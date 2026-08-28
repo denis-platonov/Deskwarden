@@ -31,9 +31,11 @@
 //!    see [`ACCOUNT_STATUS`] for why that one cannot be shown here at all yet.
 
 use crate::login_ui::{draw_window_chrome, round_window_corners, ChromeAction};
+use crate::service_keys::{Access, KeyRecord, Scope, Subject};
 use crate::settings::{
     clamp_auto_lock_minutes, parse_clipboard_minutes, ClearInterval, ClipboardEntry, Settings,
 };
+use crate::vault_bridge::ItemKind;
 use crate::theme;
 use eframe::egui::{
     self, CornerRadius, FontFamily, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke,
@@ -163,11 +165,29 @@ fn backend_description(bw_selected: bool) -> &'static str {
     }
 }
 
-/// The direct-REST opt-out's label.
+/// The backend choice's label.
 ///
 /// The owner's own words for the setting, kept as they were written. It names
 /// `bw` because that is what the row is about and what the user will see in
 /// Task Manager; the description is where the trade is spelled out.
+///
+/// # Which way round it is, said once and never restated
+///
+/// **On means `bw`.** The field behind this row is
+/// `Settings::use_official_bw_crypto`, it defaults to `true`, and `true` is
+/// the official CLI -- so the pill is on when this app is doing what it has
+/// always done, and off is the opt-in to the built-in client. The label reads
+/// that way on purpose ("use official bw" is true when the pill is on) and
+/// [`official_crypto_description`] opens by naming both states rather than
+/// leaving the reader to infer the second from the first.
+///
+/// That is worth this much prose because the inversion is invisible: a row
+/// wired to `!use_official_bw_crypto` paints, clicks and persists perfectly,
+/// and the only symptom is that a fresh install of the default configuration
+/// shows the pill off, or that a user who thinks they have turned `bw` on has
+/// turned it off. `the_backend_row_is_on_when_bw_is_the_backend` pins it
+/// against [`crate::backend_policy::choose`] rather than against the field,
+/// so an inversion anywhere between the pill and the decision fails.
 const OFFICIAL_CRYPTO_LABEL: &str = "Use official bw for crypto";
 
 /// The description shown under the [`OFFICIAL_CRYPTO_LABEL`] toggle, in its
@@ -198,14 +218,17 @@ const OFFICIAL_CRYPTO_LABEL: &str = "Use official bw for crypto";
 ///    reason: a ghosted control with no explanation reads as a bug.
 fn official_crypto_description(self_hosted: bool) -> &'static str {
     if self_hosted {
-        "On, Deskwarden's vault goes through the official Bitwarden CLI, which holds your keys \
-         in a background process of its own.\n\n\
-         Off is much lighter and faster — Deskwarden talks to your server itself, so no \
-         background process keeps running (the Bitwarden CLI is still used to sign in) — but \
+        "On (the default), Deskwarden's vault goes through the official Bitwarden CLI — the \
+         `bw` program — which holds your keys in a background process of its own.\n\n\
+         Off is much lighter and faster — Deskwarden's built-in client talks to your server \
+         itself, so no background process keeps running (the Bitwarden CLI is still used to \
+         sign in) — but \
          in that case your passwords are stored in the app: the \
          key that unlocks your vault is kept on this PC, protected by Windows, and unlike a \
          session it never expires. Anyone who can run programs as you on this PC can use it.\n\n\
-         Changing this takes effect the next time Deskwarden starts."
+         Changing this takes effect the next time Deskwarden starts, and either direction \
+         asks you to sign in again. Turning it back on also deletes the stored vault key from \
+         this PC, so nothing is left behind by the switch."
     } else {
         // Not a silent no-op under the same label, and not a hidden row. The
         // owner's rule is "disabled if not self-hosted vault to avoid issues
@@ -245,6 +268,23 @@ fn account_is_self_hosted(status: Option<AccountStatus>) -> bool {
         _ => false,
     }
 }
+
+/// The row Sync & account keeps where the backend switch used to be.
+///
+/// **A signpost, not a setting.** The switch moved to [`Section::Vault`] and
+/// a user who last saw it here will look here first; a page that simply
+/// stopped mentioning it reads as a page from which the setting was removed.
+const SYNC_MOVED_LABEL: &str = "Which backend holds this vault";
+
+/// [`SYNC_MOVED_LABEL`]'s sentence.
+///
+/// Names the page in the words the nav uses, and a test pins that it really
+/// is [`Section::Vault`]'s label -- otherwise a rename leaves this pointing
+/// at a page nobody can find. It also names what else is over there, because
+/// "it moved" without "and so did these" sends a user on a second trip.
+const SYNC_MOVED_NOTE: &str = "That switch is on the Vault page now, beside the encrypted copy \
+                               on this PC -- they decide one thing between them, so they are \
+                               read together.";
 
 /// The encrypted disk cache's label. It names the file rather than the
 /// benefit, because the benefit ("opens instantly") is not the part a user
@@ -846,6 +886,66 @@ pub enum Section {
     Autofill,
     NativeApps,
     Security,
+    /// **Everything about where this vault lives and what is kept of it on
+    /// this PC.**
+    ///
+    /// [`Section::Breaches`]'s argument, taken to its end on the one subject
+    /// where the pages had actually scattered. This page carries all of it:
+    /// which backend holds the vault (the official `bw` CLI or Deskwarden's
+    /// built-in client), whether that backend is kept warm, whether an
+    /// encrypted copy is kept on this PC and whether reads consult it.
+    ///
+    /// **What it does not carry is the local API**, which is
+    /// [`Section::Api`]. Those four settings answer "where does Deskwarden
+    /// get this vault from"; the API answers "who else may ask Deskwarden for
+    /// it". They met here only because both had once been called "the vault
+    /// service", and a page that answers two questions is a page on which
+    /// neither answer is findable -- the key list, which is the longest thing
+    /// in this window and has no upper bound, sat under four rows of
+    /// three-paragraph copy that nobody reading about keys wanted.
+    ///
+    /// # Why they were gathered, and it is not tidiness
+    ///
+    /// The owner walked into a self-trapping state: with
+    /// `keep_backend_running` off the vault window failed to load, and
+    /// Preferences is a page *inside* that window -- so the only switch that
+    /// could undo it was behind the thing it had broken. That was reachable
+    /// because the settings that decide how the vault is served were on three
+    /// different pages, each placement individually defensible. Seen
+    /// together they are one decision with several parts, and a reader who
+    /// can see all of them at once can see what they have just done to
+    /// themselves.
+    ///
+    /// **Directly after Security**, which is the page a reader looking for
+    /// "where does my vault come from" reaches first, and where they would
+    /// otherwise expect to find this.
+    Vault,
+    /// **The local HTTP API, and every key that opens it**: the switch that
+    /// starts the endpoint on 127.0.0.1, the form that mints a key, the one
+    /// showing of a key it has just made, the list of the keys that exist,
+    /// and revoking one.
+    ///
+    /// # Why it is its own page and not the bottom of [`Section::Vault`]
+    ///
+    /// The half that must never be split is the switch and the keys, and it
+    /// is not split: **a switch on one page and the list of who can walk
+    /// through the door it opens on another is an arrangement where the
+    /// owner can believe they turned something off while three keys still
+    /// exist for it.** That argument is about these two, and both are here.
+    ///
+    /// It says nothing about the backend choice or the disk cache, which
+    /// answer a different question -- see [`Section::Vault`]. Those four are
+    /// settings, each a row that is read once and left alone. This page is a
+    /// *workspace*: it has a form, an unbounded list, and two questions the
+    /// user answers in place. Sharing a scroll region with four rows of
+    /// three-paragraph copy meant the mint button moved down the page as
+    /// keys were added, which is the one control here a user comes back for.
+    ///
+    /// **Directly after Vault**, because the endpoint serves whatever the
+    /// Vault page decided is being served, and because a reader who has just
+    /// read what is kept on this PC is exactly the reader who should next be
+    /// asked who may reach it.
+    Api,
     Clipboard,
     Shortcuts,
     SyncAndAccount,
@@ -877,12 +977,14 @@ pub enum Section {
 
 impl Section {
     /// The nav, top to bottom.
-    pub const ALL: [Section; 10] = [
+    pub const ALL: [Section; 12] = [
         Section::General,
         Section::Breaches,
         Section::Autofill,
         Section::NativeApps,
         Section::Security,
+        Section::Vault,
+        Section::Api,
         Section::Clipboard,
         Section::Shortcuts,
         Section::SyncAndAccount,
@@ -899,6 +1001,8 @@ impl Section {
             Section::Autofill => "Autofill",
             Section::NativeApps => "Native apps",
             Section::Security => "Security",
+            Section::Vault => "Vault",
+            Section::Api => "Local API",
             Section::Clipboard => "Clipboard",
             Section::Shortcuts => "Shortcuts",
             Section::SyncAndAccount => "Sync & account",
@@ -921,6 +1025,25 @@ impl Section {
             }
             Section::NativeApps => "The applications Deskwarden fills credentials into.",
             Section::Security => "What Deskwarden asks for before it reveals or fills a secret.",
+            // Every part, in the order the page draws them: where the vault
+            // is served FROM, then what is kept on this PC, then who else may
+            // ask for it. The endpoint still comes before the keys, for the
+            // reason it always did -- the keys mean nothing while nothing is
+            // listening, and a reader who has not grasped that there IS an
+            // endpoint cannot weigh them.
+            Section::Vault => {
+                "Which backend holds this vault, and what is kept of it on this PC."
+            }
+            // Names the door before the keys, for the reason the page draws
+            // them in that order: the keys mean nothing while nothing is
+            // listening, and a reader who has not grasped that there IS an
+            // endpoint cannot weigh them. Says *other programs on this PC*
+            // rather than "clients", because who may walk through is the
+            // decision this page asks for.
+            Section::Api => {
+                "The local endpoint that hands this vault to other programs on this PC, and \
+                 the keys that open it."
+            }
             // Says *taken back*, not "cleared", and names the copy rather than
             // the clipboard: the page is about the second half of
             // `clipboard.rs` and not about the history exclusion, which has no
@@ -1027,6 +1150,68 @@ pub struct PrefsState {
     /// only things that read `scan_history.json`.
     hello_available: fn() -> bool,
     scan_history: crate::scan_history::ScanHistory,
+    /// The API keys the service will honour, as the store held them when this
+    /// window opened.
+    ///
+    /// **Empty in [`PrefsState::new`] and NOT read off disk there**, exactly
+    /// as [`Self::scan_history`] is empty there and for the same reason: `new`
+    /// is what the paint tests build, and a constructor that reached
+    /// `%APPDATA%\Deskwarden` would make every one of them a reader of the
+    /// owner's real credentials. [`Self::with_scan_history`] loads it.
+    keys: Vec<KeyRecord>,
+    /// Where a minted or revoked key is written.
+    ///
+    /// **A `fn` on the state, defaulting in `new` to one that writes nothing
+    /// and succeeds** -- the inert answer, in [`Self::hello_available`]'s
+    /// idiom. A draw that called [`save_service_keys`] directly would make
+    /// every paint test in this module a *writer* of the owner's key store,
+    /// which is a worse failure than the reading one that seam already
+    /// prevents. The production shells install the real writer in
+    /// [`Self::with_scan_history`].
+    keys_sink: fn(&[KeyRecord]) -> Result<(), String>,
+    /// What is typed into the mint form, between frames.
+    key_form: KeyForm,
+    /// The one key that has been minted and not yet dismissed, holding the
+    /// only plaintext copy of it that exists anywhere.
+    minted: Option<MintedKey>,
+    /// What the page last told the owner about a mint or a revoke: a refusal,
+    /// or a store that could not be written. `None` is "nothing to say".
+    ///
+    /// Kept in state rather than recomputed each frame for
+    /// [`Self::clipboard_entry_error`]'s reason: it is about an *event* --
+    /// the moment a button was pressed -- and not about what is currently in
+    /// the form.
+    key_message: Option<String>,
+    /// The backend flip that has been clicked once and not yet confirmed.
+    /// `None` means nothing is being asked.
+    ///
+    /// **The proposed direction, not a copy of the setting.** What the pill
+    /// paints while this is `Some` is still
+    /// `Settings::use_official_bw_crypto`, unchanged -- so a question that is
+    /// dismissed, or abandoned by leaving the page, cannot leave the row
+    /// showing a state the app is not in.
+    pending_backend_switch: Option<BackendSwitch>,
+    /// The name of the key whose revoke button has been pressed once and not
+    /// yet confirmed. `None` means nothing is being asked.
+    pending_revoke: Option<String>,
+    /// The clock the expiry list and `mint` are answered against, **as a
+    /// function pointer** for [`Self::account_source`]'s reason: expiry is a
+    /// question about *now*, and a test that had to wait for a real second to
+    /// pass to see a key expire is a test nobody writes.
+    key_clock: fn() -> u64,
+    /// Where a new key's 256 bits come from. A seam for
+    /// `service_token::mint`'s own reason: the encoding, the length and the
+    /// hashing are all worth driving from a test, and none of them needs an
+    /// unpredictable value to be driven.
+    key_random: fn() -> [u8; 32],
+    /// Where the Copy button sends the revealed key.
+    ///
+    /// **A no-op in `new`**, like [`Self::keys_sink`]: the Windows clipboard
+    /// is process-wide state, and a paint test that clicked Copy would put a
+    /// live credential on the clipboard of whoever is running the suite. The
+    /// production shells install `clipboard::copy_secret`, which is this
+    /// crate's one clipboard path and the only one that clears itself.
+    key_copy: fn(&str),
 }
 
 /// The wall clock, in milliseconds since the Unix epoch, UTC.
@@ -1167,6 +1352,19 @@ impl PrefsState {
             // words.
             scan_history: crate::scan_history::ScanHistory::default(),
             hello_available: || false,
+            // The key store, and the two ways out of this window that could
+            // touch something real, all inert here. See each field's doc:
+            // `new` is what the paint tests build.
+            keys: Vec::new(),
+            keys_sink: |_| Ok(()),
+            key_form: KeyForm::default(),
+            minted: None,
+            key_message: None,
+            pending_backend_switch: None,
+            pending_revoke: None,
+            key_clock: crate::service_keys::now_unix,
+            key_random: crate::service_token::os_random,
+            key_copy: |_| {},
         }
     }
 
@@ -1204,6 +1402,14 @@ impl PrefsState {
         Self {
             scan_history: load_scan_history(),
             hello_available: crate::vault_disk_cache::hello_available,
+            // The API keys are loaded here for the same reason and under the
+            // same rule: this is the constructor that is allowed to read
+            // `%APPDATA%\Deskwarden`, and it is the one the two production
+            // shells call. The writer and the clipboard path are installed
+            // here too, so a state built any other way can reach neither.
+            keys: load_service_keys(),
+            keys_sink: save_service_keys,
+            key_copy: crate::clipboard::copy_secret,
             ..Self::new(settings)
         }
     }
@@ -1251,6 +1457,51 @@ impl PrefsState {
     /// [`show_account_source`](Self::show_account_source)'s reason exactly.
     pub fn show_hello_available(&mut self, probe: fn() -> bool) {
         self.hello_available = probe;
+    }
+
+    /// Supplies the API keys the Local API page lists, instead of the
+    /// ones that were on disk when this state was built.
+    ///
+    /// For `examples/ui_preview`, which **must not read**
+    /// `%APPDATA%\Deskwarden`, and for the tests, which must not either --
+    /// [`show_scan_history`](Self::show_scan_history)'s argument, over the
+    /// file beside it.
+    pub fn show_service_keys(&mut self, keys: Vec<KeyRecord>) {
+        self.keys = keys;
+    }
+
+    /// Answers this page's "what time is it?" from `clock` instead of from
+    /// the machine.
+    ///
+    /// Expiry is the one thing on this window that changes with no input, so
+    /// a screenshot of an expired key -- and a test of one -- can only exist
+    /// if the clock is a parameter.
+    pub fn show_key_clock(&mut self, clock: fn() -> u64) {
+        self.key_clock = clock;
+    }
+
+    /// Mints from `random` instead of from the OS.
+    ///
+    /// For the tests, which need to know what key came out in order to check
+    /// that its plaintext is on screen and that its hash -- and not it -- is
+    /// what the record kept.
+    pub fn show_key_random(&mut self, random: fn() -> [u8; 32]) {
+        self.key_random = random;
+    }
+
+    /// Sends a minted key somewhere other than the store.
+    ///
+    /// For the tests, which must not write `%APPDATA%\Deskwarden`, and which
+    /// need to drive the "the key was made and the file could not be
+    /// written" branch -- a state the owner has to be told about truthfully,
+    /// and one that cannot be reached by breaking a real disk.
+    pub fn show_keys_sink(&mut self, sink: fn(&[KeyRecord]) -> Result<(), String>) {
+        self.keys_sink = sink;
+    }
+
+    /// Sends the Copy button's key somewhere other than the clipboard.
+    pub fn show_key_copy(&mut self, copy: fn(&str)) {
+        self.key_copy = copy;
     }
 }
 
@@ -1594,11 +1845,13 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
             ui,
             "Auto-lock is on the General page. Nothing else here is configurable yet.",
         ),
+        Section::Vault => draw_vault(ui, state),
+        Section::Api => draw_api(ui, state),
         Section::Clipboard => draw_clipboard(ui, state),
         // The one read of the published status -- see `hotkey::availability`, and
         // `draw_shortcuts` for why it is a parameter from here down.
         Section::Shortcuts => draw_shortcuts(ui, crate::hotkey::availability()),
-        Section::SyncAndAccount => draw_sync_and_account(ui, state),
+        Section::SyncAndAccount => draw_sync_and_account(ui),
         Section::Updates => draw_updates(ui, state),
         Section::About => draw_about(ui, state),
     }
@@ -1757,46 +2010,22 @@ fn value_row(ui: &mut Ui, label: &str, description: &str, value: &str) {
 fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         // **The backend row is not here any more.** It moved, whole, to
-        // `Section::SyncAndAccount`, where it is now a CHILD of the switch
-        // that decides whether `bw serve` is used at all -- see
-        // [`backend_description`] for why a live-looking switch two pages
-        // from the thing that makes it meaningless was a defect and not
-        // merely an untidiness. The same argument the breach row's move
+        // `Section::Vault` (by way of `Section::SyncAndAccount`), where it is
+        // a CHILD of the switch that decides whether `bw serve` is used at
+        // all -- see [`backend_description`] for why a live-looking switch
+        // two pages from the thing that makes it meaningless was a defect and
+        // not merely an untidiness. The same argument the breach row's move
         // makes below, one subsystem later.
         //
-        // Directly under it used to be the disk-cache row, and that pairing
-        // still holds: the backend row decided how much the app pays to keep
-        // `bw serve` warm, and this one is how it stops needing `bw serve`
-        // warm at all. The spec put it here rather than on
-        // `Section::Security` -- which did not exist when it was written and
-        // is still a placeholder -- and it is the one setting on this page
-        // that changes what is written to the user's disk.
+        // **The disk-cache pair is not here any more either**, and it left
+        // for the third time this comment has had to be written: to sit
+        // beside the thing that governs it. `cache_vault_to_disk` and its
+        // child `read_through_cache` are now on `Section::Vault`, in the same
+        // card as the backend rows -- see that section's own doc for the
+        // self-trapping bug that gathering them was a response to. The
+        // pairing this comment used to describe (the backend row above, the
+        // disk cache below) is intact; both halves simply moved together.
         //
-        // `child_toggle_row` rather than a bespoke unavailable block: with no
-        // Windows Hello the row is ghosted and its description says why,
-        // readable without hovering, and the returned value is the stored one
-        // unchanged so a stray click cannot enable machinery that has no key
-        // to run on.
-        let hello_available = (state.hello_available)();
-        state.settings.cache_vault_to_disk = child_toggle_row(
-            ui,
-            DISK_CACHE_LABEL,
-            disk_cache_description(hello_available),
-            state.settings.cache_vault_to_disk,
-            hello_available,
-        );
-        row_separator(ui);
-        // The child of the row above: with no copy permitted there is nothing
-        // to read. Ghosted rather than hidden, for `child_toggle_row`'s usual
-        // reason -- a row that vanishes is a row a user cannot find out about.
-        state.settings.read_through_cache = child_toggle_row(
-            ui,
-            READ_THROUGH_LABEL,
-            read_through_description(state.settings.cache_vault_to_disk),
-            state.settings.read_through_cache,
-            state.settings.cache_vault_to_disk,
-        );
-        row_separator(ui);
         // The one switch that governs what a matched window does. It sits on
         // General beside the other two rather than under Shortcuts, because
         // it is not about a shortcut: `PROMPT_DESCRIPTION` names the hotkey
@@ -2182,6 +2411,1203 @@ fn scan_button(ui: &mut Ui, label: &str, enabled: bool) -> bool {
     );
     ui.painter().galley(at, galley, theme::TEXT_SECONDARY);
     enabled && response.clicked()
+}
+
+// ---------------------------------------------------------------------------
+// The local API, and the keys that open it
+// ---------------------------------------------------------------------------
+
+/// The master switch's label. It names **what happens to the vault**, not the
+/// mechanism: "Run the local API" describes a process, and the thing the
+/// owner is deciding about is that other programs get their items.
+const SERVICE_LABEL: &str = "Serve this vault to programs on this PC";
+
+/// The description under [`SERVICE_LABEL`], in its two states.
+///
+/// A pure function, and asserted on by tests, for [`disk_cache_description`]'s
+/// reason exactly: this is the sentence a person reads before deciding to put
+/// a door into their vault, and copy buried in an eframe closure is copy
+/// nothing can reach.
+///
+/// Four properties the tests below hold, each deliberate:
+///
+///  * **The OFF copy says what turning it ON would do.** This is the one that
+///    matters and the one that is easy to get wrong -- an off state that says
+///    only "off" leaves the decision to the label, and the label is six
+///    words. Off is also the default, and the copy says so rather than
+///    leaving it to `Settings::default`, the same way `BREACH_DESCRIPTION`
+///    states its own.
+///  * **It names what is served, without a euphemism**: usernames, passwords,
+///    notes and two-factor secrets. Not "vault data". The disk-cache row two
+///    pages away already fought this argument and lost the euphemism.
+///  * **It names who can use it** -- any program on this PC holding a key --
+///    because "local endpoint" reads to most people as "only me", and
+///    `service_token`'s own module doc is explicit that it is not.
+///  * **It says a key is the whole credential.** Every other door into this
+///    vault asks for the master password; this one does not, and a reader
+///    who assumes it does has misjudged the entire trade.
+fn service_description(enabled: bool) -> &'static str {
+    if enabled {
+        "On. Deskwarden is listening on 127.0.0.1 and will hand out decrypted vault items -- \
+         usernames, passwords, notes and two-factor secrets -- to any program on this PC that \
+         presents one of the keys below. It never asks for your master password: a key is the \
+         whole credential, so anyone who can read one can use it. Turning this off stops the \
+         endpoint and leaves the keys where they are."
+    } else {
+        "Off, which is the default. Turning it on starts a local HTTP endpoint on 127.0.0.1 \
+         that hands out decrypted vault items -- usernames, passwords, notes and two-factor \
+         secrets -- to any program on this PC that presents one of the keys you mint below. It \
+         never asks for your master password: a key is the whole credential, so anyone who can \
+         read one can use it. Nothing is listening, and no key opens anything, until you turn \
+         this on."
+    }
+}
+
+/// The key store's file name.
+///
+/// **This must be the name the service itself reads** (`service_keys_path` in
+/// `main.rs`), or this screen mints keys into a file nothing consults and the
+/// whole page is decoration. There is no shared constant to import -- the
+/// service's copy is a private function in a binary -- so the agreement is
+/// held by a source guard over both spellings instead of by the compiler.
+use crate::service_keys::KEY_STORE_FILE_NAME as SERVICE_KEYS_FILE_NAME;
+
+/// Where the key store lives: beside `settings.json`, in the directory this
+/// app already owns.
+fn service_keys_path() -> Option<std::path::PathBuf> {
+    crate::settings::config_dir().map(|dir| dir.join(SERVICE_KEYS_FILE_NAME))
+}
+
+/// The stored keys, or none where there is no resolvable config directory.
+///
+/// An empty store is a state the page renders in words ("No keys have been
+/// minted"), so there is nothing here to report as an error --
+/// [`load_scan_history`]'s argument, on the file next to it.
+fn load_service_keys() -> Vec<KeyRecord> {
+    service_keys_path().map(|path| crate::service_keys::load(&path)).unwrap_or_default()
+}
+
+/// Writes the key store where the service will read it.
+///
+/// **The only production writer**, and it is a `fn` installed on the state
+/// rather than a call in the draw, for the reason [`PrefsState::keys_sink`]
+/// gives: the paint tests build [`PrefsState::new`], and a draw that saved
+/// would make every one of them a writer of the owner's real key store.
+fn save_service_keys(records: &[KeyRecord]) -> Result<(), String> {
+    let path = service_keys_path()
+        .ok_or_else(|| "Deskwarden could not work out where its own settings live".to_string())?;
+    crate::service_keys::save(&path, records)
+}
+
+// -- copy -------------------------------------------------------------------
+
+const KEYS_SECTION_LABEL: &str = "API keys";
+
+/// The empty state. A result, not a blank panel -- and it says what the
+/// emptiness *means*, because "no keys" and "the service is wide open" are
+/// exactly the confusion this page has to prevent.
+const KEYS_NONE: &str = "No keys have been minted, so nothing can reach the service yet. A \
+                         program needs a key from here before it is answered at all.";
+
+const MINT_SECTION_LABEL: &str = "Mint a key";
+const MINT_SECTION_DESCRIPTION: &str = "A key is shown once, when it is made, and after that only \
+                                        its hash is kept.";
+const NAME_LABEL: &str = "Name";
+const NAME_DESCRIPTION: &str = "Name it after the program that will hold it. The name is how you \
+                                recognise this key in the list, and how you revoke it.";
+const EXPIRY_LABEL: &str = "Expires after";
+const EXPIRY_DESCRIPTION: &str = "Days from now. Leave it empty for a key that never expires \
+                                  and works until you revoke it.";
+const SUBJECT_LABEL: &str = "What it can reach";
+const ACCESS_LABEL: &str = "What it may do";
+const ITEM_ID_LABEL: &str = "Item id";
+const ITEM_ID_DESCRIPTION: &str = "The id of the one item this key may reach, as it appears in \
+                                   the vault's own links.";
+const MINT_BUTTON: &str = "Mint the key";
+
+/// The mint form's field ids, stable across frames for [`STEPPER_FIELD_ID`]'s
+/// reason: focus and the caret live in egui's memory under the widget's id,
+/// and this page changes height under the cursor whenever the item-id row
+/// appears.
+const NAME_FIELD_ID: &str = "prefs-key-name";
+const EXPIRY_FIELD_ID: &str = "prefs-key-expiry-days";
+const ITEM_FIELD_ID: &str = "prefs-key-item-id";
+/// The full trailing control column, which is what a key's name needs.
+const NAME_FIELD_WIDTH: f32 = CONTROL_COLUMN_WIDTH;
+/// A box for a number of days, sized like the two steppers' value cells.
+const EXPIRY_FIELD_WIDTH: f32 = 72.0;
+/// Wide enough for their own labels at 12px semibold, with 3e's breathing
+/// room around them.
+const MINT_BUTTON_WIDTH: f32 = 120.0;
+const REVOKE_BUTTON_WIDTH: f32 = 88.0;
+const COPY_BUTTON_WIDTH: f32 = 88.0;
+/// A picker cell's horizontal padding, total. Its width is measured from its
+/// own label, because "Secure note" and "Card" are not the same word.
+const CHOICE_PADDING: f32 = 20.0;
+
+const EVERYTHING_CHOICE: &str = "Everything";
+const ONE_ITEM_CHOICE: &str = "One item";
+const READ_CHOICE: &str = "Read";
+const WRITE_CHOICE: &str = "Write";
+
+/// The heading over a key that has just been minted.
+const REVEAL_LABEL: &str = "Copy this key now";
+
+/// **The whole contract of the reveal, in the place it is shown.**
+///
+/// It says the key is not stored, not merely that it will not be shown again
+/// -- because "shown once" reads as a policy someone could relax, and "we
+/// keep only a hash of it" is the reason it cannot be relaxed. A reader who
+/// believes the key is retrievable will close this card and come back for it.
+const REVEAL_NOTE: &str = "This is the only time this key is shown. Deskwarden stores nothing \
+                           but a hash of it, so it cannot be shown again -- not by this screen, \
+                           not from the file. If you lose it, revoke this key and mint another.";
+
+const COPY_BUTTON: &str = "Copy";
+const DONE_BUTTON: &str = "Done";
+const REVOKE_BUTTON: &str = "Revoke";
+const REVOKE_CONFIRM_BUTTON: &str = "Revoke it";
+const REVOKE_CANCEL_BUTTON: &str = "Keep it";
+
+/// What the owner is asked before a key goes.
+///
+/// **It names the consequence, not the operation.** "Are you sure?" tells a
+/// person nothing they did not know when they clicked; what they need is
+/// that the program holding this key stops working immediately, that the
+/// failure it gets says nothing about why, and that there is no undo -- which
+/// is exactly the mis-click this confirmation exists for.
+fn revoke_prompt(name: &str) -> String {
+    format!(
+        "Revoke \u{201c}{name}\u{201d}? Any program still holding this key stops being answered \
+         the moment you do -- with a refusal that tells it nothing about why -- and the key \
+         cannot be brought back. Replacing it means putting a new key into whatever was using \
+         this one."
+    )
+}
+
+/// Why a form was refused before [`crate::service_keys::mint`] ever saw it.
+///
+/// These three are deliberately **not** [`crate::service_keys::MintRefusal`] arms: `mint` cannot
+/// see any of them. It takes an `Option<u64>` and a `Vec<Scope>`, so a box of
+/// nonsense where a number should be, and a scope set that is empty because
+/// neither access was chosen, have already become "no expiry" and "no
+/// permissions" by the time it is called -- both of which are legitimate
+/// values it must accept. Judging them here is the only place they are still
+/// distinguishable from the thing the owner meant.
+const EXPIRY_NOT_A_NUMBER: &str = "Enter the number of days this key should last -- 30, say -- \
+                                   or leave the box empty for a key that never expires.";
+const NO_ITEM_ID: &str = "Enter the id of the item this key is for. A key scoped to no item is \
+                          refused every item, which is a key that looks live and is not.";
+const NO_ACCESS: &str = "Choose Read, Write, or both. A key with neither is refused everything \
+                         it asks for, which is a key that looks live and is not.";
+
+/// Said after a key was minted but the store could not be written.
+///
+/// **The key is live in this window and dead after a restart**, which is the
+/// worst of the three possible states and the one a "could not save" would
+/// not convey.
+const MINT_NOT_SAVED: &str = "The key was made, but the key store could not be written, so it \
+                              will be gone the next time Deskwarden starts: ";
+
+/// Said after a key was revoked but the store could not be written.
+///
+/// **The other direction, and the dangerous one**: the list on screen no
+/// longer shows the key and the file still grants it. A message that said
+/// only "could not save" would leave the owner believing they had revoked
+/// it.
+const REVOKE_NOT_SAVED: &str = "The key is gone from this list, but the key store could not be \
+                                written -- so it still works, and will be back in this list when \
+                                Deskwarden restarts: ";
+
+// -- what a key is, in words ------------------------------------------------
+
+/// The five kinds a key can be scoped to, in the order the picker offers
+/// them.
+///
+/// [`ItemKind::Unknown`] is deliberately absent: it is what an item of a type
+/// this build does not know reads as, and there is no sense in offering a
+/// grant over "whatever we could not parse". A key wanting one of those
+/// scopes to a single id instead.
+const KEY_CATEGORIES: [ItemKind; 5] = [
+    ItemKind::Login,
+    ItemKind::SecureNote,
+    ItemKind::Card,
+    ItemKind::Identity,
+    ItemKind::SshKey,
+];
+
+/// One grant, as a sentence.
+///
+/// Access first, because that is the half that decides whether a mistake here
+/// costs a disclosure or an edit.
+fn scope_wording(scope: &Scope) -> String {
+    let access = match scope.access {
+        Access::Read => "Read",
+        Access::Write => "Write",
+    };
+    let subject = match &scope.subject {
+        Subject::All => "everything in the vault".to_string(),
+        Subject::Category(kind) => format!("every {}", kind.label().to_lowercase()),
+        Subject::Item(id) => format!("the item {id}"),
+        // **Named, and named as granting nothing**, because that is what
+        // `service_keys` does with it. A row that quietly omitted an
+        // unrecognised scope would be a screen claiming a key is narrower
+        // than the file says, on a build that is merely older than the file.
+        Subject::Unrecognised(raw) => {
+            format!("\u{201c}{raw}\u{201d}, which this version does not understand and treats as \
+                     permitting nothing")
+        }
+    };
+    format!("{access} {subject}")
+}
+
+/// Every grant on a key, as one line.
+///
+/// The empty set is a sentence rather than a blank, and it says what the
+/// default-deny rule means in practice: a key with no scopes is refused
+/// everything. `service_keys`' module doc is explicit that this is a state a
+/// record can genuinely be in.
+fn scopes_wording(scopes: &[Scope]) -> String {
+    if scopes.is_empty() {
+        return "No permissions at all: this key is refused everything it asks for.".to_string();
+    }
+    scopes.iter().map(scope_wording).collect::<Vec<_>>().join(" \u{00b7} ")
+}
+
+/// When a key was made and when it stops working, as one line.
+///
+/// **Expiry is answered against `now_unix`, not read off the record**, for
+/// the reason `service_keys::find` takes a clock: a key whose date has passed
+/// is refused by the service, and a list that showed it as an ordinary future
+/// date would be the screen disagreeing with the door.
+///
+/// "Never expires" is spelled out rather than left blank. A blank cell in an
+/// expiry column is read as "not applicable", which is the opposite of what
+/// it means here.
+fn key_when_wording(
+    record: &KeyRecord,
+    now_unix: u64,
+    zone: &dyn crate::local_time::LocalOffset,
+) -> String {
+    let when = |seconds: u64| {
+        crate::local_time::format_day_time(crate::local_time::local_parts(
+            (seconds as i64).saturating_mul(1000),
+            zone,
+        ))
+    };
+    let created = format!("Created {}", when(record.created_unix));
+    match record.expires_unix {
+        None => format!("{created} \u{00b7} Never expires"),
+        // Inclusive, exactly as `service_keys::find` is: a key whose expiry
+        // is this second is already refused, so this second is already
+        // "expired" and not "expires now".
+        Some(at) if at <= now_unix => {
+            format!("{created} \u{00b7} Expired {} \u{2014} it is already refused", when(at))
+        }
+        Some(at) => format!("{created} \u{00b7} Expires {}", when(at)),
+    }
+}
+
+// -- the form, as plain values ----------------------------------------------
+
+/// What the subject picker is on.
+///
+/// A choice rather than a [`Subject`] because [`Subject::Item`] carries the
+/// id, and the id lives in its own text buffer that must survive the user
+/// clicking away to `Everything` and back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectChoice {
+    Everything,
+    Category(ItemKind),
+    OneItem,
+}
+
+/// What is typed into the mint form, between frames.
+///
+/// Plain values with no `Ui` anywhere near them, so every decision this form
+/// makes -- what it refuses, what scopes it produces, what expiry it computes
+/// -- is a function call in a test rather than a click on a window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyForm {
+    name: String,
+    /// Days from now, as typed. Empty means no expiry.
+    expiry_days: String,
+    subject: SubjectChoice,
+    /// Kept even while [`Self::subject`] is not `OneItem`, so clicking away
+    /// and back does not lose a pasted id.
+    item_id: String,
+    read: bool,
+    write: bool,
+}
+
+impl Default for KeyForm {
+    /// **Read on, write off.** Not "both off" and not "both on".
+    ///
+    /// Both off would make the first click on `Mint` a refusal for a reason
+    /// the owner has not been told about yet. Both on would make the default
+    /// key one that can *change* the vault, which is not what anyone reaches
+    /// for this screen to do first -- the case in the design is a backup
+    /// script -- and a default that grants more than the common case is how
+    /// an over-scoped key gets minted by someone who never looked at this
+    /// row.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            expiry_days: String::new(),
+            subject: SubjectChoice::Everything,
+            item_id: String::new(),
+            read: true,
+            write: false,
+        }
+    }
+}
+
+/// What is wrong with the form, before `mint` is asked.
+fn form_refusal(form: &KeyForm) -> Option<&'static str> {
+    if !form.expiry_days.trim().is_empty() && form.expiry_days.trim().parse::<u64>().is_err() {
+        return Some(EXPIRY_NOT_A_NUMBER);
+    }
+    if form.subject == SubjectChoice::OneItem && form.item_id.trim().is_empty() {
+        return Some(NO_ITEM_ID);
+    }
+    if !form.read && !form.write {
+        return Some(NO_ACCESS);
+    }
+    None
+}
+
+/// The instant the form's expiry lands on, or `None` for no expiry.
+///
+/// `saturating_mul`/`saturating_add`, because the box takes a number and
+/// `u64::MAX` days is one that can be typed into it. Saturating lands on a
+/// date far past any clock, which is the honest reading of "that many days";
+/// wrapping would land in the past and mint a key that is dead on arrival.
+///
+/// **Zero days is not special-cased here.** It computes to exactly `now`,
+/// which `service_keys::mint` refuses as `ExpiryAlreadyPassed` -- and that is
+/// the refusal the owner should see, in `service_keys`' own words, rather
+/// than a second sentence written here that says the same thing differently.
+fn form_expiry(form: &KeyForm, now_unix: u64) -> Option<u64> {
+    let days: u64 = form.expiry_days.trim().parse().ok()?;
+    Some(now_unix.saturating_add(days.saturating_mul(86_400)))
+}
+
+/// The grants the form describes.
+///
+/// Empty when neither access is ticked -- which [`form_refusal`] stops before
+/// it can be minted, and which is still the right value to compute rather
+/// than a panic: default deny is `service_keys`' rule and an empty set is how
+/// it is spelled.
+fn form_scopes(form: &KeyForm) -> Vec<Scope> {
+    let subject = match form.subject {
+        SubjectChoice::Everything => Subject::All,
+        SubjectChoice::Category(kind) => Subject::Category(kind),
+        SubjectChoice::OneItem => Subject::Item(form.item_id.trim().to_string()),
+    };
+    let mut scopes = Vec::new();
+    if form.read {
+        scopes.push(Scope { subject: subject.clone(), access: Access::Read });
+    }
+    if form.write {
+        scopes.push(Scope { subject, access: Access::Write });
+    }
+    scopes
+}
+
+/// A key that has been made and not yet dismissed.
+///
+/// **No `Debug`, derived or otherwise.** It holds the one plaintext key that
+/// exists anywhere in this process, and `crate::debug_leak_guard` is the
+/// record of what happens when a type like this gets a derive.
+struct MintedKey {
+    name: String,
+    /// Wiped when this is dropped. The store holds only a hash, so this
+    /// string is the only copy in existence until the owner has pasted it
+    /// somewhere.
+    secret: zeroize::Zeroizing<String>,
+}
+
+/// What pressing Mint did.
+///
+/// A value rather than a mutation of the state, so the whole decision --
+/// which refusals fire, in which order, and what the owner is told -- is
+/// testable without a window.
+enum MintOutcome {
+    Minted(KeyRecord, MintedKey),
+    /// The sentence to show. Either one of this module's three form refusals
+    /// or, **verbatim**, [`crate::service_keys::MintRefusal::message`]: a refusal the owner cannot
+    /// act on is a refusal that wastes their afternoon, and `service_keys`
+    /// already wrote the actionable words.
+    Refused(String),
+}
+
+/// The whole of pressing Mint, as a function of values.
+fn attempt_mint(
+    form: &KeyForm,
+    now_unix: u64,
+    random: fn() -> [u8; 32],
+    existing: &[KeyRecord],
+) -> MintOutcome {
+    if let Some(reason) = form_refusal(form) {
+        return MintOutcome::Refused(reason.to_string());
+    }
+    match crate::service_keys::mint(
+        form.name.clone(),
+        form_expiry(form, now_unix),
+        form_scopes(form),
+        now_unix,
+        random,
+        existing,
+    ) {
+        Ok((record, secret)) => {
+            let minted =
+                MintedKey { name: record.name.clone(), secret: zeroize::Zeroizing::new(secret) };
+            MintOutcome::Minted(record, minted)
+        }
+        Err(refusal) => MintOutcome::Refused(refusal.message()),
+    }
+}
+
+// -- the page ---------------------------------------------------------------
+
+/// The **Vault** page: where the vault is served from, what is kept on this
+/// PC, and who else may ask for it.
+///
+/// # Everything about the vault on one page, deliberately
+///
+/// [`draw_breaches`]'s argument, with more at stake, and now applied to the
+/// whole subject rather than to the service alone. The backend choice decides
+/// which program holds the keys; `keep_backend_running` decides whether that
+/// program stays up; the disk cache decides what is left on the disk when it
+/// is not; the service switch decides whether a door exists at all; the keys
+/// are that door's only credential; the mint form is how another one is cut;
+/// the revoke button is the only way one is taken back.
+///
+/// Split across pages -- which is what shipped, over General, Sync & account
+/// and here -- the owner can turn the backend off on one screen and discover
+/// on another that the window they would undo it from no longer opens, and
+/// can turn the service "off" without ever having seen the three keys that
+/// will work again the moment it is on. Both of those happened.
+///
+/// # The order is the order of consequence
+///
+/// Where the vault comes from, then what is written down, then who may ask.
+/// Each card is only decidable once the one above it is: whether an encrypted
+/// copy is worth keeping depends on whether a backend is being kept warm, and
+/// what the service can serve depends on both.
+///
+/// # The plaintext key is on screen exactly once, and never on disk
+///
+/// [`attempt_mint`] hands back a [`MintedKey`] which lives in
+/// [`PrefsState::minted`] until the owner dismisses it, and is wiped when it
+/// is dropped. What is *stored* is the [`KeyRecord`], which holds
+/// `SHA-256(key)` -- see `service_keys`' module doc for why that hash is fast
+/// and why the file is worth nothing to whoever reads it.
+///
+/// The card stays up until it is dismissed, rather than clearing on a page
+/// change, and that is not laziness: it is the only copy of the key in
+/// existence, and a mis-click in the nav must not destroy it.
+///
+/// # Revoking asks first
+///
+/// Every other control on this window is reversible by clicking it again.
+/// This one is not, and the thing it breaks is somebody's unattended script
+/// -- so it is the one place in Preferences with a confirmation, and the
+/// confirmation says what breaks rather than "are you sure".
+/// Which way a click on the backend row would take the vault.
+///
+/// **Named directions rather than the `bool` itself**, because the two are
+/// not the same size of decision and the whole point of the confirmation is
+/// that they are not: one of them deletes a key off the user's disk and the
+/// other does not. A `bool` threaded from the pill to the prompt would let
+/// that asymmetry be lost to a single inverted comparison, silently, in the
+/// one sentence a user reads before agreeing to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendSwitch {
+    /// Off to on: back to the official `bw` CLI, which is also the arm that
+    /// takes `userkey.bin` off this PC -- see `main`'s
+    /// `settle_the_vault_backend`, which clears the store on every arm that
+    /// is not `DirectRest`.
+    ToOfficial,
+    /// On to off: over to Deskwarden's own built-in direct-REST client.
+    ToBuiltIn,
+}
+
+impl BackendSwitch {
+    /// Whether taking this direction removes the stored vault key from the
+    /// PC.
+    ///
+    /// Only one of the two does, and that is not a detail of the wording: the
+    /// key is a non-expiring wrapped master key, so "it is deleted" is the
+    /// reassurance a user needs going one way and a claim that would be
+    /// simply false going the other.
+    fn deletes_the_stored_vault_key(self) -> bool {
+        matches!(self, Self::ToOfficial)
+    }
+}
+
+/// What a click on the backend pill is proposing, or `None` where it is
+/// proposing nothing.
+///
+/// **A pure function of the two values, decided away from the frame.** The
+/// question "does this need confirming, and what does it cost" is the whole
+/// of this feature, and it is answered here so the tests can put it under
+/// oath without a window, a server or a vault -- the same separation
+/// [`official_crypto_description`] keeps for the copy under the row.
+///
+/// `None` for a frame where the row handed back what it was given, which is
+/// every frame nobody clicked and every click on the ghosted row: a
+/// confirmation that could be raised without a flip would ask the user about
+/// a change that is not being made.
+fn backend_switch(stored: bool, clicked: bool) -> Option<BackendSwitch> {
+    match (stored, clicked) {
+        (false, true) => Some(BackendSwitch::ToOfficial),
+        (true, false) => Some(BackendSwitch::ToBuiltIn),
+        _ => None,
+    }
+}
+
+const BACKEND_SWITCH_CONFIRM_BUTTON: &str = "Switch it";
+const BACKEND_SWITCH_CANCEL_BUTTON: &str = "Leave it";
+
+/// What the owner is asked before the backend moves.
+///
+/// [`revoke_prompt`]'s rule on the other control that costs something: it
+/// names the consequence rather than asking "are you sure". Three facts, and
+/// the third only where it is true:
+///
+///  * **the app has to be restarted.** The choice is captured once, by
+///    `main`'s `BackendSettlement`, and never re-read -- so the click changes
+///    nothing this session, and a user who is not told that clicks it again;
+///  * **you have to sign in again.** Either direction re-derives the vault
+///    key from the master password. A login prompt nobody was warned about
+///    reads as a fault;
+///  * **and, going back to `bw` only, the stored vault key is deleted from
+///    this PC.** That is the good news of that direction and the reason it
+///    cannot be worded generically: said in both, it would be a lie in one;
+///    left out of both, the user cannot tell whether turning this back on
+///    undoes what turning it off did.
+///
+/// **It does not promise a relaunch.** Nothing in this program restarts it --
+/// there is no `current_exe` respawn anywhere -- so the sentence asks the
+/// user to close and reopen Deskwarden themselves. A confirmation whose Yes
+/// implied a restart that never came would be the worst of the three
+/// possible wordings.
+fn backend_switch_prompt(switch: BackendSwitch) -> &'static str {
+    if switch.deletes_the_stored_vault_key() {
+        "Switch back to the official Bitwarden CLI? It does not take effect until Deskwarden is \
+         restarted -- close it and open it again yourself -- and you will have to sign in again \
+         when it comes back. This also deletes the vault key stored on this PC, so nothing is \
+         left behind by the switch."
+    } else {
+        "Switch to Deskwarden's built-in client? It does not take effect until Deskwarden is \
+         restarted -- close it and open it again yourself -- and you will have to sign in again \
+         when it comes back."
+    }
+}
+
+/// The question, under the row that raised it.
+///
+/// Shaped exactly like [`key_row`]'s pending half -- the prompt in
+/// [`theme::ERROR`], then the two buttons side by side -- because this window
+/// now asks twice and two confirmations that looked different would read as
+/// two different kinds of question.
+fn backend_switch_row(ui: &mut Ui, switch: BackendSwitch) -> Option<RowAction> {
+    let mut action = None;
+    card_row(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+        ui.label(RichText::new(backend_switch_prompt(switch)).size(12.0).color(theme::ERROR));
+        ui.horizontal(|ui| {
+            if key_button(ui, BACKEND_SWITCH_CONFIRM_BUTTON, REVOKE_BUTTON_WIDTH) {
+                action = Some(RowAction::Confirm);
+            }
+            if key_button(ui, BACKEND_SWITCH_CANCEL_BUTTON, REVOKE_BUTTON_WIDTH) {
+                action = Some(RowAction::Cancel);
+            }
+        });
+    });
+    action
+}
+
+/// **Which backend holds the vault, and whether it is kept warm.**
+///
+/// The parent is `use_official_bw_crypto`: on -- the shipped default -- the
+/// vault goes through the official `bw` CLI, and off it goes through
+/// Deskwarden's own built-in client. The child is `keep_backend_running`,
+/// which is a trade about the `bw serve` subprocess and therefore means
+/// nothing when there is no subprocess.
+///
+/// # Both gates are `backend_policy`'s, never re-decided here
+///
+/// The parent is available only where the choice can actually take effect:
+/// [`account_is_self_hosted`], which reaches
+/// [`crate::backend_policy::is_self_hosted`]. The owner's rule is that the
+/// built-in client is a thing to point at your own server and not at somebody
+/// else's service, and a switch that flips while
+/// [`crate::backend_policy::choose`] goes on answering `BwServe` is a switch
+/// that lies.
+///
+/// The child is gated on [`crate::backend_policy::choose`] itself, over the
+/// account's server and the **live** value of the parent -- so the two rows
+/// agree within one frame rather than one restart, and there is no second
+/// copy here of what "which backend" means.
+///
+/// Both use [`child_toggle_row`] rather than hiding: a row that vanishes is a
+/// row a user cannot find out about, and the returned value is the stored one
+/// unchanged, so a click on a configuration this app cannot serve writes
+/// nothing.
+fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
+    card(ui, |ui| {
+        // Read once and shared by both rows: two calls could answer
+        // differently mid-frame -- the status arrives on a worker thread --
+        // and a parent that says "self-hosted" over a child that says
+        // otherwise is the disagreement this card was rebuilt to remove.
+        let status = (state.account_source)();
+        let self_hosted = account_is_self_hosted(status.clone());
+        // **The pill paints the stored value, including while the question
+        // is up.** The owner's rule for a declined switch is that the toggle
+        // visibly stays where it was, and the way to be sure of that is never
+        // to have moved it: the click is a proposal, and nothing but
+        // `Confirm` below writes the field.
+        let stored = state.settings.use_official_bw_crypto;
+        let clicked = child_toggle_row(
+            ui,
+            OFFICIAL_CRYPTO_LABEL,
+            official_crypto_description(self_hosted),
+            stored,
+            self_hosted,
+        );
+        if let Some(switch) = backend_switch(stored, clicked) {
+            state.pending_backend_switch = Some(switch);
+        }
+        if let Some(switch) = state.pending_backend_switch {
+            row_separator(ui);
+            match backend_switch_row(ui, switch) {
+                Some(RowAction::Confirm) => {
+                    // Cleared on BOTH arms, and that is the bug the revoke
+                    // confirmation shipped with for a while: an answer that
+                    // left `pending` set would leave the question on screen
+                    // and make the buttons inert, which is a confirmation the
+                    // owner cannot get out of.
+                    state.pending_backend_switch = None;
+                    // Spelled out rather than reusing
+                    // `deletes_the_stored_vault_key`, which happens to be
+                    // true on the same arm: two facts that coincide today are
+                    // two facts, and collapsing them is how one of them gets
+                    // changed by an edit to the other.
+                    state.settings.use_official_bw_crypto =
+                        matches!(switch, BackendSwitch::ToOfficial);
+                }
+                Some(RowAction::Cancel) => state.pending_backend_switch = None,
+                Some(RowAction::Ask) | None => {}
+            }
+        }
+        row_separator(ui);
+        let server = match &status {
+            Some(AccountStatus::SignedIn { server, .. }) => server.as_deref(),
+            _ => None,
+        };
+        let bw_selected = matches!(
+            crate::backend_policy::choose(server, state.settings.use_official_bw_crypto),
+            crate::backend_policy::VaultBackendChoice::BwServe
+        );
+        state.settings.keep_backend_running = child_toggle_row(
+            ui,
+            BACKEND_LABEL,
+            backend_description(bw_selected),
+            state.settings.keep_backend_running,
+            bw_selected,
+        );
+    });
+}
+
+/// **The encrypted copy on this PC, and whether reads consult it.**
+///
+/// Deliberately its own card rather than two more rows under the backend
+/// pair: these two are about what is written to the user's disk, and the two
+/// above are about which process is running. A single card of four rows would
+/// read as one group with one rule, which they are not.
+///
+/// **Not two independent switches, and the card must not imply they are.**
+/// [`crate::backend_policy::read_path`] answers `ServiceOnly` whenever
+/// `cache_vault_to_disk` is off, whatever `read_through_cache` says -- the
+/// first is a veto over the second. So the second is a [`child_toggle_row`]
+/// of the first: ghosted when there is no copy to read, saying so in the row,
+/// and handing back the stored value unchanged.
+///
+/// The parent has a gate of its own that is not the child's: Windows Hello.
+/// The file is encrypted with a key Hello keeps in this PC's TPM, and without
+/// Hello there is no such key -- so the row is ghosted with the reason in it
+/// rather than silently downgraded to something weaker under the same label.
+fn draw_disk_cache_card(ui: &mut Ui, state: &mut PrefsState) {
+    card(ui, |ui| {
+        let hello_available = (state.hello_available)();
+        state.settings.cache_vault_to_disk = child_toggle_row(
+            ui,
+            DISK_CACHE_LABEL,
+            disk_cache_description(hello_available),
+            state.settings.cache_vault_to_disk,
+            hello_available,
+        );
+        row_separator(ui);
+        // The child of the row above: with no copy permitted there is nothing
+        // to read. Ghosted rather than hidden, for `child_toggle_row`'s usual
+        // reason -- a row that vanishes is a row a user cannot find out about.
+        state.settings.read_through_cache = child_toggle_row(
+            ui,
+            READ_THROUGH_LABEL,
+            read_through_description(state.settings.cache_vault_to_disk),
+            state.settings.read_through_cache,
+            state.settings.cache_vault_to_disk,
+        );
+    });
+}
+
+/// Where the vault is served from, then what is kept of it on this PC.
+///
+/// **No scroll region, and that is a measurement rather than an opinion.**
+/// This page had one while the key list was on it, because that list has no
+/// upper bound. Four rows of long copy do not: the worst combination of
+/// descriptions this page can paint -- the three-paragraph crypto copy over
+/// the Windows Hello explanation -- ends 180 points above the fold of a body
+/// that is a fixed 740. See
+/// `the_whole_vault_page_is_readable_without_scrolling`, which drives all
+/// four combinations and would fail before a user found a row they could not
+/// reach.
+///
+/// So it follows the same rule as every other fixed page here: a scroll
+/// region on content that fits reserves a lane for a bar that can never be
+/// needed, and this file's bars are `AlwaysVisible` -- one here would be a
+/// permanent bar on a page that never moves.
+fn draw_vault(ui: &mut Ui, state: &mut PrefsState) {
+    vault_cards(ui, state);
+}
+
+/// The Vault page's cards, in reading order.
+///
+/// Kept as its own function, though it is now two calls: it is the seam the
+/// scroll-region question is asked at, and inlining it would put the answer
+/// back in `draw_section`'s match arm where nothing can document it.
+fn vault_cards(ui: &mut Ui, state: &mut PrefsState) {
+    draw_backend_card(ui, state);
+    draw_disk_cache_card(ui, state);
+}
+
+/// **The one page in this window that scrolls**, and it is not a precaution:
+/// the key list has no upper bound. Every other page here is a fixed set of
+/// rows that fits the fixed window by construction, so a scroll region on
+/// them would reserve a lane for a bar that can never be needed. Ten keys on
+/// this one runs off the bottom of a window that cannot be resized, and a
+/// revoke button below the fold is a revoke button that does not exist.
+///
+/// **This is the half of the split that had to keep the region.** The Vault
+/// page's was there for this list; with the list gone, its remaining four
+/// rows fit -- see [`draw_vault`].
+///
+/// Always visible, for `draw_notes`'s reason exactly: content clipped with no
+/// bar reads as content that failed to load, and a bar whose lane comes and
+/// goes with the content makes the cards change width as keys are minted.
+///
+/// The `id_salt` is the one this region has always had. It is the same
+/// region, moved with the content it was made for, and an id is what egui
+/// keeps the scroll offset under -- changing it here would be a new region
+/// wearing the old one's job for no reason.
+fn draw_api(ui: &mut Ui, state: &mut PrefsState) {
+    egui::ScrollArea::vertical()
+        .id_salt("prefs-vault-service")
+        .auto_shrink([false, false])
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = Vec2::new(0.0, CONTENT_GAP);
+            api_cards(ui, state);
+        });
+}
+
+/// The page's cards, in reading order.
+///
+/// **The unbounded list is last.** Every card above it is fixed-height and
+/// all of them are more urgent than the eleventh key; putting the list above
+/// them would push the mint button off the bottom of a page whose length the
+/// owner does not control.
+///
+/// **The switch is first**, because a key is meaningless while nothing is
+/// listening: a reader who mints one without having seen the switch has
+/// bought a credential for a door that does not exist.
+fn api_cards(ui: &mut Ui, state: &mut PrefsState) {
+    card(ui, |ui| {
+        state.settings.service_enabled = toggle_row(
+            ui,
+            SERVICE_LABEL,
+            service_description(state.settings.service_enabled),
+            state.settings.service_enabled,
+        );
+    });
+
+    draw_minted_key(ui, state);
+    draw_mint_form(ui, state);
+
+    card(ui, |ui| {
+        card_row(ui, |ui| {
+            ui.label(RichText::new(KEYS_SECTION_LABEL).size(13.0).color(theme::INK));
+        });
+        if state.keys.is_empty() {
+            row_separator(ui);
+            card_row(ui, |ui| {
+                ui.label(RichText::new(KEYS_NONE).size(12.0).color(theme::TEXT_FAINT));
+            });
+            return;
+        }
+        let now = (state.key_clock)();
+        // Collected before the loop: the rows borrow `state.keys`, and what
+        // a click on one of them changes is `state`.
+        let mut asked = None;
+        let mut confirmed = None;
+        let mut cancelled = false;
+        for record in &state.keys {
+            row_separator(ui);
+            let pending = state.pending_revoke.as_deref() == Some(record.name.as_str());
+            match key_row(ui, record, now, pending) {
+                Some(RowAction::Ask) => asked = Some(record.name.clone()),
+                Some(RowAction::Confirm) => confirmed = Some(record.name.clone()),
+                // **A flag, not `asked = None`.** Setting the local back to
+                // `None` leaves `pending_revoke` exactly where it was, so the
+                // question stays up and Keep it does nothing -- which is a
+                // confirmation the owner cannot get out of, on the one
+                // control here that cannot be undone. The test that drives
+                // Keep it is what found this.
+                Some(RowAction::Cancel) => cancelled = true,
+                None => {}
+            }
+        }
+        if let Some(name) = asked {
+            state.pending_revoke = Some(name);
+        }
+        if cancelled {
+            state.pending_revoke = None;
+        }
+        if let Some(name) = confirmed {
+            state.pending_revoke = None;
+            if crate::service_keys::revoke(&mut state.keys, &name) {
+                let sink = state.keys_sink;
+            if let Err(error) = sink(&state.keys) {
+                    state.key_message = Some(format!("{REVOKE_NOT_SAVED}{error}"));
+                } else {
+                    state.key_message = None;
+                }
+            }
+        }
+    });
+}
+
+/// What a key's row reported this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    /// Revoke was pressed: ask before doing anything.
+    Ask,
+    Confirm,
+    Cancel,
+}
+
+/// One stored key: its name, when it was made, when it dies, and what it
+/// opens -- and **never the key**, because the store holds only a hash and
+/// there is nothing else that could be shown.
+fn key_row(ui: &mut Ui, record: &KeyRecord, now_unix: u64, pending: bool) -> Option<RowAction> {
+    let mut action = None;
+    card_row(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+        ui.label(theme::semibold(&record.name, 14.0).color(theme::INK));
+        let when = key_when_wording(record, now_unix, &crate::local_time::SystemZone);
+        // An expired key is not an ordinary row and is not painted like one:
+        // `ERROR` is what this app uses for "something is wrong" everywhere
+        // else, and a key the service already refuses is a script that has
+        // already stopped working.
+        let expired = record.expires_unix.is_some_and(|at| at <= now_unix);
+        ui.label(
+            RichText::new(when)
+                .size(12.0)
+                .color(if expired { theme::ERROR } else { theme::TEXT_FAINT }),
+        );
+        ui.label(
+            RichText::new(scopes_wording(&record.scopes)).size(12.0).color(theme::TEXT_FAINT),
+        );
+        if pending {
+            ui.label(RichText::new(revoke_prompt(&record.name)).size(12.0).color(theme::ERROR));
+            ui.horizontal(|ui| {
+                if key_button(ui, REVOKE_CONFIRM_BUTTON, REVOKE_BUTTON_WIDTH) {
+                    action = Some(RowAction::Confirm);
+                }
+                if key_button(ui, REVOKE_CANCEL_BUTTON, REVOKE_BUTTON_WIDTH) {
+                    action = Some(RowAction::Cancel);
+                }
+            });
+        } else if key_button(ui, REVOKE_BUTTON, REVOKE_BUTTON_WIDTH) {
+            action = Some(RowAction::Ask);
+        }
+    });
+    action
+}
+
+/// The just-minted key, or nothing.
+fn draw_minted_key(ui: &mut Ui, state: &mut PrefsState) {
+    // Taken out and put back, so the card can be drawn from a borrow while
+    // the buttons under it decide whether the state keeps it.
+    let mut reveal = state.minted.take();
+    let mut copy = false;
+    let mut done = false;
+    if let Some(minted) = reveal.as_ref() {
+        card(ui, |ui| {
+            card_row(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+                ui.label(theme::semibold(REVEAL_LABEL, 14.0).color(theme::INK));
+                ui.label(RichText::new(&minted.name).size(12.0).color(theme::TEXT_FAINT));
+                ui.label(RichText::new(REVEAL_NOTE).size(12.0).color(theme::ERROR));
+            });
+            row_separator(ui);
+            card_row(ui, |ui| {
+                // Monospace, and painted in full: this is a 64-character hex
+                // string somebody is about to compare by eye or select with a
+                // mouse, and an elided one is a key they cannot use.
+                ui.label(
+                    RichText::new(minted.secret.as_str())
+                        .size(12.0)
+                        .family(FontFamily::Monospace)
+                        .color(theme::INK),
+                );
+            });
+            row_separator(ui);
+            card_row(ui, |ui| {
+                ui.horizontal(|ui| {
+                    copy = key_button(ui, COPY_BUTTON, COPY_BUTTON_WIDTH);
+                    done = key_button(ui, DONE_BUTTON, COPY_BUTTON_WIDTH);
+                });
+            });
+        });
+        if copy {
+            (state.key_copy)(minted.secret.as_str());
+        }
+    }
+    if done {
+        // Dropped here, and `Zeroizing` wipes it on the way out.
+        reveal = None;
+    }
+    state.minted = reveal;
+}
+
+/// The form that makes a key, and the one button in this app that does.
+fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
+    let mut mint = false;
+    card(ui, |ui| {
+        card_row(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+            ui.label(RichText::new(MINT_SECTION_LABEL).size(13.0).color(theme::INK));
+            ui.label(
+                RichText::new(MINT_SECTION_DESCRIPTION).size(12.0).color(theme::TEXT_FAINT),
+            );
+        });
+
+        row_separator(ui);
+        control_row(ui, NAME_LABEL, NAME_DESCRIPTION, |ui| {
+            form_field(ui, NAME_FIELD_ID, &mut state.key_form.name, NAME_FIELD_WIDTH);
+        });
+
+        row_separator(ui);
+        control_row(ui, EXPIRY_LABEL, EXPIRY_DESCRIPTION, |ui| {
+            form_field(ui, EXPIRY_FIELD_ID, &mut state.key_form.expiry_days, EXPIRY_FIELD_WIDTH);
+        });
+
+        row_separator(ui);
+        card_row(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+            ui.label(theme::semibold(SUBJECT_LABEL, 14.0).color(theme::INK));
+            ui.horizontal_wrapped(|ui| {
+                let all = state.key_form.subject == SubjectChoice::Everything;
+                if choice_button(ui, EVERYTHING_CHOICE, all) {
+                    state.key_form.subject = SubjectChoice::Everything;
+                }
+                for kind in KEY_CATEGORIES {
+                    let chosen = state.key_form.subject == SubjectChoice::Category(kind);
+                    if choice_button(ui, &kind.label(), chosen) {
+                        state.key_form.subject = SubjectChoice::Category(kind);
+                    }
+                }
+                let one = state.key_form.subject == SubjectChoice::OneItem;
+                if choice_button(ui, ONE_ITEM_CHOICE, one) {
+                    state.key_form.subject = SubjectChoice::OneItem;
+                }
+            });
+        });
+
+        if state.key_form.subject == SubjectChoice::OneItem {
+            row_separator(ui);
+            control_row(ui, ITEM_ID_LABEL, ITEM_ID_DESCRIPTION, |ui| {
+                form_field(ui, ITEM_FIELD_ID, &mut state.key_form.item_id, NAME_FIELD_WIDTH);
+            });
+        }
+
+        row_separator(ui);
+        card_row(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+            ui.label(theme::semibold(ACCESS_LABEL, 14.0).color(theme::INK));
+            ui.horizontal(|ui| {
+                if choice_button(ui, READ_CHOICE, state.key_form.read) {
+                    state.key_form.read = !state.key_form.read;
+                }
+                if choice_button(ui, WRITE_CHOICE, state.key_form.write) {
+                    state.key_form.write = !state.key_form.write;
+                }
+            });
+        });
+
+        row_separator(ui);
+        card_row(ui, |ui| {
+            mint = key_button(ui, MINT_BUTTON, MINT_BUTTON_WIDTH);
+        });
+
+        if let Some(message) = &state.key_message {
+            row_separator(ui);
+            card_row(ui, |ui| {
+                ui.label(RichText::new(message).size(12.0).color(theme::ERROR));
+            });
+        }
+    });
+
+    if !mint {
+        return;
+    }
+    match attempt_mint(&state.key_form, (state.key_clock)(), state.key_random, &state.keys) {
+        MintOutcome::Refused(message) => {
+            // **Nothing else moves.** The form keeps everything that was
+            // typed into it, so a refused name is one edit away from a good
+            // one rather than a form to fill in again.
+            state.key_message = Some(message);
+        }
+        MintOutcome::Minted(record, minted) => {
+            state.keys.push(record);
+            let sink = state.keys_sink;
+            state.key_message = match sink(&state.keys) {
+                Ok(()) => None,
+                Err(error) => Some(format!("{MINT_NOT_SAVED}{error}")),
+            };
+            // The plaintext goes here and nowhere else. It is not logged, not
+            // put on the record, and not written to the store.
+            state.minted = Some(minted);
+            state.key_form = KeyForm::default();
+        }
+    }
+}
+
+/// A single-line text box in the trailing control column.
+///
+/// A stable `id` for [`STEPPER_FIELD_ID`]'s reason: focus and the caret live
+/// in egui's memory under the widget's id, and an id derived from layout
+/// position is lost the moment a row above changes height -- which on this
+/// page happens whenever the item-id row appears.
+fn form_field(ui: &mut Ui, id: &str, buffer: &mut String, width: f32) {
+    let (outer, _) = ui.allocate_exact_size(Vec2::new(width, STEPPER_HEIGHT), Sense::hover());
+    ui.painter().rect(
+        outer,
+        CornerRadius::same(STEPPER_RADIUS),
+        theme::CARD,
+        Stroke::new(1.0, theme::BORDER_STRONG),
+        StrokeKind::Inside,
+    );
+    ui.put(
+        outer.shrink(5.0),
+        egui::TextEdit::singleline(buffer)
+            .id(egui::Id::new(id))
+            .frame(egui::Frame::new())
+            .font(FontId::new(12.0, FontFamily::Proportional))
+            .vertical_align(egui::Align::Center)
+            .margin(Margin::ZERO),
+    );
+}
+
+/// One cell of a picker: [`key_button`]'s box, filled when it is the choice
+/// in force.
+///
+/// Selected state is the nav's own language (`BLUE_WASH` behind
+/// `BLUE_DEEP`), rather than a new colour, so "this is the one that is on"
+/// looks the same here as it does in the column to the left.
+fn choice_button(ui: &mut Ui, label: &str, selected: bool) -> bool {
+    let galley_width = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
+            theme::INK,
+        )
+        .size()
+        .x;
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(galley_width + CHOICE_PADDING, STEPPER_HEIGHT),
+        Sense::click(),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let (fill, ink) = if selected {
+        (theme::BLUE_WASH, theme::BLUE_DEEP)
+    } else if response.hovered() {
+        (theme::CANVAS, theme::TEXT_SECONDARY)
+    } else {
+        (theme::CARD, theme::TEXT_SECONDARY)
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(STEPPER_RADIUS),
+        fill,
+        Stroke::new(1.0, if selected { theme::BLUE_EDGE } else { theme::BORDER_STRONG }),
+        StrokeKind::Inside,
+    );
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
+        ink,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        ink,
+    );
+    response.clicked()
+}
+
+/// This page's button: [`scan_button`]'s box at a width its own label needs.
+///
+/// A separate function rather than a parameter on `scan_button`, because that
+/// one carries an `enabled` state this page has no use for -- every button
+/// here is live whenever it is drawn, and the states that would grey one out
+/// (a form that cannot mint) are said in words instead.
+fn key_button(ui: &mut Ui, label: &str, width: f32) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, STEPPER_HEIGHT), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(STEPPER_RADIUS),
+        if response.hovered() { theme::CANVAS } else { theme::CARD },
+        Stroke::new(1.0, theme::BORDER_STRONG),
+        StrokeKind::Inside,
+    );
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
+        theme::TEXT_SECONDARY,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        theme::TEXT_SECONDARY,
+    );
+    response.clicked()
 }
 
 fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
@@ -3295,94 +4721,46 @@ fn update_button(ui: &mut Ui, label: &str, enabled: bool) -> bool {
 /// copy of 3e's controls: all three look like a feature that is present and
 /// broken. A sentence saying what governs the behaviour today, and where it is
 /// set if it is set anywhere, is the whole content.
-/// **Sync & account**: which backend fetches this account's vault.
+/// **Sync & account**: what this page can still answer.
 ///
-/// # Why here and not on General, beside the backend row
+/// # The backend rows are not here any more
 ///
-/// It was written for General. That page's card is one row from its ceiling:
-/// the window is a fixed 780 points with no page-level scroll region, and an
-/// eighth row -- with the three paragraphs this setting's copy has to carry --
-/// pushes the auto-lock row off the bottom. Measured, not guessed: with the
-/// row there, `general_paints_every_setting_that_actually_exists` stopped
-/// finding "Lock the vault after" at all.
+/// They were written for General, moved here when General's card ran out of
+/// height, and have now moved once more -- to [`Section::Vault`], with the
+/// disk-cache pair and the service switch. The reason is not that this page
+/// was the wrong home for "which backend fetches this account's vault"; it
+/// reads perfectly well under a subtitle about the account this vault comes
+/// from. It is that *four* settings decided how the vault is served and they
+/// were on three pages, which is how the owner came to turn
+/// `keep_backend_running` off from a page that gave no sign the vault window
+/// -- the window Preferences itself lives inside -- would then fail to open.
 ///
-/// A row nobody can scroll to is worse than a row on the next page along, and
-/// this page is the one the setting is actually about --
-/// [`Section::SyncAndAccount`]'s own subtitle, unchanged, is "The Bitwarden
-/// account this vault comes from", which is the question this row answers.
-/// The old placeholder said signing in and syncing are done from the vault
-/// window, which is still true and is not a setting.
+/// A setting is easiest to reason about beside the settings it interacts
+/// with, and `keep_backend_running` interacts with the backend choice, the
+/// disk cache and the service. It interacts with nothing else on this page.
+/// See [`Section::Vault`].
 ///
-/// # What the row is
-///
-/// [`child_toggle_row`], the same control the disk-cache row uses, for the
-/// same reason: the owner's rule is that the setting is unavailable off a
-/// self-hosted server ("to avoid issues with Bitwarden"), and a row that
-/// *vanishes* is a row a user cannot find out about. Ghosted, it says what
-/// would make it available, and it hands back the stored value unchanged --
-/// so a click on a server this backend cannot serve cannot select it.
-///
-/// # It takes effect on restart, and the copy says so
-///
-/// A live switch would have to stop `bw serve`, clear
-/// [`crate::vault_cache::VaultCache`] *and* the encrypted disk copy -- which
-/// is fingerprinted per account and **not** per backend, so the file the old
-/// backend wrote is a file the new one would happily adopt -- and then derive
-/// a master key this process may not hold, from a master-password prompt
-/// raised over whatever window the user opened Preferences from. Four
-/// irreversible steps and a prompt, to save a relaunch.
-///
-/// So `main` reads `use_official_bw_crypto` once, at startup, and keeps that
-/// value for the life of the process (`BackendSettlement`) -- including across
-/// an account switch, which re-runs the *choice* but not the *setting*.
-/// Nothing re-reads the field, which is why the sentence in
-/// [`official_crypto_description`] is true rather than aspirational.
-fn draw_sync_and_account(ui: &mut Ui, state: &mut PrefsState) {
+/// What is left is the sentence this page carried before the backend rows
+/// arrived, and it is still the honest answer to the question the nav row
+/// asks: signing in and syncing are not settings.
+fn draw_sync_and_account(ui: &mut Ui) {
     card(ui, |ui| {
-        // Read once and shared by both rows: two calls could answer
-        // differently mid-frame -- the status arrives on a worker thread --
-        // and a parent that says "self-hosted" over a child that says
-        // otherwise is the disagreement this card was rebuilt to remove.
-        let status = (state.account_source)();
-        let self_hosted = account_is_self_hosted(status.clone());
-        state.settings.use_official_bw_crypto = child_toggle_row(
-            ui,
-            OFFICIAL_CRYPTO_LABEL,
-            official_crypto_description(self_hosted),
-            state.settings.use_official_bw_crypto,
-            self_hosted,
-        );
-        row_separator(ui);
-        // The child of the row above, and the reason it is on this page at
-        // all -- see [`backend_description`]. The gate is `backend_policy`'s
-        // own decision function over the LIVE value of that toggle, so the
-        // two rows agree within one frame rather than one restart, and there
-        // is no second copy here of what "which backend" means.
-        let server = match &status {
-            Some(AccountStatus::SignedIn { server, .. }) => server.as_deref(),
-            _ => None,
-        };
-        let bw_selected = matches!(
-            crate::backend_policy::choose(server, state.settings.use_official_bw_crypto),
-            crate::backend_policy::VaultBackendChoice::BwServe
-        );
-        state.settings.keep_backend_running = child_toggle_row(
-            ui,
-            BACKEND_LABEL,
-            backend_description(bw_selected),
-            state.settings.keep_backend_running,
-            bw_selected,
-        );
-        row_separator(ui);
-        // The placeholder's sentence, kept as a row rather than deleted: it is
-        // still the answer to "where do I sign in and sync from", and this
-        // page is still where somebody looks for it.
         card_row(ui, |ui| {
             row_text(
                 ui,
                 "Signing in, syncing and locking",
                 "All three are done from the vault window and from the tray, not from here.",
             );
+        });
+        row_separator(ui);
+        // **Names the page the settings went to.** A user who last saw the
+        // backend switch here and finds it gone has to be told where, in the
+        // place they are looking -- the alternative is that they conclude the
+        // setting was removed. `Section::Vault::label` rather than the word,
+        // so a later rename cannot leave this pointing at a page that is not
+        // called that any more.
+        card_row(ui, |ui| {
+            row_text(ui, SYNC_MOVED_LABEL, SYNC_MOVED_NOTE);
         });
     });
 }
@@ -3828,6 +5206,33 @@ mod tests {
                 .count()
         }
 
+        /// The fill colour of every toggle pill, top to bottom.
+        ///
+        /// **The only way to read a pill's state from outside the widget.**
+        /// [`theme::toggle_pill`] paints its track `theme::BLUE` when on and
+        /// `theme::TOGGLE_OFF` when off, and nothing else on this window
+        /// paints a 40x22 rectangle -- so the colour at index *n* is the
+        /// state of the *n*th row's switch. Needed because the one guarantee
+        /// worth pinning about the backend row is which way round it is, and
+        /// a test that read only the settings field would pass a row that
+        /// painted every value backwards.
+        ///
+        /// Ordered by painted y, exactly as [`Self::rects_of_size`] is and
+        /// for the same reason.
+        fn pill_fills(&self) -> Vec<egui::Color32> {
+            let mut found: Vec<(f32, egui::Color32)> = self
+                .rects
+                .iter()
+                .filter(|r| {
+                    (r.rect.width() - TOGGLE_SIZE.x).abs() < 0.5
+                        && (r.rect.height() - TOGGLE_SIZE.y).abs() < 0.5
+                })
+                .map(|r| (r.rect.top(), r.fill))
+                .collect();
+            found.sort_by(|a, b| a.0.total_cmp(&b.0));
+            found.into_iter().map(|(_, fill)| fill).collect()
+        }
+
         /// Every rectangle of exactly this size, top to bottom -- how a
         /// control that paints no text of its own (the toggle pill) is
         /// located now that the General card holds two of them.
@@ -4191,9 +5596,903 @@ mod tests {
         assert!(hits.is_empty(), "{hits:#?}");
     }
 
+    // -- the local API, and the keys that open it --------------------------
+
+    /// A viewport tall enough for the whole of either scrolling page.
+    ///
+    /// Both scroll in the real window (see [`draw_api`] and [`draw_vault`]),
+    /// and
+    /// a `ScrollArea` **culls what is outside its viewport** -- so a test
+    /// reading `BODY_SIZE` would find the mint button missing and could not
+    /// tell that from a mint button that was never drawn. Height only:
+    /// `paint_section_at`'s argument in the other axis, for the same reason
+    /// it exists there.
+    const TALL_BODY: Vec2 = Vec2::new(WINDOW_SIZE[0], 1600.0);
+
+    /// The instant every test on this page is answered against. A round
+    /// number in 2023, and a *parameter* rather than the clock, because
+    /// expiry is the one thing on this page that changes with no input.
+    const TEST_NOW: u64 = 1_700_000_000;
+
+    /// The 32 bytes every minted key in these tests is made of, and the hex
+    /// they come out as. Fixed, because a test that cannot say what key was
+    /// made cannot check that the key on screen is not the one in the record.
+    const TEST_KEY_BYTES: [u8; 32] = [0xab; 32];
+    const TEST_KEY: &str =
+        "abababababababababababababababababababababababababababababababab";
+
+    /// Where the one test that clicks Copy puts the key, instead of on the
+    /// clipboard.
+    ///
+    /// A `static` because the sink is a `fn` pointer with nothing to capture
+    /// -- and **exactly one test writes it**, deliberately: the suite runs in
+    /// parallel and a second test reading this would be reading whatever the
+    /// first had just put there. Everything else on this page is driven
+    /// through values.
+    static COPIED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    fn tall_input(events: &[egui::Event]) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, TALL_BODY)),
+            events: events.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// A Local API page with every seam pointed at a value: a fixed clock,
+    /// fixed randomness, a store that writes nowhere, and a clipboard that is
+    /// not the clipboard.
+    fn api_state() -> PrefsState {
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Api;
+        state.show_key_clock(|| TEST_NOW);
+        state.show_key_random(|| TEST_KEY_BYTES);
+        state
+    }
+
+    fn tall_frame(
+        ctx: &egui::Context,
+        state: &mut PrefsState,
+        events: &[egui::Event],
+    ) -> Painted {
+        let output = ctx.run_ui(tall_input(events), |ui| draw_prefs_body(ui, state));
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    /// A click, and then the frame that draws what it did.
+    ///
+    /// **Two frames, not one, and that is not a formality.** Every button on
+    /// this page is read at the point it is drawn and acted on afterwards --
+    /// the reveal card is above the form whose button makes it, and a row's
+    /// revoke question is decided after the row has been laid out. So the
+    /// frame a click is *reported* on still shows the page as it was before
+    /// it. A test that asserted on the click frame would be reading the old
+    /// screen, which is the same shape of mistake
+    /// `no_id_diagnostic_while_the_nav_rows_are_clicked_through` documents
+    /// for the nav.
+    fn tall_click(ctx: &egui::Context, state: &mut PrefsState, pos: Pos2) -> Painted {
+        let _ = tall_frame(ctx, state, &click(pos));
+        tall_frame(ctx, state, &[])
+    }
+
+    /// A context whose fonts are live, sized for the tall viewport.
+    fn tall_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(tall_input(&[]), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(tall_input(&[]), |_ui| {});
+        ctx
+    }
+
+    /// One stored key, so the list has something in it.
+    fn stored_key(name: &str, expires_unix: Option<u64>) -> KeyRecord {
+        KeyRecord {
+            name: name.to_string(),
+            hash: crate::service_keys::hash_key(TEST_KEY),
+            created_unix: TEST_NOW - 86_400,
+            expires_unix,
+            scopes: vec![Scope { subject: Subject::All, access: Access::Read }],
+        }
+    }
+
+    /// **The copy is the requirement here, not a detail of the page.**
+    ///
+    /// Off is the default, and a person who turns this on has decided to put
+    /// a door into their vault. The sentence they read while deciding is this
+    /// one, so a future edit that quietly drops the uncomfortable half of it
+    /// fails a test rather than shipping -- `disk_cache_description`'s rule,
+    /// on the row with more at stake.
+    #[test]
+    fn the_off_copy_says_what_turning_it_on_would_do() {
+        let text = service_description(false);
+        assert!(text.contains("default"), "the copy stopped saying off is the default");
+        assert!(
+            text.contains("127.0.0.1"),
+            "the copy does not say an HTTP endpoint appears: {text}"
+        );
+        assert!(
+            text.contains("usernames, passwords, notes and two-factor secrets"),
+            "the copy names what is served with a euphemism: {text}"
+        );
+        assert!(
+            text.contains("any program on this PC"),
+            "the copy does not say who can use it, and \"local\" reads as \"only me\": {text}"
+        );
+        assert!(
+            text.contains("master password"),
+            "the copy does not say a key is the whole credential: {text}"
+        );
+        // The control: the two states are not the same sentence with a word
+        // changed, so asserting on the off one is asserting on something.
+        assert_ne!(text, service_description(true));
+    }
+
+    /// The ON copy describes what is happening **now**, in the present tense,
+    /// and still names the reach. A person who has turned it on and come back
+    /// to check is asking "what is this doing", not "what would it do".
+    #[test]
+    fn the_on_copy_says_the_endpoint_is_live_and_who_it_answers() {
+        let text = service_description(true);
+        assert!(text.contains("listening"), "got {text}");
+        assert!(text.contains("127.0.0.1"), "got {text}");
+        assert!(
+            text.contains("usernames, passwords, notes and two-factor secrets"),
+            "got {text}"
+        );
+        assert!(text.contains("master password"), "got {text}");
+        assert!(!text.contains("Off, which is the default"), "the off copy is being shown");
+    }
+
+    /// **"Never expires" is spelled out rather than left blank.**
+    ///
+    /// A blank in an expiry column reads as "not applicable". Here it would
+    /// mean a credential that works forever, which is the one value on this
+    /// row a reader must not have to infer.
+    #[test]
+    fn a_key_with_no_expiry_says_so_out_loud() {
+        let record = stored_key("Backup", None);
+        let line = key_when_wording(&record, TEST_NOW, &zone());
+        assert!(line.contains("Never expires"), "got {line}");
+        assert!(line.contains("Created"), "the creation date went missing: {line}");
+        // The control: a key that DOES expire says something else, so the
+        // assertion above is not merely reading a constant.
+        let dated = stored_key("Backup", Some(TEST_NOW + 86_400));
+        let other = key_when_wording(&dated, TEST_NOW, &zone());
+        assert!(!other.contains("Never expires"), "got {other}");
+        assert!(other.contains("Expires"), "got {other}");
+    }
+
+    /// **Expiry is answered against the clock, and inclusively**, exactly as
+    /// `service_keys::find` answers it.
+    ///
+    /// A key whose date has arrived is already being refused by the service.
+    /// A list that showed it as an ordinary future date would be the screen
+    /// disagreeing with the door -- and the owner would spend the afternoon
+    /// debugging a script that is being turned away by a key this window
+    /// says is fine.
+    #[test]
+    fn a_key_whose_expiry_has_arrived_is_shown_as_already_refused() {
+        let expired = stored_key("Nightly", Some(TEST_NOW));
+        let line = key_when_wording(&expired, TEST_NOW, &zone());
+        assert!(line.contains("Expired"), "got {line}");
+        assert!(line.contains("already refused"), "got {line}");
+        // The control, one second the other side of the boundary: this is
+        // the exact edge `service_keys::find` treats inclusively, and a
+        // wording keyed on `<` rather than `<=` would pass every other
+        // assertion here.
+        let live = key_when_wording(&expired, TEST_NOW - 1, &zone());
+        assert!(!live.contains("Expired"), "got {live}");
+        assert!(live.contains("Expires"), "got {live}");
+    }
+
+    /// **A key with no grants is a sentence, not an empty cell.**
+    ///
+    /// `service_keys` permits an empty scope set and refuses everything it
+    /// asks for -- default deny, and a state a hand-edited file really can be
+    /// in. A blank line there would read as "unrestricted", which is the
+    /// exact opposite.
+    #[test]
+    fn a_key_with_no_scopes_says_it_is_refused_everything() {
+        let line = scopes_wording(&[]);
+        assert!(line.contains("refused everything"), "got {line}");
+        // The control: a key WITH a scope does not say that.
+        let one = scopes_wording(&[Scope { subject: Subject::All, access: Access::Read }]);
+        assert!(!one.contains("refused everything"), "got {one}");
+    }
+
+    /// Each grant reads back as what it may do and what it may do it to,
+    /// in that order -- because the access is the half that decides whether a
+    /// mistake here costs a disclosure or an edit.
+    #[test]
+    fn a_scope_reads_back_as_its_access_and_its_subject() {
+        assert_eq!(
+            scope_wording(&Scope { subject: Subject::All, access: Access::Read }),
+            "Read everything in the vault"
+        );
+        assert_eq!(
+            scope_wording(&Scope {
+                subject: Subject::Category(ItemKind::SecureNote),
+                access: Access::Write,
+            }),
+            "Write every secure note"
+        );
+        assert_eq!(
+            scope_wording(&Scope {
+                subject: Subject::Item("abc-123".to_string()),
+                access: Access::Read,
+            }),
+            "Read the item abc-123"
+        );
+    }
+
+    /// **A scope this build cannot parse is shown, and shown as granting
+    /// nothing.**
+    ///
+    /// This is what an older build reading a newer file sees, and
+    /// `service_keys` keeps the subject verbatim precisely so it survives the
+    /// round trip. A row that silently omitted it would be this screen
+    /// claiming a key is narrower than the file says -- on a build that is
+    /// merely out of date, which is the one case the owner would never
+    /// suspect.
+    #[test]
+    fn a_scope_this_build_does_not_understand_is_shown_as_permitting_nothing() {
+        let line = scope_wording(&Scope {
+            subject: Subject::Unrecognised("folder:work".to_string()),
+            access: Access::Read,
+        });
+        assert!(line.contains("folder:work"), "the scope was dropped from the list: {line}");
+        assert!(line.contains("permitting nothing"), "got {line}");
+    }
+
+    /// **The three refusals `service_keys::mint` cannot see.**
+    ///
+    /// By the time `mint` is called, a box of nonsense where a number should
+    /// be has become `None` ("never expires") and an unticked Read and Write
+    /// have become an empty scope set ("refused everything") -- both of which
+    /// are legitimate values it must accept. Here is the only place they are
+    /// still distinguishable from what the owner meant.
+    #[test]
+    fn the_form_refuses_what_mint_would_silently_accept() {
+        let base = KeyForm { name: "Backup".to_string(), ..KeyForm::default() };
+
+        let nonsense = KeyForm { expiry_days: "soon".to_string(), ..base.clone() };
+        assert_eq!(form_refusal(&nonsense), Some(EXPIRY_NOT_A_NUMBER));
+
+        let no_id = KeyForm { subject: SubjectChoice::OneItem, ..base.clone() };
+        assert_eq!(form_refusal(&no_id), Some(NO_ITEM_ID));
+
+        let no_access = KeyForm { read: false, write: false, ..base.clone() };
+        assert_eq!(form_refusal(&no_access), Some(NO_ACCESS));
+
+        // The controls, one per refusal: each is the same form with the one
+        // fault repaired, and each must pass -- otherwise the assertions
+        // above could be a function that refuses everything.
+        assert_eq!(form_refusal(&base), None, "the plain form is refused");
+        assert_eq!(
+            form_refusal(&KeyForm { expiry_days: "30".to_string(), ..base.clone() }),
+            None
+        );
+        assert_eq!(
+            form_refusal(&KeyForm {
+                subject: SubjectChoice::OneItem,
+                item_id: "abc-123".to_string(),
+                ..base.clone()
+            }),
+            None
+        );
+        assert_eq!(form_refusal(&KeyForm { read: false, write: true, ..base }), None);
+    }
+
+    /// **The form opens on Read, and only Read.**
+    ///
+    /// Both off would make the first press of Mint a refusal for a reason
+    /// nobody has been told yet. Both on would make the default key one that
+    /// can *change* the vault, which is not what this screen is reached for
+    /// -- and a default that grants more than the common case is how an
+    /// over-scoped key gets minted by someone who never read that row.
+    #[test]
+    fn a_new_form_grants_read_over_everything_and_no_write() {
+        let form = KeyForm::default();
+        assert!(form.read);
+        assert!(!form.write);
+        assert_eq!(form.subject, SubjectChoice::Everything);
+        assert_eq!(
+            form_scopes(&form),
+            vec![Scope { subject: Subject::All, access: Access::Read }]
+        );
+    }
+
+    /// Both boxes ticked make two grants over the same subject, because
+    /// `service_keys` has two flags with no hierarchy -- neither implies the
+    /// other, so neither can be left out.
+    #[test]
+    fn read_and_write_are_two_grants_and_not_one() {
+        let form = KeyForm {
+            subject: SubjectChoice::Category(ItemKind::Login),
+            write: true,
+            ..KeyForm::default()
+        };
+        assert_eq!(
+            form_scopes(&form),
+            vec![
+                Scope { subject: Subject::Category(ItemKind::Login), access: Access::Read },
+                Scope { subject: Subject::Category(ItemKind::Login), access: Access::Write },
+            ]
+        );
+        // The control: with Write alone there is exactly one grant, and it is
+        // not a Read.
+        let write_only = KeyForm { read: false, write: true, ..KeyForm::default() };
+        assert_eq!(
+            form_scopes(&write_only),
+            vec![Scope { subject: Subject::All, access: Access::Write }]
+        );
+    }
+
+    /// The days box is days, and a number too large to be days lands far in
+    /// the future rather than wrapping into the past.
+    ///
+    /// `u64::MAX` is a value that can be typed into a text box. Wrapping
+    /// arithmetic on it would produce an expiry *behind* now, which
+    /// `service_keys::mint` refuses -- so the owner would type an
+    /// unreasonably large number and be told their expiry had already passed,
+    /// which is true of the arithmetic and nonsense to the reader.
+    #[test]
+    fn an_expiry_in_days_lands_that_many_days_out_and_never_behind_now() {
+        let form = |days: &str| KeyForm { expiry_days: days.to_string(), ..KeyForm::default() };
+        assert_eq!(form_expiry(&form(""), TEST_NOW), None, "empty is no expiry");
+        assert_eq!(form_expiry(&form("30"), TEST_NOW), Some(TEST_NOW + 30 * 86_400));
+        let huge = form_expiry(&form("18446744073709551615"), TEST_NOW).unwrap();
+        assert!(huge > TEST_NOW, "a saturating expiry landed in the past: {huge}");
+    }
+
+    /// **A refusal from `service_keys` reaches the owner in its own words.**
+    ///
+    /// Those sentences are written to be acted on -- "pick another name, or
+    /// revoke that one first" -- and this screen re-wording them, or
+    /// flattening them to "could not mint a key", is how a refusal becomes an
+    /// afternoon.
+    #[test]
+    fn a_refusal_from_service_keys_is_passed_through_verbatim() {
+        let existing = vec![stored_key("Backup", None)];
+        let form = KeyForm { name: "  backup ".to_string(), ..KeyForm::default() };
+        let MintOutcome::Refused(message) =
+            attempt_mint(&form, TEST_NOW, || TEST_KEY_BYTES, &existing)
+        else {
+            panic!("a duplicate name was minted");
+        };
+        assert_eq!(
+            message,
+            crate::service_keys::MintRefusal::DuplicateName("Backup".to_string()).message(),
+            "the duplicate-name refusal was reworded on the way to the screen"
+        );
+
+        // An expiry of zero days is exactly now, which `mint` refuses -- and
+        // it is refused in ITS words, not in a second sentence written here
+        // that says the same thing differently.
+        let dead = KeyForm {
+            name: "Nightly".to_string(),
+            expiry_days: "0".to_string(),
+            ..KeyForm::default()
+        };
+        let MintOutcome::Refused(message) = attempt_mint(&dead, TEST_NOW, || TEST_KEY_BYTES, &[])
+        else {
+            panic!("a key that was dead on arrival was minted");
+        };
+        assert_eq!(
+            message,
+            crate::service_keys::MintRefusal::ExpiryAlreadyPassed.message()
+        );
+
+        // The control: one day, and the same form mints.
+        let live = KeyForm { expiry_days: "1".to_string(), ..dead };
+        assert!(matches!(
+            attempt_mint(&live, TEST_NOW, || TEST_KEY_BYTES, &[]),
+            MintOutcome::Minted(..)
+        ));
+    }
+
+    /// **The record keeps the hash and never the key.**
+    ///
+    /// This is the whole bargain of the store: a key file that is read --
+    /// backed up, synced, copied off a disk -- must not hand over working
+    /// credentials. The assertion is made over the record's *serialised*
+    /// form, because that is what reaches the file, and a field added later
+    /// that carried the plaintext would be invisible to an assertion that
+    /// only checked `hash`.
+    #[test]
+    fn the_stored_record_holds_the_hash_and_the_plaintext_appears_nowhere_in_it() {
+        let form = KeyForm { name: "Backup".to_string(), ..KeyForm::default() };
+        let MintOutcome::Minted(record, minted) =
+            attempt_mint(&form, TEST_NOW, || TEST_KEY_BYTES, &[])
+        else {
+            panic!("the form was refused");
+        };
+        // The control: there IS a key, and it is the 64 hex characters
+        // `service_token::mint` promises -- so the absence asserted below is
+        // the absence of something real.
+        assert_eq!(minted.secret.as_str(), TEST_KEY);
+        assert_eq!(minted.secret.len(), 64);
+
+        assert_eq!(record.hash, crate::service_keys::hash_key(TEST_KEY));
+        assert_ne!(record.hash, TEST_KEY, "the hash IS the key");
+        let stored = serde_json::to_string(&record).expect("the record serialises");
+        assert!(
+            !stored.contains(TEST_KEY),
+            "the plaintext key is in what would be written to the store: {stored}"
+        );
+    }
+
+    // -- the page, driven at the pane --------------------------------------
+
+    /// **The service switch, driven at the pane**: the row exists, it is
+    /// wired to `service_enabled`, and it is wired to THAT field and not to a
+    /// neighbour -- which on this row is worth pinning twice, because the
+    /// field it moves decides whether a decrypted vault is reachable over a
+    /// socket.
+    #[test]
+    fn clicking_the_service_toggle_changes_the_setting_it_is_wired_to() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        assert!(!state.settings.service_enabled, "the default: nothing is listening");
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let pills = first.rects_of_size(TOGGLE_SIZE);
+        assert_eq!(
+            pills.len(),
+            1,
+            "the Local API page paints exactly one pill -- the service switch. It used to be \
+             the fifth of five, under the backend and disk-cache cards; those went back to \
+             the Vault page, and a test that indexed past the end, or into a pill that had \
+             followed them here, would be clicking something else"
+        );
+        let pill = pills[0].center();
+
+        let _ = tall_frame(&ctx, &mut state, &click(pill));
+        assert!(
+            state.settings.service_enabled,
+            "the switch did not turn on -- the row is painted but its value is never written \
+             back, so the pill is decoration"
+        );
+        assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.use_official_bw_crypto, "the wrong row's toggle moved");
+        assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
+        assert!(state.settings.read_through_cache, "the wrong row's toggle moved");
+
+        let _ = tall_frame(&ctx, &mut state, &click(pill));
+        assert!(!state.settings.service_enabled, "and back off again");
+    }
+
+    /// The page says what turning it on means **while it is off**, which is
+    /// the state every install starts in and the only state in which the
+    /// sentence can still change someone's mind.
+    #[test]
+    fn the_page_says_what_turning_the_service_on_would_do() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        let painted = tall_frame(&ctx, &mut state, &[]);
+        assert!(
+            painted.any_containing("usernames, passwords, notes and two-factor secrets"),
+            "the page does not say what would be served: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.any_containing("any program on this PC"),
+            "the page does not say who could use it"
+        );
+    }
+
+    /// **An empty store is a result, not a blank panel**, and it says what
+    /// the emptiness means: nothing can reach the service. "No keys" and
+    /// "no restrictions" are the confusion this page exists to prevent.
+    #[test]
+    fn a_store_with_no_keys_says_nothing_can_reach_the_service() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        let painted = tall_frame(&ctx, &mut state, &[]);
+        assert!(painted.any_containing("No keys have been minted"), "got {:?}", painted.strings());
+    }
+
+    /// **A listed key shows its name, its dates and its scopes -- and never
+    /// a key.**
+    ///
+    /// There is nothing else it could show: the store holds `SHA-256(key)`.
+    /// So the assertion that matters is the negative one, and it is made
+    /// against the *hash* as well as the plaintext -- a row that helpfully
+    /// printed the hash would be publishing the one value an offline
+    /// attacker wants.
+    #[test]
+    fn a_stored_key_is_listed_by_name_and_scope_and_never_by_its_secret() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        state.show_service_keys(vec![stored_key("Backup script", None)]);
+        let painted = tall_frame(&ctx, &mut state, &[]);
+
+        assert!(painted.contains("Backup script"), "got {:?}", painted.strings());
+        assert!(painted.any_containing("Never expires"));
+        assert!(painted.any_containing("Read everything in the vault"));
+        // The control: the empty-state sentence is gone, so the list really
+        // did draw a row.
+        assert!(!painted.any_containing("No keys have been minted"));
+
+        let hash = crate::service_keys::hash_key(TEST_KEY);
+        for painted_text in painted.strings() {
+            assert!(!painted_text.contains(TEST_KEY), "a key is on screen: {painted_text}");
+            assert!(!painted_text.contains(&hash), "a key's hash is on screen: {painted_text}");
+        }
+    }
+
+    /// **The minted key is shown, once, and is gone the moment it is
+    /// dismissed.**
+    ///
+    /// This is the contract the whole store rests on: the plaintext exists in
+    /// one place, on screen, until the owner has taken it. What is *kept* is
+    /// a hash -- so a screen that could show the key again would mean the key
+    /// had been stored somewhere it should not be, and a screen that lost it
+    /// before the owner copied it would mean minting again.
+    #[test]
+    fn a_minted_key_is_shown_until_it_is_dismissed_and_then_never_again() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        state.key_form.name = "Backup".to_string();
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        // The control: it is not on screen before the button is pressed.
+        assert!(
+            !first.contains(TEST_KEY),
+            "the key was on screen before anything was minted: {:?}",
+            first.strings()
+        );
+        let mint = first.ink_of(MINT_BUTTON).rect.center();
+
+        let minted = tall_click(&ctx, &mut state, mint);
+        assert!(
+            minted.contains(TEST_KEY),
+            "the minted key is not readable anywhere: {:?}",
+            minted.strings()
+        );
+        assert!(
+            minted.any_containing("cannot be shown again"),
+            "the page does not say this is the only time"
+        );
+
+        // Still there on the next frame: it is the only copy in existence,
+        // and a card that cleared itself on a repaint would destroy it.
+        let again = tall_frame(&ctx, &mut state, &[]);
+        assert!(again.contains(TEST_KEY), "the reveal did not survive a repaint");
+
+        let done = again.ink_of(DONE_BUTTON).rect.center();
+        let dismissed = tall_click(&ctx, &mut state, done);
+        assert!(!dismissed.contains(TEST_KEY), "the key is still on screen after Done");
+        assert!(state.minted.is_none(), "the plaintext is still being held");
+
+        // And it is not recoverable: the record that was kept holds the hash,
+        // and nothing on a later frame can produce the key again.
+        let later = tall_frame(&ctx, &mut state, &[]);
+        assert!(!later.contains(TEST_KEY), "the key came back on a later frame");
+        assert_eq!(state.keys.len(), 1, "the record itself was lost with the reveal");
+        assert_eq!(state.keys[0].hash, crate::service_keys::hash_key(TEST_KEY));
+    }
+
+    /// **Nothing that is kept holds the plaintext.**
+    ///
+    /// The frame above proves the key reaches the screen; this proves it
+    /// reaches nothing else. Asserted over the serialised key list, because
+    /// that is exactly the bytes `service_keys::save` would write, and a
+    /// field added later that carried the key would be invisible to a check
+    /// that only read `hash`.
+    #[test]
+    fn minting_puts_the_plaintext_on_screen_and_into_nothing_that_is_stored() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        state.key_form.name = "Backup".to_string();
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let mint = first.ink_of(MINT_BUTTON).rect.center();
+        let _ = tall_click(&ctx, &mut state, mint);
+
+        let stored = serde_json::to_string(&state.keys).expect("the store serialises");
+        assert!(
+            stored.contains(&crate::service_keys::hash_key(TEST_KEY)),
+            "the control: the record that would be written is in this text at all"
+        );
+        assert!(
+            !stored.contains(TEST_KEY),
+            "the plaintext key is in what would be written to the store: {stored}"
+        );
+        // The form is empty again, so the next key cannot be minted under the
+        // last one's name by someone who did not look.
+        assert!(state.key_form.name.is_empty());
+    }
+
+    /// The Copy button hands over the key, and does not clear the card.
+    ///
+    /// Copying is not the same act as being finished with it: a paste that
+    /// went to the wrong window is a second Copy away only if the key is
+    /// still on screen.
+    #[test]
+    fn copying_hands_over_the_key_and_leaves_it_on_screen() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        state.key_form.name = "Backup".to_string();
+        state.show_key_copy(|key| {
+            *COPIED.lock().expect("the copy sink") = Some(key.to_string());
+        });
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let mint = first.ink_of(MINT_BUTTON).rect.center();
+        let minted = tall_click(&ctx, &mut state, mint);
+        // The control: nothing has been copied yet, so the assertion after
+        // the click is about the click.
+        assert!(COPIED.lock().expect("the copy sink").is_none());
+
+        let copy = minted.ink_of(COPY_BUTTON).rect.center();
+        let after = tall_click(&ctx, &mut state, copy);
+        assert_eq!(COPIED.lock().expect("the copy sink").as_deref(), Some(TEST_KEY));
+        assert!(after.contains(TEST_KEY), "the card cleared itself on a copy");
+    }
+
+    /// **One click on Revoke removes nothing.**
+    ///
+    /// Revocation is the only irreversible control in Preferences, and what
+    /// it breaks is somebody's unattended script. So the first press asks,
+    /// and the question says what breaks rather than "are you sure".
+    #[test]
+    fn revoking_asks_before_it_removes_anything() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        state.show_service_keys(vec![stored_key("Backup", None)]);
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let revoke = first.ink_of(REVOKE_BUTTON).rect.center();
+        let asked = tall_click(&ctx, &mut state, revoke);
+        assert_eq!(state.keys.len(), 1, "one click revoked the key with no confirmation");
+        assert!(
+            asked.any_containing("stops being answered"),
+            "the question does not say what breaks: {:?}",
+            asked.strings()
+        );
+        assert!(asked.any_containing("cannot be brought back"), "the question hides the undo");
+
+        // Keeping it puts the row back as it was, with the key still there.
+        let keep = asked.ink_of(REVOKE_CANCEL_BUTTON).rect.center();
+        let kept = tall_click(&ctx, &mut state, keep);
+        assert_eq!(state.keys.len(), 1);
+        assert!(!kept.any_containing("stops being answered"), "the question is still up");
+        assert!(state.pending_revoke.is_none());
+    }
+
+    /// Confirming really does revoke -- the control for the test above, which
+    /// would otherwise pass just as well against a button that does nothing
+    /// at all.
+    #[test]
+    fn confirming_a_revoke_removes_the_key() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        state.show_service_keys(vec![stored_key("Backup", None), stored_key("Nightly", None)]);
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        // The first key's own Revoke button: two are painted, and the one
+        // higher on the page belongs to the row that was drawn first.
+        let revoke = first
+            .ink
+            .iter()
+            .filter(|i| i.source == REVOKE_BUTTON)
+            .min_by(|a, b| a.rect.top().total_cmp(&b.rect.top()))
+            .expect("a revoke button")
+            .rect
+            .center();
+        let asked = tall_click(&ctx, &mut state, revoke);
+        let confirm = asked.ink_of(REVOKE_CONFIRM_BUTTON).rect.center();
+        let after = tall_click(&ctx, &mut state, confirm);
+
+        assert_eq!(state.keys.len(), 1, "the confirmation did not remove the key");
+        assert_eq!(state.keys[0].name, "Nightly", "the wrong key was revoked");
+        assert!(!after.contains("Backup"), "the revoked key is still listed");
+        assert!(after.contains("Nightly"), "the control: the other key is still listed");
+    }
+
+    /// **A store that cannot be written is said out loud, in both
+    /// directions.**
+    ///
+    /// The two failures are not the same failure. A mint that was not saved
+    /// leaves a key that works now and is gone after a restart. A revoke that
+    /// was not saved leaves a key that is off this list and still opens the
+    /// vault -- and an owner who believes they have revoked it. "Could not
+    /// save" would describe neither.
+    #[test]
+    fn a_store_that_cannot_be_written_says_which_way_it_went_wrong() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        state.show_keys_sink(|_| Err("the disk is read-only".to_string()));
+        state.key_form.name = "Backup".to_string();
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let mint = first.ink_of(MINT_BUTTON).rect.center();
+        let minted = tall_click(&ctx, &mut state, mint);
+        assert!(
+            minted.any_containing("gone the next time Deskwarden starts"),
+            "the page does not say the key will not survive a restart: {:?}",
+            minted.strings()
+        );
+        assert!(minted.any_containing("the disk is read-only"), "the reason was swallowed");
+
+        let done = minted.ink_of(DONE_BUTTON).rect.center();
+        let listed = tall_click(&ctx, &mut state, done);
+        let revoke = listed.ink_of(REVOKE_BUTTON).rect.center();
+        let asked = tall_click(&ctx, &mut state, revoke);
+        let confirm = asked.ink_of(REVOKE_CONFIRM_BUTTON).rect.center();
+        let after = tall_click(&ctx, &mut state, confirm);
+        assert!(
+            after.any_containing("it still works"),
+            "the page let the owner believe a key was revoked when the file still grants it: \
+             {:?}",
+            after.strings()
+        );
+    }
+
+    /// A refusal is shown on the page, in `service_keys`' words, and the form
+    /// keeps what was typed into it -- a refused name is one edit away from a
+    /// good one, not a form to fill in again.
+    #[test]
+    fn a_refused_mint_says_why_on_the_page_and_keeps_the_form() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        state.key_form.expiry_days = "30".to_string();
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let mint = first.ink_of(MINT_BUTTON).rect.center();
+        let refused = tall_click(&ctx, &mut state, mint);
+
+        assert!(state.keys.is_empty(), "a key with no name was minted");
+        assert!(state.minted.is_none(), "a refused mint still revealed a key");
+        assert!(
+            refused.any_containing("Give the key a name"),
+            "the refusal is not on the page: {:?}",
+            refused.strings()
+        );
+        assert_eq!(state.key_form.expiry_days, "30", "the form was cleared by a refusal");
+    }
+
+    /// **A paint state reaches no key store, no clipboard and no clock of its
+    /// own.**
+    ///
+    /// `PrefsState::new` is what every test in this module builds, and the
+    /// three seams on this page each lead somewhere real: the owner's
+    /// `service-keys.json`, the Windows clipboard, and the machine's idea of
+    /// now. The defaults have to be the inert answers.
+    #[test]
+    fn a_paint_state_reaches_no_key_store_and_no_clipboard() {
+        let state = PrefsState::new(Settings::default());
+        assert!(state.keys.is_empty(), "the constructor read a key store");
+        assert!(
+            (state.keys_sink)(&[stored_key("Backup", None)]).is_ok(),
+            "the default sink reports a failure, so the page would say so on every mint"
+        );
+        // The control that the sink really wrote nothing: `service_keys_path`
+        // is where a real one would write, and nothing in this module may
+        // resolve it -- see `no_test_here_resolves_the_real_key_store`, which
+        // pins that by reading this file's own source.
+        (state.key_copy)("this must not reach the clipboard");
+    }
+
+    /// **The source pin over the test half**, in
+    /// `no_test_here_resolves_the_real_scan_history`'s idiom and for the same
+    /// reason, over the file beside it: `%APPDATA%\Deskwarden` is off limits
+    /// to the suite, and the way a test would reach it is by accident.
+    ///
+    /// The key store is the worse of the two to touch. Reading it discloses
+    /// what a machine's credentials are named and scoped; **writing it
+    /// revokes every key the owner has ever minted**, including the ones
+    /// their unattended scripts are holding.
+    #[test]
+    fn no_test_here_resolves_the_real_key_store() {
+        let source = include_str!("prefs_ui.rs");
+        let tests = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .expect("no test marker in this file")
+            .1;
+        for needle in [
+            concat!("load_service_", "keys("),
+            concat!("save_service_", "keys"),
+            concat!("service_keys_", "path("),
+            concat!("copy_", "secret"),
+        ] {
+            assert_eq!(
+                tests.matches(needle).count(),
+                0,
+                "a test in this module spells `{needle}`, which reaches the owner's real key \
+                 store or their real clipboard"
+            );
+        }
+        // The positive controls: production really does spell each of them,
+        // so counting zero above means something.
+        for needle in [
+            concat!("fn load_service_", "keys()"),
+            concat!("fn save_service_", "keys("),
+            concat!("fn service_keys_", "path()"),
+            concat!("clipboard::copy_", "secret"),
+        ] {
+            // Two for the clipboard path -- the field's own doc names it as
+            // well as the line that installs it -- and one for each of the
+            // rest. The number is the control, not the name: it is here so
+            // that a needle which has drifted reads as a failure rather than
+            // as a clean zero above.
+            let expected =
+                if needle.ends_with(concat!("copy_", "secret")) { 2 } else { 1 };
+            assert_eq!(
+                source.matches(needle).count(),
+                expected,
+                "{needle:?} is no longer spelled that way -- the needle above has drifted and \
+                 its absence proves nothing"
+            );
+        }
+    }
+
+    /// **The file this screen writes is the file the service reads.**
+    ///
+    /// It used to be possible for those to differ: this screen spelled the
+    /// name, and the service built its own path from a private function in
+    /// `main.rs`, so the compiler could not hold the two together. Drift
+    /// would have been silent in both directions -- each half working
+    /// perfectly, the owner told a key exists while every request using it
+    /// was refused.
+    ///
+    /// **The fix was a shared constant, not a better test**, so what is
+    /// pinned now is that the sharing survives: neither side may go back to
+    /// spelling the name itself. An earlier version of this test asserted
+    /// `main.rs` *contained* the literal, and it fired the moment the
+    /// duplication was removed -- correctly, and as a sign it was guarding
+    /// the wrong property.
+    #[test]
+    fn neither_side_spells_the_key_store_name_for_itself() {
+        let service = include_str!("main.rs");
+        assert!(
+            service.contains("service_keys::key_store_path"),
+            "`main.rs` no longer routes through the shared path helper, so the service and this \
+             screen can now disagree about which file holds the keys"
+        );
+        assert!(
+            !service.contains(SERVICE_KEYS_FILE_NAME),
+            "`main.rs` spells the key store's name itself again; it must come from \
+             `service_keys::KEY_STORE_FILE_NAME` so the two cannot drift"
+        );
+
+        // Control: the needle really is what `main.rs` would have to contain,
+        // rather than a string that could never appear either way.
+        assert_eq!(SERVICE_KEYS_FILE_NAME, "service-keys.json");
+        assert!(
+            include_str!("service_keys.rs").contains("pub const KEY_STORE_FILE_NAME"),
+            "control: the shared constant is gone, so this test is guarding nothing"
+        );
+    }
+
+    /// UTC, so every painted date in these tests is exact wherever the suite
+    /// runs. The page itself uses `local_time::SystemZone`.
+
+    fn zone() -> crate::local_time::FixedOffset {
+        crate::local_time::FixedOffset(0)
+    }
+
     /// One frame of a fresh window on `section`.
     fn paint(section: Section) -> Painted {
         paint_settings(section, Settings::default())
+    }
+
+    /// The same, on the tall viewport.
+    ///
+    /// **For the absence assertions**, which are the ones a culling scroll
+    /// region can make vacuous: on `BODY_SIZE` a page that scrolls hands back
+    /// only what fits the window, so "this label is not painted here" would
+    /// be satisfied by a label that is merely below the fold. On `TALL_BODY`
+    /// nothing is culled, so an absence is a real absence.
+    fn paint_tall(section: Section) -> Painted {
+        let ctx = tall_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = section;
+        tall_frame(&ctx, &mut state, &[])
     }
 
     /// One frame of General on a pane of a given width. `frame` and its
@@ -4298,12 +6597,21 @@ mod tests {
 
     /// One frame of a page whose Hello answer is `available`, since that is
     /// the only input to this row and no other harness here can supply it.
-    fn paint_general_with_hello(available: bool) -> Painted {
-        let ctx = styled_context();
+    /// One frame of the **Vault** page with Windows Hello answering
+    /// `available`, on the tall viewport that page's scroll region needs.
+    ///
+    /// It was `paint_general_with_hello` and it moved with the rows. The
+    /// viewport is `TALL_BODY` rather than `BODY_SIZE` for
+    /// [`tall_frame`]'s reason exactly: a `ScrollArea` culls what is outside
+    /// its viewport, so a short frame would find a row missing and could not
+    /// tell that from a row that was never drawn. Reachability on the real
+    /// window is a separate claim, asserted separately.
+    fn paint_vault_with_hello(available: bool) -> Painted {
+        let ctx = tall_context();
         let mut state = PrefsState::new(Settings::default());
-        state.section = Section::General;
+        state.section = Section::Vault;
         state.show_hello_available(if available { || true } else { || false });
-        frame(&ctx, &mut state, &[])
+        tall_frame(&ctx, &mut state, &[])
     }
 
     /// The copy is the requirement, so these assertions exist so that a
@@ -4344,11 +6652,11 @@ mod tests {
     }
 
     #[test]
-    fn general_draws_the_disk_cache_row_with_the_reason_when_hello_is_missing() {
-        let painted = paint_general_with_hello(false);
+    fn the_vault_page_draws_the_disk_cache_row_with_the_reason_when_hello_is_missing() {
+        let painted = paint_vault_with_hello(false);
         assert!(
             painted.contains(DISK_CACHE_LABEL),
-            "the disk-cache row is not on General at all: {:?}",
+            "the disk-cache row is not on the Vault page at all: {:?}",
             painted.strings()
         );
         assert!(
@@ -4361,17 +6669,17 @@ mod tests {
     fn a_frame_cannot_turn_the_disk_cache_on_while_hello_is_missing() {
         // The ghosted row returns the stored value unchanged, so there is no
         // frame in which the setting reads as on with no key to run on.
-        let ctx = styled_context();
+        let ctx = tall_context();
         let mut state = PrefsState::new(Settings::default());
-        state.section = Section::General;
+        state.section = Section::Vault;
         state.show_hello_available(|| false);
-        let _ = frame(&ctx, &mut state, &[]);
+        let _ = tall_frame(&ctx, &mut state, &[]);
         assert!(!state.settings.cache_vault_to_disk);
     }
 
     #[test]
-    fn general_says_what_is_in_the_file_when_hello_is_available() {
-        let painted = paint_general_with_hello(true);
+    fn the_vault_page_says_what_is_in_the_file_when_hello_is_available() {
+        let painted = paint_vault_with_hello(true);
         assert!(
             painted.any_containing("usernames, passwords, notes and two-factor secrets"),
             "the page does not say what is in the file"
@@ -4389,28 +6697,126 @@ mod tests {
     /// runs and this one decides whether a decrypted vault goes on the disk.
     #[test]
     fn clicking_the_disk_cache_toggle_changes_the_setting_it_is_wired_to() {
-        let ctx = styled_context();
+        let ctx = tall_context();
         let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Vault;
         state.show_hello_available(|| true);
         assert!(!state.settings.cache_vault_to_disk, "the default: nothing on disk");
 
-        let first = frame(&ctx, &mut state, &[]);
-        // FIRST pill down now: the backend row that used to sit above it
-        // moved to Sync & account.
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
-        frame(&ctx, &mut state, &click(pill));
+        let first = tall_frame(&ctx, &mut state, &[]);
+        // THIRD pill down on the Vault page: the backend card's two rows are
+        // above it, and the disk-cache card's own child is directly below.
+        // Named by index rather than by position on a card, because that is
+        // what `rects_of_size` returns -- and asserted against the count, so
+        // an index that has drifted fails here rather than quietly clicking
+        // the row above.
+        let pills = first.rects_of_size(TOGGLE_SIZE);
+        assert_eq!(
+            pills.len(),
+            4,
+            "the Vault page paints four pills: the backend choice and its child, and the \
+             disk copy and its child. The service switch was a fifth until it moved to the \
+             Local API page, and an index that has drifted must fail here rather than \
+             quietly click the row above"
+        );
+        let pill = pills[2].center();
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.cache_vault_to_disk,
             "the disk-cache toggle did not turn on -- the row is painted but its value is \
              never written back, so the pill is decoration"
         );
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+        assert!(state.settings.use_official_bw_crypto, "the wrong row's toggle moved");
+        assert!(!state.settings.service_enabled, "the wrong row's toggle moved");
         assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
         assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
 
-        frame(&ctx, &mut state, &click(pill));
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.cache_vault_to_disk, "and back off again");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
+    }
+
+    /// **The disk-cache pair is one decision with a veto, and the screen
+    /// says so.**
+    ///
+    /// [`crate::backend_policy::read_path`] answers `ServiceOnly` whenever
+    /// `cache_vault_to_disk` is off, *whatever* `read_through_cache` says --
+    /// the first vetoes the second. Two switches side by side, both live,
+    /// would tell the user they were choosing between four configurations
+    /// when there are three, and would leave "read from that copy first"
+    /// switched on next to "keep a copy" switched off: a screen that says a
+    /// file is being consulted which does not exist.
+    ///
+    /// Three claims, because any one alone is passed by the defect. The child
+    /// is **inert** while the parent is off (not merely grey); it says **why**
+    /// in the row, readable without hovering; and the policy really does
+    /// ignore it, so the ghosting is describing the behaviour rather than
+    /// inventing a rule of its own.
+    #[test]
+    fn the_read_through_row_is_a_child_of_the_disk_copy_and_not_a_second_switch() {
+        use crate::backend_policy::{read_path, ReadPath};
+
+        let ctx = tall_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Vault;
+        state.show_hello_available(|| true);
+        // The premise: shipped, the copy is OFF and the read-through is ON --
+        // which is precisely the pair that would read as a contradiction if
+        // both rows were live.
+        assert!(!state.settings.cache_vault_to_disk, "the shipped default");
+        assert!(state.settings.read_through_cache, "the shipped default");
+        assert_eq!(
+            read_path(state.settings.cache_vault_to_disk, state.settings.read_through_cache),
+            ReadPath::ServiceOnly,
+            "the premise: with no copy permitted, the read-through setting decides nothing"
+        );
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        // FOURTH pill: the backend card's two, then the disk copy, then this.
+        let child = first.rects_of_size(TOGGLE_SIZE)[3].center();
+        tall_frame(&ctx, &mut state, &click(child));
+        assert!(
+            state.settings.read_through_cache,
+            "the read-through pill wrote its setting while there is no copy to read, so the \
+             two rows are a pair of independent switches after all"
+        );
+        assert!(
+            first.contains(read_through_description(false)),
+            "the ghosted child does not say what would make it available, so it reads as a \
+             bug rather than as a consequence of the row above; got {:?}",
+            first.strings()
+        );
+
+        // **The control**, and without it the assertions above are passed by
+        // a row that is inert always. Turn the parent on -- through the pane,
+        // so it is the same click path -- and the child is live, moves its
+        // own field, and changes what the policy answers.
+        let parent = first.rects_of_size(TOGGLE_SIZE)[2].center();
+        tall_frame(&ctx, &mut state, &click(parent));
+        assert!(state.settings.cache_vault_to_disk, "the control could not turn the parent on");
+        assert_eq!(
+            read_path(state.settings.cache_vault_to_disk, state.settings.read_through_cache),
+            ReadPath::CacheFirst
+        );
+
+        let second = tall_frame(&ctx, &mut state, &[]);
+        let child = second.rects_of_size(TOGGLE_SIZE)[3].center();
+        tall_frame(&ctx, &mut state, &click(child));
+        assert!(
+            !state.settings.read_through_cache,
+            "the child is inert even with a copy to read, so the row is decoration and the \
+             refusal above proved nothing"
+        );
+        assert!(
+            state.settings.cache_vault_to_disk,
+            "clicking the child moved the parent's field"
+        );
+        assert_eq!(
+            read_path(state.settings.cache_vault_to_disk, state.settings.read_through_cache),
+            ReadPath::ServiceOnly,
+            "the child's field moved but the read path did not follow it"
+        );
     }
 
     #[test]
@@ -4446,6 +6852,20 @@ mod tests {
             "Autofill",
             "Native apps",
             "Security",
+            // The vault page sits beside Security because that is where a
+            // reader looking for "where does my vault come from" looks
+            // first. It was "Vault service" while the service was all it
+            // carried, and the service has since gone to a page of its own;
+            // what the row names now is the backend choice and the disk
+            // cache, and a nav row has to name the whole page or the
+            // settings on it are unfindable.
+            "Vault",
+            // And directly after it, the endpoint that serves what Vault
+            // decided is being served. It came off the bottom of Vault, so by
+            // the rule Breaches and Updates were placed by, it lands where
+            // the bulk of it came from -- one row down from the page a reader
+            // last saw it on.
+            "Local API",
             "Clipboard",
             "Shortcuts",
             "Sync & account",
@@ -4564,22 +6984,19 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_seven_toggles_and_one_stepper() {
+    fn general_paints_exactly_five_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            7,
-            "seven 40x22 pills: `cache_vault_to_disk` and its child `read_through_cache`, \
-             then `prompt_on_match`, `fetch_icons`, \
-             `use_brand_logos`, `reveal_totp_seed` and `auto_lock_enabled`, and nothing else. \
-             The disk-cache pill is painted whether or not Windows Hello is available -- \
-             ghosted and inert when it is not -- so this count does not depend on the machine \
-             running the test. \
-             THREE settings are no longer here and all three left for the same reason -- to \
+            5,
+            "five 40x22 pills: `prompt_on_match`, `fetch_icons`, `use_brand_logos`, \
+             `reveal_totp_seed` and `auto_lock_enabled`, and nothing else. \
+             FIVE settings are no longer here and all five left for the same reason -- to \
              sit beside the thing that governs them. `check_breaches` moved to Breaches, \
-             `check_for_updates` moved to Updates, and `keep_backend_running` moved to Sync & \
-             account, where it is a child of the switch that decides whether `bw serve` runs \
-             at all; see `draw_breaches`, `draw_updates` and `backend_description`"
+             `check_for_updates` moved to Updates, and `keep_backend_running`, \
+             `cache_vault_to_disk` and `read_through_cache` are now on `Section::Vault` with \
+             the backend choice, which is the one page where all of them can be weighed \
+             against each other; see `draw_breaches`, `draw_updates` and `Section::Vault`"
         );
         assert_eq!(
             painted.count_of_size(Vec2::new(112.0, 28.0)),
@@ -4606,14 +7023,20 @@ mod tests {
         // is what a switch is supposed to do, and it is asserted rather than
         // assumed.
         //
-        // **On Sync & account, not General.** The row moved there as a child
-        // of the crypto switch; this test moved with it rather than being
-        // repointed at whatever now sits first on General, which would have
-        // left `keep_backend_running` with no click coverage at all while
-        // still passing.
-        let ctx = styled_context();
+        // **On the Vault page, not General and no longer on Sync & account.**
+        // The row is a child of the crypto switch and moved with it; this
+        // test moved with them both rather than being repointed at whatever
+        // now sits first on General, which would have left
+        // `keep_backend_running` with no click coverage at all while still
+        // passing.
+        //
+        // This is the row the owner trapped themselves with -- turning it off
+        // stopped the vault window opening, and Preferences is inside that
+        // window -- so "there is a place you can click this" is the claim
+        // that matters, and this test is where it is made.
+        let ctx = tall_context();
         let mut state = PrefsState::new(Settings::default());
-        state.section = Section::SyncAndAccount;
+        state.section = Section::Vault;
         // A signed-in account on Bitwarden's own cloud, so `choose` answers
         // `BwServe` and the child is LIVE. Ghosted, `child_toggle_row` hands
         // back the stored value and the click below would do nothing --
@@ -4624,17 +7047,19 @@ mod tests {
         });
         assert!(state.settings.keep_backend_running, "the default");
 
-        let first = frame(&ctx, &mut state, &[]);
+        let first = tall_frame(&ctx, &mut state, &[]);
         // SECOND pill: the crypto switch is the parent and paints first.
         // Clicking this one must not move it, which is what the neighbouring
         // assertion here pins -- a child wired to its parent's field is
         // exactly the mix-up this card's rebuild could have introduced.
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
-        frame(&ctx, &mut state, &click(pill));
+        let pill = first.rects_of_size(TOGGLE_SIZE)[1].center();
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.keep_backend_running);
         assert!(state.settings.use_official_bw_crypto, "the parent's toggle moved");
+        assert!(!state.settings.cache_vault_to_disk, "a neighbouring card's toggle moved");
+        assert!(!state.settings.service_enabled, "a neighbouring card's toggle moved");
 
-        frame(&ctx, &mut state, &click(pill));
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(state.settings.keep_backend_running, "and back again");
         assert!(state.settings.use_official_bw_crypto, "the parent's toggle moved");
     }
@@ -4648,11 +7073,11 @@ mod tests {
     /// configuration does not start.
     #[test]
     fn the_ghosted_backend_pill_does_not_change_the_setting_when_clicked() {
-        let ctx = styled_context();
+        let ctx = tall_context();
         let mut settings = Settings::default();
         settings.use_official_bw_crypto = false;
         let mut state = PrefsState::new(settings);
-        state.section = Section::SyncAndAccount;
+        state.section = Section::Vault;
         state.show_account_source(|| {
             Some(AccountStatus::SignedIn {
                 email: Some("me@example.com".to_string()),
@@ -4661,9 +7086,9 @@ mod tests {
         });
         assert!(state.settings.keep_backend_running, "the default");
 
-        let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[1].center();
-        frame(&ctx, &mut state, &click(pill));
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(TOGGLE_SIZE)[1].center();
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.keep_backend_running,
             "a ghosted row wrote its setting anyway, so the pill is live and only looks dead"
@@ -4683,9 +7108,10 @@ mod tests {
         assert!(state.settings.prompt_on_match, "the default: a match prompts");
 
         let first = frame(&ctx, &mut state, &[]);
-        // SECOND pill down now: the encrypted disk cache is the only row
-        // above it since the backend row left this page.
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[2].center();
+        // FIRST pill down now: the disk-cache pair followed the backend row
+        // off this page, to `Section::Vault`, so the prompt row is the top
+        // of General's card.
+        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(
             !state.settings.prompt_on_match,
@@ -5163,13 +7589,13 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // THIRD pill down now: disk cache, prompt, site icons, network
-        // logos, TOTP secret, auto-lock. Three rows have left this page --
-        // the breach row to Breaches, the update row to Updates, and the
-        // backend row to Sync & account, where it is a child of the switch
-        // that decides whether there is a backend to keep running at all.
-        let pill = pills[3].center();
+        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        // SECOND pill down now: prompt, site icons, network logos, TOTP
+        // secret, auto-lock. Five rows have left this page -- the breach row
+        // to Breaches, the update row to Updates, and the backend row plus
+        // the disk-cache pair to `Section::Vault`, where they are read
+        // together with the service switch.
+        let pill = pills[1].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -5212,10 +7638,10 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // FOURTH pill down: disk cache, prompt, site icons, network
-        // logos, TOTP secret, auto-lock.
-        let pill = pills[4].center();
+        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        // THIRD pill down: prompt, site icons, network logos, TOTP secret,
+        // auto-lock.
+        let pill = pills[2].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -5456,10 +7882,10 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7, "the General card no longer paints seven pills");
-        // FIFTH pill down now: disk cache, prompt, site icons,
-        // network logos, TOTP secret, auto-lock.
-        let pill = pills[5].center();
+        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        // FOURTH pill down now: prompt, site icons, network logos, TOTP
+        // secret, auto-lock.
+        let pill = pills[3].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -5507,16 +7933,22 @@ mod tests {
 
         // ... and the pills follow the labels, so it is the ROW that moved
         // and not just its text.
+        //
+        // **The indices are named, because they moved.** General now paints
+        // prompt(0), site icons(1), network logos(2), TOTP secret(3),
+        // auto-lock(4) -- the disk-cache pair that used to occupy 0 and 1 is
+        // on `Section::Vault`. The pill under test is 3, and its neighbours
+        // are 2 and 4.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 7);
-        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not below the network-logos pill");
-        assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
+        assert_eq!(pills.len(), 5);
+        assert!(pills[2].top() < pills[3].top(), "the TOTP-secret pill is not below the network-logos pill");
+        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not above the auto-lock pill");
         assert!(
-            pills[4].top() > breach.bottom(),
+            pills[3].top() > breach.bottom(),
             "the TOTP-secret pill is level with the site-icons row's text, so the pills and the labels disagree about which row is which"
         );
         assert!(
-            pills[4].bottom() < auto_lock.top(),
+            pills[3].bottom() < auto_lock.top(),
             "the TOTP-secret pill overhangs the auto-lock row"
         );
     }
@@ -5572,20 +8004,27 @@ mod tests {
 
     #[test]
     fn clicking_the_auto_lock_toggle_turns_auto_lock_off_and_on_again() {
-        // The user's actual request. `auto_lock_enabled` starts true, and
-        // the SEVENTH pill down is the one wired to it --
-        // `cache_vault_to_disk`, `prompt_on_match`, `fetch_icons`,
-        // `use_brand_logos` and `reveal_totp_seed` sit between it and the
-        // backend row. It was the fifth until the network-logos row was
-        // inserted, the sixth before `check_breaches` moved to its own page,
-        // and the seventh since the encrypted disk cache took the row
-        // directly under the backend one.
+        // The user's actual request. `auto_lock_enabled` starts true, and it
+        // is the LAST pill on the page -- `prompt_on_match`, `fetch_icons`,
+        // `use_brand_logos` and `reveal_totp_seed` sit above it. It was the
+        // fifth until the network-logos row was inserted, the sixth before
+        // `check_breaches` moved to its own page, the seventh while the
+        // encrypted disk cache sat under the backend row, and the fifth
+        // again now that the disk-cache pair has followed the backend row to
+        // `Section::Vault`.
+        //
+        // **Read as the last index rather than written as `4`**, because
+        // this index has now been wrong four times. What the test means is
+        // "the bottom row of General", and that is a thing the paint can be
+        // asked directly.
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
         assert!(state.settings.auto_lock_enabled, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[6].center();
+        let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
+        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        let pill = pills[pills.len() - 1].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
@@ -6179,7 +8618,7 @@ mod tests {
         );
     }
 
-    // -- the backend row on Sync & account ---------------------------------
+    // -- the backend rows, on the Vault page -------------------------------
 
     /// A signed-in status for a given server, as the shells publish one.
     fn signed_in_on(server: Option<&str>) -> AccountStatus {
@@ -6204,7 +8643,7 @@ mod tests {
             })
         }
         let mut state = PrefsState::new(Settings::default());
-        state.show(Section::SyncAndAccount);
+        state.show(Section::Vault);
         state.show_account_source(source);
         state
     }
@@ -6218,34 +8657,142 @@ mod tests {
             })
         }
         let mut state = PrefsState::new(Settings::default());
-        state.show(Section::SyncAndAccount);
+        state.show(Section::Vault);
         state.show_account_source(source);
         state
     }
 
-    /// The page draws the row, and it draws exactly one pill -- so the copy
-    /// assertions below are about a control that is really there.
+    /// **The whole point of the gathering: one screen carries every setting
+    /// that decides where this vault comes from.**
+    ///
+    /// Asserted as four labels on one painted page, and -- the half that can
+    /// actually fail -- as four labels absent from every other page in the
+    /// window. A test that only checked presence would pass a change that
+    /// *copied* the rows, which is this file's most-feared defect: a control
+    /// fixed in one place and left broken in the other.
+    ///
+    /// **`Section::Api` is in the absent list, and that is not padding.** The
+    /// service switch was gathered onto Vault alongside these four and has
+    /// since moved on to its own page; the mirror-image test below pins that
+    /// it left. Two pages that were briefly one are exactly the pair where a
+    /// half-finished split leaves a duplicate.
     #[test]
-    fn sync_and_account_paints_the_backend_row_and_one_pill() {
+    fn every_setting_that_decides_where_the_vault_comes_from_is_on_the_vault_page() {
+        let vault = paint_vault_with_hello(true);
+        let gathered =
+            [OFFICIAL_CRYPTO_LABEL, BACKEND_LABEL, DISK_CACHE_LABEL, READ_THROUGH_LABEL];
+        for label in gathered {
+            assert!(
+                vault.contains(label),
+                "{label:?} is not on the Vault page; got {:?}",
+                vault.strings()
+            );
+        }
+
+        // And nowhere else. General and Sync & account are the two pages
+        // these rows were taken off; the Local API page is the one they could
+        // most plausibly be copied onto. A row left behind on any of them is
+        // two switches over one field.
+        for section in [Section::General, Section::SyncAndAccount, Section::Api] {
+            let painted = paint_tall(section);
+            for label in gathered {
+                assert!(
+                    !painted.contains(label),
+                    "{label:?} is still painted on {section:?} as well as on the Vault page, \
+                     so one field now has two switches"
+                );
+            }
+        }
+
+        // The control for the loop above: those pages are not simply blank,
+        // so "not painted" is a claim about these rows rather than about a
+        // paint that produced nothing. The API page's control is the switch
+        // it does own, which is also the assertion the next test starts from.
+        assert!(paint(Section::General).contains(PROMPT_LABEL));
+        assert!(paint(Section::SyncAndAccount).contains(SYNC_MOVED_LABEL));
+        assert!(paint_tall(Section::Api).contains(SERVICE_LABEL));
+    }
+
+    /// **The mirror image, and the half a move gets wrong: the API page
+    /// carries the endpoint and every key control, and the Vault page it came
+    /// off carries none of them.**
+    ///
+    /// The switch and the key list are the one pair that must never be
+    /// separated -- a switch on one page and the list of who can walk through
+    /// the door it opens on another is an arrangement where the owner can
+    /// believe they turned something off while three keys still exist for it.
+    /// So they are asserted together, on one painted page.
+    ///
+    /// The absence half is asserted against Vault specifically. A row that
+    /// was *copied* rather than moved would leave the Vault page painting a
+    /// second `service_enabled` pill, and the owner could turn the endpoint
+    /// off on one page and find it on from the other.
+    #[test]
+    fn the_endpoint_and_every_key_control_are_on_the_api_page_and_not_on_vault() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        state.show_service_keys(vec![stored_key("Backup script", None)]);
+        let api = tall_frame(&ctx, &mut state, &[]);
+        // The switch, the empty-or-not list with its heading, the form that
+        // mints, and a listed key's revoke button: every control the split
+        // had to carry across, and each one a separate way to lose half.
+        for label in [SERVICE_LABEL, KEYS_SECTION_LABEL, MINT_SECTION_LABEL, MINT_BUTTON] {
+            assert!(
+                api.contains(label),
+                "{label:?} is not on the Local API page; got {:?}",
+                api.strings()
+            );
+        }
+        assert!(api.contains(REVOKE_BUTTON), "a listed key has no revoke button");
+        assert!(api.contains("Backup script"), "control: the list really drew a row");
+
+        // And none of it on Vault -- driven with the same key in the store,
+        // so a Vault page that still drew the list would be caught rather
+        // than merely being handed nothing to draw.
+        let mut vault = PrefsState::new(Settings::default());
+        vault.section = Section::Vault;
+        vault.show_hello_available(|| true);
+        vault.show_service_keys(vec![stored_key("Backup script", None)]);
+        let painted = tall_frame(&ctx, &mut vault, &[]);
+        for label in
+            [SERVICE_LABEL, KEYS_SECTION_LABEL, MINT_SECTION_LABEL, MINT_BUTTON, REVOKE_BUTTON]
+        {
+            assert!(
+                !painted.contains(label),
+                "{label:?} is still painted on the Vault page as well as on the Local API \
+                 page; got {:?}",
+                painted.strings()
+            );
+        }
+        assert!(!painted.contains("Backup script"), "the key list is still drawn on Vault");
+        // The control: the Vault page is not blank, and the store it was
+        // handed is the one the API page listed a row from.
+        assert!(painted.contains(DISK_CACHE_LABEL), "control: the Vault page drew its own rows");
+    }
+
+    /// **A user who last saw the switch on Sync & account is told where it
+    /// went, on that page, in the nav's own word for the new one.**
+    ///
+    /// Without this, moving the rows turns "the setting I used yesterday" into
+    /// "the setting they removed". The label is read off [`Section::Vault`]
+    /// rather than spelled again, so a later rename of the page cannot leave
+    /// this sentence pointing somewhere that does not exist.
+    #[test]
+    fn sync_and_account_says_where_the_backend_switch_went() {
         let painted = paint(Section::SyncAndAccount);
         assert!(
-            painted.contains(OFFICIAL_CRYPTO_LABEL),
-            "the backend row is not on the page it moved to; got {:?}",
+            painted.contains(SYNC_MOVED_NOTE),
+            "the page that lost the switch says nothing about where it went; got {:?}",
             painted.strings()
-        );
-        assert_eq!(
-            painted.count_of_size(Vec2::new(40.0, 22.0)),
-            2,
-            "two 40x22 pills: `use_official_bw_crypto` and its child \
-             `keep_backend_running`, and nothing else"
         );
         assert!(
-            painted.contains(BACKEND_LABEL),
-            "the backend row did not come with its parent; got {:?}",
-            painted.strings()
+            SYNC_MOVED_NOTE.contains(Section::Vault.label()),
+            "the signpost does not name the page in the nav's own word for it: \
+             {SYNC_MOVED_NOTE:?} vs {:?}",
+            Section::Vault.label()
         );
-        // The sentence the old placeholder carried is still on the page: it is
-        // still the answer to "where do I sign in from".
+        // The sentence the page carried before the backend rows ever arrived
+        // is still here: it is still the answer to "where do I sign in from".
         assert!(
             painted
                 .strings()
@@ -6254,18 +8801,26 @@ mod tests {
             "the page dropped what it used to say; got {:?}",
             painted.strings()
         );
+        // And no pill: this page decides nothing now, and a switch here would
+        // be a second copy of one that lives on the Vault page.
+        assert_eq!(
+            painted.count_of_size(TOGGLE_SIZE),
+            0,
+            "Sync & account is painting a toggle again; got {:?}",
+            painted.strings()
+        );
     }
 
-    /// One frame of Sync & account for an account on `server`, with the
+    /// One frame of the Vault page for an account on `server`, with the
     /// crypto toggle at `use_official`. Both inputs are needed together:
     /// [`backend_description`]'s gate is `backend_policy::choose` over the
     /// pair, and neither alone decides it.
-    fn paint_sync_for(server: Option<&'static str>, use_official: bool) -> Painted {
-        let ctx = styled_context();
+    fn paint_vault_for(server: Option<&'static str>, use_official: bool) -> Painted {
+        let ctx = tall_context();
         let mut settings = Settings::default();
         settings.use_official_bw_crypto = use_official;
         let mut state = PrefsState::new(settings);
-        state.section = Section::SyncAndAccount;
+        state.section = Section::Vault;
         state.show_account_source(match server {
             Some("self") => || {
                 Some(AccountStatus::SignedIn {
@@ -6280,7 +8835,7 @@ mod tests {
                 })
             },
         });
-        frame(&ctx, &mut state, &[])
+        tall_frame(&ctx, &mut state, &[])
     }
 
     /// **The defect this card was rebuilt to remove.**
@@ -6298,7 +8853,7 @@ mod tests {
     /// grey.
     #[test]
     fn the_backend_row_goes_quiet_when_there_is_no_backend_to_keep_running() {
-        let direct = paint_sync_for(Some("self"), false);
+        let direct = paint_vault_for(Some("self"), false);
         assert!(
             direct.contains(backend_description(false)),
             "a self-hosted account with `bw` crypto off still offers to keep a subprocess it \
@@ -6314,7 +8869,7 @@ mod tests {
             (None, false, "bitwarden.com, `bw` crypto off"),
             (None, true, "bitwarden.com, `bw` crypto on"),
         ] {
-            let painted = paint_sync_for(server, use_official);
+            let painted = paint_vault_for(server, use_official);
             assert!(
                 painted.contains(backend_description(true)),
                 "{why} is served by `bw serve`, so this row decides something and must say \
@@ -6337,43 +8892,334 @@ mod tests {
         );
     }
 
-    /// **The row is not off the bottom of the window.**
+    /// **Every row on this page, and every paragraph under it, is readable on
+    /// the real window without scrolling.**
     ///
-    /// The reason it is on this page at all: General's card was one row from
-    /// its ceiling and this row's copy is three paragraphs. A row that is
-    /// painted but below the fold is a row nobody can reach -- the window has
-    /// no page-level scroll region -- so this asserts the position and not
-    /// merely the presence, on the same fixed body the window uses.
+    /// This test used to be about General's ceiling, and then about the
+    /// backend row landing on the first card of a Vault page that scrolled.
+    /// The page does not scroll any more -- the key list it scrolled for is
+    /// on `Section::Api` -- so the claim goes back to its strongest form: a
+    /// row painted past `BODY_SIZE.y` on a page with no scroll region is a
+    /// row nobody can reach, and one of these four rows is the switch the
+    /// owner was trapped by.
+    ///
+    /// **All four copy combinations**, because the descriptions are what
+    /// make this page long and each pair is a different length: the crypto
+    /// row's three-paragraph copy appears only on a self-hosted account, and
+    /// the disk-cache row's Hello explanation only where Hello is missing.
+    /// A test that measured the default state alone would be measuring the
+    /// shortest page this screen can draw.
+    ///
+    /// Measured on `TALL_BODY` and compared against `BODY_SIZE.y`, which is
+    /// not a fiction here but the only way to see an overflow: a page whose
+    /// content ran past the window would simply be clipped on `BODY_SIZE`,
+    /// and the measurement would report the fold back to itself.
     #[test]
-    fn the_backend_row_and_its_copy_both_fit_on_the_page() {
-        // The **enabled** copy, which is the long one -- three paragraphs, and
-        // the reason this row did not fit on General.
-        let ctx = styled_context();
+    fn the_whole_vault_page_is_readable_without_scrolling() {
+        for hello in [false, true] {
+            for self_hosted in [false, true] {
+                let painted = paint_vault_copy(hello, self_hosted);
+                // The premise: this really is the long copy. Without it a
+                // future edit that shortened the descriptions to nothing
+                // would pass this test while making it meaningless.
+                assert!(
+                    painted.contains(official_crypto_description(self_hosted))
+                        && painted.contains(disk_cache_description(hello)),
+                    "hello={hello} self_hosted={self_hosted}: the page did not paint the copy \
+                     under test; got {:?}",
+                    painted.strings()
+                );
+                let bottom = content_bottom(&painted);
+                assert!(
+                    bottom < BODY_SIZE.y,
+                    "hello={hello} self_hosted={self_hosted}: the Vault page runs to y={bottom} \
+                     on a body {} tall and has no scroll region, so its last row is one nobody \
+                     can reach",
+                    BODY_SIZE.y
+                );
+            }
+        }
+
+        // **The control, and it is the reason this measurement is worth
+        // making**: the same yardstick over the page that DOES scroll says
+        // the opposite. Without it, `content_bottom` could be reading
+        // something that is short whatever is drawn, and every assertion
+        // above would pass on an empty page.
+        let ctx = tall_context();
+        let mut api = api_state();
+        api.show_service_keys(vec![
+            stored_key("one", None),
+            stored_key("two", None),
+            stored_key("three", None),
+        ]);
+        let bottom = content_bottom(&tall_frame(&ctx, &mut api, &[]));
+        assert!(
+            bottom > BODY_SIZE.y,
+            "control: the Local API page with three keys measures y={bottom}, inside a body \
+             {} tall, so this yardstick cannot tell a long page from a short one",
+            BODY_SIZE.y
+        );
+    }
+
+    /// The bottom of the lowest thing painted in the **content column**.
+    ///
+    /// Right of `NAV_WIDTH`, because the nav rail is drawn full-height on
+    /// every page and its version footer sits at the bottom of whatever
+    /// viewport it is given -- a measurement that included it would report
+    /// the viewport's height on every page and could never fail.
+    fn content_bottom(painted: &Painted) -> f32 {
+        painted
+            .ink
+            .iter()
+            .filter(|i| i.rect.min.x > NAV_WIDTH)
+            .map(|i| i.rect.max.y)
+            .fold(0.0f32, f32::max)
+    }
+
+    /// The Vault page with the copy each of its two ghostable rows shows in
+    /// the named state: Hello present or missing, on a self-hosted server or
+    /// on the official cloud.
+    fn paint_vault_copy(hello: bool, self_hosted: bool) -> Painted {
+        let ctx = tall_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Vault;
+        state.show_hello_available(if hello { || true } else { || false });
+        state.show_account_source(if self_hosted {
+            || {
+                Some(AccountStatus::SignedIn {
+                    email: Some("me@example.com".to_string()),
+                    server: Some("https://vault.example.com".to_string()),
+                })
+            }
+        } else {
+            || {
+                Some(AccountStatus::SignedIn {
+                    email: Some("me@example.com".to_string()),
+                    server: Some("https://vault.bitwarden.com".to_string()),
+                })
+            }
+        });
+        tall_frame(&ctx, &mut state, &[])
+    }
+
+    /// Clicks the backend pill at `pill` and then says yes to the question
+    /// it raises, leaving the switch actually taken.
+    ///
+    /// The tests that predate the confirmation are about where the row is
+    /// wired, not about the question, and they say what they always said
+    /// through this helper: a click on this row now costs two presses, and
+    /// spelling both out at each of their call sites would bury the
+    /// assertion they exist for.
+    fn take_the_backend_switch(ctx: &egui::Context, state: &mut PrefsState, pill: Pos2) {
+        let asked = tall_click(ctx, state, pill);
+        let yes = asked.ink_of(BACKEND_SWITCH_CONFIRM_BUTTON).rect.center();
+        let _ = tall_click(ctx, state, yes);
+    }
+
+    /// **One click on the backend pill moves nothing.**
+    ///
+    /// This row is not a preference the user can try out and undo: the choice
+    /// is captured at startup, so the click costs a restart and a fresh sign
+    /// in whichever way it goes, and one of the two directions deletes a key
+    /// off the disk. A mis-click on it is expensive in a way a mis-click on
+    /// every other toggle in this window is not, which is the same reason the
+    /// revoke button asks -- so this one asks in the same shape.
+    ///
+    /// **And the question is escapable**, which is the half worth a test of
+    /// its own. The revoke confirmation shipped for a while with a Keep it
+    /// that cleared a local and not the pending state, so the question stayed
+    /// up and neither button did anything. The last assertions here are that
+    /// answering no both leaves the setting alone AND puts the row back, so a
+    /// second attempt can still be made.
+    #[test]
+    fn switching_the_backend_asks_before_it_takes_effect() {
+        let ctx = tall_context();
         let mut state = on_a_self_hosted_server();
-        let painted = frame(&ctx, &mut state, &[]);
-        let label = painted.ink_of(OFFICIAL_CRYPTO_LABEL);
+        assert!(state.settings.use_official_bw_crypto, "the shipped default");
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
+        let asked = tall_click(&ctx, &mut state, pill);
+
         assert!(
-            label.rect.max.y < BODY_SIZE.y,
-            "the row's label is painted at y={} on a body {} tall, so it is below the fold",
-            label.rect.max.y,
-            BODY_SIZE.y
+            state.settings.use_official_bw_crypto,
+            "one click moved the backend with no confirmation"
         );
-        let copy = painted.ink_of(official_crypto_description(true));
         assert!(
-            copy.rect.max.y < BODY_SIZE.y,
-            "the row's description runs to y={} on a body {} tall",
-            copy.rect.max.y,
-            BODY_SIZE.y
+            asked.any_containing("restarted"),
+            "the question does not say the app has to be restarted: {:?}",
+            asked.strings()
         );
-        // The positive control for the two above: General, which is the page
-        // this row was taken off, really does end above the fold as well --
-        // so the assertions are about a measurement that can distinguish the
-        // two rather than one that passes for everything.
-        let general = paint(Section::General);
+        // **The needle is one only the question carries.** The row's own
+        // description also says the switch asks you to sign in again, so
+        // "sign in again" alone would be satisfied by the page that was
+        // already on screen before anything was clicked -- a vacuous
+        // assertion, and one that would then hold just as well after the
+        // question had gone.
         assert!(
-            general.ink_of(AUTO_LOCK_LABEL).rect.max.y < BODY_SIZE.y,
-            "control: General's last row is itself below the fold, so this measurement says \
-             nothing about where the backend row would have landed"
+            asked.any_containing("sign in again when it comes back"),
+            "the question does not say the user has to sign in again: {:?}",
+            asked.strings()
+        );
+        // The pill is still painted where it was. A row that moved on the
+        // click and moved back on the refusal would satisfy every value
+        // assertion here and still show the user a switch that flipped
+        // itself.
+        assert_eq!(
+            asked.pill_fills()[0],
+            theme::BLUE,
+            "the pill moved before the question was answered"
+        );
+
+        let no = asked.ink_of(BACKEND_SWITCH_CANCEL_BUTTON).rect.center();
+        let left = tall_click(&ctx, &mut state, no);
+        assert!(state.settings.use_official_bw_crypto, "saying no switched the backend anyway");
+        assert_eq!(left.pill_fills()[0], theme::BLUE, "the pill moved on a refusal");
+        assert!(
+            state.pending_backend_switch.is_none(),
+            "the question is still pending, so the row is stuck on it"
+        );
+        assert!(
+            !left.any_containing("sign in again when it comes back"),
+            "the question is still on screen after it was answered: {:?}",
+            left.strings()
+        );
+
+        // And the whole thing can be attempted again -- the assertion the
+        // never-cleared pending state would fail, and the one that makes the
+        // clearing above mean something.
+        let again = tall_click(&ctx, &mut state, pill);
+        assert!(
+            again.any_containing("sign in again when it comes back"),
+            "a second press of the pill raises nothing, so the row can only be refused once: \
+             {:?}",
+            again.strings()
+        );
+    }
+
+    /// Saying yes really does switch -- the control for the test above, which
+    /// a pair of buttons that did nothing at all would otherwise pass.
+    ///
+    /// Asserted through [`crate::backend_policy::choose`] rather than the
+    /// field, for `the_backend_row_is_on_when_bw_is_the_backend`'s reason:
+    /// what a yes has to change is which backend serves the vault.
+    #[test]
+    fn confirming_a_backend_switch_applies_it() {
+        use crate::backend_policy::{choose, VaultBackendChoice};
+        const SERVER: Option<&str> = Some("https://vault.example.com");
+
+        let ctx = tall_context();
+        let mut state = on_a_self_hosted_server();
+        assert_eq!(
+            choose(SERVER, state.settings.use_official_bw_crypto),
+            VaultBackendChoice::BwServe,
+            "control: the page did not start on the official CLI, so a change to the built-in \
+             client would prove nothing"
+        );
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
+        let asked = tall_click(&ctx, &mut state, pill);
+        let yes = asked.ink_of(BACKEND_SWITCH_CONFIRM_BUTTON).rect.center();
+        let after = tall_click(&ctx, &mut state, yes);
+
+        assert_eq!(
+            choose(SERVER, state.settings.use_official_bw_crypto),
+            VaultBackendChoice::DirectRest,
+            "the confirmation did not take the switch"
+        );
+        assert!(state.pending_backend_switch.is_none(), "the question outlived its answer");
+        assert_eq!(
+            after.pill_fills()[0],
+            theme::TOGGLE_OFF,
+            "the switch was taken and the pill still shows the old state"
+        );
+        assert!(
+            !after.any_containing("sign in again when it comes back"),
+            "the question is still on screen after it was taken: {:?}",
+            after.strings()
+        );
+    }
+
+    /// **The two directions do not cost the same thing, and the question says
+    /// so.**
+    ///
+    /// Turning `bw` back on deletes `userkey.bin` -- `main`'s
+    /// `settle_the_vault_backend` clears the store on every arm that is not
+    /// `DirectRest`, and its own
+    /// `settling_off_direct_rest_deletes_the_stored_vault_key` pins it.
+    /// Turning it off does not delete anything; it creates the file. A single
+    /// generic sentence would therefore either promise a deletion that does
+    /// not happen or hide the one that does, and the second is the worse of
+    /// the two: it is the only reassurance that switching back undoes what
+    /// switching away did.
+    ///
+    /// Asserted on the pure function rather than on a painted frame, because
+    /// the asymmetry is a fact about the decision and not about the layout.
+    #[test]
+    fn only_the_switch_back_to_bw_mentions_the_deleted_vault_key() {
+        let back = backend_switch_prompt(BackendSwitch::ToOfficial);
+        assert!(
+            back.contains("deletes the vault key stored on this PC"),
+            "going back to the official CLI does not say the stored key is removed, so the \
+             user cannot tell whether it undoes what the switch did: {back:?}"
+        );
+
+        let away = backend_switch_prompt(BackendSwitch::ToBuiltIn);
+        assert!(
+            !away.contains("delete"),
+            "the switch TO the built-in client claims to delete a key -- it writes one: {away:?}"
+        );
+
+        // Both halves the two directions really do share, so the asymmetry
+        // above is the only difference and not an excuse for a thinner
+        // sentence on one side.
+        for (name, prompt) in [("back to bw", back), ("to the built-in client", away)] {
+            assert!(
+                prompt.contains("restarted"),
+                "the {name} question does not say the app has to be restarted: {prompt:?}"
+            );
+            assert!(
+                prompt.contains("sign in again"),
+                "the {name} question does not say the user has to sign in again: {prompt:?}"
+            );
+            // **It does not promise a relaunch it cannot perform.** Nothing
+            // in this program respawns it, so a Yes that said "restarting
+            // now" would be a lie told at the moment the user is agreeing to
+            // something.
+            assert!(
+                prompt.contains("close it and open it again yourself"),
+                "the {name} question leaves who restarts the app unsaid, and nothing here \
+                 restarts it: {prompt:?}"
+            );
+        }
+    }
+
+    /// **A frame nobody clicked proposes nothing.**
+    ///
+    /// [`backend_switch`] is asked on every frame, so an arm that answered
+    /// `Some` for the value the row was already showing would put a
+    /// confirmation in front of a user who did nothing -- and, worse, one
+    /// whose Yes would be a change they never asked for. The two flips are
+    /// the control: without them this would pass against a function that
+    /// answered `None` always.
+    #[test]
+    fn a_backend_row_that_did_not_move_asks_nothing() {
+        assert_eq!(backend_switch(true, true), None, "the row was left on and raised a question");
+        assert_eq!(
+            backend_switch(false, false),
+            None,
+            "the row was left off and raised a question"
+        );
+        assert_eq!(backend_switch(true, false), Some(BackendSwitch::ToBuiltIn));
+        assert_eq!(backend_switch(false, true), Some(BackendSwitch::ToOfficial));
+        assert!(
+            BackendSwitch::ToOfficial.deletes_the_stored_vault_key(),
+            "the direction that clears `userkey.bin` says it does not"
+        );
+        assert!(
+            !BackendSwitch::ToBuiltIn.deletes_the_stored_vault_key(),
+            "the direction that WRITES the stored key claims to delete it"
         );
     }
 
@@ -6384,13 +9230,15 @@ mod tests {
     /// will not run there.
     #[test]
     fn the_backend_row_is_disabled_and_inert_on_an_official_cloud() {
-        let ctx = styled_context();
+        let ctx = tall_context();
         let mut state = on_an_official_cloud();
         assert!(state.settings.use_official_bw_crypto, "the shipped default");
 
-        let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
-        frame(&ctx, &mut state, &click(pill));
+        let first = tall_frame(&ctx, &mut state, &[]);
+        // FIRST pill on the Vault page: the backend choice is the top row of
+        // the top card, which is where the page's reading order puts it.
+        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
+        tall_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.use_official_bw_crypto,
             "a click on the ghosted pill changed the setting anyway"
@@ -6413,21 +9261,115 @@ mod tests {
     /// else on the page.
     #[test]
     fn the_backend_row_toggles_on_a_self_hosted_server_and_moves_only_its_own_field() {
-        let ctx = styled_context();
+        let ctx = tall_context();
         let mut state = on_a_self_hosted_server();
 
-        let first = frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(Vec2::new(40.0, 22.0))[0].center();
-        frame(&ctx, &mut state, &click(pill));
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
+        take_the_backend_switch(&ctx, &mut state, pill);
         assert!(
             !state.settings.use_official_bw_crypto,
             "the row did not turn off on a self-hosted server"
         );
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
+        assert!(!state.settings.service_enabled, "the wrong row's toggle moved");
 
-        frame(&ctx, &mut state, &click(pill));
+        take_the_backend_switch(&ctx, &mut state, pill);
         assert!(state.settings.use_official_bw_crypto, "and back on again");
+    }
+
+    /// **The one guarantee on this page that cannot be seen by looking: the
+    /// pill is ON when `bw` is the backend, and OFF when the built-in client
+    /// is.**
+    ///
+    /// An inverted row paints, clicks and persists perfectly. Nothing about
+    /// it looks wrong -- the switch moves, the setting is written back, the
+    /// counter-assertions on the neighbouring tests all hold -- and the only
+    /// symptoms are that a fresh install shows the pill off while running the
+    /// official CLI, and that a user who turns it on has opted in to the
+    /// built-in client and stored a non-expiring master key on their PC in
+    /// the belief they had done the opposite.
+    ///
+    /// So this is asserted **through
+    /// [`crate::backend_policy::choose`]** -- the function that actually
+    /// decides -- rather than through the field. The field could be read
+    /// backwards by the row, or the row could be right and the decision
+    /// inverted; going pill to decision covers both, and covers any third
+    /// place an inversion could be introduced between them.
+    ///
+    /// A self-hosted server throughout, because that is the only account
+    /// where the choice is live: the assertions below are about a control the
+    /// user can actually move.
+    #[test]
+    fn the_backend_row_is_on_when_bw_is_the_backend() {
+        use crate::backend_policy::{choose, VaultBackendChoice};
+        const SERVER: Option<&str> = Some("https://vault.example.com");
+
+        let ctx = tall_context();
+        let mut state = on_a_self_hosted_server();
+
+        // The shipped default: the pill is ON, and `bw serve` is what the
+        // policy answers for it. Both halves, because either alone is
+        // satisfied by an inversion of the other.
+        assert!(state.settings.use_official_bw_crypto, "the shipped default");
+        assert_eq!(
+            choose(SERVER, state.settings.use_official_bw_crypto),
+            VaultBackendChoice::BwServe,
+            "the default configuration does not select the official `bw` CLI"
+        );
+        let first = tall_frame(&ctx, &mut state, &[]);
+        assert_eq!(
+            first.pill_fills()[0],
+            theme::BLUE,
+            "the pill for the shipped default is painted off, so a fresh install shows the \
+             official CLI switched off while it is running the official CLI"
+        );
+
+        // Clicking it turns it OFF, and the policy then selects the built-in
+        // direct-REST client -- the state whose whole cost is the copy under
+        // this row.
+        take_the_backend_switch(&ctx, &mut state, first.rects_of_size(TOGGLE_SIZE)[0].center());
+        assert!(!state.settings.use_official_bw_crypto);
+        assert_eq!(
+            choose(SERVER, state.settings.use_official_bw_crypto),
+            VaultBackendChoice::DirectRest,
+            "turning the row OFF did not select the built-in client, so the label's two \
+             states do not mean what it says they mean"
+        );
+        let second = tall_frame(&ctx, &mut state, &[]);
+        assert_eq!(
+            second.pill_fills()[0],
+            theme::TOGGLE_OFF,
+            "the pill is painted on for a configuration served by the built-in client"
+        );
+
+        // ...and back, so the two paints above are telling the states apart
+        // rather than reporting one constant twice.
+        take_the_backend_switch(&ctx, &mut state, second.rects_of_size(TOGGLE_SIZE)[0].center());
+        assert!(state.settings.use_official_bw_crypto);
+        assert_eq!(
+            choose(SERVER, state.settings.use_official_bw_crypto),
+            VaultBackendChoice::BwServe
+        );
+
+        // And the copy reads the same way round as the control does. A row
+        // whose pill is right and whose sentence is backwards is the same
+        // defect delivered in prose.
+        let copy = official_crypto_description(true);
+        let on = copy.find("On (the default)").expect("the copy no longer names the on state");
+        let off = copy.find("Off is much lighter").expect("the copy no longer names the off state");
+        assert!(on < off, "the copy describes the off state first, under a label that reads on");
+        assert!(
+            copy[on..off].contains("official Bitwarden CLI"),
+            "the copy's ON paragraph does not say the official CLI is what ON means: {:?}",
+            &copy[on..off]
+        );
+        assert!(
+            copy[off..].contains("built-in client"),
+            "the copy's OFF paragraph does not say the built-in client is what OFF means: {:?}",
+            &copy[off..]
+        );
     }
 
     /// **What the enabled copy has to say**, asserted as text rather than
@@ -6453,6 +9395,25 @@ mod tests {
             copy.contains("next time Deskwarden starts"),
             "the copy does not say the change takes effect on restart, so a user who clicks it \
              and sees nothing happen clicks it again"
+        );
+        // **The two costs a restart alone does not describe.** Switching in
+        // either direction re-derives the vault key, so the master password
+        // is asked for again -- a user who expects a relaunch and gets a
+        // login prompt will assume something broke. And `main` deletes
+        // `userkey.bin` when an account stops being served over REST
+        // (`user_key_store::UserKeyStore::clear`), which is the reassuring
+        // half: turning the built-in client back off does not leave a
+        // non-expiring master key on the disk. Both are consequences of
+        // clicking this row and neither is visible from it.
+        assert!(
+            copy.contains("asks you to sign in again"),
+            "the copy does not say the switch re-authenticates, so a login prompt after a \
+             relaunch reads as a failure: {copy:?}"
+        );
+        assert!(
+            copy.contains("deletes the stored vault key from this PC"),
+            "the copy does not say the stored key is removed when the switch goes back, so a \
+             user cannot tell whether turning this back on undoes what it did: {copy:?}"
         );
         // The disabled twin says what would make it available, and does not
         // repeat the trade -- there is nothing to weigh on a server this
@@ -8463,11 +11424,13 @@ mod modal_tests {
         // again returned as raw shapes for the id-clash guards; and
         // `cursor_over_notes`, which is the same frame again read for its
         // cursor rather than its shapes, because a hit rectangle a test may
-        // not click can only be witnessed by hovering it. All four are tests;
-        // the production callers are still the two shells.
+        // not click can only be witnessed by hovering it -- and `tall_frame`,
+        // which is the same frame once more on a viewport tall enough that
+        // the Local API page's scroll region culls nothing. All five are
+        // tests; the production callers are still the two shells.
         assert_eq!(
             source.match_indices(body_calls).count(),
-            7,
+            8,
             "the number of `draw_prefs_body` sites changed; if a THIRD production caller \
              was added, confirm it is a shell and not a second form"
         );
@@ -8479,4 +11442,5 @@ mod modal_tests {
             );
         }
     }
+
 }

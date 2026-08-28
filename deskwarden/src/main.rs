@@ -201,6 +201,10 @@ fn main() {
         // A window, and nothing else. It never takes the mutex, never asks
         // anyone to stand down, and never comes back here.
         Ok(LaunchIntent::Ui(surface)) => std::process::exit(run_as_a_ui_process(surface)),
+        // The vault service. Like a UI process, it never takes the app
+        // mutex, never asks another instance to stand down, and never
+        // comes back here.
+        Ok(LaunchIntent::Service(mode)) => std::process::exit(run_as_the_vault_service(mode)),
         // **Refused, not fallen back on.** See `UiLaunchRefusal`: every
         // available fallback either opens a window nobody asked for or starts
         // a second full daemon out of a command line that asked for a window.
@@ -244,8 +248,9 @@ fn main() {
     // Bound with a name, and never `let _`: a `_`-bound guard drops at once,
     // which would release the slot on the next line and make every reading
     // of it a lie.
-    let vault_slot = deskwarden::vault_service::attach(&deskwarden::vault_service::windows_env());
-    match &vault_slot {
+    let vault_attachment =
+        deskwarden::vault_service::attach(&deskwarden::vault_service::windows_env());
+    match &vault_attachment {
         Some(slot) => log::info!(
             "vault attachment slot {} claimed; anyone_attached={}",
             slot.slot(),
@@ -1970,7 +1975,9 @@ fn main() {
     // vault window opening, the tray's Sync item, another lock) restarts it
     // only for as long as it is actually needed and reconciles again
     // afterwards -- see `stop_backend_if_idle` and the main loop below.
-    stop_backend_if_idle(&mut estate.child, estate.settings.keep_backend_running);
+    // `false`: this runs before the loop, and any startup window has
+    // already closed by the time it does.
+    stop_backend_if_idle(&mut estate.child, estate.settings.keep_backend_running, false);
 
     // The tray icon and the global hotkey manager each create a hidden
     // Win32 window on the thread that builds them (here, the main thread)
@@ -2256,6 +2263,11 @@ fn main() {
     // it instead of opening a second one and so its exit is noticed at all.
     // See `UiWindows`.
     let mut ui_windows = UiWindows::default();
+    // When the loop last started a backend because somebody attached. Kept
+    // here rather than in the estate because it is a fact about this LOOP's
+    // throttling, not about the vault session -- a re-settle must not clear
+    // it and hand a failing server a fresh burst of attempts.
+    let mut last_attachment_start: Option<Instant> = None;
 
     // **The startup window's vault outcome, dispatched by the one dispatcher.**
     //
@@ -3256,8 +3268,45 @@ fn main() {
         // throttling it) -- the three places that *do* need the backend
         // (startup, `open_vault_window`, the tray's Sync item) each ask for
         // it explicitly and this only ever tears it back down afterwards.
+        // Asked ONCE and used by both halves below, so the thing that
+        // stops the backend and the thing that starts it cannot come to
+        // disagree about who needs it.
+        let somebody_needs_the_vault = ui_windows.vault_pid().is_some()
+            || deskwarden::vault_service::anyone_else_attached(
+                &deskwarden::vault_service::windows_env(),
+                vault_attachment.as_ref().map(deskwarden::vault_service::Attachment::slot),
+            );
+
+        // **The start half, and it fires on a fact rather than on the loop
+        // going round.** Somebody is holding an attachment slot, so they
+        // need the vault; the vault service is a separate process with no
+        // channel to this one, and the attachment IS the channel. Without
+        // this the service could keep a backend alive but never cause one.
+        if attachment_needs_a_backend_start(
+            somebody_needs_the_vault,
+            &estate.task_in_progress,
+            backend_is_running(&mut estate.child),
+            last_attachment_start.map(|at: Instant| at.elapsed()),
+            ATTACHMENT_START_COOLDOWN,
+        ) {
+            log::info!("something is attached to the vault and the backend is down; starting it");
+            last_attachment_start = Some(Instant::now());
+            spawn_backend_start(
+                estate.token.to_string(),
+                Arc::clone(&job),
+                backend_op_tx.clone(),
+            );
+        }
+
         if estate.task_in_progress.is_none() {
-            stop_backend_if_idle(&mut estate.child, estate.settings.keep_backend_running);
+            stop_backend_if_idle(
+                &mut estate.child,
+                estate.settings.keep_backend_running,
+                // **The input that was missing.** Without it this stopped
+                // `bw serve` out from under a window that had just asked
+                // for it, one second after it came up.
+                somebody_needs_the_vault,
+            );
         }
 
         if last_update_check.elapsed() >= UPDATE_CHECK_INTERVAL {
@@ -6974,6 +7023,23 @@ fn run_vault_loop(
         // guards' rule and this exit do not overlap, and keeping them
         // textually apart is what keeps that visible.
         let opened_here = if first_result.is_none() {
+            // **Ask for the backend before the window that needs it.**
+            // `stop_backend_if_idle` has very likely just stopped it: in
+            // save-memory mode nothing needed it a moment ago, and a
+            // window is exactly the thing that changes that. Asked here
+            // because here is where `est.child` is known -- `open_window`
+            // itself cannot see it, which is how the ask came to be lost.
+            if window_needs_the_backend_started(
+                backend_is_running(&mut est.child),
+                est.settings.keep_backend_running,
+            ) {
+                log::info!("the vault window needs bw serve; starting it before the window");
+                spawn_backend_start(
+                    est.token.to_string(),
+                    Arc::clone(deps.job),
+                    deps.backend_op_tx.clone(),
+                );
+            }
             let (returned, session) = ops.open_window(est, deps);
             est = returned;
             let Some(session) = session else { return est };
@@ -8470,8 +8536,48 @@ fn backend_is_running(child: &mut Option<Child>) -> bool {
 /// backend -- startup, `open_vault_window`, and the tray's Sync item -- each
 /// ask for it explicitly instead; this function only ever tears it back
 /// down again afterwards once the policy says it's no longer needed.
-fn stop_backend_if_idle(bw_serve_child: &mut Option<Child>, keep_backend_running: bool) {
-    if backend_policy::should_run(backend_policy::selected(), keep_backend_running) {
+/// Whether opening the vault window has to start `bw serve` first.
+///
+/// **The missing half of [`stop_backend_if_idle`].** That function's own
+/// doc names the three places that must ask for the backend explicitly --
+/// "startup, `open_vault_window`, and the tray's Sync item" -- because
+/// nothing starts it on their behalf. When the vault window moved into a
+/// process of its own, the asking was left behind on the in-daemon path,
+/// and `open_vault_window` stopped being one of the three.
+///
+/// What that cost, with `keep_backend_running` off: the daemon stops
+/// `bw serve` the moment nothing needs it, then spawns a window that polls
+/// `localhost:8087` for fifty-seven seconds and gives up with zero items.
+/// **And the only switch for that setting lives inside the window that
+/// cannot load**, so the state is self-trapping -- a user who turns
+/// save-memory mode on has no way back through the app.
+///
+/// Pure, and a mirror of `stop_backend_if_idle`'s first line, so the two
+/// halves of "should the backend be up right now" are one rule read from
+/// two directions rather than two rules that can disagree.
+fn window_needs_the_backend_started(
+    backend_running: bool,
+    keep_backend_running: bool,
+) -> bool {
+    if backend_running {
+        return false;
+    }
+    // Exactly `should_run`'s question. On a direct-REST account it answers
+    // false and nothing is started, which is right: that account has no
+    // `bw serve` to want.
+    backend_policy::bw_serve_is_selected() || keep_backend_running
+}
+
+fn stop_backend_if_idle(
+    bw_serve_child: &mut Option<Child>,
+    keep_backend_running: bool,
+    a_vault_window_is_open: bool,
+) {
+    if backend_policy::should_run(
+        backend_policy::selected(),
+        keep_backend_running,
+        a_vault_window_is_open,
+    ) {
         return;
     }
     if backend_is_running(bw_serve_child) {
@@ -8513,6 +8619,52 @@ fn needs_backend_start(
     backend_already_running: bool,
 ) -> bool {
     backend_task_in_progress.is_none() && !backend_already_running
+}
+
+/// How long to wait before trying again after a start that did not take.
+///
+/// **This constant is the whole answer to the retry storm.**
+/// `stop_backend_if_idle`'s doc explains why the idle loop must never
+/// start a backend on its own: it runs every ~200ms, so a backend that
+/// keeps failing to start would be retried five times a second forever,
+/// each attempt paying a port wait and a `bw sync`. Thirty seconds is long
+/// enough that a wedged server costs two attempts a minute rather than
+/// three hundred, and short enough that a script waiting on the service
+/// is not left for minutes after the cause clears.
+const ATTACHMENT_START_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Whether an attachment by somebody else should start the backend now.
+///
+/// **The symmetric counterpart to [`stop_backend_if_idle`]**, and the
+/// reason it can exist where a general idle start could not: this fires on
+/// a *fact about another process* -- somebody is holding an attachment
+/// slot and therefore needs the vault -- rather than on the loop merely
+/// going round again.
+///
+/// Without it the vault service could keep a backend alive but never cause
+/// one, so a script got `locked` or `503` unless a window or the tray's
+/// Sync had already brought `bw serve` up. The service is a separate
+/// process with no channel to the daemon; the attachment IS the channel.
+///
+/// `since_last_attempt` is a `Duration` rather than an `Instant` so this
+/// stays pure and the cooldown is testable without waiting for one.
+fn attachment_needs_a_backend_start(
+    anyone_else_attached: bool,
+    backend_task_in_progress: &Option<(Instant, BackendOpKind)>,
+    backend_already_running: bool,
+    since_last_attempt: Option<Duration>,
+    cooldown: Duration,
+) -> bool {
+    if !anyone_else_attached {
+        return false;
+    }
+    if !needs_backend_start(backend_task_in_progress, backend_already_running) {
+        return false;
+    }
+    match since_last_attempt {
+        None => true,
+        Some(since) => since >= cooldown,
+    }
 }
 
 /// Which kind of background backend operation `backend_task_in_progress` is
@@ -9373,6 +9525,21 @@ const AUTOSTART_FLAG: &str = "--autostart";
 /// tray, no hotkey and no daemon behind it. The installer's one flag is
 /// [`AUTOSTART_FLAG`], and that guard is the other side of
 /// `the_installers_run_entry_passes_the_flag_the_app_reads`.
+/// The word that starts the local vault service instead of the daemon.
+///
+/// Written by two writers and no others: the installer, for the 24/7
+/// mode, and an app that finds no service running. Matched whole, like
+/// [`UI_FLAG`], so a path containing the word is not a request.
+const SERVICE_FLAG: &str = "--service";
+
+/// The word after [`SERVICE_FLAG`] that asks for the installed lifetime.
+///
+/// Absent means consumer-driven, which is the safe default: a service
+/// that exits when the last app lets go cannot outlive anything by
+/// accident. Holding a slot forever is the deliberate choice, so it is
+/// the one that needs a word.
+const INSTALLED_WORD: &str = "installed";
+
 const UI_FLAG: &str = "--ui";
 
 /// **Which window a UI process was asked for.**
@@ -9502,6 +9669,15 @@ enum LaunchIntent {
     /// `.superpowers/sdd/ui-process-split-report.md` for why the spawn is not
     /// wired yet.
     Ui(Surface),
+    /// **The local vault service, and nothing else.** No tray icon, no
+    /// hotkey, no window, and no `bw serve` -- it IS the backend. It
+    /// holds an attachment slot only in
+    /// [`deskwarden::service_host::Mode::Installed`], which is the whole
+    /// difference between the two lifetimes.
+    ///
+    /// Parsed here; the loop that answers it is the next task, and until
+    /// that exists this is a command line no part of this app writes.
+    Service(deskwarden::service_host::Mode),
 }
 
 /// Reads [`LaunchIntent`] off the command line.
@@ -9561,6 +9737,29 @@ fn launch_intent<S: AsRef<str>>(
     // Whole-argument matching, exactly as `AUTOSTART_FLAG` is matched below
     // and for the same reason: `C:\--ui tools\deskwarden.exe` is a path, not a
     // request for a window.
+    // Answered before `--ui` for the same reason `--ui` is answered before
+    // `--autostart`: it is the most specific thing a command line can say,
+    // and a process asked to be the service must not become a daemon
+    // because another flag was also present.
+    if let Some(at) = args.iter().position(|arg| arg == SERVICE_FLAG) {
+        return match args.get(at + 1) {
+            None => Ok(LaunchIntent::Service(deskwarden::service_host::Mode::ConsumerDriven)),
+            Some(word) if word == INSTALLED_WORD => {
+                Ok(LaunchIntent::Service(deskwarden::service_host::Mode::Installed))
+            }
+            // A word that follows another FLAG is not this flag's
+            // argument: `--service --autostart` asks for the default
+            // lifetime, not for an unknown one.
+            Some(word) if word.starts_with("--") => {
+                Ok(LaunchIntent::Service(deskwarden::service_host::Mode::ConsumerDriven))
+            }
+            // Anything else is refused rather than guessed at. Guessing
+            // here would mean a typo silently choosing a lifetime, and
+            // one of the two lifetimes never exits on its own.
+            Some(word) => Err(UiLaunchRefusal::UnknownSurface(word.clone())),
+        };
+    }
+
     if let Some(at) = args.iter().position(|arg| arg == UI_FLAG) {
         return match args.get(at + 1) {
             None => Err(UiLaunchRefusal::NoSurface),
@@ -9641,6 +9840,247 @@ fn refuse_a_ui_launch(refusal: &UiLaunchRefusal) -> i32 {
 /// with, and a UI process that authenticated would hand the daemon a backend
 /// it did not start and a token it does not know about. Moving the sign-in
 /// flow across is Task 7 of the plan and is not done here.
+/// **The local vault service.** Binds a loopback port, answers `bw serve`'s
+/// API, and serves only what the presented key is scoped to.
+///
+/// Returns the exit code rather than calling `exit`, exactly as
+/// [`run_as_a_ui_process`] does and for its reason: every arm of `main`'s
+/// branch ends the process on one line, and nothing here can be mistaken for
+/// a path that continues into the daemon's startup.
+///
+/// # It does not ask for a master password, and that is the point
+///
+/// The daemon already stores a DPAPI-wrapped [`rest::api::Authenticated`] per
+/// account, and this loads the same one. So the service needs no new
+/// cryptography, no second copy of the login flow, and no way to take a
+/// master password at all -- the credential it uses is one the owner already
+/// created by signing in, unwrappable only under their Windows account.
+///
+/// **If there is no stored key it refuses to start**, rather than standing up
+/// an endpoint that answers every request with an error. A service that is
+/// listening but cannot read the vault is a thing scripts retry against; one
+/// that never started is a thing the owner fixes.
+///
+/// # Every request re-reads the vault
+///
+/// Deliberate, and the slow-but-correct choice on purpose: a snapshot held
+/// here would go stale against edits made in the app, and this process is
+/// answering a script rather than a keystroke. `CachingBackend` is the place
+/// that decision gets revisited, not this loop.
+fn run_as_the_vault_service(mode: deskwarden::service_host::Mode) -> i32 {
+    // No log file exists yet in this process -- `logging::init` belongs to the
+    // daemon's startup, which this branch never reaches -- so this opens one
+    // itself before saying anything, exactly as `refuse_a_ui_launch` does.
+    let Some(config_dir) = settings::config_dir() else {
+        return 3;
+    };
+    let _ = logging::init(&config_dir);
+
+    let settings = settings::Settings::load(&config_dir.join("settings.json"));
+
+    // **First, and before anything reads a credential.** See
+    // `service_start_refusal`.
+    if let Some(refusal) = service_start_refusal(settings.service_enabled) {
+        log::error!("{refusal}");
+        return 3;
+    }
+
+    let Some(active) = settings.active_account.as_ref() else {
+        log::error!("the vault service has no active account to serve; sign in with Deskwarden first");
+        return 3;
+    };
+    let Some(account) = accounts::account_for(&settings.accounts, active) else {
+        log::error!("the active account is not in the account list; refusing to guess which one to serve");
+        return 3;
+    };
+
+    // **Whichever backend this account is actually configured for.**
+    //
+    // The service serves `bw serve`'s API, and `serve_the_vault` holds a
+    // `&dyn VaultBackend` -- it has no idea which implementation is behind
+    // it, and neither does the consumer. So who DECRYPTS is a setting, not
+    // a property of this service:
+    //
+    //     bw decrypts      server -> bw -> us -> consumer
+    //     we decrypt       server -> us -> consumer
+    //
+    // An earlier version hard-coded the direct-REST backend and refused to
+    // start without a stored vault key. That was not a requirement of
+    // anything here; it was the first backend wired, mistaken for the only
+    // one. It also made the service unreachable for every owner on the
+    // default backend -- the ones who would most benefit, since `bw serve`
+    // has no authentication at all and this puts scoped, expiring keys in
+    // front of it.
+    let inner: std::sync::Arc<dyn deskwarden::vault_backend::VaultBackend> =
+        match backend_policy::selected() {
+            backend_policy::VaultBackendChoice::DirectRest => {
+                let key_store = deskwarden::user_key_store::UserKeyStore::new(
+                    accounts::user_key_path_for(&config_dir, &account.id),
+                );
+                let Some(authenticated) = key_store.load() else {
+                    log::error!(
+                        "this account is served by the built-in client, but no vault key is \
+                         stored for it. The service never asks for a master password -- it uses \
+                         the credential the app saves when you sign in, so sign in with \
+                         Deskwarden once and start the service again."
+                    );
+                    return 3;
+                };
+                // No default URL: `backend_policy` is explicit that direct
+                // REST needs a self-hosted server, and inventing one would
+                // point this at somebody else's on an account that never
+                // asked for it.
+                let Some(server_url) = account.server_url.clone() else {
+                    log::error!(
+                        "this account is served by the built-in client but has no server URL, \
+                         so there is nothing for the service to talk to"
+                    );
+                    return 3;
+                };
+                std::sync::Arc::new(rest::backend::RestBackend::new(
+                    rest::api::RestClient::new(server_url),
+                    authenticated,
+                ))
+            }
+            backend_policy::VaultBackendChoice::BwServe => {
+                // **This service does not start `bw serve`, and does not
+                // stop it.** The daemon owns that child and its job object.
+                // If it is not up, reads fail and the loop answers 503 --
+                // which is the honest answer, and is what `/status`
+                // reports as locked. Starting one here would put a second
+                // owner on the same port, which is the state
+                // `backend_policy`'s twelve entry points exist to prevent.
+                log::info!(
+                    "serving the vault over bw serve at {BW_SERVE_URL}; this service does \
+                     not start or stop it"
+                );
+                std::sync::Arc::new(VaultBridge::new(BW_SERVE_URL))
+            }
+        };
+
+    // **And whether reads go through the encrypted cache**, which is the
+    // other axis and is orthogonal to the first: `CachingBackend` decorates
+    // `Arc<dyn VaultBackend>`, so it wraps either implementation. Between
+    // the two settings there are four shapes, and a consumer cannot tell
+    // them apart -- that is the whole reason this speaks `bw serve`'s API
+    // rather than one of its own.
+    let read_path = backend_policy::read_path(
+        settings.cache_vault_to_disk,
+        settings.read_through_cache,
+    );
+    let backend: std::sync::Arc<dyn deskwarden::vault_backend::VaultBackend> = match read_path {
+        backend_policy::ReadPath::CacheFirst => {
+            let disk = std::sync::Arc::new(deskwarden::vault_disk_cache::DiskCache::new(
+                &accounts::data_dir_for(&config_dir, &account.id),
+                deskwarden::vault_disk_cache::DiskCacheEnv::production(),
+            ));
+            log::info!("reads are answered from the encrypted cache first");
+            std::sync::Arc::new(deskwarden::vault_backend::CachingBackend::new(inner, disk))
+        }
+        backend_policy::ReadPath::ServiceOnly => inner,
+    };
+    // **Default deny is what makes this safe to start.** No key file means no
+    // key, and every request is answered `401` -- the service is unreachable
+    // until the owner deliberately mints one.
+    let keys = deskwarden::service_keys::load(&service_keys_path(&config_dir));
+    if keys.is_empty() {
+        log::warn!(
+            "the vault service is running with no API keys, so every request will be refused. \
+             Mint one in Preferences to make it reachable."
+        );
+    }
+
+    // **Held for as long as this service serves, in either lifetime.**
+    //
+    // `slots_to_hold` was about which lifetime keeps the SERVICE alive.
+    // This is a different question: while the service is up it is a
+    // consumer of the vault like any window, and the daemon has to know
+    // that or save-memory mode stops `bw serve` under it and every script
+    // gets a 503. That is the hole this counting was built to close, and
+    // this is its first real caller.
+    let _slot = deskwarden::vault_service::attach(&deskwarden::vault_service::windows_env());
+    if _slot.is_none() {
+        log::warn!(
+            "no free attachment slot; the daemon will not know this service needs the \
+             backend, so reads may fail while save-memory mode is on"
+        );
+    }
+
+    let addr = deskwarden::service_host::listen_addr(0);
+    let server = match tiny_http::Server::http(addr) {
+        Ok(server) => server,
+        Err(e) => {
+            log::error!("the vault service could not listen on {addr}: {e}");
+            return 3;
+        }
+    };
+    let port = server.server_addr().to_ip().map_or(0, |a| a.port());
+    log::info!("the vault service is listening on 127.0.0.1:{port} in {mode:?} mode");
+
+    deskwarden::service_host::serve_the_vault(&server, backend.as_ref(), &keys);
+    0
+}
+
+/// **Whether the owner has agreed to any of this**, as a value.
+///
+/// `Some` is the sentence the log gets and the reason the service does not
+/// start; `None` is permission to carry on. A function rather than an `if` in
+/// [`run_as_the_vault_service`] because everything else in that function's
+/// prologue is unreachable from a test -- it reads `%APPDATA%`, unwraps a
+/// DPAPI-sealed vault key and binds a socket -- and this feature has already
+/// had two bugs that lived in exactly that untestable shape.
+///
+/// # It is asked FIRST, before anything reads a credential
+///
+/// `settings::Settings::service_enabled` defaults to `false`, so an install
+/// whose owner has never seen the switch reads as off. Answering that here,
+/// above the account lookup and the key store, is what makes "off" mean *the
+/// vault key is never unwrapped* rather than *the port is not bound at the
+/// end*. `the_setting_is_read_before_the_vault_key_is` pins the ordering,
+/// because the ordering is the part a later edit could quietly lose while
+/// every other test still passed.
+///
+/// # Why the other three refusals are not in here
+///
+/// No active account, no server URL and no stored key are refusals too, and
+/// merging them would look tidier. They are deliberately left where they are:
+///
+/// * Each is the *precondition of the next*. The key store path is built from
+///   the account's id and the server URL is read off the account, so they
+///   cannot be reduced to independent booleans without doing the work first
+///   -- which would mean unwrapping the vault credential to decide whether a
+///   disabled service should start. That is the exact thing this gate exists
+///   to prevent.
+/// * They are facts about *this machine's state*, discovered by reading it,
+///   and each already carries its own sentence at the point it is discovered.
+///   This one is a fact about *consent*, is knowable from one `bool`, and is
+///   the only one of the four that is a policy rather than a diagnosis.
+///
+/// So the split is not "pure things here, impure things there" -- it is that
+/// this decision has an input a test can supply and the others do not.
+fn service_start_refusal(enabled: bool) -> Option<&'static str> {
+    if enabled {
+        return None;
+    }
+    // Names the switch and where it lives, because a refusal the owner cannot
+    // act on is a refusal they will read as a crash. The service is off by
+    // default, so this is the line most owners meet first.
+    Some(
+        "the vault service is switched off, so it will not start. Nothing was bound and no \
+         vault key was read. Turn it on in Deskwarden's Preferences, under Local API -- it \
+         is off by default, \
+         and while it is on it serves decrypted vault items to any program on this machine \
+         holding an API key -- then start the service again.",
+    )
+}
+
+/// Where the API keys live. Beside `settings.json`, in the directory this app
+/// already owns.
+fn service_keys_path(config_dir: &std::path::Path) -> std::path::PathBuf {
+    deskwarden::service_keys::key_store_path(config_dir)
+}
+
+
 fn run_as_a_ui_process(surface: Surface) -> i32 {
     let Some(project_dirs) = directories::ProjectDirs::from("dev", "Deskwarden", "Deskwarden")
     else {
@@ -9850,6 +10290,13 @@ fn first_surface(intent: LaunchIntent) -> FirstSurface {
         // `Ui` before that point is the next task; this arm is the honest
         // total answer until it exists.
         LaunchIntent::Ui(_) => FirstSurface::ShowTheWindow,
+        // **The service has no first surface at all**, and this arm exists
+        // so that saying so is a decision rather than a catch-all. It is not
+        // reached in production for the same reason the arm above is not:
+        // `main` answers `Service` a thousand lines earlier and never comes
+        // back here. Staying in the tray is the safe total answer -- a
+        // service that somehow reached this must not put a window on screen.
+        LaunchIntent::Service(_) => FirstSurface::StayInTheTray,
     }
 }
 
@@ -11275,6 +11722,561 @@ fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) 
 mod tests {
     use super::*;
 
+    // --- The vault service's per-request join-up ------------------------
+    //
+    // `answer_one_request` is the one place the decision, the body and the
+    // status meet. Each of the three modules behind it proves things about
+    // itself; none of them can prove that this function pairs them up the way
+    // it should, and a mistake here would defeat all of them at once. These
+    // drive it as the pure function it is: no port, no clock, no vault.
+
+    use deskwarden::service_keys::{hash_key, Access, KeyRecord, Scope, Subject};
+    // The loop these drive now lives in the library, so that a real socket
+    // can reach it too -- see `service_host`'s note. They stay here beside
+    // `service_start_refusal`'s tests, which cover `main`'s own decision.
+    use deskwarden::service_host::answer_one_request;
+    use deskwarden::vault_bridge::{Folder, ItemKind, VaultItem};
+
+    /// A live key with the scopes given, matching the literal `"the-key"`.
+    fn service_key(scopes: Vec<Scope>) -> KeyRecord {
+        KeyRecord {
+            name: "a test key".to_string(),
+            hash: hash_key("the-key"),
+            created_unix: 1,
+            expires_unix: None,
+            scopes,
+        }
+    }
+
+    fn read_scope(subject: Subject) -> Scope {
+        Scope { subject, access: Access::Read }
+    }
+
+    /// Built through `serde_json` rather than by naming fields, exactly as
+    /// `service_body`'s own fixtures are: a `VaultItem` is a deserialised
+    /// wire shape, and a fixture that skipped the deserialiser would be a
+    /// shape this code never actually meets.
+    fn service_item(id: &str, name: &str, kind: i64) -> VaultItem {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
+            "type": kind,
+            "login": { "username": "someone@example.com", "password": "hunter2",
+                       "uris": [{ "uri": "https://example.com" }] },
+        }))
+        .expect("the fixture must parse as a VaultItem")
+    }
+
+    /// The vault every test below serves from: one login and one card, so
+    /// that "only what this key may see" is a distinction that can fail.
+    fn a_small_vault() -> Result<(Vec<VaultItem>, Vec<Folder>), String> {
+        Ok((vec![service_item("login-1", "Example", 1), service_item("card-1", "Bank", 3)], Vec::new()))
+    }
+
+    /// A vault loader that fails the test if it is ever called. Handed to
+    /// every request that must not reach the vault at all.
+    fn no_vault() -> Result<(Vec<VaultItem>, Vec<Folder>), String> {
+        panic!("the vault was loaded for a request that was refused before it could read one");
+    }
+
+    const A_LIVE_KEY: Option<&str> = Some("Bearer the-key");
+
+    /// **A caller with no credential is told nothing, including in the
+    /// body.**
+    ///
+    /// The status is the smaller half of this. `service_body::body_for`
+    /// answers `None` for every refusal precisely so that a refused request
+    /// carries no bytes, and that guarantee is only worth anything if the
+    /// code that turns an answer into a reply honours it -- an empty `401` and
+    /// a `401` whose body happens to contain the vault are the same status
+    /// code. So the body is asserted to be empty, not merely "not the vault".
+    ///
+    /// The loader panics, which makes this also the assertion that an
+    /// unauthenticated request does not make this process fetch anything: the
+    /// caller is unknown, and letting them drive two network round trips per
+    /// connection is a cost handed to a stranger.
+    #[test]
+    fn an_unauthenticated_request_is_refused_with_an_empty_body() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        for auth in [None, Some("Bearer wrong"), Some("the-key")] {
+            let reply =
+                answer_one_request("GET", "/list/object/items", auth, &keys, 1_000, no_vault);
+            assert_eq!(reply.status, 401, "{auth:?} was not refused");
+            assert_eq!(reply.body, "", "a refused request was handed a body: {}", reply.body);
+        }
+    }
+
+    /// Control for the test above: the same request WITH the credential is
+    /// served, and served something. Without this, an
+    /// `answer_one_request` that returned an empty `401` unconditionally
+    /// would pass every assertion up there.
+    #[test]
+    fn the_same_request_with_a_credential_is_served() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply =
+            answer_one_request("GET", "/list/object/items", A_LIVE_KEY, &keys, 1_000, a_small_vault);
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.contains("login-1"), "the granted vault was not served: {}", reply.body);
+    }
+
+    /// **A scoped key is served the vault narrowed to its scope, and the
+    /// narrowing has to survive this function.**
+    ///
+    /// `service_body` filters, and it is tested that it filters. What is
+    /// tested here is that the filtered body is the one that reaches the
+    /// reply: a join-up that built the body from the wrong key, or that fell
+    /// back to an unfiltered list on any path, would leave every test in
+    /// `service_body` passing and still put a card on the wire.
+    #[test]
+    fn a_category_scoped_key_is_served_only_its_category() {
+        let keys = [service_key(vec![read_scope(Subject::Category(ItemKind::Login))])];
+        let reply =
+            answer_one_request("GET", "/list/object/items", A_LIVE_KEY, &keys, 1_000, a_small_vault);
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.contains("login-1"), "control: the granted item is missing");
+        assert!(!reply.body.contains("card-1"), "a card reached a key scoped to logins");
+        assert!(!reply.body.contains("Bank"), "a card's name reached a key scoped to logins");
+    }
+
+    /// **Refusing a scope is a different sentence from refusing a
+    /// credential, and this is where the two could be flattened into one.**
+    ///
+    /// A key that names one item and is asked for another is `403`: its
+    /// credential is right and does not cover this. Answering `401` would
+    /// send the owner looking for a broken key, and answering `200` with an
+    /// empty body would tell a script the item is empty rather than off
+    /// limits. The vault is never loaded for it either -- the id was refused
+    /// before anything went looking for it.
+    #[test]
+    fn a_key_scoped_to_one_item_is_refused_another_with_403() {
+        let keys = [service_key(vec![read_scope(Subject::Item("login-1".to_string()))])];
+        let refused =
+            answer_one_request("GET", "/object/item/card-1", A_LIVE_KEY, &keys, 1_000, no_vault);
+        assert_eq!(refused.status, 403, "an out-of-scope item was not refused as out of scope");
+        assert_eq!(refused.body, "", "a forbidden request was handed a body: {}", refused.body);
+
+        // Control: the item this key DOES name is served, so the assertions
+        // above are not describing a function that refuses everything.
+        let served = answer_one_request(
+            "GET",
+            "/object/item/login-1",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            a_small_vault,
+        );
+        assert_eq!(served.status, 200, "control: the granted item was refused too");
+        assert!(served.body.contains("login-1"));
+    }
+
+    /// **`POST /auth` is answered honestly, and not in the shape of a failed
+    /// password.**
+    ///
+    /// This service has no way to take a master password and is not going to
+    /// grow one; the credential it accepts is an API key. The danger in
+    /// answering `/auth` at all is that the obvious answer -- `401` -- is
+    /// exactly what a client sees when a password was WRONG, so a script
+    /// would retry, prompt the owner, and eventually have them typing their
+    /// master password at something that cannot use it. `501` says the
+    /// A vault loader that fails, standing in for an expired session, a
+    /// server that is down, or a network that is gone.
+    fn unreadable_vault() -> Result<(Vec<VaultItem>, Vec<Folder>), String> {
+        Err("the session is no longer valid".to_string())
+    }
+
+    /// **A vault that could not be read is not an empty vault.**
+    ///
+    /// This was `unwrap_or_default()`, which answered 200 with zero items
+    /// when the read failed. A backup script writes an empty backup; a
+    /// sync script deletes everything. It is the same mistake the service
+    /// refuses at start-up, made one layer down where that refusal did
+    /// not reach.
+    #[test]
+    fn a_vault_that_cannot_be_read_is_not_served_as_an_empty_one() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply = answer_one_request(
+            "GET",
+            "/list/object/items",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            unreadable_vault,
+        );
+        assert_eq!(
+            reply.status, 503,
+            "a failed read was reported as success, which a script cannot tell from an empty vault"
+        );
+        assert!(
+            !reply.body.contains("\"data\""),
+            "the failure carried a data envelope a client would parse as a vault: {}",
+            reply.body
+        );
+    }
+
+    /// Control for the test above: the same request against a vault that CAN
+    /// be read is served. Without it, a function that answered 503 always
+    /// would pass.
+    #[test]
+    fn a_readable_vault_is_still_served() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply = answer_one_request(
+            "GET",
+            "/list/object/items",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            a_small_vault,
+        );
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.contains("login-1"));
+    }
+
+    /// **`/status` is the one route with an answer when the vault cannot
+    /// be read**, and it is the answer a polling script needs.
+    #[test]
+    fn status_reports_locked_when_the_vault_cannot_be_read() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let unreadable =
+            answer_one_request("GET", "/status", A_LIVE_KEY, &keys, 1_000, unreadable_vault);
+        assert_eq!(unreadable.status, 200, "a status poll should answer, not fail");
+        assert!(
+            unreadable.body.contains("locked"),
+            "status did not report locked while the vault was unreadable: {}",
+            unreadable.body
+        );
+
+        // The control, and the bug it replaces: `locked` used to be
+        // hard-coded `false`, so this half passed while the half above
+        // could not have.
+        let readable =
+            answer_one_request("GET", "/status", A_LIVE_KEY, &keys, 1_000, a_small_vault);
+        assert_eq!(readable.status, 200);
+        assert!(
+            readable.body.contains("unlocked"),
+            "status did not report unlocked while the vault was readable: {}",
+            readable.body
+        );
+    }
+
+    /// A request that is refused must not reach the loader at all, even
+    /// now that the loader can fail: an unauthenticated caller gets 401,
+    /// never 503, because a 503 would confirm the service is there and
+    /// merely unwell.
+    #[test]
+    fn a_refused_request_is_not_told_the_vault_is_unreadable() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply =
+            answer_one_request("GET", "/list/object/items", None, &keys, 1_000, unreadable_vault);
+        assert_eq!(reply.status, 401);
+        assert!(reply.body.is_empty());
+    }
+
+    /// **A write must not answer 200 with the item.**
+    ///
+    /// `decide` maps every non-GET method to `Access::Write` and lets a
+    /// write-scoped key through; `body_for` is never told the method and
+    /// answers with the item anyway. So `PUT /object/item/{id}` used to
+    /// return 200 and the item, having changed nothing -- which a script
+    /// reads as a write that landed. Silent data loss from the caller's
+    /// side, and the reason this refusal exists.
+    #[test]
+    fn a_write_is_refused_as_unbuilt_rather_than_answered_with_the_item() {
+        let keys = [service_key(vec![
+            read_scope(Subject::All),
+            Scope { subject: Subject::All, access: Access::Write },
+        ])];
+        for method in ["PUT", "POST", "DELETE", "PATCH"] {
+            let reply = answer_one_request(
+                method,
+                "/object/item/login-1",
+                A_LIVE_KEY,
+                &keys,
+                0,
+                || panic!("a write must not reach the vault: it cannot use it"),
+            );
+            assert_eq!(reply.status, 501, "{method} did not report that writing is unbuilt");
+            assert!(
+                !reply.body.contains("login-1"),
+                "{method} answered with the item, which reads as a successful write: {}",
+                reply.body
+            );
+        }
+    }
+
+    /// Control for the test above: the same key, the same item, a GET --
+    /// which must still be served. Without this, a function that refused
+    /// everything would pass.
+    #[test]
+    fn the_same_key_and_item_are_still_served_for_a_read() {
+        let keys = [service_key(vec![
+            read_scope(Subject::All),
+            Scope { subject: Subject::All, access: Access::Write },
+        ])];
+        let reply = answer_one_request(
+            "GET",
+            "/object/item/login-1",
+            A_LIVE_KEY,
+            &keys,
+            0,
+            a_small_vault,
+        );
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.contains("login-1"));
+    }
+
+    /// **A key with no write grant is told 403, not 501.** The order
+    /// matters: an unauthorised caller must not learn which features are
+    /// built from the shape of its refusal.
+    #[test]
+    fn an_unscoped_write_is_refused_before_it_learns_writing_is_unbuilt() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply = answer_one_request(
+            "PUT",
+            "/object/item/login-1",
+            A_LIVE_KEY,
+            &keys,
+            0,
+            || panic!("a refused write must not reach the vault"),
+        );
+        assert_eq!(
+            reply.status, 403,
+            "a key without a write grant was told writing is unbuilt, which is a fact about this service it had not earned"
+        );
+        assert!(reply.body.is_empty(), "a refusal carried a body");
+    }
+    /// route is not implemented, which is a thing a client can stop on.
+    #[test]
+    fn the_auth_route_answers_not_implemented_rather_than_a_bad_password() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply = answer_one_request("POST", "/auth", None, &keys, 1_000, no_vault);
+        assert_eq!(reply.status, 501);
+        assert_ne!(
+            reply.status,
+            deskwarden::service_host::failed_auth_status(),
+            "the auth route answers with the status of a rejected password"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&reply.body).expect("control: the auth refusal is not valid JSON");
+        assert_eq!(parsed["success"], false, "control: the body does not say it failed");
+        let message = parsed["message"].as_str().expect("control: there is no message to read");
+        for resembles_a_password_failure in
+            ["invalid_grant", "invalid_username_or_password", "incorrect", "try again", "Verify"]
+        {
+            assert!(
+                !message.contains(resembles_a_password_failure),
+                "the auth refusal reads like a rejected password: {message}"
+            );
+        }
+        assert!(
+            message.contains("API key"),
+            "control: the refusal does not say what to present instead: {message}"
+        );
+    }
+
+    /// **A route nobody serves is `404`, and only once the caller is
+    /// known.**
+    ///
+    /// The ordering behind this is `service_api`'s -- an unauthenticated
+    /// caller gets `401` for a path that does not exist, so that the set of
+    /// real routes is not a map handed to a stranger. This asserts the pair
+    /// that makes that ordering observable from the outside: the same path,
+    /// with and without a credential, must give two different answers.
+    #[test]
+    fn an_unknown_route_is_404_when_authenticated_and_401_when_not() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let known =
+            answer_one_request("GET", "/nope", A_LIVE_KEY, &keys, 1_000, no_vault);
+        assert_eq!(known.status, 404);
+        assert_eq!(known.body, "", "a 404 was handed a body: {}", known.body);
+
+        let stranger = answer_one_request("GET", "/nope", None, &keys, 1_000, no_vault);
+        assert_eq!(
+            stranger.status, 401,
+            "an unknown caller was told which routes do not exist, which is the map of the \
+             ones that do"
+        );
+    }
+
+    /// **A permitted request for an item that is not there is `404`, not an
+    /// empty `200`.**
+    ///
+    /// This is the one place the join-up has to add something rather than
+    /// pass it along: `service_body` answers `None`, and `status_code_for`
+    /// has already said `200` because the ANSWER was `Ok`. Shipping that pair
+    /// as it stands would put "here it is" on an empty body, and every client
+    /// -- including this crate's own `VaultBridge` -- parses a `200` and gets
+    /// a JSON error instead of the missing-item answer it can act on.
+    #[test]
+    fn a_permitted_request_for_an_item_that_does_not_exist_is_not_an_empty_200() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply = answer_one_request(
+            "GET",
+            "/object/item/nobody-has-this",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            a_small_vault,
+        );
+        assert_eq!(reply.status, 404, "an id no item has was answered as a success");
+        assert_eq!(reply.body, "");
+
+        // Control: an id the vault DOES have is served, so this is not a
+        // function that has stopped serving items altogether.
+        let served = answer_one_request(
+            "GET",
+            "/object/item/login-1",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            a_small_vault,
+        );
+        assert_eq!(served.status, 200);
+    }
+
+    /// **What goes on the wire parses, and it parses into `bw serve`'s two
+    /// envelopes.**
+    ///
+    /// `service_body` asserts the same shapes about the strings it returns.
+    /// What this adds is that those strings are the ones that reach a reply,
+    /// through the whole path a real request takes: a list is
+    /// `{"success":true,"data":{"data":[...]}}` and a single item is one
+    /// level shallower. Getting the nesting wrong breaks every client written
+    /// against `bw serve`, and no type in this crate checks it.
+    #[test]
+    fn the_reply_bodies_are_bw_serves_two_envelopes() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+
+        let list =
+            answer_one_request("GET", "/list/object/items", A_LIVE_KEY, &keys, 1_000, a_small_vault);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&list.body).expect("the list body is not valid JSON");
+        assert_eq!(parsed["success"], true);
+        let listed = parsed["data"]["data"].as_array().expect("a list is nested one deeper");
+        assert_eq!(listed.len(), 2, "control: the list came back empty and proves nothing");
+
+        let one = answer_one_request(
+            "GET",
+            "/object/item/login-1",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            a_small_vault,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&one.body).expect("the item body is not valid JSON");
+        assert_eq!(parsed["data"]["id"], "login-1");
+        assert!(parsed["data"]["data"].is_null(), "a single item is nested like a list");
+    }
+
+    /// A key that has expired is a refused credential, and expiry is judged
+    /// against the moment this function is HANDED rather than the machine's
+    /// clock. Without the parameter this behaviour could only be tested by
+    /// waiting, which means it would not be tested.
+    #[test]
+    fn an_expired_key_is_refused_at_the_moment_it_is_judged_against() {
+        let mut record = service_key(vec![read_scope(Subject::All)]);
+        record.expires_unix = Some(1_000);
+        let keys = [record];
+        let before =
+            answer_one_request("GET", "/status", A_LIVE_KEY, &keys, 900, a_small_vault);
+        assert_eq!(before.status, 200, "control: the key was refused while it was still live");
+        let after = answer_one_request("GET", "/status", A_LIVE_KEY, &keys, 5_000, no_vault);
+        assert_eq!(after.status, 401, "an expired key was still served");
+        assert_eq!(after.body, "");
+    }
+
+    /// **A build with no keys at all serves nothing**, which is what makes a
+    /// freshly started service safe: the key file is created when the owner
+    /// mints a key, and until then every request is refused rather than
+    /// waved through for want of anything to check against.
+    #[test]
+    fn a_service_with_no_keys_refuses_every_route() {
+        for path in ["/status", "/list/object/items", "/list/object/folders", "/object/item/login-1"]
+        {
+            let reply = answer_one_request("GET", path, A_LIVE_KEY, &[], 1_000, no_vault);
+            assert_eq!(reply.status, 401, "{path} was served by a service with no keys");
+            assert_eq!(reply.body, "");
+        }
+    }
+
+    // --- The switch that has to be on before any of the above happens ---
+
+    /// **Off is the default, and off means it does not start.**
+    ///
+    /// `settings::Settings::service_enabled` is `false` for every install
+    /// whose owner has never seen the switch, including every existing one
+    /// upgraded into this build. A service that started anyway would be a
+    /// decrypted vault put behind a loopback port on the owner's behalf, on
+    /// machines whose owner was never asked -- which is the one change this
+    /// whole feature is not allowed to make.
+    #[test]
+    fn the_service_refuses_to_start_while_the_setting_is_off() {
+        assert!(
+            service_start_refusal(false).is_some(),
+            "the service started with the setting off"
+        );
+        assert!(
+            service_start_refusal(true).is_none(),
+            "control: with the setting on there must be no refusal, or the test above passes \
+             for a function that refuses unconditionally"
+        );
+    }
+
+    /// The refusal has to be **actionable**. This branch has no window and no
+    /// message box -- it is a console-less binary writing one line to a log
+    /// the owner will read after their script got connection-refused -- so
+    /// the line itself is the entire user interface. It names where the
+    /// switch is, and says what turning it on means.
+    #[test]
+    fn the_refusal_says_where_to_turn_it_on_and_what_that_costs() {
+        let refusal = service_start_refusal(false).expect("control: off must refuse");
+        for expected in ["Preferences", "off by default", "decrypted", "API key"] {
+            assert!(
+                refusal.contains(expected),
+                "the refusal does not mention {expected:?}, so the owner is told it failed \
+                 without being told what to do: {refusal}"
+            );
+        }
+    }
+
+    /// **The gate is read before the vault key is**, and that ordering is the
+    /// point rather than a detail.
+    ///
+    /// `service_start_refusal` being correct proves nothing about a caller
+    /// that asks it last. If the setting were checked after
+    /// `UserKeyStore::load`, a disabled service would still DPAPI-unwrap the
+    /// credential that decrypts the vault before deciding it must not run --
+    /// work that "off" is supposed to mean never happens. That is invisible
+    /// to every value-level test, so it is pinned against the source: an
+    /// ordering nothing can observe from outside is exactly what a source pin
+    /// is for in this file.
+    #[test]
+    fn the_setting_is_read_before_the_vault_key_is() {
+        let body = body_of(production_half_of_this_file(), "fn run_as_the_vault_service(");
+        // The ARGUMENT, not just the call. `service_start_refusal(true)`
+        // compiles, type-checks, and passes every value-level test in this
+        // file while starting a service the owner switched off -- that mutant
+        // was tried, survived the first version of this test, and is why the
+        // needle is the whole expression.
+        let gate = body
+            .find("service_start_refusal(settings.service_enabled)")
+            .expect(
+                "the service no longer gates on `settings.service_enabled`; either the check is \
+                 gone or it is being handed something other than the owner's setting",
+            );
+        let key = body
+            .find("key_store.load()")
+            .expect("control: the vault key is no longer loaded here, so this pin guards nothing");
+        let bind = body
+            .find("tiny_http::Server::http")
+            .expect("control: the socket is no longer bound here, so this pin guards nothing");
+        assert!(
+            gate < key,
+            "the vault key is unwrapped before the service asks whether it is allowed to run"
+        );
+        assert!(gate < bind, "the port is bound before the service asks whether it may run");
+    }
+
     /// **The update check is not made when the setting is off**, observed as
     /// a request that never arrives rather than as a branch that was taken.
     ///
@@ -12187,10 +13189,149 @@ mod tests {
         assert!(!backend_is_running(&mut child));
     }
 
+    /// **The defect this function exists for.** Save-memory mode stops
+    /// `bw serve` whenever nothing needs it; a vault window is exactly the
+    /// thing that changes that, and nothing was starting it again. The
+    /// window polled `localhost:8087` for fifty-seven seconds and showed
+    /// "Your vault could not be loaded" with zero items.
+    #[test]
+    fn a_window_opening_in_save_memory_mode_asks_for_the_backend() {
+        assert!(
+            window_needs_the_backend_started(false, false),
+            "save-memory mode with the backend stopped is exactly the case that was broken"
+        );
+    }
+
+    /// And a backend that is already up is not started twice.
+    ///
+    /// This is not a nicety: `try_start_backend` waits for the PORT TO BE
+    /// FREE and then fails, so a redundant start costs a thirty-second
+    /// stall and a `PortHeld` error on the app's slowest visible action.
+    #[test]
+    fn a_running_backend_is_not_started_again() {
+        assert!(!window_needs_the_backend_started(true, false));
+        assert!(!window_needs_the_backend_started(true, true));
+    }
+
+    /// The two halves of "should the backend be up" must agree. Whatever
+    /// `stop_backend_if_idle` would tear down, opening a window must be
+    /// willing to bring back -- otherwise the pair oscillates or, as it
+    /// did, one half simply stops running.
+    #[test]
+    fn starting_and_stopping_are_one_rule_read_from_two_directions() {
+        for keep in [true, false] {
+            let stopper_would_keep_it =
+                backend_policy::should_run(backend_policy::selected(), keep, false);
+            let opener_would_start_it = window_needs_the_backend_started(false, keep);
+            assert!(
+                !stopper_would_keep_it || opener_would_start_it,
+                "with keep_backend_running={keep} the idle stopper would keep the backend \
+                 running, but opening a window would not start one -- the two halves disagree"
+            );
+        }
+    }
+
+    /// **The guard that would have caught this.** `stop_backend_if_idle`'s
+    /// doc names the three places that must ask for the backend explicitly.
+    /// One of them stopped asking when the vault window moved into its own
+    /// process, and nothing noticed, because the claim lived only in prose.
+    /// It is now a claim the file has to keep.
+    #[test]
+    fn every_place_that_needs_the_backend_still_asks_for_it() {
+        let source = production_half_of_this_file();
+        assert!(
+            source.contains("fn window_needs_the_backend_started"),
+            "control: the opener's decision is gone, so this guard is vacuous"
+        );
+        // The loop that opens a window must consult it. An `open_window`
+        // reached without this line is the defect, exactly as it shipped.
+        let loop_at = source
+            .find("let opened_here = if first_result.is_none() {")
+            .expect("control: the window-opening branch has been renamed");
+        let branch = &source[loop_at..loop_at + 1200];
+        assert!(
+            branch.contains("window_needs_the_backend_started"),
+            "the vault window is opened without asking whether `bw serve` is running; in \
+             save-memory mode that window loads nothing, and the only switch for that mode \
+             is inside it"
+        );
+    }
+
+    /// **The defect, end to end.** Save-memory mode stopped `bw serve` one
+    /// second after starting it for a window that had just asked, because
+    /// the stopper was never told a window was open. Measured on the owner's
+    /// machine: started 14:01:18, stopped 14:01:18, window gave up at
+    /// 14:02:10 with zero items.
+    /// **The start half of the rule.** The vault service is a separate
+    /// process with no channel to the daemon; holding an attachment slot is
+    /// the channel. Without this the service could keep a backend alive but
+    /// never cause one, so a script got `locked` unless a window or the
+    /// tray had already brought `bw serve` up.
+    #[test]
+    fn an_attachment_by_somebody_else_starts_the_backend() {
+        assert!(attachment_needs_a_backend_start(
+            true, &None, false, None, ATTACHMENT_START_COOLDOWN,
+        ));
+    }
+
+    /// Nobody attached is not a reason to start anything. This is what keeps
+    /// it from becoming the idle start `stop_backend_if_idle` refuses to be.
+    #[test]
+    fn an_idle_loop_never_starts_a_backend_on_its_own() {
+        assert!(!attachment_needs_a_backend_start(
+            false, &None, false, None, ATTACHMENT_START_COOLDOWN,
+        ));
+    }
+
+    /// **The retry storm the idle-stop doc warns about.** The loop runs about
+    /// five times a second; a backend that keeps failing to start would be
+    /// retried five times a second forever, each attempt paying a port wait
+    /// and a `bw sync`. The cooldown is the whole answer, so it gets the test.
+    #[test]
+    fn a_failed_start_is_not_retried_five_times_a_second() {
+        let just_now = Some(Duration::from_millis(200));
+        assert!(
+            !attachment_needs_a_backend_start(
+                true, &None, false, just_now, ATTACHMENT_START_COOLDOWN,
+            ),
+            "a start was attempted 200ms after the last one; that is the retry storm"
+        );
+        // The control: once the cooldown has passed it tries again, or a
+        // backend that came back would never be started at all.
+        assert!(attachment_needs_a_backend_start(
+            true, &None, false, Some(ATTACHMENT_START_COOLDOWN), ATTACHMENT_START_COOLDOWN,
+        ));
+    }
+
+    /// Never a second attempt on top of one in flight, and never a start for
+    /// a backend that is already up -- both would race to bind one port.
+    #[test]
+    fn a_start_is_not_stacked_on_a_running_or_pending_one() {
+        let in_flight = Some((Instant::now(), BackendOpKind::EnsureRunning));
+        assert!(!attachment_needs_a_backend_start(
+            true, &in_flight, false, None, ATTACHMENT_START_COOLDOWN,
+        ));
+        assert!(!attachment_needs_a_backend_start(
+            true, &None, true, None, ATTACHMENT_START_COOLDOWN,
+        ));
+    }
+    #[test]
+    fn a_backend_is_not_stopped_out_from_under_an_open_vault_window() {
+        let mut child = Some(long_lived_command().spawn().unwrap());
+        stop_backend_if_idle(&mut child, false, true);
+        assert!(
+            backend_is_running(&mut child),
+            "save-memory mode stopped the backend while the vault window was open"
+        );
+        // The control, and the whole point of the mode: once the window is
+        // gone it is stopped as before.
+        stop_backend_if_idle(&mut child, false, false);
+        assert!(!backend_is_running(&mut child));
+    }
     #[test]
     fn stop_backend_if_idle_leaves_a_running_backend_alone_when_keeping_it() {
         let mut child = Some(long_lived_command().spawn().unwrap());
-        stop_backend_if_idle(&mut child, true);
+        stop_backend_if_idle(&mut child, true, false);
         assert!(
             backend_is_running(&mut child),
             "keep_backend_running = true must never stop the backend"
@@ -12204,7 +13345,7 @@ mod tests {
         // `keep_backend_running = false`, idle reconciliation must actually
         // tear the backend down rather than leaving it running forever.
         let mut child = Some(long_lived_command().spawn().unwrap());
-        stop_backend_if_idle(&mut child, false);
+        stop_backend_if_idle(&mut child, false, false);
         assert!(
             child.is_none(),
             "save-memory mode must stop bw serve once nothing needs it"
@@ -12214,7 +13355,7 @@ mod tests {
     #[test]
     fn stop_backend_if_idle_is_a_no_op_with_nothing_running() {
         let mut child: Option<Child> = None;
-        stop_backend_if_idle(&mut child, false);
+        stop_backend_if_idle(&mut child, false, false);
         assert!(child.is_none());
     }
 
@@ -12227,7 +13368,7 @@ mod tests {
         let _ = c.wait();
         let mut child = Some(c);
 
-        stop_backend_if_idle(&mut child, false);
+        stop_backend_if_idle(&mut child, false, false);
         assert!(child.is_none());
     }
 
@@ -13587,6 +14728,65 @@ mod tests {
     /// The whole point of the type: every fallback available here puts a
     /// window on the user's screen that nothing asked for, or starts a second
     /// full daemon out of a spawn that wanted neither.
+    /// `--service` with no word is the consumer-driven lifetime, which is
+    /// the safe default: a service that exits when the last app lets go
+    /// cannot outlive anything by accident.
+    #[test]
+    fn a_bare_service_flag_is_the_consumer_driven_lifetime() {
+        assert_eq!(
+            launch_intent([SERVICE_FLAG]),
+            Ok(LaunchIntent::Service(deskwarden::service_host::Mode::ConsumerDriven))
+        );
+    }
+
+    /// Holding a slot forever is the deliberate choice, so it needs a word.
+    #[test]
+    fn the_installed_lifetime_has_to_be_asked_for_by_name() {
+        assert_eq!(
+            launch_intent([SERVICE_FLAG, INSTALLED_WORD]),
+            Ok(LaunchIntent::Service(deskwarden::service_host::Mode::Installed))
+        );
+    }
+
+    /// **A typo must not choose a lifetime**, because one of the two never
+    /// exits on its own.
+    #[test]
+    fn an_unknown_lifetime_is_refused_rather_than_guessed_at() {
+        assert!(launch_intent([SERVICE_FLAG, "instaled"]).is_err());
+        assert!(launch_intent([SERVICE_FLAG, "permanent"]).is_err());
+    }
+
+    /// A following FLAG is not this flag's argument.
+    #[test]
+    fn a_flag_after_service_is_not_its_lifetime() {
+        assert_eq!(
+            launch_intent([SERVICE_FLAG, AUTOSTART_FLAG]),
+            Ok(LaunchIntent::Service(deskwarden::service_host::Mode::ConsumerDriven))
+        );
+    }
+
+    /// **A process asked to be the service must not become a daemon**
+    /// because another flag was also present. `--service` is the most
+    /// specific thing a command line can say, so it is answered first.
+    #[test]
+    fn service_wins_over_every_other_flag() {
+        for other in [AUTOSTART_FLAG, UI_FLAG] {
+            assert_eq!(
+                launch_intent([other, SERVICE_FLAG]),
+                Ok(LaunchIntent::Service(deskwarden::service_host::Mode::ConsumerDriven)),
+                "{other} before --service produced something other than the service"
+            );
+        }
+    }
+
+    /// A path containing the word is a path.
+    #[test]
+    fn a_path_that_contains_the_word_is_not_the_service_flag() {
+        assert_eq!(
+            launch_intent(["C:" , "--service tools/deskwarden.exe"]),
+            Ok(LaunchIntent::UserLaunch)
+        );
+    }
     #[test]
     fn a_ui_launch_that_names_no_window_is_refused_rather_than_guessed() {
         assert_eq!(
@@ -28239,13 +29439,27 @@ mod startup_shape_tests {
         //    window beside the one that stayed -- which an offset check alone
         //    would pass on the survivor.
         let below: &[(&str, usize)] = &[
-            (
-                concat!(
-                    "stop_backend_if_idle(&mut estate.child, estate.settings.keep_backend_",
-                    "running);"
-                ),
-                2,
-            ),
+            // **The call, not its formatting.** This needle used to be the
+            // whole single-line call. Giving `stop_backend_if_idle` a third
+            // argument -- whether a vault window is open, the input whose
+            // absence let save-memory mode stop the backend under a window --
+            // wrapped both call sites, and the needle went to zero matches
+            // while both calls were still there. What this guard is for is
+            // that a startup initialisation is not COPIED, so it should count
+            // the call and not the line breaks around it.
+            // **Three: the definition and its two calls.** This needle used
+            // to be the whole single-line call, which went to zero matches
+            // the moment `stop_backend_if_idle` gained a third argument --
+            // whether a vault window is open, the input whose absence let
+            // save-memory mode stop the backend out from under a window --
+            // and both calls wrapped. Two narrower needles were tried and
+            // were worse: the bare name also matches the definition, and
+            // `&mut estate.child,` is passed to two OTHER functions besides.
+            //
+            // So it counts the name and includes the definition in the
+            // number. What this guard exists to catch is a startup
+            // initialisation being COPIED, and a third call still makes four.
+            (concat!("stop_backend_if_", "idle("), 3),
             (concat!("let mut fill_hotkey = hotkey::register_fill_", "hotkey();"), 1),
             (concat!("let mut tray = tray::build", "_tray();"), 1),
             (concat!("tray.rebuild_accounts_menu(estate.accounts.as_", "ref());"), 2),

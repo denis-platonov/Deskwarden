@@ -581,7 +581,10 @@ fn installed_mode_is_one_permanent_attachment() {
 
 - [x] **Step 2:** not observed; the loopback pin is guarded by a control instead.
 - [x] **Step 3a: the host layer** -- `listen_addr`, `Mode`, `slots_to_hold`, `status_code_for`, `failed_auth_status`, and a source pin against a configurable bind address.
-- [ ] **Step 3b: the `--service` arm in `main.rs`** -- the request loop, and actually verifying a master password. NOT DONE. `service_host` has no production caller yet.
+- [x] **Step 3b (part 1): the command line.** `--service` and `--service installed` parse to `LaunchIntent::Service(Mode)`, answered before every other flag; an unknown lifetime word is refused rather than guessed at. `first_surface` gained a total `Service` arm.
+- [x] **Step 3c: the request loop.** Done, and **without a master-password path at all** -- the service loads the same DPAPI-wrapped `Authenticated` the daemon stores, so there is no new cryptography and no second copy of the login flow. `POST /auth` answers 501 and says so.
+
+**Live check, partial and stated as such:** start-up was exercised on real files -- config directory, settings, active account, server URL -- and refused at the stored key with exit 3, because this machine's active account is on `bw serve`. **The request loop was NOT exercised**; reaching it needs a direct-REST account.
 - [x] **Step 4: host-layer tests pass.**
 - [x] **Step 5: Commit** the host layer.
 

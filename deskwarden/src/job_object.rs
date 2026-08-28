@@ -2183,7 +2183,14 @@ mod tests {
             // The hash below was recomputed independently rather than copied
             // out of the failure message -- a pin re-pinned to whatever the
             // file happens to say is not a pin.
-            (12351, 0x74d9_dec7_e2d3_88ba_u64),
+            // **Re-pinned for the 0.12.0 version bump.** One field, and the
+            // only one: no dependency moved, no name added, removed or
+            // re-pointed, no [patch]/[replace] table, no path or fork, and
+            // [build-dependencies] still reads exactly `winresource = "0.1"`.
+            // The length is unchanged at 12351 because "0.11.1" and "0.12.0"
+            // are the same width -- which is exactly why the CONTENT hash
+            // exists beside the length rather than a length alone.
+            (12351, 0x6a6e_65da_cfe6_8b6c_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
@@ -2554,6 +2561,7 @@ mod tests {
                 "examples/prompt_preview.rs",
                 "examples/rest_probe.rs",
                 "examples/save_login_preview.rs",
+                "examples/service_probe.rs",
                 "examples/ui_automation_probe.rs",
                 "examples/ui_preview.rs",
                 "examples/unlock_prompt_preview.rs",
