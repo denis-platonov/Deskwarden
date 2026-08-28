@@ -1140,6 +1140,15 @@ pub struct PrefsState {
     /// the moment a button was pressed -- and not about what is currently in
     /// the form.
     key_message: Option<String>,
+    /// The backend flip that has been clicked once and not yet confirmed.
+    /// `None` means nothing is being asked.
+    ///
+    /// **The proposed direction, not a copy of the setting.** What the pill
+    /// paints while this is `Some` is still
+    /// `Settings::use_official_bw_crypto`, unchanged -- so a question that is
+    /// dismissed, or abandoned by leaving the page, cannot leave the row
+    /// showing a state the app is not in.
+    pending_backend_switch: Option<BackendSwitch>,
     /// The name of the key whose revoke button has been pressed once and not
     /// yet confirmed. `None` means nothing is being asked.
     pending_revoke: Option<String>,
@@ -1309,6 +1318,7 @@ impl PrefsState {
             key_form: KeyForm::default(),
             minted: None,
             key_message: None,
+            pending_backend_switch: None,
             pending_revoke: None,
             key_clock: crate::service_keys::now_unix,
             key_random: crate::service_token::os_random,
@@ -2861,6 +2871,121 @@ fn attempt_mint(
 /// This one is not, and the thing it breaks is somebody's unattended script
 /// -- so it is the one place in Preferences with a confirmation, and the
 /// confirmation says what breaks rather than "are you sure".
+/// Which way a click on the backend row would take the vault.
+///
+/// **Named directions rather than the `bool` itself**, because the two are
+/// not the same size of decision and the whole point of the confirmation is
+/// that they are not: one of them deletes a key off the user's disk and the
+/// other does not. A `bool` threaded from the pill to the prompt would let
+/// that asymmetry be lost to a single inverted comparison, silently, in the
+/// one sentence a user reads before agreeing to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendSwitch {
+    /// Off to on: back to the official `bw` CLI, which is also the arm that
+    /// takes `userkey.bin` off this PC -- see `main`'s
+    /// `settle_the_vault_backend`, which clears the store on every arm that
+    /// is not `DirectRest`.
+    ToOfficial,
+    /// On to off: over to Deskwarden's own built-in direct-REST client.
+    ToBuiltIn,
+}
+
+impl BackendSwitch {
+    /// Whether taking this direction removes the stored vault key from the
+    /// PC.
+    ///
+    /// Only one of the two does, and that is not a detail of the wording: the
+    /// key is a non-expiring wrapped master key, so "it is deleted" is the
+    /// reassurance a user needs going one way and a claim that would be
+    /// simply false going the other.
+    fn deletes_the_stored_vault_key(self) -> bool {
+        matches!(self, Self::ToOfficial)
+    }
+}
+
+/// What a click on the backend pill is proposing, or `None` where it is
+/// proposing nothing.
+///
+/// **A pure function of the two values, decided away from the frame.** The
+/// question "does this need confirming, and what does it cost" is the whole
+/// of this feature, and it is answered here so the tests can put it under
+/// oath without a window, a server or a vault -- the same separation
+/// [`official_crypto_description`] keeps for the copy under the row.
+///
+/// `None` for a frame where the row handed back what it was given, which is
+/// every frame nobody clicked and every click on the ghosted row: a
+/// confirmation that could be raised without a flip would ask the user about
+/// a change that is not being made.
+fn backend_switch(stored: bool, clicked: bool) -> Option<BackendSwitch> {
+    match (stored, clicked) {
+        (false, true) => Some(BackendSwitch::ToOfficial),
+        (true, false) => Some(BackendSwitch::ToBuiltIn),
+        _ => None,
+    }
+}
+
+const BACKEND_SWITCH_CONFIRM_BUTTON: &str = "Switch it";
+const BACKEND_SWITCH_CANCEL_BUTTON: &str = "Leave it";
+
+/// What the owner is asked before the backend moves.
+///
+/// [`revoke_prompt`]'s rule on the other control that costs something: it
+/// names the consequence rather than asking "are you sure". Three facts, and
+/// the third only where it is true:
+///
+///  * **the app has to be restarted.** The choice is captured once, by
+///    `main`'s `BackendSettlement`, and never re-read -- so the click changes
+///    nothing this session, and a user who is not told that clicks it again;
+///  * **you have to sign in again.** Either direction re-derives the vault
+///    key from the master password. A login prompt nobody was warned about
+///    reads as a fault;
+///  * **and, going back to `bw` only, the stored vault key is deleted from
+///    this PC.** That is the good news of that direction and the reason it
+///    cannot be worded generically: said in both, it would be a lie in one;
+///    left out of both, the user cannot tell whether turning this back on
+///    undoes what turning it off did.
+///
+/// **It does not promise a relaunch.** Nothing in this program restarts it --
+/// there is no `current_exe` respawn anywhere -- so the sentence asks the
+/// user to close and reopen Deskwarden themselves. A confirmation whose Yes
+/// implied a restart that never came would be the worst of the three
+/// possible wordings.
+fn backend_switch_prompt(switch: BackendSwitch) -> &'static str {
+    if switch.deletes_the_stored_vault_key() {
+        "Switch back to the official Bitwarden CLI? It does not take effect until Deskwarden is \
+         restarted -- close it and open it again yourself -- and you will have to sign in again \
+         when it comes back. This also deletes the vault key stored on this PC, so nothing is \
+         left behind by the switch."
+    } else {
+        "Switch to Deskwarden's built-in client? It does not take effect until Deskwarden is \
+         restarted -- close it and open it again yourself -- and you will have to sign in again \
+         when it comes back."
+    }
+}
+
+/// The question, under the row that raised it.
+///
+/// Shaped exactly like [`key_row`]'s pending half -- the prompt in
+/// [`theme::ERROR`], then the two buttons side by side -- because this window
+/// now asks twice and two confirmations that looked different would read as
+/// two different kinds of question.
+fn backend_switch_row(ui: &mut Ui, switch: BackendSwitch) -> Option<RowAction> {
+    let mut action = None;
+    card_row(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+        ui.label(RichText::new(backend_switch_prompt(switch)).size(12.0).color(theme::ERROR));
+        ui.horizontal(|ui| {
+            if key_button(ui, BACKEND_SWITCH_CONFIRM_BUTTON, REVOKE_BUTTON_WIDTH) {
+                action = Some(RowAction::Confirm);
+            }
+            if key_button(ui, BACKEND_SWITCH_CANCEL_BUTTON, REVOKE_BUTTON_WIDTH) {
+                action = Some(RowAction::Cancel);
+            }
+        });
+    });
+    action
+}
+
 /// **Which backend holds the vault, and whether it is kept warm.**
 ///
 /// The parent is `use_official_bw_crypto`: on -- the shipped default -- the
@@ -2896,13 +3021,44 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
         // otherwise is the disagreement this card was rebuilt to remove.
         let status = (state.account_source)();
         let self_hosted = account_is_self_hosted(status.clone());
-        state.settings.use_official_bw_crypto = child_toggle_row(
+        // **The pill paints the stored value, including while the question
+        // is up.** The owner's rule for a declined switch is that the toggle
+        // visibly stays where it was, and the way to be sure of that is never
+        // to have moved it: the click is a proposal, and nothing but
+        // `Confirm` below writes the field.
+        let stored = state.settings.use_official_bw_crypto;
+        let clicked = child_toggle_row(
             ui,
             OFFICIAL_CRYPTO_LABEL,
             official_crypto_description(self_hosted),
-            state.settings.use_official_bw_crypto,
+            stored,
             self_hosted,
         );
+        if let Some(switch) = backend_switch(stored, clicked) {
+            state.pending_backend_switch = Some(switch);
+        }
+        if let Some(switch) = state.pending_backend_switch {
+            row_separator(ui);
+            match backend_switch_row(ui, switch) {
+                Some(RowAction::Confirm) => {
+                    // Cleared on BOTH arms, and that is the bug the revoke
+                    // confirmation shipped with for a while: an answer that
+                    // left `pending` set would leave the question on screen
+                    // and make the buttons inert, which is a confirmation the
+                    // owner cannot get out of.
+                    state.pending_backend_switch = None;
+                    // Spelled out rather than reusing
+                    // `deletes_the_stored_vault_key`, which happens to be
+                    // true on the same arm: two facts that coincide today are
+                    // two facts, and collapsing them is how one of them gets
+                    // changed by an edit to the other.
+                    state.settings.use_official_bw_crypto =
+                        matches!(switch, BackendSwitch::ToOfficial);
+                }
+                Some(RowAction::Cancel) => state.pending_backend_switch = None,
+                Some(RowAction::Ask) | None => {}
+            }
+        }
         row_separator(ui);
         let server = match &status {
             Some(AccountStatus::SignedIn { server, .. }) => server.as_deref(),
@@ -8640,6 +8796,227 @@ mod tests {
         );
     }
 
+    /// Clicks the backend pill at `pill` and then says yes to the question
+    /// it raises, leaving the switch actually taken.
+    ///
+    /// The tests that predate the confirmation are about where the row is
+    /// wired, not about the question, and they say what they always said
+    /// through this helper: a click on this row now costs two presses, and
+    /// spelling both out at each of their call sites would bury the
+    /// assertion they exist for.
+    fn take_the_backend_switch(ctx: &egui::Context, state: &mut PrefsState, pill: Pos2) {
+        let asked = vault_click(ctx, state, pill);
+        let yes = asked.ink_of(BACKEND_SWITCH_CONFIRM_BUTTON).rect.center();
+        let _ = vault_click(ctx, state, yes);
+    }
+
+    /// **One click on the backend pill moves nothing.**
+    ///
+    /// This row is not a preference the user can try out and undo: the choice
+    /// is captured at startup, so the click costs a restart and a fresh sign
+    /// in whichever way it goes, and one of the two directions deletes a key
+    /// off the disk. A mis-click on it is expensive in a way a mis-click on
+    /// every other toggle in this window is not, which is the same reason the
+    /// revoke button asks -- so this one asks in the same shape.
+    ///
+    /// **And the question is escapable**, which is the half worth a test of
+    /// its own. The revoke confirmation shipped for a while with a Keep it
+    /// that cleared a local and not the pending state, so the question stayed
+    /// up and neither button did anything. The last assertions here are that
+    /// answering no both leaves the setting alone AND puts the row back, so a
+    /// second attempt can still be made.
+    #[test]
+    fn switching_the_backend_asks_before_it_takes_effect() {
+        let ctx = tall_context();
+        let mut state = on_a_self_hosted_server();
+        assert!(state.settings.use_official_bw_crypto, "the shipped default");
+
+        let first = vault_frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
+        let asked = vault_click(&ctx, &mut state, pill);
+
+        assert!(
+            state.settings.use_official_bw_crypto,
+            "one click moved the backend with no confirmation"
+        );
+        assert!(
+            asked.any_containing("restarted"),
+            "the question does not say the app has to be restarted: {:?}",
+            asked.strings()
+        );
+        // **The needle is one only the question carries.** The row's own
+        // description also says the switch asks you to sign in again, so
+        // "sign in again" alone would be satisfied by the page that was
+        // already on screen before anything was clicked -- a vacuous
+        // assertion, and one that would then hold just as well after the
+        // question had gone.
+        assert!(
+            asked.any_containing("sign in again when it comes back"),
+            "the question does not say the user has to sign in again: {:?}",
+            asked.strings()
+        );
+        // The pill is still painted where it was. A row that moved on the
+        // click and moved back on the refusal would satisfy every value
+        // assertion here and still show the user a switch that flipped
+        // itself.
+        assert_eq!(
+            asked.pill_fills()[0],
+            theme::BLUE,
+            "the pill moved before the question was answered"
+        );
+
+        let no = asked.ink_of(BACKEND_SWITCH_CANCEL_BUTTON).rect.center();
+        let left = vault_click(&ctx, &mut state, no);
+        assert!(state.settings.use_official_bw_crypto, "saying no switched the backend anyway");
+        assert_eq!(left.pill_fills()[0], theme::BLUE, "the pill moved on a refusal");
+        assert!(
+            state.pending_backend_switch.is_none(),
+            "the question is still pending, so the row is stuck on it"
+        );
+        assert!(
+            !left.any_containing("sign in again when it comes back"),
+            "the question is still on screen after it was answered: {:?}",
+            left.strings()
+        );
+
+        // And the whole thing can be attempted again -- the assertion the
+        // never-cleared pending state would fail, and the one that makes the
+        // clearing above mean something.
+        let again = vault_click(&ctx, &mut state, pill);
+        assert!(
+            again.any_containing("sign in again when it comes back"),
+            "a second press of the pill raises nothing, so the row can only be refused once: \
+             {:?}",
+            again.strings()
+        );
+    }
+
+    /// Saying yes really does switch -- the control for the test above, which
+    /// a pair of buttons that did nothing at all would otherwise pass.
+    ///
+    /// Asserted through [`crate::backend_policy::choose`] rather than the
+    /// field, for `the_backend_row_is_on_when_bw_is_the_backend`'s reason:
+    /// what a yes has to change is which backend serves the vault.
+    #[test]
+    fn confirming_a_backend_switch_applies_it() {
+        use crate::backend_policy::{choose, VaultBackendChoice};
+        const SERVER: Option<&str> = Some("https://vault.example.com");
+
+        let ctx = tall_context();
+        let mut state = on_a_self_hosted_server();
+        assert_eq!(
+            choose(SERVER, state.settings.use_official_bw_crypto),
+            VaultBackendChoice::BwServe,
+            "control: the page did not start on the official CLI, so a change to the built-in \
+             client would prove nothing"
+        );
+
+        let first = vault_frame(&ctx, &mut state, &[]);
+        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
+        let asked = vault_click(&ctx, &mut state, pill);
+        let yes = asked.ink_of(BACKEND_SWITCH_CONFIRM_BUTTON).rect.center();
+        let after = vault_click(&ctx, &mut state, yes);
+
+        assert_eq!(
+            choose(SERVER, state.settings.use_official_bw_crypto),
+            VaultBackendChoice::DirectRest,
+            "the confirmation did not take the switch"
+        );
+        assert!(state.pending_backend_switch.is_none(), "the question outlived its answer");
+        assert_eq!(
+            after.pill_fills()[0],
+            theme::TOGGLE_OFF,
+            "the switch was taken and the pill still shows the old state"
+        );
+        assert!(
+            !after.any_containing("sign in again when it comes back"),
+            "the question is still on screen after it was taken: {:?}",
+            after.strings()
+        );
+    }
+
+    /// **The two directions do not cost the same thing, and the question says
+    /// so.**
+    ///
+    /// Turning `bw` back on deletes `userkey.bin` -- `main`'s
+    /// `settle_the_vault_backend` clears the store on every arm that is not
+    /// `DirectRest`, and its own
+    /// `settling_off_direct_rest_deletes_the_stored_vault_key` pins it.
+    /// Turning it off does not delete anything; it creates the file. A single
+    /// generic sentence would therefore either promise a deletion that does
+    /// not happen or hide the one that does, and the second is the worse of
+    /// the two: it is the only reassurance that switching back undoes what
+    /// switching away did.
+    ///
+    /// Asserted on the pure function rather than on a painted frame, because
+    /// the asymmetry is a fact about the decision and not about the layout.
+    #[test]
+    fn only_the_switch_back_to_bw_mentions_the_deleted_vault_key() {
+        let back = backend_switch_prompt(BackendSwitch::ToOfficial);
+        assert!(
+            back.contains("deletes the vault key stored on this PC"),
+            "going back to the official CLI does not say the stored key is removed, so the \
+             user cannot tell whether it undoes what the switch did: {back:?}"
+        );
+
+        let away = backend_switch_prompt(BackendSwitch::ToBuiltIn);
+        assert!(
+            !away.contains("delete"),
+            "the switch TO the built-in client claims to delete a key -- it writes one: {away:?}"
+        );
+
+        // Both halves the two directions really do share, so the asymmetry
+        // above is the only difference and not an excuse for a thinner
+        // sentence on one side.
+        for (name, prompt) in [("back to bw", back), ("to the built-in client", away)] {
+            assert!(
+                prompt.contains("restarted"),
+                "the {name} question does not say the app has to be restarted: {prompt:?}"
+            );
+            assert!(
+                prompt.contains("sign in again"),
+                "the {name} question does not say the user has to sign in again: {prompt:?}"
+            );
+            // **It does not promise a relaunch it cannot perform.** Nothing
+            // in this program respawns it, so a Yes that said "restarting
+            // now" would be a lie told at the moment the user is agreeing to
+            // something.
+            assert!(
+                prompt.contains("close it and open it again yourself"),
+                "the {name} question leaves who restarts the app unsaid, and nothing here \
+                 restarts it: {prompt:?}"
+            );
+        }
+    }
+
+    /// **A frame nobody clicked proposes nothing.**
+    ///
+    /// [`backend_switch`] is asked on every frame, so an arm that answered
+    /// `Some` for the value the row was already showing would put a
+    /// confirmation in front of a user who did nothing -- and, worse, one
+    /// whose Yes would be a change they never asked for. The two flips are
+    /// the control: without them this would pass against a function that
+    /// answered `None` always.
+    #[test]
+    fn a_backend_row_that_did_not_move_asks_nothing() {
+        assert_eq!(backend_switch(true, true), None, "the row was left on and raised a question");
+        assert_eq!(
+            backend_switch(false, false),
+            None,
+            "the row was left off and raised a question"
+        );
+        assert_eq!(backend_switch(true, false), Some(BackendSwitch::ToBuiltIn));
+        assert_eq!(backend_switch(false, true), Some(BackendSwitch::ToOfficial));
+        assert!(
+            BackendSwitch::ToOfficial.deletes_the_stored_vault_key(),
+            "the direction that clears `userkey.bin` says it does not"
+        );
+        assert!(
+            !BackendSwitch::ToBuiltIn.deletes_the_stored_vault_key(),
+            "the direction that WRITES the stored key claims to delete it"
+        );
+    }
+
     /// **Ghosted off a self-hosted server, and a click cannot select it.**
     ///
     /// The owner's rule, measured on the value rather than on the paint: a
@@ -8683,7 +9060,7 @@ mod tests {
 
         let first = vault_frame(&ctx, &mut state, &[]);
         let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
-        vault_frame(&ctx, &mut state, &click(pill));
+        take_the_backend_switch(&ctx, &mut state, pill);
         assert!(
             !state.settings.use_official_bw_crypto,
             "the row did not turn off on a self-hosted server"
@@ -8692,7 +9069,7 @@ mod tests {
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
         assert!(!state.settings.service_enabled, "the wrong row's toggle moved");
 
-        vault_frame(&ctx, &mut state, &click(pill));
+        take_the_backend_switch(&ctx, &mut state, pill);
         assert!(state.settings.use_official_bw_crypto, "and back on again");
     }
 
@@ -8746,7 +9123,7 @@ mod tests {
         // Clicking it turns it OFF, and the policy then selects the built-in
         // direct-REST client -- the state whose whole cost is the copy under
         // this row.
-        vault_frame(&ctx, &mut state, &click(first.rects_of_size(TOGGLE_SIZE)[0].center()));
+        take_the_backend_switch(&ctx, &mut state, first.rects_of_size(TOGGLE_SIZE)[0].center());
         assert!(!state.settings.use_official_bw_crypto);
         assert_eq!(
             choose(SERVER, state.settings.use_official_bw_crypto),
@@ -8763,7 +9140,7 @@ mod tests {
 
         // ...and back, so the two paints above are telling the states apart
         // rather than reporting one constant twice.
-        vault_frame(&ctx, &mut state, &click(second.rects_of_size(TOGGLE_SIZE)[0].center()));
+        take_the_backend_switch(&ctx, &mut state, second.rects_of_size(TOGGLE_SIZE)[0].center());
         assert!(state.settings.use_official_bw_crypto);
         assert_eq!(
             choose(SERVER, state.settings.use_official_bw_crypto),
