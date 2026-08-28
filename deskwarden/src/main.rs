@@ -1408,151 +1408,81 @@ fn main() {
     arm_autofill_and_seed_cache(&startup_entries, &cache, items, startup_epoch);
     }
     if surface == FirstSurface::ShowTheWindow {
-    // **ONE WINDOW: the spinner, then the vault.**
+    // **ONE WINDOW, IN A PROCESS OF ITS OWN.**
     //
-    // This is the launch the second report was about -- "On start there is
-    // another window Setting up your vault and then actual window loads -
-    // should be same actual window with spinner". It used to open
-    // `loading_ui::show_while`'s own 360x220 window, OS-centred, for however
-    // long `bw serve` took to answer (8s in the reporter's log), close it, and
-    // leave the vault to arrive later somewhere else at a different size. Both
-    // are now stages of one `app_window` window at the vault window's own
-    // geometry, so nothing moves when the spinner is replaced by the item list.
+    // This door and the tray's *Open Vault* now open the same way, which
+    // they did not before: the tray asked `UiWindows` for a process and
+    // this one called `app_window::run_from_working` and built the vault
+    // frame right here, in the daemon. On the owner's machine 3 launches
+    // took the first path and 32 took this one.
     //
-    // The readiness probe runs on a worker thread inside that host, not here:
-    // on the frame thread it would freeze the window exactly where it is meant
-    // to be showing a spinner.
+    // # What building it here cost, measured
     //
-    // **Everything the `'static` closures need is cloned out first.** The vault
-    // stage's closure is moved into an eframe update closure and can borrow
-    // nothing on this stack; the estate below is built after the window, from
-    // the originals.
-    let vault_for_probe = vault.clone();
-    let schedule_for_probe = schedule.clone();
-    let cache_for_vault = cache.clone();
-    let fill_stats_for_vault = fill_stats.clone();
-    let icon_cache_dir_for_vault = icon_cache_dir.clone();
-    let auto_lock_for_vault = settings.auto_lock();
-    let accounts_for_vault = accounts_state.clone();
-    let entries_out = startup_entries.clone();
-    let token_for_vault = session_token.clone();
-
-    let warm = app_window::run_from_working(
-        SETUP_MESSAGE,
-        // ON A WORKER THREAD: the same probe, on the same schedule, that the
-        // separate spinner window used to run behind itself.
-        move || wait_for_vault_ready(vault_for_probe.as_ref(), &schedule_for_probe),
-        // ON THE MAIN THREAD, in the frame that drains the worker. The cache
-        // has to be filled BEFORE the vault frame is built, or the window's
-        // first vault frame paints an empty vault as data.
-        move |ready: &mut Result<Vec<deskwarden::vault_bridge::VaultItem>, String>| {
-            // `None` here is the failure the host turns into a close, which is
-            // what leaves `main` to run the recovery below.
-            let items = std::mem::take(ready.as_mut().ok()?);
-            arm_autofill_and_seed_cache(&entries_out, &cache_for_vault, items, startup_epoch);
-            // **Not prefetched, and not waited for.** The toolbar's avatar and
-            // account label come from a `bw status` spawn that is regularly
-            // seconds; the window is already up and the label fills in, exactly
-            // as it does for a window a tray click opens. `est.details` stays
-            // `None`, so the refill below the window still runs off what this
-            // session actually used.
-            let details = account_details_source(None, |tx| {
-                std::thread::spawn(move || {
-                    let _ = tx.send(login_ui::check_bw_status_details());
-                });
-            });
-            let (_options, frame, handles) = vault_window::build_frame(
-                cache_for_vault.clone(),
-                fill_stats_for_vault,
-                details,
-                token_for_vault,
-                icon_cache_dir_for_vault,
-                auto_lock_for_vault,
-                // The readiness probe has just answered, so the backend is up
-                // and the vault's own initial load may skip its readiness wait.
-                true,
-                accounts_for_vault,
-                // This window's first frame already installed the fonts,
-                // rounded the corners and raised it, one stage ago.
-                true,
-                vault_window::VaultFrameEnv::production(),
-            );
-            Some((frame, handles))
-        },
-    );
-    log::info!("the warm launch window showed {:?}", warm.stages);
-    startup_vault = warm.vault;
-
-    // **The window ended without ever showing a vault**, which is the only
-    // state that still needs answering here: on the ordinary path the closure
-    // above has already armed autofill and seeded the cache, and the vault the
-    // user was looking at is dispatched further down.
-    if startup_vault.is_none() {
-        let abandoned = warm.abandoned;
-        let items = match warm.prepared {
-            // The probe answered, and it answered with a failure. Nothing has
-            // been taken out of it -- `build_vault` returns before the
-            // `mem::take` on this path -- and unlike a close, this IS a signal
-            // to act on: the heavier recovery kills the backend, sends the user
-            // back through the master password and starts over.
-            Some(Err(e)) => recover_from_failed_vault_wait(
-                &e,
-                &vault,
-                &schedule,
-                &mut bw_serve_child,
-                &mut session_token,
-                &job,
-                &store,
-                &config_dir,
-                login,
-            ),
-            // No answer at all: the user closed the spinner, the worker died,
-            // or the stage's deadline fired. Closing the window is not, on its
-            // own, evidence that the backend or session is broken -- there is
-            // no "maybe the session was rejected" signal to act on (review 12's
-            // Important 2) -- so the same, still-running backend gets one more
-            // honest readiness probe, no kill and no reauth, before the heavier
-            // recovery.
-            //
-            // **And that retry shows no window.** It used to reopen the spinner
-            // with different wording (`SETUP_RETRY_MESSAGE`, deleted with
-            // design turn 7) so the user could tell it apart from the one just
-            // closed. Inside one window there is nothing to tell apart: a
-            // window the user has just closed reopening at all is the two-window
-            // flow this change removes, only worse for having been asked to go
-            // away first. So the retry runs silently and the app lands in the
-            // tray, which is where closing that window says it wants to be.
-            //
-            // (`Some(Ok(..))` cannot reach here -- an `Ok` built the vault
-            // frame, which is a vault -- and folds in with the rest because the
-            // honest response to it would be this one anyway: probe again
-            // rather than read items back out of a value the vault stage may
-            // already have emptied.)
-            _ => {
-                log::info!(
-                    "the warm launch window ended before the vault backend was confirmed ready \
-                     (closed by the user: {abandoned}); trying the readiness probe again, \
-                     without a window, before treating anything as actually broken"
-                );
-                match wait_for_vault_ready(vault.as_ref(), &schedule) {
-                    Ok(items) => items,
-                    Err(e) => recover_from_failed_vault_wait(
-                        &e,
-                        &vault,
-                        &schedule,
-                        &mut bw_serve_child,
-                        &mut session_token,
-                        &job,
-                        &store,
-                        &config_dir,
-                        login,
-                    ),
-                }
-            }
-        };
-
-        arm_autofill_and_seed_cache(&startup_entries, &cache, items, startup_epoch);
+    // The OpenGL driver is mapped into whichever process draws and is
+    // returned only at process exit -- so a daemon that draws once holds
+    // it until sign-out. 98.6 MB resident with `nvoglv64.dll` at 41.1 MB,
+    // against 35.9 MB for a tray that never drew. Reported twice, as
+    // "62Mb in tray" and "tray again is 50Mb".
+    //
+    // It cost a second thing, reported separately as the tray icon
+    // disappearing while the window was up: the tray is built BELOW this
+    // branch, and `run_from_working` blocked for the whole life of the
+    // window -- so on this launch there was no tray icon at all until the
+    // user closed the vault.
+    //
+    // # Why nothing is waited for here
+    //
+    // The window is asked for and then left alone. Its result comes home
+    // through `poll_the_vault_window` on the loop below, by the same
+    // route and into the same handler as a window the tray opened, so
+    // `startup_vault` stays `None` on this path: there is no outcome to
+    // hand in, because the outcome has not happened yet. Waiting for it
+    // here would put the block back in a different shape.
+    //
+    // The backend does not need starting first. `start_backend` has
+    // already run above this branch and blocks until `bw serve` answers;
+    // a `ShowTheWindow` launch is never cache-first, so it is never the
+    // arm that skips it.
+    if !ui_windows.ask_for_the_vault_window() {
+        // **No process, so no window, and the app lands in the tray.**
+        // The old fallback was to draw here instead -- which is the thing
+        // this change exists to stop, and it would be spending the
+        // driver for the life of the session on the rarest path there
+        // is: this app failing to spawn its own executable. The tray is
+        // built below and its *Open Vault* tries again, so the user is
+        // one click from a window rather than out of luck.
+        log::error!(
+            "no UI process could be started for the launch window; this launch lands in \
+             the tray instead, and Open Vault will try again"
+        );
     }
+
+    // **The probe still runs here, in the daemon, and it is not
+    // duplicated work.** The child does its own readiness wait to decide
+    // when to stop showing a spinner; this one exists for what the DAEMON
+    // owns and the child cannot touch -- the autofill engine and the
+    // shared cache, which the tray, the global hotkey and every later
+    // fill read. Both processes wait through the same readiness at the
+    // same time rather than one after the other.
+    let items = match wait_for_vault_ready(vault.as_ref(), &schedule) {
+        Ok(items) => items,
+        // Unchanged, and still the heavier recovery: kill the backend,
+        // ask for the master password, start over. A probe that fails
+        // after the backend was started and answered IS evidence that
+        // something is broken, unlike a window the user simply closed.
+        Err(e) => recover_from_failed_vault_wait(
+            &e,
+            &vault,
+            &schedule,
+            &mut bw_serve_child,
+            &mut session_token,
+            &job,
+            &store,
+            &config_dir,
+            login,
+        ),
+    };
+    arm_autofill_and_seed_cache(&startup_entries, &cache, items, startup_epoch);
     }
 
     SessionEstate {
@@ -13950,9 +13880,17 @@ mod tests {
         // answered a dismissal by reopening the spinner window and could
         // therefore be dismissed twice; one window has one way of ending
         // without a vault, so that third arm went with the second window.
+        // **Five, down from six**, and the one that went was not an answer
+        // being lost. The cached-session arm used to run this recovery
+        // twice: once for a probe that failed inside the window it was
+        // drawing, and once for the retry after that window ended without
+        // a vault. With the window in a process of its own the daemon runs
+        // one probe and has one way for it to fail, so the two arms are one
+        // arm. Every way of failing a startup wait still reaches this
+        // recovery; there is simply one fewer way to fail.
         assert_eq!(
             production_half_of_this_file().matches(call).count(),
-            6,
+            5,
             "the number of `recover_from_failed_vault_wait` sites changed; a new one is not \
              covered by the argument check above -- extend the guard to reach it"
         );
@@ -14457,17 +14395,19 @@ mod tests {
 
         let paired = main_body.matches(concat!("arm_autofill_and_", "seed_cache(")).count();
         assert_eq!(
-            paired, 6,
-            "startup has {paired} PAIRED repopulation sites, not the six it should have. \
-             Startup has seven sites that arm the match engine; six of them obtained items \
+            paired, 5,
+            "startup has {paired} PAIRED repopulation sites, not the five it should have. \
+             Startup has six sites that arm the match engine; five of them obtained items \
              from a fetch and must therefore write both halves, and this is the count of \
-             those six. The seventh is the cache-first arm, which obtained nothing and is \
+             those five. The sixth is the cache-first arm, which obtained nothing and is \
              counted by the `match_entries(` assertion below instead -- see this test's doc. \
              Signing in: \
              the single window's `build_vault`, the `work.items == Err` recovery and the \
-             no-work recovery. Already holding a session and SHOWING a window: the warm launch \
-             window's own `build_vault`, and the one recovery tail that answers every way that \
-             window can end without a vault. Already holding a session and staying in the TRAY \
+             no-work recovery. Already holding a session and SHOWING a window: one, and it \
+             was two until the window moved into a process of its own -- the daemon no \
+             longer builds that frame, so there is no `build_vault` here to pair with, and \
+             the probe the daemon still runs for the ENGINE and the CACHE is both the happy \
+             path and the recovery. Already holding a session and staying in the TRAY \
              -- a login autostart -- one, which is the whole of that arm: it has no window and \
              therefore no `build_vault`, so the single site is both its happy path and its \
              recovery's. Each one must arm the match engine and seed the cache from the same \
@@ -29194,10 +29134,17 @@ mod startup_shape_tests {
         );
         // The window this launch DOES show, and it is the one that becomes the
         // vault in place.
+        // **Asked for, not drawn here.** This used to look for
+        // `app_window::run_from_working(`, because the arm built the vault
+        // frame in the daemon. The window is the same window and the user
+        // still sees it during the eight seconds `bw serve` takes -- it is
+        // now drawn by a process of its own, so the daemon never maps the
+        // OpenGL driver and the tray comes up beside it instead of after
+        // it. What must not come back is this arm showing NO window.
         assert!(
-            arm.contains(concat!("app_window::run_from_", "working(")),
-            "the launch that already has a session shows no window of its own any more, so \
-             the user watches nothing at all for the eight seconds `bw serve` takes: {arm:?}"
+            arm.contains(concat!("ask_for_the_vault_", "window()")),
+            "the launch that already has a session asks for no window at all any more, \
+             so the user watches nothing for the eight seconds `bw serve` takes: {arm:?}"
         );
         // **...and it shows it only when somebody asked for it.** The owner:
         // "if user launched it - it should show up (not go to tray), if it
@@ -30298,9 +30245,13 @@ mod bw_serve_gate {
             "the startup door still builds a vault frame in the daemon, which loads the \
              OpenGL driver into the process that holds the tray for the rest of its life"
         );
+        // Through the registry, which is the whole of "like the tray door
+        // does": `ask_for_the_vault_window` is where one-window-per-surface
+        // is decided. A door that called the spawn directly would open a
+        // second window over one already up.
         assert!(
-            region.contains(concat!("spawn_the_vault_window_in_its_own_", "process")),
-            "the startup door does not spawn a UI process"
+            region.contains(concat!("ask_for_the_vault_", "window()")),
+            "the startup door does not ask the registry for a UI process"
         );
     }
 
@@ -31119,12 +31070,22 @@ mod the_daemon_never_blocks_on_a_ui_process_pin {
              the one-window rule, an Open Vault that never opens again. More than one call is \
              two drains of a result that is delivered once"
         );
+        // **Three: the declaration and the TWO doors.** It was two, when
+        // the tray was the only door that asked and the startup branch drew
+        // its own frame in the daemon instead. A second caller is not a
+        // second way to get two windows, because the rule is not in the
+        // count of callers -- it is inside the method, where
+        // `open_decision` reads the occupied slot and answers
+        // `FocusTheOpenOne` rather than `Spawn`. Both doors go through that
+        // gate. What this still catches is a door that goes AROUND it, by
+        // calling the spawn directly.
         assert_eq!(
             source.matches(ASK).count(),
-            2,
-            "expected the registry to be asked for the window in exactly one place besides \
-             its own declaration. That call is where one-window-per-surface is decided, and a \
-             second door round it is a second vault window on the same vault"
+            3,
+            "expected the registry to be asked for the window in exactly two places besides \
+             its own declaration. Those calls are where one-window-per-surface is decided, \
+             and a door that does not go through them is a second vault window on the same \
+             vault"
         );
 
         for (needle, why) in [
