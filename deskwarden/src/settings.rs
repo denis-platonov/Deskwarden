@@ -1139,6 +1139,29 @@ pub struct Settings {
     /// and ghosts it with an explanation on an account that is not
     /// self-hosted.
     pub use_official_bw_crypto: bool,
+    /// Whether `deskwarden.exe --service` may serve the vault on loopback.
+    ///
+    /// **`false` (the default, and what an older `settings.json` without this
+    /// field parses as), and this one is not a close call.** What the service
+    /// answers with is the *decrypted* vault -- see
+    /// `docs/superpowers/specs/2026-08-27-service-auth-design.md` -- and a
+    /// default-on local endpoint serving that would be a change to the
+    /// security of every existing install, made on the owner's behalf and
+    /// without their noticing. Every other preference here describes how the
+    /// app behaves on this machine; this one opens a door in it.
+    ///
+    /// **The upgrade path is the direction that matters**, and it is the same
+    /// argument [`Self::check_breaches`] carries one field over: a
+    /// `settings.json` written before this field existed describes a machine
+    /// whose owner has never been asked, so it must read as off rather than
+    /// as consent nobody gave. The container's `#[serde(default)]` and the
+    /// `false` in [`Default`] are what make that true, and
+    /// `an_older_settings_file_without_the_service_key_loads_as_off` pins it.
+    ///
+    /// Off here means there is nothing to reach, before any key or scope is
+    /// considered: `service_keys` bounds what a *key* may do, and this bounds
+    /// whether anything is listening to present one to.
+    pub service_enabled: bool,
     pub never_save_for_apps: Vec<String>,
     /// Where the vault window was, and how big, when it was last closed --
     /// `None` until it has been closed once.
@@ -1235,6 +1258,7 @@ impl Default for Settings {
             cache_vault_to_disk: false,
             read_through_cache: true,
             use_official_bw_crypto: true,
+            service_enabled: false,
             never_save_for_apps: Vec::new(),
             vault_window: None,
             accounts: Vec::new(),
@@ -1369,6 +1393,7 @@ impl Settings {
             cache_vault_to_disk,
             read_through_cache,
             use_official_bw_crypto,
+            service_enabled,
             // Owned by the overlay, not by the preferences window: it is
             // written by `Self::persist_never_save_for_app` from inside the 3c
             // card, and the copy `main.rs` holds is stale the moment a user
@@ -1401,6 +1426,7 @@ impl Settings {
         on_disk.cache_vault_to_disk = *cache_vault_to_disk;
         on_disk.read_through_cache = *read_through_cache;
         on_disk.use_official_bw_crypto = *use_official_bw_crypto;
+        on_disk.service_enabled = *service_enabled;
         on_disk.save(path)
     }
 
@@ -1640,6 +1666,10 @@ mod tests {
         let path = temp_path("round-trip");
         let written = Settings {
             read_through_cache: false,
+            // Deliberately the opposite of the default, so a round trip that
+            // silently dropped this field would show up as a mismatch here
+            // rather than as a service that quietly stopped being enabled.
+            service_enabled: true,
             keep_backend_running: false,
             // Deliberately the OPPOSITE of `keep_backend_running`: two `bool`s that
             // agreed would round-trip identically through a writer that assigned
@@ -1889,6 +1919,10 @@ mod tests {
         let path = temp_path("auto-lock-round-trip");
         let written = Settings {
             read_through_cache: false,
+            // Deliberately the opposite of the default, so a round trip that
+            // silently dropped this field would show up as a mismatch here
+            // rather than as a service that quietly stopped being enabled.
+            service_enabled: true,
             keep_backend_running: true,
             prompt_on_match: false,
             check_breaches: true,
@@ -1988,6 +2022,84 @@ mod tests {
             .persist_preferences(&path)
             .unwrap();
         assert!(Settings::load(&path).prompt_on_match);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The service is off until the owner turns it on.** What it serves is
+    /// the decrypted vault on a loopback socket, so a default of `true` would
+    /// open that door on every machine this build lands on, without anybody
+    /// having asked for it. Both halves are asserted, because they are two
+    /// different code paths: the in-memory default, and the fresh install
+    /// with no file at all.
+    #[test]
+    fn the_vault_service_is_off_by_default() {
+        assert!(!Settings::default().service_enabled);
+        assert!(!Settings::load(&temp_path("service-absent")).service_enabled);
+    }
+
+    /// **The upgrade path, and the only direction this field can be wrong
+    /// in.** Every existing `settings.json` was written before the service
+    /// existed, so its owner has never been asked. Parsing such a file must
+    /// answer "off" -- not "on", which would be consent nobody gave, and not
+    /// a parse failure, which would throw away the account list on the way
+    /// past.
+    #[test]
+    fn an_older_settings_file_without_the_service_key_loads_as_off() {
+        let path = temp_path("service-older-file");
+        let older = br#"{"keep_backend_running": false, "check_breaches": true, "auto_lock_minutes": 9}"#;
+        // The premise, asserted rather than assumed: a fixture that happened
+        // to carry the key would make the rest of this test vacuous.
+        assert!(
+            !std::str::from_utf8(older).unwrap().contains("service_enabled"),
+            "the fixture names the key, so it is not an older file"
+        );
+        std::fs::write(&path, older).unwrap();
+        let loaded = Settings::load(&path);
+        // And the premise that the file was parsed at all, rather than
+        // falling back to `Settings::default()` wholesale -- which would make
+        // "off" true for the wrong reason. Two fields that disagree with the
+        // defaults.
+        assert!(!loaded.keep_backend_running, "the file was not parsed: {loaded:?}");
+        assert_eq!(loaded.auto_lock_minutes, 9);
+        assert!(loaded.check_breaches);
+        assert!(
+            !loaded.service_enabled,
+            "upgrading started serving this user's decrypted vault on a socket"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The same hazard `the_breach_toggle_survives_persist_preferences`
+    /// documents.** `persist_preferences` destructures exhaustively, so a new
+    /// field cannot go unnamed -- but binding it and never assigning
+    /// `on_disk.service_enabled` compiles, and that mutant has survived the
+    /// whole suite in this repo before. Here it would mean the owner turning
+    /// the service on, or off, and the choice never reaching the file.
+    ///
+    /// Both directions, because a writer that always wrote the default
+    /// (`false`) would pass a one-way test -- and off is the state somebody
+    /// switching the service back off is relying on.
+    #[test]
+    fn the_service_toggle_survives_persist_preferences() {
+        let path = temp_path("prefs-service");
+        Settings::default().save(&path).unwrap();
+        assert!(!Settings::load(&path).service_enabled, "the premise: it starts off");
+
+        Settings { service_enabled: true, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        assert!(
+            Settings::load(&path).service_enabled,
+            "turning the service on did not reach the file"
+        );
+
+        Settings { service_enabled: false, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        assert!(
+            !Settings::load(&path).service_enabled,
+            "turning the service back OFF did not reach the file, so it is still serving"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -2458,6 +2570,10 @@ mod tests {
         let path = temp_path("geometry-round-trip");
         let written = Settings {
             read_through_cache: false,
+            // Deliberately the opposite of the default, so a round trip that
+            // silently dropped this field would show up as a mismatch here
+            // rather than as a service that quietly stopped being enabled.
+            service_enabled: true,
             keep_backend_running: false,
             prompt_on_match: true,
             check_breaches: true,

@@ -129,6 +129,152 @@ pub fn session_record(now_unix: u64, random: fn() -> [u8; 32]) -> (KeyRecord, St
     (record, secret)
 }
 
+/// Why a key was not minted.
+///
+/// Every arm is a refusal the owner has to be *told about*, so each carries
+/// its own sentence rather than a code the screen has to translate. A
+/// refusal that reached the screen as "could not mint a key" would be one
+/// the owner cannot act on.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MintRefusal {
+    /// The name was empty, or nothing but whitespace.
+    NoName,
+    /// A key by that name already exists.
+    DuplicateName(String),
+    /// The expiry chosen is already at or before now.
+    ExpiryAlreadyPassed,
+}
+
+impl MintRefusal {
+    /// What the owner is told, in their words rather than the code's.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::NoName => {
+                "Give the key a name. It is how you will recognise it later, and how you \
+                 will revoke it."
+                    .to_string()
+            }
+            Self::DuplicateName(name) => format!(
+                "There is already a key called \u{201c}{name}\u{201d}. Pick another name, or \
+                 revoke that one first."
+            ),
+            Self::ExpiryAlreadyPassed => {
+                "That expiry has already passed, so the key would be dead the moment it was \
+                 made. Choose a date in the future, or no expiry at all."
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Mints a named key: the record to store, and the plaintext to show **once**.
+///
+/// The secret is [`crate::service_token::mint`]'s -- 256 bits of OS
+/// randomness, hex -- and the record keeps only its hash, exactly as
+/// [`session_record`] does. Nothing here writes anything; [`save`] does that,
+/// so a caller that refuses at the confirmation screen leaves no trace.
+///
+/// **Three refusals, and each is a mistake the owner would not otherwise
+/// notice:**
+///
+/// - *No name.* A key with a blank name cannot be told apart in the list, and
+///   [`revoke`] takes a name, so a nameless key is one that cannot be
+///   revoked through the screen that made it.
+/// - *An expiry already at or before `now_unix`.* [`find`] treats expiry
+///   inclusively, so such a key is dead on arrival -- and it would look
+///   perfectly fine in the list, and its script would fail with a 401 that
+///   says nothing about why. A key minted dead is a bug that surfaces at 3am
+///   in somebody else's log.
+/// - *A duplicate name.* Two keys called the same thing make the list
+///   ambiguous and [`revoke`] arbitrary; the owner would revoke one of them
+///   and believe they had revoked the other.
+///
+/// Names are compared **ignoring case and surrounding whitespace**, because
+/// `Backup` and `backup ` are one name to the person reading the list. The
+/// same comparison is used by [`revoke`], so a name that was refused as a
+/// duplicate is exactly a name that revokes the record it collided with.
+pub fn mint(
+    name: String,
+    expires_unix: Option<u64>,
+    scopes: Vec<Scope>,
+    now_unix: u64,
+    random: fn() -> [u8; 32],
+    existing: &[KeyRecord],
+) -> Result<(KeyRecord, String), MintRefusal> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(MintRefusal::NoName);
+    }
+    if let Some(clash) = existing.iter().find(|record| same_name(&record.name, &name)) {
+        return Err(MintRefusal::DuplicateName(clash.name.clone()));
+    }
+    if let Some(expiry) = expires_unix {
+        if expiry <= now_unix {
+            return Err(MintRefusal::ExpiryAlreadyPassed);
+        }
+    }
+    let secret = crate::service_token::mint(random).expose().to_string();
+    let record = KeyRecord {
+        name,
+        hash: hash_key(&secret),
+        created_unix: now_unix,
+        expires_unix,
+        scopes,
+    };
+    Ok((record, secret))
+}
+
+/// Whether two key names are the same name to the owner.
+fn same_name(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+/// Removes every record called `name`. Answers whether anything went.
+///
+/// The answer is the point: a screen that says "revoked" after removing
+/// nothing has told the owner their script is locked out when it is not.
+///
+/// *Every* match rather than the first, and the same name comparison
+/// [`mint`] refuses duplicates with -- so a file that was hand-edited into
+/// holding two keys of one name cannot leave one of them behind, still
+/// working, after the owner revoked what they saw.
+pub fn revoke(records: &mut Vec<KeyRecord>, name: &str) -> bool {
+    let before = records.len();
+    records.retain(|record| !same_name(&record.name, name));
+    records.len() != before
+}
+
+/// Writes the key store.
+///
+/// **Atomic**, in [`crate::vault_disk_cache`]'s idiom: a full write to a
+/// `.tmp` sibling followed by a rename over the target. A crash between the
+/// two leaves the previous store intact, where a truncated `settings.json`
+/// costs a preference and a truncated key store silently revokes every key
+/// the owner has ever minted -- including the ones their unattended scripts
+/// are holding.
+///
+/// The `.tmp` file is removed if the rename fails, so a failed write does
+/// not leave a second copy of the store lying beside the first.
+pub fn save(path: &std::path::Path, records: &[KeyRecord]) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(records)
+        .map_err(|e| format!("could not encode the API keys: {e}"))?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
+        }
+    }
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, json).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not replace {}: {e}", path.display())
+    })
+}
+
 /// The key file, or an empty list.
 ///
 /// **An unreadable or malformed file reads as no keys**, which is the same
@@ -503,6 +649,319 @@ mod tests {
         let (record, secret) = session_record(NOW, || [3u8; 32]);
         let written = serde_json::to_string(&record).expect("write");
         assert!(!written.contains(&secret), "the session key is in the record: {written}");
+    }
+
+    /// A scratch key-store path, unique to this process **and to this call**.
+    ///
+    /// `temp_dir()` and nothing else, ever: the real key store lives beside
+    /// `settings.json` in `%APPDATA%`, and a test that wrote there would
+    /// revoke the machine owner's own keys. The pid and the nanos are this
+    /// crate's usual pair -- two `cargo test` runs at once, and two tests in
+    /// one run asking for the same label, are both real here.
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "deskwarden-service-keys-test-{name}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is before the epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// The guard the path helper needs, since every file test below is only
+    /// as isolated as it is: two labels must not collide, the name must carry
+    /// this process, and nothing may escape the system temp directory.
+    #[test]
+    fn every_scratch_key_store_is_unique_and_inside_the_temp_directory() {
+        let a = temp_path("collision-probe");
+        let b = temp_path("collision-probe");
+        assert_ne!(a, b, "two scratch key stores share a path, so two tests overwrite each other");
+        for path in [&a, &b] {
+            let name = path.file_name().expect("no file name").to_string_lossy().into_owned();
+            assert!(name.contains(&std::process::id().to_string()), "{name} names no process");
+            // Control for the two above: the uniqueness is not coming from
+            // the label having been dropped.
+            assert!(name.contains("collision-probe"), "{name} lost its label");
+            assert!(path.starts_with(std::env::temp_dir()), "escaped the temp directory: {path:?}");
+        }
+    }
+
+    fn minted(name: &str, expires: Option<u64>, existing: &[KeyRecord]) -> (KeyRecord, String) {
+        mint(name.to_string(), expires, vec![read(Subject::All)], NOW, || [9u8; 32], existing)
+            .expect("this key was supposed to mint")
+    }
+
+    /// **A key must never be minted dead.** [`find`] treats expiry
+    /// inclusively, so an expiry of exactly now -- or of any earlier moment --
+    /// produces a record that is in the list, looks configured, and answers
+    /// 401 to the script it was made for. The owner would not see that here;
+    /// they would see it in somebody else's log at 3am, if at all. So the
+    /// refusal is at creation, where there is a screen to say it on.
+    #[test]
+    fn a_key_whose_expiry_has_already_passed_is_refused_rather_than_minted() {
+        for expiry in [0, 1, NOW - 1, NOW] {
+            assert_eq!(
+                mint("backup".to_string(), Some(expiry), vec![], NOW, || [9u8; 32], &[]).err(),
+                Some(MintRefusal::ExpiryAlreadyPassed),
+                "an expiry of {expiry} was minted at {NOW}"
+            );
+        }
+        // Control: the refusal is about the expiry and not about everything.
+        // Without this, a `mint` that refused unconditionally would pass.
+        let (record, _) = minted("backup", Some(NOW + 1), &[]);
+        assert_eq!(record.expires_unix, Some(NOW + 1));
+    }
+
+    /// And the boundary the refusal is drawn at is [`find`]'s, not one
+    /// guessed beside it: the earliest expiry `mint` accepts is one `find`
+    /// still honours at the moment of minting.
+    #[test]
+    fn the_earliest_accepted_expiry_is_a_key_that_actually_works() {
+        let (record, secret) = minted("backup", Some(NOW + 1), &[]);
+        let records = vec![record];
+        assert!(find(&records, &secret, NOW).is_some(), "the earliest accepted expiry is dead");
+        // ...and it is genuinely the edge, not a comfortable margin: one
+        // second later it is gone.
+        assert!(find(&records, &secret, NOW + 1).is_none());
+    }
+
+    /// A key with no expiry at all is still allowed, because the screen says
+    /// so out loud and an owner may mean it. Without this the test above
+    /// passes on a `mint` that demanded an expiry.
+    #[test]
+    fn a_key_with_no_expiry_is_allowed() {
+        let (record, _) = minted("forever", None, &[]);
+        assert_eq!(record.expires_unix, None);
+    }
+
+    /// A nameless key cannot be recognised in the list and cannot be handed
+    /// to [`revoke`], which takes a name. Minting one would be minting a
+    /// credential the owner has no way to take back through the screen that
+    /// made it.
+    #[test]
+    fn a_key_with_no_usable_name_is_refused() {
+        for name in ["", "   ", "\t\n"] {
+            assert_eq!(
+                mint(name.to_string(), None, vec![], NOW, || [9u8; 32], &[]).err(),
+                Some(MintRefusal::NoName),
+                "{name:?} was accepted as a key name"
+            );
+        }
+        // Control: a name with something in it does mint, so the refusal is
+        // about the name being blank rather than about names.
+        assert!(mint(" backup ".to_string(), None, vec![], NOW, || [9u8; 32], &[]).is_ok());
+    }
+
+    /// The name is stored trimmed, so the list does not show a key with
+    /// invisible padding that the owner then cannot match when revoking.
+    #[test]
+    fn a_padded_name_is_stored_without_its_padding() {
+        let (record, _) = minted("  backup  ", None, &[]);
+        assert_eq!(record.name, "backup");
+    }
+
+    /// **Two keys of one name make the list a lie.** The owner would revoke
+    /// one and believe they had revoked the other -- and since [`revoke`]
+    /// works by name, the one still working is the one they cannot tell
+    /// apart from the one they killed.
+    #[test]
+    fn a_second_key_of_the_same_name_is_refused() {
+        let (first, _) = minted("backup", None, &[]);
+        let existing = vec![first];
+        assert_eq!(
+            mint("backup".to_string(), None, vec![], NOW, || [1u8; 32], &existing).err(),
+            Some(MintRefusal::DuplicateName("backup".to_string()))
+        );
+        // Control: the list is not simply refusing every mint once it is
+        // non-empty.
+        assert!(mint("restore".to_string(), None, vec![], NOW, || [1u8; 32], &existing).is_ok());
+    }
+
+    /// And the comparison is the one a person makes: case and padding are
+    /// not two different keys to the human reading the list. This is the
+    /// same relation [`revoke`] uses, which is what makes "refused as a
+    /// duplicate" and "revokes that record" the same set of names.
+    #[test]
+    fn names_that_differ_only_in_case_or_padding_are_the_same_name() {
+        let (first, _) = minted("Backup", None, &[]);
+        let existing = vec![first];
+        for name in ["backup", "BACKUP", "  Backup  "] {
+            assert!(
+                mint(name.to_string(), None, vec![], NOW, || [1u8; 32], &existing).is_err(),
+                "{name:?} was minted alongside a key called Backup"
+            );
+            let mut records = existing.clone();
+            assert!(revoke(&mut records, name), "{name:?} revoked nothing");
+            assert!(records.is_empty());
+        }
+    }
+
+    /// Every refusal reaches the owner as a sentence they can act on, and
+    /// the duplicate one names the key it collided with -- a refusal that
+    /// said only "that name is taken" leaves them hunting the list.
+    #[test]
+    fn every_refusal_says_something_the_owner_can_act_on() {
+        for refusal in [
+            MintRefusal::NoName,
+            MintRefusal::DuplicateName("backup".to_string()),
+            MintRefusal::ExpiryAlreadyPassed,
+        ] {
+            let message = refusal.message();
+            assert!(message.len() > 20, "{message:?} is not an explanation");
+            assert!(message.ends_with('.'), "{message:?} is not a sentence");
+        }
+        assert!(
+            MintRefusal::DuplicateName("backup".to_string()).message().contains("backup"),
+            "the duplicate refusal does not name the key it collided with"
+        );
+    }
+
+    /// **Shown once, and stored as a hash.** The plaintext `mint` returns is
+    /// a working credential and the record beside it must not be a second
+    /// copy of it -- a key store that is read is otherwise a key store that
+    /// works.
+    #[test]
+    fn a_minted_key_is_returned_once_and_never_stored() {
+        let (record, secret) = minted("backup", None, &[]);
+        let written = serde_json::to_string(&record).expect("write");
+        assert!(!written.contains(&secret), "the minted key is in the record: {written}");
+        // Control: the record does hold something derived from that key, so
+        // the assertion above is not passing on an empty record.
+        assert!(written.contains(&hash_key(&secret)));
+        // And the plaintext returned is the one that opens it, exactly once
+        // -- there is nowhere else to get it from.
+        assert!(find(&[record], &secret, NOW).is_some());
+    }
+
+    /// Two mints from different draws are different keys. A fixed fake would
+    /// otherwise hide a `mint` that ignored its randomness and issued one
+    /// key to every consumer.
+    #[test]
+    fn two_minted_keys_are_not_the_same_key() {
+        let first = mint("a".to_string(), None, vec![], NOW, || [1u8; 32], &[]).expect("mint");
+        let second = mint("b".to_string(), None, vec![], NOW, || [2u8; 32], &[]).expect("mint");
+        assert_ne!(first.1, second.1);
+        assert_ne!(first.0.hash, second.0.hash);
+    }
+
+    /// Revoking removes the record, and the key stops working -- the second
+    /// half being the one that matters, since a list that no longer shows a
+    /// key while the service still honours it is the worst of both.
+    #[test]
+    fn revoking_removes_the_record_and_the_key_stops_working() {
+        let (record, secret) = minted("backup", None, &[]);
+        let mut records = vec![record];
+        assert!(find(&records, &secret, NOW).is_some(), "control: it worked before revoking");
+        assert!(revoke(&mut records, "backup"));
+        assert!(records.is_empty());
+        assert!(find(&records, &secret, NOW).is_none());
+    }
+
+    /// Revoking a name that is not there answers `false` rather than
+    /// pretending. A screen that said "revoked" after removing nothing tells
+    /// the owner a script is locked out when it is not.
+    #[test]
+    fn revoking_a_name_that_is_not_there_says_so() {
+        let (record, secret) = minted("backup", None, &[]);
+        let mut records = vec![record];
+        assert!(!revoke(&mut records, "restore"));
+        // And it left the key it did not recognise alone, rather than
+        // clearing the list on the way past.
+        assert_eq!(records.len(), 1);
+        assert!(find(&records, &secret, NOW).is_some());
+    }
+
+    /// Revoking one key of several leaves the others working. Without this,
+    /// a `revoke` that emptied the list entirely would satisfy every
+    /// assertion above.
+    #[test]
+    fn revoking_one_key_does_not_disturb_the_others() {
+        let (first, first_secret) = minted("backup", None, &[]);
+        let existing = vec![first];
+        let (second, second_secret) = mint(
+            "restore".to_string(),
+            None,
+            vec![read(Subject::All)],
+            NOW,
+            || [8u8; 32],
+            &existing,
+        )
+        .expect("mint");
+        let mut records = vec![existing[0].clone(), second];
+        assert!(revoke(&mut records, "backup"));
+        assert_eq!(records.len(), 1);
+        assert!(find(&records, &first_secret, NOW).is_none());
+        assert!(find(&records, &second_secret, NOW).is_some(), "the wrong key was revoked");
+    }
+
+    /// A hand-edited file holding two keys of one name must not leave one of
+    /// them behind, still working, after the owner revoked what they saw.
+    /// `mint` refuses to create this state; the file is editable, so
+    /// `revoke` does not assume it cannot exist.
+    #[test]
+    fn revoking_removes_every_record_of_that_name() {
+        let mut records = vec![record_with(vec![read(Subject::All)]), record_with(vec![])];
+        assert_eq!(records.len(), 2, "control: there are two to remove");
+        assert!(revoke(&mut records, "a key"));
+        assert!(records.is_empty(), "a key of the revoked name survived");
+    }
+
+    /// The store round-trips: what was saved is what loads, scopes and
+    /// expiry included, and the saved key still opens the service after a
+    /// restart. Anything less and revoking would be the only thing that
+    /// worked across a restart.
+    #[test]
+    fn a_saved_store_loads_back_as_what_was_saved() {
+        let path = temp_path("round-trip");
+        let (record, secret) = minted("backup", Some(NOW + 60), &[]);
+        save(&path, &[record]).expect("save");
+        let loaded = load(&path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "backup");
+        assert_eq!(loaded[0].expires_unix, Some(NOW + 60));
+        assert_eq!(loaded[0].scopes, vec![read(Subject::All)]);
+        assert!(find(&loaded, &secret, NOW).is_some(), "the key did not survive the round trip");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **The write is atomic, and the temp file is not left behind.** A
+    /// truncated `settings.json` costs a preference; a truncated key store
+    /// silently revokes every key the owner has minted, including the ones
+    /// their unattended scripts are holding. So the write goes to a sibling
+    /// and is renamed over the target -- and a leftover sibling would be a
+    /// second, stale copy of the store sitting beside the real one.
+    #[test]
+    fn saving_leaves_no_temp_file_beside_the_store() {
+        let path = temp_path("atomic");
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        let tmp = std::path::PathBuf::from(tmp);
+        let (record, _) = minted("backup", None, &[]);
+        save(&path, &[record]).expect("save");
+        assert!(path.exists(), "control: the store was not written at all");
+        assert!(!tmp.exists(), "a stale second copy of the key store was left at {tmp:?}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Saving over an existing store replaces it rather than appending to
+    /// it, so a revoke that is saved is a revoke that took.
+    #[test]
+    fn saving_over_an_existing_store_replaces_it() {
+        let path = temp_path("replace");
+        let (record, secret) = minted("backup", None, &[]);
+        save(&path, &[record]).expect("save");
+        assert_eq!(load(&path).len(), 1, "control: the first save landed");
+        let mut records = load(&path);
+        assert!(revoke(&mut records, "backup"));
+        save(&path, &records).expect("save");
+        let loaded = load(&path);
+        assert!(loaded.is_empty(), "the revoked key is still in the store");
+        assert!(find(&loaded, &secret, NOW).is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Two sessions minted from different draws are different keys.
