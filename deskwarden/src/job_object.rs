@@ -2554,6 +2554,7 @@ mod tests {
                 "examples/prompt_preview.rs",
                 "examples/rest_probe.rs",
                 "examples/save_login_preview.rs",
+                "examples/service_probe.rs",
                 "examples/ui_automation_probe.rs",
                 "examples/ui_preview.rs",
                 "examples/unlock_prompt_preview.rs",

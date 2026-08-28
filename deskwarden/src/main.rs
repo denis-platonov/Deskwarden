@@ -9804,7 +9804,7 @@ fn run_as_the_vault_service(mode: deskwarden::service_host::Mode) -> i32 {
     let port = server.server_addr().to_ip().map_or(0, |a| a.port());
     log::info!("the vault service is listening on 127.0.0.1:{port} in {mode:?} mode");
 
-    serve_the_vault(&server, &backend, &keys);
+    deskwarden::service_host::serve_the_vault(&server, &backend, &keys);
     0
 }
 
@@ -9867,168 +9867,6 @@ fn service_keys_path(config_dir: &std::path::Path) -> std::path::PathBuf {
     deskwarden::service_keys::key_store_path(config_dir)
 }
 
-/// What goes back on the wire for one request: a status and a body, and
-/// nothing that knows about a socket.
-///
-/// A struct rather than a tuple because the two halves are the thing that has
-/// to agree -- a refusal with a body, or a served item with a `403`, are both
-/// one silent swap of an unnamed pair away.
-#[derive(Debug, PartialEq, Eq)]
-struct ServiceReply {
-    status: u16,
-    body: String,
-}
-
-/// The answer this service gives a caller who asks for the master-password
-/// exchange. A named constant so the test that says it must not look like a
-/// failed sign-in is comparing against the same bytes the wire carries.
-const NO_MASTER_PASSWORD_BODY: &str =
-    "{\"success\":false,\"message\":\"this service does not take a master password; use an API key\"}";
-
-/// What a write is told, until writing is built.
-///
-/// **This exists because the alternative was a lie.** `decide` maps every
-/// non-GET method to [`Access::Write`] and lets a write-scoped key
-/// through, and `body_for` -- which is never told the method -- then
-/// answers with the item. So `PUT /object/item/{id}` returned **200 and
-/// the item, having changed nothing**, which a script reads as a write
-/// that landed. Silent data loss from the caller's side.
-///
-/// 501 rather than 405: the route exists and the method is one this
-/// service intends to support, which is a different thing from a method
-/// it will never accept.
-const WRITES_NOT_BUILT_BODY: &str =
-    "{\"success\":false,\"message\":\"this service does not write yet; the scope model accepts write grants but no write is performed\"}";
-
-/// **One request, decided and rendered, as a value.**
-///
-/// This is where the three tested modules are joined up, and joining them up
-/// is its own opportunity to be wrong: the decision comes from
-/// [`deskwarden::service_api::decide`], the status from
-/// [`deskwarden::service_host::status_code_for`] and the body from
-/// [`deskwarden::service_body::body_for`], and a mistake HERE -- a status
-/// paired with the wrong body, a refusal handed something to read -- defeats
-/// every guarantee those three prove about themselves. So it takes strings
-/// and returns a struct: no socket, no clock, no vault of its own.
-///
-/// `now_unix` is passed in for the reason `decide` takes it -- expiry has to
-/// be drivable without waiting for a day to pass -- and the vault arrives as
-/// a closure for a stronger reason than testing:
-///
-/// # The vault is loaded only if the answer is one that reads it
-///
-/// An earlier shape of this loop fetched items and folders for EVERY request
-/// before looking at the answer, which meant an unauthenticated caller --
-/// somebody with no credential at all -- made this process do two network
-/// round trips to the server per request, as fast as they could connect.
-/// Taking the load as `FnOnce` makes "a refusal touches nothing" a fact the
-/// type system carries, and a test asserts it by handing in a closure that
-/// panics.
-fn answer_one_request<F>(
-    method: &str,
-    url: &str,
-    auth: Option<&str>,
-    keys: &[deskwarden::service_keys::KeyRecord],
-    now_unix: u64,
-    load_vault: F,
-) -> ServiceReply
-where
-    F: FnOnce() -> (Vec<deskwarden::vault_bridge::VaultItem>, Vec<deskwarden::vault_bridge::Folder>),
-{
-    use deskwarden::service_api::Answer;
-
-    let answer = deskwarden::service_api::decide(method, url, auth, keys, now_unix);
-
-    // The path is logged and the credential is not. A refused request is
-    // worth seeing; the value that was refused is not worth storing.
-    log::debug!("{method} {url} -> {answer:?}");
-
-    // Not built yet, and answered honestly rather than with a shape that
-    // looks like a failed password. The service has no way to take one.
-    if matches!(answer, Answer::Authenticate) {
-        return ServiceReply { status: 501, body: NO_MASTER_PASSWORD_BODY.to_string() };
-    }
-
-    let status = deskwarden::service_host::status_code_for(&answer);
-    if !matches!(answer, Answer::Ok { .. }) {
-        // **No body for a refusal.** `body_for` would answer `None` here
-        // anyway; not asking it is the same answer arrived at without ever
-        // holding the bytes.
-        return ServiceReply { status, body: String::new() };
-    }
-
-    // **After the scope check and BEFORE the vault is loaded.** After,
-    // because a key with no write grant is told 403 by `decide` and never
-    // reaches here -- an unauthorised caller learns nothing about what is
-    // built and what is not. Before, because fetching the whole vault to
-    // answer a request that cannot use it is the exact bug this function
-    // was extracted to fix, and it would be a poor showing to reintroduce
-    // a smaller copy of it one line lower.
-    if method != "GET" {
-        return ServiceReply { status: 501, body: WRITES_NOT_BUILT_BODY.to_string() };
-    }
-
-    let (items, folders) = load_vault();
-    let vault = deskwarden::service_body::Vault { items: &items, folders: &folders, locked: false };
-
-    match deskwarden::service_body::body_for(&answer, &vault, keys) {
-        Some(body) => ServiceReply { status, body },
-        // Permitted, and there is nothing to hand back -- an id no item has.
-        // That is a `404` and not a `200` with an empty body: an empty `200`
-        // is a well-formed answer meaning "here it is", and a client that
-        // parses it gets a JSON error instead of the "no such item" it can
-        // act on.
-        None => ServiceReply { status: 404, body: String::new() },
-    }
-}
-
-/// The request loop.
-///
-/// Split out from [`run_as_the_vault_service`] so that everything above it is
-/// start-up that happens once, and this is the part that repeats. It holds no
-/// decision of its own, and now no rendering either: it reads three strings
-/// off the request, hands them to [`answer_one_request`], and writes the
-/// result back. Everything worth being wrong about is in that function, where
-/// a test can reach it.
-fn serve_the_vault(
-    server: &tiny_http::Server,
-    backend: &dyn deskwarden::vault_backend::VaultBackend,
-    keys: &[deskwarden::service_keys::KeyRecord],
-) {
-    for request in server.incoming_requests() {
-        let method = request.method().as_str().to_string();
-        let url = request.url().to_string();
-        // Read once, and never logged: an `Authorization` header IS the
-        // credential.
-        let auth = request
-            .headers()
-            .iter()
-            .find(|header| header.field.equiv("Authorization"))
-            .map(|header| header.value.as_str().to_string());
-
-        let reply = answer_one_request(
-            &method,
-            &url,
-            auth.as_deref(),
-            keys,
-            deskwarden::service_keys::now_unix(),
-            || (backend.list_items().unwrap_or_default(), backend.list_folders().unwrap_or_default()),
-        );
-
-        let _ = respond(request, reply.status, &reply.body);
-    }
-}
-
-/// One reply, as JSON.
-fn respond(request: tiny_http::Request, status: u16, body: &str) -> std::io::Result<()> {
-    let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-        .expect("a literal header that cannot fail to parse");
-    request.respond(
-        tiny_http::Response::from_string(body.to_string())
-            .with_status_code(status)
-            .with_header(header),
-    )
-}
 
 fn run_as_a_ui_process(surface: Surface) -> i32 {
     let Some(project_dirs) = directories::ProjectDirs::from("dev", "Deskwarden", "Deskwarden")
@@ -11680,6 +11518,10 @@ mod tests {
     // drive it as the pure function it is: no port, no clock, no vault.
 
     use deskwarden::service_keys::{hash_key, Access, KeyRecord, Scope, Subject};
+    // The loop these drive now lives in the library, so that a real socket
+    // can reach it too -- see `service_host`'s note. They stay here beside
+    // `service_start_refusal`'s tests, which cover `main`'s own decision.
+    use deskwarden::service_host::answer_one_request;
     use deskwarden::vault_bridge::{Folder, ItemKind, VaultItem};
 
     /// A live key with the scopes given, matching the literal `"the-key"`.
