@@ -1225,6 +1225,26 @@ fn main() {
     };
     log::info!("this launch is a {launch:?}, so its first surface is {:?}", first_surface(launch));
 
+    // **The UI processes this daemon has open, and the reason the loop below
+    // never blocks on one.**
+    //
+    // It is the whole of the one-window rule's memory: a window opened on
+    // one pass has to still be known about on the next, both so a second
+    // *Open Vault* focuses it instead of opening a second one and so its
+    // exit is noticed at all. See `UiWindows`.
+    //
+    // **Declared above `estate`, which is further up than it looks.** The
+    // startup branch is not a statement in this function's body -- it sits
+    // INSIDE the initialiser expression below, which closes at the `};`
+    // some seven hundred lines down. So a declaration placed merely above
+    // that branch dies with the expression and is gone by the time the loop
+    // runs; it has to be above the `let` itself. That is the whole reason
+    // the startup door could not ask for a window the way the tray door
+    // does, and the plan for this change guessed the cause wrong: it blamed
+    // an ordering dependency on the tray, when `UiWindows` is one `Option`
+    // with a derived `Default` and depends on nothing at all.
+    let mut ui_windows = UiWindows::default();
+
     let mut estate = if let Some(token) = cached_session {
     session_token = token;
     // **Three `if`s and no `else`, deliberately.** The startup branch's own
@@ -2268,15 +2288,6 @@ fn main() {
     // `requests_outliving_a_window`.
     let mut pending_menu_events: VecDeque<MenuEvent> = VecDeque::new();
 
-    // **The UI processes this daemon has open, and the reason the loop below
-    // never blocks on one.**
-    //
-    // Declared out here rather than inside the loop because it is the whole
-    // of the one-window rule's memory: a window opened on one pass has to
-    // still be known about on the next, both so a second *Open Vault* focuses
-    // it instead of opening a second one and so its exit is noticed at all.
-    // See `UiWindows`.
-    let mut ui_windows = UiWindows::default();
     // When the loop last started a backend because somebody attached. Kept
     // here rather than in the estate because it is a fact about this LOOP's
     // throttling, not about the vault session -- a re-settle must not clear
