@@ -6987,6 +6987,23 @@ fn run_vault_loop(
         // guards' rule and this exit do not overlap, and keeping them
         // textually apart is what keeps that visible.
         let opened_here = if first_result.is_none() {
+            // **Ask for the backend before the window that needs it.**
+            // `stop_backend_if_idle` has very likely just stopped it: in
+            // save-memory mode nothing needed it a moment ago, and a
+            // window is exactly the thing that changes that. Asked here
+            // because here is where `est.child` is known -- `open_window`
+            // itself cannot see it, which is how the ask came to be lost.
+            if window_needs_the_backend_started(
+                backend_is_running(&mut est.child),
+                est.settings.keep_backend_running,
+            ) {
+                log::info!("the vault window needs bw serve; starting it before the window");
+                spawn_backend_start(
+                    est.token.to_string(),
+                    Arc::clone(deps.job),
+                    deps.backend_op_tx.clone(),
+                );
+            }
             let (returned, session) = ops.open_window(est, deps);
             est = returned;
             let Some(session) = session else { return est };
@@ -8483,6 +8500,38 @@ fn backend_is_running(child: &mut Option<Child>) -> bool {
 /// backend -- startup, `open_vault_window`, and the tray's Sync item -- each
 /// ask for it explicitly instead; this function only ever tears it back
 /// down again afterwards once the policy says it's no longer needed.
+/// Whether opening the vault window has to start `bw serve` first.
+///
+/// **The missing half of [`stop_backend_if_idle`].** That function's own
+/// doc names the three places that must ask for the backend explicitly --
+/// "startup, `open_vault_window`, and the tray's Sync item" -- because
+/// nothing starts it on their behalf. When the vault window moved into a
+/// process of its own, the asking was left behind on the in-daemon path,
+/// and `open_vault_window` stopped being one of the three.
+///
+/// What that cost, with `keep_backend_running` off: the daemon stops
+/// `bw serve` the moment nothing needs it, then spawns a window that polls
+/// `localhost:8087` for fifty-seven seconds and gives up with zero items.
+/// **And the only switch for that setting lives inside the window that
+/// cannot load**, so the state is self-trapping -- a user who turns
+/// save-memory mode on has no way back through the app.
+///
+/// Pure, and a mirror of `stop_backend_if_idle`'s first line, so the two
+/// halves of "should the backend be up right now" are one rule read from
+/// two directions rather than two rules that can disagree.
+fn window_needs_the_backend_started(
+    backend_running: bool,
+    keep_backend_running: bool,
+) -> bool {
+    if backend_running {
+        return false;
+    }
+    // Exactly `should_run`'s question. On a direct-REST account it answers
+    // false and nothing is started, which is right: that account has no
+    // `bw serve` to want.
+    backend_policy::bw_serve_is_selected() || keep_backend_running
+}
+
 fn stop_backend_if_idle(
     bw_serve_child: &mut Option<Child>,
     keep_backend_running: bool,
@@ -12991,6 +13040,74 @@ mod tests {
     fn backend_is_running_is_false_with_nothing_running() {
         let mut child: Option<Child> = None;
         assert!(!backend_is_running(&mut child));
+    }
+
+    /// **The defect this function exists for.** Save-memory mode stops
+    /// `bw serve` whenever nothing needs it; a vault window is exactly the
+    /// thing that changes that, and nothing was starting it again. The
+    /// window polled `localhost:8087` for fifty-seven seconds and showed
+    /// "Your vault could not be loaded" with zero items.
+    #[test]
+    fn a_window_opening_in_save_memory_mode_asks_for_the_backend() {
+        assert!(
+            window_needs_the_backend_started(false, false),
+            "save-memory mode with the backend stopped is exactly the case that was broken"
+        );
+    }
+
+    /// And a backend that is already up is not started twice.
+    ///
+    /// This is not a nicety: `try_start_backend` waits for the PORT TO BE
+    /// FREE and then fails, so a redundant start costs a thirty-second
+    /// stall and a `PortHeld` error on the app's slowest visible action.
+    #[test]
+    fn a_running_backend_is_not_started_again() {
+        assert!(!window_needs_the_backend_started(true, false));
+        assert!(!window_needs_the_backend_started(true, true));
+    }
+
+    /// The two halves of "should the backend be up" must agree. Whatever
+    /// `stop_backend_if_idle` would tear down, opening a window must be
+    /// willing to bring back -- otherwise the pair oscillates or, as it
+    /// did, one half simply stops running.
+    #[test]
+    fn starting_and_stopping_are_one_rule_read_from_two_directions() {
+        for keep in [true, false] {
+            let stopper_would_keep_it =
+                backend_policy::should_run(backend_policy::selected(), keep, false);
+            let opener_would_start_it = window_needs_the_backend_started(false, keep);
+            assert!(
+                !stopper_would_keep_it || opener_would_start_it,
+                "with keep_backend_running={keep} the idle stopper would keep the backend \
+                 running, but opening a window would not start one -- the two halves disagree"
+            );
+        }
+    }
+
+    /// **The guard that would have caught this.** `stop_backend_if_idle`'s
+    /// doc names the three places that must ask for the backend explicitly.
+    /// One of them stopped asking when the vault window moved into its own
+    /// process, and nothing noticed, because the claim lived only in prose.
+    /// It is now a claim the file has to keep.
+    #[test]
+    fn every_place_that_needs_the_backend_still_asks_for_it() {
+        let source = production_half_of_this_file();
+        assert!(
+            source.contains("fn window_needs_the_backend_started"),
+            "control: the opener's decision is gone, so this guard is vacuous"
+        );
+        // The loop that opens a window must consult it. An `open_window`
+        // reached without this line is the defect, exactly as it shipped.
+        let loop_at = source
+            .find("let opened_here = if first_result.is_none() {")
+            .expect("control: the window-opening branch has been renamed");
+        let branch = &source[loop_at..loop_at + 1200];
+        assert!(
+            branch.contains("window_needs_the_backend_started"),
+            "the vault window is opened without asking whether `bw serve` is running; in \
+             save-memory mode that window loads nothing, and the only switch for that mode \
+             is inside it"
+        );
     }
 
     /// **The defect, end to end.** Save-memory mode stopped `bw serve` one
