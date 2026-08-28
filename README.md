@@ -190,22 +190,14 @@ secret and are not filtered.
 
 ## Screenshots
 
-Rendered by `cargo run --example ui_preview -- --all`, which CI runs on every
-push and uploads in full. **Every surface here is drawn from fixtures** -- no
-vault is read, no network is touched, no `bw` is spawned -- so these show the
-real UI without showing anyone's real logins.
+![The vault](docs/screenshots/vault_item_list.png)
 
-| | |
-| --- | --- |
-| ![The vault](docs/screenshots/vault_item_list.png) | ![An item](docs/screenshots/detail_login.png) |
-| The vault | One item |
-| ![Password health](docs/screenshots/vault_password_health.png) | ![Two-factor codes](docs/screenshots/totp_add_picker.png) |
-| Password health | Adding a two-factor code |
-| ![Preferences](docs/screenshots/prefs_clipboard.png) | ![Signing in](docs/screenshots/login_signin.png) |
-| Preferences | Signing in |
+**[More screenshots](docs/SCREENSHOTS.md)** -- one item, password health,
+two-factor codes, preferences, signing in.
 
-The other forty are in the `ui-screenshots` artifact on any CI run -- every
-error state, every empty state, every spinner.
+Rendered from fixtures by `cargo run --example ui_preview -- --all`: no vault
+is read, no network touched, no `bw` spawned. The real UI, nobody's real
+logins.
 
 ## Stack, and why
 
