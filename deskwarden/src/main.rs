@@ -201,6 +201,10 @@ fn main() {
         // A window, and nothing else. It never takes the mutex, never asks
         // anyone to stand down, and never comes back here.
         Ok(LaunchIntent::Ui(surface)) => std::process::exit(run_as_a_ui_process(surface)),
+        // The vault service. Like a UI process, it never takes the app
+        // mutex, never asks another instance to stand down, and never
+        // comes back here.
+        Ok(LaunchIntent::Service(mode)) => std::process::exit(run_as_the_vault_service(mode)),
         // **Refused, not fallen back on.** See `UiLaunchRefusal`: every
         // available fallback either opens a window nobody asked for or starts
         // a second full daemon out of a command line that asked for a window.
@@ -9373,6 +9377,21 @@ const AUTOSTART_FLAG: &str = "--autostart";
 /// tray, no hotkey and no daemon behind it. The installer's one flag is
 /// [`AUTOSTART_FLAG`], and that guard is the other side of
 /// `the_installers_run_entry_passes_the_flag_the_app_reads`.
+/// The word that starts the local vault service instead of the daemon.
+///
+/// Written by two writers and no others: the installer, for the 24/7
+/// mode, and an app that finds no service running. Matched whole, like
+/// [`UI_FLAG`], so a path containing the word is not a request.
+const SERVICE_FLAG: &str = "--service";
+
+/// The word after [`SERVICE_FLAG`] that asks for the installed lifetime.
+///
+/// Absent means consumer-driven, which is the safe default: a service
+/// that exits when the last app lets go cannot outlive anything by
+/// accident. Holding a slot forever is the deliberate choice, so it is
+/// the one that needs a word.
+const INSTALLED_WORD: &str = "installed";
+
 const UI_FLAG: &str = "--ui";
 
 /// **Which window a UI process was asked for.**
@@ -9502,6 +9521,15 @@ enum LaunchIntent {
     /// `.superpowers/sdd/ui-process-split-report.md` for why the spawn is not
     /// wired yet.
     Ui(Surface),
+    /// **The local vault service, and nothing else.** No tray icon, no
+    /// hotkey, no window, and no `bw serve` -- it IS the backend. It
+    /// holds an attachment slot only in
+    /// [`deskwarden::service_host::Mode::Installed`], which is the whole
+    /// difference between the two lifetimes.
+    ///
+    /// Parsed here; the loop that answers it is the next task, and until
+    /// that exists this is a command line no part of this app writes.
+    Service(deskwarden::service_host::Mode),
 }
 
 /// Reads [`LaunchIntent`] off the command line.
@@ -9561,6 +9589,29 @@ fn launch_intent<S: AsRef<str>>(
     // Whole-argument matching, exactly as `AUTOSTART_FLAG` is matched below
     // and for the same reason: `C:\--ui tools\deskwarden.exe` is a path, not a
     // request for a window.
+    // Answered before `--ui` for the same reason `--ui` is answered before
+    // `--autostart`: it is the most specific thing a command line can say,
+    // and a process asked to be the service must not become a daemon
+    // because another flag was also present.
+    if let Some(at) = args.iter().position(|arg| arg == SERVICE_FLAG) {
+        return match args.get(at + 1) {
+            None => Ok(LaunchIntent::Service(deskwarden::service_host::Mode::ConsumerDriven)),
+            Some(word) if word == INSTALLED_WORD => {
+                Ok(LaunchIntent::Service(deskwarden::service_host::Mode::Installed))
+            }
+            // A word that follows another FLAG is not this flag's
+            // argument: `--service --autostart` asks for the default
+            // lifetime, not for an unknown one.
+            Some(word) if word.starts_with("--") => {
+                Ok(LaunchIntent::Service(deskwarden::service_host::Mode::ConsumerDriven))
+            }
+            // Anything else is refused rather than guessed at. Guessing
+            // here would mean a typo silently choosing a lifetime, and
+            // one of the two lifetimes never exits on its own.
+            Some(word) => Err(UiLaunchRefusal::UnknownSurface(word.clone())),
+        };
+    }
+
     if let Some(at) = args.iter().position(|arg| arg == UI_FLAG) {
         return match args.get(at + 1) {
             None => Err(UiLaunchRefusal::NoSurface),
@@ -9641,6 +9692,56 @@ fn refuse_a_ui_launch(refusal: &UiLaunchRefusal) -> i32 {
 /// with, and a UI process that authenticated would hand the daemon a backend
 /// it did not start and a token it does not know about. Moving the sign-in
 /// flow across is Task 7 of the plan and is not done here.
+/// **The local vault service.** Binds a loopback port, answers
+/// `bw serve`'s API, and exits when nobody is attached.
+///
+/// Returns the exit code rather than calling `exit`, exactly as
+/// [`run_as_a_ui_process`] does and for its reason: every arm of `main`'s
+/// branch ends the process on one line, and nothing here can be mistaken
+/// for a path that continues into the daemon's startup.
+///
+/// # What is deliberately missing, and why the service refuses to start
+/// without it
+///
+/// **There is no vault yet.** Unlocking one means taking a master password
+/// on `POST /auth`, deriving the account key and standing up a
+/// [`deskwarden::rest::backend::RestBackend`] behind the encrypted cache --
+/// the first code in this feature that touches real secrets, and its own
+/// task.
+///
+/// Until then this refuses to start rather than serving an empty vault.
+/// An empty vault is indistinguishable from a vault with nothing in it: a
+/// script would read a successful, well-formed, EMPTY answer and conclude
+/// the owner has no logins. Refusing is the only answer that cannot be
+/// mistaken for data.
+///
+/// # Nothing can reach it in any case
+///
+/// No key can exist yet -- the Preferences screen that mints one is a
+/// later task -- so every request would be answered
+/// [`deskwarden::service_api::Answer::Unauthenticated`] even if this did
+/// bind. That is the design working, not a gap: default deny means the
+/// service is unreachable until the owner deliberately makes it reachable.
+fn run_as_the_vault_service(mode: deskwarden::service_host::Mode) -> i32 {
+    // No log file exists yet in this process -- `logging::init` belongs to
+    // the daemon's startup, which this branch never reaches -- so this
+    // opens one itself before saying anything, exactly as
+    // `refuse_a_ui_launch` does. Best-effort: a refusal that could not be
+    // logged is still a refusal.
+    if let Some(config_dir) = settings::config_dir() {
+        let _ = logging::init(&config_dir);
+    }
+    log::error!(
+        "the vault service was asked to start in {mode:?} mode, but it has no way to open a \
+         vault yet: `POST /auth` and the backend behind it are not built. Refusing to start \
+         rather than serving an empty vault, which a script cannot tell from an empty account."
+    );
+    // 3, and not 2: 2 is `refuse_a_ui_launch`'s "this command line is
+    // wrong". This command line is right and the feature is unfinished,
+    // which is a different thing to be told.
+    3
+}
+
 fn run_as_a_ui_process(surface: Surface) -> i32 {
     let Some(project_dirs) = directories::ProjectDirs::from("dev", "Deskwarden", "Deskwarden")
     else {
@@ -9850,6 +9951,13 @@ fn first_surface(intent: LaunchIntent) -> FirstSurface {
         // `Ui` before that point is the next task; this arm is the honest
         // total answer until it exists.
         LaunchIntent::Ui(_) => FirstSurface::ShowTheWindow,
+        // **The service has no first surface at all**, and this arm exists
+        // so that saying so is a decision rather than a catch-all. It is not
+        // reached in production for the same reason the arm above is not:
+        // `main` answers `Service` a thousand lines earlier and never comes
+        // back here. Staying in the tray is the safe total answer -- a
+        // service that somehow reached this must not put a window on screen.
+        LaunchIntent::Service(_) => FirstSurface::StayInTheTray,
     }
 }
 
@@ -13587,6 +13695,65 @@ mod tests {
     /// The whole point of the type: every fallback available here puts a
     /// window on the user's screen that nothing asked for, or starts a second
     /// full daemon out of a spawn that wanted neither.
+    /// `--service` with no word is the consumer-driven lifetime, which is
+    /// the safe default: a service that exits when the last app lets go
+    /// cannot outlive anything by accident.
+    #[test]
+    fn a_bare_service_flag_is_the_consumer_driven_lifetime() {
+        assert_eq!(
+            launch_intent([SERVICE_FLAG]),
+            Ok(LaunchIntent::Service(deskwarden::service_host::Mode::ConsumerDriven))
+        );
+    }
+
+    /// Holding a slot forever is the deliberate choice, so it needs a word.
+    #[test]
+    fn the_installed_lifetime_has_to_be_asked_for_by_name() {
+        assert_eq!(
+            launch_intent([SERVICE_FLAG, INSTALLED_WORD]),
+            Ok(LaunchIntent::Service(deskwarden::service_host::Mode::Installed))
+        );
+    }
+
+    /// **A typo must not choose a lifetime**, because one of the two never
+    /// exits on its own.
+    #[test]
+    fn an_unknown_lifetime_is_refused_rather_than_guessed_at() {
+        assert!(launch_intent([SERVICE_FLAG, "instaled"]).is_err());
+        assert!(launch_intent([SERVICE_FLAG, "permanent"]).is_err());
+    }
+
+    /// A following FLAG is not this flag's argument.
+    #[test]
+    fn a_flag_after_service_is_not_its_lifetime() {
+        assert_eq!(
+            launch_intent([SERVICE_FLAG, AUTOSTART_FLAG]),
+            Ok(LaunchIntent::Service(deskwarden::service_host::Mode::ConsumerDriven))
+        );
+    }
+
+    /// **A process asked to be the service must not become a daemon**
+    /// because another flag was also present. `--service` is the most
+    /// specific thing a command line can say, so it is answered first.
+    #[test]
+    fn service_wins_over_every_other_flag() {
+        for other in [AUTOSTART_FLAG, UI_FLAG] {
+            assert_eq!(
+                launch_intent([other, SERVICE_FLAG]),
+                Ok(LaunchIntent::Service(deskwarden::service_host::Mode::ConsumerDriven)),
+                "{other} before --service produced something other than the service"
+            );
+        }
+    }
+
+    /// A path containing the word is a path.
+    #[test]
+    fn a_path_that_contains_the_word_is_not_the_service_flag() {
+        assert_eq!(
+            launch_intent(["C:" , "--service tools/deskwarden.exe"]),
+            Ok(LaunchIntent::UserLaunch)
+        );
+    }
     #[test]
     fn a_ui_launch_that_names_no_window_is_refused_rather_than_guessed() {
         assert_eq!(
