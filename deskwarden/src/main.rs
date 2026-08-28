@@ -9806,12 +9806,102 @@ fn service_keys_path(config_dir: &std::path::Path) -> std::path::PathBuf {
     config_dir.join("service-keys.json")
 }
 
+/// What goes back on the wire for one request: a status and a body, and
+/// nothing that knows about a socket.
+///
+/// A struct rather than a tuple because the two halves are the thing that has
+/// to agree -- a refusal with a body, or a served item with a `403`, are both
+/// one silent swap of an unnamed pair away.
+#[derive(Debug, PartialEq, Eq)]
+struct ServiceReply {
+    status: u16,
+    body: String,
+}
+
+/// The answer this service gives a caller who asks for the master-password
+/// exchange. A named constant so the test that says it must not look like a
+/// failed sign-in is comparing against the same bytes the wire carries.
+const NO_MASTER_PASSWORD_BODY: &str =
+    "{\"success\":false,\"message\":\"this service does not take a master password; use an API key\"}";
+
+/// **One request, decided and rendered, as a value.**
+///
+/// This is where the three tested modules are joined up, and joining them up
+/// is its own opportunity to be wrong: the decision comes from
+/// [`deskwarden::service_api::decide`], the status from
+/// [`deskwarden::service_host::status_code_for`] and the body from
+/// [`deskwarden::service_body::body_for`], and a mistake HERE -- a status
+/// paired with the wrong body, a refusal handed something to read -- defeats
+/// every guarantee those three prove about themselves. So it takes strings
+/// and returns a struct: no socket, no clock, no vault of its own.
+///
+/// `now_unix` is passed in for the reason `decide` takes it -- expiry has to
+/// be drivable without waiting for a day to pass -- and the vault arrives as
+/// a closure for a stronger reason than testing:
+///
+/// # The vault is loaded only if the answer is one that reads it
+///
+/// An earlier shape of this loop fetched items and folders for EVERY request
+/// before looking at the answer, which meant an unauthenticated caller --
+/// somebody with no credential at all -- made this process do two network
+/// round trips to the server per request, as fast as they could connect.
+/// Taking the load as `FnOnce` makes "a refusal touches nothing" a fact the
+/// type system carries, and a test asserts it by handing in a closure that
+/// panics.
+fn answer_one_request<F>(
+    method: &str,
+    url: &str,
+    auth: Option<&str>,
+    keys: &[deskwarden::service_keys::KeyRecord],
+    now_unix: u64,
+    load_vault: F,
+) -> ServiceReply
+where
+    F: FnOnce() -> (Vec<deskwarden::vault_bridge::VaultItem>, Vec<deskwarden::vault_bridge::Folder>),
+{
+    use deskwarden::service_api::Answer;
+
+    let answer = deskwarden::service_api::decide(method, url, auth, keys, now_unix);
+
+    // The path is logged and the credential is not. A refused request is
+    // worth seeing; the value that was refused is not worth storing.
+    log::debug!("{method} {url} -> {answer:?}");
+
+    // Not built yet, and answered honestly rather than with a shape that
+    // looks like a failed password. The service has no way to take one.
+    if matches!(answer, Answer::Authenticate) {
+        return ServiceReply { status: 501, body: NO_MASTER_PASSWORD_BODY.to_string() };
+    }
+
+    let status = deskwarden::service_host::status_code_for(&answer);
+    if !matches!(answer, Answer::Ok { .. }) {
+        // **No body for a refusal.** `body_for` would answer `None` here
+        // anyway; not asking it is the same answer arrived at without ever
+        // holding the bytes.
+        return ServiceReply { status, body: String::new() };
+    }
+
+    let (items, folders) = load_vault();
+    let vault = deskwarden::service_body::Vault { items: &items, folders: &folders, locked: false };
+    match deskwarden::service_body::body_for(&answer, &vault, keys) {
+        Some(body) => ServiceReply { status, body },
+        // Permitted, and there is nothing to hand back -- an id no item has.
+        // That is a `404` and not a `200` with an empty body: an empty `200`
+        // is a well-formed answer meaning "here it is", and a client that
+        // parses it gets a JSON error instead of the "no such item" it can
+        // act on.
+        None => ServiceReply { status: 404, body: String::new() },
+    }
+}
+
 /// The request loop.
 ///
 /// Split out from [`run_as_the_vault_service`] so that everything above it is
 /// start-up that happens once, and this is the part that repeats. It holds no
-/// decision of its own: [`deskwarden::service_api::decide`] says who may, and
-/// [`deskwarden::service_body::body_for`] says what they get.
+/// decision of its own, and now no rendering either: it reads three strings
+/// off the request, hands them to [`answer_one_request`], and writes the
+/// result back. Everything worth being wrong about is in that function, where
+/// a test can reach it.
 fn serve_the_vault(
     server: &tiny_http::Server,
     backend: &dyn deskwarden::vault_backend::VaultBackend,
@@ -9828,37 +9918,16 @@ fn serve_the_vault(
             .find(|header| header.field.equiv("Authorization"))
             .map(|header| header.value.as_str().to_string());
 
-        let now = deskwarden::service_keys::now_unix();
-        let answer = deskwarden::service_api::decide(&method, &url, auth.as_deref(), keys, now);
+        let reply = answer_one_request(
+            &method,
+            &url,
+            auth.as_deref(),
+            keys,
+            deskwarden::service_keys::now_unix(),
+            || (backend.list_items().unwrap_or_default(), backend.list_folders().unwrap_or_default()),
+        );
 
-        // The path is logged and the credential is not. A refused request is
-        // worth seeing; the value that was refused is not worth storing.
-        log::debug!("{method} {url} -> {answer:?}");
-
-        let status = deskwarden::service_host::status_code_for(&answer);
-        let body = match &answer {
-            // Not built yet, and answered honestly rather than with a shape
-            // that looks like a failed password. The service has no way to
-            // take one -- see this module's doc.
-            deskwarden::service_api::Answer::Authenticate => {
-                let _ = respond(request, 501, "{\"success\":false,\"message\":\"this service does not take a master password; use an API key\"}");
-                continue;
-            }
-            _ => {
-                let items = backend.list_items().unwrap_or_default();
-                let folders = backend.list_folders().unwrap_or_default();
-                let vault = deskwarden::service_body::Vault {
-                    items: &items,
-                    folders: &folders,
-                    locked: false,
-                };
-                deskwarden::service_body::body_for(&answer, &vault, keys)
-            }
-        };
-
-        // **No body for a refusal**, which `body_for` already decided; this
-        // only has to not invent one.
-        let _ = respond(request, status, body.as_deref().unwrap_or(""));
+        let _ = respond(request, reply.status, &reply.body);
     }
 }
 
@@ -11513,6 +11582,313 @@ fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- The vault service's per-request join-up ------------------------
+    //
+    // `answer_one_request` is the one place the decision, the body and the
+    // status meet. Each of the three modules behind it proves things about
+    // itself; none of them can prove that this function pairs them up the way
+    // it should, and a mistake here would defeat all of them at once. These
+    // drive it as the pure function it is: no port, no clock, no vault.
+
+    use deskwarden::service_keys::{hash_key, Access, KeyRecord, Scope, Subject};
+    use deskwarden::vault_bridge::{Folder, ItemKind, VaultItem};
+
+    /// A live key with the scopes given, matching the literal `"the-key"`.
+    fn service_key(scopes: Vec<Scope>) -> KeyRecord {
+        KeyRecord {
+            name: "a test key".to_string(),
+            hash: hash_key("the-key"),
+            created_unix: 1,
+            expires_unix: None,
+            scopes,
+        }
+    }
+
+    fn read_scope(subject: Subject) -> Scope {
+        Scope { subject, access: Access::Read }
+    }
+
+    /// Built through `serde_json` rather than by naming fields, exactly as
+    /// `service_body`'s own fixtures are: a `VaultItem` is a deserialised
+    /// wire shape, and a fixture that skipped the deserialiser would be a
+    /// shape this code never actually meets.
+    fn service_item(id: &str, name: &str, kind: i64) -> VaultItem {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
+            "type": kind,
+            "login": { "username": "someone@example.com", "password": "hunter2",
+                       "uris": [{ "uri": "https://example.com" }] },
+        }))
+        .expect("the fixture must parse as a VaultItem")
+    }
+
+    /// The vault every test below serves from: one login and one card, so
+    /// that "only what this key may see" is a distinction that can fail.
+    fn a_small_vault() -> (Vec<VaultItem>, Vec<Folder>) {
+        (vec![service_item("login-1", "Example", 1), service_item("card-1", "Bank", 3)], Vec::new())
+    }
+
+    /// A vault loader that fails the test if it is ever called. Handed to
+    /// every request that must not reach the vault at all.
+    fn no_vault() -> (Vec<VaultItem>, Vec<Folder>) {
+        panic!("the vault was loaded for a request that was refused before it could read one");
+    }
+
+    const A_LIVE_KEY: Option<&str> = Some("Bearer the-key");
+
+    /// **A caller with no credential is told nothing, including in the
+    /// body.**
+    ///
+    /// The status is the smaller half of this. `service_body::body_for`
+    /// answers `None` for every refusal precisely so that a refused request
+    /// carries no bytes, and that guarantee is only worth anything if the
+    /// code that turns an answer into a reply honours it -- an empty `401` and
+    /// a `401` whose body happens to contain the vault are the same status
+    /// code. So the body is asserted to be empty, not merely "not the vault".
+    ///
+    /// The loader panics, which makes this also the assertion that an
+    /// unauthenticated request does not make this process fetch anything: the
+    /// caller is unknown, and letting them drive two network round trips per
+    /// connection is a cost handed to a stranger.
+    #[test]
+    fn an_unauthenticated_request_is_refused_with_an_empty_body() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        for auth in [None, Some("Bearer wrong"), Some("the-key")] {
+            let reply =
+                answer_one_request("GET", "/list/object/items", auth, &keys, 1_000, no_vault);
+            assert_eq!(reply.status, 401, "{auth:?} was not refused");
+            assert_eq!(reply.body, "", "a refused request was handed a body: {}", reply.body);
+        }
+    }
+
+    /// Control for the test above: the same request WITH the credential is
+    /// served, and served something. Without this, an
+    /// `answer_one_request` that returned an empty `401` unconditionally
+    /// would pass every assertion up there.
+    #[test]
+    fn the_same_request_with_a_credential_is_served() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply =
+            answer_one_request("GET", "/list/object/items", A_LIVE_KEY, &keys, 1_000, a_small_vault);
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.contains("login-1"), "the granted vault was not served: {}", reply.body);
+    }
+
+    /// **A scoped key is served the vault narrowed to its scope, and the
+    /// narrowing has to survive this function.**
+    ///
+    /// `service_body` filters, and it is tested that it filters. What is
+    /// tested here is that the filtered body is the one that reaches the
+    /// reply: a join-up that built the body from the wrong key, or that fell
+    /// back to an unfiltered list on any path, would leave every test in
+    /// `service_body` passing and still put a card on the wire.
+    #[test]
+    fn a_category_scoped_key_is_served_only_its_category() {
+        let keys = [service_key(vec![read_scope(Subject::Category(ItemKind::Login))])];
+        let reply =
+            answer_one_request("GET", "/list/object/items", A_LIVE_KEY, &keys, 1_000, a_small_vault);
+        assert_eq!(reply.status, 200);
+        assert!(reply.body.contains("login-1"), "control: the granted item is missing");
+        assert!(!reply.body.contains("card-1"), "a card reached a key scoped to logins");
+        assert!(!reply.body.contains("Bank"), "a card's name reached a key scoped to logins");
+    }
+
+    /// **Refusing a scope is a different sentence from refusing a
+    /// credential, and this is where the two could be flattened into one.**
+    ///
+    /// A key that names one item and is asked for another is `403`: its
+    /// credential is right and does not cover this. Answering `401` would
+    /// send the owner looking for a broken key, and answering `200` with an
+    /// empty body would tell a script the item is empty rather than off
+    /// limits. The vault is never loaded for it either -- the id was refused
+    /// before anything went looking for it.
+    #[test]
+    fn a_key_scoped_to_one_item_is_refused_another_with_403() {
+        let keys = [service_key(vec![read_scope(Subject::Item("login-1".to_string()))])];
+        let refused =
+            answer_one_request("GET", "/object/item/card-1", A_LIVE_KEY, &keys, 1_000, no_vault);
+        assert_eq!(refused.status, 403, "an out-of-scope item was not refused as out of scope");
+        assert_eq!(refused.body, "", "a forbidden request was handed a body: {}", refused.body);
+
+        // Control: the item this key DOES name is served, so the assertions
+        // above are not describing a function that refuses everything.
+        let served = answer_one_request(
+            "GET",
+            "/object/item/login-1",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            a_small_vault,
+        );
+        assert_eq!(served.status, 200, "control: the granted item was refused too");
+        assert!(served.body.contains("login-1"));
+    }
+
+    /// **`POST /auth` is answered honestly, and not in the shape of a failed
+    /// password.**
+    ///
+    /// This service has no way to take a master password and is not going to
+    /// grow one; the credential it accepts is an API key. The danger in
+    /// answering `/auth` at all is that the obvious answer -- `401` -- is
+    /// exactly what a client sees when a password was WRONG, so a script
+    /// would retry, prompt the owner, and eventually have them typing their
+    /// master password at something that cannot use it. `501` says the
+    /// route is not implemented, which is a thing a client can stop on.
+    #[test]
+    fn the_auth_route_answers_not_implemented_rather_than_a_bad_password() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply = answer_one_request("POST", "/auth", None, &keys, 1_000, no_vault);
+        assert_eq!(reply.status, 501);
+        assert_ne!(
+            reply.status,
+            deskwarden::service_host::failed_auth_status(),
+            "the auth route answers with the status of a rejected password"
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&reply.body).expect("control: the auth refusal is not valid JSON");
+        assert_eq!(parsed["success"], false, "control: the body does not say it failed");
+        let message = parsed["message"].as_str().expect("control: there is no message to read");
+        for resembles_a_password_failure in
+            ["invalid_grant", "invalid_username_or_password", "incorrect", "try again", "Verify"]
+        {
+            assert!(
+                !message.contains(resembles_a_password_failure),
+                "the auth refusal reads like a rejected password: {message}"
+            );
+        }
+        assert!(
+            message.contains("API key"),
+            "control: the refusal does not say what to present instead: {message}"
+        );
+    }
+
+    /// **A route nobody serves is `404`, and only once the caller is
+    /// known.**
+    ///
+    /// The ordering behind this is `service_api`'s -- an unauthenticated
+    /// caller gets `401` for a path that does not exist, so that the set of
+    /// real routes is not a map handed to a stranger. This asserts the pair
+    /// that makes that ordering observable from the outside: the same path,
+    /// with and without a credential, must give two different answers.
+    #[test]
+    fn an_unknown_route_is_404_when_authenticated_and_401_when_not() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let known =
+            answer_one_request("GET", "/nope", A_LIVE_KEY, &keys, 1_000, no_vault);
+        assert_eq!(known.status, 404);
+        assert_eq!(known.body, "", "a 404 was handed a body: {}", known.body);
+
+        let stranger = answer_one_request("GET", "/nope", None, &keys, 1_000, no_vault);
+        assert_eq!(
+            stranger.status, 401,
+            "an unknown caller was told which routes do not exist, which is the map of the \
+             ones that do"
+        );
+    }
+
+    /// **A permitted request for an item that is not there is `404`, not an
+    /// empty `200`.**
+    ///
+    /// This is the one place the join-up has to add something rather than
+    /// pass it along: `service_body` answers `None`, and `status_code_for`
+    /// has already said `200` because the ANSWER was `Ok`. Shipping that pair
+    /// as it stands would put "here it is" on an empty body, and every client
+    /// -- including this crate's own `VaultBridge` -- parses a `200` and gets
+    /// a JSON error instead of the missing-item answer it can act on.
+    #[test]
+    fn a_permitted_request_for_an_item_that_does_not_exist_is_not_an_empty_200() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+        let reply = answer_one_request(
+            "GET",
+            "/object/item/nobody-has-this",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            a_small_vault,
+        );
+        assert_eq!(reply.status, 404, "an id no item has was answered as a success");
+        assert_eq!(reply.body, "");
+
+        // Control: an id the vault DOES have is served, so this is not a
+        // function that has stopped serving items altogether.
+        let served = answer_one_request(
+            "GET",
+            "/object/item/login-1",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            a_small_vault,
+        );
+        assert_eq!(served.status, 200);
+    }
+
+    /// **What goes on the wire parses, and it parses into `bw serve`'s two
+    /// envelopes.**
+    ///
+    /// `service_body` asserts the same shapes about the strings it returns.
+    /// What this adds is that those strings are the ones that reach a reply,
+    /// through the whole path a real request takes: a list is
+    /// `{"success":true,"data":{"data":[...]}}` and a single item is one
+    /// level shallower. Getting the nesting wrong breaks every client written
+    /// against `bw serve`, and no type in this crate checks it.
+    #[test]
+    fn the_reply_bodies_are_bw_serves_two_envelopes() {
+        let keys = [service_key(vec![read_scope(Subject::All)])];
+
+        let list =
+            answer_one_request("GET", "/list/object/items", A_LIVE_KEY, &keys, 1_000, a_small_vault);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&list.body).expect("the list body is not valid JSON");
+        assert_eq!(parsed["success"], true);
+        let listed = parsed["data"]["data"].as_array().expect("a list is nested one deeper");
+        assert_eq!(listed.len(), 2, "control: the list came back empty and proves nothing");
+
+        let one = answer_one_request(
+            "GET",
+            "/object/item/login-1",
+            A_LIVE_KEY,
+            &keys,
+            1_000,
+            a_small_vault,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&one.body).expect("the item body is not valid JSON");
+        assert_eq!(parsed["data"]["id"], "login-1");
+        assert!(parsed["data"]["data"].is_null(), "a single item is nested like a list");
+    }
+
+    /// A key that has expired is a refused credential, and expiry is judged
+    /// against the moment this function is HANDED rather than the machine's
+    /// clock. Without the parameter this behaviour could only be tested by
+    /// waiting, which means it would not be tested.
+    #[test]
+    fn an_expired_key_is_refused_at_the_moment_it_is_judged_against() {
+        let mut record = service_key(vec![read_scope(Subject::All)]);
+        record.expires_unix = Some(1_000);
+        let keys = [record];
+        let before =
+            answer_one_request("GET", "/status", A_LIVE_KEY, &keys, 900, a_small_vault);
+        assert_eq!(before.status, 200, "control: the key was refused while it was still live");
+        let after = answer_one_request("GET", "/status", A_LIVE_KEY, &keys, 5_000, no_vault);
+        assert_eq!(after.status, 401, "an expired key was still served");
+        assert_eq!(after.body, "");
+    }
+
+    /// **A build with no keys at all serves nothing**, which is what makes a
+    /// freshly started service safe: the key file is created when the owner
+    /// mints a key, and until then every request is refused rather than
+    /// waved through for want of anything to check against.
+    #[test]
+    fn a_service_with_no_keys_refuses_every_route() {
+        for path in ["/status", "/list/object/items", "/list/object/folders", "/object/item/login-1"]
+        {
+            let reply = answer_one_request("GET", path, A_LIVE_KEY, &[], 1_000, no_vault);
+            assert_eq!(reply.status, 401, "{path} was served by a service with no keys");
+            assert_eq!(reply.body, "");
+        }
+    }
 
     /// **The update check is not made when the setting is off**, observed as
     /// a request that never arrives rather than as a branch that was taken.
