@@ -357,6 +357,32 @@ off are set out in [PRIVACY.md](PRIVACY.md).
 
 Changes between releases are in [CHANGELOG.md](CHANGELOG.md).
 
+## No warranty, and use at your own risk
+
+**This software is provided as is, with no warranty of any kind, and you use
+it at your own risk.** That is not throat-clearing: it is sections 15 and 16
+of the [AGPL-3.0](LICENSE) this is released under, stated here in plain words
+because a licence file is not where anyone looks.
+
+Specifically, and worth reading before you trust it with a vault:
+
+- **The author is not liable** for any loss, disclosure or corruption of your
+  passwords or other data, however caused, to the fullest extent the law
+  allows.
+- **This is a community project**, built by one person, not audited by a
+  security firm. It handles secrets, and it will have bugs. Some of them will
+  be mine and some will be in the dependencies underneath it.
+- **Keep your vault backed up independently.** Your Bitwarden-compatible
+  server is the source of truth; this is a client, and no client should be the
+  only place your data exists.
+- **Some features widen your exposure and say so where you turn them on** --
+  the encrypted local copy, and the local HTTP API most of all. Read what each
+  one tells you rather than only this page.
+
+Deciding whether it is fit for what you need is yours to make. The source is
+here to be read, and [PRIVACY.md](PRIVACY.md) sets out exactly what leaves
+this machine and when.
+
 ## License
 
 AGPL-3.0-or-later — see [LICENSE](LICENSE). (The same license also ships with the crate at
