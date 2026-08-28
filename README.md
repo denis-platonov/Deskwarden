@@ -188,6 +188,25 @@ secret and are not filtered.
   snapshot, so the service is correct against edits made in the app and is not
   fast. It does not read the encrypted disk cache.
 
+## Screenshots
+
+Rendered by `cargo run --example ui_preview -- --all`, which CI runs on every
+push and uploads in full. **Every surface here is drawn from fixtures** -- no
+vault is read, no network is touched, no `bw` is spawned -- so these show the
+real UI without showing anyone's real logins.
+
+| | |
+| --- | --- |
+| ![The vault](docs/screenshots/vault_item_list.png) | ![An item](docs/screenshots/detail_login.png) |
+| The vault | One item |
+| ![Password health](docs/screenshots/vault_password_health.png) | ![Two-factor codes](docs/screenshots/totp_add_picker.png) |
+| Password health | Adding a two-factor code |
+| ![Preferences](docs/screenshots/prefs_clipboard.png) | ![Signing in](docs/screenshots/login_signin.png) |
+| Preferences | Signing in |
+
+The other forty are in the `ui-screenshots` artifact on any CI run -- every
+error state, every empty state, every spinner.
+
 ## Stack, and why
 
 | Choice | Reasoning |
