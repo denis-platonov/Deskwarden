@@ -248,8 +248,9 @@ fn main() {
     // Bound with a name, and never `let _`: a `_`-bound guard drops at once,
     // which would release the slot on the next line and make every reading
     // of it a lie.
-    let vault_slot = deskwarden::vault_service::attach(&deskwarden::vault_service::windows_env());
-    match &vault_slot {
+    let vault_attachment =
+        deskwarden::vault_service::attach(&deskwarden::vault_service::windows_env());
+    match &vault_attachment {
         Some(slot) => log::info!(
             "vault attachment slot {} claimed; anyone_attached={}",
             slot.slot(),
@@ -3269,7 +3270,15 @@ fn main() {
                 // **The input that was missing.** Without it this stopped
                 // `bw serve` out from under a window that had just asked
                 // for it, one second after it came up.
-                ui_windows.vault_pid().is_some(),
+                // A window of ours, OR anything else attached -- the vault
+                // service is a consumer too, and it holds a slot while it
+                // serves. Its own slot is excluded, or the daemon would
+                // read itself as a reason to keep the backend forever.
+                ui_windows.vault_pid().is_some()
+                    || deskwarden::vault_service::anyone_else_attached(
+                        &deskwarden::vault_service::windows_env(),
+                        vault_attachment.as_ref().map(deskwarden::vault_service::Attachment::slot),
+                    ),
             );
         }
 
@@ -9908,13 +9917,21 @@ fn run_as_the_vault_service(mode: deskwarden::service_host::Mode) -> i32 {
         );
     }
 
-    // A slot only in the installed lifetime. The consumer-driven one is
-    // counted by the apps that asked for it, which is the whole difference
-    // between the two -- see `service_host::slots_to_hold`.
-    let env = deskwarden::vault_service::windows_env();
-    let _slot = (deskwarden::service_host::slots_to_hold(mode) > 0)
-        .then(|| deskwarden::vault_service::attach(&env))
-        .flatten();
+    // **Held for as long as this service serves, in either lifetime.**
+    //
+    // `slots_to_hold` was about which lifetime keeps the SERVICE alive.
+    // This is a different question: while the service is up it is a
+    // consumer of the vault like any window, and the daemon has to know
+    // that or save-memory mode stops `bw serve` under it and every script
+    // gets a 503. That is the hole this counting was built to close, and
+    // this is its first real caller.
+    let _slot = deskwarden::vault_service::attach(&deskwarden::vault_service::windows_env());
+    if _slot.is_none() {
+        log::warn!(
+            "no free attachment slot; the daemon will not know this service needs the \
+             backend, so reads may fail while save-memory mode is on"
+        );
+    }
 
     let addr = deskwarden::service_host::listen_addr(0);
     let server = match tiny_http::Server::http(addr) {

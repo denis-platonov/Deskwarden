@@ -155,6 +155,24 @@ pub fn attach(env: &ServiceEnv) -> Option<Attachment> {
     })
 }
 
+/// Whether anybody OTHER than this process is attached.
+///
+/// **The daemon needs this rather than [`anyone_attached`], and the
+/// difference is not pedantic:** the daemon holds a slot of its own from
+/// the moment it starts, so `anyone_attached` is true for the whole of its
+/// life and would answer "somebody needs the vault" even when nobody but
+/// itself does. Asked that way it would pin `bw serve` up forever and
+/// quietly undo save-memory mode.
+///
+/// `mine` is the slot to ignore. `None` means this process holds none, in
+/// which case this is exactly [`anyone_attached`].
+#[must_use]
+pub fn anyone_else_attached(env: &ServiceEnv, mine: Option<usize>) -> bool {
+    (0..SLOTS)
+        .filter(|slot| Some(*slot) != mine)
+        .any(|slot| (env.is_held)(&attach_slot_name(slot)))
+}
+
 /// Whether any slot still has a live holder.
 ///
 /// Every slot is asked about: a dead slot is not evidence about the others,
@@ -634,6 +652,43 @@ mod tests {
         let slot = first.slot();
         drop(first);
         assert_eq!(attach(&env()).expect("second").slot(), slot);
+    }
+
+    /// **The daemon must not see its own slot as a reason to stay up.**
+    ///
+    /// It holds one for its whole life, so asking `anyone_attached` would
+    /// answer yes forever and pin `bw serve` up, undoing save-memory mode
+    /// in the name of the counting that was meant to make it work.
+    #[test]
+    fn a_process_does_not_count_itself_as_somebody_needing_the_vault() {
+        reset();
+        let mine = attach(&env()).expect("the daemon's own slot");
+        assert!(
+            anyone_attached(&env()),
+            "control: with only its own slot held, the unfiltered question says yes"
+        );
+        assert!(
+            !anyone_else_attached(&env(), Some(mine.slot())),
+            "the daemon counted its own slot, which would keep bw serve up forever"
+        );
+
+        // And a second holder -- the service -- is seen.
+        let theirs = attach(&env()).expect("the service's slot");
+        assert!(
+            anyone_else_attached(&env(), Some(mine.slot())),
+            "a second process needing the vault went unnoticed"
+        );
+        drop(theirs);
+        assert!(!anyone_else_attached(&env(), Some(mine.slot())));
+    }
+
+    /// With no slot of its own, the filtered question is the plain one.
+    #[test]
+    fn holding_no_slot_makes_the_two_questions_the_same() {
+        reset();
+        assert!(!anyone_else_attached(&env(), None));
+        let _theirs = attach(&env()).expect("somebody");
+        assert!(anyone_else_attached(&env(), None));
     }
 
     /// **The test the design exists for.** An app that dies without releasing

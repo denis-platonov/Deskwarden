@@ -4,6 +4,7 @@
 [![release](https://img.shields.io/github/v/release/denis-platonov/deskwarden?sort=semver&style=flat-square&color=007ec6&label=release)](https://github.com/denis-platonov/deskwarden/releases/latest)
 [![downloads](https://img.shields.io/github/downloads/denis-platonov/deskwarden/total?style=flat-square&color=44cc11&logo=github&label=Downloads)](https://github.com/denis-platonov/deskwarden/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/denis-platonov/deskwarden/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/denis-platonov/deskwarden/actions/workflows/ci.yml)
+[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-donate-FFDD00?style=flat-square&logo=buymeacoffee&logoColor=333333)](https://buymeacoffee.com/denis.platonov)
 
 
 > **Unofficial and unaffiliated with Bitwarden.** This is an independent,
