@@ -144,6 +144,83 @@ jobs:
   #
   # NO REAL VAULT, NO NETWORK, NO `bw`. Every surface renders from fixtures
   # held in the example -- see its module doc, which states that as a
+  # ---- coverage ------------------------------------------------------
+  #
+  # **A floor, not a target.** The number is published for a badge, but the
+  # thing that fails the build is the floor below -- a percentage nobody
+  # enforces drifts down one uncovered branch at a time and is noticed by
+  # nobody. The floor is set from the first measured run and raised
+  # deliberately, never lowered to make a red build green.
+  #
+  # This does NOT gate the release: it runs beside the other jobs, and a
+  # coverage dip is a thing to look at rather than a thing that stops a
+  # security fix shipping.
+  coverage:
+    name: Coverage
+    runs-on: windows-latest
+    # At the JOB level deliberately: a step's own `env:` is not visible to
+    # that step's `if:`, so the upload condition below would have been read
+    # against an unset value and never fired -- or fired always.
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: deskwarden
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # `--no-fail-fast` for the reason `scripts/ci-locally.sh` learned the
+      # hard way: cargo stops after a target fails, so without it a failing
+      # lib target means the bin target is never measured at all.
+      - name: Measure
+        working-directory: deskwarden
+        run: cargo llvm-cov --no-fail-fast --lcov --output-path lcov.info -j 8
+
+      - name: Report and enforce the floor
+        working-directory: deskwarden
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Read the summary llvm-cov already computed rather than
+          # re-deriving it from the lcov file: two ways of computing one
+          # number is two numbers.
+          pct=$(cargo llvm-cov report --summary-only \
+                | awk '/^TOTAL/ {gsub(/%/, "", $10); print $10}')
+          echo "line coverage: ${pct}%"
+          echo "### Coverage: ${pct}%" >> "$GITHUB_STEP_SUMMARY"
+          # **Zero, which enforces NOTHING, and that is deliberate for one
+          # run.** There is no measured number yet -- the local attempt ran
+          # the disk out before it compiled -- and inventing a floor would be
+          # guessing at the very thing this job exists to find out. Raise it
+          # to just under the first real figure and this becomes a guard;
+          # leave it at zero and it stays a reporter wearing a guard's
+          # clothes.
+          floor=0
+          awk -v p="$pct" -v f="$floor" 'BEGIN { exit !(p+0 >= f+0) }' || {
+            echo "coverage ${pct}% is below the floor of ${floor}%" >&2
+            exit 1
+          }
+
+      # Uploaded only when a token is configured, so a fork's build -- and
+      # this repo before anyone sets one up -- neither fails nor silently
+      # pretends to publish. Coverage data is file paths and line counts,
+      # no vault content, but it is still this repo's shape leaving the
+      # machine, so it is opt-in rather than on by default.
+      - name: Upload to Codecov
+        if: ${{ env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v5
+        with:
+          files: deskwarden/lcov.info
+          fail_ci_if_error: false
   # property of the file rather than a hope.
   screenshots:
     name: Screenshots of every surface

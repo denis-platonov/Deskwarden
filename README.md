@@ -1,10 +1,12 @@
 # Deskwarden
 
+[![Rust](https://img.shields.io/badge/Rust-2021%20edition-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![license](https://img.shields.io/badge/license-AGPL--3.0-orange?style=flat-square)](LICENSE)
 [![release](https://img.shields.io/github/v/release/denis-platonov/deskwarden?sort=semver&style=flat-square&color=007ec6&label=release)](https://github.com/denis-platonov/deskwarden/releases/latest)
 [![downloads](https://img.shields.io/github/downloads/denis-platonov/deskwarden/total?style=flat-square&color=44cc11&logo=github&label=Downloads)](https://github.com/denis-platonov/deskwarden/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/denis-platonov/deskwarden/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/denis-platonov/deskwarden/actions/workflows/ci.yml)
-[![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-donate-FFDD00?style=flat-square&logo=buymeacoffee&logoColor=333333)](https://buymeacoffee.com/denis.platonov)
+[![tests](https://img.shields.io/badge/tests-4300%2B-brightgreen?style=flat-square)](https://github.com/denis-platonov/deskwarden/actions/workflows/ci.yml)
+[![Buy me a coffee](https://raw.githubusercontent.com/pachadotdev/buymeacoffee-badges/main/bmc-yellow.svg)](https://buymeacoffee.com/denis.platonov)
 
 
 > **Unofficial and unaffiliated with Bitwarden.** This is an independent,
@@ -299,8 +301,14 @@ AGPL-3.0-or-later — see [LICENSE](LICENSE). (The same license also ships with 
 
 ---
 
+<!-- The star-history chart that used to be here stopped working on
+     2026-06-30, when GitHub restricted the stargazers API to a
+     repository's own admins and collaborators. Every third-party chart
+     service reads that endpoint, so none of them can draw this any more --
+     the image was rendering as a broken link rather than a chart. Replaced
+     with the count itself, which comes from an endpoint that still works. -->
 <p align="center">
-  <a href="https://star-history.com/#denis-platonov/deskwarden&Date">
-    <img src="https://api.star-history.com/svg?repos=denis-platonov/deskwarden&type=Date" alt="Star History Chart" width="600">
+  <a href="https://github.com/denis-platonov/deskwarden/stargazers">
+    <img src="https://img.shields.io/github/stars/denis-platonov/deskwarden?style=for-the-badge&color=f5c518&labelColor=1c1c1c" alt="Stars">
   </a>
 </p>

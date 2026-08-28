@@ -1416,6 +1416,63 @@ mod tests {
         THREAD_SPAWN_SITES.iter().find(|(f, _)| *f == relative).map_or(0, |(_, n)| *n)
     }
 
+    /// **The README's test count is a claim, so it is held to one.**
+    ///
+    /// A number typed into a README goes stale the moment the next test is
+    /// written, and nothing notices. It is the same failure mode as the
+    /// prose in `stop_backend_if_idle`'s doc, which named three callers
+    /// that had to ask for the backend while one had quietly stopped
+    /// asking -- a claim nothing held.
+    ///
+    /// The badge says `N+`, rounded down to a hundred, so ordinary work
+    /// does not touch it. This fails only when the real count drops BELOW
+    /// what is advertised, or runs two hundred past it and the `+` has
+    /// stopped being honest in the other direction.
+    #[test]
+    fn the_readme_test_count_is_not_a_boast() {
+        let readme = include_str!("../../README.md");
+        let marker = "/badge/tests-";
+        let at = readme
+            .find(marker)
+            .expect("control: the README has no tests badge, so this guard is vacuous");
+        let claimed: usize = readme[at + marker.len()..]
+            .split("%2B")
+            .next()
+            .and_then(|n| n.parse().ok())
+            .expect("the tests badge is no longer `tests-<number>%2B`");
+
+        let needle = concat!("#[te", "st]");
+        fn count_under(dir: &std::path::Path, needle: &str) -> usize {
+            let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+            let mut n = 0;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    n += count_under(&path, needle);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    n += std::fs::read_to_string(&path).unwrap_or_default().matches(needle).count();
+                }
+            }
+            n
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let actual = count_under(&src, needle);
+
+        assert!(
+            actual > 0,
+            "control: no test attributes were found at all, so the comparison below is vacuous"
+        );
+        assert!(
+            actual >= claimed,
+            "the README advertises {claimed}+ tests and there are {actual}. A badge that \
+             overstates is worse than no badge."
+        );
+        assert!(
+            actual < claimed + 200,
+            "there are {actual} tests and the README still says {claimed}+. Round the badge \
+             up: two hundred behind is no longer a plus."
+        );
+    }
     #[test]
     fn the_thread_spawn_census_is_exact() {
         // The exemption granted by [`is_a_genuine_std_thread_spawn`] is
