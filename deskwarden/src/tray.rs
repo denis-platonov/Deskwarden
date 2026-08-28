@@ -594,7 +594,6 @@ fn set_tooltip(tray: &AppTray, text: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::hotkey::{HotkeyStatus, Unavailable};
 
     /// **The chord is worth showing where the user already is.** The owner
