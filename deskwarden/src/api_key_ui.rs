@@ -971,4 +971,91 @@ mod tests {
              absence above means nothing"
         );
     }
+    /// **The client secret's hygiene rule, read off the source.**
+    ///
+    /// It is a permanent, password-free login to the account, and the design
+    /// gives it "the master password's handling": `Zeroizing`, no `Debug`,
+    /// never logged, never in an error string. Three of those four are
+    /// properties of the *text of this file* and no runtime value can
+    /// demonstrate them, which is why this test reads the file.
+    #[test]
+    fn the_client_secret_is_handled_like_a_password() {
+        let source = include_str!("api_key_ui.rs").replace("\r\n", "\n");
+        let marker = "\n#[cfg(test)]\nmod tests {";
+        let cut = source.find(marker).expect("the test module marker was not found");
+        let production = &source[..cut];
+
+        // Control on the cut: the subject really is in this half.
+        assert!(
+            production.contains("pub struct ApiKeyForm {"),
+            "the cut lost the form, so every absence below proves nothing"
+        );
+
+        // 1. Still wiped on drop.
+        assert!(
+            production.contains("pub secret: Zeroizing<String>"),
+            "the client secret is no longer wiped on drop"
+        );
+        assert!(
+            production.contains("pub password: Zeroizing<String>"),
+            "control: the master password beside it is wiped the same way, so the needle \
+             above is the shape this file really uses"
+        );
+
+        // 2. Not printable -- neither derived nor hand-written.
+        assert!(
+            !production.contains("impl std::fmt::Debug for ApiKeyForm"),
+            "ApiKeyForm gained a Debug; there is nothing in it a formatter may print"
+        );
+        assert!(
+            !production.contains("impl std::fmt::Debug for ApiKeyCommand"),
+            "ApiKeyCommand gained a Debug; two of its variants carry a credential"
+        );
+        // Control on that search technique: a `derive(..)]\npub enum` really is
+        // findable this way, so the two absences above are about Debug and not
+        // about the needle being unspellable.
+        assert!(
+            production.contains("derive(Debug, Clone, Copy, PartialEq, Eq)]\npub enum ApiKeyRefusal"),
+            "the derive-then-item search no longer matches anything, so the assertions \
+             above prove nothing"
+        );
+
+        // 3. Never formatted, never logged, never in an error string.
+        //
+        // Every production line that so much as names the secret, checked one
+        // at a time -- a whole-file search would be satisfied by the wrong
+        // line.
+        let touching: Vec<&str> = production
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                !t.starts_with("//") && !t.starts_with("///")
+            })
+            .filter(|line| line.contains("secret") || line.contains("client_secret"))
+            .collect();
+        assert!(
+            touching.len() >= 4,
+            "control: the scan found only {} lines naming the secret, which is fewer than \
+             this module has -- the filter is wrong and the loop below is vacuous: {touching:?}",
+            touching.len()
+        );
+        for line in &touching {
+            for forbidden in ["log::", "format!", "println!", "eprintln!", "{secret", "to_string()"]
+            {
+                assert!(
+                    !line.contains(forbidden),
+                    "a line naming the client secret also reaches for `{forbidden}`; the \
+                     secret is never formatted, logged, or put in an error string. Line: \
+                     {line:?}"
+                );
+            }
+        }
+        // Control on THAT loop: the same scan over a line that does log finds
+        // it, so the absence above is about this file and not about the needle.
+        assert!(
+            production.contains("log::warn!"),
+            "this module logs nothing at all, so 'the secret is never logged' is a claim \
+             about a file with no logging in it"
+        );
+    }
 }
