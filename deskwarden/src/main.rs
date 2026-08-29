@@ -3226,7 +3226,7 @@ fn main() {
         // Asked ONCE and used by both halves below, so the thing that
         // stops the backend and the thing that starts it cannot come to
         // disagree about who needs it.
-        let somebody_needs_the_vault = ui_windows.vault_pid().is_some()
+        let somebody_needs_the_vault = ui_windows.vault_is_in_use()
             || deskwarden::vault_service::anyone_else_attached(
                 &deskwarden::vault_service::windows_env(),
                 vault_attachment.as_ref().map(deskwarden::vault_service::Attachment::slot),
@@ -6002,6 +6002,24 @@ impl UiWindows {
     /// one-window rule's input; see [`deskwarden::ui_process::open_decision`].
     fn vault_pid(&self) -> Option<u32> {
         self.vault.as_ref().map(|open| open.pid)
+    }
+
+    /// **Whether a window is actually USING the vault**, which a hidden one
+    /// is not.
+    ///
+    /// Deliberately not [`vault_pid`](Self::vault_pid). That one answers
+    /// "does a window exist", which is the one-window rule's question and is
+    /// still yes while hidden -- the next *Open Vault* shows this one rather
+    /// than starting a second. This one answers "is the vault in use", and a
+    /// hidden window has already dropped its vault-service attachment.
+    ///
+    /// Told apart because conflating them keeps `bw serve` alive behind a
+    /// hidden window for ever: `keep_ui_loaded` would silently cancel
+    /// save-memory mode. Observed on the running app, where the child
+    /// released its slot exactly as designed and the backend still would not
+    /// stop, because this disjunct never went false.
+    fn vault_is_in_use(&self) -> bool {
+        self.vault.as_ref().is_some_and(|open| !open.hidden)
     }
 
     /// **Answer a request for the vault window without blocking on it.**
