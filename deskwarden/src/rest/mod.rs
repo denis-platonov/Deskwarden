@@ -31,8 +31,11 @@
 //! restore and hard delete for *ciphers*. There is still no folder write, no
 //! Send, no attachment upload and no app wiring: nothing in this crate
 //! constructs an [`api::RestClient`]. Two-factor authentication is
-//! *recognised* and refused by name
-//! ([`api::RestError::TwoFactorRequired`]), not completed.
+//! *completed* now rather than refused by name: authenticator, email and
+//! YubiKey, plus the personal API-key grant for the accounts none of those
+//! reach. See [`api::LoginOutcome`] and [`api::Challenge`].
+//! [`api::RestError::TwoFactorRequired`] survives for the callers that
+//! cannot prompt.
 //!
 //! # What a write does not carry, and what that costs
 //!
