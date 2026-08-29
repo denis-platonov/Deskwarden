@@ -56,12 +56,24 @@ exits rather than hiding.
 | `Resettle` | `locked` or `needs_reauth` | **exits**, as today |
 | `Done` | "the window closed for good" | **hides** |
 
-**`Done` hides; everything else exits.** That is the whole rule, and it is
-why this change is small: every outcome the daemon acts on still arrives by
-the route it arrives by now -- result file, exit, reap, resettle -- so the
-session machinery is untouched. `Done`'s own doc already says nothing is
-left to do, which is precisely the case where there is nothing to report and
-therefore nothing a resident process withholds.
+**`Done` hides; everything else exits** -- **and `Done` is not quite
+enough on its own.** `vault_follow_up` does not read `edited_settings`, but
+the daemon does, above the match: `main.rs:7121` applies the edited
+settings to `est.settings` and runs `apply_disk_cache_change` for the disk
+cache the gear may have just turned off. A window that hid after a visit to
+the gear would withhold both, and the daemon would go on running against
+settings the user had changed.
+
+So the rule is **`Done` AND `edited_settings.is_none()`**. Visiting the
+gear and closing exits, as it does today; the reopen after it is a cold
+one. That is the rare case and the cheap answer -- the alternative is a
+live result channel existing solely so that a preferences edit can be
+delivered without an exit, which is most of the machinery this design
+avoids, bought for the least frequent thing a window does.
+
+Everything else the daemon acts on still arrives by the route it arrives by
+now -- result file, exit, reap, resettle -- so the session machinery is
+untouched.
 
 Auto-lock needs no special case. It surfaces as `locked: true`, which is
 `Resettle`, so a hidden window whose auto-lock fires exits like a visible
@@ -69,15 +81,35 @@ one. The decision is a pure function:
 
 ```rust
 pub enum OnClose { Hide, Exit }
-pub fn hide_or_exit(follow_up: VaultFollowUp, keep_loaded: bool) -> OnClose
+pub fn on_close(keep_loaded: bool, result: &UiVaultResult) -> OnClose
 ```
 
-### Three pieces of new mechanism, and no more
+Written against `UiVaultResult` -- the type that already crosses between
+the two processes -- rather than against `VaultFollowUp`, which lives in
+the binary and the library cannot see. That is also what lets the rule be
+stricter than `Done` without a second rule: it reads `edited_settings`
+itself.
 
-1. **`OpenUiWindow` gains `hidden: bool`**, and
-   `ui_process::open_decision` a third answer, `ShowTheHiddenOne { pid }`.
-   `FocusTheOpenOne` cannot serve: `foreground::raise_process` raises a
-   window that exists, and a hidden viewport has none to raise.
+### The new mechanism, and no more than this
+
+1. **`ui_process::open_decision` gains a third answer**,
+   `ShowTheHiddenOne { pid }`. `FocusTheOpenOne` cannot serve:
+   `foreground::raise_process` raises a window that exists, and a hidden
+   viewport has none to raise.
+
+   **Corrected during implementation.** This first said `OpenUiWindow`
+   gains a `hidden: bool`, and that was wrong in a way only running it
+   showed: the daemon sets that flag and the *child* changes state, in
+   another process, through no channel. It read `false` for ever -- so
+   `bw serve` stayed up behind a hidden window and *Open Vault* raised a
+   window that was not there. There is no stored answer now. The child
+   holds a named mutex, `ui_show::visible_name`, while its window is on
+   screen and drops it on hide; the daemon asks the kernel. Windows
+   releases it if the process dies, so a crashed window reads as gone.
+
+   A mutex rather than a second event because this is a **state** somebody
+   asks about, not a message -- and it reuses `vault_service`'s own
+   `hold`/`is_held` rather than opening kernel handles a second way.
 
 2. **A named auto-reset event, `Local\Deskwarden-UI-Show-<pid>`.** The
    daemon sets it; the child waits on it and answers with
@@ -136,6 +168,11 @@ exists at all.
 ## Status
 
 Design, approved 2026-08-28. No plan, no code.
+
+Built and verified live 2026-08-28. The plan is
+`docs/superpowers/plans/2026-08-28-keeping-the-ui-loaded.md`; the one
+correction the build forced is recorded above, under the mechanism it
+changed.
 
 ## Adjacent, and deliberately not in scope
 
