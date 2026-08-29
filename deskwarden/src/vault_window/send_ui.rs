@@ -7215,8 +7215,14 @@ mod frame_promptness {
     /// is also the tune button's hover text -- the pointer is resting on that
     /// button when the modal opens, so its tooltip would satisfy a control
     /// that meant to be about the modal.
-    const PREFS_MODAL_ONLY: &str =
-        "How Deskwarden runs in the background, and when it locks itself.";
+    // **Read from the page, not transcribed from it.** This was a copy of
+    // the General subtitle and it went stale the day that subtitle gained
+    // "the shortcut it answers" -- leaving a permanently red test that was
+    // about a sentence rather than about the modal it exists to detect.
+    // Sourced from `Section::subtitle`, the drift cannot happen again.
+    fn prefs_modal_only() -> &'static str {
+        crate::prefs_ui::Section::General.subtitle()
+    }
     /// The one Send [`counted_send_list`] hands back, and the Sends screen's
     /// second positive control: a row with this name on it can only have been
     /// painted by `draw_send_pane`'s `Ok` arm.
@@ -8197,7 +8203,7 @@ mod frame_promptness {
     /// Reached by pressing the titlebar's tune mark, the only writer of the
     /// `prefs` cell. Two positive controls:
     ///
-    ///  * [`PREFS_MODAL_ONLY`] is on screen -- the General section's
+    ///  * [`prefs_modal_only()`] is on screen -- the General section's
     ///    subtitle, which only `prefs_ui` paints.
     ///  * the vault behind it is STILL painted. The modal is an overlay, not
     ///    a screen: if the item list vanished, the click did something other
@@ -8208,7 +8214,7 @@ mod frame_promptness {
         let outcome = measured("prefs", Scenario { press_prefs: true, ..Scenario::new() });
         assert_the_body_was_entered("prefs", &outcome);
         outcome.expect_painted(
-            PREFS_MODAL_ONLY,
+            prefs_modal_only(),
             "the tune mark was pressed and the preferences modal is not on screen, so the \
              block at the end of the closure never ran",
         );
