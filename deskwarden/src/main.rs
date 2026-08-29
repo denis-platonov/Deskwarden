@@ -10235,6 +10235,23 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // that hides on a plain close and waits to be shown again -- see
     // `ui_process::on_close` for which closes qualify, and `ui_show` for
     // how the daemon asks.
+    // **Held by EVERY window while it is on screen, not only a hidable one.**
+    //
+    // The daemon reads this name to answer "is the vault in use", and it asks
+    // it of every window there is. Creating it inside the `keep_ui_loaded`
+    // branch below -- which is where it was first written -- meant an
+    // ordinary window held nothing, so the daemon concluded nobody needed the
+    // vault and save-memory stopped `bw serve` underneath a window that was
+    // still open. That is not a hiding feature at all; it is what the window
+    // IS, so it is taken here.
+    let visible = std::rc::Rc::new(std::cell::RefCell::new(
+        (deskwarden::vault_service::windows_env().hold)(
+            &deskwarden::ui_show::visible_name(std::process::id()),
+        ),
+    ));
+    let visible_for_hidden = std::rc::Rc::clone(&visible);
+    let visible_for_shown = std::rc::Rc::clone(&visible);
+
     let hide = settings.keep_ui_loaded.then(|| {
         let signal = (deskwarden::ui_show::ShowEnv::production().create)(
             &deskwarden::ui_show::signal_name(std::process::id()),
@@ -10252,16 +10269,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         ));
         let slot_for_hidden = std::rc::Rc::clone(&slot);
         let slot_for_shown = std::rc::Rc::clone(&slot);
-        // **The name this process holds while its window is on screen.**
-        // Taken now, because the window is about to be; dropped on hide
-        // and retaken on show. It is how the DAEMON tells a hidden
-        // window from a showing one -- see `ui_show::visible_name` for
-        // why that is asked rather than remembered.
-        let visible = std::rc::Rc::new(std::cell::RefCell::new(
-            (env.hold)(&deskwarden::ui_show::visible_name(std::process::id())),
-        ));
-        let visible_for_hidden = std::rc::Rc::clone(&visible);
-        let visible_for_shown = std::rc::Rc::clone(&visible);
+
         vault_window::HideHooks {
             wait_for_show: std::sync::Arc::new(move || {
                 // `INFINITE`: there is nothing to poll for, and a timed
@@ -18816,6 +18824,40 @@ mod tests {
                 vault_follow_up(&closed()),
                 VaultFollowUp::Done,
                 "control: a plain close ends the window"
+            );
+        }
+
+        /// **Every window claims the visibility name, hidable or not.**
+        ///
+        /// The daemon asks that name whether the vault is in use, of every
+        /// window there is. This claim was first written INSIDE the
+        /// `keep_ui_loaded` branch, where an ordinary window held nothing --
+        /// so the daemon concluded nobody needed the vault and save-memory
+        /// stopped `bw serve` underneath a window that was still open. The
+        /// user met it as "Your vault could not be loaded", with a connection
+        /// timed out against the backend the daemon had just killed.
+        ///
+        /// Ordering, not presence, is what this pins: the claim has to be
+        /// reached on every path through `run_as_a_ui_process`, and being
+        /// above the branch is what makes that true.
+        #[test]
+        fn every_ui_process_claims_the_visibility_name_not_only_a_hidable_one() {
+            let source = super::production_half_of_this_file();
+            let child = source
+                .split_once("fn run_as_a_ui_process")
+                .expect("control: the UI process entry point was renamed")
+                .1;
+            let claim = child
+                .find(concat!("visible_name(std::process::", "id())"))
+                .expect("no window claims the visibility name, so the daemon can never see one");
+            let branch = child
+                .find(concat!("keep_ui_loaded.", "then("))
+                .expect("control: the hide hooks are no longer built from the setting");
+            assert!(
+                claim < branch,
+                "the visibility claim sits inside the `keep_ui_loaded` branch, so a window \
+                 opened with the setting OFF holds nothing -- the daemon reads that as \
+                 nobody needing the vault and stops `bw serve` under a live window"
             );
         }
 
