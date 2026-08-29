@@ -1309,7 +1309,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 70] = [
+        const OPENS_NO_WINDOW: [&str; 71] = [
             "accounts",
             "app",
             // A pure matching function over vault items: it scores and
@@ -1457,6 +1457,11 @@ mod tests {
             // something and the part that touches the OS are separate files so
             // that this one can stay windowless.
             "screen_capture",
+            // The second-factor card's state, copy and pure decisions. It
+            // draws into a `Ui` the one window hands it -- `app_window`'s
+            // `Stage::SecondFactor`, which is a stage of a window that already
+            // exists and is already raised. Nothing here opens one.
+            "second_factor_ui",
             // Builds the argument vector, the stdin JSON and the failure
             // classification for `bw send`. Pure data; the Sends screen that
             // will draw it is a later step and is not this module.

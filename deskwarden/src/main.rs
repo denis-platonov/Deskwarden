@@ -11173,7 +11173,11 @@ fn settle_the_vault_backend(
             server_url,
             email: account.email.clone(),
             device_id: device_id_for(&account.id),
-            authenticate: login_ui::derive_direct_rest,
+            second_factor: login_ui::PRODUCTION_SECOND_FACTOR,
+            // Filled in by the host that has a code stage to show it
+            // on; `None` here is the behaviour every account had
+            // before the prompt existed.
+            prompt: None,
             adopt,
         }),
     }
