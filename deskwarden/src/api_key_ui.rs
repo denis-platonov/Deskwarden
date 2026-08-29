@@ -27,6 +27,7 @@
 //! `Account`, `Step`, `Command` and `Report` are every one of them already
 //! taken elsewhere in this crate.
 
+use crate::rest::api::RestError;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Which of the two things the user is being asked for.
@@ -191,6 +192,45 @@ impl ApiKeyForm {
             // nothing moves. The button comes back and they press it again.
             ApiKeyRefusal::Unreachable => {}
         }
+    }
+}
+
+/// What a failed [`crate::rest::api::RestClient::api_key_grant`] means to the
+/// user.
+///
+/// Everything the server actively refused is the key pair's fault, because the
+/// key pair is the only thing this call sends that a user can get wrong: there
+/// is no username and no password in a `client_credentials` grant. Everything
+/// else -- no answer, or an answer this client cannot read -- is
+/// [`ApiKeyRefusal::Unreachable`], which asks the user to check their
+/// connection rather than a secret that may be perfectly correct.
+///
+/// **No arm formats the error.** `RestError`'s `Display` carries a status and
+/// a route, but this function's whole output is an [`ApiKeyRefusal`], so
+/// nothing the server said can reach a message on the way past.
+pub fn grant_refusal(error: &RestError) -> ApiKeyRefusal {
+    match error {
+        RestError::Transport(_) | RestError::Parse(_) => ApiKeyRefusal::Unreachable,
+        _ => ApiKeyRefusal::KeyPairRejected,
+    }
+}
+
+/// What a failed stage 2 means to the user.
+///
+/// Stage 2 is prelogin, then a derivation that cannot fail on a wrong
+/// password, then a sync, then unwrapping the user key. **The unwrap is the
+/// verification**, and a [`RestError::Crypto`] out of it is the only thing in
+/// this whole path that means "that master password was wrong".
+///
+/// A [`RestError::Unauthorized`] here is the session dying, not the password
+/// failing -- so it returns [`ApiKeyRefusal::KeyPairRejected`], which is where
+/// a new session comes from.
+pub fn unlock_refusal(error: &RestError) -> ApiKeyRefusal {
+    match error {
+        RestError::Crypto(_) => ApiKeyRefusal::PasswordRejected,
+        RestError::Transport(_) | RestError::Parse(_) => ApiKeyRefusal::Unreachable,
+        RestError::Unauthorized => ApiKeyRefusal::KeyPairRejected,
+        _ => ApiKeyRefusal::Unreachable,
     }
 }
 
@@ -366,5 +406,82 @@ mod tests {
             );
             assert!(!form.busy, "control: the refusal was applied at all");
         }
+    }
+    /// Stage 1: every way the grant can say no is the key pair's fault, and
+    /// the one way it can say nothing is not.
+    #[test]
+    fn a_refused_grant_is_the_key_pairs_fault_and_a_dead_socket_is_not() {
+        use crate::rest::api::RestError;
+
+        for refused in [
+            RestError::Unauthorized,
+            RestError::InvalidCredentials,
+            RestError::Rejected {
+                error: "invalid_client".to_string(),
+                description: "client_secret is invalid".to_string(),
+            },
+            RestError::Status(403),
+        ] {
+            assert_eq!(
+                grant_refusal(&refused),
+                ApiKeyRefusal::KeyPairRejected,
+                "{refused:?} is the server refusing this key pair"
+            );
+        }
+
+        assert_eq!(
+            grant_refusal(&RestError::Transport("dns error".to_string())),
+            ApiKeyRefusal::Unreachable,
+            "a transport failure is not a wrong secret, and telling the user it was would \
+             send them to rotate a key that is fine"
+        );
+        assert_eq!(
+            grant_refusal(&RestError::Parse("the access token")),
+            ApiKeyRefusal::Unreachable,
+            "an answer this client cannot read is not a credential the user can fix"
+        );
+    }
+
+    /// Stage 2: the ONLY thing that means "wrong master password" is a crypto
+    /// failure unwrapping the user key. There is no grant here to reject it.
+    #[test]
+    fn only_a_crypto_failure_means_the_master_password_was_wrong() {
+        use crate::rest::api::RestError;
+        use crate::rest::crypto::CryptoError;
+
+        // The real one. `unwrap_user_key` -> `decrypt` answers `MacMismatch`
+        // for a key that is not this account's, which `rest/crypto.rs`'s own
+        // wrong-password test already pins.
+        assert_eq!(
+            unlock_refusal(&RestError::Crypto(CryptoError::MacMismatch)),
+            ApiKeyRefusal::PasswordRejected,
+            "a user key that will not unwrap IS the wrong-password signal: `master_key` \
+             derives a key from any bytes and never fails on one"
+        );
+        assert_eq!(
+            unlock_refusal(&RestError::Crypto(CryptoError::KeyLength { expected: 64, got: 32 })),
+            ApiKeyRefusal::PasswordRejected,
+            "control: the arm is about `Crypto` and not about one variant of it"
+        );
+        assert_eq!(
+            unlock_refusal(&RestError::Transport("connection reset".to_string())),
+            ApiKeyRefusal::Unreachable
+        );
+        // **The session died, not the password.** A 401 on stage 2 is the
+        // token minted by stage 1 having been revoked or expired, so the
+        // honest place to send the user is back to the key pair.
+        assert_eq!(
+            unlock_refusal(&RestError::Unauthorized),
+            ApiKeyRefusal::KeyPairRejected,
+            "a 401 at stage 2 is a dead session, and a dead session is re-minted from the \
+             key pair -- not from the master password"
+        );
+        // Positive control on the whole function: it does not answer
+        // `PasswordRejected` to everything.
+        assert_ne!(
+            unlock_refusal(&RestError::Transport("x".to_string())),
+            ApiKeyRefusal::PasswordRejected,
+            "control: unlock_refusal discriminates at all"
+        );
     }
 }
