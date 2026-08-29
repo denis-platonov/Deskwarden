@@ -2487,6 +2487,7 @@ fn main() {
                 &backend_op_rx,
                 &config_dir,
                 first_run_account.as_ref(),
+                &mut ui_windows,
             );
         }
 
@@ -6182,6 +6183,59 @@ impl UiWindows {
         }
     }
 
+    /// **Close the open window, because Windows says the user walked away.**
+    ///
+    /// The decision is [`deskwarden::ui_process::farewell_to_an_open_window`]
+    /// under [`deskwarden::ui_process::WhyClose::TheUserWalkedAway`], and the
+    /// gate in front of *that* is `away_lock::locks_the_vault` -- already
+    /// asked, and already answered yes, by the only caller
+    /// ([`lock_after_walking_away`]). Nothing here re-reads a setting.
+    ///
+    /// **A near-twin of [`UiWindows::close_on_quit`], and the difference is
+    /// the whole reason it is a second method.** That one runs on the way to
+    /// `process::exit(0)`; this one runs in the middle of a loop that keeps
+    /// going. So emptying the slot is load-bearing rather than tidy:
+    /// `Child::kill` is `TerminateProcess` with exit code 1,
+    /// `UiVaultResult::EXIT_LOCKED` is 1, and a killed child left in the slot
+    /// would be reaped on the next pass and read back as a lock the user never
+    /// asked for -- a second `resettle_session` and a second master-password
+    /// prompt for a window this function killed itself. See
+    /// `the_walked_away_kill_takes_the_slot_so_the_kill_is_not_reaped_as_a_lock`.
+    ///
+    /// **Nothing is waited on.** The caller is about to block on a
+    /// master-password prompt that can stand there for hours; a window that
+    /// will not die must not be able to hold that up, and there is nothing to
+    /// learn from the wait anyway. The result file is deleted rather than
+    /// read, for the reason `close_on_quit` gives and one more: its exit code
+    /// is ours.
+    ///
+    /// **Visibility is never asked about**, and that is deliberate. This works
+    /// over the process id the spawn returned, so a UI process left resident
+    /// and hidden -- `keep_ui_loaded`, on another branch -- is killed by this
+    /// same line with no change here, provided it is still recorded in this
+    /// slot. A hidden process holding a decrypted vault across a workstation
+    /// lock is strictly worse than a visible one: nothing on screen reminds
+    /// the user it is there.
+    fn close_because_the_user_walked_away(&mut self, config_dir: &Path) {
+        let reason = deskwarden::ui_process::WhyClose::TheUserWalkedAway;
+        if let deskwarden::ui_process::Farewell::CloseIt { pid } =
+            deskwarden::ui_process::farewell_to_an_open_window(reason, self.vault_pid())
+        {
+            let mut open = self.vault.take().expect("a pid means the slot is occupied");
+            log::info!(
+                "Windows reported the user walked away with the vault window (process {pid})                  open; closing it rather than leaving a decrypted vault on a machine its                  owner has left"
+            );
+            if let Err(e) = open.child.kill() {
+                log::warn!(
+                    "could not close the vault window's process {pid} ({e}); the vault is                      still being locked behind it, but that process may still be showing it"
+                );
+            }
+            deskwarden::ui_process::forget_result(&deskwarden::ui_process::result_path(
+                config_dir, pid,
+            ));
+        }
+    }
+
     fn poll_the_vault_window(
         &mut self,
         config_dir: &Path,
@@ -7484,6 +7538,12 @@ fn lock_after_walking_away(
     backend_op_rx: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
     config_dir: &Path,
     first_run_account: Option<&accounts::AccountId>,
+    // **The registry, so that this path can reach the second process.** Its
+    // absence from this list was the defect: the vault window has run in a
+    // process of its own since the daemon/UI split, the daemon's loop pumps
+    // messages the whole time it is up, and this function was locking
+    // everything except the largest decrypted thing there was.
+    ui: &mut UiWindows,
 ) {
     if !deskwarden::away_lock::locks_the_vault(
         away,
@@ -7500,6 +7560,13 @@ fn lock_after_walking_away(
     }
     log::info!("Windows reported {away:?}; locking the vault rather than waiting out the idle timeout");
     deskwarden::clipboard::clear_if_still_ours_for(deskwarden::clipboard::ClearTrigger::Lock);
+    // **Before the resettle, and that ordering is the point.**
+    // `resettle_session` below blocks on a master-password prompt which can
+    // stand on screen for as long as the user is away -- the whole duration
+    // this feature exists to cover. A window closed after it is a window that
+    // survived the entire absence. See
+    // `the_walked_away_lock_closes_the_window_before_it_blocks_on_the_password_prompt`.
+    ui.close_because_the_user_walked_away(config_dir);
     // Field-level borrow splitting, for the reason `run_vault_loop` gives
     // where it does the same: the closure below wants `store` and
     // `active_account` while five other fields are held `&mut`.
@@ -12548,6 +12615,126 @@ mod tests {
             "an ungoverned no-argument clear call is back in main.rs -- every call site \r
              must name the trigger it clears under, or the preferences page cannot \r
              govern it"
+        );
+    }
+
+    /// **The away-lock kill empties the registry slot**, and that is not
+    /// tidiness.
+    ///
+    /// `Child::kill` on Windows is `TerminateProcess` with exit code 1, and
+    /// `UiVaultResult::EXIT_LOCKED` is 1. Left in the slot, the killed child
+    /// would be reaped on the next pass of a loop that is still running,
+    /// decoded as `locked: true`, and handed to `run_vault_loop` as a lock to
+    /// act on -- a second `resettle_session` and a second master-password
+    /// prompt for a window the daemon killed itself. `close_on_quit` gets away
+    /// without caring because `process::exit(0)` is the next line; this one
+    /// does not.
+    #[test]
+    fn the_walked_away_kill_takes_the_slot_so_the_kill_is_not_reaped_as_a_lock() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once(concat!("fn close_because_the_user_walked_", "away("))
+            .expect("control: the away-lock close must be defined in this file")
+            .1
+            .split_once("
+    }")
+            .expect("the method must be brace-terminated at method indentation")
+            .0;
+        assert!(
+            body.contains("self.vault.take()"),
+            "the slot must be emptied in the same breath as the kill; got {body:?}"
+        );
+        assert!(
+            body.contains("forget_result"),
+            "the child will never have written a result worth reading, and a file nobody              reads is one the user's config directory should not keep; got {body:?}"
+        );
+        assert!(
+            !body.contains("read_result"),
+            "reading the killed child's result file is the exact mistake this test exists              to prevent: exit code 1 is EXIT_LOCKED; got {body:?}"
+        );
+    }
+
+    /// The exit-code collision the test above is about, asserted rather than
+    /// asserted-about. If Windows or this crate ever stopped colliding here,
+    /// the reasoning above would be stale and this test says so first.
+    #[test]
+    fn a_terminated_process_status_collides_with_the_locked_exit_code() {
+        assert_eq!(
+            deskwarden::ui_process::UiVaultResult::EXIT_LOCKED,
+            1,
+            "TerminateProcess (which is what Child::kill is on Windows) sets exit code 1.              These being equal is why the away-lock kill must take the registry slot"
+        );
+        assert!(
+            deskwarden::ui_process::UiVaultResult::from_exit_code(1).locked,
+            "control: status 1 really does decode as a lock, so leaving a killed child in              the slot really would produce a spurious one"
+        );
+    }
+
+    /// **The window is closed before the resettle, not after.**
+    ///
+    /// `resettle_session` blocks on a master-password prompt, and that prompt
+    /// can stand on screen for as long as the user is away -- which is the
+    /// entire duration this feature exists to cover. A close sequenced after
+    /// it is a vault window that survives the whole absence and is torn down
+    /// at the moment the user comes back and types their password, which is
+    /// precisely when it no longer matters.
+    ///
+    /// A source pin because `lock_after_walking_away` takes an `AppTray` and a
+    /// `SessionEstate` and cannot be called from any test in this crate -- the
+    /// same reason `both_shutdown_paths_clear_the_clipboard_as_a_quit` reads
+    /// source text one screen above.
+    #[test]
+    fn the_walked_away_lock_closes_the_window_before_it_blocks_on_the_password_prompt() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once(concat!("fn lock_after_walking_", "away("))
+            .expect("control: the away-lock effect must be defined in this file")
+            .1
+            .split_once("
+fn ")
+            .expect("the function must be followed by another item")
+            .0;
+
+        let close = body
+            .find(concat!("close_because_the_user_walked_", "away("))
+            .expect(
+                "the away-lock path must close the vault window; without this the user                  presses Win+L and leaves a decrypted vault rendered in a second process",
+            );
+        let clipboard = body
+            .find(concat!("clear_if_still_ours_", "for("))
+            .expect("control: the clipboard clear is still on this path");
+        let resettle = body
+            .find(concat!("resettle_", "session("))
+            .expect("control: the resettle is still on this path");
+
+        assert!(
+            clipboard < close,
+            "the clipboard clear stays first: it is microseconds and it is the one thing              that outlives this process entirely"
+        );
+        assert!(
+            close < resettle,
+            "the window must be closed BEFORE resettle_session, which blocks on a              master-password prompt for as long as the user is away"
+        );
+    }
+
+    /// The away-lock close has exactly one caller, and it is the gated one.
+    ///
+    /// A second call site would be a second place that could reach the kill
+    /// without passing `away_lock::locks_the_vault` first -- which is the only
+    /// thing making `WhyClose::TheUserWalkedAway` free of a preference of its
+    /// own.
+    #[test]
+    fn nothing_but_the_gated_away_lock_path_closes_the_window_for_walking_away() {
+        let source = include_str!("main.rs");
+        assert_eq!(
+            source.matches(concat!("close_because_the_user_walked_", "away(")).count(),
+            2,
+            "expected exactly the definition and its one call inside              lock_after_walking_away, and no others"
+        );
+        assert_eq!(
+            source.matches(concat!("close_on_", "quit(")).count(),
+            2,
+            "control: the quit path's own killer still has exactly its definition and its              one call, so the count above is measuring what it claims to"
         );
     }
 
