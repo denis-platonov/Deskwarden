@@ -123,6 +123,62 @@ impl Prompt {
     }
 }
 
+/// The heading over the code box: the factor, named the way the user's own
+/// Bitwarden security settings name it.
+pub fn factor_title(factor: &SecondFactor) -> &'static str {
+    match factor {
+        SecondFactor::Authenticator => "Authenticator app",
+        SecondFactor::Email { .. } => "Email code",
+        SecondFactor::YubiKey => "YubiKey",
+        SecondFactor::Unsupported(_) => "Two-step login",
+    }
+}
+
+/// The line under the heading: where the code is, in the one sentence it takes
+/// to say it.
+///
+/// Returns `String` rather than `&'static str` because the Email arm carries
+/// the masked address the server sent -- which is the only reason this line
+/// earns its space for a user with more than one mailbox.
+pub fn factor_hint(factor: &SecondFactor) -> String {
+    match factor {
+        SecondFactor::Authenticator => {
+            "Open your authenticator app and enter the 6-digit code it shows for this \
+             account."
+                .to_string()
+        }
+        SecondFactor::Email { masked: Some(address) } => format!(
+            "Send a code to {address}, then enter it here. Codes expire after a few \
+             minutes."
+        ),
+        SecondFactor::Email { masked: None } => {
+            "Send a code to the email address on this account, then enter it here. Codes \
+             expire after a few minutes."
+                .to_string()
+        }
+        SecondFactor::YubiKey => {
+            "Plug in your YubiKey, put the cursor in the box below and touch the key. It \
+             types the code for you."
+                .to_string()
+        }
+        SecondFactor::Unsupported(_) => {
+            "Deskwarden cannot complete this kind of two-step login.".to_string()
+        }
+    }
+}
+
+pub const SEND_CODE_LABEL: &str = "Send code";
+pub const CODE_SENT_NOTICE: &str =
+    "Code sent. Check your email \u{2014} it may take a moment to arrive.";
+
+impl Prompt {
+    /// Email is the one factor that needs a call before the user has anything
+    /// to type. See the design's "Email is the one that needs a second call".
+    pub fn wants_send_button(&self) -> bool {
+        matches!(self.chosen, Some(SecondFactor::Email { .. }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,4 +260,62 @@ mod tests {
             "and must clear an error that was about the other provider"
         );
     }
+
+    /// The card names the factor the user is being asked for, and the hint
+    /// tells them where to look for the code. "Enter your code" would be true
+    /// of all three and useful for none.
+    #[test]
+    fn each_factor_is_named_and_says_where_the_code_comes_from() {
+        assert_eq!(factor_title(&SecondFactor::Authenticator), "Authenticator app");
+        assert!(
+            factor_hint(&SecondFactor::Authenticator).contains("authenticator app"),
+            "got {:?}",
+            factor_hint(&SecondFactor::Authenticator)
+        );
+
+        assert_eq!(factor_title(&SecondFactor::YubiKey), "YubiKey");
+        assert!(
+            factor_hint(&SecondFactor::YubiKey).contains("touch"),
+            "a YubiKey hint that does not mention touching the key describes nothing the \
+             user can do; got {:?}",
+            factor_hint(&SecondFactor::YubiKey)
+        );
+
+        // The masked address is the whole value of the Email arm's hint: it is
+        // how a user with two mailboxes knows which one to open.
+        let masked = SecondFactor::Email { masked: Some("a***@b.c".to_string()) };
+        assert!(
+            factor_hint(&masked).contains("a***@b.c"),
+            "got {:?}",
+            factor_hint(&masked)
+        );
+        let unmasked = SecondFactor::Email { masked: None };
+        assert!(
+            !factor_hint(&unmasked).contains("None") && !factor_hint(&unmasked).is_empty(),
+            "an address-less email hint must still be a sentence, not a debug-printed \
+             Option; got {:?}",
+            factor_hint(&unmasked)
+        );
+    }
+
+    /// **Send code appears for Email and for nothing else.** The other two
+    /// factors need no round trip -- the code is already on the phone or the
+    /// key -- and a button that sends nothing is this project's most-repeated
+    /// defect.
+    #[test]
+    fn only_email_offers_to_send_a_code() {
+        let email = Prompt::new(vec![SecondFactor::Email { masked: None }]);
+        assert!(
+            email.wants_send_button(),
+            "control: the Email prompt is the one that must have the button"
+        );
+        for factor in [SecondFactor::Authenticator, SecondFactor::YubiKey] {
+            let prompt = Prompt::new(vec![factor.clone()]);
+            assert!(
+                !prompt.wants_send_button(),
+                "{factor:?} needs no round trip and must not offer one"
+            );
+        }
+    }
+
 }
