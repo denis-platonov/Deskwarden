@@ -10,6 +10,77 @@ things can still change between minor versions.
 
 ## Unreleased
 
+## 0.13.0 - 2026-08-29
+
+### Two-step login works, and the Bitwarden CLI is no longer in the way
+
+If your account uses two-step login, Deskwarden can now ask for the code
+itself. Before this it could not, and said so: it told you to run
+`bw login` in a terminal and come back.
+
+It handles the three factors the Bitwarden CLI handles -- **authenticator
+app, emailed code, and YubiKey** -- and for accounts using Duo or a
+passkey, which the CLI cannot do either, there is now a **personal API
+key** sign-in instead. That is the same escape hatch `bw login --apikey`
+gives those accounts.
+
+A wrong code no longer costs you your master password: the code box
+clears and the password is not asked for again.
+
+**On a server Deskwarden talks to directly, signing in no longer runs the
+CLI at all.** It used to run `bw` first and only then do its own sign-in,
+which is why a two-step account could never get in -- `bw` cannot answer a
+second factor on its own, so it failed, and everything after it was
+skipped.
+
+### Locking Windows now closes the vault window
+
+Since the vault window moved into its own process, locking your PC left
+that window running with your vault decrypted behind the lock screen.
+It now closes, on the same setting that governs locking (**Preferences →
+Vault → Lock the vault when you step away**). With that setting off,
+nothing changes -- the window stays, as it does today.
+
+### The vault window opens in its own process
+
+It used to be drawn by the same process that holds the tray icon, which
+made that process load the graphics driver and keep it for the rest of
+the session: **98.6 MB against 33 MB**. It also meant no tray icon at all
+while the window was open. Both are fixed.
+
+### Open the vault instantly (optional)
+
+A new switch under **Preferences → Vault**. With it on, closing the vault
+window hides it instead of ending it, so the next open is immediate. It
+holds about 100 MB while the vault is unlocked, and it is **off by
+default**. Locking, switching account or changing settings still close it
+fully.
+
+### Fixed
+
+- An install created before the `--autostart` flag existed kept starting
+  Deskwarden as if you had double-clicked it, which drew a window and
+  loaded the graphics driver into the tray process on every sign-in.
+  Existing installs now repair their own logon entry.
+- The tray icon no longer disappears while the vault window is open.
+- Five Preferences pages that had nothing on them are gone.
+
+### For contributors
+
+- The test suite is trustworthy again. It had been failing 27 to 54 tests
+  a run out of 4160, with a different set failing each time, which meant
+  a real failure was indistinguishable from noise -- a permanently red
+  test hid in it for days. The mock HTTP server used by 209 test call
+  sites is now hand-rolled rather than `mockito`, and the library suite
+  runs green.
+  **Known remainder:** twelve sites in `main.rs` cannot reach that seam,
+  because it is `cfg(test)`-gated in the library and the binary is a
+  separate crate. Those still produce 3-4 intermittent failures out of
+  333 in the binary suite. Fixing it means a feature gate, not a rename.
+- CI no longer runs the full matrix for documentation-only pushes, and
+  pushes to `main` no longer evict each other's pending runs -- which had
+  been silently skipping commits from the `compiles` job's range checks.
+
 ## 0.12.0 - 2026-08-28
 
 ### Your own scripts can read the vault, over a local API
