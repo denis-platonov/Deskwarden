@@ -275,10 +275,22 @@ pub struct ApiKeySeam {
     /// is the whole reason this feature has two stages.
     pub grant:
         fn(&ApiKeyAccount, client_id: &str, client_secret: &str) -> Result<Session, RestError>,
-    /// **Stage 2.** Prelogin, derive, sync, unwrap. Consumes the session
-    /// because the [`Authenticated`] it returns carries it onward -- there is
-    /// one session and it does not get copied.
-    pub unlock: fn(&ApiKeyAccount, Session, password: &[u8]) -> Result<Authenticated, RestError>,
+    /// **Stage 2.** Prelogin, derive, sync, unwrap. **Borrows** the session
+    /// rather than consuming it: a mistyped master password must be retryable
+    /// against the session stage 1 already minted, which is the whole reason
+    /// the design does not repeat stage 1. Returns only the master key; the
+    /// caller owns the session and pairs the two.
+    ///
+    /// It was written by-value first, to match [`Authenticated`]'s own field,
+    /// and that shape does not merely mis-report a retry -- it **hangs the
+    /// worker**. The failed attempt consumed the session, so the retry found
+    /// none, answered `KeyPairRejected`, and the loop went back to blocking on
+    /// a `recv()` for a key pair the user had no reason to re-enter.
+    pub unlock: fn(
+        &ApiKeyAccount,
+        &Session,
+        password: &[u8],
+    ) -> Result<crate::rest::crypto::MasterKey, RestError>,
 }
 
 /// [`ApiKeySeam::grant`] as production performs it.
@@ -315,21 +327,21 @@ pub fn grant_direct_rest(
 /// tracking.
 pub fn unlock_direct_rest(
     account: &ApiKeyAccount,
-    session: Session,
+    session: &Session,
     password: &[u8],
-) -> Result<Authenticated, RestError> {
+) -> Result<crate::rest::crypto::MasterKey, RestError> {
     let client = RestClient::new(&account.server_url);
     let kdf = client.prelogin(&account.email)?;
     let master_key = crate::rest::crypto::master_key(password, &account.email, kdf)?;
 
-    let synced = client.sync(&session)?;
+    let synced = client.sync(session)?;
     let profile = synced.profile.ok_or(RestError::Parse("the account profile"))?;
     let protected = profile.key.as_deref().ok_or(RestError::Parse("the protected user key"))?;
     let protected: crate::rest::crypto::EncString = protected.parse()?;
     // The verification. The returned key is deliberately dropped here.
     let _ = crate::rest::crypto::unwrap_user_key(&master_key.stretch(), &protected)?;
 
-    Ok(Authenticated { session, master_key })
+    Ok(master_key)
 }
 
 /// What the user's device list calls this app. The same value
@@ -341,6 +353,116 @@ const DEVICE_NAME: &str = "Deskwarden";
 /// The seam's one production value, written in exactly one place.
 pub const PRODUCTION_API_KEY: ApiKeySeam =
     ApiKeySeam { grant: grant_direct_rest, unlock: unlock_direct_rest };
+
+/// **What the window tells the worker.**
+///
+/// No `Debug`, for [`ApiKeyForm`]'s reason: two of the three variants carry a
+/// credential, and a derived `Debug` would print whatever they let it.
+pub enum ApiKeyCommand {
+    /// Stage 1. The secret is moved in and dropped when the arm handling it
+    /// ends, wiping itself on the way.
+    KeyPair { client_id: String, secret: Zeroizing<String> },
+    /// Stage 2, against the session stage 1 minted.
+    MasterPassword(Zeroizing<String>),
+    /// The user backed out or closed the window. The worker drops the session
+    /// and returns.
+    Abandon,
+}
+
+/// **What the worker tells the window.**
+///
+/// A variant and not a `String`, so the window cannot be handed a message
+/// built out of a `RestError` this module has not vetted -- and so the only
+/// strings this feature ever shows about a failure are [`message_for`]'s
+/// three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeyReport {
+    /// Stage 1 passed. The card moves to the master password.
+    KeyPairAccepted,
+    /// One of the three. See [`ApiKeyForm::refused`] for what each does.
+    Refused(ApiKeyRefusal),
+}
+
+/// **The API-key sign-in, from the worker thread's side.**
+///
+/// Blocks on the window's commands while holding the [`Session`] stage 1
+/// minted, and returns an [`Authenticated`] or nothing. Holding the session is
+/// what makes a mistyped master password cheap: stage 1 is not repeated,
+/// because nothing about it failed.
+///
+/// **It blocks a detached thread on a human**, for the code stage's reason and
+/// with the code stage's bounds: an [`ApiKeyCommand::Abandon`] and a
+/// disconnected channel both return, and returning drops the session.
+///
+/// **Nothing here is persisted and nothing here is logged with a value in
+/// it.** The two `log::warn!` lines carry a stage name and the `RestError`,
+/// whose `Display` piece 1 pins as carrying no credential; the refusal the
+/// window sees is an enum.
+pub fn run_api_key_sign_in(
+    seam: &ApiKeySeam,
+    account: &ApiKeyAccount,
+    commands: &std::sync::mpsc::Receiver<ApiKeyCommand>,
+    report: &std::sync::mpsc::Sender<ApiKeyReport>,
+) -> Option<Authenticated> {
+    // The one session, minted at most once per accepted key pair. `None` is
+    // "stage 1 has not passed yet", which is also what makes a stray
+    // `MasterPassword` answerable rather than a panic.
+    let mut session: Option<Session> = None;
+
+    // `recv()` and not `try_recv()`: this thread has nothing else to do, and a
+    // poll loop would spin for as long as it takes somebody to find their web
+    // vault. `Err` is a disconnected channel, which is a closed window.
+    while let Ok(command) = commands.recv() {
+        match command {
+            ApiKeyCommand::Abandon => return None,
+            ApiKeyCommand::KeyPair { client_id, secret } => {
+                match (seam.grant)(account, client_id.trim(), secret.trim()) {
+                    Ok(granted) => {
+                        session = Some(granted);
+                        let _ = report.send(ApiKeyReport::KeyPairAccepted);
+                    }
+                    Err(e) => {
+                        // The route and the status reach the log; the window
+                        // gets a variant. Neither half of the key pair is in
+                        // either.
+                        log::warn!("the API-key grant was not accepted: {e}");
+                        let _ = report.send(ApiKeyReport::Refused(grant_refusal(&e)));
+                    }
+                }
+            }
+            ApiKeyCommand::MasterPassword(password) => {
+                // No session means stage 1 has not passed. Answering
+                // `KeyPairRejected` is the true statement: what is missing is
+                // the key pair.
+                let Some(held) = session.as_ref() else {
+                    let _ = report.send(ApiKeyReport::Refused(ApiKeyRefusal::KeyPairRejected));
+                    continue;
+                };
+                match (seam.unlock)(account, held, password.as_bytes()) {
+                    Ok(master_key) => {
+                        // The session is handed on with the key it pairs with;
+                        // `take` is what guarantees there is exactly one.
+                        let session = session.take()?;
+                        return Some(Authenticated { session, master_key });
+                    }
+                    Err(e) => {
+                        let refusal = unlock_refusal(&e);
+                        log::warn!("the API-key sign-in could not unlock the vault: {e}");
+                        // A dead session cannot be retried against; a wrong
+                        // password can, and does -- the session stays. This is
+                        // the line the whole two-stage shape rests on: drop it
+                        // and the next password finds nothing to try against.
+                        if refusal == ApiKeyRefusal::KeyPairRejected {
+                            session = None;
+                        }
+                        let _ = report.send(ApiKeyReport::Refused(refusal));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
 
 #[cfg(test)]
 mod tests {
@@ -599,13 +721,8 @@ mod tests {
         ))
     }
 
-    fn fake_authenticated() -> crate::rest::api::Authenticated {
-        crate::rest::api::Authenticated {
-            session: fake_session(),
-            master_key: crate::rest::crypto::MasterKey::from_bytes(
-                [0x5A; crate::rest::crypto::MASTER_KEY_LEN],
-            ),
-        }
+    fn fake_master_key() -> crate::rest::crypto::MasterKey {
+        crate::rest::crypto::MasterKey::from_bytes([0x5A; crate::rest::crypto::MASTER_KEY_LEN])
     }
 
     fn test_account() -> ApiKeyAccount {
@@ -673,28 +790,29 @@ mod tests {
                 GRANTS.fetch_add(1, Ordering::SeqCst);
                 Ok(fake_session())
             },
-            unlock: |_account, _session, password| {
+            unlock: |_account, _session: &crate::rest::api::Session, password| {
                 let n = UNLOCKS.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     assert_eq!(password, b"wrong-one", "control: the first password arrives");
                     Err(RestError::Crypto(crate::rest::crypto::CryptoError::MacMismatch))
                 } else {
                     assert_eq!(password, b"hunter2", "the SECOND password is the one used");
-                    Ok(fake_authenticated())
+                    Ok(fake_master_key())
                 }
             },
         };
 
         let session = (seam.grant)(&test_account(), "user.9f3c", "b7d2ecc").expect("stage 1");
-        let first = (seam.unlock)(&test_account(), session, b"wrong-one");
+        let first = (seam.unlock)(&test_account(), &session, b"wrong-one");
         let refusal = unlock_refusal(&first.expect_err("the first password is wrong"));
         assert_eq!(refusal, ApiKeyRefusal::PasswordRejected);
 
         // The retry: a NEW session is not minted, because stage 1 did not
         // fail. This is the shape the worker loop enforces; here it is the
         // seam's own contract being stated.
-        let session = (seam.grant)(&test_account(), "user.9f3c", "b7d2ecc").expect("stage 1");
-        assert!((seam.unlock)(&test_account(), session, b"hunter2").is_ok());
+        // The SAME session, not a new one: the borrow is what makes this
+        // possible at all, and the by-value shape could not express it.
+        assert!((seam.unlock)(&test_account(), &session, b"hunter2").is_ok());
         assert_eq!(
             UNLOCKS.load(Ordering::SeqCst),
             2,
@@ -702,8 +820,155 @@ mod tests {
         );
         assert_eq!(
             GRANTS.load(Ordering::SeqCst),
-            2,
-            "control: the fake grant is reachable"
+            1,
+            "control: the fake grant is reachable, and the retry did not reach it again"
+        );
+    }
+    /// **A wrong master password is retried against the SAME session.** The
+    /// key pair is used once, to mint a session, and dropped -- the design's
+    /// own words -- so a password typo costs one sync and not a second grant.
+    #[test]
+    fn a_wrong_password_is_retried_without_a_second_grant() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::mpsc;
+        static GRANTS: AtomicUsize = AtomicUsize::new(0);
+        static UNLOCKS: AtomicUsize = AtomicUsize::new(0);
+        GRANTS.store(0, Ordering::SeqCst);
+        UNLOCKS.store(0, Ordering::SeqCst);
+
+        let seam = ApiKeySeam {
+            grant: |_, id, secret| {
+                GRANTS.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(id, "user.9f3c");
+                assert_eq!(secret, "b7d2ecc", "the secret reaches the grant untouched");
+                Ok(fake_session())
+            },
+            unlock: |_, _session, _password| {
+                if UNLOCKS.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(RestError::Crypto(crate::rest::crypto::CryptoError::MacMismatch))
+                } else {
+                    Ok(fake_master_key())
+                }
+            },
+        };
+
+        let (tx, rx) = mpsc::channel();
+        let (report_tx, report_rx) = mpsc::channel();
+        tx.send(ApiKeyCommand::KeyPair {
+            client_id: "user.9f3c".to_string(),
+            secret: zeroize::Zeroizing::new("b7d2ecc".to_string()),
+        })
+        .unwrap();
+        tx.send(ApiKeyCommand::MasterPassword(zeroize::Zeroizing::new(
+            "wrong-one".to_string(),
+        )))
+        .unwrap();
+        tx.send(ApiKeyCommand::MasterPassword(zeroize::Zeroizing::new(
+            "hunter2".to_string(),
+        )))
+        .unwrap();
+
+        let outcome = run_api_key_sign_in(&seam, &test_account(), &rx, &report_tx);
+
+        assert!(outcome.is_some(), "the second password signs the user in");
+        assert_eq!(UNLOCKS.load(Ordering::SeqCst), 2, "control: both passwords were tried");
+        assert_eq!(
+            GRANTS.load(Ordering::SeqCst),
+            1,
+            "a wrong password must NOT re-grant: stage 1 did not fail, and a second grant \
+             would register a device and spend a round trip per typo"
+        );
+        assert_eq!(
+            report_rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                ApiKeyReport::KeyPairAccepted,
+                ApiKeyReport::Refused(ApiKeyRefusal::PasswordRejected),
+            ],
+            "the window was told stage 1 passed, then told the PASSWORD was what failed"
+        );
+    }
+
+    /// **A rejected key pair does not advance.** The loop stays on stage 1 and
+    /// the next thing it will accept is another key pair -- a
+    /// `MasterPassword` arriving now has no session to try against.
+    #[test]
+    fn a_rejected_key_pair_leaves_the_loop_on_stage_one() {
+        use std::sync::mpsc;
+        let seam = ApiKeySeam {
+            grant: |_, _, _| Err(RestError::Unauthorized),
+            unlock: |_, _, _| panic!("nothing was granted, so nothing may be unlocked"),
+        };
+        let (tx, rx) = mpsc::channel();
+        let (report_tx, report_rx) = mpsc::channel();
+        tx.send(ApiKeyCommand::KeyPair {
+            client_id: "user.9f3c".to_string(),
+            secret: zeroize::Zeroizing::new("wrong".to_string()),
+        })
+        .unwrap();
+        // Arrives while there is no session. It must be ignored rather than
+        // panicking the worker on the one screen a blocked user is looking at.
+        tx.send(ApiKeyCommand::MasterPassword(zeroize::Zeroizing::new(
+            "hunter2".to_string(),
+        )))
+        .unwrap();
+        tx.send(ApiKeyCommand::Abandon).unwrap();
+
+        assert!(run_api_key_sign_in(&seam, &test_account(), &rx, &report_tx).is_none());
+        assert_eq!(
+            report_rx.try_iter().collect::<Vec<_>>(),
+            vec![
+                ApiKeyReport::Refused(ApiKeyRefusal::KeyPairRejected),
+                ApiKeyReport::Refused(ApiKeyRefusal::KeyPairRejected),
+            ],
+            "the stray password is answered as 'the key pair is what is missing', which is \
+             true, and not as a rejected password, which would be a lie"
+        );
+    }
+
+    /// A closed command channel -- the window went away -- ends the loop and
+    /// drops the session, rather than blocking a detached thread forever.
+    #[test]
+    fn a_closed_window_ends_the_loop() {
+        use std::sync::mpsc;
+        let seam = ApiKeySeam {
+            grant: |_, _, _| panic!("nothing was sent, so nothing may be granted"),
+            unlock: |_, _, _| panic!("nothing was sent, so nothing may be unlocked"),
+        };
+        let (tx, rx) = mpsc::channel::<ApiKeyCommand>();
+        let (report_tx, _report_rx) = mpsc::channel();
+        drop(tx);
+        assert!(run_api_key_sign_in(&seam, &test_account(), &rx, &report_tx).is_none());
+    }
+
+    /// **Nothing in this module writes the key pair to disk.** The design's
+    /// deliberate refusal, read off the source: a stored `client_secret` is a
+    /// permanent password-free login sitting on disk.
+    #[test]
+    fn the_key_pair_is_never_persisted() {
+        let source = include_str!("api_key_ui.rs").replace("\r\n", "\n");
+        let marker = "\n#[cfg(test)]\nmod tests {";
+        let cut = source.find(marker).expect("the test module marker was not found");
+        let production = &source[..cut];
+
+        for forbidden in
+            ["SessionStore", "user_key_store", "std::fs::", "fs::write", "File::create", "settings::"]
+        {
+            assert!(
+                !production.contains(forbidden),
+                "this module reached for `{forbidden}`; the client secret is not persisted \
+                 and the session token goes to the store the `adopt` sink already owns"
+            );
+        }
+        // Positive controls: the cut really did keep the production half, and
+        // these needles really are findable in this crate when they are there.
+        assert!(
+            production.contains("pub fn run_api_key_sign_in"),
+            "the cut lost the production half, so the absences above prove nothing"
+        );
+        assert!(
+            include_str!("session_store.rs").contains("std::fs::write"),
+            "the needle has drifted -- persistence is no longer spelled this way, so its \
+             absence above means nothing"
         );
     }
 }
