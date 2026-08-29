@@ -10,6 +10,7 @@
 //! integration tests.
 
 pub mod accounts;
+pub mod api_key_ui;
 pub mod app;
 pub mod app_candidates;
 pub mod app_identity;
