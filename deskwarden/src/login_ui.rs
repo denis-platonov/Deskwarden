@@ -2168,6 +2168,167 @@ pub fn derive_direct_rest(
     }
 }
 
+/// **What the worker tells the window when the server asks for a second
+/// factor.**
+///
+/// Providers and nothing else. What those providers came out of stays on the
+/// worker thread for the life of the prompt, because it holds the derived
+/// password hash and the master key, and this struct is received by a frame
+/// closure that outlives the stage.
+///
+/// Pinned by `second_factor_boundary::the_request_carries_no_credential`,
+/// which reads this definition's own source: no runtime value can demonstrate
+/// the absence of a field.
+pub struct SecondFactorRequest {
+    /// Every provider the account offers, unsupported entries included --
+    /// `second_factor_ui::unsupported_only_message` needs them to name Duo.
+    pub providers: Vec<crate::rest::api::SecondFactor>,
+}
+
+/// **What the window tells the worker.**
+///
+/// Digits, or a request to send some, or nothing at all. What the answer is
+/// checked against is not here because it never left; the worker matches these
+/// against the one it is holding.
+///
+/// No `Debug`: [`crate::rest::api::SecondFactorAnswer`] has none, because a
+/// live one-time code is a credential for as long as it lasts, and a derived
+/// `Debug` here would be a request to give it one.
+pub enum SecondFactorCommand {
+    /// Complete the sign-in with these digits, against the provider named.
+    Answer(crate::rest::api::SecondFactorAnswer),
+    /// Email only: ask the server to send a code.
+    SendEmail,
+    /// The user closed the window or backed out. The worker drops what it is
+    /// holding and returns.
+    Abandon,
+}
+
+/// The two `rest::api` calls the prompt makes, plus the grant that starts it,
+/// as `fn` pointers.
+///
+/// A struct and not three aliases: a test that faked `finish` but let
+/// `send_email` reach the network would be a test of half a worker. A
+/// `fn`-pointer struct and not a `cfg(test)` seam, which this crate bans
+/// crate-wide, and not a trait object, because there is exactly one production
+/// value.
+///
+/// **`C` is the challenge, and it is a parameter for one reason**:
+/// [`crate::rest::api::Challenge`] has no constructor outside its own module
+/// -- deliberately, because a `cfg(test)` way to build a password-equivalent
+/// credential is exactly what that module refuses -- so a test of
+/// [`complete_second_factor`] can only exist if the loop is written against
+/// *a* challenge rather than *the* challenge. Production is `C = Challenge`
+/// and the default says so.
+///
+/// **Every `Err` here is a message for a log.** `RestError`'s `Display`
+/// carries a status and a route and nothing of what was sent; nothing in this
+/// module may put the challenge, the hash or the key into one.
+pub struct SecondFactorSeam<C = crate::rest::api::Challenge> {
+    /// The first grant. `Ok(LoginOutcome::NeedsSecondFactor(..))` is the case
+    /// this whole feature is about.
+    pub start: fn(
+        server_url: &str,
+        email: &str,
+        device_id: &str,
+        password: &[u8],
+    ) -> Result<crate::rest::api::LoginOutcome, String>,
+    /// `POST /api/two-factor/send-email-login`. Every failure is the same
+    /// trouble -- the user has nothing to check either way -- so this one
+    /// carries only a log line.
+    pub send_email: fn(&C) -> Result<(), String>,
+    /// The retry, carrying the same hash the first grant derived. Its `Err`
+    /// carries the classification as well as the log line, because "the server
+    /// said no to these digits" and "the server said nothing at all" are two
+    /// different things to tell the user, and this is the only call that can
+    /// tell them apart.
+    pub finish: fn(&C, &crate::rest::api::SecondFactorAnswer) -> Result<Authenticated, Refusal>,
+}
+
+/// A `Clone`/`Copy` written by hand rather than derived.
+///
+/// A derived one would require `C: Copy`, and the production `C` is
+/// [`crate::rest::api::Challenge`], which is deliberately not even `Clone`.
+/// No field is a `C` -- they are `fn` pointers, which are always `Copy` -- so
+/// the bound would forbid the one instantiation that matters.
+impl<C> Clone for SecondFactorSeam<C> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<C> Copy for SecondFactorSeam<C> {}
+
+/// Why a second-factor grant did not produce a session: what to tell the user,
+/// and what to write down.
+///
+/// The two are separate fields because they have separate audiences and
+/// separate rules. `trouble` is a variant the window may render; `log` is a
+/// `RestError`'s own `Display`, which names a status and a route and is never
+/// shown.
+pub struct Refusal {
+    pub trouble: crate::second_factor_ui::Trouble,
+    pub log: String,
+}
+
+/// Which failure of a second-factor grant this is, from the user's side.
+///
+/// **The commonest case is the surprising one.** Vaultwarden answers a wrong
+/// token by re-sending the whole challenge body, so a mistyped digit arrives
+/// here as [`crate::rest::api::RestError::TwoFactorRequired`] rather than as
+/// any kind of rejection -- and a classifier that only recognised
+/// `InvalidCredentials` would tell a user with fat fingers that their network
+/// was down. Which of the four a given server sends depends on the server, so
+/// all four are read the same way.
+fn trouble_for(error: &crate::rest::api::RestError) -> crate::second_factor_ui::Trouble {
+    use crate::rest::api::RestError;
+    use crate::second_factor_ui::Trouble;
+    match error {
+        RestError::TwoFactorRequired { .. }
+        | RestError::InvalidCredentials
+        | RestError::Unauthorized
+        | RestError::Rejected { .. } => Trouble::CodeRejected,
+        // Everything else -- no answer at all, an answer this client could not
+        // read, a status with no meaning here. None of them is the user's code
+        // being wrong, and saying it was would send them to re-read a code that
+        // is perfectly good.
+        _ => Trouble::Unreachable,
+    }
+}
+
+fn start_direct_rest(
+    server_url: &str,
+    email: &str,
+    device_id: &str,
+    password: &[u8],
+) -> Result<crate::rest::api::LoginOutcome, String> {
+    let client = crate::rest::api::RestClient::new(server_url);
+    let device = crate::rest::api::Device::windows_desktop(device_id, DEVICE_NAME);
+    client.authenticate(email, password, &device).map_err(|e| e.to_string())
+}
+
+fn send_direct_rest_email(challenge: &crate::rest::api::Challenge) -> Result<(), String> {
+    crate::rest::api::RestClient::new(challenge.server_url())
+        .send_email_code(challenge)
+        .map_err(|e| e.to_string())
+}
+
+fn finish_direct_rest(
+    challenge: &crate::rest::api::Challenge,
+    answer: &crate::rest::api::SecondFactorAnswer,
+) -> Result<Authenticated, Refusal> {
+    crate::rest::api::RestClient::new(challenge.server_url())
+        .finish_second_factor(challenge, answer)
+        .map_err(|e| Refusal { trouble: trouble_for(&e), log: e.to_string() })
+}
+
+/// The seam's one production value, written in exactly one place.
+pub const PRODUCTION_SECOND_FACTOR: SecondFactorSeam = SecondFactorSeam {
+    start: start_direct_rest,
+    send_email: send_direct_rest_email,
+    finish: finish_direct_rest,
+};
+
 /// **The plaintext master password's whole life, in one function that returns
 /// without it and without anything derived from it.**
 ///
@@ -10456,5 +10617,157 @@ mod status_deadline_tests {
                  once, so it is stale and is widening this check for nothing"
             );
         }
+    }
+}
+
+/// **The second factor's boundary: what leaves the worker thread.**
+///
+/// The `Challenge` carries the derived password hash and the master key. It is
+/// born on the worker thread and dies there. These tests are the statement of
+/// that, in the two forms this crate can check: a source pin over the types
+/// that cross, and a compile-time check that the crossing types are the only
+/// ones the window is given.
+#[cfg(test)]
+mod second_factor_boundary {
+    use super::*;
+
+    /// Reads this file's own source, in the other source pins' idiom, because
+    /// the property is about a struct DEFINITION and no runtime value can show
+    /// it.
+    fn definition_of(name: &str) -> String {
+        let source = include_str!("login_ui.rs");
+        let opener = format!("pub struct {name} {{");
+        source
+            .split_once(&opener)
+            .unwrap_or_else(|| panic!("{name} must be defined in this file"))
+            .1
+            .split_once("\n}")
+            .expect("the definition must be brace-terminated")
+            .0
+            .to_string()
+    }
+
+    /// The request the worker sends UP carries providers and nothing else.
+    #[test]
+    fn the_request_carries_no_credential() {
+        let body = definition_of("SecondFactorRequest");
+        assert!(
+            body.contains("providers"),
+            "control: the definition was found and has the field this is about; got {body:?}"
+        );
+        for forbidden in ["Challenge", "MasterKey", "password", "hash", "Zeroizing"] {
+            assert!(
+                !body.contains(forbidden),
+                "SecondFactorRequest must not carry `{forbidden}`: it crosses to a frame \
+                 closure that outlives the stage. got {body:?}"
+            );
+        }
+    }
+
+    /// The command the window sends DOWN carries digits and nothing else --
+    /// in particular it does not carry the challenge back, which would mean
+    /// the window had held it.
+    #[test]
+    fn the_command_carries_no_credential() {
+        let source = include_str!("login_ui.rs");
+        let body = source
+            .split_once(concat!("pub enum SecondFactor", "Command {"))
+            .expect("SecondFactorCommand must be defined in this file")
+            .1
+            .split_once("\n}")
+            .expect("the definition must be brace-terminated")
+            .0;
+        assert!(
+            body.contains("Answer"),
+            "control: the definition was found; got {body:?}"
+        );
+        for forbidden in ["Challenge", "MasterKey", "password"] {
+            assert!(
+                !body.contains(forbidden),
+                "SecondFactorCommand must not carry `{forbidden}`; got {body:?}"
+            );
+        }
+    }
+
+    /// `SecondFactorRequest` is `Send` (it crosses the channel) and the
+    /// challenge is not in it. Compile-time, so it cannot rot.
+    #[test]
+    fn the_request_is_the_thing_that_crosses() {
+        fn assert_send<T: Send>() {}
+        assert_send::<SecondFactorRequest>();
+        assert_send::<SecondFactorCommand>();
+    }
+
+    /// The production seam is wired to the real functions and not to a stub
+    /// somebody left in while testing.
+    #[test]
+    fn the_production_seam_is_not_a_stub() {
+        // Line endings normalised first: this is a CRLF checkout of an LF
+        // blob, so a needle containing a newline matches on one machine and
+        // vacuously fails on the other. The other pins here split on a needle
+        // whose newline is the FIRST character, which survives either way;
+        // this one splits after a semicolon, and does not.
+        let source = include_str!("login_ui.rs").replace("\r\n", "\n");
+        let body = source
+            .split_once(concat!("pub const PRODUCTION_SECOND_", "FACTOR: SecondFactorSeam"))
+            .expect("the production seam must exist")
+            .1
+            .split_once(";\n")
+            .expect("the const must be terminated")
+            .0;
+        assert!(body.len() > 40, "control: the seam's body is not empty");
+        for real in ["start_direct_rest", "send_direct_rest_email", "finish_direct_rest"] {
+            assert!(body.contains(real), "the seam must be wired to {real}; got {body:?}");
+        }
+        // And the three helpers it names call `rest::api`'s own routes rather
+        // than reimplementing a grant. Read from the production half, so a
+        // fixture in a test module below cannot satisfy this.
+        let production = &source[..source.find(concat!("\n#[cfg(", "test)]")).expect("the cut")];
+        for route in ["authenticate(", "send_email_code(", "finish_second_factor("] {
+            assert!(
+                production.contains(route),
+                "no production call to rest::api's {route} -- the seam is a stub"
+            );
+        }
+    }
+
+    /// **A wrong code is not a broken network.** Vaultwarden answers a bad
+    /// token by re-sending the challenge body, so the failure that reaches
+    /// this classifier for the commonest mistake a user makes is
+    /// `TwoFactorRequired` -- and reporting that as "couldn't reach the
+    /// server" would send somebody to check their wifi over a mistyped digit.
+    #[test]
+    fn a_re_challenged_grant_reads_as_a_rejected_code() {
+        use crate::rest::api::RestError;
+        use crate::second_factor_ui::Trouble;
+
+        for rejection in [
+            RestError::TwoFactorRequired { providers: vec!["0".to_string()] },
+            RestError::InvalidCredentials,
+            RestError::Unauthorized,
+            RestError::Rejected {
+                error: "invalid_grant".to_string(),
+                description: "Two-step token is invalid.".to_string(),
+            },
+        ] {
+            assert_eq!(
+                trouble_for(&rejection),
+                Trouble::CodeRejected,
+                "{rejection:?} is how a server says no to a code"
+            );
+        }
+
+        // The control, and the reason this function exists at all: something
+        // that is NOT a rejected code must not be reported as one.
+        assert_eq!(
+            trouble_for(&RestError::Transport("dns failure".to_string())),
+            Trouble::Unreachable,
+            "a request that never got an answer is not a wrong code"
+        );
+        assert_eq!(
+            trouble_for(&RestError::Parse("access_token")),
+            Trouble::Unreachable,
+            "an answer this client could not read is not the user's code being wrong"
+        );
     }
 }
