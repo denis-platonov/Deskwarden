@@ -273,6 +273,44 @@ unconditionally.
 
 ## Status
 
+### The `keep_ui_loaded` rendezvous, read rather than assumed
+
+`keep_ui_loaded` **is** reachable from this checkout on 2026-08-29: local
+branch `keep-the-ui-loaded`, tip `b947c17` ("Every window claims the
+visibility name, not only a hidable one").
+
+It leaves the resident process recorded in `UiWindows.vault`, so this work
+covers the hidden window with no change. Verified by reading, on that branch:
+
+- `main.rs:5969` -- `OpenUiWindow` gains no field for hiding; the registry is
+  still `vault: Option<OpenUiWindow>` (`main.rs:5990`) and `vault_pid` is
+  still `self.vault.as_ref().map(|open| open.pid)` (`main.rs:5996`).
+- `main.rs:10254-10285` -- hiding is `HideHooks`, and `wait_for_show` blocks
+  the child on a named event with `INFINITE`. The process does **not** exit
+  when the window hides.
+- `main.rs:6162` -- so `poll_the_vault_window`'s `try_wait` answers `Ok(None)`
+  for a hidden child, `reap_step` says `Reap::Keep`, and the slot is not
+  emptied. Nothing else on that branch empties it on hide: the only
+  `self.vault.take()`s are the show-failure arm (`main.rs:6088`),
+  `close_on_quit` (`main.rs:6144`) and the reap (`main.rs:6176`).
+
+So on the merge of the two branches,
+`UiWindows::close_because_the_user_walked_away` reads a `vault_pid` that is
+still `Some` for a hidden window, and `Child::kill` ends it. That is the
+design's *visibility-blind by construction* claim holding in fact rather than
+in intent -- nothing on this path asks whether a window is on screen.
+
+Two things this reading does **not** claim. It is a read of `b947c17`, not of
+a merge that has been performed; and it is a source read, not a live check --
+the live check in the plan's Task 6 is run against a build of *this* branch,
+where there is no hidden window to observe.
+
+One consequence worth recording for whoever merges: that branch's
+`ask_for_the_vault_window` show-failure arm (`main.rs:6088`) is the same
+take-then-kill shape as `close_on_quit` and as the method this work adds, for
+the same reason -- a killed child left in the slot is reaped as `EXIT_LOCKED`.
+Three call sites now depend on that ordering.
+
 Design, 2026-08-29. Written against `two-factor-without-the-cli`, reading only.
 Two doc comments in the tree assert the opposite of this document's premise —
 `away_lock`'s module doc and `lock_after_walking_away`'s — and are stale as of
