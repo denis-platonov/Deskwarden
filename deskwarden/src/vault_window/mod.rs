@@ -521,6 +521,11 @@ pub fn build_frame(
         pre_styled,
         env,
         String::new(),
+        // The ordinary window ends its process when it is closed. Only
+        // `run`, in a process started with `keep_ui_loaded` on, passes
+        // hooks -- and it calls `build_frame_with_search` directly to do
+        // it.
+        None,
     )
 }
 
@@ -529,6 +534,14 @@ pub fn build_frame(
 /// See [`build_frame`] for every other parameter; only the last one is new,
 /// and only one caller passes a non-empty value for it.
 #[allow(clippy::too_many_arguments)]
+/// The `hide` parameter is what `keep_ui_loaded` looks like from in here:
+/// `Some` means a plain close hides the viewport instead of ending the
+/// process. It is a parameter rather than a [`VaultFrameEnv`] field on
+/// purpose -- every field of that struct is a `fn` pointer compared BY
+/// ADDRESS by `export_wiring`, and a boxed-closure field could not be
+/// compared that way. Adding one would have meant reshaping a guard that
+/// has already caught three real regressions, to hold something it was
+/// not built to hold.
 pub fn build_frame_with_search(
     cache: std::sync::Arc<VaultCache>,
     fill_stats: FillStats,
@@ -555,6 +568,9 @@ pub fn build_frame_with_search(
     // recovery or an account switch does not silently re-apply a query the
     // user has since cleared.
     initial_search: String,
+    // `Some` when this process was started with `keep_ui_loaded` on. See this
+    // function's doc.
+    hide: Option<HideHooks>,
 ) -> (eframe::NativeOptions, VaultFrameFn, VaultFrameHandles) {
     // The body is unchanged from before `initial_search` existed; see
     // `build_frame` above for why the parameter is on this function and not on
@@ -1303,7 +1319,83 @@ pub fn build_frame_with_search(
     // here, and it is reported once rather than every frame.
     let eframe_handoff = std::time::Instant::now();
 
+    // **The hidden-window state, and why it is three cells.**
+    //
+    // `hide_hooks` is `Some` only when `keep_ui_loaded` is on. `hidden`
+    // is whether the viewport is currently hidden; `waiting` stops a new
+    // waiter being spawned on every repaint while it is; and `woken` is
+    // how the worker answers, because it is the only one of the three a
+    // thread touches -- 0 nothing yet, 1 show, 2 the wait failed.
+    let hide_hooks = hide;
+    let hidden = std::rc::Rc::new(std::cell::Cell::new(false));
+    let waiting_for_show = std::rc::Rc::new(std::cell::Cell::new(false));
+    let woken = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+
     let vault_frame_fn = move |ui: &mut egui::Ui| {
+        // **The hidden window's whole life, run before anything paints.**
+        //
+        // Nothing here blocks: the wait is on a worker and answers
+        // through `woken`, so the frame thread stays free to paint the
+        // show when it is asked for. A blocking wait here would freeze
+        // the very process that has to act on the signal.
+        if let Some(hooks) = hide_hooks.as_ref() {
+            use std::sync::atomic::Ordering;
+            if hidden.get() && !waiting_for_show.get() {
+                waiting_for_show.set(true);
+                let wait = std::sync::Arc::clone(&hooks.wait_for_show);
+                let answered = std::sync::Arc::clone(&woken);
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let shown = wait();
+                    answered.store(if shown { 1 } else { 2 }, Ordering::SeqCst);
+                    // Without this the answer sits in the cell until
+                    // something else happens to repaint -- and a hidden
+                    // window is exactly the state in which nothing else
+                    // does.
+                    ctx.request_repaint();
+                });
+            }
+            match woken.swap(0, Ordering::SeqCst) {
+                1 => {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                    (hooks.on_shown)();
+                    hidden.set(false);
+                    waiting_for_show.set(false);
+                    log::info!("the vault window was asked to show itself, and did");
+                }
+                2 => {
+                    log::warn!(
+                        "the hidden vault window's wait failed; closing rather than \
+                         staying hidden with nothing able to bring it back"
+                    );
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                _ => {}
+            }
+        }
+
+        // **Alt+F4 and the OS close button take the same decision as the
+        // titlebar's X**, which is not automatic: they do not go through
+        // `ChromeAction` at all. Cancelled first, then decided, so that a
+        // window which is going to hide is not closed underneath us.
+        if hide_hooks.is_some()
+            && !hidden.get()
+            && ui.ctx().input(|i| i.viewport().close_requested())
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            close_or_hide(
+                ui.ctx(),
+                hide_hooks.as_ref(),
+                &hidden,
+                &locked_for_closure,
+                &needs_reauth_for_closure,
+                &edited_settings_for_closure,
+                &switch_to_for_closure,
+                &add_account_for_closure,
+                &remove_account_for_closure,
+            );
+        }
         if !styled {
             log::info!("vault window: first frame {:?} after eframe was asked", eframe_handoff.elapsed());
             theme::paint_window_background(ui);
@@ -2077,7 +2169,17 @@ pub fn build_frame_with_search(
                 }
             },
         ) {
-            ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+            ChromeAction::Close => close_or_hide(
+                ui.ctx(),
+                hide_hooks.as_ref(),
+                &hidden,
+                &locked_for_closure,
+                &needs_reauth_for_closure,
+                &edited_settings_for_closure,
+                &switch_to_for_closure,
+                &add_account_for_closure,
+                &remove_account_for_closure,
+            ),
             ChromeAction::Minimize => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
             ChromeAction::None => {}
         }
@@ -4943,6 +5045,83 @@ pub type VaultFrameFn = Box<dyn FnMut(&mut egui::Ui)>;
 /// item declared up here truncates that slice and blinds a dozen guards to
 /// everything below it. Measured: eleven tests red, none of them about this
 /// seam. The substitute therefore lives below every one of them.
+/// **Close, or hide and wait to be shown again.**
+///
+/// The decision itself is [`crate::ui_process::on_close`], which is also
+/// what the daemon's own rule is written against -- one rule, read from
+/// the six cells this window has been filling in. `hooks` being `Some` is
+/// what `keep_ui_loaded` being on looks like from in here, so `true` is
+/// passed for it.
+///
+/// **Every field is read, not just `locked`.** A window that hid while
+/// holding a switch, a re-auth or a preferences edit would be an outcome
+/// the daemon never hears about, because the only way any of them travels
+/// is this process exiting.
+#[allow(clippy::too_many_arguments)]
+fn close_or_hide(
+    ctx: &egui::Context,
+    hooks: Option<&HideHooks>,
+    hidden: &std::rc::Rc<std::cell::Cell<bool>>,
+    locked: &Rc<RefCell<bool>>,
+    needs_reauth: &Rc<RefCell<bool>>,
+    edited_settings: &Rc<RefCell<Option<crate::settings::Settings>>>,
+    switch_to: &Rc<RefCell<Option<crate::accounts::AccountId>>>,
+    add_account: &Rc<RefCell<bool>>,
+    remove_account: &Rc<RefCell<bool>>,
+) {
+    let Some(hooks) = hooks else {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        return;
+    };
+    let crossing = crate::ui_process::UiVaultResult {
+        locked: *locked.borrow(),
+        needs_reauth: *needs_reauth.borrow(),
+        edited_settings: edited_settings.borrow().clone(),
+        switch_to: switch_to.borrow().clone(),
+        add_account: *add_account.borrow(),
+        remove_account: *remove_account.borrow(),
+    };
+    if crate::ui_process::on_close(true, &crossing) == crate::ui_process::OnClose::Exit {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        return;
+    }
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    (hooks.on_hidden)();
+    hidden.set(true);
+    log::info!(
+        "the vault window hid itself; this process stays loaded so the next open is \
+         immediate"
+    );
+    ctx.request_repaint();
+}
+
+/// **What a window does instead of closing, when its process may stay
+/// resident.**
+///
+/// `Some` exactly when [`crate::settings::Settings::keep_ui_loaded`] is
+/// on, which is why nothing here carries the setting: the presence of
+/// the hooks IS the setting.
+///
+/// Boxed closures rather than `fn` pointers, because the child captures
+/// its vault-service attachment and its event handle in them.
+pub struct HideHooks {
+    /// Blocks until the daemon asks for this window. `false` means the
+    /// wait failed, and the window closes rather than staying hidden with
+    /// nothing able to bring it back.
+    ///
+    /// `Arc` and `Send + Sync` because this one runs on a WORKER: the
+    /// frame thread must never block on it, or the hidden window could
+    /// not paint the show it is waiting for.
+    pub wait_for_show: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Called on the frame thread just after the viewport is hidden.
+    /// Production releases the vault-service attachment slot here, so
+    /// save-memory can still stop `bw serve` behind a hidden window.
+    pub on_hidden: Box<dyn Fn()>,
+    /// Called on the frame thread just after the viewport is shown
+    /// again. Production retakes the attachment slot.
+    pub on_shown: Box<dyn Fn()>,
+}
+
 pub struct VaultFrameEnv {
     /// `spawn_vault_sync` in production. Both call sites go through it: the
     /// auto-sync on the window's first real frame and the Sync button.
@@ -5199,8 +5378,16 @@ pub fn run(
     auto_lock: AutoLock,
     backend_already_running: bool,
     accounts: Option<crate::accounts::AccountsState>,
+    // `Some` when this process was started with `keep_ui_loaded` on, in
+    // which case a plain close hides the window instead of ending it and
+    // this function does not return until something happens that the daemon
+    // has to hear about.
+    hide: Option<HideHooks>,
 ) -> VaultWindowResult {
-    let (options, mut frame_fn, handles) = build_frame(
+    // **`build_frame_with_search`, not `build_frame`**, only because this is
+    // the one caller that has hide hooks to hand in; the search starts empty
+    // exactly as `build_frame` would have left it.
+    let (options, mut frame_fn, handles) = build_frame_with_search(
         cache,
         fill_stats,
         details,
@@ -5213,8 +5400,14 @@ pub fn run(
         // installs the fonts, rounds the corners and raises it.
         false,
         VaultFrameEnv::production(),
+        String::new(),
+        hide,
     );
 
+    // **Called once, and it must stay once.** winit's event loop is consumed
+    // by this call; a hide implemented by returning here and running again
+    // would be a window that never comes back. That is why hiding happens
+    // inside the closure, as a viewport command.
     let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| frame_fn(ui));
 
     let result = handles.finish();
@@ -10430,6 +10623,50 @@ pub(crate) fn webbrowser_open(url: &str) {
 
 /// [`VaultFrameHandles::lost_session`] -- the one question a host that KEEPS
 /// the window has to ask while the frame is still running.
+#[cfg(test)]
+mod hide_shape_tests {
+    /// **Hiding happens inside the running app, and this pin says so.**
+    ///
+    /// `eframe::run_ui_native` consumes winit's event loop. A second call in
+    /// the same process does not open a second window -- it fails -- so a
+    /// "hide" implemented by returning from `run` and calling it again would
+    /// be a window that never comes back, and it would look perfectly
+    /// reasonable in review. The hide must be a viewport command sent from
+    /// inside the update closure, and the host must be entered exactly once.
+    #[test]
+    fn the_hide_is_a_viewport_command_and_the_host_is_entered_once() {
+        let source = include_str!("mod.rs");
+        let production = source
+            .split(concat!("#[cfg(", "test)]"))
+            .next()
+            .expect("a production half");
+        assert!(
+            production.len() > 10_000,
+            "control: the production slice is {} bytes, so the cut took the file with it",
+            production.len()
+        );
+        assert!(
+            production.contains(concat!("ViewportCommand::", "Visible(false)")),
+            "nothing in this module hides the viewport, so `keep_ui_loaded` has no way to \
+             keep a window that can come back"
+        );
+        assert_eq!(
+            // The CALL, not the prose: four doc comments in this file name
+            // the host without calling it, and a pin that counted those
+            // would fail on a comment and pass on a second call.
+            production.matches(concat!("eframe::run_ui_", "native(")).count(),
+            1,
+            "the eframe host is entered more than once, which winit does not support: the \
+             second window never opens and the user's Open Vault does nothing"
+        );
+        assert!(
+            production.contains(concat!("ViewportCommand::", "CancelClose")),
+            "Alt+F4 is not intercepted, so the OS close path would end the process while \
+             the titlebar's X hides it -- two answers to one gesture"
+        );
+    }
+}
+
 #[cfg(test)]
 mod lost_session_tests {
     use super::VaultFrameHandles;
@@ -18085,10 +18322,19 @@ mod frame_host_tests {
     #[test]
     fn the_tray_click_host_runs_the_shared_frame_rather_than_a_second_copy_of_it() {
         let body = run_body();
+        // **Either builder counts, and that is not a loosening.**
+        // `build_frame` is a wrapper whose entire body is a call to
+        // `build_frame_with_search` with an empty query -- so a `run` that
+        // calls the inner one is drawing the SAME closure, one level nearer.
+        // `run` does exactly that because it is the only caller with hide
+        // hooks to hand in, and they are the inner function's parameter. What
+        // this still catches is the thing it was written for: `run` building
+        // a second frame of its own.
         assert!(
-            body.contains(concat!("build_", "frame(")),
-            "`run` no longer calls `build_frame`, so the vault UI the tray opens is not the \
-             one the single-window host draws: {body:?}"
+            body.contains(concat!("build_", "frame("))
+                || body.contains(concat!("build_frame_with_", "search(")),
+            "`run` no longer calls either shared builder, so the vault UI the tray opens is \
+             not the one the single-window host draws: {body:?}"
         );
         // The whole point of the split: the closure body lives in ONE place.
         // A second `move |ui: &mut egui::Ui` inside `run` would be a copy of
@@ -20036,7 +20282,10 @@ mod preferences_modal_wiring_tests {
             // 59 as of the kebab's Clone, which added `mod clone_name_tests`
             // -- what a cloned item is called, and why it cannot simply be
             // the original's name.
-            modules, 59,
+            // 60 as of `keep_ui_loaded`, which added `mod hide_shape_tests`
+            // -- that hiding is a viewport command sent from inside the
+            // running app, and that the eframe host is entered exactly once.
+            modules, 60,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"

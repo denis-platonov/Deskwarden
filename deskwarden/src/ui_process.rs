@@ -189,6 +189,10 @@ pub fn reap_step(answer: Result<Option<Option<i32>>, ()>) -> Reap {
 pub enum UiOpenDecision {
     /// Nothing is open for this surface; start one.
     Spawn,
+    /// One is open but HIDDEN, because `keep_ui_loaded` kept its process
+    /// resident after a plain close. Show that one; it cannot be raised,
+    /// because a hidden viewport has no window to raise.
+    ShowTheHiddenOne { pid: u32 },
     /// One is already open. Bring *that* one forward; do not start a second.
     FocusTheOpenOne { pid: u32 },
 }
@@ -206,10 +210,15 @@ pub enum UiOpenDecision {
 /// record that a window exists: it is what the spawn returned, it is what the
 /// result file is named by, and it is what the focus below is aimed at. There
 /// is no second registry to disagree with it.
-pub fn open_decision(already_open: Option<u32>) -> UiOpenDecision {
-    match already_open {
-        Some(pid) => UiOpenDecision::FocusTheOpenOne { pid },
-        None => UiOpenDecision::Spawn,
+/// `hidden` is whether that open window has hidden itself after a plain
+/// close. It is a second argument rather than a third state of
+/// `already_open` because the pid means the same thing either way -- the
+/// process exists and is ours -- and only what to DO with it differs.
+pub fn open_decision(already_open: Option<u32>, hidden: bool) -> UiOpenDecision {
+    match (already_open, hidden) {
+        (Some(pid), true) => UiOpenDecision::ShowTheHiddenOne { pid },
+        (Some(pid), false) => UiOpenDecision::FocusTheOpenOne { pid },
+        (None, _) => UiOpenDecision::Spawn,
     }
 }
 
@@ -364,6 +373,48 @@ impl UiVaultResult {
 /// **Named by the child's own process id**, so a stale file from a UI process
 /// that was killed cannot be read as this one's answer, and two UI processes
 /// (once there is more than one surface) cannot write over each other. The
+/// What a closing vault window does with its process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnClose {
+    /// Hide the viewport and stay resident, ready to be shown again.
+    Hide,
+    /// End the process, which is how every result gets home.
+    Exit,
+}
+
+/// **Whether this close hides the window or ends its process.**
+///
+/// Hiding is safe for exactly one result: the empty one. Every field of
+/// [`UiVaultResult`] is something the daemon acts on, and the only way any
+/// of them reaches the daemon is this process exiting -- the result file
+/// is named by pid and read when the child is reaped. A process that hid
+/// while holding a set field would be a lock, a switch or a settings edit
+/// that silently never happened.
+///
+/// **This deliberately does not mirror `vault_follow_up`'s `Done`.** That
+/// function answers a different question -- what the daemon does next --
+/// and it does not read `edited_settings`, because by the time it is
+/// consulted the daemon has already applied that field (`main.rs:7121`,
+/// which also runs `apply_disk_cache_change` from it). Hiding on `Done`
+/// alone would swallow a preferences edit and leave the daemon running
+/// against settings the user had changed.
+/// `the_hide_rule_is_stricter_than_done` in `main.rs` holds the two
+/// together, over every combination of the six fields.
+#[must_use]
+pub fn on_close(keep_loaded: bool, result: &UiVaultResult) -> OnClose {
+    let nothing_to_report = !result.locked
+        && !result.needs_reauth
+        && !result.add_account
+        && !result.remove_account
+        && result.switch_to.is_none()
+        && result.edited_settings.is_none();
+    if keep_loaded && nothing_to_report {
+        OnClose::Hide
+    } else {
+        OnClose::Exit
+    }
+}
+
 /// daemon knows the id from the `Child` it spawned; the child knows its own.
 pub fn result_path(config_dir: &Path, pid: u32) -> PathBuf {
     config_dir.join(format!("ui-result-{pid}.json"))
@@ -418,6 +469,89 @@ pub fn forget_result(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    /// A hidden window is SHOWN, not spawned and not raised. Raising is
+    /// what `FocusTheOpenOne` does and it cannot work here: there is no
+    /// window on screen for `raise_process` to bring forward.
+    #[test]
+    fn a_hidden_window_is_shown() {
+        assert_eq!(
+            open_decision(Some(77), true),
+            UiOpenDecision::ShowTheHiddenOne { pid: 77 }
+        );
+    }
+
+    /// A visible window is still focused, and still nothing is spawned.
+    /// Two vault windows on one vault is two editors of the same records.
+    #[test]
+    fn a_visible_window_is_still_focused() {
+        assert_eq!(open_decision(Some(77), false), UiOpenDecision::FocusTheOpenOne { pid: 77 });
+    }
+
+    /// No window at all is a spawn whatever `hidden` says -- there is
+    /// nothing to hide. The `true` arm is not reachable in production, and
+    /// is asserted so that a future caller passing a stale flag cannot
+    /// turn "no window" into "show the window that is not there".
+    #[test]
+    fn no_window_is_still_a_spawn() {
+        assert_eq!(open_decision(None, false), UiOpenDecision::Spawn);
+        assert_eq!(open_decision(None, true), UiOpenDecision::Spawn);
+    }
+    /// The one case that hides: the setting is on and the user just
+    /// closed the window with nothing to report.
+    #[test]
+    fn a_plain_close_hides_when_the_setting_is_on() {
+        assert_eq!(on_close(true, &UiVaultResult::default()), OnClose::Hide);
+    }
+
+    /// **Off means today's behaviour, exactly.** With the setting off no
+    /// result hides, or the setting would not be a setting.
+    #[test]
+    fn nothing_hides_when_the_setting_is_off() {
+        assert_eq!(on_close(false, &UiVaultResult::default()), OnClose::Exit);
+    }
+
+    /// **Every outcome the daemon acts on exits**, so the result file, the
+    /// reap and the resettle all keep working unchanged. Each is asserted
+    /// by name rather than in a loop: a loop that built the wrong value
+    /// would pass five times and prove nothing.
+    #[test]
+    fn every_outcome_the_daemon_acts_on_exits() {
+        let locked = UiVaultResult { locked: true, ..Default::default() };
+        assert_eq!(on_close(true, &locked), OnClose::Exit, "a lock must reach the daemon");
+
+        let reauth = UiVaultResult { needs_reauth: true, ..Default::default() };
+        assert_eq!(on_close(true, &reauth), OnClose::Exit, "a re-auth must reach the daemon");
+
+        let switch =
+            UiVaultResult { switch_to: Some(AccountId::generate()), ..Default::default() };
+        assert_eq!(on_close(true, &switch), OnClose::Exit, "a switch must reach the daemon");
+
+        let add = UiVaultResult { add_account: true, ..Default::default() };
+        assert_eq!(on_close(true, &add), OnClose::Exit, "an add must reach the daemon");
+
+        let remove = UiVaultResult { remove_account: true, ..Default::default() };
+        assert_eq!(on_close(true, &remove), OnClose::Exit, "a remove must reach the daemon");
+    }
+
+    /// **A preferences edit exits too, and this is the subtle one.**
+    ///
+    /// `vault_follow_up` returns `Done` for it -- editing preferences is
+    /// not a reason a window closed -- but the daemon reads
+    /// `edited_settings` ABOVE that match (`main.rs:7121`): it copies the
+    /// edited settings into its own estate and runs
+    /// `apply_disk_cache_change`. A window that hid after a visit to the
+    /// gear would withhold both, and the daemon would go on running
+    /// against settings the user had changed.
+    #[test]
+    fn a_preferences_edit_exits_even_though_its_follow_up_is_done() {
+        let geared =
+            UiVaultResult { edited_settings: Some(Settings::default()), ..Default::default() };
+        assert_eq!(
+            on_close(true, &geared),
+            OnClose::Exit,
+            "the window hid holding edited settings, so the daemon never applied them"
+        );
+    }
     use super::*;
 
     #[test]
@@ -508,13 +642,13 @@ mod tests {
 
     #[test]
     fn a_surface_with_nothing_open_spawns() {
-        assert_eq!(open_decision(None), UiOpenDecision::Spawn);
+        assert_eq!(open_decision(None, false), UiOpenDecision::Spawn);
     }
 
     #[test]
     fn a_surface_that_is_already_open_is_focused_rather_than_opened_again() {
         assert_eq!(
-            open_decision(Some(4242)),
+            open_decision(Some(4242), false),
             UiOpenDecision::FocusTheOpenOne { pid: 4242 },
             "two vault windows on one vault is two editors of the same records; the second              request brings the first window forward"
         );

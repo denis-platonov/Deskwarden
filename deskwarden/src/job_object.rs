@@ -1390,7 +1390,12 @@ mod tests {
         // account details on a thread rather than in front of the window it
         // has not opened yet -- the same 1-3s `bw` spawn, and the same reason,
         // as the two `check_bw_status_details` spawns already counted here.
-        ("main.rs", 12),
+        // Eleven again once the STARTUP door stopped drawing in the daemon:
+        // that branch built a vault frame here and fetched its toolbar
+        // details on a thread of its own, and both went when the window moved
+        // into a process of its own. The window still makes that fetch -- in
+        // the child, on the line counted just above.
+        ("main.rs", 11),
         ("picker_ui.rs", 2),
         // One: the `bw unlock` behind the daemon's unlock prompt. It cannot be
         // inline for a reason stronger than the frame-loop one every entry
@@ -1407,7 +1412,12 @@ mod tests {
         // running while the preferences window that started them is open.
         ("update_panel.rs", 2),
         ("updater.rs", 3),
-        ("vault_window/mod.rs", 8),
+        // Nine since `keep_ui_loaded`: a hidden window waits to be shown on a
+        // worker, never on the frame thread. Blocking the frame thread is the
+        // one thing that cannot work here -- the process would be unable to
+        // paint the show it is waiting for, so the window would never come
+        // back. See `ui_show`.
+        ("vault_window/mod.rs", 9),
     ];
 
     /// The budget [`THREAD_SPAWN_SITES`] grants a file, by the same relative

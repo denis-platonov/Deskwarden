@@ -131,6 +131,24 @@ const RESET_BUTTON_WIDTH: f32 = 72.0;
 
 const BACKEND_LABEL: &str = "Keep the Bitwarden backend running";
 
+/// The label for [`crate::settings::Settings::keep_ui_loaded`].
+const UI_LOADED_LABEL: &str = "Open the vault instantly";
+
+/// The description under [`UI_LOADED_LABEL`].
+///
+/// **Names the cost as well as what it buys**, as the backend row above
+/// does: this is the same trade in a different process, and somebody who
+/// turns it on should not meet the memory afterwards in Task Manager.
+///
+/// It also names what still closes the window, because "instantly" would
+/// otherwise read as a promise that a lock cannot keep -- locking,
+/// switching account and editing these settings all end the process, so
+/// that what they have to tell the app actually gets told.
+const UI_LOADED_DESCRIPTION: &str =
+    "Keeps the vault window loaded and hidden after you close it, so it opens \
+     immediately next time. Holds about 100 MB while the vault is unlocked. \
+     Locking, switching account or changing these settings closes it fully.";
+
 /// The description under [`BACKEND_LABEL`], in its two states.
 ///
 /// # Why this row is a child of the one above it, and why it moved pages
@@ -3100,6 +3118,17 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
             state.settings.keep_backend_running,
             bw_selected,
         );
+        row_separator(ui);
+        // **Not a `child_toggle_row`.** The backend row above is ghosted
+        // when `bw serve` is not the backend, because it describes a
+        // process that would not exist. This one is about Deskwarden's own
+        // window and is true on every backend, so it is never ghosted.
+        state.settings.keep_ui_loaded = toggle_row(
+            ui,
+            UI_LOADED_LABEL,
+            UI_LOADED_DESCRIPTION,
+            state.settings.keep_ui_loaded,
+        );
     });
 }
 
@@ -5680,6 +5709,31 @@ mod tests {
     /// fails a test rather than shipping -- `disk_cache_description`'s rule,
     /// on the row with more at stake.
     #[test]
+    /// **The row says what it costs, not only what it buys.**
+    ///
+    /// The backend row beside it names its ~111 MB; this one holds about
+    /// 100 MB in a second process, and a user who discovers that in Task
+    /// Manager rather than here has been surprised by their own settings.
+    /// That surprise is the report this whole split came from.
+    #[test]
+    fn the_ui_loaded_row_names_both_halves_of_the_trade() {
+        assert!(
+            UI_LOADED_DESCRIPTION.contains("MB"),
+            "the row does not say what it costs, so the memory is a surprise: \
+             {UI_LOADED_DESCRIPTION}"
+        );
+        assert!(
+            UI_LOADED_LABEL.to_lowercase().contains("open"),
+            "the row does not say what it buys: {UI_LOADED_LABEL}"
+        );
+        assert!(
+            UI_LOADED_DESCRIPTION.to_lowercase().contains("lock"),
+            "the row promises instant opening without saying what still closes the \
+             window, so a lock reads as the setting having failed"
+        );
+    }
+
+    #[test]
     fn the_off_copy_says_what_turning_it_on_would_do() {
         let text = service_description(false);
         assert!(text.contains("default"), "the copy stopped saying off is the default");
@@ -6691,13 +6745,14 @@ mod tests {
         let pills = first.rects_of_size(TOGGLE_SIZE);
         assert_eq!(
             pills.len(),
-            4,
-            "the Vault page paints four pills: the backend choice and its child, and the \
-             disk copy and its child. The service switch was a fifth until it moved to the \
-             Local API page, and an index that has drifted must fail here rather than \
+            5,
+            "the Vault page paints five pills: the backend choice and its child, the \
+             instant-open switch beside them, and the disk copy and its child. It was four \
+             until `keep_ui_loaded` was added as the third, which shifted the disk rows \
+             down by one -- and an index that has drifted must fail here rather than \
              quietly click the row above"
         );
-        let pill = pills[2].center();
+        let pill = pills[3].center();
         tall_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.cache_vault_to_disk,
@@ -6752,7 +6807,7 @@ mod tests {
 
         let first = tall_frame(&ctx, &mut state, &[]);
         // FOURTH pill: the backend card's two, then the disk copy, then this.
-        let child = first.rects_of_size(TOGGLE_SIZE)[3].center();
+        let child = first.rects_of_size(TOGGLE_SIZE)[4].center();
         tall_frame(&ctx, &mut state, &click(child));
         assert!(
             state.settings.read_through_cache,
@@ -6770,7 +6825,7 @@ mod tests {
         // a row that is inert always. Turn the parent on -- through the pane,
         // so it is the same click path -- and the child is live, moves its
         // own field, and changes what the policy answers.
-        let parent = first.rects_of_size(TOGGLE_SIZE)[2].center();
+        let parent = first.rects_of_size(TOGGLE_SIZE)[3].center();
         tall_frame(&ctx, &mut state, &click(parent));
         assert!(state.settings.cache_vault_to_disk, "the control could not turn the parent on");
         assert_eq!(
@@ -6779,7 +6834,7 @@ mod tests {
         );
 
         let second = tall_frame(&ctx, &mut state, &[]);
-        let child = second.rects_of_size(TOGGLE_SIZE)[3].center();
+        let child = second.rects_of_size(TOGGLE_SIZE)[4].center();
         tall_frame(&ctx, &mut state, &click(child));
         assert!(
             !state.settings.read_through_cache,

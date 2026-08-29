@@ -1309,7 +1309,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 69] = [
+        const OPENS_NO_WINDOW: [&str; 70] = [
             "accounts",
             "app",
             // A pure matching function over vault items: it scores and
@@ -1514,6 +1514,10 @@ mod tests {
             // `vault_window`, which is classified in its own right. Nothing
             // here touches Win32 at all.
             "ui_process",
+            // Signals a window that ALREADY EXISTS to show itself again; it
+            // creates none of its own. The showing is a viewport command sent
+            // by the process that owns the window, in `vault_window`.
+            "ui_show",
             // One account's DPAPI-wrapped master key and refresh token: a
             // path, two file reads and a byte layout. It draws nothing, and
             // the master password it saves the user from being asked for is
