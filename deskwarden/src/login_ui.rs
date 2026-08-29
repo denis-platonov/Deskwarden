@@ -1515,6 +1515,11 @@ pub enum LoginAction {
     HelloUnlock,
     /// The footer's "Log out" was clicked: drop the account.
     LogOut,
+    /// **The sign-in card's link to [`crate::api_key_ui`]**: the way in for an
+    /// account whose second factor this app cannot complete. Duo and WebAuthn
+    /// are not reachable from `bw login` either, so this is not a shortcut
+    /// past the password prompt -- it is the only door those accounts have.
+    UseApiKey,
 }
 
 /// Draws the login/unlock window body (design 3h): brand lockup, title
@@ -1780,6 +1785,17 @@ pub fn draw_login_window(
     // to fire a second login while the first is still in flight.
     if !auth_in_progress && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
         action = Some(LoginAction::Submit);
+    }
+
+    // **The escape hatch, in the flowing content rather than the footer**, so
+    // it is measured by `flow_bottom` below and the window grows for it. Only
+    // while signing in: an attached account is past the point an API key would
+    // help, and the link would be an offer to start over.
+    if status == BwStatus::Unauthenticated {
+        ui.add_space(10.0);
+        if ui.link(RichText::new(crate::api_key_ui::USE_API_KEY_LABEL).size(12.0)).clicked() {
+            action = Some(LoginAction::UseApiKey);
+        }
     }
 
     // Where the flowing content ends, in window coordinates. The caller
@@ -2720,6 +2736,13 @@ pub fn build_login_frame(
     // overlay_ui::show_prompt_overlay.)
     let token: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let token_for_closure = token.clone();
+    // **The card's link to the API-key stage, reported the way the token is.**
+    // A cell and not a return value for `token`'s reason exactly: this closure
+    // is `FnMut + 'static` and can hand nothing back, and the stage that has
+    // to be entered lives in `app_window`, which owns this frame rather than
+    // being owned by it.
+    let api_key_asked: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let api_key_asked_for_closure = api_key_asked.clone();
 
     // Mutable because 3h's "Log out" flips the window into the sign-in state
     // without closing it.
@@ -3139,13 +3162,19 @@ pub fn build_login_frame(
                             form.error = Some(e);
                         }
                     },
+                    // Recorded and not acted on here: this card cannot show
+                    // the API-key stage, because the stage is `app_window`'s
+                    // and this closure is one of the things it draws.
+                    Some(LoginAction::UseApiKey) => {
+                        *api_key_asked_for_closure.borrow_mut() = true;
+                    }
                     None => {}
                 }
             },
         );
     };
 
-    (options, Box::new(login_frame_fn), LoginFrameHandles { token })
+    (options, Box::new(login_frame_fn), LoginFrameHandles { token, api_key_asked })
 }
 
 /// The login UI's per-frame closure, boxed so it can be stored in a struct and
@@ -3156,6 +3185,9 @@ pub type LoginFrameFn = Box<dyn FnMut(&mut egui::Ui, &mut eframe::Frame)>;
 /// through.
 pub struct LoginFrameHandles {
     token: Rc<RefCell<Option<String>>>,
+    /// Set when the card's "Sign in with an API key" link was clicked. Taken
+    /// rather than read, for [`LoginFrameHandles::take_token`]'s reason.
+    api_key_asked: Rc<RefCell<bool>>,
 }
 
 impl LoginFrameHandles {
@@ -3169,6 +3201,14 @@ impl LoginFrameHandles {
     /// the rest of the session.
     pub fn take_token(&self) -> Option<String> {
         self.token.borrow_mut().take()
+    }
+
+    /// Whether the card's API-key link was clicked, **taken**: a second call
+    /// answers `false`. Polled every frame by `app_window`, so a cell that
+    /// kept answering `true` would re-enter the stage on every frame for the
+    /// rest of the session -- the same defect `take_token` documents.
+    pub fn take_api_key_request(&self) -> bool {
+        std::mem::take(&mut *self.api_key_asked.borrow_mut())
     }
 }
 

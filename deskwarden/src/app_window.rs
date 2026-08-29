@@ -54,7 +54,7 @@
 //! reason those two functions exist separately from their own hosts.
 
 use crate::accounts::Account;
-use crate::{foreground, loading_ui, login_ui, second_factor_ui, theme, vault_window};
+use crate::{api_key_ui, foreground, loading_ui, login_ui, second_factor_ui, theme, vault_window};
 use eframe::egui;
 use std::cell::RefCell;
 use std::path::Path;
@@ -171,6 +171,11 @@ pub enum Stage {
     /// factor, which it can only do AFTER the grant, which is why this is a
     /// stage between the card and the spinner rather than a field on the card.
     SecondFactor,
+    /// **The API-key card** -- `api_key_ui`'s two steps, over the same backdrop
+    /// the sign-in card uses. Reached from the sign-in card's link and from
+    /// `second_factor_ui`'s unsupported-only message; it is a way of signing
+    /// in, so it lives where signing in happens and is not a Preferences page.
+    ApiKey,
 }
 
 /// What happened that could move the window on.
@@ -209,6 +214,15 @@ pub enum Event {
     /// worker has dropped the challenge; the card is what comes next, because
     /// starting over means a new master password.
     SecondFactorAbandoned,
+    /// The user chose to sign in with an API key -- from the sign-in card, or
+    /// from the unsupported-only second-factor message.
+    ApiKeyChosen,
+    /// The API-key sign-in produced a session and a master key. From here the
+    /// window is in exactly the state a password sign-in leaves it in.
+    ApiKeyDone,
+    /// The user backed out of the API-key card. Back to the sign-in card,
+    /// because they still have an account to sign into.
+    ApiKeyAbandoned,
 }
 
 /// **Which of two channels the startup host's working stage is draining.**
@@ -260,6 +274,66 @@ impl SecondFactorStage {
     }
 }
 
+/// **The API-key stage's whole state**: the form, and the three channel ends
+/// it talks to its own worker over.
+///
+/// There is no client secret and no master password in here beyond the text
+/// boxes themselves, which is as good as it gets: unlike the code stage's
+/// `Challenge`, the credentials of this feature are *typed by the user*, so
+/// the buffers have to live on the UI thread. What is contained instead is
+/// their lifetime -- see `api_key_ui::ApiKeyForm`.
+///
+/// **The token end is a channel and not the login card's cell**, because this
+/// stage has no login card: its worker is its own, and what it produces is a
+/// `login_ui::DIRECT_REST_SESSION` sentinel sent once, after the `adopt` sink
+/// has taken the `Authenticated`.
+struct ApiKeyStage {
+    state: api_key_ui::ApiKeyForm,
+    commands: mpsc::Sender<api_key_ui::ApiKeyCommand>,
+    reports: mpsc::Receiver<api_key_ui::ApiKeyReport>,
+    token: mpsc::Receiver<String>,
+}
+
+impl ApiKeyStage {
+    /// Starts the worker and returns the stage that talks to it.
+    ///
+    /// **The worker is this feature's own**, deliberately: it blocks on a
+    /// human between two network calls while holding a `Session`, which is a
+    /// shape `login_ui`'s `spawn_auth` has no room for. It is bounded exactly
+    /// as the code stage's worker is -- an `Abandon` and a disconnected
+    /// channel both end it, and ending it drops the session.
+    fn start(direct: &login_ui::DirectRestLogin) -> Self {
+        let (commands, command_rx) = mpsc::channel();
+        let (report_tx, reports) = mpsc::channel();
+        let (token_tx, token) = mpsc::channel();
+        let account = api_key_ui::ApiKeyAccount {
+            server_url: direct.server_url.clone(),
+            email: direct.email.clone(),
+            device_id: direct.device_id.clone(),
+        };
+        let adopt = direct.adopt.clone();
+        std::thread::spawn(move || {
+            if let Some(authenticated) = api_key_ui::run_api_key_sign_in(
+                &api_key_ui::PRODUCTION_API_KEY,
+                &account,
+                &command_rx,
+                &report_tx,
+            ) {
+                // **Sideways, on this thread**, exactly as the password
+                // sign-in hands its own `Authenticated` over. The window is
+                // told only that a session exists.
+                adopt(authenticated);
+                // **The sentinel, not an empty string.** `away_lock` is handed
+                // `!token.is_empty()` as "is there a session at all", so an
+                // empty token here would stop Win+L locking an unlocked vault.
+                // See `login_ui::DIRECT_REST_SESSION`.
+                let _ = token_tx.send(login_ui::DIRECT_REST_SESSION.to_string());
+            }
+        });
+        Self { state: api_key_ui::ApiKeyForm::new(), commands, reports, token }
+    }
+}
+
 /// Where an event leaves the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Next {
@@ -290,6 +364,10 @@ pub fn advance(stage: Stage, event: Event) -> Next {
         (Stage::SignIn, Event::SecondFactorNeeded) => Next::Show(Stage::SecondFactor),
         (Stage::SecondFactor, Event::SecondFactorDone) => Next::Show(Stage::Working),
         (Stage::SecondFactor, Event::SecondFactorAbandoned) => Next::Show(Stage::SignIn),
+        (Stage::SignIn, Event::ApiKeyChosen) => Next::Show(Stage::ApiKey),
+        (Stage::SecondFactor, Event::ApiKeyChosen) => Next::Show(Stage::ApiKey),
+        (Stage::ApiKey, Event::ApiKeyDone) => Next::Show(Stage::Working),
+        (Stage::ApiKey, Event::ApiKeyAbandoned) => Next::Show(Stage::SignIn),
         (stage, _) => Next::Show(stage),
     }
 }
@@ -1193,6 +1271,12 @@ where
     // worker asks. Nothing in here is a challenge -- see
     // `login_ui::SecondFactorRequest`.
     let mut second_factor: Option<SecondFactorStage> = None;
+    // The API-key stage, and the account it signs into. `None` until the user
+    // asks for it; the account is read once here rather than per frame, and a
+    // `None` here is a `bw serve` account, for which an API key would mint a
+    // session nothing in this process would read.
+    let mut api_key: Option<ApiKeyStage> = None;
+    let api_key_account = crate::backend_policy::direct_rest_login();
 
     let (_login_options, login_fn, login_handles) = login_ui::build_login_frame(
         account,
@@ -1323,22 +1407,36 @@ where
         // The card is drawn after this, so a token produced during a frame is
         // acted on at the top of the next one; `request_repaint` below is what
         // makes that next frame immediate.
-        if matches!(stage, Stage::SignIn | Stage::SecondFactor) {
-            let produced_event = if stage == Stage::SecondFactor {
-                Event::SecondFactorDone
-            } else {
-                Event::SignedIn
+        if matches!(stage, Stage::SignIn | Stage::SecondFactor | Stage::ApiKey) {
+            let produced_event = match stage {
+                Stage::SecondFactor => Event::SecondFactorDone,
+                Stage::ApiKey => Event::ApiKeyDone,
+                _ => Event::SignedIn,
             };
             // The card records its token and does NOT close the window
             // (`close_on_success: false`); this is where that token is
             // noticed. `take_token` takes, so this cannot fire twice.
-            let produced = login.as_mut().and_then(|(_, handles)| handles.take_token());
+            //
+            // **The API-key stage has no card**, so its token comes off its own
+            // worker's channel instead. Everything downstream -- the cell, the
+            // `prepare` spawn, the lock's password handover -- is the shared
+            // wiring below, which is the whole reason this is one block and not
+            // an arm per stage.
+            let produced = if stage == Stage::ApiKey {
+                api_key.as_ref().and_then(|stage| stage.token.try_recv().ok())
+            } else {
+                login.as_mut().and_then(|(_, handles)| handles.take_token())
+            };
             if let Some(produced) = produced {
                 // The prompt, if there was one, is over: the code was
                 // accepted. Dropping it closes the command channel, which is
                 // one of the two things that end
                 // `login_ui::complete_second_factor`.
                 second_factor = None;
+                // And the API-key stage, for the same reason: its worker has
+                // returned, so the channels are dead and the form's buffers
+                // have no reason to outlive the frame that used them.
+                api_key = None;
                 // **The token the window ENDED with**, which is what
                 // `StartupOutcome::token` means. The lock catch clears it, so
                 // a post-lock card overwrites it here and a post-lock card the
@@ -1424,6 +1522,28 @@ where
                     }
                     ui.ctx().request_repaint();
                 }
+                // **The card's link to the API-key stage.** Taken, not read,
+                // so this fires once; gated on there being an account to sign
+                // into, because the stage needs the email as its KDF salt and
+                // has no card of its own to ask for one.
+                let asked = login
+                    .as_ref()
+                    .is_some_and(|(_, handles)| handles.take_api_key_request());
+                if asked {
+                    if let Some(direct) = api_key_account.as_ref() {
+                        api_key = Some(ApiKeyStage::start(direct));
+                        if let Next::Show(next) = advance(stage, Event::ApiKeyChosen) {
+                            stage = next;
+                        }
+                        ui.ctx().request_repaint();
+                    } else {
+                        log::warn!(
+                            "the API-key stage was asked for on an account this process serves \
+                             through `bw serve`; there is nothing here for the session it \
+                             would mint to be read by"
+                        );
+                    }
+                }
             }
             Stage::SecondFactor => {
                 let Some(prompt) = second_factor.as_mut() else {
@@ -1454,6 +1574,25 @@ where
                         prompt.state.busy = true;
                         let _ =
                             prompt.commands.send(login_ui::SecondFactorCommand::Answer(answer));
+                    }
+                    Some(second_factor_ui::PromptAction::UseApiKey) => {
+                        // The unsupported-only card. Its own message told the
+                        // user to do this, so the sign-in it is abandoning is
+                        // one that could never have finished: tell the worker
+                        // to let go of what it is holding.
+                        let _ = prompt.commands.send(login_ui::SecondFactorCommand::Abandon);
+                        second_factor = None;
+                        login = None;
+                        if let Some(direct) = api_key_account.as_ref() {
+                            api_key = Some(ApiKeyStage::start(direct));
+                            if let Next::Show(next) = advance(stage, Event::ApiKeyChosen) {
+                                stage = next;
+                            }
+                        } else if let Next::Show(next) =
+                            advance(stage, Event::SecondFactorAbandoned)
+                        {
+                            stage = next;
+                        }
                     }
                     Some(second_factor_ui::PromptAction::Back) => {
                         let _ = prompt.commands.send(login_ui::SecondFactorCommand::Abandon);
@@ -1714,6 +1853,70 @@ where
                         }
                         ui.ctx().request_repaint();
                     }
+                }
+            }
+            // **After the vault arm on purpose.** `second_factor_arm()` and
+            // `working_arm()` slice this closure between the labels above, and
+            // this arm names a master password -- which the code stage's arm is
+            // pinned NOT to. Placed between them it would red a guard that is
+            // about a different stage entirely.
+            Stage::ApiKey => {
+                let Some(card) = api_key.as_mut() else {
+                    // No worker, so nothing to answer and nothing to wait for.
+                    // Treated as an abandonment rather than a panic, for the
+                    // code stage's reason: the cost of being wrong is the
+                    // window dying on the one screen a blocked user is on.
+                    if let Next::Show(next) = advance(stage, Event::ApiKeyAbandoned) {
+                        stage = next;
+                    }
+                    return;
+                };
+                for report in card.reports.try_iter() {
+                    match report {
+                        api_key_ui::ApiKeyReport::KeyPairAccepted => {
+                            card.state.busy = false;
+                            card.state.error = None;
+                            card.state.step = api_key_ui::ApiKeyStep::MasterPassword;
+                        }
+                        api_key_ui::ApiKeyReport::Refused(refusal) => {
+                            card.state.refused(refusal)
+                        }
+                    }
+                }
+                match api_key_ui::draw(ui, &mut card.state) {
+                    Some(api_key_ui::ApiKeyAction::Submit) => {
+                        card.state.busy = true;
+                        // **The stage decides which command, not the card.**
+                        // Building it in `draw` would mean copying the secret
+                        // out of the buffer that owns it a frame early.
+                        let command = match card.state.step {
+                            api_key_ui::ApiKeyStep::KeyPair => {
+                                api_key_ui::ApiKeyCommand::KeyPair {
+                                    client_id: card.state.client_id.clone(),
+                                    secret: card.state.secret.clone(),
+                                }
+                            }
+                            api_key_ui::ApiKeyStep::MasterPassword => {
+                                api_key_ui::ApiKeyCommand::MasterPassword(
+                                    card.state.password.clone(),
+                                )
+                            }
+                        };
+                        let _ = card.commands.send(command);
+                    }
+                    Some(api_key_ui::ApiKeyAction::Back) => {
+                        // Ends the worker and drops the session it holds.
+                        let _ = card.commands.send(api_key_ui::ApiKeyCommand::Abandon);
+                        api_key = None;
+                        // The card is rebuilt on the way back: the one that is
+                        // up may have been sitting on its own "signing in"
+                        // state since before the user came here.
+                        login = None;
+                        if let Next::Show(next) = advance(stage, Event::ApiKeyAbandoned) {
+                            stage = next;
+                        }
+                    }
+                    None => {}
                 }
             }
         }
@@ -2197,6 +2400,13 @@ where
                 );
                 let _ = frame;
             }
+            // Unreachable for the same reason, one step further along: this
+            // host builds no sign-in card and no code stage, so there is
+            // nothing here that could offer the API-key link either.
+            Stage::ApiKey => {
+                log::error!("this window reached the API-key stage, which it has no card for");
+                let _ = frame;
+            }
             Stage::Working => {
                 match loading_ui::draw_spinner_body(
                     ui,
@@ -2532,6 +2742,18 @@ where
                     log::error!(
                         "the warm launch window reached the second-factor stage, which it has \
                          no card for; closing so the startup recovery can run"
+                    );
+                    close_this_window(ui.ctx(), &mut closing);
+                }
+                let _ = frame;
+            }
+            // And one step further along again: no sign-in card means no link
+            // to the API-key stage, so nothing here can reach it.
+            Stage::ApiKey => {
+                if !closing.decided() {
+                    log::error!(
+                        "the warm launch window reached the API-key stage, which it has no \
+                         card for; closing so the startup recovery can run"
                     );
                     close_this_window(ui.ctx(), &mut closing);
                 }
@@ -2894,6 +3116,36 @@ mod transition_tests {
             "backing out returns to the card, not to a closed window: the user still has \
              an account to sign into"
         );
+    }
+
+    /// **The API-key card is reachable from BOTH places the design names**,
+    /// and it leaves the way a sign-in leaves.
+    #[test]
+    fn the_api_key_card_is_reached_from_the_card_and_from_the_blocked_factor() {
+        assert_eq!(advance(Stage::SignIn, Event::ApiKeyChosen), Next::Show(Stage::ApiKey));
+        assert_eq!(
+            advance(Stage::SecondFactor, Event::ApiKeyChosen),
+            Next::Show(Stage::ApiKey),
+            "a Duo account is told to use an API key, so the message must be able to get \
+             the user there"
+        );
+        assert_eq!(
+            advance(Stage::ApiKey, Event::ApiKeyDone),
+            Next::Show(Stage::Working),
+            "a finished API-key sign-in enters the spinner exactly as a password one does"
+        );
+        assert_eq!(
+            advance(Stage::ApiKey, Event::ApiKeyAbandoned),
+            Next::Show(Stage::SignIn),
+            "backing out returns to the card: the user still has an account to sign into"
+        );
+        assert_eq!(
+            advance(Stage::ApiKey, Event::SignedIn),
+            Next::Show(Stage::ApiKey),
+            "a stale SignedIn must not skip the key pair"
+        );
+        // Positive control: the table still moves for the events it owns.
+        assert_eq!(advance(Stage::ApiKey, Event::ApiKeyDone), Next::Show(Stage::Working));
     }
 
     /// The stage does not become a hole in the table. A `SignedIn` arriving

@@ -1309,8 +1309,12 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 71] = [
+        const OPENS_NO_WINDOW: [&str; 72] = [
             "accounts",
+            // The API-key sign-in stage. It draws into `app_window`'s one
+            // window, exactly as `second_factor_ui` and `login_ui`'s frame do
+            // -- it is a stage, not a surface. See `app_window::Stage::ApiKey`.
+            "api_key_ui",
             "app",
             // A pure matching function over vault items: it scores and
             // ranks the candidates for the account picker. No Win32, no

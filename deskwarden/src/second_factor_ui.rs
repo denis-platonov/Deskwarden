@@ -338,6 +338,11 @@ pub enum PromptAction {
     Submit(crate::rest::api::SecondFactorAnswer),
     /// Back to the master password.
     Back,
+    /// **The unsupported-only card's one way forward**: the personal API key
+    /// its own message names. Without it that message is a promise this app
+    /// does not keep -- it tells a Duo user to sign in with an API key, and
+    /// there is nowhere to type one. See [`crate::api_key_ui`].
+    UseApiKey,
 }
 
 /// Draws the code stage. Pure view: the caller owns the [`Prompt`] and
@@ -349,6 +354,11 @@ pub fn draw(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
         ui.add_space(8.0);
         ui.label(RichText::new(message).size(12.0).color(theme::TEXT_MUTED));
         ui.add_space(16.0);
+        // The message above names the API key and where to create it. This is
+        // the button that makes it true.
+        if ui.button(crate::api_key_ui::USE_API_KEY_LABEL).clicked() {
+            return Some(PromptAction::UseApiKey);
+        }
         return ui.button(BACK_LABEL).clicked().then_some(PromptAction::Back);
     }
 
@@ -920,4 +930,32 @@ mod tests {
         assert!(!prompt.busy, "and the answer's failure brings the card back");
     }
 
+    /// **The unsupported-only card now leads somewhere.** Piece 2's own
+    /// self-review named this: "If the API-key path does not land, Task 3's
+    /// message is a promise this app does not keep." This is the button that
+    /// keeps it.
+    #[test]
+    fn the_unsupported_only_card_offers_the_api_key_it_names() {
+        let mut duo = Prompt::new(vec![SecondFactor::Unsupported(2)]);
+        let texts = painted(&mut duo);
+        assert!(
+            says(&texts, "API key"),
+            "control: the message this button belongs to is still painted; got {texts:?}"
+        );
+        assert!(
+            says(&texts, crate::api_key_ui::USE_API_KEY_LABEL),
+            "the message tells the user to sign in with an API key and there must be a \
+             way to; got {texts:?}"
+        );
+
+        // Control on the other direction: a card that CAN be answered does not
+        // offer the escape hatch, so the presence above is about this account
+        // and not about a button painted on every card.
+        let mut totp = Prompt::new(vec![SecondFactor::Authenticator]);
+        let texts = painted(&mut totp);
+        assert!(
+            !says(&texts, crate::api_key_ui::USE_API_KEY_LABEL),
+            "an account with an authenticator app should use it; got {texts:?}"
+        );
+    }
 }

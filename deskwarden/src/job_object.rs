@@ -1355,12 +1355,12 @@ mod tests {
     const THREAD_SPAWN_SITES: &[(&str, usize)] = &[
         ("app.rs", 1),
         ("app_identity.rs", 1),
-        // Six. Five, then `run_recovery`'s: the recovery host starts a fresh
-        // readiness probe per attempt -- one when it opens, one per Retry --
-        // from a single site. On the frame thread any of them would freeze the
-        // window exactly where it is meant to be showing a spinner, which is
-        // the reason every other host here has a worker too.
-        ("app_window.rs", 6),
+        // Seven. Six, then the API-key stage's: `ApiKeyStage::start` spawns
+        // the worker that performs the grant and the unlock and blocks on a
+        // human between them. On the frame thread it would freeze the window
+        // for the length of two network round trips and a PBKDF2 derivation,
+        // which is the reason every other host here has a worker too.
+        ("app_window.rs", 7),
         ("breach.rs", 2),
         // One: the worker a `breach_scan` run starts. There are up to
         // `breach_scan::MAX_IN_FLIGHT` of them at a time, from this ONE site

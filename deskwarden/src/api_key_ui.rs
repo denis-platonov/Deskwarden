@@ -28,6 +28,8 @@
 //! taken elsewhere in this crate.
 
 use crate::rest::api::{Authenticated, Device, RestClient, RestError, Session};
+use crate::theme;
+use eframe::egui::{self, RichText};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Which of the two things the user is being asked for.
@@ -462,6 +464,115 @@ pub fn run_api_key_sign_in(
         }
     }
     None
+}
+
+pub const KEY_PAIR_TITLE: &str = "Sign in with an API key";
+pub const KEY_PAIR_HINT: &str = "Create a personal API key under Account settings \u{2192} \
+                                 Security \u{2192} Keys in the Bitwarden web vault, then paste \
+                                 both halves here.";
+pub const CLIENT_ID_LABEL: &str = "Client ID";
+pub const CLIENT_SECRET_LABEL: &str = "Client secret";
+pub const PASSWORD_TITLE: &str = "Master password";
+pub const PASSWORD_HINT: &str = "The API key signed you in. Your master password is what \
+                                 unlocks the vault \u{2014} the key cannot decrypt it.";
+pub const PASSWORD_LABEL: &str = "Master password";
+pub const CONTINUE_LABEL: &str = "Continue";
+pub const BACK_LABEL: &str = "Back";
+/// The label on both routes in: the sign-in card's link, and the button on
+/// `second_factor_ui`'s unsupported-only card. One constant, so the two places
+/// cannot drift into naming the same destination differently.
+pub const USE_API_KEY_LABEL: &str = "Sign in with an API key";
+
+/// What the user asked the API-key stage to do this frame. `None` from
+/// [`draw`] is the ordinary case: they are still typing.
+///
+/// No `Debug`: [`ApiKeyAction::Submit`] means "send what is in the form", and
+/// while it carries nothing itself, giving this a `Debug` is one refactor away
+/// from giving it a field.
+pub enum ApiKeyAction {
+    /// Submit whatever the current [`ApiKeyStep`] is asking for. The caller
+    /// reads `form.step` and builds the [`ApiKeyCommand`] -- the card does not,
+    /// because building it would mean copying the secret out of the buffer that
+    /// owns it.
+    Submit,
+    /// Back to the sign-in card.
+    Back,
+}
+
+/// Draws the API-key stage. Pure view: the caller owns the [`ApiKeyForm`] and
+/// performs the channel sends for whatever comes back, exactly as
+/// `login_ui::draw_login_window` and its caller are split.
+///
+/// **`&mut *form.secret` and not a copy.** [`Zeroizing`] is `DerefMut`, so the
+/// text edit writes straight into the buffer that owns the secret and there is
+/// never a second `String` holding it. That is not full containment and is not
+/// claimed as such: `TextEdit` grows the buffer as the user types, and a
+/// reallocation copies the old bytes to a new allocation and frees the old one
+/// **unwiped**. The `Drop` covers the final buffer, not every intermediate.
+/// `login_ui::LoginForm` has had exactly this exposure for the master password
+/// since it was written; the real fix is a fixed-capacity buffer, and it
+/// belongs to neither of them alone.
+pub fn draw(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
+    let mut asked = None;
+    let ready = match form.step {
+        ApiKeyStep::KeyPair => form.key_pair_ready(),
+        ApiKeyStep::MasterPassword => form.password_ready(),
+    };
+
+    match form.step {
+        ApiKeyStep::KeyPair => {
+            ui.label(RichText::new(KEY_PAIR_TITLE).size(17.0));
+            ui.add_space(6.0);
+            ui.label(RichText::new(KEY_PAIR_HINT).size(12.0).color(theme::TEXT_MUTED));
+            ui.add_space(14.0);
+
+            ui.label(RichText::new(CLIENT_ID_LABEL).size(12.0));
+            ui.add_enabled(
+                !form.busy,
+                egui::TextEdit::singleline(&mut form.client_id).desired_width(f32::INFINITY),
+            );
+            ui.add_space(10.0);
+
+            ui.label(RichText::new(CLIENT_SECRET_LABEL).size(12.0));
+            ui.add_enabled(
+                !form.busy,
+                egui::TextEdit::singleline(&mut *form.secret)
+                    .password(true)
+                    .desired_width(f32::INFINITY),
+            );
+        }
+        ApiKeyStep::MasterPassword => {
+            ui.label(RichText::new(PASSWORD_TITLE).size(17.0));
+            ui.add_space(6.0);
+            ui.label(RichText::new(PASSWORD_HINT).size(12.0).color(theme::TEXT_MUTED));
+            ui.add_space(14.0);
+
+            ui.label(RichText::new(PASSWORD_LABEL).size(12.0));
+            ui.add_enabled(
+                !form.busy,
+                egui::TextEdit::singleline(&mut *form.password)
+                    .password(true)
+                    .desired_width(f32::INFINITY),
+            );
+        }
+    }
+
+    if let Some(error) = form.error.as_deref() {
+        ui.add_space(6.0);
+        ui.label(RichText::new(error).size(11.0).color(theme::ERROR));
+    }
+
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        if ui.add_enabled(!form.busy && ready, egui::Button::new(CONTINUE_LABEL)).clicked() {
+            asked = Some(ApiKeyAction::Submit);
+        }
+        if ui.button(BACK_LABEL).clicked() {
+            asked = Some(ApiKeyAction::Back);
+        }
+    });
+
+    asked
 }
 
 #[cfg(test)]
@@ -1056,6 +1167,153 @@ mod tests {
             production.contains("log::warn!"),
             "this module logs nothing at all, so 'the secret is never logged' is a claim \
              about a file with no logging in it"
+        );
+    }
+    const WINDOW: egui::Vec2 = egui::vec2(420.0, 620.0);
+
+    fn raw_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, WINDOW)),
+            ..Default::default()
+        }
+    }
+
+    /// A context with `theme::apply`'s fonts actually live -- a font set
+    /// registered during a frame only becomes usable at the start of the next
+    /// one, so the throwaway frames are load-bearing. `second_factor_ui` and
+    /// `login_ui` keep their own copies of this for the same reason: it is six
+    /// lines, and the alternative is a `pub(crate)` promotion across a file
+    /// this module owes no dependency.
+    fn styled_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        ctx
+    }
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            // Everything else is geometry this module does not assert on.
+            _ => {}
+        }
+    }
+
+    /// Every string the card paints in one frame.
+    fn painted(form: &mut ApiKeyForm) -> Vec<String> {
+        let ctx = styled_context();
+        let output = ctx.run_ui(raw_input(), |ui| {
+            let _ = draw(ui, form);
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn says(texts: &[String], needle: &str) -> bool {
+        texts.iter().any(|t| t.contains(needle))
+    }
+
+    /// **The two stages are two screens.** The key-pair screen has no master
+    /// password box, and the password screen has no secret box -- which is the
+    /// design's second reason for the split: "it keeps a long-lived credential
+    /// and the master password off the screen at the same moment."
+    #[test]
+    fn each_stage_shows_only_its_own_fields() {
+        let mut form = ApiKeyForm::new();
+        let stage_one = painted(&mut form);
+        assert!(
+            says(&stage_one, CLIENT_ID_LABEL),
+            "control: the key-pair card painted its own labels; got {stage_one:?}"
+        );
+        assert!(says(&stage_one, CLIENT_SECRET_LABEL), "got {stage_one:?}");
+        assert!(
+            !says(&stage_one, PASSWORD_LABEL),
+            "the master password is not on the same screen as the client secret; \
+             got {stage_one:?}"
+        );
+
+        let mut form = ApiKeyForm::new();
+        form.step = ApiKeyStep::MasterPassword;
+        let stage_two = painted(&mut form);
+        assert!(
+            says(&stage_two, PASSWORD_LABEL),
+            "control: the password card painted its own label; got {stage_two:?}"
+        );
+        assert!(
+            !says(&stage_two, CLIENT_SECRET_LABEL),
+            "the secret is done with; leaving it on screen is a long-lived credential \
+             sitting in a text box for no reason. got {stage_two:?}"
+        );
+    }
+
+    /// **The password screen says why it is asking.** A user who just typed a
+    /// key that "signs them in" and is then asked for a password will read it
+    /// as a failure unless the card says otherwise.
+    #[test]
+    fn the_password_stage_explains_why_the_key_was_not_enough() {
+        let mut form = ApiKeyForm::new();
+        form.step = ApiKeyStep::MasterPassword;
+        let texts = painted(&mut form);
+        assert!(
+            says(&texts, "unlock") || says(&texts, "decrypt"),
+            "the hint must say what the password is FOR, which is the vault's contents; \
+             got {texts:?}"
+        );
+        assert!(
+            !says(&texts, "wrong") && !says(&texts, "failed"),
+            "nothing failed -- the key pair was accepted; got {texts:?}"
+        );
+    }
+
+    /// A refusal is painted where the user is looking, on the stage it sent
+    /// them to.
+    #[test]
+    fn the_refusal_is_painted_on_the_stage_it_returns_to() {
+        let mut form = ApiKeyForm::new();
+        form.step = ApiKeyStep::MasterPassword;
+        form.refused(ApiKeyRefusal::PasswordRejected);
+        let texts = painted(&mut form);
+        assert!(
+            says(&texts, message_for(ApiKeyRefusal::PasswordRejected)),
+            "got {texts:?}"
+        );
+        assert!(
+            says(&texts, PASSWORD_LABEL),
+            "control: it is painted on the PASSWORD stage, which is where that refusal \
+             returns to; got {texts:?}"
+        );
+
+        let mut form = ApiKeyForm::new();
+        form.refused(ApiKeyRefusal::KeyPairRejected);
+        let texts = painted(&mut form);
+        assert!(
+            says(&texts, message_for(ApiKeyRefusal::KeyPairRejected)),
+            "got {texts:?}"
+        );
+        assert!(
+            says(&texts, CLIENT_SECRET_LABEL),
+            "a rejected key pair returns to the key-pair stage with both fields on screen; \
+             got {texts:?}"
+        );
+
+        // Control on the whole harness: a form with no refusal paints neither
+        // message, so the two presences above are about `refused` and not
+        // about a card that paints every string it knows.
+        let mut clean = ApiKeyForm::new();
+        let texts = painted(&mut clean);
+        assert!(
+            !says(&texts, message_for(ApiKeyRefusal::KeyPairRejected))
+                && !says(&texts, message_for(ApiKeyRefusal::PasswordRejected)),
+            "control: a card with nothing wrong paints no refusal; got {texts:?}"
         );
     }
 }
