@@ -5975,14 +5975,7 @@ struct OpenUiWindow {
     /// Only ever logged. How long the user had the window up is the number
     /// that made the blocking version's cost visible, and it stays visible.
     opened_at: Instant,
-    /// Whether this window has hidden itself after a plain close, which
-    /// it does only when `keep_ui_loaded` is on.
-    ///
-    /// **A hidden window is still an OPEN window** for the one-window
-    /// rule: the next *Open Vault* shows this one rather than starting a
-    /// second process on the same vault. The flag says how to bring it
-    /// back, not whether it is there.
-    hidden: bool,
+
 }
 
 /// **The UI processes the daemon has open, one slot per surface.**
@@ -6019,7 +6012,18 @@ impl UiWindows {
     /// released its slot exactly as designed and the backend still would not
     /// stop, because this disjunct never went false.
     fn vault_is_in_use(&self) -> bool {
-        self.vault.as_ref().is_some_and(|open| !open.hidden)
+        self.vault.as_ref().is_some_and(|open| {
+            (deskwarden::vault_service::windows_env().is_held)(
+                &deskwarden::ui_show::visible_name(open.pid),
+            )
+        })
+    }
+
+    /// Whether the open window is hidden and must be SHOWN rather than
+    /// raised. The complement of [`vault_is_in_use`](Self::vault_is_in_use)
+    /// over a window that exists.
+    fn vault_is_hidden(&self) -> bool {
+        self.vault.is_some() && !self.vault_is_in_use()
     }
 
     /// **Answer a request for the vault window without blocking on it.**
@@ -6041,7 +6045,7 @@ impl UiWindows {
     /// (`pump_windows_messages`) and drains the hotkey, the foreground
     /// watcher and the tray besides.
     fn ask_for_the_vault_window(&mut self) -> bool {
-        let hidden = self.vault.as_ref().is_some_and(|open| open.hidden);
+        let hidden = self.vault_is_hidden();
         match deskwarden::ui_process::open_decision(self.vault_pid(), hidden) {
             deskwarden::ui_process::UiOpenDecision::FocusTheOpenOne { pid } => {
                 // **Not a second window.** With the loop live, the tray is
@@ -6072,9 +6076,9 @@ impl UiWindows {
                     log::info!(
                         "asked the hidden vault window (process {pid}) to show itself"
                     );
-                    if let Some(open) = self.vault.as_mut() {
-                        open.hidden = false;
-                    }
+                    // Nothing to write back: the child retakes the
+                    // visibility name as it shows itself, and that name
+                    // is the only record there is.
                     return true;
                 }
                 log::warn!(
@@ -6260,7 +6264,7 @@ fn spawn_the_vault_window_in_its_own_process() -> Option<OpenUiWindow> {
         plan.program.display(),
         plan.args.join(" ")
     );
-    Some(OpenUiWindow { child, pid, opened_at: Instant::now(), hidden: false })
+    Some(OpenUiWindow { child, pid, opened_at: Instant::now() })
 }
 
 /// **What a finished UI process reported**, from its exit code and its file.
@@ -10248,6 +10252,16 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         ));
         let slot_for_hidden = std::rc::Rc::clone(&slot);
         let slot_for_shown = std::rc::Rc::clone(&slot);
+        // **The name this process holds while its window is on screen.**
+        // Taken now, because the window is about to be; dropped on hide
+        // and retaken on show. It is how the DAEMON tells a hidden
+        // window from a showing one -- see `ui_show::visible_name` for
+        // why that is asked rather than remembered.
+        let visible = std::rc::Rc::new(std::cell::RefCell::new(
+            (env.hold)(&deskwarden::ui_show::visible_name(std::process::id())),
+        ));
+        let visible_for_hidden = std::rc::Rc::clone(&visible);
+        let visible_for_shown = std::rc::Rc::clone(&visible);
         vault_window::HideHooks {
             wait_for_show: std::sync::Arc::new(move || {
                 // `INFINITE`: there is nothing to poll for, and a timed
@@ -10261,6 +10275,12 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                 })
             }),
             on_hidden: Box::new(move || {
+                // **Dropped BEFORE the attachment**, so that a daemon
+                // looking between the two sees "not showing" and never
+                // "showing but detached" -- the order in which a
+                // half-hidden window would look like one that had lost
+                // its vault.
+                visible_for_hidden.borrow_mut().take();
                 if slot_for_hidden.borrow_mut().take().is_some() {
                     log::info!(
                         "released this window's vault attachment while hidden, so the \
@@ -10270,7 +10290,12 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
             }),
             on_shown: Box::new(move || {
                 let env = deskwarden::vault_service::windows_env();
+                // The attachment first this time, and the visibility
+                // second: the reverse of the hide, so that neither
+                // order ever shows a window that is not attached.
                 *slot_for_shown.borrow_mut() = deskwarden::vault_service::attach(&env);
+                *visible_for_shown.borrow_mut() =
+                    (env.hold)(&deskwarden::ui_show::visible_name(std::process::id()));
             }),
         }
     });

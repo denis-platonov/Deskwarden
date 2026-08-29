@@ -44,6 +44,32 @@ pub fn signal_name(pid: u32) -> String {
     format!(r"Local\Deskwarden-UI-Show-{pid}")
 }
 
+/// **The name a UI process holds while its window is ON SCREEN**, and drops
+/// while hidden.
+///
+/// This is how the daemon tells "a window exists" from "a window is showing",
+/// and it has to be asked rather than remembered. The daemon's first attempt
+/// stored the answer in a `hidden` flag on its own record of the child --
+/// which nothing ever set, because the child hides itself and the two
+/// processes share no memory. The flag read `false` for ever: `bw serve`
+/// stayed up behind a hidden window, and *Open Vault* raised a window that
+/// was not there.
+///
+/// A held name cannot go stale that way. The child holds it while visible and
+/// drops it on hide, and **Windows releases it if the process dies**, so a
+/// crashed window is indistinguishable from a closed one -- which is exactly
+/// right, because for this question it is one.
+///
+/// Deliberately a mutex rather than a second event: this is a STATE somebody
+/// asks about, not a message. [`crate::vault_service`]'s attachment slots are
+/// the same shape for the same reason, and this reuses their `hold`/`is_held`
+/// rather than opening kernel handles a second way -- that module's access
+/// right was wrong once already.
+#[must_use]
+pub fn visible_name(pid: u32) -> String {
+    format!(r"Local\Deskwarden-UI-Visible-{pid}")
+}
+
 /// A live handle to the event, closed when this is dropped.
 pub struct Signal(HANDLE);
 
@@ -198,5 +224,41 @@ mod tests {
     #[test]
     fn asking_a_process_that_has_no_signal_fails_cleanly() {
         assert!(!ask_to_show(&ShowEnv::production(), 0xFFFF_FFF0));
+    }
+
+    /// The visibility name is scoped and per-process for the same reasons the
+    /// show signal is, and is a DIFFERENT name -- one is a message, the other
+    /// a state, and a process holding the one it should be waiting on would
+    /// deadlock itself.
+    #[test]
+    fn the_visible_name_is_its_own_name() {
+        let name = visible_name(1234);
+        assert!(name.starts_with(r"Local\"), "not logon-session scoped: {name}");
+        assert!(name.contains("1234"), "not per-process: {name}");
+        assert_ne!(name, signal_name(1234), "the state and the message share a name");
+        assert_ne!(visible_name(1234), visible_name(1235));
+    }
+
+    /// **Held means visible, and the holding really is observable from
+    /// outside** -- which is the whole point, since the process that asks is
+    /// not the process that holds.
+    ///
+    /// Over the real kernel, through `vault_service`'s own `hold`/`is_held`,
+    /// because those are what production uses and a fake would only prove the
+    /// fake works.
+    #[test]
+    fn a_held_visibility_name_is_visible_to_another_asker() {
+        let env = crate::vault_service::windows_env();
+        let name = visible_name(std::process::id() ^ 0x7777);
+
+        assert!(!(env.is_held)(&name), "the name was held before anybody took it");
+        let held = (env.hold)(&name).expect("the name should be takeable");
+        assert!((env.is_held)(&name), "a held name does not read as held");
+        drop(held);
+        assert!(
+            !(env.is_held)(&name),
+            "the name stayed held after being dropped, so a hidden window would still read as \
+             showing and the backend would never stop behind it"
+        );
     }
 }
