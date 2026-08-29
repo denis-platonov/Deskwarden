@@ -120,6 +120,80 @@ impl ApiKeyForm {
     }
 }
 
+/// Why the API-key sign-in stopped.
+///
+/// Three variants and not one `String`, because the *behaviour* differs and
+/// not only the wording: each names a different stage to return to and a
+/// different set of fields to keep. A `String` error would put that decision
+/// in the caller, where nothing tests it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeyRefusal {
+    /// The grant said no: the id or the secret is wrong, or the key has been
+    /// rotated in the web vault. **Both fields are kept.**
+    KeyPairRejected,
+    /// The session is good and the key is not the problem: the master password
+    /// did not unwrap this account's user key. Stage 1 is not repeated.
+    PasswordRejected,
+    /// Neither call got an answer at all. **Not a rejected credential** --
+    /// nothing the user typed was refused. The same distinction
+    /// [`crate::rest::api::RestError::CodeNotSent`] makes for the email code.
+    Unreachable,
+}
+
+/// One line the user can act on, per refusal.
+///
+/// `&'static str` and not a formatted `String`, deliberately: a formatted
+/// message is a place a credential can be interpolated into, and these three
+/// are the only strings this feature ever shows a user about a failure.
+pub fn message_for(refusal: ApiKeyRefusal) -> &'static str {
+    match refusal {
+        ApiKeyRefusal::KeyPairRejected => {
+            "That API key wasn't accepted. Check the client id and client secret \u{2014} and \
+             if the key has been rotated in the web vault, create a new one under Account \
+             settings \u{2192} Security \u{2192} Keys."
+        }
+        ApiKeyRefusal::PasswordRejected => {
+            "That master password didn't unlock this account. The key pair is fine \u{2014} \
+             only the password needs retyping."
+        }
+        ApiKeyRefusal::Unreachable => {
+            "Couldn't reach the server. Check your connection \u{2014} and the server URL, if \
+             this is a self-hosted account."
+        }
+    }
+}
+
+impl ApiKeyForm {
+    /// Applies a refusal to the form: the message, the stage to return to, and
+    /// the fields to clear.
+    ///
+    /// **The whole of the design's error-state section is this one `match`**,
+    /// which is why it is here and not spread across the draw function and the
+    /// worker.
+    pub fn refused(&mut self, refusal: ApiKeyRefusal) {
+        self.busy = false;
+        self.error = Some(message_for(refusal).to_string());
+        match refusal {
+            // Back to stage 1, holding both fields: the user is likelier to
+            // have mistyped the short id than the pasted secret, and they can
+            // see both to tell.
+            ApiKeyRefusal::KeyPairRejected => {
+                self.step = ApiKeyStep::KeyPair;
+                self.password.zeroize();
+            }
+            // Stage 2 only. The session minted by stage 1 is still good and is
+            // still held by the worker.
+            ApiKeyRefusal::PasswordRejected => {
+                self.step = ApiKeyStep::MasterPassword;
+                self.password.zeroize();
+            }
+            // Nothing the user typed was refused, so nothing is cleared and
+            // nothing moves. The button comes back and they press it again.
+            ApiKeyRefusal::Unreachable => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +247,124 @@ mod tests {
             "b7d2ecc",
             "control: the secret survives the step change too, so the 'stage 1 is not              repeated' rule is about the STEP and not about lost fields"
         );
+    }
+    /// The three failures say three different things. A shared "That didn't
+    /// work" would tell a user whose Wi-Fi dropped to check a secret that is
+    /// correct.
+    #[test]
+    fn the_three_refusals_do_not_share_a_message() {
+        let key_pair = message_for(ApiKeyRefusal::KeyPairRejected);
+        let password = message_for(ApiKeyRefusal::PasswordRejected);
+        let unreachable = message_for(ApiKeyRefusal::Unreachable);
+
+        assert!(
+            key_pair.contains("API key") || key_pair.contains("client secret"),
+            "the key-pair failure must name the thing that was refused; got {key_pair:?}"
+        );
+        assert!(
+            key_pair.contains("rotated") || key_pair.contains("web vault"),
+            "a rotated key is the commonest cause and the only one with a fix the user can              act on; got {key_pair:?}"
+        );
+        assert!(password.contains("master password"), "got {password:?}");
+        assert!(
+            !password.contains("API key"),
+            "the password failure must not send the user back to a key that worked;              got {password:?}"
+        );
+        assert!(
+            unreachable.contains("reach") || unreachable.contains("connection"),
+            "got {unreachable:?}"
+        );
+        assert!(
+            !unreachable.contains("wrong") && !unreachable.contains("didn't work"),
+            "an unreachable server must not read as a rejected credential; got {unreachable:?}"
+        );
+
+        let all = [key_pair, password, unreachable];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two refusals share one message");
+            }
+        }
+    }
+
+    /// **A rejected key pair returns to stage 1 with BOTH fields kept.** This
+    /// is the behaviour the design exists to produce.
+    #[test]
+    fn a_rejected_key_pair_keeps_both_fields() {
+        let mut form = ApiKeyForm::new();
+        form.client_id.push_str("user.9f3c");
+        form.secret.push_str("b7d2ecc");
+        form.step = ApiKeyStep::MasterPassword;
+        form.busy = true;
+
+        form.refused(ApiKeyRefusal::KeyPairRejected);
+
+        assert_eq!(form.step, ApiKeyStep::KeyPair, "the key pair is what failed");
+        assert_eq!(form.client_id, "user.9f3c", "the id is kept");
+        assert_eq!(
+            form.secret.as_str(),
+            "b7d2ecc",
+            "and so is the secret -- retyping 64 characters because the id had a typo is              exactly what this design refuses to charge for"
+        );
+        assert!(!form.busy, "the buttons come back");
+        assert_eq!(
+            form.error.as_deref(),
+            Some(message_for(ApiKeyRefusal::KeyPairRejected))
+        );
+    }
+
+    /// **A rejected password returns to stage 2 only.** Stage 1 is not
+    /// repeated, because nothing about it failed -- the session is good.
+    #[test]
+    fn a_rejected_password_does_not_reask_for_the_key_pair() {
+        let mut form = ApiKeyForm::new();
+        form.client_id.push_str("user.9f3c");
+        form.secret.push_str("b7d2ecc");
+        form.step = ApiKeyStep::MasterPassword;
+        form.password.push_str("wrong-one");
+        form.busy = true;
+
+        form.refused(ApiKeyRefusal::PasswordRejected);
+
+        assert_eq!(
+            form.step,
+            ApiKeyStep::MasterPassword,
+            "the key pair worked; sending the user back to it would be a lie about what failed"
+        );
+        assert!(form.password.is_empty(), "the wrong password is gone from the box");
+        assert_eq!(
+            form.client_id, "user.9f3c",
+            "control: the key pair is still held, so a retry needs no re-entry"
+        );
+        assert_eq!(
+            form.error.as_deref(),
+            Some(message_for(ApiKeyRefusal::PasswordRejected))
+        );
+    }
+
+    /// An unreachable server changed nothing about what the user typed, so it
+    /// clears nothing and moves nothing.
+    #[test]
+    fn an_unreachable_server_touches_no_field_and_no_step() {
+        for step in [ApiKeyStep::KeyPair, ApiKeyStep::MasterPassword] {
+            let mut form = ApiKeyForm::new();
+            form.client_id.push_str("user.9f3c");
+            form.secret.push_str("b7d2ecc");
+            form.password.push_str("hunter2");
+            form.step = step;
+            form.busy = true;
+
+            form.refused(ApiKeyRefusal::Unreachable);
+
+            assert_eq!(form.step, step, "an unreachable server is not a wrong stage");
+            assert_eq!(form.client_id, "user.9f3c");
+            assert_eq!(form.secret.as_str(), "b7d2ecc");
+            assert_eq!(
+                form.password.as_str(),
+                "hunter2",
+                "nothing the user typed was refused, so nothing they typed is thrown away"
+            );
+            assert!(!form.busy, "control: the refusal was applied at all");
+        }
     }
 }
