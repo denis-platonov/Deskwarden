@@ -32,6 +32,23 @@ session through `api_key_grant` (`grant_type=client_credentials`).
 **Stage 2 -- the master password.** Prelogin for the KDF parameters, then
 `master_key`, which is what actually decrypts the vault.
 
+**What rejects a wrong password, which this design first failed to say.**
+`api_key_grant` never sees a password, so it cannot check one, and
+`master_key` is a key derivation function -- it turns any bytes into a key
+and returns `Err` only for unusable KDF *parameters* (`iterations == 0`).
+Neither of the two calls above fails on a wrong password. Left there, stage 2
+would always "succeed" and the user would reach a vault that decrypts to
+nothing, which is the exact failure this document calls worse than a refusal
+because it looks like success.
+
+The rejection is `VaultKeys::unwrap_from` (`rest/sync.rs:487`), which
+unwraps the account's protected user key with the derived key and answers
+`CryptoError::MacMismatch` when the password was wrong. That is not new
+machinery: it is the same check the ordinary password sign-in already makes,
+and `rest/crypto.rs:1655` already tests it with a deliberately wrong
+password. So stage 2 is prelogin, `master_key`, and **one sync**, and the
+sync is the part that says yes or no.
+
 **Both, always.** The API key authenticates and does not decrypt; that is
 precisely why `bw login --apikey` must be followed by `bw unlock`. A design
 that treated the key as a way to skip the password would produce an app that
