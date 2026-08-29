@@ -2468,6 +2468,26 @@ pub fn complete_second_factor<C>(
 /// from a password that did not open the vault is a key whose first sync
 /// fails -- and this app's answer to that is to ask again, which it would have
 /// just finished doing.
+/// **What a direct-REST sign-in returns where a `bw` sign-in returns a
+/// session token.**
+///
+/// There is no CLI session on that path and nothing asks for one: every
+/// consumer of the token -- `start_backend`, `try_start_backend`,
+/// `run_bw_sync` -- is a `bw`-path call that short-circuits on
+/// `BackendStart::NotSelected` when direct REST is selected.
+///
+/// **So why not the empty string?** Because emptiness is read as meaning
+/// rather than absence. `away_lock::locks_the_vault` is handed
+/// `!token.is_empty()` as *whether there is a session at all*, and a
+/// direct-REST account returning `""` would tell it there is none -- so
+/// walking away from an unlocked vault would stop locking it. A sign-in
+/// that succeeded has a session, and this is how it says so.
+///
+/// Deliberately not token-shaped: a real `bw` session is 88 base64
+/// characters, so if this ever reaches a `--session` argument the failure
+/// is immediate and obvious rather than a puzzling rejection.
+pub const DIRECT_REST_SESSION: &str = "direct-rest";
+
 fn authenticate_then_wipe(
     password: String,
     run_cli: impl FnOnce(&str) -> Result<String, String>,
@@ -2483,67 +2503,102 @@ fn authenticate_then_wipe(
     // `an_unwind_does_not_release_the_master_password_in_the_clear` was
     // retargeted onto.
     let password = Zeroizing::new(password);
-    let token = run_cli(&password);
 
-    if token.is_ok() {
-        enroll(&password);
-        if let Some(direct) = direct {
-            match (direct.second_factor.start)(
-                &direct.server_url,
-                &direct.email,
-                &direct.device_id,
-                password.as_bytes(),
-            ) {
-                // Straight into the sink, on this thread, without ever being
-                // bound to a name the window can reach.
-                Ok(crate::rest::api::LoginOutcome::Done(authenticated)) => {
-                    (direct.adopt)(authenticated)
-                }
-                // **The challenge is bound here and nowhere else.** It lives
-                // for the length of one call and is dropped before this arm
-                // ends; the window is told only what `SecondFactorRequest`
-                // carries. This is also why the plaintext's life got longer:
-                // `complete_second_factor` blocks on a human, and the
-                // `Zeroizing` above is what makes that safe on every exit.
-                Ok(crate::rest::api::LoginOutcome::NeedsSecondFactor(challenge)) => {
-                    match direct.prompt.as_ref().and_then(|prompt| {
-                        prompt.ask(SecondFactorRequest {
-                            providers: challenge.providers().to_vec(),
-                        })
-                    }) {
-                        Some((commands, report)) => {
-                            if let Some(authenticated) = complete_second_factor(
-                                &direct.second_factor,
-                                &challenge,
-                                &commands,
-                                &report,
-                            ) {
-                                (direct.adopt)(authenticated);
-                            }
-                        }
-                        // No stage to show it on, or the window declined to
-                        // open one -- the unsupported-only case. Logged and
-                        // not surfaced, for the reason the `Err` arm below is.
-                        None => log::info!(
+    // **The direct-REST account, and the CLI is not run at all.**
+    //
+    // `Some` here means `backend_policy::direct_rest_login` found
+    // `VaultBackendChoice::DirectRest` -- this account's vault is served by
+    // talking to the server, and `bw` is not part of it. It used to run
+    // anyway, and gate this whole block on its success, which had two
+    // consequences worth naming because both were reported as bugs:
+    //
+    //  * an account with a second factor could never sign in here at all.
+    //    `bw` cannot complete one non-interactively, so `run_cli` failed,
+    //    so the block below was skipped -- including the code prompt built
+    //    to answer exactly that. The prompt was unreachable in every
+    //    configuration: with `bw` present because it failed, and without it
+    //    because it failed.
+    //  * a machine with no `bw.exe` could not sign in to an account that
+    //    never needed one.
+    //
+    // **A failure on this arm is a failed sign-in**, not a warning. On the
+    // old ordering it could be logged and swallowed because the CLI had
+    // already succeeded and the user was signed in regardless. Here there
+    // is nothing else that succeeded, so swallowing it would leave a window
+    // reporting success over a vault that cannot be read.
+    if let Some(direct) = direct {
+        let authenticated = match (direct.second_factor.start)(
+            &direct.server_url,
+            &direct.email,
+            &direct.device_id,
+            password.as_bytes(),
+        ) {
+            // Straight into the sink below, without ever being bound to a
+            // name the window can reach.
+            Ok(crate::rest::api::LoginOutcome::Done(authenticated)) => Some(authenticated),
+            // **The challenge is bound here and nowhere else.** It lives for
+            // the length of this arm and is dropped at its end; the window is
+            // told only what `SecondFactorRequest` carries. This is also why
+            // the plaintext's life is long: `complete_second_factor` blocks on
+            // a human, and the `Zeroizing` above is what makes that safe on
+            // every exit.
+            Ok(crate::rest::api::LoginOutcome::NeedsSecondFactor(challenge)) => {
+                match direct.prompt.as_ref().and_then(|prompt| {
+                    prompt.ask(SecondFactorRequest { providers: challenge.providers().to_vec() })
+                }) {
+                    Some((commands, report)) => complete_second_factor(
+                        &direct.second_factor,
+                        &challenge,
+                        &commands,
+                        &report,
+                    ),
+                    // No stage to draw it on -- a host with no code card, or
+                    // an account whose only providers are ones this app cannot
+                    // complete. Both end the sign-in below; neither is a
+                    // reason to pretend it worked.
+                    None => {
+                        log::info!(
                             "the second factor was not completed: this window offered no \
                              prompt for the providers this account has"
-                        ),
+                        );
+                        None
                     }
                 }
-                // Logged and not surfaced: the `bw` sign-in succeeded, so the
-                // window is finished and the user is signed in. What notices
-                // there is no direct-REST login is the vault backend itself --
-                // an unfilled `LateBoundBackend` answers `Unauthorized`, which
-                // is this app's existing "sign in again" and is exactly the
-                // right answer here.
-                Err(e) => log::warn!("the direct-REST login could not be derived: {e}"),
             }
-        }
+            // Surfaced rather than logged away: see this arm's opening
+            // comment. Nothing else succeeded, so there is nothing to be
+            // signed in to.
+            Err(e) => {
+                log::warn!("the direct-REST sign-in failed: {e}");
+                return Err(e);
+            }
+        };
+
+        let Some(authenticated) = authenticated else {
+            return Err("the second factor was not completed".to_string());
+        };
+        (direct.adopt)(authenticated);
+        // **Enrolment runs on this arm too**, and it is not a `bw` thing --
+        // `hello::enroll_for` seals the password for quick unlock and knows
+        // nothing about which backend serves the vault. Losing it to this
+        // reshuffle would have turned quick unlock off for exactly the
+        // accounts this branch is for.
+        enroll(&password);
+        return Ok(DIRECT_REST_SESSION.to_string());
+    }
+
+    // **The `bw serve` account: unchanged, deliberately.** This is the
+    // default backend and the path every existing install is on, so it runs
+    // the CLI exactly as it always has and enrols on exactly the same
+    // condition.
+    let token = run_cli(&password);
+    if token.is_ok() {
+        enroll(&password);
     }
 
     // No `zeroize()` here: `password` is a `Zeroizing`, so the wipe happens on
     // the way out of this function whichever way it leaves -- including the
-    // three unwinds above, which a call here would not have covered.
+    // unwinds above, which a call here would not have covered.
     token
 }
 
@@ -9845,6 +9900,132 @@ pub(crate) mod password_lifetime_tests {
     /// The strings here are built by the caller BEFORE the watch is armed --
     /// this function only moves them -- so their own allocations are never
     /// what a measurement below is about.
+    /// **A direct-REST account does not run the CLI, and that is the whole
+    /// of the switch-over.**
+    ///
+    /// It used to. `authenticate_then_wipe` ran `bw` first and gated the
+    /// direct block on its success, which made two things impossible at
+    /// once: signing in on a machine with no `bw.exe`, and signing in to an
+    /// account with a second factor -- because `bw` cannot complete one
+    /// non-interactively, so it failed, so the code prompt built to answer
+    /// exactly that was never reached. The prompt was unreachable in every
+    /// configuration, with `bw` and without it.
+    #[test]
+    fn a_direct_rest_account_never_spawns_the_cli() {
+        let ran_cli = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&ran_cli);
+
+        let token = authenticate_then_wipe(
+            "correct horse battery staple".to_string(),
+            move |_password| {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok("a bw session token".to_string())
+            },
+            |_password| {},
+            Some(direct_rest(tidy_authenticate, &reached)),
+        );
+
+        assert!(
+            !ran_cli.load(std::sync::atomic::Ordering::SeqCst),
+            "the CLI was spawned for an account whose vault is served by talking to the \
+             server -- which is what made a machine without bw.exe unable to sign in"
+        );
+        assert!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            "control: the direct-REST login was not adopted either, so this test would \
+             pass against a function that simply does nothing"
+        );
+        assert_eq!(
+            token.as_deref(),
+            Ok(DIRECT_REST_SESSION),
+            "a direct-REST sign-in must report a session; `away_lock` reads an empty \
+             token as `there is no session` and would stop locking the vault"
+        );
+    }
+
+    /// **The control for the test above**: a `bw serve` account still runs
+    /// the CLI, on the same function, so the assertion up there is about
+    /// which arm was taken and not about a function that stopped spawning
+    /// anything at all.
+    #[test]
+    fn a_bw_serve_account_still_spawns_the_cli() {
+        let ran_cli = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&ran_cli);
+
+        let token = authenticate_then_wipe(
+            "correct horse battery staple".to_string(),
+            move |_password| {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok("a bw session token".to_string())
+            },
+            |_password| {},
+            None,
+        );
+
+        assert!(ran_cli.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(token.as_deref(), Ok("a bw session token"));
+    }
+
+    /// **A failed direct-REST sign-in fails the sign-in.**
+    ///
+    /// On the old ordering this was logged and swallowed, correctly: the CLI
+    /// had already succeeded and the user WAS signed in, so the only thing
+    /// missing was a derived key the backend would notice later. With the
+    /// CLI gone from this arm there is nothing else that succeeded, and
+    /// reporting success would put a window over a vault that cannot be read.
+    #[test]
+    fn a_failed_direct_rest_sign_in_is_not_reported_as_success() {
+        fn refuses(
+            _server_url: &str,
+            _email: &str,
+            _device_id: &str,
+            _password: &[u8],
+        ) -> Result<crate::rest::api::LoginOutcome, String> {
+            Err("401 Unauthorized at /identity/connect/token".to_string())
+        }
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let token = authenticate_then_wipe(
+            "correct horse battery staple".to_string(),
+            |_password| Ok("a bw session token".to_string()),
+            |_password| {},
+            Some(direct_rest(refuses, &reached)),
+        );
+
+        assert!(token.is_err(), "a refused direct-REST sign-in reported success: {token:?}");
+        assert!(
+            !reached.load(std::sync::atomic::Ordering::SeqCst),
+            "control: something was adopted despite the grant being refused"
+        );
+    }
+
+    /// **Quick unlock is enrolled on both arms.** `hello::enroll_for` seals
+    /// the master password and knows nothing about which backend serves the
+    /// vault; losing it to the reshuffle would have turned quick unlock off
+    /// for exactly the accounts the switch-over is for.
+    #[test]
+    fn windows_hello_is_enrolled_on_both_arms() {
+        for direct in [true, false] {
+            let enrolled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = std::sync::Arc::clone(&enrolled);
+            let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let _ = authenticate_then_wipe(
+                "correct horse battery staple".to_string(),
+                |_password| Ok("a bw session token".to_string()),
+                move |_password| seen.store(true, std::sync::atomic::Ordering::SeqCst),
+                direct.then(|| direct_rest(tidy_authenticate, &reached)),
+            );
+
+            assert!(
+                enrolled.load(std::sync::atomic::Ordering::SeqCst),
+                "quick unlock was not enrolled on the {} arm",
+                if direct { "direct-REST" } else { "bw serve" }
+            );
+        }
+    }
+
     fn direct_rest(
         start: StartLoginFn,
         reached: &std::sync::Arc<std::sync::atomic::AtomicBool>,
