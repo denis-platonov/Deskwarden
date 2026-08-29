@@ -969,6 +969,21 @@ mod tests {
         Device::windows_desktop("11111111-2222-3333-4444-555555555555", "TEST-PC")
     }
 
+    /// The fixture login, taken out of its outcome.
+    ///
+    /// The second-factor arm panics rather than being tolerated: a fixture
+    /// server that started asking for one would no longer be serving the
+    /// login these tests describe, and quietly skipping the test would be the
+    /// worst of the three possible answers.
+    fn fixture_login(client: &RestClient) -> Authenticated {
+        match client.authenticate(EMAIL, PASSWORD, &device()).expect("the fixture login") {
+            crate::rest::api::LoginOutcome::Done(authenticated) => authenticated,
+            crate::rest::api::LoginOutcome::NeedsSecondFactor(_) => {
+                panic!("the fixture server asked for a second factor")
+            }
+        }
+    }
+
     /// The 64 bytes of the user key every fixture vault is encrypted under.
     fn user_key_bytes() -> [u8; 64] {
         let mut bytes = [0u8; 64];
@@ -1122,8 +1137,7 @@ mod tests {
             .create();
 
         let client = RestClient::new(server.url());
-        let authenticated =
-            client.authenticate(EMAIL, PASSWORD, &device()).expect("the fixture login");
+        let authenticated = fixture_login(&client);
         (server, RestBackend::new(client, authenticated))
     }
 
@@ -1386,8 +1400,7 @@ mod tests {
             .create();
         server.mock("DELETE", "/api/folders/f1").with_status(200).expect(1).create();
         let client = RestClient::new(server.url());
-        let authenticated =
-            client.authenticate(EMAIL, PASSWORD, &device()).expect("the fixture login");
+        let authenticated = fixture_login(&client);
         let backend = RestBackend::new(client, authenticated);
         backend.delete_folder("f1").expect("the delete, with no sync behind it");
     }
@@ -1580,8 +1593,7 @@ mod tests {
             .expect(1)
             .create();
         let client = RestClient::new(server.url());
-        let authenticated =
-            client.authenticate(EMAIL, PASSWORD, &device()).expect("the fixture login");
+        let authenticated = fixture_login(&client);
         let backend = RestBackend::new(client, authenticated);
         backend.archive_item("live-1").expect("the archive, with no sync behind it");
     }
@@ -1900,8 +1912,7 @@ mod tests {
             .with_body(r#"{"access_token":"AT-1","refresh_token":"RT-1","expires_in":3600}"#)
             .create();
         let client = RestClient::new(server.url());
-        let authenticated =
-            client.authenticate(EMAIL, PASSWORD, &device()).expect("the fixture login");
+        let authenticated = fixture_login(&client);
         drop(grant);
 
         // Both the sync and the refresh that follows it say no.
@@ -2013,8 +2024,7 @@ mod tests {
         server.mock("GET", "/api/sync?excludeDomains=true").with_body(body).create();
 
         let client = RestClient::new(server.url());
-        let authenticated =
-            client.authenticate(EMAIL, PASSWORD, &device()).expect("the fixture login");
+        let authenticated = fixture_login(&client);
         let backend = RestBackend::new(client, authenticated);
         assert_eq!(backend.get_totp("no-totp").expect("no failure"), None);
     }
