@@ -169,6 +169,7 @@ pub mod user_key_store;
 /// lives here.
 pub mod vault_backend;
 pub mod vault_bridge;
+pub mod ui_show;
 pub mod vault_cache;
 pub mod vault_disk_cache;
 pub mod vault_export;
