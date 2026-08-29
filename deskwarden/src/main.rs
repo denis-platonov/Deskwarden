@@ -697,6 +697,39 @@ fn main() {
     // every boot. So the answer here is not a token but a question, and only
     // the `None` arm below opens `app_window`.
     let cached_session = match store.load() {
+        // **A direct-REST session, which `bw status` cannot speak for.**
+        //
+        // The token is `DIRECT_REST_SESSION` because this account signed in by
+        // talking to the server; there is no CLI session behind it, and asking
+        // `bw` about one would spawn a process that is not this account's
+        // backend -- and, on a machine with no `bw.exe`, is not there at all.
+        // Either way it would answer `not unlocked` and send a perfectly good
+        // session back through the sign-in card on every launch.
+        //
+        // What speaks for this session is the store that holds the key it
+        // decrypts with. A key that is present is a session; a key that is
+        // gone -- cleared on a lock, or never saved -- is not.
+        Some(token) if token == login_ui::DIRECT_REST_SESSION => {
+            match login.account.and_then(|(config_dir, account)| {
+                user_key_store::UserKeyStore::new(accounts::user_key_path_for(
+                    config_dir,
+                    &account.id,
+                ))
+                .load()
+            }) {
+                Some(_) => {
+                    log::info!("cached direct-REST session verified against the user key");
+                    Some(token)
+                }
+                None => {
+                    log::warn!(
+                        "a direct-REST session token has no user key behind it; \
+                         re-authenticating"
+                    );
+                    None
+                }
+            }
+        }
         Some(token) => match login_ui::check_bw_status_with_session(Some(&token)) {
             login_ui::BwStatus::Unlocked => {
                 log::info!("cached session token verified as unlocked");
