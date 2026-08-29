@@ -18673,6 +18673,60 @@ mod tests {
             );
         }
 
+        /// **Hiding is stricter than `Done`, and must stay stricter.**
+        ///
+        /// Two rules in two crate halves decide overlapping things.
+        /// `vault_follow_up` says what the DAEMON does next;
+        /// `ui_process::on_close` says whether the CHILD may stay alive
+        /// instead of reporting. If a result ever hid while its follow-up
+        /// was not `Done`, that outcome would be swallowed by a window
+        /// that never came home to deliver it.
+        ///
+        /// Walked over all 64 combinations of the six fields rather than a
+        /// few chosen ones, because the interesting case is the one nobody
+        /// thought to write down.
+        #[test]
+        fn the_hide_rule_is_stricter_than_done() {
+            let mut hides = 0;
+            for bits in 0u8..64 {
+                let crossing = deskwarden::ui_process::UiVaultResult {
+                    locked: bits & 1 != 0,
+                    needs_reauth: bits & 2 != 0,
+                    add_account: bits & 4 != 0,
+                    remove_account: bits & 8 != 0,
+                    switch_to: (bits & 16 != 0)
+                        .then(deskwarden::accounts::AccountId::generate),
+                    edited_settings: (bits & 32 != 0)
+                        .then(deskwarden::settings::Settings::default),
+                };
+                let window = VaultWindowResult {
+                    locked: crossing.locked,
+                    needs_reauth: crossing.needs_reauth,
+                    edited_settings: crossing.edited_settings.clone(),
+                    switch_to: crossing.switch_to.clone(),
+                    add_account: crossing.add_account,
+                    remove_account: crossing.remove_account,
+                    account_details: None,
+                };
+                if deskwarden::ui_process::on_close(true, &crossing)
+                    == deskwarden::ui_process::OnClose::Hide
+                {
+                    hides += 1;
+                    assert_eq!(
+                        vault_follow_up(&window),
+                        VaultFollowUp::Done,
+                        "a result that hides does not land on `Done`, so hiding it loses \
+                         whatever the daemon would have done about it: {crossing:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                hides, 1,
+                "control: exactly one of the 64 combinations should hide -- the empty one. \
+                 {hides} did, so this test is not pinning what it says it pins"
+            );
+        }
+
         /// The one ordering the branches have always had, now stated where it
         /// can be read: an account request outranks the lock recovery, because
         /// that recovery re-authenticates against the account being LEFT.
