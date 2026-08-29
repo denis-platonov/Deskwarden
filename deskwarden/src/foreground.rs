@@ -1309,7 +1309,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 69] = [
+        const OPENS_NO_WINDOW: [&str; 70] = [
             "accounts",
             "app",
             // A pure matching function over vault items: it scores and
@@ -1497,6 +1497,10 @@ mod tests {
             // snapshot the caller already holds into it. It draws nothing,
             // owns no window, and cannot ship.
             "test_vault",
+            // Test-only at its declaration in `lib.rs`, like `test_vault`: it
+            // hands out a `mockito` server under a gate. A TCP listener on
+            // loopback is not a window and raises nothing.
+            "test_http",
             "theme",
             "tray",
             // The About page's update flow: a state machine, two worker

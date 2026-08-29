@@ -474,7 +474,7 @@ mod tests {
 
     #[test]
     fn wait_for_vault_ready_returns_items_when_the_server_answers() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/list/object/items")
             .with_status(200)

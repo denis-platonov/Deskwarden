@@ -2472,7 +2472,7 @@ mod tests {
 
     #[test]
     fn populate_fills_the_snapshot_and_reads_come_from_it() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let items = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -2517,7 +2517,7 @@ mod tests {
         // so it lands strictly after the populate began fetching and
         // strictly before it tries to write -- the exact interleaving,
         // deterministically, with no sleeping.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = std::sync::Arc::new(cache_for(server.url()));
         let _items = server
             .mock("GET", "/list/object/items")
@@ -2556,7 +2556,7 @@ mod tests {
         // The guard must not be so eager that the ordinary path stops
         // working: with no `clear()` in flight the epoch is unchanged and
         // the snapshot is written exactly as before.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _items = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -2586,7 +2586,7 @@ mod tests {
         // `items` it's given rather than listing them again itself. If it
         // did, the request would hit this unmocked endpoint and the eventual
         // `unwrap()` below would fail.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let folders = server
             .mock("GET", "/list/object/folders")
             .with_status(200)
@@ -2629,7 +2629,7 @@ mod tests {
         // unchanged value and write the pre-clear account's items with
         // `populated = true`, which is the precise hole the epoch exists to
         // close.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _f = server
             .mock("GET", "/list/object/folders")
             .with_status(200)
@@ -2667,7 +2667,7 @@ mod tests {
     fn a_failed_populate_with_leaves_the_cache_unpopulated() {
         // Mirrors `populate`'s atomicity: if the folder fetch fails, the
         // given items must not be adopted into a half-formed snapshot.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _f = server.mock("GET", "/list/object/folders").with_status(500).create();
 
         let cache = cache_for(server.url());
@@ -2786,7 +2786,7 @@ mod tests {
 
     #[test]
     fn clear_empties_the_snapshot_so_idle_holds_no_vault_contents() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _i = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -2812,7 +2812,7 @@ mod tests {
 
     #[test]
     fn a_deleted_item_leaves_the_cache_immediately() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _i = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -2838,7 +2838,7 @@ mod tests {
     #[test]
     fn a_failed_write_leaves_the_cache_untouched() {
         // The cache must reflect the server, never an optimistic guess.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _i = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -2861,7 +2861,7 @@ mod tests {
 
     #[test]
     fn a_renamed_folder_updates_in_place() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _i = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -2936,7 +2936,7 @@ mod tests {
     /// not what the populate did.
     #[test]
     fn a_second_favourite_toggle_carries_the_revision_date_the_first_write_returned() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = cache_with_one_dated_item(&mut server);
         let first = echoing_item_put(&mut server, "/object/item/1", AFTER_FIRST_WRITE)
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
@@ -2997,7 +2997,7 @@ mod tests {
     /// not.
     #[test]
     fn a_second_edit_of_one_item_carries_the_revision_date_the_first_save_returned() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = cache_with_one_dated_item(&mut server);
         let first = echoing_item_put(&mut server, "/object/item/1", AFTER_FIRST_WRITE)
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
@@ -3035,7 +3035,7 @@ mod tests {
 
     #[test]
     fn set_app_match_updates_the_cached_item() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _i = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -3068,7 +3068,7 @@ mod tests {
 
     #[test]
     fn a_failed_set_app_match_leaves_the_cache_untouched() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _i = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -3125,7 +3125,7 @@ mod tests {
 
     #[test]
     fn moving_an_item_into_a_folder_updates_the_cached_item() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache_with_a_filed_item(&mut server);
         let _u = echoing_item_put(&mut server, "/object/item/2", NEXT_REVISION).create();
 
@@ -3145,7 +3145,7 @@ mod tests {
 
     #[test]
     fn unfiling_an_item_clears_the_cached_folder_id() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache_with_a_filed_item(&mut server);
         // The mock matches ONLY a body that states `folderId` as present and
         // null, so this also pins that the cache routes through
@@ -3177,7 +3177,7 @@ mod tests {
 
     #[test]
     fn a_failed_move_leaves_the_cache_untouched() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache_with_a_filed_item(&mut server);
         let _u = server.mock("PUT", "/object/item/1").with_status(500).create();
 
@@ -3202,7 +3202,7 @@ mod tests {
         // read from THIS snapshot (`sidebar::SidebarFilter::Favorites`), so a
         // write the server took and the cache did not means the star lights
         // up and the row the user just favourited is not in Favorites.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache_with_a_filed_item(&mut server);
         // The mock matches only a body that STATES `favorite: true`, so this
         // also pins the wire shape and not merely the in-memory result.
@@ -3233,7 +3233,7 @@ mod tests {
     #[test]
     fn un_favouriting_an_item_writes_through_too() {
         // Both directions, so the write-through cannot rot into "always sets".
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -3278,7 +3278,7 @@ mod tests {
         // paint a filled star from a failed write -- it holds only its
         // original item and an error. The snapshot must be untouched too, or
         // the sidebar would count a favourite the vault does not have.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache_with_a_filed_item(&mut server);
         let _u = server.mock("PUT", "/object/item/2").with_status(500).create();
 
@@ -3298,7 +3298,7 @@ mod tests {
     fn a_401_on_a_favourite_write_arrives_as_unauthorized() {
         // The re-auth path keys off this variant. A locked vault behind a
         // star click must not read as a generic failure.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache_with_a_filed_item(&mut server);
         let _u = server.mock("PUT", "/object/item/2").with_status(401).create();
         let item = cache.items().into_iter().find(|i| i.id == "2").unwrap();
@@ -3311,7 +3311,7 @@ mod tests {
         // pins, for this write: without the `note_item_write` in
         // `set_favorite`, a populate whose fetch predates the click silently
         // un-stars the item on the next sync.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache_with_a_filed_item(&mut server);
         let _u = echoing_item_put(&mut server, "/object/item/2", NEXT_REVISION).create();
 
@@ -3356,7 +3356,7 @@ mod tests {
         // fetch STARTS after the write is entitled to that fetch, and only a
         // mock could return pre-move data from it. The replay covers the
         // window between a populate's mark and its lock, and nothing else.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache_with_a_filed_item(&mut server);
         let _u = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION).create();
 
@@ -3406,7 +3406,7 @@ mod tests {
         // it is "still applicable, and here is the snapshot INCLUDING that
         // write". An epoch comparison alone answers the first half and
         // silently invites the caller to act on its own stale copy.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _i = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -3467,7 +3467,7 @@ mod tests {
         // -- reporting `Unpopulated` here would invite the populate that
         // cannot help. An `is_err` assertion passes under the swapped order
         // and so pinned nothing about the thing this test is named for.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _i = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -3505,8 +3505,8 @@ mod tests {
     }
 
     /// Every mock a populate plus a write to item 1 needs.
-    fn populating_server_with_a_writable_item() -> mockito::ServerGuard {
-        let mut server = mockito::Server::new();
+    fn populating_server_with_a_writable_item() -> crate::test_http::MockServer {
+        let mut server = crate::test_http::server();
         server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -3878,7 +3878,7 @@ mod tests {
         // the next `populate()` -- the bridge call still happens and its
         // result is still returned, but the local snapshot must not gain a
         // one-item "vault" from a stray write while locked.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let created_body = r#"{"success":true,"data":{"id":"3","name":"Gamma","fields":[],"type":1}}"#;
         let _c = server
             .mock("POST", "/object/item")
@@ -3898,7 +3898,7 @@ mod tests {
 
     /// Populates `cache` from the two standard mock lists, so a write test can
     /// assert on how the snapshot changed rather than on whether it exists.
-    fn a_populated_cache(server: &mut mockito::ServerGuard) -> VaultCache {
+    fn a_populated_cache(server: &mut crate::test_http::MockServer) -> VaultCache {
         server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -3929,7 +3929,7 @@ mod tests {
             (NewItem::identity("Me", IdentityData::default(), None), "6", "Me"),
             (NewItem::ssh_key("deploy", "PRIV", "PUB", "FP", None), "7", "deploy"),
         ] {
-            let mut server = mockito::Server::new();
+            let mut server = crate::test_http::server();
             let cache = a_populated_cache(&mut server);
             let _c = server
                 .mock("POST", "/object/item")
@@ -3952,7 +3952,7 @@ mod tests {
         // The other half of the test above: the snapshot must reflect a
         // create that SUCCEEDED, and only that one. A 500 leaves the list as
         // it was, so the window never shows an item the server does not have.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = a_populated_cache(&mut server);
         let _c = server.mock("POST", "/object/item").with_status(500).create();
 
@@ -4061,7 +4061,7 @@ mod tests {
         // handler, so it lands strictly after the populate began fetching and
         // strictly before it tries to write. Neither half of the pair may
         // survive it for the pre-clear era.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = std::sync::Arc::new(cache_for(server.url()));
         let _i = server
             .mock("GET", "/list/object/items")
@@ -4114,7 +4114,7 @@ mod tests {
         // own `self.lock()`, the statement immediately after the PUT returns.
         // The whole window is that response-return latency. See
         // `AppMatchWrite::ServerOnly`.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _f = server
             .mock("GET", "/list/object/folders")
             .with_status(200)
@@ -4165,7 +4165,7 @@ mod tests {
 
     #[test]
     fn set_app_match_reports_an_unpopulated_cache_as_server_only_too() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _u = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION).create();
         let cache = cache_for(server.url());
         let item = VaultItem {
@@ -4209,7 +4209,7 @@ mod tests {
 
     #[test]
     fn every_populate_that_reaches_the_write_back_gets_a_distinct_sequence_number() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _i = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -4291,7 +4291,7 @@ mod tests {
         // deleted rows into every live list in the app -- the sidebar, the
         // item list and `app::handle_match`'s autofill candidates all read
         // `items`.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
@@ -4318,7 +4318,7 @@ mod tests {
         // The half that must keep working. `list_trash_unless_superseded` is
         // a guard, and a guard that refused everything would satisfy the
         // test below on its own.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
@@ -4351,7 +4351,7 @@ mod tests {
         // the live load, and its doc explicitly refuses to rest on "every
         // production `clear` runs on the main thread". This path re-imposed
         // that reliance until the era check reached it too.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
@@ -4397,7 +4397,7 @@ mod tests {
         // surfacing it would put "Trash could not be read" in front of a user
         // whose session was merely replaced. The era check runs after the
         // fetch and swallows both outcomes alike.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
@@ -4418,7 +4418,7 @@ mod tests {
         // because the era moved. In the ordinary case the failure has to
         // reach the band, which is what `AuxLoadError` and the inline notice
         // are for.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
@@ -4437,7 +4437,7 @@ mod tests {
         // The two lists go through one private helper precisely so they
         // cannot come to disagree about when a result is still current --
         // asserted rather than left to the shared call.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _a = server
             .mock("GET", "/list/object/items")
@@ -4465,7 +4465,7 @@ mod tests {
 
     #[test]
     fn a_successful_restore_puts_the_item_into_the_live_snapshot() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
@@ -4497,7 +4497,7 @@ mod tests {
         // means the vault window's next ordinary edit PUTs a deletion date at
         // a backend whose handling of one is UNVERIFIED. Dropped at the one
         // place the item crosses from trash to live.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
@@ -4529,7 +4529,7 @@ mod tests {
         // The Trash view will report the failure and keep the row in the
         // trash, so a rejected restore must not come back `Ok` and must not
         // put the item into the live list.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
@@ -4614,7 +4614,7 @@ mod tests {
         // Reverting `current_revision_of` to `item.clone()` gives
         //     the snapshot kept the pre-restore revision token
         //     left: Some("2026-07-30T09:15:00.000Z")
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = mock_trash_with_a_token(&mut server);
         let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
@@ -4654,7 +4654,7 @@ mod tests {
         // Replacing `with_revision_date_from(item, &server)` with `server`
         // gives
         //     the read-back's whole copy was swapped in, not just its token
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = mock_trash_with_a_token(&mut server);
         let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
@@ -4682,7 +4682,7 @@ mod tests {
         //
         // Reverting `current_revision_of` to `item.clone()` gives
         //     favouriting a just-restored item was refused
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = mock_trash_with_a_token(&mut server);
         let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
@@ -4720,7 +4720,7 @@ mod tests {
         // Reverting `current_revision_of` to `item.clone()` makes this PASS
         // the write and fail here with
         //     the stale pre-restore token is still what this app sends
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = mock_trash_with_a_token(&mut server);
         let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
@@ -4751,7 +4751,7 @@ mod tests {
         //
         // Making `current_revision_of`'s `Err` arm return the error instead
         // gives a panic on the `unwrap` below, with the 501 in it.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = mock_trash_with_a_token(&mut server);
         let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
@@ -4785,7 +4785,7 @@ mod tests {
         // replayed window covers both the delete and the restore, which is
         // exactly the window a sync started before the user opened Trash
         // occupies.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _d = server.mock("DELETE", "/object/item/1").with_status(200).create();
         let _t = server
@@ -4839,7 +4839,7 @@ mod tests {
         // FETCH taken while the item was still live. Without it, the purge is
         // undone in the cache and the vault window shows a row for an item
         // that no longer exists anywhere.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let purge = server
             .mock("DELETE", "/object/item/1")
@@ -4872,7 +4872,7 @@ mod tests {
 
     #[test]
     fn a_failed_purge_leaves_the_snapshot_alone() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _p = server
             .mock("DELETE", "/object/item/1")
@@ -4916,7 +4916,7 @@ mod tests {
         // item list, the match engine and autofill -- the three consumers
         // whose exclusion this app gets for free precisely BECAUSE the
         // archive is a separate query.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         mock_archive_list(&mut server);
 
@@ -4931,7 +4931,7 @@ mod tests {
 
     #[test]
     fn archiving_an_item_takes_it_out_of_the_live_snapshot() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let archive = server.mock("POST", "/archive/item/1").with_status(200).expect(1).create();
 
@@ -4952,7 +4952,7 @@ mod tests {
         // Re-archiving an already-archived item is a 400 on the live backend,
         // so this path is reachable. Removing the item locally on a write the
         // server refused would hide an item the vault still has.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _a = server.mock("POST", "/archive/item/1").with_status(400).create();
 
@@ -4978,7 +4978,7 @@ mod tests {
         // and otherwise only when the user clicks the Sync pill -- which
         // `vault_window::mod`'s pill comment states outright. The window is
         // opened by those two events, and by nothing else.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _a = server.mock("POST", "/archive/item/1").with_status(200).create();
 
@@ -5005,7 +5005,7 @@ mod tests {
         // unarchive does not overwrite it `replay_writes` strips the item out
         // of EVERY later fetch -- the item comes back on the server and stays
         // invisible here for the rest of the session.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _a = server.mock("POST", "/archive/item/1").with_status(200).create();
         let unarchive = server.mock("POST", "/restore/item/1").with_status(200).expect(1).create();
@@ -5038,7 +5038,7 @@ mod tests {
 
     #[test]
     fn a_failed_unarchive_leaves_the_snapshot_alone() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         mock_archive_list(&mut server);
         let _u = server.mock("POST", "/restore/item/a1").with_status(500).create();
@@ -5063,7 +5063,7 @@ mod tests {
         // Reverting `current_revision_of` to `item.clone()` gives
         //     the snapshot kept the pre-unarchive revision token
         //     left: Some("2026-07-30T09:15:00.000Z")
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         server
             .mock("GET", "/list/object/items")
@@ -5117,7 +5117,7 @@ mod tests {
 
     #[test]
     fn a_401_on_an_archive_call_reaches_the_caller_as_unauthorized() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         server
             .mock("GET", "/list/object/items")
@@ -5138,7 +5138,7 @@ mod tests {
         // The cache must not flatten the variant the vault window's re-auth
         // path keys off. Nothing here maps errors -- they ride `?` -- so this
         // pins that nobody adds a `map_err` later.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
@@ -5164,7 +5164,7 @@ mod tests {
         // write through to, the vault has the item live, and any populate
         // brings it in. It must NOT be an error -- the server accepted the
         // restore -- and it must not mark the cache populated.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _r = server.mock("POST", "/restore/item/t1").with_status(200).create();
         let cache = cache_for(server.url());
         assert!(!cache.is_populated());
@@ -5255,7 +5255,7 @@ mod tests {
             "the probe cannot see an unwiped custom-field value, so this test proves nothing"
         );
 
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = cache_with_a_probe_custom_field(&mut server, "PIN", PROBE);
 
         // Read back through a borrow, not a clone, so the positive control
@@ -5299,7 +5299,7 @@ mod tests {
             "the probe is deaf, so neither assertion below means anything"
         );
 
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = cache_with_a_probe_custom_field(&mut server, PROBE, "4821");
 
         let snapshot = cache.items();
@@ -5470,7 +5470,7 @@ mod tests {
     #[test]
     fn a_successful_mutation_rewrites_the_file() {
         let dir = temp_dir_for("mutation-rewrites");
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _d = server
             .mock("DELETE", "/object/item/1")
             .with_status(200)

@@ -140,6 +140,12 @@ pub mod session_store;
 pub mod settings;
 pub mod signature;
 pub mod single_instance;
+/// The one place a `mockito` server is created, and the gate that keeps only
+/// one serving at a time -- the fix for the `os error 10054` resets that used
+/// to scatter across every module with a mock server. Test-only at the
+/// declaration, exactly like [`below_cut`], so nothing in it can ship.
+#[cfg(test)]
+pub mod test_http;
 /// Seeding a [`vault_cache::VaultCache`] for a test with no backend at all --
 /// no `mockito` server, no port, no round-trip. Test-only at the declaration,
 /// exactly like [`below_cut`], so nothing in it can ship.

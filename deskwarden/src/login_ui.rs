@@ -5499,7 +5499,7 @@ pub(crate) mod password_lifetime_tests {
         // codebase's signature failure committed by the instrument built to
         // catch it. And the crate's own house rule that fixtures are built
         // before the measured window arms manufactures exactly that shape:
-        // `vault_bridge`'s `mockito::Server::new()` and `breach::spawn_check`
+        // `vault_bridge`'s `crate::test_http::server()` and `breach::spawn_check`
         // both put a live worker behind the window that measures them.
         // `rv_a_leak_on_a_thread_that_predates_the_window_is_still_this_windows_leak`
         // is that leak, made deterministic.
@@ -5908,7 +5908,7 @@ pub(crate) mod password_lifetime_tests {
     /// BOTH entry points, with no panic. Clean, while blind, from the instrument
     /// this crate built to catch exactly that -- and reached by following the
     /// crate's own house rule that fixtures are built before the measured window
-    /// arms. `vault_bridge`'s `mockito::Server::new()` and `breach::spawn_check`
+    /// arms. `vault_bridge`'s `crate::test_http::server()` and `breach::spawn_check`
     /// are two live workers of that shape.
     ///
     /// This is that leak, made deterministic, in both of its forms: plaintext
@@ -5980,7 +5980,7 @@ pub(crate) mod password_lifetime_tests {
             }),
             "a worker that existed before this window opened freed the plaintext probe INSIDE \
              it, un-wiped, and the window reported clean. Every fixture this crate builds \
-             before arming -- `mockito::Server::new()`, `breach::spawn_check` -- leaves a \
+             before arming -- `crate::test_http::server()`, `breach::spawn_check` -- leaves a \
              worker of exactly that age behind the window that measures it"
         );
         joiner.join().expect("the outsider ran");

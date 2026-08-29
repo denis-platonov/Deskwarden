@@ -1400,6 +1400,13 @@ mod tests {
         // stops repainting, drags smear across it, and Windows offers to kill
         // it. The worker is what lets the prompt keep drawing its progress bar
         // while the password is with the CLI.
+        // One, and it is in a test rather than in anything that ships:
+        // `test_http`'s gate is only a gate if two threads racing it cannot
+        // both hold a mock server, and the only way to observe that is to run
+        // two threads at it. Counted here like every other site, because a
+        // census with a "tests don't count" rule in it is a rule-shaped
+        // exemption, which is precisely what this table exists instead of.
+        ("test_http.rs", 1),
         ("unlock_prompt.rs", 1),
         // Two: the About page's check, and its download-and-verify. Neither
         // can be a tick in a frame loop -- both are seconds-to-minutes of

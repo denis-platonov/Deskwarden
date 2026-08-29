@@ -6092,7 +6092,7 @@ mod fill_dispatch_tests {
         // sequence assertion below fails at random when an unrelated test
         // happens to be holding a `SequenceGuard`.
         let _serialised = crate::injector::sequence_test_lock();
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let totp = server
             .mock("GET", "/object/totp/item-1")
             .with_status(200)
@@ -6144,7 +6144,7 @@ mod fill_dispatch_tests {
         // sequence assertion below fails at random when an unrelated test
         // happens to be holding a `SequenceGuard`.
         let _serialised = crate::injector::sequence_test_lock();
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let totp = server.mock("GET", "/object/totp/item-1").with_status(200).create();
 
         let cache = crate::test_vault::cache_at(
@@ -6185,7 +6185,7 @@ mod fill_dispatch_tests {
     #[test]
     fn a_choice_that_needs_a_code_is_what_makes_the_fill_fetch_one() {
         let _serialised = crate::injector::sequence_test_lock();
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let totp = server
             .mock("GET", "/object/totp/item-1")
             .with_status(200)
@@ -6237,7 +6237,7 @@ mod fill_dispatch_tests {
     #[test]
     fn a_choice_that_needs_no_code_makes_no_totp_request() {
         let _serialised = crate::injector::sequence_test_lock();
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let totp = server.mock("GET", "/object/totp/item-1").with_status(200).create();
 
         let cache =
@@ -6290,7 +6290,7 @@ mod fill_dispatch_tests {
     #[test]
     fn a_cache_miss_during_a_fill_reaches_the_bridge_and_logs() {
         let _serialised = crate::injector::sequence_test_lock();
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let fetched = server
             .mock("GET", "/object/item/item-404")
             .with_status(200)

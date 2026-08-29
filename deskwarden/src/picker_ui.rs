@@ -1663,7 +1663,7 @@ mod tests {
         // with a healthy `bw serve`. `load_items_for_picker` must notice the
         // cache was never populated and go fetch instead of trusting the
         // empty snapshot.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _items = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -1780,7 +1780,7 @@ mod tests {
         // For the era this click belongs to there is no vault: the right
         // answer is `VaultLocked`, not a list and not "your vault doesn't have
         // any items yet".
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _items = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -1825,7 +1825,7 @@ mod tests {
         // mocked folders response handler, so it lands strictly after the
         // populate began fetching and strictly before it tries to write --
         // the same interleaving `vault_cache`'s own guard test uses.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = std::sync::Arc::new(cache_for(server.url()));
         let _items = server
             .mock("GET", "/list/object/items")
@@ -1863,7 +1863,7 @@ mod tests {
         // that was already knowable. `expect(0)` is the assertion: the fix is
         // a return type that separates "superseded" from "never fetched", not
         // a faster populate.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let items = server
             .mock("GET", "/list/object/items")
             .with_status(200)

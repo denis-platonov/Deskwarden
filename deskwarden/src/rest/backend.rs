@@ -1117,8 +1117,8 @@ mod tests {
     /// a suite nobody runs; `crypto.rs` pins the real cost separately. The
     /// server is returned so the caller can add write mocks to it and so it
     /// outlives the backend.
-    fn logged_in() -> (mockito::ServerGuard, RestBackend) {
-        let mut server = mockito::Server::new();
+    fn logged_in() -> (crate::test_http::MockServer, RestBackend) {
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":0,"kdfIterations":1}"#)
@@ -1389,7 +1389,7 @@ mod tests {
     /// connection.
     #[test]
     fn a_folder_delete_does_not_pay_for_a_sync() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":0,"kdfIterations":1}"#)
@@ -1574,7 +1574,7 @@ mod tests {
     /// the cost their docs claim and the other id-only writes beside them.
     #[test]
     fn the_archive_writes_do_not_pay_for_a_sync() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":0,"kdfIterations":1}"#)
@@ -1902,7 +1902,7 @@ mod tests {
     /// once and retries before giving up.
     #[test]
     fn an_expired_session_reaches_the_caller_as_unauthorized() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":0,"kdfIterations":1}"#)
@@ -2002,7 +2002,7 @@ mod tests {
     /// an error, and not an empty string a UI would render as a code.
     #[test]
     fn an_item_with_no_seed_answers_none_rather_than_failing() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":0,"kdfIterations":1}"#)

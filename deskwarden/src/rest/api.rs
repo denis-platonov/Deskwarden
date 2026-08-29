@@ -1816,7 +1816,7 @@ mod tests {
             r#"{"kdf":0,"kdfIterations":600000,"kdfMemory":null,"kdfParallelism":null}"#,
             r#"{"Kdf":0,"KdfIterations":600000,"KdfMemory":null,"KdfParallelism":null}"#,
         ] {
-            let mut server = mockito::Server::new();
+            let mut server = crate::test_http::server();
             let mock = server
                 .mock("POST", "/identity/accounts/prelogin")
                 .with_status(200)
@@ -1831,7 +1831,7 @@ mod tests {
 
     #[test]
     fn an_argon2id_prelogin_carries_its_memory_and_parallelism() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let mock = server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":1,"kdfIterations":3,"kdfMemory":64,"kdfParallelism":4}"#)
@@ -1848,7 +1848,7 @@ mod tests {
     /// login the user reads as a wrong master password.
     #[test]
     fn an_argon2id_prelogin_missing_its_parameters_is_refused_not_defaulted() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server.mock("POST", "/identity/accounts/prelogin").with_body(r#"{"kdf":1,"kdfIterations":3}"#).create();
         let err = RestClient::new(server.url()).prelogin("a@b.c").expect_err("no memory figure");
         assert_eq!(err, RestError::Parse("the Argon2id memory or parallelism"));
@@ -1856,7 +1856,7 @@ mod tests {
 
     #[test]
     fn an_unknown_kdf_number_is_refused_rather_than_treated_as_pbkdf2() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":7,"kdfIterations":3}"#)
@@ -1870,7 +1870,7 @@ mod tests {
     /// the fallback (or never fell back) reds.
     #[test]
     fn a_server_with_only_the_old_prelogin_route_still_logs_in() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let modern =
             server.mock("POST", "/identity/accounts/prelogin").with_status(404).create();
         let legacy = server
@@ -1887,7 +1887,7 @@ mod tests {
     /// A 400 from the modern path is a real answer and must be returned.
     #[test]
     fn a_prelogin_that_was_rejected_does_not_fall_through_to_the_old_route() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/accounts/prelogin")
             .with_status(400)
@@ -1911,7 +1911,7 @@ mod tests {
     /// body worth reading".
     #[test]
     fn the_password_grant_sends_every_field_the_server_requires() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let mock = server
             .mock("POST", "/identity/connect/token")
             .match_header("Auth-Email", "YUBiLmM")
@@ -1947,7 +1947,7 @@ mod tests {
     #[test]
     fn a_login_puts_the_derived_hash_on_the_wire_and_never_the_password() {
         const PASSWORD: &str = "correct horse battery staple";
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let pre = server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":0,"kdfIterations":5000}"#)
@@ -1982,7 +1982,7 @@ mod tests {
 
     #[test]
     fn a_wrong_password_is_its_own_error_and_not_a_bare_400() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_status(400)
@@ -2002,7 +2002,7 @@ mod tests {
     /// `invalid_grant` -- because the two need opposite things from the user.
     #[test]
     fn a_second_factor_requirement_is_recognised_and_kept_apart_from_a_wrong_password() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_status(400)
@@ -2176,7 +2176,7 @@ mod tests {
     /// right, and what comes back is something the caller can act on.
     #[test]
     fn a_second_factor_comes_back_as_a_challenge_rather_than_an_error() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (prelogin, grant) = challenge_mocks(&mut server);
         let outcome = RestClient::new(server.url())
             .authenticate("a@b.c", CHALLENGE_PASSWORD.as_bytes(), &device())
@@ -2208,7 +2208,7 @@ mod tests {
     /// second prelogin is how a re-derivation would show.
     #[test]
     fn the_retry_sends_every_field_the_first_grant_sent_plus_the_code() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (prelogin, first) = challenge_mocks(&mut server);
         let hash = expected_hash();
         // Matched on the second factor's own two fields *and* on all eight of
@@ -2263,7 +2263,7 @@ mod tests {
     /// replaces.
     #[test]
     fn a_rejected_code_can_be_answered_again_from_the_same_challenge() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (_prelogin, first) = challenge_mocks(&mut server);
         let rejected = server
             .mock("POST", "/identity/connect/token")
@@ -2314,7 +2314,7 @@ mod tests {
     /// The email provider's extra call, and the three values it carries.
     #[test]
     fn the_email_code_request_carries_the_email_the_hash_and_the_device() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (_prelogin, _grant) = challenge_mocks(&mut server);
         let send = server
             .mock("POST", "/api/two-factor/send-email-login")
@@ -2343,7 +2343,7 @@ mod tests {
     /// instructions to the user, so they may not be the same error.
     #[test]
     fn a_code_that_could_not_be_sent_is_not_a_rejected_code() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (_prelogin, _grant) = challenge_mocks(&mut server);
         server.mock("POST", "/api/two-factor/send-email-login").with_status(500).create();
         server
@@ -2405,7 +2405,7 @@ mod tests {
     /// quietly become the password grant with extra fields.
     #[test]
     fn the_api_key_grant_sends_client_credentials_and_no_password() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (seen, recorder) = body_recorder();
         let mock = server
             .mock("POST", "/identity/connect/token")
@@ -2500,7 +2500,7 @@ mod tests {
     /// docs' own worked example of an unhelpful error.
     #[test]
     fn a_missing_required_field_reaches_the_caller_with_the_servers_own_words() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_status(400)
@@ -2523,7 +2523,7 @@ mod tests {
     /// It must not panic and must not become an empty success.
     #[test]
     fn a_400_with_an_unreadable_body_is_still_a_rejection() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_status(400)
@@ -2540,7 +2540,7 @@ mod tests {
 
     #[test]
     fn a_grant_that_answers_without_an_access_token_is_a_parse_failure() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_body(r#"{"token_type":"Bearer","expires_in":3600}"#)
@@ -2557,7 +2557,7 @@ mod tests {
     /// this about the proactive path.
     #[test]
     fn a_token_that_is_already_expiring_is_refreshed_before_the_sync_is_attempted() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let grant = server
             .mock("POST", "/identity/connect/token")
             .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
@@ -2598,7 +2598,7 @@ mod tests {
     /// access token were dropped on the floor.
     #[test]
     fn a_401_mid_session_is_refreshed_once_and_the_retry_carries_the_new_token() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
@@ -2642,7 +2642,7 @@ mod tests {
     /// "exactly two attempts, ever".
     #[test]
     fn a_session_that_cannot_be_restored_gives_up_instead_of_looping() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
@@ -2680,7 +2680,7 @@ mod tests {
     /// a different one.
     #[test]
     fn a_refresh_that_is_itself_rejected_becomes_a_plain_re_authenticate() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
@@ -2713,7 +2713,7 @@ mod tests {
     /// with an empty field.
     #[test]
     fn a_session_with_no_refresh_token_says_so_instead_of_sending_an_empty_one() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_body(r#"{"access_token":"AT-1","expires_in":3600}"#)
@@ -2729,7 +2729,7 @@ mod tests {
     /// nobody stated.
     #[test]
     fn a_token_with_no_stated_lifetime_is_never_refreshed_proactively() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_body(r#"{"access_token":"AT-1","refresh_token":"RT-1"}"#)
@@ -2743,7 +2743,7 @@ mod tests {
 
     #[test]
     fn a_base_url_with_a_trailing_slash_does_not_produce_a_double_slash() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let mock = server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":0,"kdfIterations":1}"#)
@@ -2759,7 +2759,7 @@ mod tests {
     fn no_error_can_carry_a_credential() {
         const NEEDLES: [&str; 4] = ["AT-1", "RT-1", "HASH-VALUE", "master-password"];
 
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_body(token_body(3600))
@@ -2929,7 +2929,7 @@ mod tests {
     /// the bearer header, and a body carrying ciphertext and no plaintext.
     #[test]
     fn a_create_posts_the_encrypted_body_with_the_bearer_token() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let cipher = encrypted_cipher();
         let body = cipher.body().clone();
@@ -2965,7 +2965,7 @@ mod tests {
     /// the collection.
     #[test]
     fn an_update_puts_to_the_item_path_and_carries_only_ciphertext() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let cipher = encrypted_cipher();
         let body = cipher.body().clone();
@@ -2995,7 +2995,7 @@ mod tests {
     #[test]
     fn trash_restore_and_hard_delete_each_hit_their_own_route_with_an_empty_body() {
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let trash = server
             .mock("PUT", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/delete")
@@ -3062,7 +3062,7 @@ mod tests {
     /// folder.
     #[test]
     fn the_folder_writers_send_the_encrypted_name_to_their_own_routes() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let folder = encrypted_folder();
         let body = folder.body().clone();
@@ -3106,7 +3106,7 @@ mod tests {
     /// written down somewhere it can fail.
     #[test]
     fn a_folder_delete_takes_an_empty_body_as_a_success() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let deleted = server
             .mock("DELETE", "/api/folders/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
@@ -3131,7 +3131,7 @@ mod tests {
     /// being shared.
     #[test]
     fn a_401_on_a_folder_create_is_refreshed_once_and_the_retry_carries_the_new_token() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let folder = encrypted_folder();
         let body = folder.body().clone();
@@ -3168,7 +3168,7 @@ mod tests {
     /// socket is opened.
     #[test]
     fn an_unsafe_id_is_refused_by_the_folder_routes_too() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let folder = encrypted_folder();
         let any = server.mock("DELETE", mockito::Matcher::Any).with_status(200).create();
@@ -3192,7 +3192,7 @@ mod tests {
     /// same body. `expect(1)` on each mock is what pins "exactly once".
     #[test]
     fn a_401_on_a_create_is_refreshed_once_and_the_retry_carries_the_new_token() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let cipher = encrypted_cipher();
         let body = cipher.body().clone();
@@ -3229,7 +3229,7 @@ mod tests {
     /// 401 must not be hammered.
     #[test]
     fn a_write_against_a_dead_session_gives_up_instead_of_looping() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let refresh = server
             .mock("POST", "/identity/connect/token")
@@ -3259,7 +3259,7 @@ mod tests {
     /// point: the request must not happen at all.
     #[test]
     fn an_id_that_is_not_url_path_safe_is_refused_before_anything_is_sent() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let any = server.mock("DELETE", mockito::Matcher::Any).with_status(200).create();
         for bad in ["../../api/accounts", "a/b", "a?x=1", "", "a#b"] {
@@ -3277,7 +3277,7 @@ mod tests {
     /// on a write.
     #[test]
     fn a_write_with_an_expiring_token_refreshes_before_it_is_attempted() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
@@ -3327,7 +3327,7 @@ mod tests {
     /// that still sent `{"ids": [...]}` would fail here.
     #[test]
     fn the_archive_routes_put_the_id_in_the_path_and_are_two_distinct_routes() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let archive = server
@@ -3388,7 +3388,7 @@ mod tests {
             ),
         ];
         for (what, body) in bodies {
-            let mut server = mockito::Server::new();
+            let mut server = crate::test_http::server();
             let (client, mut session) = granted(&mut server);
             server
                 .mock("PUT", format!("/api/ciphers/{id}/archive").as_str())
@@ -3411,7 +3411,7 @@ mod tests {
     /// direction would pass every archive case and fail only this one.
     #[test]
     fn an_unarchive_whose_cipher_is_still_stamped_is_not_a_success() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         server
@@ -3448,7 +3448,7 @@ mod tests {
     /// whole updated cipher.
     #[test]
     fn an_archive_answered_with_no_body_at_all_is_not_a_success_either() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         server
@@ -3484,7 +3484,7 @@ mod tests {
     fn the_servers_own_refusals_on_the_archive_routes_are_kept_as_themselves() {
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         server
             .mock("PUT", format!("/api/ciphers/{id}/archive").as_str())
@@ -3503,7 +3503,7 @@ mod tests {
             }
         );
 
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         server
             .mock("PUT", format!("/api/ciphers/{id}/archive").as_str())
@@ -3517,7 +3517,7 @@ mod tests {
             "a 400 on an archive was not read as a rejection: {err:?}"
         );
 
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         server
             .mock("PUT", format!("/api/ciphers/{id}/unarchive").as_str())
@@ -3546,7 +3546,7 @@ mod tests {
             ),
             format!(r#"[{{"id":"{id}","archivedDate":"2022-03-01T00:00:00Z"}}]"#),
         ] {
-            let mut server = mockito::Server::new();
+            let mut server = crate::test_http::server();
             let (client, mut session) = granted(&mut server);
             server
                 .mock("PUT", format!("/api/ciphers/{id}/archive").as_str())
@@ -3577,7 +3577,7 @@ mod tests {
     fn a_cipher_that_carries_its_own_data_field_is_not_mistaken_for_an_envelope() {
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         for (suffix, stamp) in [("archive", r#""2022-03-01T00:00:00Z""#), ("unarchive", "null")] {
-            let mut server = mockito::Server::new();
+            let mut server = crate::test_http::server();
             let (client, mut session) = granted(&mut server);
             server
                 .mock("PUT", format!("/api/ciphers/{id}/{suffix}").as_str())
@@ -3605,7 +3605,7 @@ mod tests {
     #[test]
     fn a_real_data_envelope_is_still_unwrapped() {
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         server
             .mock("PUT", format!("/api/ciphers/{id}/archive").as_str())
@@ -3625,7 +3625,7 @@ mod tests {
     /// being hit is the assertion.
     #[test]
     fn an_unsafe_id_is_refused_by_the_archive_routes_too() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let any = server.mock("PUT", mockito::Matcher::Any).with_status(200).create();
         for bad in ["../../api/accounts", "a/b", "a?x=1", "", "a#b"] {
@@ -3649,7 +3649,7 @@ mod tests {
     /// look for this.
     #[test]
     fn a_401_on_an_archive_is_refreshed_once_and_retried() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let stale = server
@@ -3686,7 +3686,7 @@ mod tests {
     /// 400 in this module does -- and does not become a bare `Status(400)`.
     #[test]
     fn a_rejected_write_carries_the_servers_own_explanation() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         server
             .mock("POST", "/api/ciphers")

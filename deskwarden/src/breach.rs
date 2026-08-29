@@ -1231,7 +1231,7 @@ mod tests {
 
     #[test]
     fn a_present_suffix_over_the_wire_reports_breached() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/range/5BAA6")
             .with_status(200)
@@ -1253,7 +1253,7 @@ mod tests {
     /// mean all 35 characters were compared.
     #[test]
     fn an_absent_suffix_over_the_wire_reports_safe() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/range/5BAA6")
             .with_status(200)
@@ -1272,7 +1272,7 @@ mod tests {
 
     #[test]
     fn a_descriptive_user_agent_is_sent() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("GET", "/range/5BAA6")
             .match_header("user-agent", USER_AGENT)
@@ -1307,7 +1307,7 @@ mod tests {
     /// `Err(Malformed("zero count"))` did to every padded response.
     #[test]
     fn the_request_asks_for_hibps_own_padding_and_survives_the_answer() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("GET", "/range/5BAA6")
             .match_header("add-padding", "true")
@@ -1334,7 +1334,7 @@ mod tests {
     /// range: an all-decoy answer is `Safe`, not `Unavailable`.
     #[test]
     fn an_all_decoy_answer_over_the_wire_reports_safe() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/range/5BAA6")
             .with_status(200)
@@ -1501,7 +1501,7 @@ mod tests {
 
     #[test]
     fn a_500_reports_unavailable_not_safe() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/range/5BAA6").with_status(500).with_body(FIXTURE).create();
 
         let suffix = Zeroizing::new(NEAR_MISS_LAST.to_string());
@@ -1516,7 +1516,7 @@ mod tests {
 
     #[test]
     fn a_404_reports_unavailable_not_safe() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/range/5BAA6").with_status(404).with_body("").create();
 
         let suffix = Zeroizing::new(NEAR_MISS_LAST.to_string());
@@ -1531,7 +1531,7 @@ mod tests {
 
     #[test]
     fn a_200_with_an_empty_body_reports_unavailable_not_safe() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/range/5BAA6").with_status(200).with_body("").create();
 
         let suffix = Zeroizing::new(NEAR_MISS_LAST.to_string());
