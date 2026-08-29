@@ -1309,8 +1309,12 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 70] = [
+        const OPENS_NO_WINDOW: [&str; 73] = [
             "accounts",
+            // The API-key sign-in stage. It draws into `app_window`'s one
+            // window, exactly as `second_factor_ui` and `login_ui`'s frame do
+            // -- it is a stage, not a surface. See `app_window::Stage::ApiKey`.
+            "api_key_ui",
             "app",
             // A pure matching function over vault items: it scores and
             // ranks the candidates for the account picker. No Win32, no
@@ -1457,6 +1461,11 @@ mod tests {
             // something and the part that touches the OS are separate files so
             // that this one can stay windowless.
             "screen_capture",
+            // The second-factor card's state, copy and pure decisions. It
+            // draws into a `Ui` the one window hands it -- `app_window`'s
+            // `Stage::SecondFactor`, which is a stage of a window that already
+            // exists and is already raised. Nothing here opens one.
+            "second_factor_ui",
             // Builds the argument vector, the stdin JSON and the failure
             // classification for `bw send`. Pure data; the Sends screen that
             // will draw it is a later step and is not this module.
@@ -1497,6 +1506,10 @@ mod tests {
             // snapshot the caller already holds into it. It draws nothing,
             // owns no window, and cannot ship.
             "test_vault",
+            // Test-only at its declaration in `lib.rs`, like `test_vault`: it
+            // hands out a `mockito` server under a gate. A TCP listener on
+            // loopback is not a window and raises nothing.
+            "test_http",
             "theme",
             "tray",
             // The About page's update flow: a state machine, two worker

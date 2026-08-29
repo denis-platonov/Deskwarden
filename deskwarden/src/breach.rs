@@ -1222,7 +1222,7 @@ mod tests {
         assert!(small.contains("Change this password"), "{small}");
     }
 
-    // ---------------------------------------------------------- mockito seam
+    // -------------------------------------------------------- mock-server seam
 
     #[test]
     fn the_production_endpoint_is_the_https_range_api() {
@@ -1231,7 +1231,7 @@ mod tests {
 
     #[test]
     fn a_present_suffix_over_the_wire_reports_breached() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/range/5BAA6")
             .with_status(200)
@@ -1253,7 +1253,7 @@ mod tests {
     /// mean all 35 characters were compared.
     #[test]
     fn an_absent_suffix_over_the_wire_reports_safe() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/range/5BAA6")
             .with_status(200)
@@ -1272,7 +1272,7 @@ mod tests {
 
     #[test]
     fn a_descriptive_user_agent_is_sent() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("GET", "/range/5BAA6")
             .match_header("user-agent", USER_AGENT)
@@ -1307,7 +1307,7 @@ mod tests {
     /// `Err(Malformed("zero count"))` did to every padded response.
     #[test]
     fn the_request_asks_for_hibps_own_padding_and_survives_the_answer() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("GET", "/range/5BAA6")
             .match_header("add-padding", "true")
@@ -1334,7 +1334,7 @@ mod tests {
     /// range: an all-decoy answer is `Safe`, not `Unavailable`.
     #[test]
     fn an_all_decoy_answer_over_the_wire_reports_safe() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/range/5BAA6")
             .with_status(200)
@@ -1354,7 +1354,7 @@ mod tests {
     /// **The privacy claim, as a test.**
     ///
     /// Read off the literal request head this crate put on a socket -- not off
-    /// a mockito matcher, which can only tell you that something you already
+    /// a request matcher, which can only tell you that something you already
     /// named was present.
     ///
     /// The assertion is an **exact allowlist**, not a hunt for the secret. The
@@ -1401,6 +1401,18 @@ mod tests {
                 .as_bytes(),
             );
             let _ = stream.flush();
+            // Half-close and then read to EOF before dropping the socket.
+            // Dropping it straight after the write is a `closesocket` while
+            // the client's FIN has not arrived, which Winsock may complete
+            // ABORTIVELY -- an RST discards the response still in the send
+            // buffer and the client reads `os error 10054` instead of the
+            // fixture. That is not hypothetical here: this test failed that
+            // way once in three full `--lib` runs, as `Unavailable` where the
+            // assertion below wants `Breached`. See `test_http::graceful_close`
+            // for the same three-step close and the measurements behind it.
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let mut discard = [0u8; 256];
+            while stream.read(&mut discard).unwrap_or(0) > 0 {}
             String::from_utf8_lossy(&head).into_owned()
         });
 
@@ -1501,7 +1513,7 @@ mod tests {
 
     #[test]
     fn a_500_reports_unavailable_not_safe() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/range/5BAA6").with_status(500).with_body(FIXTURE).create();
 
         let suffix = Zeroizing::new(NEAR_MISS_LAST.to_string());
@@ -1516,7 +1528,7 @@ mod tests {
 
     #[test]
     fn a_404_reports_unavailable_not_safe() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/range/5BAA6").with_status(404).with_body("").create();
 
         let suffix = Zeroizing::new(NEAR_MISS_LAST.to_string());
@@ -1531,7 +1543,7 @@ mod tests {
 
     #[test]
     fn a_200_with_an_empty_body_reports_unavailable_not_safe() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/range/5BAA6").with_status(200).with_body("").create();
 
         let suffix = Zeroizing::new(NEAR_MISS_LAST.to_string());
@@ -2044,7 +2056,7 @@ mod tests {
         assert_eq!(
             password_prefix().as_str(),
             &PASSWORD_SHA1[..PREFIX_LEN],
-            "every mockito mock in this file is keyed on this path"
+            "every mock in this file is keyed on this path"
         );
         assert_eq!(password_prefix().as_str(), "5BAA6", "and that path is /range/5BAA6");
     }

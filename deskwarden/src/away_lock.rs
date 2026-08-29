@@ -37,12 +37,26 @@
 //! it, so [`away_event`] classifies it right there. The pump is the window
 //! procedure we already had.
 //!
-//! One consequence, stated rather than hidden: the pump does not run while a
-//! vault window is up, because that window runs its own nested `eframe` loop.
-//! In that state the idle auto-lock inside the vault window is what covers the
-//! user, which is the arrangement that already existed. This module covers the
-//! other state -- app in the tray, vault unlocked, no window -- where until now
-//! nothing did.
+//! One consequence, restated after the daemon/UI split changed it: the vault
+//! window runs in **its own process** (`deskwarden.exe --ui vault`), the
+//! daemon does not block on it, and this pump therefore runs the whole time
+//! that window is up. So [`locks_the_vault`]'s answer governs two things and
+//! not one -- the daemon's own session, and the second process holding a
+//! decrypted vault on screen. `main::lock_after_walking_away` acts on both,
+//! the second through `UiWindows::close_because_the_user_walked_away`.
+//!
+//! This paragraph used to say the opposite, and it was right at the time: the
+//! window was a nested `eframe` loop inside this process, nothing pumped
+//! while it ran, and the window's own idle auto-lock was all that covered the
+//! user. It is recorded here because a stale reassurance in this spot is
+//! exactly how a decrypted vault came to survive Win+L -- see
+//! `docs/superpowers/specs/2026-08-29-the-lock-closes-the-window-design.md`.
+//!
+//! The one state where the old paragraph still holds is the in-daemon
+//! fallback window, opened when `spawn_the_vault_window_in_its_own_process`
+//! could not start a process at all. That window is a nested loop, this pump
+//! does not run while it is up, and its own idle auto-lock is what covers the
+//! user there.
 //!
 //! ## What can be tested and what cannot
 //!
@@ -443,5 +457,44 @@ mod tests {
     fn a_process_with_no_helper_window_registers_nothing() {
         assert_eq!(pick_notification_window(&[]), None);
         assert_eq!(pick_notification_window(&[window(0x10, false, "Deskwarden")]), None);
+    }
+
+    /// **The module doc must not still claim the vault-window case is
+    /// somebody else's.**
+    ///
+    /// It said so, correctly, when the vault window ran a nested `eframe` loop
+    /// inside this process. Since the daemon/UI split the window is a separate
+    /// process, the daemon's loop pumps throughout, and this module's decision
+    /// governs that window too -- via
+    /// `main::lock_after_walking_away` -> `UiWindows::close_because_the_user_walked_away`.
+    /// A stale reassurance here is how the defect survived: a reader checking
+    /// whether the window was covered found a paragraph saying it was.
+    #[test]
+    fn the_module_doc_does_not_claim_the_pump_is_asleep_while_a_window_is_up() {
+        // **The module doc alone, unwrapped**, and both halves of that matter.
+        //
+        // Only the `//!` lines, because this test's own doc comment quotes the
+        // arrangement it is asserting about -- searched over the whole file,
+        // the control would be satisfied by the words directly above it and
+        // would prove nothing about the module doc at all.
+        //
+        // Unwrapped, because the stale sentence was broken across two `//!`
+        // lines: a raw substring search for it would have passed on the very
+        // text it exists to forbid. Both are the house defect class -- a test
+        // that passes because it never reached the thing it names.
+        let prose = include_str!("away_lock.rs")
+            .lines()
+            .map_while(|line| line.strip_prefix("//!"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let prose = prose.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            prose.contains("its own process"),
+            "control: the module doc must actually describe the arrangement it has -- the              vault window is a separate process and this module's decision reaches it"
+        );
+        assert!(
+            !prose.contains("the pump does not run while a vault window is up"),
+            "this sentence was true before the daemon/UI process split and is now the              reassurance that hid a security defect"
+        );
     }
 }

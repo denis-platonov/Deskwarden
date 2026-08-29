@@ -10,6 +10,7 @@
 //! integration tests.
 
 pub mod accounts;
+pub mod api_key_ui;
 pub mod app;
 pub mod app_candidates;
 pub mod app_identity;
@@ -114,6 +115,10 @@ pub mod scratch_window;
 /// The only OS-touching part of "scan a region of my screen"; everything
 /// downstream of it is a pure function.
 pub mod screen_capture;
+/// The second-factor prompt: the stage between the sign-in card and the
+/// spinner. Its state, its copy and its pure decisions -- and never a
+/// `Challenge`, which stays on the sign-in worker thread.
+pub mod second_factor_ui;
 pub mod send;
 /// Who may call what, for the local vault service: one pure function over a
 /// method, a path and a credential. Binds nothing, and speaks `bw serve`'s
@@ -140,6 +145,12 @@ pub mod session_store;
 pub mod settings;
 pub mod signature;
 pub mod single_instance;
+/// The one place a `mockito` server is created, and the gate that keeps only
+/// one serving at a time -- the fix for the `os error 10054` resets that used
+/// to scatter across every module with a mock server. Test-only at the
+/// declaration, exactly like [`below_cut`], so nothing in it can ship.
+#[cfg(test)]
+pub mod test_http;
 /// Seeding a [`vault_cache::VaultCache`] for a test with no backend at all --
 /// no `mockito` server, no port, no round-trip. Test-only at the declaration,
 /// exactly like [`below_cut`], so nothing in it can ship.

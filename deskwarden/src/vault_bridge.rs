@@ -944,7 +944,7 @@ pub fn with_revision_date_from(item: &VaultItem, source: &VaultItem) -> VaultIte
     adopted
 }
 
-/// A `mockito` PUT mock that answers the way `bw serve` really does: with the
+/// A PUT mock that answers the way `bw serve` really does: with the
 /// item the request carried, wrapped in the success envelope, and with
 /// `REVISION_DATE_KEY` advanced to `new_revision`.
 ///
@@ -956,16 +956,16 @@ pub fn with_revision_date_from(item: &VaultItem, source: &VaultItem) -> VaultIte
 /// rather than a bare `with_status(200)` for any write that succeeds.
 #[cfg(test)]
 pub fn echoing_item_put(
-    server: &mut mockito::Server,
+    server: &mut crate::test_http::Server,
     path: &str,
     new_revision: &'static str,
-) -> mockito::Mock {
+) -> crate::test_http::Mock {
     server
         .mock("PUT", path)
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body_from_request(move |req| {
-            let sent = req.body().expect("a PUT this app makes always carries a body");
+            let sent = req.body();
             let mut item: serde_json::Value =
                 serde_json::from_slice(sent).expect("this app's write bodies are JSON");
             if let Some(map) = item.as_object_mut() {
@@ -1943,7 +1943,7 @@ impl VaultBridge {
     /// which `bw serve` MERGES -- the item keeps its old folder and the
     /// un-file silently does nothing. [`folder_move_body`] states the key
     /// explicitly and carries the full reasoning; the failure it prevents was
-    /// watched, as a 501 from a mockito matcher that rejects the omitting
+    /// watched, as a 501 from a matcher that rejects the omitting
     /// body.
     ///
     /// Callers should reach this through [`crate::vault_cache::VaultCache`],
@@ -3294,7 +3294,7 @@ mod tests {
 
     #[test]
     fn list_items_parses_bw_serve_envelope() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let body = r#"{"success":true,"data":{"data":[
             {"id":"1","name":"Rockstar","fields":[]},
             {"id":"2","name":"Mabl","fields":[]}
@@ -3408,7 +3408,7 @@ mod tests {
 
         let source = include_str!("vault_bridge.rs");
         // Everything before the test module -- production code only, so a
-        // mockito `.post(` in a test fixture cannot be mistaken for a route.
+        // a mock `.post(` in a test fixture cannot be mistaken for a route.
         // Split on the module header rather than on `#[cfg(test)]`, which also
         // sits on a test-facing helper *inside* the production half and would
         // cut the impl block in two (found by this test failing with 0 routes,
@@ -3467,7 +3467,7 @@ mod tests {
 
     #[test]
     fn get_item_parses_a_single_item_envelope() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/object/item/abc")
             .with_status(200)
@@ -3489,7 +3489,7 @@ mod tests {
 
     #[test]
     fn get_item_reports_http_failure() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/object/item/missing")
             .with_status(404)
@@ -3508,7 +3508,7 @@ mod tests {
         // `list_items` (the call `VaultCache::populate` makes) as a
         // representative read and `update_item` as a representative write --
         // every other call site routes through the same `map_http_err`.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _items = server.mock("GET", "/list/object/items").with_status(401).create();
         let _update = server.mock("PUT", "/object/item/1").with_status(401).create();
 
@@ -3539,7 +3539,7 @@ mod tests {
         // 404, ...) must keep surfacing as the catch-all `Http` variant so
         // callers don't mistake an unrelated server error for a stale
         // session.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/list/object/items").with_status(500).create();
 
         let bridge = VaultBridge::new(server.url());
@@ -3678,7 +3678,7 @@ mod tests {
 
     #[test]
     fn list_folders_parses_bw_serve_envelope() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let body = r#"{"success":true,"data":{"data":[
             {"id":"f1","name":"Engineering"},
             {"id":"f2","name":"Personal"}
@@ -3717,7 +3717,7 @@ mod tests {
 
     #[test]
     fn create_folder_posts_and_parses_the_new_folder() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("POST", "/object/folder")
             .with_status(200)
@@ -3732,10 +3732,10 @@ mod tests {
 
     #[test]
     fn update_folder_puts_the_new_name_and_parses_the_result() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("PUT", "/object/folder/f3")
-            .match_body(mockito::Matcher::Json(serde_json::json!({ "name": "Renamed" })))
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({ "name": "Renamed" })))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"success":true,"data":{"id":"f3","name":"Renamed"}}"#)
@@ -3749,7 +3749,7 @@ mod tests {
 
     #[test]
     fn delete_folder_calls_the_delete_endpoint() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("DELETE", "/object/folder/f3").with_status(200).create();
         let bridge = VaultBridge::new(server.url());
         assert!(bridge.delete_folder("f3").is_ok());
@@ -4061,10 +4061,10 @@ mod tests {
 
     #[test]
     fn create_item_posts_a_login_shaped_payload() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("POST", "/object/item")
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "name": "New",
                 "type": 1,
                 "folderId": null,
@@ -4090,10 +4090,10 @@ mod tests {
     /// `notes` or into a custom field would not match and this would red.
     #[test]
     fn create_item_posts_an_imported_record_with_the_seed_in_the_logins_totp() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("POST", "/object/item")
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "name": "SAP Production",
                 "type": 1,
                 "folderId": null,
@@ -4158,10 +4158,10 @@ mod tests {
         // `username`/`password` keys at all (not `""`), so if `create_item`
         // regresses to sending them as empty strings this test fails with a
         // 501 from the unmatched mock rather than silently passing.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("POST", "/object/item")
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "name": "New",
                 "type": 1,
                 "folderId": null,
@@ -4179,10 +4179,10 @@ mod tests {
 
     #[test]
     fn create_item_posts_a_secure_note_shaped_payload() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("POST", "/object/item")
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "name": "Wifi",
                 "type": 2,
                 "folderId": null,
@@ -4201,10 +4201,10 @@ mod tests {
 
     #[test]
     fn create_item_posts_a_card_shaped_payload() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("POST", "/object/item")
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "name": "Visa",
                 "type": 3,
                 "folderId": "f1",
@@ -4229,10 +4229,10 @@ mod tests {
 
     #[test]
     fn create_item_posts_an_identity_shaped_payload() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("POST", "/object/item")
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "name": "Me",
                 "type": 4,
                 "folderId": null,
@@ -4258,10 +4258,10 @@ mod tests {
         // template endpoint: `{"type":5,"name":...,"sshKey":{privateKey,
         // publicKey, keyFingerprint}}` returned 200 (see
         // `.superpowers/sdd/item-shapes-capture.md`).
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("POST", "/object/item")
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "name": "deploy",
                 "type": 5,
                 "folderId": null,
@@ -4283,7 +4283,7 @@ mod tests {
 
     #[test]
     fn update_item_puts_the_full_item_state() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION).create();
         let bridge = VaultBridge::new(server.url());
         let item: VaultItem = serde_json::from_str(r#"{"id":"1","name":"A","fields":[]}"#).unwrap();
@@ -4305,11 +4305,11 @@ mod tests {
     fn moving_an_item_into_a_folder_puts_that_folders_id() {
         // `Matcher::Json` compares parsed `serde_json::Value`s, so this is an
         // assertion on the ACTUAL request body and not on the returned value:
-        // a body that differs in any key makes mockito answer 501, which
+        // a body that differs in any key makes the mock server answer 501, which
         // `unwrap` turns into a failure, and `assert` then reports the miss.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION)
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "id": "1",
                 "name": "A",
                 "fields": [],
@@ -4335,9 +4335,9 @@ mod tests {
         // equivalent. `the_unfile_body_carries_a_folder_id_key_that_is_present_and_null`
         // asserts the same property structurally, with a message that says
         // which of the two failed.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION)
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "id": "1",
                 "name": "A",
                 "fields": [],
@@ -4357,7 +4357,7 @@ mod tests {
         // The structural half of the test above, kept separate because the
         // two failures a reader needs to tell apart -- "the key is absent"
         // and "the key is present with the wrong value" -- are one 501 from
-        // mockito and two different messages here.
+        // the mock server and two different messages here.
         let body = folder_move_body(&an_item_in_folder(Some("f1")), None).unwrap();
         let map = body.as_object().expect("an item body is a JSON object");
         assert!(
@@ -4446,9 +4446,9 @@ mod tests {
         // `"folderId": null` on EVERY item PUT this app makes. This test fails
         // if anyone does that, and so does
         // `a_real_shaped_item_round_trips_with_every_observed_key`.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION)
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "id": "1",
                 "name": "A",
                 "fields": [],
@@ -4466,7 +4466,7 @@ mod tests {
     fn a_failed_move_is_reported_rather_than_swallowed() {
         // The vault window reverts the dragged row on `Err`, so a move that
         // the server rejected must not come back `Ok`.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("PUT", "/object/item/1").with_status(500).create();
         let bridge = VaultBridge::new(server.url());
         assert!(bridge.move_item_to_folder(&an_item_in_folder(Some("f1")), None).is_err());
@@ -4493,7 +4493,7 @@ mod tests {
 
     #[test]
     fn delete_item_calls_the_delete_endpoint() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("DELETE", "/object/item/1").with_status(200).create();
         let bridge = VaultBridge::new(server.url());
         assert!(bridge.delete_item("1").is_ok());
@@ -4501,7 +4501,7 @@ mod tests {
 
     #[test]
     fn get_totp_returns_the_current_code() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/object/totp/1")
             .with_status(200)
@@ -4516,7 +4516,7 @@ mod tests {
     fn get_totp_returns_none_when_the_item_has_no_totp() {
         // bw serve answers a 400 for an item with no TOTP secret configured --
         // that's an expected "no code", not a real error.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/object/totp/2").with_status(400).create();
         let bridge = VaultBridge::new(server.url());
         assert_eq!(bridge.get_totp("2").unwrap(), None);
@@ -4529,7 +4529,7 @@ mod tests {
         // "no TOTP configured" bucket as a genuine 400 -- otherwise a code
         // that should be re-authenticated for instead reads as an item that
         // simply has no TOTP secret, and goes silently blank.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/object/totp/3").with_status(401).create();
         let bridge = VaultBridge::new(server.url());
         assert!(matches!(bridge.get_totp("3"), Err(VaultError::Unauthorized)));
@@ -4544,7 +4544,7 @@ mod tests {
         // an item that was never TOTP-enabled: the row silently vanished,
         // nothing was logged, and a failure-streak flag elsewhere reset as
         // though the poll had succeeded.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/object/totp/4").with_status(500).create();
         let bridge = VaultBridge::new(server.url());
         assert!(matches!(bridge.get_totp("4"), Err(VaultError::Http(_))));
@@ -4578,12 +4578,12 @@ mod tests {
         // be caught by looking at what comes back: the response parses fine
         // and the Trash view shows 1654 live items. `Matcher::Exact` on the
         // query string is what makes this bite: it rejects an absent query, a
-        // renamed parameter and an extra one, each as a mockito 501 that turns
+        // renamed parameter and an extra one, each as a 501 that turns
         // the `unwrap` below into a failure.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(a_trashed_item_body())
@@ -4606,10 +4606,10 @@ mod tests {
         // acquiring `trash=true` (every item in the app becoming a trashed
         // one) rather than `list_trash` losing it. `Matcher::Missing` matches
         // only a request with no query string.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Missing)
+            .match_query(crate::test_http::Matcher::Missing)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"success":true,"data":{"data":[{"id":"1","name":"A","fields":[]}]}}"#)
@@ -4629,12 +4629,12 @@ mod tests {
         // IGNORED, answering 200 with the entire live vault. So the wrong
         // spelling parses fine and fills the Archive row with every item the
         // user has. `Matcher::Exact` rejects an absent query, that spelling,
-        // and an extra parameter, each as a mockito 501 that fails the
+        // and an extra parameter, each as a 501 that fails the
         // `unwrap` below.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("archived=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -4657,9 +4657,9 @@ mod tests {
     #[test]
     fn archiving_an_item_posts_to_the_archive_endpoint() {
         // Another path shape of its own (`/archive/item/{id}`, not
-        // `/object/item/{id}`), so mockito answering only that exact POST is
+        // `/object/item/{id}`), so the server answering only that exact POST is
         // the test.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server.mock("POST", "/archive/item/a1").with_status(200).expect(1).create();
 
         let bridge = VaultBridge::new(server.url());
@@ -4680,7 +4680,7 @@ mod tests {
         // is the regression this exists to catch. The two calls are then
         // asserted to be indistinguishable on the wire -- that is the claim
         // the doc makes, and it would otherwise be only a comment.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server.mock("POST", "/restore/item/a1").with_status(200).expect(2).create();
 
         let bridge = VaultBridge::new(server.url());
@@ -4694,10 +4694,10 @@ mod tests {
         // Same rule as the trash calls: the window's re-auth path keys off
         // `Unauthorized`, so a locked vault must not reach the Archive row as
         // a generic failure.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _list = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("archived=true".into()))
             .with_status(401)
             .create();
         let _archive = server.mock("POST", "/archive/item/a1").with_status(401).create();
@@ -4714,7 +4714,7 @@ mod tests {
         // Re-POSTing `/archive` on an already-archived item is a 400 on the
         // live backend. If that arrived as `Ok(())` the window would move the
         // item out of its live list on a write that never happened.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _archive = server.mock("POST", "/archive/item/a1").with_status(400).create();
 
         let bridge = VaultBridge::new(server.url());
@@ -4724,9 +4724,9 @@ mod tests {
     #[test]
     fn restore_item_posts_to_the_restore_endpoint() {
         // A different path shape from every other item call in this file, so
-        // the path itself is the thing under test: mockito only answers a POST
+        // the path itself is the thing under test: the server only answers a POST
         // to exactly `/restore/item/t1`, and anything else is a 501.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("POST", "/restore/item/t1")
             .with_status(200)
@@ -4746,10 +4746,10 @@ mod tests {
         // nothing, and the user's "delete forever" silently does not happen.
         // Nothing about the response distinguishes the two, so the query
         // string is asserted directly.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("DELETE", "/object/item/t1")
-            .match_query(mockito::Matcher::Exact("permanent=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("permanent=true".into()))
             .with_status(200)
             .expect(1)
             .create();
@@ -4765,10 +4765,10 @@ mod tests {
         // `permanent=true` leaking onto the ordinary delete path would turn
         // every "Delete" in the app into an unrecoverable purge, with the item
         // never reaching the trash the user expects to find it in.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("DELETE", "/object/item/1")
-            .match_query(mockito::Matcher::Missing)
+            .match_query(crate::test_http::Matcher::Missing)
             .with_status(200)
             .expect(1)
             .create();
@@ -4785,16 +4785,16 @@ mod tests {
         // failure -- a Trash view that reports "something went wrong" for a
         // locked vault is the `get_totp` defect (recorded above) in a new
         // place.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _list = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(401)
             .create();
         let _restore = server.mock("POST", "/restore/item/t1").with_status(401).create();
         let _purge = server
             .mock("DELETE", "/object/item/t1")
-            .match_query(mockito::Matcher::Exact("permanent=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("permanent=true".into()))
             .with_status(401)
             .create();
 
@@ -4806,7 +4806,7 @@ mod tests {
 
     #[test]
     fn a_non_401_failure_on_a_trash_call_stays_a_plain_http_error() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _restore = server.mock("POST", "/restore/item/t1").with_status(500).create();
         let bridge = VaultBridge::new(server.url());
         assert!(matches!(bridge.restore_item("t1"), Err(VaultError::Http(_))));
@@ -5162,10 +5162,10 @@ mod tests {
         // (`-u`, `-l`, `-n`, `-s`, `-p`, `-c`) are commander aliases that
         // exist only on the argv parser; the serve route never sees them, so
         // `?u=true` would be ignored and the class silently dropped.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("GET", "/generate")
-            .match_query(mockito::Matcher::Exact(
+            .match_query(crate::test_http::Matcher::Exact(
                 "length=20&uppercase=true&lowercase=true&number=true&special=true\
                  &minNumber=1&minSpecial=1&ambiguous=true"
                     .into(),
@@ -5191,10 +5191,10 @@ mod tests {
         // (`convertBooleanOption(passedOptions?.passphrase) ? "passphrase" :
         // "password"`), so the omission is not an error anywhere, it is a
         // different kind of secret than the user asked for.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("GET", "/generate")
-            .match_query(mockito::Matcher::Exact(
+            .match_query(crate::test_http::Matcher::Exact(
                 "passphrase=true&words=4&separator=-&capitalize=true&includeNumber=true".into(),
             ))
             .with_status(200)
@@ -5259,16 +5259,16 @@ mod tests {
         // Same rule as every other call in this file: a locked vault must
         // reach the re-auth path, not a generic "something went wrong" beside
         // a password box.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         // `Matcher::Any` is stated rather than left to the default, and it
-        // has to be: mockito 1.x defaults a mock's query matcher to
+        // has to be: a mock's query matcher defaults to
         // "no query string at all", so a mock declared without this answers
         // **501** to the query-carrying request under test -- which arrives
         // as `Http`, and would have made this test claim the 401 mapping was
         // broken when it was not. Watched, not assumed.
         let _m = server
             .mock("GET", "/generate")
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(401)
             .create();
         let bridge = VaultBridge::new(server.url());
@@ -5280,10 +5280,10 @@ mod tests {
 
     #[test]
     fn a_non_401_generator_failure_stays_a_plain_http_error() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/generate")
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(500)
             .create();
         let bridge = VaultBridge::new(server.url());
@@ -5299,10 +5299,10 @@ mod tests {
         // `/object/totp/{id}` does. A bare `{"success":true,"data":"pw"}` is
         // what a naive reading of the route would expect, and taking it would
         // mean this call had quietly stopped matching the backend.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/generate")
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"success":true,"data":"pw"}"#)
@@ -5320,10 +5320,10 @@ mod tests {
         // query unescaped would split into extra parameters, and the route
         // would read the fragments as options rather than fail -- so what is
         // pinned is that the value survives as ONE parameter.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let m = server
             .mock("GET", "/generate")
-            .match_query(mockito::Matcher::UrlEncoded("separator".into(), "&".into()))
+            .match_query(crate::test_http::Matcher::UrlEncoded("separator".into(), "&".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(a_generated_body("a&b&c&d"))
@@ -5388,7 +5388,7 @@ mod tests {
     /// UTF-16 widening) is invisible to this instrument, exactly as it is to
     /// the crate's other probe tests. It says nothing about the transport
     /// buffers beyond attributing them, nothing about blocks freed after the
-    /// last window closes, and nothing about the copy `mockito` holds, which
+    /// last window closes, and nothing about the copy the mock server holds, which
     /// is the server's.
     #[test]
     fn generate_hands_back_a_password_that_does_not_reach_the_allocator_in_the_clear() {
@@ -5406,10 +5406,10 @@ mod tests {
              allocator, so every verdict below means nothing"
         );
 
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/generate")
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(a_generated_body(PROBE))

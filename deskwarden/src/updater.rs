@@ -1483,7 +1483,7 @@ mod tests {
     ///
     /// The LIST endpoint, not `/releases/latest`: the panel shows every
     /// release the user skipped, so one release's worth of response is no
-    /// longer what the check reads. mockito matches the path and leaves the
+    /// longer what the check reads. The mock matches the path and leaves the
     /// query to `Matcher::Any`, so the `?per_page=` is not restated here.
     const RELEASES_PATH: &str = "/repos/denis-platonov/deskwarden/releases";
 
@@ -1500,7 +1500,7 @@ mod tests {
 
     #[test]
     fn reports_a_newer_release_as_available() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let body = r#"{
             "tag_name": "v1.2.0",
             "assets": [
@@ -1509,7 +1509,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -1544,7 +1544,7 @@ mod tests {
     /// exact prose the mock served.
     #[test]
     fn the_release_notes_come_back_with_the_version_from_the_one_response() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let body = r#"{
             "tag_name": "v1.2.0",
             "body": "Fixed\n- the overlay no longer lies",
@@ -1554,7 +1554,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -1633,10 +1633,10 @@ mod tests {
 
     /// Serves `releases` from the list endpoint and runs the check.
     fn check_against(releases: &[String], current: &str) -> Result<Option<ReleaseInfo>, String> {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(format!("[{}]", releases.join(",")))
             .create();
@@ -1809,10 +1809,10 @@ mod tests {
     /// passing.
     #[test]
     fn the_check_asks_for_exactly_one_page_of_a_stated_size() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::UrlEncoded(
+            .match_query(crate::test_http::Matcher::UrlEncoded(
                 "per_page".into(),
                 RELEASES_PER_PAGE.to_string(),
             ))
@@ -2185,7 +2185,7 @@ mod tests {
         // Task 6's release workflow publishes both a bare `deskwarden.exe` and
         // a `*-installer.exe`. This test pins the selection logic to picking
         // the installer specifically, regardless of asset order.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let body = r#"{
             "tag_name": "v1.2.0",
             "assets": [
@@ -2195,7 +2195,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -2228,7 +2228,7 @@ mod tests {
     /// to make that true is here, before anything is downloaded.
     #[test]
     fn a_release_whose_installer_has_no_digest_is_refused_rather_than_offered() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let body = r#"{
             "tag_name": "v1.2.0",
             "assets": [
@@ -2237,7 +2237,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -2271,7 +2271,7 @@ mod tests {
             // Empty.
             String::new(),
         ] {
-            let mut server = mockito::Server::new();
+            let mut server = crate::test_http::server();
             let body = format!(
                 r#"{{"tag_name": "v1.2.0", "assets": [{{"name": "deskwarden-installer.exe",
                    "browser_download_url": "https://example.com/i-installer.exe",
@@ -2279,7 +2279,7 @@ mod tests {
             );
             let _m = server
                 .mock("GET", RELEASES_PATH)
-                .match_query(mockito::Matcher::Any)
+                .match_query(crate::test_http::Matcher::Any)
                 .with_status(200)
                 .with_body(release_list(&body))
                 .create();
@@ -2376,12 +2376,12 @@ mod tests {
     /// **The download pass refuses and DELETES an installer whose bytes are
     /// not the ones the release published.**
     ///
-    /// Served over a real socket by `mockito`, so the bytes travel the same
+    /// Served over a real socket by [`crate::test_http`], so the bytes travel the same
     /// path a real download does. The pair below is one server response apart:
     /// same code, same fixture size, different digest on the release.
     #[test]
     fn a_download_whose_digest_does_not_match_is_deleted_and_refused() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/deskwarden-9.9.9-installer.exe")
             .with_status(200)
@@ -2422,7 +2422,7 @@ mod tests {
     /// replaced.
     #[test]
     fn a_download_whose_digest_matches_is_kept_and_its_path_returned() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/deskwarden-9.9.9-installer.exe")
             .with_status(200)
@@ -2452,7 +2452,7 @@ mod tests {
 
     #[test]
     fn reports_no_update_when_current_version_is_latest() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let body = r#"{
             "tag_name": "v1.1.0",
             "assets": [
@@ -2461,7 +2461,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -2475,7 +2475,7 @@ mod tests {
 
     #[test]
     fn reports_no_update_when_current_version_is_newer() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let body = r#"{
             "tag_name": "v1.0.0",
             "assets": [
@@ -2484,7 +2484,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -2561,11 +2561,11 @@ mod tests {
 
     #[test]
     fn errors_when_no_installer_asset_is_present() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let body = r#"{"tag_name": "v1.2.0", "assets": []}"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();

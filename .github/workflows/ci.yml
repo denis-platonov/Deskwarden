@@ -22,22 +22,173 @@ name: CI
 on:
   push:
     branches: ["main"]
+    # A README, a screenshot or a spec cannot change whether the crate
+    # compiles, so they do not get the four-job matrix. Between 21:19 and
+    # 22:10 on 2026-08-28 six documentation commits each paid for tests, a
+    # coverage run, a Mesa download plus an eleven-surface screenshot walk,
+    # and a per-commit `cargo check`. None of it could have found anything.
+    #
+    # Stated as paths-ignore rather than a paths allowlist on purpose: an
+    # allowlist silently stops running when somebody adds a new source
+    # directory, and a CI that quietly stops guarding is worse than one that
+    # runs too often.
+    #
+    # `.github/**` is deliberately NOT ignored -- a change to this file must
+    # run this file.
+    #
+    # THE TRAP, and read it before turning on branch protection. A run
+    # skipped by paths-ignore does not report a status AT ALL; it is not a
+    # green one. If any job here is made a REQUIRED STATUS CHECK, every
+    # documentation-only pull request will sit forever waiting on a check
+    # that will never arrive, and no amount of re-running fixes it. The
+    # documented remedy is a companion workflow with the INVERSE filter
+    # (`paths:` where this says `paths-ignore:`) declaring jobs of exactly
+    # these four names whose only step is `run: 'true'`, so the required
+    # names always report. It is deliberately not added here: two workflows
+    # exposing the same four check names, with nothing yet requiring them,
+    # is its own confusion. Add it at the same time as branch protection,
+    # not before. See docs/ci-and-actions-minutes.md §4.1.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
   pull_request:
     branches: ["main"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+  # Manual runs can pick the runner. Default false, so nothing changes
+  # unless somebody deliberately asks for the local machine. See the
+  # "runner" job below -- and the security note above it -- before using it.
+  workflow_dispatch:
+    inputs:
+      self_hosted:
+        description: "Run on the self-hosted Windows runner"
+        type: boolean
+        default: false
 
-# A superseded run is wasted money and a misleading red. Keep the newest per
-# ref and cancel the rest -- except on main, where each push's history is
-# checked on its own and cancelling would leave a range unverified.
+# A superseded run is wasted time and a misleading red. Keep the newest per
+# ref and cancel the rest.
+#
+# On main, one group PER COMMIT, and `cancel-in-progress: false` was NOT
+# enough. The runs prove it: 33212017060, 33213431791, 33214469055 and
+# 33040707278 are all `cancelled` on main with ZERO jobs -- they were evicted
+# while still pending, because a concurrency group replaces the run waiting
+# in it when a newer one arrives. cancel-in-progress governs RUNNING jobs
+# only, so the flag was doing exactly what it says and still losing runs.
+#
+# That is a correctness bug, not just waste. The `compiles` job walks
+# `github.event.before..HEAD`; when push A's run is evicted while pending,
+# push B's run starts from A's tip, so A's commits are checked by neither --
+# and that happens precisely during a rapid burst, which is when a broken
+# intermediate commit is most likely. It is the exact guarantee the header of
+# this file says the job exists to provide.
+#
+# Keying on the SHA gives each push to main its own group, so nothing queues
+# behind anything and nothing can be evicted. The cost is that several main
+# runs may execute in parallel during a burst; this repository is public, so
+# GitHub bills none of it. See docs/ci-and-actions-minutes.md §4.3.
 concurrency:
-  group: ci-${{ github.ref }}
+  # Folded onto one line before GitHub sees it: every continuation below is
+  # at the same indent as the first, so YAML joins them with spaces rather
+  # than keeping the newlines inside the `${{ }}`.
+  group: >-
+    ci-${{ github.ref }}-${{ github.ref == 'refs/heads/main'
+    && github.sha || 'ref' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # One place that decides which machine the four Windows jobs land on, so
+  # they cannot drift apart. It emits a JSON `runs-on` value -- either the
+  # string "windows-latest" or the array ["self-hosted","windows"] -- which
+  # each job passes through `fromJSON`, because `runs-on` needs one shape or
+  # the other and an expression can only return a string.
+  #
+  # A job rather than a workflow-level `env:`: the `env` context is NOT
+  # readable from a job-level `runs-on` (the contexts available there are
+  # github, needs, strategy, matrix, vars and inputs), so the tidier-looking
+  # version silently resolves to nothing and every job fails to schedule.
+  # One free Linux job-minute buys an expression that is unambiguously valid.
+  #
+  # ---------------------------------------------------------------------
+  # SECURITY. READ THIS BEFORE REGISTERING A RUNNER. IT IS NOT OPTIONAL.
+  # ---------------------------------------------------------------------
+  #
+  # Deskwarden is a PUBLIC repository and it is a CREDENTIAL TOOL. Anyone on
+  # the internet can open a pull request against it. A self-hosted runner is
+  # not a disposable VM -- it is somebody's actual Windows machine, running
+  # as their user, with their filesystem, their network, their SSH keys and,
+  # on the machine this app is developed on, a real Bitwarden session. A job
+  # that reaches it executes a stranger's code there and keeps whatever that
+  # code leaves behind. GitHub states plainly that self-hosted runners
+  # "should only be used for private repositories" for this reason:
+  # https://docs.github.com/en/actions/how-tos/manage-runners/self-hosted-runners/manage-access
+  #
+  # What makes the switch below safe BY CONSTRUCTION, and what must stay
+  # true of it:
+  #
+  #   1. `inputs.self_hosted` exists only for workflow_dispatch. It is unset
+  #      for push and pull_request, and the check below additionally demands
+  #      `github.event_name == 'workflow_dispatch'`. A fork pull request
+  #      therefore cannot reach the runner no matter what its author writes
+  #      in the PR -- there is no field in a pull_request payload that feeds
+  #      this expression.
+  #   2. workflow_dispatch can only be fired by an account with write access
+  #      to this repository. A stranger cannot start such a run at all.
+  #
+  # Do NOT later "simplify" this into a condition a pull request can
+  # influence -- an `if` on a label, a branch name, a commit message or a PR
+  # title -- because every one of those is attacker-controlled.
+  #
+  # Before enabling it, ALL of the following must be true, and none of them
+  # can be done from this file:
+  #
+  #   * The runner is registered at REPOSITORY scope, not account scope. An
+  #     account-level runner is reachable by every repository the owner
+  #     owns, including a public one created later without thinking.
+  #   * It runs in a VM or a throwaway Windows account -- never on the
+  #     workstation holding a real vault.
+  #   * Settings -> Actions -> General -> "Fork pull request workflows" is
+  #     set to require approval for all external contributors. Belt and
+  #     braces behind (1), and worth setting even if no runner ever exists.
+  #
+  # Until a runner is actually registered this switch is inert: nothing is
+  # listening on those labels, so a dispatched run with the box ticked
+  # simply queues. That is the intended default state. The minutes it would
+  # save are minutes GitHub does not charge for on a public repository, so
+  # if the care above is more than the convenience is worth, the honest
+  # answer is to leave it off. See docs/ci-and-actions-minutes.md §4.2.
+  runner:
+    name: Pick the runner
+    runs-on: ubuntu-latest
+    outputs:
+      labels: ${{ steps.pick.outputs.labels }}
+    steps:
+      - name: Decide
+        id: pick
+        shell: bash
+        env:
+          SELF_HOSTED: ${{ inputs.self_hosted }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] \
+             && [ "${SELF_HOSTED:-false}" = "true" ]; then
+            echo 'labels=["self-hosted","windows"]' >> "$GITHUB_OUTPUT"
+            echo "self-hosted runner requested by a manual dispatch."
+          else
+            echo 'labels="windows-latest"' >> "$GITHUB_OUTPUT"
+            echo "GitHub-hosted windows-latest."
+          fi
+
   # The full bar the project actually holds: tests green, zero warnings,
   # measured on the tree as it will be built.
   test:
     name: Tests and warnings
-    runs-on: windows-latest
+    needs: runner
+    runs-on: ${{ fromJSON(needs.runner.outputs.labels) }}
     steps:
       - uses: actions/checkout@v5
 
@@ -93,16 +244,26 @@ jobs:
       # is the point -- it is how the advisory gets seen -- and the answer is
       # to read it and record the decision in `deny.toml`, which already
       # carries one such acceptance for RUSTSEC-2023-0071.
+      # A prebuilt binary rather than `cargo install`, which built cargo-deny
+      # and its whole dependency tree from source, on Windows, on every run.
+      # `Swatinem/rust-cache` caches the WORKSPACE target directory, not
+      # ~/.cargo/bin, so none of that work was ever reused -- several minutes
+      # a run for a tool that ships binaries. This workflow already uses the
+      # right mechanism one job over, for cargo-llvm-cov.
+      #
+      # **The ^0.20 pin is preserved, and it is load-bearing.** It was pinned
+      # to ^0.16 first and that failed on the very first CI run:
+      # `unmaintained = "workspace"` is a key 0.16.4 had removed and 0.20
+      # reintroduced, so the config was correct locally and invalid on the
+      # runner. Pin the version the config was actually tested against.
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@^0.20
+
       - name: Audit licences and advisories
         working-directory: deskwarden
-        run: |
-          # **^0.20, which is what this config was validated against.** It
-          # was pinned to ^0.16 first, and that failed on the very first CI
-          # run: `unmaintained = "workspace"` is a key 0.16.4 had removed and
-          # 0.20 reintroduced, so the config was correct locally and invalid
-          # on the runner. Pin the version you actually tested with.
-          cargo install cargo-deny --locked --version ^0.20
-          cargo deny check licenses advisories
+        run: cargo deny check licenses advisories
 
   # A picture of every surface this app draws, on every push, for a human to
   # look at.
@@ -157,7 +318,8 @@ jobs:
   # security fix shipping.
   coverage:
     name: Coverage
-    runs-on: windows-latest
+    needs: runner
+    runs-on: ${{ fromJSON(needs.runner.outputs.labels) }}
     # At the JOB level deliberately: a step's own `env:` is not visible to
     # that step's `if:`, so the upload condition below would have been read
     # against an unset value and never fired -- or fired always.
@@ -226,7 +388,8 @@ jobs:
   # property of the file rather than a hope.
   screenshots:
     name: Screenshots of every surface
-    runs-on: windows-latest
+    needs: runner
+    runs-on: ${{ fromJSON(needs.runner.outputs.labels) }}
     # Nothing here needs to write, and a third-party DLL runs in this job.
     permissions:
       contents: read
@@ -317,7 +480,8 @@ jobs:
   # covers everything else. Checking is fast enough to afford per commit.
   compiles:
     name: Every new commit compiles
-    runs-on: windows-latest
+    needs: runner
+    runs-on: ${{ fromJSON(needs.runner.outputs.labels) }}
     steps:
       - uses: actions/checkout@v5
         with:

@@ -1018,7 +1018,12 @@ impl Section {
     /// gone -- it had no setting on it -- so what is left here is all
     /// shape-and-no-original, which changes nothing about how they are
     /// written: one sentence, naming what the page decides.
-    fn subtitle(self) -> &'static str {
+    /// `pub(crate)` so that tests elsewhere can CONTROL on the real text
+    /// rather than on a copy of it. `send_ui`'s preferences-modal control
+    /// held its own transcription of the General subtitle and went stale the
+    /// day this one gained "the shortcut it answers" -- a red test about a
+    /// sentence, not about the modal it was guarding.
+    pub(crate) fn subtitle(self) -> &'static str {
         match self {
             // **Says "the shortcut it answers" because the fill hotkey row is
             // on this page now.** A subtitle that named only background

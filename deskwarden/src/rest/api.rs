@@ -57,15 +57,50 @@
 //! well, and the master password is the only way back. Nothing here caches a
 //! password to re-derive with, and nothing here should.
 //!
-//! # Two-factor authentication is recognised, not handled
+//! # Two-factor authentication, completed rather than named
 //!
 //! A server that wants a second factor answers the grant with **400** and a
 //! body carrying `error: "invalid_grant"`, `error_description: "Two factor
-//! required."` and a `TwoFactorProviders` array of provider numbers. That is
-//! returned as [`RestError::TwoFactorRequired`] -- distinguishable from a
-//! wrong password, which is the point -- and this module goes no further.
-//! Completing the second factor means resending the grant with
-//! `twoFactorProvider`/`twoFactorToken`, and that is not in this task.
+//! required."`, a `TwoFactorProviders` array of provider numbers, and a
+//! `TwoFactorProviders2` object carrying per-provider detail -- the masked
+//! address, in email's case.
+//!
+//! [`RestClient::authenticate`] turns that into
+//! [`LoginOutcome::NeedsSecondFactor`] rather than into an error, because it
+//! is not one: the password was right. What comes back is a [`Challenge`]
+//! carrying the parsed [`SecondFactor`]s **and the material to resume with**
+//! -- the email, the derived hash, and the [`MasterKey`]. Holding that across
+//! a prompt is the price of the protocol: the server only says a second
+//! factor is wanted *after* the grant is attempted, so the alternative is
+//! asking for the master password twice. See [`Challenge`] for what that
+//! costs and how it is contained.
+//!
+//! [`RestClient::finish_second_factor`] resends the grant with every field
+//! the first one sent plus `twoFactorProvider`/`twoFactorToken`, **reusing
+//! the hash from the challenge**. Re-deriving it would be six hundred
+//! thousand PBKDF2 iterations for a value already in hand, and the split
+//! between [`RestClient::authenticate`] and [`RestClient::password_grant`]
+//! exists so that it does not have to be.
+//!
+//! Three providers are completed: authenticator (0), email (1) and YubiKey
+//! OTP (3) -- exactly the set `bw login` supports. Duo (2 and 6) and WebAuthn
+//! (7) parse as [`SecondFactor::Unsupported`] **carrying their number**, so a
+//! caller can name what the account actually wants rather than saying
+//! "two-step login"; and an account with one of those *and* an authenticator
+//! app is still offered the authenticator. For an account with nothing else,
+//! the way in is [`RestClient::api_key_grant`], which authenticates a session
+//! and **does not decrypt anything**: the vault key still comes from the
+//! master password through the same prelogin. That is why `bw login
+//! --apikey` must be followed by `bw unlock`, and it is true here for the
+//! same reason.
+//!
+//! Email is the one provider needing a round trip *before* the prompt --
+//! [`RestClient::send_email_code`] -- and the one that can therefore fail
+//! before there is anything to type; see [`RestError::CodeNotSent`].
+//!
+//! [`RestError::TwoFactorRequired`] stays, because [`RestClient::
+//! password_grant`] is reachable from callers with no way to prompt, and an
+//! error is the only thing they can be told.
 //!
 //! # Bounds
 //!
@@ -147,6 +182,15 @@ pub const CLIENT_ID: &str = "desktop";
 /// why `offline_access` is not optional.
 const SCOPE: &str = "api offline_access";
 
+/// The scope the personal API-key grant asks for.
+///
+/// `api` alone, and the missing half is not an oversight: the
+/// `client_credentials` grant is renewed by presenting the same client
+/// secret again, so a refresh token would be a second, weaker copy of a
+/// credential the caller already holds. Bitwarden's own server refuses
+/// `offline_access` on this grant for that reason.
+const API_KEY_SCOPE: &str = "api";
+
 /// Bitwarden's `DeviceType` for a Windows desktop client.
 ///
 /// Sent as a string because the grant is form-encoded and every field on that
@@ -227,6 +271,14 @@ pub enum RestError {
     /// echoing a server-supplied value into an error that may be logged buys
     /// nothing here.
     ArchiveNotConfirmed,
+    /// The email second factor's code could not be **sent**.
+    ///
+    /// Its own variant, wrapping whatever failed underneath, because the two
+    /// failures either side of it ask opposite things of the user: a rejected
+    /// code means "type it again", and this means "there is nothing to type
+    /// yet". Flattening them would tell somebody whose server would not send
+    /// the mail that they had mistyped a code they were never given.
+    CodeNotSent(Box<RestError>),
 }
 
 impl std::fmt::Display for RestError {
@@ -250,6 +302,9 @@ impl std::fmt::Display for RestError {
                 f.write_str("this session has no refresh token and cannot be renewed")
             }
             Self::UnsafeId => f.write_str("that item's id is not one this client will put in a URL"),
+            Self::CodeNotSent(why) => {
+                write!(f, "the code could not be emailed: {why}")
+            }
             Self::ArchiveNotConfirmed => f.write_str(
                 "the server accepted the request but did not report that item as changed, so it \
                  may not have been",
@@ -299,6 +354,229 @@ impl Device {
             device_type: DEVICE_TYPE_WINDOWS_DESKTOP.to_string(),
         }
     }
+}
+
+// ---- the second factor ------------------------------------------------------
+
+/// One second factor the server will accept.
+///
+/// Parsed from the provider number rather than kept as one, because every
+/// caller would otherwise have to know Bitwarden's numbering to ask the only
+/// question that matters -- what to put in front of the user.
+///
+/// Nothing here is a secret. `masked` is the *masked* address the server
+/// itself chose to reveal (`a***@b.c`), which exists precisely to be shown,
+/// so a derived `Debug` is right: this is what a reader debugging a challenge
+/// needs to see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecondFactor {
+    /// Provider 0: a TOTP code from an authenticator app.
+    Authenticator,
+    /// Provider 1: a code the server emails, once asked --
+    /// [`RestClient::send_email_code`]. `masked` is the address it will go
+    /// to, as the server masked it, and `None` when the server sent the
+    /// array without the detail object.
+    Email { masked: Option<String> },
+    /// Provider 3: a YubiKey OTP, typed by the key itself.
+    YubiKey,
+    /// A provider this client cannot complete -- Duo (2), OrganizationDuo
+    /// (6), WebAuthn (7).
+    ///
+    /// **Not an error, and it carries its number for a reason.** An account
+    /// with WebAuthn *and* an authenticator app must still be offered the
+    /// authenticator, and an account with nothing else needs to be told which
+    /// provider it wants, so the message can name Duo instead of saying
+    /// "two-step login" and leaving the user to guess.
+    Unsupported(u8),
+}
+
+impl SecondFactor {
+    /// Bitwarden's own provider number, which is what goes on the wire as
+    /// `twoFactorProvider`.
+    #[must_use]
+    pub fn number(&self) -> u8 {
+        match self {
+            Self::Authenticator => 0,
+            Self::Email { .. } => 1,
+            Self::YubiKey => 3,
+            Self::Unsupported(number) => *number,
+        }
+    }
+
+    /// A provider number, plus whatever `TwoFactorProviders2` said about it.
+    fn from_number(number: u8, detail: Option<&serde_json::Value>) -> Self {
+        match number {
+            0 => Self::Authenticator,
+            1 => Self::Email { masked: masked_email(detail) },
+            3 => Self::YubiKey,
+            other => Self::Unsupported(other),
+        }
+    }
+}
+
+/// The one factor to offer first when an account has several.
+///
+/// Bitwarden's own priority order, restricted to the three completed here:
+/// YubiKey, then Authenticator, then Email. Email is last because it is the
+/// only one that costs a round trip and a wait; the other two are already on
+/// the user's phone or key.
+///
+/// `None` when nothing in the list can be completed -- which is not the same
+/// as an empty list, and is exactly the case a caller must handle by naming
+/// the [`SecondFactor::Unsupported`] providers it was given.
+#[must_use]
+pub fn preferred_second_factor(factors: &[SecondFactor]) -> Option<&SecondFactor> {
+    factors
+        .iter()
+        .find(|f| matches!(f, SecondFactor::YubiKey))
+        .or_else(|| factors.iter().find(|f| matches!(f, SecondFactor::Authenticator)))
+        .or_else(|| factors.iter().find(|f| matches!(f, SecondFactor::Email { .. })))
+}
+
+/// What [`RestClient::authenticate`] found: a finished login, or a server
+/// that wants one more thing.
+///
+/// An outcome rather than an error, because a second factor is not a failure
+/// of anything -- the master password was correct, and the only remaining
+/// question is one the user can answer.
+pub enum LoginOutcome {
+    /// The password grant succeeded outright.
+    Done(Authenticated),
+    /// The server wants a second factor. See
+    /// [`RestClient::finish_second_factor`].
+    NeedsSecondFactor(Challenge),
+}
+
+/// Hand-written, and it must be: both arms hold credentials, and a derived
+/// `Debug` would print whatever they let it. See [`crate::debug_leak_guard`].
+/// The factor *list* prints, because that is the whole of what a reader
+/// debugging a challenge needs and none of it is secret.
+impl std::fmt::Debug for LoginOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Done(authed) => f.debug_tuple("Done").field(authed).finish(),
+            Self::NeedsSecondFactor(challenge) => {
+                f.debug_tuple("NeedsSecondFactor").field(&challenge.factors).finish()
+            }
+        }
+    }
+}
+
+/// A login held open across a prompt: what the server will accept, and what
+/// it takes to finish.
+///
+/// # This is a password-equivalent credential with a long life
+///
+/// `password_hash` is the value the grant sends in its `password` field. It
+/// is not the master password and the server cannot decrypt a vault with it,
+/// but anything holding it can complete this login -- and `master_key` *can*
+/// decrypt the vault. Both now live for as long as somebody takes to read six
+/// digits off a phone, which is far longer than the microseconds the login
+/// path used to hold them for.
+///
+/// There is no way around it: the server reveals that a second factor is
+/// wanted only *after* the grant is attempted, so either this survives the
+/// prompt or the user types their master password a second time.
+///
+/// What contains it:
+///
+/// * **No `Debug`, derived or otherwise.** Not redacted -- absent. Nothing in
+///   here is a formatter's business, so the type simply cannot be printed;
+///   see [`crate::debug_leak_guard`] for why a derived `Debug` over a
+///   `Zeroizing` field is the recurring bug this sidesteps.
+/// * The hash stays inside the [`Zeroizing`] [`MasterKey::password_hash`]
+///   handed over, and is never copied out of it.
+/// * Not `Clone`. One challenge, in one place, dropped when the sign-in stage
+///   ends however it ends.
+pub struct Challenge {
+    factors: Vec<SecondFactor>,
+    server_url: String,
+    email: String,
+    /// The value the first grant sent as `password`. Reused, never
+    /// re-derived: see the module docs for what re-deriving would cost.
+    password_hash: Zeroizing<String>,
+    master_key: MasterKey,
+    /// The same device the first grant identified itself as. Carried rather
+    /// than asked of the caller a second time, because a retry naming a
+    /// different device is not a retry of this grant: the server binds rate
+    /// limiting to the identifier, and it is the identifier a "remember this
+    /// device" token would ever be issued against.
+    device: Device,
+}
+
+impl Challenge {
+    /// Every provider the server offered, unfiltered -- including the ones
+    /// this client cannot complete, which the caller needs in order to name
+    /// them.
+    ///
+    /// Named for the server's own word rather than for the type, because the
+    /// caller reading it is deciding what to say about `TwoFactorProviders`.
+    #[must_use]
+    pub fn providers(&self) -> &[SecondFactor] {
+        &self.factors
+    }
+
+    /// The server this login is against, as [`RestClient::new`] normalised
+    /// it -- no trailing slash.
+    ///
+    /// Carried so that a caller resuming the login does not have to keep its
+    /// own copy in step with this one. Not a secret; it is what the user
+    /// typed into the server box.
+    #[must_use]
+    pub fn server_url(&self) -> &str {
+        &self.server_url
+    }
+
+    /// The factor to offer first. See [`preferred_second_factor`].
+    #[must_use]
+    pub fn preferred(&self) -> Option<&SecondFactor> {
+        preferred_second_factor(&self.factors)
+    }
+
+    /// The account this challenge belongs to, so the prompt can say whose
+    /// code it is asking for. Not a secret: the caller typed it.
+    #[must_use]
+    pub fn email(&self) -> &str {
+        &self.email
+    }
+}
+
+/// A code, and which factor produced it.
+///
+/// The two travel together because the server needs both and they must agree:
+/// an authenticator code sent under provider 1 is a rejected login that reads
+/// to the user as a wrong code.
+///
+/// No `Debug`, for [`Challenge`]'s reason -- a valid code is a single-use
+/// credential for as long as it lasts.
+pub struct SecondFactorAnswer {
+    provider: SecondFactor,
+    token: Zeroizing<String>,
+}
+
+impl SecondFactorAnswer {
+    /// The user's answer to one factor.
+    ///
+    /// `token` is trimmed, because both places these come from -- a paste,
+    /// and a YubiKey typing itself into the box -- routinely arrive with
+    /// whitespace the server would reject.
+    #[must_use]
+    pub fn new(provider: SecondFactor, token: &str) -> Self {
+        Self { provider, token: Zeroizing::new(token.trim().to_string()) }
+    }
+}
+
+/// The masked address out of one `TwoFactorProviders2` entry, if it is there.
+///
+/// Both casings are read for [`PreloginResponse`]'s reason: this wire has
+/// moved casing before.
+fn masked_email(detail: Option<&serde_json::Value>) -> Option<String> {
+    let detail = detail?;
+    detail
+        .get("Email")
+        .or_else(|| detail.get("email"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 // ---- the session ------------------------------------------------------------
@@ -521,23 +799,43 @@ impl RestClient {
         kdf_from(&parsed)
     }
 
-    /// Prelogin, then the password grant. The whole of a login.
+    /// Prelogin, then the password grant. The whole of a login, up to the
+    /// point where the server may want one more thing.
     ///
     /// The master password is taken as `&[u8]` for the same reason
     /// [`master_key`] takes it that way: a caller holding a
     /// `Zeroizing<String>` passes `.as_bytes()` and this makes no second,
     /// un-wiped copy of it.
+    ///
+    /// A second-factor answer is [`LoginOutcome::NeedsSecondFactor`] and not
+    /// an error, because nothing failed -- see the module docs, and
+    /// [`Challenge`] for what the returned value holds.
     pub fn authenticate(
         &self,
         email: &str,
         password: &[u8],
         device: &Device,
-    ) -> Result<Authenticated, RestError> {
+    ) -> Result<LoginOutcome, RestError> {
         let kdf = self.prelogin(email)?;
         let master_key = master_key(password, email, kdf)?;
         let hash = master_key.password_hash(password);
-        let session = self.password_grant(email, &hash, device)?;
-        Ok(Authenticated { session, master_key })
+        match self.grant(email, &hash, device, None) {
+            Ok(session) => Ok(LoginOutcome::Done(Authenticated { session, master_key })),
+            Err(GrantFailure::Rest(e)) => Err(e),
+            // The hash moves into the challenge rather than being derived
+            // again when the code arrives. That is the whole reason
+            // `password_grant` was ever split from this function.
+            Err(GrantFailure::SecondFactor { factors, .. }) => {
+                Ok(LoginOutcome::NeedsSecondFactor(Challenge {
+                    factors,
+                    server_url: self.base_url.clone(),
+                    email: email.to_string(),
+                    password_hash: hash,
+                    master_key,
+                    device: device.clone(),
+                }))
+            }
+        }
     }
 
     /// The grant itself, given a hash somebody else derived.
@@ -545,16 +843,126 @@ impl RestClient {
     /// Split out from [`Self::authenticate`] so a test can drive the HTTP
     /// without paying six hundred thousand PBKDF2 iterations, and so the one
     /// place a derived hash is put on a wire is a function a reader can find.
+    ///
+    /// A second factor is [`RestError::TwoFactorRequired`] here, not a
+    /// [`Challenge`]: this function was handed a hash it does not own and
+    /// cannot promise to keep, and a caller reaching for it rather than for
+    /// [`Self::authenticate`] is one that has no prompt to offer anyway.
     pub fn password_grant(
         &self,
         email: &str,
         password_hash: &str,
         device: &Device,
     ) -> Result<Session, RestError> {
+        self.grant(email, password_hash, device, None).map_err(GrantFailure::into_rest)
+    }
+
+    /// The retry, with the user's answer, and **the same hash the first grant
+    /// sent**.
+    ///
+    /// Takes the challenge by reference rather than consuming it: a mistyped
+    /// code must be retryable without re-deriving the key, which is the
+    /// behaviour this whole path exists to replace. The challenge's own drop
+    /// is what ends the credential's life, when the sign-in stage ends.
+    ///
+    /// A server that answers this with a second factor request *again* --
+    /// which is how at least one of them reports a wrong code -- comes back
+    /// as [`RestError::TwoFactorRequired`], which is the caller's cue to ask
+    /// again with the same challenge.
+    pub fn finish_second_factor(
+        &self,
+        challenge: &Challenge,
+        answer: &SecondFactorAnswer,
+    ) -> Result<Authenticated, RestError> {
+        let session = self
+            .grant(&challenge.email, &challenge.password_hash, &challenge.device, Some(answer))
+            .map_err(GrantFailure::into_rest)?;
+        Ok(Authenticated { session, master_key: challenge.master_key.clone() })
+    }
+
+    /// `POST /api/two-factor/send-email-login` -- ask the server to mail a
+    /// code.
+    ///
+    /// Email is the only provider needing this: the other two already have
+    /// their code on the user's phone or key. Unauthenticated as far as the
+    /// session goes, and authenticated by the same three values the grant
+    /// used -- the email, the master password hash, and the device -- which
+    /// is why it takes the challenge rather than a caller's own copies of
+    /// them.
+    ///
+    /// Every failure becomes [`RestError::CodeNotSent`]. See that variant for
+    /// why it may not be flattened into the errors a rejected *code*
+    /// produces.
+    pub fn send_email_code(&self, challenge: &Challenge) -> Result<(), RestError> {
+        let url = format!("{}/api/two-factor/send-email-login", self.base_url);
+        let email_body = serde_json::json!({
+            "email": challenge.email,
+            "masterPasswordHash": challenge.password_hash.as_str(),
+            "deviceIdentifier": challenge.device.identifier,
+        });
+        // `unit_from`, not `value_from`: a server that sends `200` with an
+        // empty body has sent the mail, and reading that as a parse failure
+        // would tell the user no code is coming while one is in flight.
+        let response = self.auth_agent.post(&url).send_json(&email_body);
+        self.unit_from(response).map_err(|why| RestError::CodeNotSent(Box::new(why)))
+    }
+
+    /// The personal API-key grant -- `bw login --apikey`'s flow.
+    ///
+    /// # It authenticates, and that is all it does
+    ///
+    /// **The vault key still comes from the master password.** This returns a
+    /// [`Session`] and no [`MasterKey`], and that is not an omission: the
+    /// client secret is not the master password and nothing derived from it
+    /// can unwrap a vault. A caller signing in this way must still run
+    /// [`Self::prelogin`] and [`master_key`] over the typed master password
+    /// to read anything, which is exactly why `bw login --apikey` has to be
+    /// followed by `bw unlock`.
+    ///
+    /// It exists for the accounts the second factors above cannot reach --
+    /// Duo and WebAuthn -- because without it, those users have no way in at
+    /// all.
+    pub fn api_key_grant(
+        &self,
+        client_id: &str,
+        client_secret: &str,
+        device: &Device,
+    ) -> Result<Session, RestError> {
+        // No `username`, no `password`, and no `Auth-Email`: there is no
+        // account name in this grant. The client id carries it.
+        let fields = [
+            ("grant_type", "client_credentials"),
+            ("scope", API_KEY_SCOPE),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("deviceIdentifier", device.identifier.as_str()),
+            ("deviceName", device.name.as_str()),
+            ("deviceType", device.device_type.as_str()),
+        ];
+        let url = format!("{}/identity/connect/token", self.base_url);
+        self.session_from(self.auth_agent.post(&url).send_form(&fields))
+    }
+
+    /// The one place the password grant is put on a wire, with or without a
+    /// second factor on it.
+    ///
+    /// Private, and returning [`GrantFailure`] rather than [`RestError`],
+    /// because the two public callers want opposite things from the same 400:
+    /// [`Self::authenticate`] wants the parsed challenge, and
+    /// [`Self::password_grant`] wants the error. Building the field list
+    /// twice would be the bug where the retry quietly stops sending
+    /// `deviceType`.
+    fn grant(
+        &self,
+        email: &str,
+        password_hash: &str,
+        device: &Device,
+        answer: Option<&SecondFactorAnswer>,
+    ) -> Result<Session, GrantFailure> {
         // The eight fields, in the order Bitwarden's own clients send them.
         // Seven of them are ones a server *validates* -- see the module docs;
         // `grant_type` is the eighth and selects the flow.
-        let fields = [
+        let mut fields = vec![
             ("grant_type", "password"),
             ("client_id", CLIENT_ID),
             ("scope", SCOPE),
@@ -564,6 +972,13 @@ impl RestClient {
             ("deviceName", device.name.as_str()),
             ("deviceType", device.device_type.as_str()),
         ];
+        // Bound outside the `if` so the number outlives the borrow the field
+        // list takes of it.
+        let provider = answer.map(|a| a.provider.number().to_string());
+        if let (Some(provider), Some(answer)) = (provider.as_deref(), answer) {
+            fields.push(("twoFactorProvider", provider));
+            fields.push(("twoFactorToken", answer.token.as_str()));
+        }
 
         let url = format!("{}/identity/connect/token", self.base_url);
         // `Auth-Email` is base64url of the email with no padding. Bitwarden's
@@ -577,7 +992,23 @@ impl RestClient {
             .post(&url)
             .set("Auth-Email", &auth_email)
             .send_form(&fields);
-        self.session_from(response)
+        match response {
+            // The one status whose body is worth more than its
+            // classification. Read once, here, because a `ureq::Response` can
+            // only be consumed once and the challenge and the error are both
+            // in it.
+            Err(ureq::Error::Status(400, body)) => {
+                let json = json_body_of(body);
+                match provider_strings(&json) {
+                    Some(providers) => Err(GrantFailure::SecondFactor {
+                        factors: second_factors_from(&providers, &json),
+                        providers,
+                    }),
+                    None => Err(GrantFailure::Rest(classify_json_400(&json))),
+                }
+            }
+            other => self.session_from(other).map_err(GrantFailure::Rest),
+        }
     }
 
     /// Exchanges a refresh token for a new access token.
@@ -1170,20 +1601,26 @@ fn archived_state_of(answer: &serde_json::Value, id: &str) -> Option<bool> {
 /// a silent `Status(400)`, because a 400 with an unreadable body is exactly
 /// the case where a human needs to see the text.
 fn classify_400(body: ureq::Response) -> RestError {
-    let text = body.into_string().unwrap_or_default();
-    let json: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    classify_json_400(&json_body_of(body))
+}
 
-    let providers = json
-        .get("TwoFactorProviders")
-        .or_else(|| json.get("twoFactorProviders"))
-        .and_then(|v| v.as_array())
-        .map(|list| list.iter().map(render_provider).collect::<Vec<_>>());
-    if let Some(providers) = providers {
+/// A response body as JSON, or `Null` when it was not JSON at all.
+///
+/// Its own function because a `ureq::Response` can be read exactly once, and
+/// [`RestClient::grant`] needs the same body for two different questions.
+fn json_body_of(body: ureq::Response) -> serde_json::Value {
+    let text = body.into_string().unwrap_or_default();
+    serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+}
+
+/// [`classify_400`], on a body somebody else has already read.
+fn classify_json_400(json: &serde_json::Value) -> RestError {
+    if let Some(providers) = provider_strings(json) {
         return RestError::TwoFactorRequired { providers };
     }
 
-    let error = string_at(&json, "error");
-    let description = string_at(&json, "error_description");
+    let error = string_at(json, "error");
+    let description = string_at(json, "error_description");
     // Bitwarden and Vaultwarden both answer a wrong password with
     // `invalid_grant` and a description naming the credentials. The
     // description is matched case-insensitively on two words rather than in
@@ -1194,6 +1631,77 @@ fn classify_400(body: ureq::Response) -> RestError {
         return RestError::InvalidCredentials;
     }
     RestError::Rejected { error, description }
+}
+
+/// The `TwoFactorProviders` array as the strings the server sent, or `None`
+/// when this body is not a second-factor challenge at all.
+///
+/// The array's *presence* is what decides, not its contents: a server that
+/// sent an empty one has still said "not without a second factor", and
+/// reading that as a plain rejection would report a 2FA account as a wrong
+/// password.
+fn provider_strings(json: &serde_json::Value) -> Option<Vec<String>> {
+    json.get("TwoFactorProviders")
+        .or_else(|| json.get("twoFactorProviders"))
+        .and_then(|v| v.as_array())
+        .map(|list| list.iter().map(render_provider).collect())
+}
+
+/// The providers, parsed, from both shapes the server sends them in.
+///
+/// `TwoFactorProviders` is the list and `TwoFactorProviders2` is the detail
+/// -- the masked address for email. The list is authoritative when it is
+/// there; the object's keys are the fallback, because the two arrived at
+/// different times in this protocol's life and there is no rule saying both
+/// must be present.
+///
+/// An entry that is not a provider number is dropped rather than guessed at.
+/// Bitwarden's providers are small integers, and a client that invented a
+/// factor from an unparseable string would offer the user a prompt no server
+/// would ever accept an answer to.
+fn second_factors_from(providers: &[String], json: &serde_json::Value) -> Vec<SecondFactor> {
+    let detail = json.get("TwoFactorProviders2").or_else(|| json.get("twoFactorProviders2"));
+    let listed: Vec<String> = if providers.is_empty() {
+        detail
+            .and_then(|d| d.as_object())
+            .map(|entries| entries.keys().cloned().collect())
+            .unwrap_or_default()
+    } else {
+        providers.to_vec()
+    };
+    listed
+        .iter()
+        .filter_map(|number| number.trim_matches('"').parse::<u8>().ok())
+        .map(|number| {
+            SecondFactor::from_number(number, detail.and_then(|d| d.get(number.to_string())))
+        })
+        .collect()
+}
+
+/// Why the password grant did not produce a session.
+///
+/// Not a public type: it exists so that the one function putting the grant on
+/// the wire can hand the *same* 400 to a caller that wants a
+/// [`Challenge`] and to one that wants a [`RestError`]. Every value of it
+/// becomes one or the other before it leaves this module.
+enum GrantFailure {
+    /// Anything that is not a second factor.
+    Rest(RestError),
+    /// A second factor, kept twice over: `factors` is what a prompt needs,
+    /// and `providers` is the server's own strings, which
+    /// [`RestError::TwoFactorRequired`] has always carried verbatim and must
+    /// keep carrying -- including any entry `factors` dropped as unparseable.
+    SecondFactor { factors: Vec<SecondFactor>, providers: Vec<String> },
+}
+
+impl GrantFailure {
+    /// The error a caller with no way to prompt gets.
+    fn into_rest(self) -> RestError {
+        match self {
+            Self::Rest(error) => error,
+            Self::SecondFactor { providers, .. } => RestError::TwoFactorRequired { providers },
+        }
+    }
 }
 
 /// One `TwoFactorProviders` entry as text. Bitwarden sends them as strings,
@@ -1308,7 +1816,7 @@ mod tests {
             r#"{"kdf":0,"kdfIterations":600000,"kdfMemory":null,"kdfParallelism":null}"#,
             r#"{"Kdf":0,"KdfIterations":600000,"KdfMemory":null,"KdfParallelism":null}"#,
         ] {
-            let mut server = mockito::Server::new();
+            let mut server = crate::test_http::server();
             let mock = server
                 .mock("POST", "/identity/accounts/prelogin")
                 .with_status(200)
@@ -1323,7 +1831,7 @@ mod tests {
 
     #[test]
     fn an_argon2id_prelogin_carries_its_memory_and_parallelism() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let mock = server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":1,"kdfIterations":3,"kdfMemory":64,"kdfParallelism":4}"#)
@@ -1340,7 +1848,7 @@ mod tests {
     /// login the user reads as a wrong master password.
     #[test]
     fn an_argon2id_prelogin_missing_its_parameters_is_refused_not_defaulted() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server.mock("POST", "/identity/accounts/prelogin").with_body(r#"{"kdf":1,"kdfIterations":3}"#).create();
         let err = RestClient::new(server.url()).prelogin("a@b.c").expect_err("no memory figure");
         assert_eq!(err, RestError::Parse("the Argon2id memory or parallelism"));
@@ -1348,7 +1856,7 @@ mod tests {
 
     #[test]
     fn an_unknown_kdf_number_is_refused_rather_than_treated_as_pbkdf2() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":7,"kdfIterations":3}"#)
@@ -1362,7 +1870,7 @@ mod tests {
     /// the fallback (or never fell back) reds.
     #[test]
     fn a_server_with_only_the_old_prelogin_route_still_logs_in() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let modern =
             server.mock("POST", "/identity/accounts/prelogin").with_status(404).create();
         let legacy = server
@@ -1379,7 +1887,7 @@ mod tests {
     /// A 400 from the modern path is a real answer and must be returned.
     #[test]
     fn a_prelogin_that_was_rejected_does_not_fall_through_to_the_old_route() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/accounts/prelogin")
             .with_status(400)
@@ -1403,22 +1911,22 @@ mod tests {
     /// body worth reading".
     #[test]
     fn the_password_grant_sends_every_field_the_server_requires() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let mock = server
             .mock("POST", "/identity/connect/token")
             .match_header("Auth-Email", "YUBiLmM")
-            .match_body(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::UrlEncoded("grant_type".into(), "password".into()),
-                mockito::Matcher::UrlEncoded("client_id".into(), "desktop".into()),
-                mockito::Matcher::UrlEncoded("scope".into(), "api offline_access".into()),
-                mockito::Matcher::UrlEncoded("username".into(), "a@b.c".into()),
-                mockito::Matcher::UrlEncoded("password".into(), "HASH==".into()),
-                mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![
+                crate::test_http::Matcher::UrlEncoded("grant_type".into(), "password".into()),
+                crate::test_http::Matcher::UrlEncoded("client_id".into(), "desktop".into()),
+                crate::test_http::Matcher::UrlEncoded("scope".into(), "api offline_access".into()),
+                crate::test_http::Matcher::UrlEncoded("username".into(), "a@b.c".into()),
+                crate::test_http::Matcher::UrlEncoded("password".into(), "HASH==".into()),
+                crate::test_http::Matcher::UrlEncoded(
                     "deviceIdentifier".into(),
                     "11111111-2222-3333-4444-555555555555".into(),
                 ),
-                mockito::Matcher::UrlEncoded("deviceName".into(), "TEST-PC".into()),
-                mockito::Matcher::UrlEncoded("deviceType".into(), "6".into()),
+                crate::test_http::Matcher::UrlEncoded("deviceName".into(), "TEST-PC".into()),
+                crate::test_http::Matcher::UrlEncoded("deviceType".into(), "6".into()),
             ]))
             .with_body(token_body(3600))
             .create();
@@ -1439,7 +1947,7 @@ mod tests {
     #[test]
     fn a_login_puts_the_derived_hash_on_the_wire_and_never_the_password() {
         const PASSWORD: &str = "correct horse battery staple";
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let pre = server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":0,"kdfIterations":5000}"#)
@@ -1452,16 +1960,19 @@ mod tests {
             .password_hash(PASSWORD.as_bytes());
         let grant = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "password".into(),
                 expected.to_string(),
             )]))
             .with_body(token_body(3600))
             .create();
 
-        let authed = RestClient::new(server.url())
+        let outcome = RestClient::new(server.url())
             .authenticate("a@b.c", PASSWORD.as_bytes(), &device())
             .expect("the login");
+        let LoginOutcome::Done(authed) = outcome else {
+            panic!("a server that granted the token asked for a second factor");
+        };
         pre.assert();
         grant.assert();
         // The master key comes back so the caller can unwrap the vault, and
@@ -1471,7 +1982,7 @@ mod tests {
 
     #[test]
     fn a_wrong_password_is_its_own_error_and_not_a_bare_400() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_status(400)
@@ -1491,7 +2002,7 @@ mod tests {
     /// `invalid_grant` -- because the two need opposite things from the user.
     #[test]
     fn a_second_factor_requirement_is_recognised_and_kept_apart_from_a_wrong_password() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_status(400)
@@ -1514,12 +2025,479 @@ mod tests {
         assert_ne!(err, RestError::InvalidCredentials, "2FA was read as a wrong password");
     }
 
+    // ---- the second factor --------------------------------------------------
+
+    /// A 2FA body as a `serde_json::Value`, so the parsing tests can work on
+    /// the shape without a socket.
+    fn challenge_body(json: &str) -> serde_json::Value {
+        serde_json::from_str(json).expect("a fixture that is JSON")
+    }
+
+    /// Both shapes together: the array says *which* providers, the object
+    /// says what is worth showing about them.
+    #[test]
+    fn providers_come_from_the_array_and_their_detail_from_the_object() {
+        let json = challenge_body(
+            r#"{"TwoFactorProviders":["0","1"],
+                "TwoFactorProviders2":{"0":null,"1":{"Email":"a***@b.c"}}}"#,
+        );
+        let providers = provider_strings(&json).expect("the array");
+        assert_eq!(
+            second_factors_from(&providers, &json),
+            vec![
+                SecondFactor::Authenticator,
+                SecondFactor::Email { masked: Some("a***@b.c".to_string()) },
+            ]
+        );
+
+        // Control on the detail object, without which the assertion above
+        // could be passing on a default rather than on a value that was read:
+        // the same array with no object parses to the same two providers and
+        // **no** address.
+        let bare = challenge_body(r#"{"TwoFactorProviders":["0","1"]}"#);
+        let bare_providers = provider_strings(&bare).expect("the array");
+        assert_eq!(
+            second_factors_from(&bare_providers, &bare),
+            vec![SecondFactor::Authenticator, SecondFactor::Email { masked: None }]
+        );
+    }
+
+    /// The array is the list *when there is one*. A server that sent it empty
+    /// alongside a populated detail object has still named its providers, and
+    /// reading only the array would offer the user nothing to pick.
+    #[test]
+    fn an_empty_array_falls_through_to_the_detail_object() {
+        let json = challenge_body(r#"{"TwoFactorProviders":[],"TwoFactorProviders2":{"3":null}}"#);
+        let providers = provider_strings(&json).expect("the array");
+        assert!(providers.is_empty(), "the fixture's array is not empty");
+        assert_eq!(second_factors_from(&providers, &json), vec![SecondFactor::YubiKey]);
+    }
+
+    /// Duo and WebAuthn are not errors, and they arrive as numbers as often
+    /// as strings.
+    #[test]
+    fn an_unsupported_provider_keeps_its_number() {
+        let json = challenge_body(r#"{"TwoFactorProviders":["2",6,7,"0"]}"#);
+        let providers = provider_strings(&json).expect("the array");
+        let factors = second_factors_from(&providers, &json);
+        assert_eq!(
+            factors,
+            vec![
+                SecondFactor::Unsupported(2),
+                SecondFactor::Unsupported(6),
+                SecondFactor::Unsupported(7),
+                SecondFactor::Authenticator,
+            ]
+        );
+        // And the point of not erroring: this account is still signable-in
+        // through the one factor that is supported.
+        assert_eq!(preferred_second_factor(&factors), Some(&SecondFactor::Authenticator));
+    }
+
+    /// An entry that is not a provider number cannot become a prompt -- but
+    /// it must still reach a caller that has only the error to read, because
+    /// it is the only description of what the server wanted.
+    #[test]
+    fn an_unreadable_provider_is_dropped_from_the_prompt_and_kept_in_the_error() {
+        let json = challenge_body(r#"{"TwoFactorProviders":["nonsense","0"]}"#);
+        let providers = provider_strings(&json).expect("the array");
+        assert_eq!(second_factors_from(&providers, &json), vec![SecondFactor::Authenticator]);
+        let failure = GrantFailure::SecondFactor {
+            factors: second_factors_from(&providers, &json),
+            providers: providers.clone(),
+        };
+        assert_eq!(failure.into_rest(), RestError::TwoFactorRequired { providers });
+    }
+
+    /// Bitwarden's priority order, restricted to what this client completes.
+    #[test]
+    fn the_default_factor_is_yubikey_then_authenticator_then_email() {
+        // Deliberately in the *opposite* order to the priority, so a function
+        // that just took the first element reds on the first assertion.
+        let all = [
+            SecondFactor::Email { masked: None },
+            SecondFactor::Authenticator,
+            SecondFactor::YubiKey,
+        ];
+        assert_eq!(preferred_second_factor(&all), Some(&SecondFactor::YubiKey));
+        assert_eq!(preferred_second_factor(&all[..2]), Some(&SecondFactor::Authenticator));
+        assert_eq!(preferred_second_factor(&all[..1]), Some(&SecondFactor::Email { masked: None }));
+        // Nothing completable is `None` -- not a panic and not a wrong guess.
+        // This is the case the caller must turn into a message naming Duo.
+        assert_eq!(
+            preferred_second_factor(&[SecondFactor::Unsupported(2), SecondFactor::Unsupported(7)]),
+            None
+        );
+        assert_eq!(preferred_second_factor(&[]), None);
+    }
+
+    /// The master password the second-factor fixtures log in with, and a KDF
+    /// cost small enough to pay in a test. Not a secret: nothing here reaches
+    /// a real server.
+    const CHALLENGE_PASSWORD: &str = "correct horse battery staple";
+    const CHALLENGE_ITERATIONS: u32 = 5000;
+
+    /// The hash the grant sends for [`CHALLENGE_PASSWORD`], derived through
+    /// the same public API the client uses rather than hard-coded, so these
+    /// tests pin the wiring and not a constant.
+    fn expected_hash() -> Zeroizing<String> {
+        master_key(
+            CHALLENGE_PASSWORD.as_bytes(),
+            "a@b.c",
+            Kdf::Pbkdf2 { iterations: CHALLENGE_ITERATIONS },
+        )
+        .expect("a cheap KDF")
+        .password_hash(CHALLENGE_PASSWORD.as_bytes())
+    }
+
+    /// Prelogin, plus a grant that answers "two factor required": the fixture
+    /// every test below starts from. Returns the mocks so a caller can assert
+    /// on how many times each was hit.
+    fn challenge_mocks(server: &mut crate::test_http::Server) -> (crate::test_http::Mock, crate::test_http::Mock) {
+        let prelogin = server
+            .mock("POST", "/identity/accounts/prelogin")
+            .with_body(format!(r#"{{"kdf":0,"kdfIterations":{CHALLENGE_ITERATIONS}}}"#))
+            .expect(1)
+            .create();
+        let grant = server
+            .mock("POST", "/identity/connect/token")
+            .with_status(400)
+            .with_body(
+                r#"{"error":"invalid_grant","error_description":"Two factor required.",
+                    "TwoFactorProviders":["0","1"],
+                    "TwoFactorProviders2":{"0":null,"1":{"Email":"a***@b.c"}}}"#,
+            )
+            .expect(1)
+            .create();
+        (prelogin, grant)
+    }
+
+    /// A second factor is an **outcome**, not an error: the password was
+    /// right, and what comes back is something the caller can act on.
+    #[test]
+    fn a_second_factor_comes_back_as_a_challenge_rather_than_an_error() {
+        let mut server = crate::test_http::server();
+        let (prelogin, grant) = challenge_mocks(&mut server);
+        let outcome = RestClient::new(server.url())
+            .authenticate("a@b.c", CHALLENGE_PASSWORD.as_bytes(), &device())
+            .expect("a challenge is not a failure");
+        prelogin.assert();
+        grant.assert();
+
+        let LoginOutcome::NeedsSecondFactor(challenge) = outcome else {
+            panic!("a 2FA answer was read as a completed login");
+        };
+        assert_eq!(challenge.email(), "a@b.c");
+        assert_eq!(
+            challenge.providers(),
+            [
+                SecondFactor::Authenticator,
+                SecondFactor::Email { masked: Some("a***@b.c".to_string()) },
+            ]
+        );
+        assert_eq!(challenge.preferred(), Some(&SecondFactor::Authenticator));
+    }
+
+    /// **The retry, and the whole of what it must carry.** Every field the
+    /// first grant sent is named again here, one by one, because the failure
+    /// this guards against is the retry quietly dropping one of them -- which
+    /// the server answers with a 400 the user reads as a wrong code.
+    ///
+    /// The prelogin mock's `expect(1)` is the other half: the hash is reused
+    /// from the challenge, so the second request must not re-derive it, and a
+    /// second prelogin is how a re-derivation would show.
+    #[test]
+    fn the_retry_sends_every_field_the_first_grant_sent_plus_the_code() {
+        let mut server = crate::test_http::server();
+        let (prelogin, first) = challenge_mocks(&mut server);
+        let hash = expected_hash();
+        // Matched on the second factor's own two fields *and* on all eight of
+        // the first grant's. Mockito prefers a mock with hits outstanding, so
+        // the 400 above answers the first request and this one answers the
+        // retry.
+        let retry = server
+            .mock("POST", "/identity/connect/token")
+            .match_header("Auth-Email", "YUBiLmM")
+            .match_body(crate::test_http::Matcher::AllOf(vec![
+                crate::test_http::Matcher::UrlEncoded("grant_type".into(), "password".into()),
+                crate::test_http::Matcher::UrlEncoded("client_id".into(), "desktop".into()),
+                crate::test_http::Matcher::UrlEncoded("scope".into(), "api offline_access".into()),
+                crate::test_http::Matcher::UrlEncoded("username".into(), "a@b.c".into()),
+                crate::test_http::Matcher::UrlEncoded("password".into(), hash.to_string()),
+                crate::test_http::Matcher::UrlEncoded(
+                    "deviceIdentifier".into(),
+                    "11111111-2222-3333-4444-555555555555".into(),
+                ),
+                crate::test_http::Matcher::UrlEncoded("deviceName".into(), "TEST-PC".into()),
+                crate::test_http::Matcher::UrlEncoded("deviceType".into(), "6".into()),
+                crate::test_http::Matcher::UrlEncoded("twoFactorProvider".into(), "0".into()),
+                crate::test_http::Matcher::UrlEncoded("twoFactorToken".into(), "123456".into()),
+            ]))
+            .with_body(token_body(3600))
+            .expect(1)
+            .create();
+
+        let client = RestClient::new(server.url());
+        let LoginOutcome::NeedsSecondFactor(challenge) = client
+            .authenticate("a@b.c", CHALLENGE_PASSWORD.as_bytes(), &device())
+            .expect("the challenge")
+        else {
+            panic!("the fixture did not challenge");
+        };
+        let answer = SecondFactorAnswer::new(SecondFactor::Authenticator, " 123456\n");
+        let authed = client.finish_second_factor(&challenge, &answer).expect("the retry");
+
+        first.assert();
+        retry.assert();
+        // One prelogin for the whole login: the KDF was asked for once and
+        // the hash was carried, not derived twice.
+        prelogin.assert();
+        assert!(authed.session.can_refresh(), "the retry's session cannot renew");
+        // The master key came through the challenge intact -- a session
+        // without it would be a signed-in app that cannot decrypt.
+        assert_eq!(*authed.master_key.password_hash(CHALLENGE_PASSWORD.as_bytes()), *hash);
+    }
+
+    /// A wrong code must leave the challenge usable. Re-typing a master
+    /// password because a digit was fat-fingered is the behaviour this
+    /// replaces.
+    #[test]
+    fn a_rejected_code_can_be_answered_again_from_the_same_challenge() {
+        let mut server = crate::test_http::server();
+        let (_prelogin, first) = challenge_mocks(&mut server);
+        let rejected = server
+            .mock("POST", "/identity/connect/token")
+            .match_body(crate::test_http::Matcher::Regex("twoFactorToken=000000".into()))
+            .with_status(400)
+            .with_body(
+                r#"{"error":"invalid_grant",
+                    "error_description":"Two-step token is invalid. Try again.",
+                    "TwoFactorProviders":["0"],"TwoFactorProviders2":{"0":null}}"#,
+            )
+            .expect(1)
+            .create();
+        let accepted = server
+            .mock("POST", "/identity/connect/token")
+            .match_body(crate::test_http::Matcher::Regex("twoFactorToken=123456".into()))
+            .with_body(token_body(3600))
+            .expect(1)
+            .create();
+
+        let client = RestClient::new(server.url());
+        let LoginOutcome::NeedsSecondFactor(challenge) = client
+            .authenticate("a@b.c", CHALLENGE_PASSWORD.as_bytes(), &device())
+            .expect("the challenge")
+        else {
+            panic!("the fixture did not challenge");
+        };
+        let wrong = client
+            .finish_second_factor(
+                &challenge,
+                &SecondFactorAnswer::new(SecondFactor::Authenticator, "000000"),
+            )
+            .expect_err("a rejected code");
+        assert_eq!(wrong, RestError::TwoFactorRequired { providers: vec!["0".to_string()] });
+        // The same challenge, again, with no prelogin and no derivation in
+        // between: this is the assertion the whole `&Challenge` signature is
+        // for.
+        client
+            .finish_second_factor(
+                &challenge,
+                &SecondFactorAnswer::new(SecondFactor::Authenticator, "123456"),
+            )
+            .expect("the second attempt");
+        first.assert();
+        rejected.assert();
+        accepted.assert();
+    }
+
+    /// The email provider's extra call, and the three values it carries.
+    #[test]
+    fn the_email_code_request_carries_the_email_the_hash_and_the_device() {
+        let mut server = crate::test_http::server();
+        let (_prelogin, _grant) = challenge_mocks(&mut server);
+        let send = server
+            .mock("POST", "/api/two-factor/send-email-login")
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
+                "email": "a@b.c",
+                "masterPasswordHash": expected_hash().to_string(),
+                "deviceIdentifier": "11111111-2222-3333-4444-555555555555",
+            })))
+            .with_status(200)
+            .expect(1)
+            .create();
+
+        let client = RestClient::new(server.url());
+        let LoginOutcome::NeedsSecondFactor(challenge) = client
+            .authenticate("a@b.c", CHALLENGE_PASSWORD.as_bytes(), &device())
+            .expect("the challenge")
+        else {
+            panic!("the fixture did not challenge");
+        };
+        // A 200 with an empty body is a sent mail, not a parse failure.
+        client.send_email_code(&challenge).expect("the send");
+        send.assert();
+    }
+
+    /// "We could not send you a code" and "that code is wrong" are opposite
+    /// instructions to the user, so they may not be the same error.
+    #[test]
+    fn a_code_that_could_not_be_sent_is_not_a_rejected_code() {
+        let mut server = crate::test_http::server();
+        let (_prelogin, _grant) = challenge_mocks(&mut server);
+        server.mock("POST", "/api/two-factor/send-email-login").with_status(500).create();
+        server
+            .mock("POST", "/identity/connect/token")
+            .match_body(crate::test_http::Matcher::Regex("twoFactorToken=".into()))
+            .with_status(400)
+            .with_body(
+                r#"{"error":"invalid_grant",
+                    "error_description":"Two-step token is invalid. Try again.",
+                    "TwoFactorProviders":["1"]}"#,
+            )
+            .create();
+
+        let client = RestClient::new(server.url());
+        let LoginOutcome::NeedsSecondFactor(challenge) = client
+            .authenticate("a@b.c", CHALLENGE_PASSWORD.as_bytes(), &device())
+            .expect("the challenge")
+        else {
+            panic!("the fixture did not challenge");
+        };
+        let not_sent = client.send_email_code(&challenge).expect_err("a server that would not send");
+        assert_eq!(not_sent, RestError::CodeNotSent(Box::new(RestError::Status(500))));
+
+        // The control: a *rejected code*, from the same challenge against the
+        // same server, is a different error -- so the assertion above is
+        // distinguishing two things that really do both occur here, rather
+        // than passing because only one of them can.
+        let rejected = client
+            .finish_second_factor(
+                &challenge,
+                &SecondFactorAnswer::new(SecondFactor::Email { masked: None }, "000000"),
+            )
+            .expect_err("a rejected code");
+        assert_ne!(not_sent, rejected, "a failed send reads as a wrong code");
+        assert!(
+            !not_sent.to_string().is_empty() && !rejected.to_string().is_empty(),
+            "an error rendered as nothing at all"
+        );
+    }
+
+    /// Captures the exact form body a mock is sent, for the assertion no
+    /// matcher can make: that a field is **absent**.
+    fn body_recorder() -> (std::sync::Arc<std::sync::Mutex<String>>, impl Fn(&crate::test_http::Request) -> bool)
+    {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let recorder = std::sync::Arc::clone(&seen);
+        (seen, move |request: &crate::test_http::Request| {
+            let body = request.utf8_lossy_body().to_string();
+            *recorder.lock().expect("the recorder") = body;
+            true
+        })
+    }
+
+    /// The API-key grant is a different grant, and **it does not carry a
+    /// password**. A version of it that sent one would be a version that had
+    /// quietly become the password grant with extra fields.
+    #[test]
+    fn the_api_key_grant_sends_client_credentials_and_no_password() {
+        let mut server = crate::test_http::server();
+        let (seen, recorder) = body_recorder();
+        let mock = server
+            .mock("POST", "/identity/connect/token")
+            .match_request(recorder)
+            .with_body(token_body(3600))
+            .expect(1)
+            .create();
+
+        let session = RestClient::new(server.url())
+            .api_key_grant("user.11111111", "SECRET-KEY", &device())
+            .expect("the api-key grant");
+        mock.assert();
+
+        let body = seen.lock().expect("the recorder").clone();
+        for field in [
+            "grant_type=client_credentials",
+            "scope=api",
+            "client_id=user.11111111",
+            "client_secret=SECRET-KEY",
+            "deviceIdentifier=11111111-2222-3333-4444-555555555555",
+            "deviceName=TEST-PC",
+            "deviceType=6",
+        ] {
+            assert!(body.contains(field), "{field} was not on the wire: {body}");
+        }
+        assert!(!body.contains("password"), "the api-key grant carried a password: {body}");
+        assert!(!body.contains("username"), "the api-key grant carried an account name: {body}");
+        assert!(session.can_refresh() || !session.can_refresh(), "the grant produced a session");
+
+        // **The control on both negative assertions.** The same recorder, the
+        // same server, a password grant: the two needles above really are
+        // findable in a body this way, so their absence in the api-key grant
+        // is a fact about that grant and not about the search.
+        let (seen, recorder) = body_recorder();
+        let password_mock = server
+            .mock("POST", "/identity/connect/token")
+            .match_request(recorder)
+            .with_body(token_body(3600))
+            .expect(1)
+            .create();
+        RestClient::new(server.url())
+            .password_grant("a@b.c", "HASH==", &device())
+            .expect("the control grant");
+        password_mock.assert();
+        let control = seen.lock().expect("the recorder").clone();
+        assert!(control.contains("password="), "the control found no password field: {control}");
+        assert!(control.contains("username="), "the control found no username field: {control}");
+    }
+
+    /// **The secret-hygiene rule for [`Challenge`], read off the source.**
+    ///
+    /// `Challenge` holds a password-equivalent hash and a master key across a
+    /// UI prompt. `crate::debug_leak_guard` already fails the suite if a type
+    /// holding a `Zeroizing` field *derives* `Debug`; what it cannot say is
+    /// that nobody hand-writes one here either, or that the hash is still
+    /// `Zeroizing` at all. Both are asserted directly, on the production half
+    /// of the file.
+    #[test]
+    fn the_challenge_holds_its_hash_wiped_and_cannot_be_printed() {
+        let source = include_str!("api.rs").replace("\r\n", "\n");
+        let marker = "\n#[cfg(test)]\nmod tests {";
+        let cut = source.find(marker).expect("the test module marker was not found");
+        let production = &source[..cut];
+
+        // Control on the cut and on the search: the type really is in this
+        // half, and a hand-written `Debug` really is findable this way --
+        // `Session` has one, three hundred lines above.
+        assert!(production.contains("pub struct Challenge {"), "the cut lost the challenge");
+        assert!(
+            production.contains("impl std::fmt::Debug for Session"),
+            "a hand-written Debug is not findable by this search, so its absence proves nothing"
+        );
+
+        assert!(
+            !production.contains("impl std::fmt::Debug for Challenge"),
+            "Challenge gained a Debug; there is nothing in it a formatter may print"
+        );
+        assert!(
+            production.contains("password_hash: Zeroizing<String>"),
+            "the challenge's hash is no longer wiped on drop"
+        );
+        // And it may not be copied, because a copy is a second credential
+        // with a life nobody is tracking.
+        assert!(
+            !production.contains("derive(Clone)]\npub struct Challenge"),
+            "Challenge became Clone"
+        );
+    }
+
     /// A missing required field is a 400 whose body names it, and the body
     /// must survive to the caller. `Status(400)` here would be the module
     /// docs' own worked example of an unhelpful error.
     #[test]
     fn a_missing_required_field_reaches_the_caller_with_the_servers_own_words() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_status(400)
@@ -1542,7 +2520,7 @@ mod tests {
     /// It must not panic and must not become an empty success.
     #[test]
     fn a_400_with_an_unreadable_body_is_still_a_rejection() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_status(400)
@@ -1559,7 +2537,7 @@ mod tests {
 
     #[test]
     fn a_grant_that_answers_without_an_access_token_is_a_parse_failure() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_body(r#"{"token_type":"Bearer","expires_in":3600}"#)
@@ -1576,10 +2554,10 @@ mod tests {
     /// this about the proactive path.
     #[test]
     fn a_token_that_is_already_expiring_is_refreshed_before_the_sync_is_attempted() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let grant = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -1587,10 +2565,10 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::UrlEncoded("grant_type".into(), "refresh_token".into()),
-                mockito::Matcher::UrlEncoded("refresh_token".into(), "RT-1".into()),
-                mockito::Matcher::UrlEncoded("client_id".into(), "desktop".into()),
+            .match_body(crate::test_http::Matcher::AllOf(vec![
+                crate::test_http::Matcher::UrlEncoded("grant_type".into(), "refresh_token".into()),
+                crate::test_http::Matcher::UrlEncoded("refresh_token".into(), "RT-1".into()),
+                crate::test_http::Matcher::UrlEncoded("client_id".into(), "desktop".into()),
             ]))
             .with_body(r#"{"access_token":"AT-2","expires_in":3600,"token_type":"Bearer"}"#)
             .expect(1)
@@ -1617,10 +2595,10 @@ mod tests {
     /// access token were dropped on the floor.
     #[test]
     fn a_401_mid_session_is_refreshed_once_and_the_retry_carries_the_new_token() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -1634,7 +2612,7 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -1661,10 +2639,10 @@ mod tests {
     /// "exactly two attempts, ever".
     #[test]
     fn a_session_that_cannot_be_restored_gives_up_instead_of_looping() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -1672,7 +2650,7 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -1699,10 +2677,10 @@ mod tests {
     /// a different one.
     #[test]
     fn a_refresh_that_is_itself_rejected_becomes_a_plain_re_authenticate() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -1710,7 +2688,7 @@ mod tests {
             .create();
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -1732,7 +2710,7 @@ mod tests {
     /// with an empty field.
     #[test]
     fn a_session_with_no_refresh_token_says_so_instead_of_sending_an_empty_one() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_body(r#"{"access_token":"AT-1","expires_in":3600}"#)
@@ -1748,7 +2726,7 @@ mod tests {
     /// nobody stated.
     #[test]
     fn a_token_with_no_stated_lifetime_is_never_refreshed_proactively() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_body(r#"{"access_token":"AT-1","refresh_token":"RT-1"}"#)
@@ -1762,7 +2740,7 @@ mod tests {
 
     #[test]
     fn a_base_url_with_a_trailing_slash_does_not_produce_a_double_slash() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let mock = server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(r#"{"kdf":0,"kdfIterations":1}"#)
@@ -1778,7 +2756,7 @@ mod tests {
     fn no_error_can_carry_a_credential() {
         const NEEDLES: [&str; 4] = ["AT-1", "RT-1", "HASH-VALUE", "master-password"];
 
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
             .with_body(token_body(3600))
@@ -1810,6 +2788,7 @@ mod tests {
             RestError::NoRefreshToken,
             RestError::UnsafeId,
             RestError::ArchiveNotConfirmed,
+            RestError::CodeNotSent(Box::new(RestError::Status(500))),
         ] {
             printed.push(error.to_string());
             printed.push(format!("{error:?}"));
@@ -1834,10 +2813,10 @@ mod tests {
     /// through a real grant against the mock server. There is no constructor
     /// shortcut, because a `cfg(test)` seam into `Session` is exactly the
     /// thing this crate bans.
-    fn granted(server: &mut mockito::Server) -> (RestClient, Session) {
+    fn granted(server: &mut crate::test_http::Server) -> (RestClient, Session) {
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -1880,8 +2859,11 @@ mod tests {
 
         // Controls: the cut landed where it was meant to, both halves are real.
         assert!(production.contains("pub fn update_cipher"), "the cut lost the writers");
-        assert!(!production.contains("mockito"), "the cut left test code in the production half");
-        assert!(tests.contains("mockito"), "the cut left no test code in the test half");
+        assert!(
+            !production.contains("test_http"),
+            "the cut left test code in the production half"
+        );
+        assert!(tests.contains("test_http"), "the cut left no test code in the test half");
 
         // Five body senders in the whole module, and no more. **This was
         // three, then four, then six, and is now five.** The fourth and the
@@ -1892,7 +2874,7 @@ mod tests {
         // between them account for all five.
         assert_eq!(
             production.matches("send_json(").count(),
-            5,
+            6,
             "a new JSON body sender appeared in rest::api"
         );
         // Two of them are the cipher writers, and both send a mapped cipher.
@@ -1912,6 +2894,17 @@ mod tests {
         );
         // The fifth is prelogin, on the auth agent, which carries no vault data.
         assert_eq!(production.matches("self.auth_agent.post(url).send_json(body)").count(), 1);
+        // The sixth is the email second factor's send request. It is the one
+        // hand-built body in the module and it is on the auth agent, not the
+        // write agent: it carries the master password hash -- the same value
+        // the grant sends -- and no vault data at all. It is named here
+        // rather than left to the `send_json(` count so that a *seventh*
+        // hand-built body cannot hide behind this one's allowance.
+        assert_eq!(
+            production.matches("self.auth_agent.post(&url).send_json(&email_body)").count(),
+            1,
+            "the email second factor stopped sending its own body, or gained a twin"
+        );
 
         // And there is **no** hand-built body left anywhere: the four mapped
         // sends above are the write agent's only `post`/`put` with content.
@@ -1936,14 +2929,14 @@ mod tests {
     /// the bearer header, and a body carrying ciphertext and no plaintext.
     #[test]
     fn a_create_posts_the_encrypted_body_with_the_bearer_token() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let cipher = encrypted_cipher();
         let body = cipher.body().clone();
         let created = server
             .mock("POST", "/api/ciphers")
             .match_header("Authorization", "Bearer AT-1")
-            .match_body(mockito::Matcher::Json(body.clone()))
+            .match_body(crate::test_http::Matcher::Json(body.clone()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"object":"cipher","id":"server-assigned-id","revisionDate":"2024-07-07T07:07:07Z"}"#)
@@ -1972,14 +2965,14 @@ mod tests {
     /// the collection.
     #[test]
     fn an_update_puts_to_the_item_path_and_carries_only_ciphertext() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let cipher = encrypted_cipher();
         let body = cipher.body().clone();
         let updated = server
             .mock("PUT", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             .match_header("Authorization", "Bearer AT-1")
-            .match_body(mockito::Matcher::Json(body.clone()))
+            .match_body(crate::test_http::Matcher::Json(body.clone()))
             .with_header("content-type", "application/json")
             .with_body(r#"{"object":"cipher","id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#)
             .expect(1)
@@ -2002,7 +2995,7 @@ mod tests {
     #[test]
     fn trash_restore_and_hard_delete_each_hit_their_own_route_with_an_empty_body() {
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let trash = server
             .mock("PUT", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/delete")
@@ -2069,7 +3062,7 @@ mod tests {
     /// folder.
     #[test]
     fn the_folder_writers_send_the_encrypted_name_to_their_own_routes() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let folder = encrypted_folder();
         let body = folder.body().clone();
@@ -2081,14 +3074,14 @@ mod tests {
         let created = server
             .mock("POST", "/api/folders")
             .match_header("Authorization", "Bearer AT-1")
-            .match_body(mockito::Matcher::Json(body.clone()))
+            .match_body(crate::test_http::Matcher::Json(body.clone()))
             .with_body(r#"{"object":"folder","id":"server-assigned-folder"}"#)
             .expect(1)
             .create();
         let renamed = server
             .mock("PUT", "/api/folders/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             .match_header("Authorization", "Bearer AT-1")
-            .match_body(mockito::Matcher::Json(body))
+            .match_body(crate::test_http::Matcher::Json(body))
             .with_body(r#"{"object":"folder","id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#)
             .expect(1)
             .create();
@@ -2113,7 +3106,7 @@ mod tests {
     /// written down somewhere it can fail.
     #[test]
     fn a_folder_delete_takes_an_empty_body_as_a_success() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let deleted = server
             .mock("DELETE", "/api/folders/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
@@ -2138,7 +3131,7 @@ mod tests {
     /// being shared.
     #[test]
     fn a_401_on_a_folder_create_is_refreshed_once_and_the_retry_carries_the_new_token() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let folder = encrypted_folder();
         let body = folder.body().clone();
@@ -2150,7 +3143,7 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -2160,7 +3153,7 @@ mod tests {
         let fresh = server
             .mock("POST", "/api/folders")
             .match_header("Authorization", "Bearer AT-2")
-            .match_body(mockito::Matcher::Json(body))
+            .match_body(crate::test_http::Matcher::Json(body))
             .with_body(r#"{"object":"folder","id":"server-assigned-folder"}"#)
             .expect(1)
             .create();
@@ -2175,11 +3168,11 @@ mod tests {
     /// socket is opened.
     #[test]
     fn an_unsafe_id_is_refused_by_the_folder_routes_too() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let folder = encrypted_folder();
-        let any = server.mock("DELETE", mockito::Matcher::Any).with_status(200).create();
-        let put = server.mock("PUT", mockito::Matcher::Any).with_status(200).create();
+        let any = server.mock("DELETE", crate::test_http::Matcher::Any).with_status(200).create();
+        let put = server.mock("PUT", crate::test_http::Matcher::Any).with_status(200).create();
         for bad in ["../accounts", "a/b", "a?x=1", "", "a#b"] {
             assert_eq!(
                 client.delete_folder(&mut session, bad).expect_err("an unsafe id"),
@@ -2199,7 +3192,7 @@ mod tests {
     /// same body. `expect(1)` on each mock is what pins "exactly once".
     #[test]
     fn a_401_on_a_create_is_refreshed_once_and_the_retry_carries_the_new_token() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let cipher = encrypted_cipher();
         let body = cipher.body().clone();
@@ -2211,7 +3204,7 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -2221,7 +3214,7 @@ mod tests {
         let fresh = server
             .mock("POST", "/api/ciphers")
             .match_header("Authorization", "Bearer AT-2")
-            .match_body(mockito::Matcher::Json(body.clone()))
+            .match_body(crate::test_http::Matcher::Json(body.clone()))
             .with_body(r#"{"object":"cipher","id":"server-assigned-id"}"#)
             .expect(1)
             .create();
@@ -2236,11 +3229,11 @@ mod tests {
     /// 401 must not be hammered.
     #[test]
     fn a_write_against_a_dead_session_gives_up_instead_of_looping() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -2266,9 +3259,9 @@ mod tests {
     /// point: the request must not happen at all.
     #[test]
     fn an_id_that_is_not_url_path_safe_is_refused_before_anything_is_sent() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
-        let any = server.mock("DELETE", mockito::Matcher::Any).with_status(200).create();
+        let any = server.mock("DELETE", crate::test_http::Matcher::Any).with_status(200).create();
         for bad in ["../../api/accounts", "a/b", "a?x=1", "", "a#b"] {
             assert_eq!(
                 client.hard_delete_cipher(&mut session, bad).expect_err("an unsafe id"),
@@ -2284,10 +3277,10 @@ mod tests {
     /// on a write.
     #[test]
     fn a_write_with_an_expiring_token_refreshes_before_it_is_attempted() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -2298,7 +3291,7 @@ mod tests {
 
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -2334,7 +3327,7 @@ mod tests {
     /// that still sent `{"ids": [...]}` would fail here.
     #[test]
     fn the_archive_routes_put_the_id_in_the_path_and_are_two_distinct_routes() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let archive = server
@@ -2395,7 +3388,7 @@ mod tests {
             ),
         ];
         for (what, body) in bodies {
-            let mut server = mockito::Server::new();
+            let mut server = crate::test_http::server();
             let (client, mut session) = granted(&mut server);
             server
                 .mock("PUT", format!("/api/ciphers/{id}/archive").as_str())
@@ -2418,7 +3411,7 @@ mod tests {
     /// direction would pass every archive case and fail only this one.
     #[test]
     fn an_unarchive_whose_cipher_is_still_stamped_is_not_a_success() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         server
@@ -2455,7 +3448,7 @@ mod tests {
     /// whole updated cipher.
     #[test]
     fn an_archive_answered_with_no_body_at_all_is_not_a_success_either() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         server
@@ -2491,7 +3484,7 @@ mod tests {
     fn the_servers_own_refusals_on_the_archive_routes_are_kept_as_themselves() {
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         server
             .mock("PUT", format!("/api/ciphers/{id}/archive").as_str())
@@ -2510,7 +3503,7 @@ mod tests {
             }
         );
 
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         server
             .mock("PUT", format!("/api/ciphers/{id}/archive").as_str())
@@ -2524,7 +3517,7 @@ mod tests {
             "a 400 on an archive was not read as a rejection: {err:?}"
         );
 
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         server
             .mock("PUT", format!("/api/ciphers/{id}/unarchive").as_str())
@@ -2553,7 +3546,7 @@ mod tests {
             ),
             format!(r#"[{{"id":"{id}","archivedDate":"2022-03-01T00:00:00Z"}}]"#),
         ] {
-            let mut server = mockito::Server::new();
+            let mut server = crate::test_http::server();
             let (client, mut session) = granted(&mut server);
             server
                 .mock("PUT", format!("/api/ciphers/{id}/archive").as_str())
@@ -2584,7 +3577,7 @@ mod tests {
     fn a_cipher_that_carries_its_own_data_field_is_not_mistaken_for_an_envelope() {
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         for (suffix, stamp) in [("archive", r#""2022-03-01T00:00:00Z""#), ("unarchive", "null")] {
-            let mut server = mockito::Server::new();
+            let mut server = crate::test_http::server();
             let (client, mut session) = granted(&mut server);
             server
                 .mock("PUT", format!("/api/ciphers/{id}/{suffix}").as_str())
@@ -2612,7 +3605,7 @@ mod tests {
     #[test]
     fn a_real_data_envelope_is_still_unwrapped() {
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         server
             .mock("PUT", format!("/api/ciphers/{id}/archive").as_str())
@@ -2632,9 +3625,9 @@ mod tests {
     /// being hit is the assertion.
     #[test]
     fn an_unsafe_id_is_refused_by_the_archive_routes_too() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
-        let any = server.mock("PUT", mockito::Matcher::Any).with_status(200).create();
+        let any = server.mock("PUT", crate::test_http::Matcher::Any).with_status(200).create();
         for bad in ["../../api/accounts", "a/b", "a?x=1", "", "a#b"] {
             assert_eq!(
                 client.archive_cipher(&mut session, bad).expect_err("an unsafe id"),
@@ -2656,7 +3649,7 @@ mod tests {
     /// look for this.
     #[test]
     fn a_401_on_an_archive_is_refreshed_once_and_retried() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let stale = server
@@ -2667,7 +3660,7 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -2693,7 +3686,7 @@ mod tests {
     /// 400 in this module does -- and does not become a bare `Status(400)`.
     #[test]
     fn a_rejected_write_carries_the_servers_own_explanation() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         server
             .mock("POST", "/api/ciphers")

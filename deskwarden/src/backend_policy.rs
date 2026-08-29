@@ -437,22 +437,26 @@ mod tests {
         ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// A direct-REST login with no server and no network behind it: the `fn`
-    /// pointer refuses, and nothing here can call it anyway.
+    /// A direct-REST login with no server and no network behind it: every `fn`
+    /// pointer refuses, and nothing here can call one anyway.
     fn a_login() -> crate::login_ui::DirectRestLogin {
         fn never(
             _server_url: &str,
             _email: &str,
             _device_id: &str,
             _password: &[u8],
-        ) -> Result<crate::rest::api::Authenticated, String> {
+        ) -> Result<crate::rest::api::LoginOutcome, String> {
             Err("this fixture never logs in".to_string())
         }
         crate::login_ui::DirectRestLogin {
             server_url: "https://vault.example.com".to_string(),
             email: "someone@example.com".to_string(),
             device_id: "00000000-0000-0000-0000-000000000000".to_string(),
-            authenticate: never,
+            second_factor: crate::login_ui::SecondFactorSeam {
+                start: never,
+                ..crate::login_ui::PRODUCTION_SECOND_FACTOR
+            },
+            prompt: None,
             adopt: std::sync::Arc::new(|_authenticated| {}),
         }
     }

@@ -483,9 +483,20 @@ pub fn friendly_auth_error(stderr: &str) -> String {
         return "That email or master password didn't work. Check them and try again."
             .to_string();
     }
+    // **This arm no longer sends anybody to a terminal.** It used to read
+    // "Run `bw login` in a terminal once to complete it, then come back",
+    // which was true when this window could not prompt for a second factor.
+    // It can: see `second_factor_ui` and `app_window::Stage::SecondFactor`.
+    //
+    // What is left here is the case where a two-step failure surfaces as a
+    // CLI stderr string rather than as a `LoginOutcome::NeedsSecondFactor` --
+    // an account still on the `bw` backend. There is no provider list in a
+    // stderr line, so this cannot name the provider the way
+    // `second_factor_ui::unsupported_only_message` does; it says what happened
+    // and stops.
     if mentions(&["two-step", "two step", "two-factor", "twofactor"]) {
-        return "This account uses two-step login, which Deskwarden can't prompt for. \
-                Run `bw login` in a terminal once to complete it, then come back."
+        return "That two-step login didn't complete. Try again — and if this account \
+                uses Duo or a security key, sign in with a personal API key instead."
             .to_string();
     }
     if mentions(&["too many", "rate limit", "traffic from your network"]) {
@@ -1504,6 +1515,11 @@ pub enum LoginAction {
     HelloUnlock,
     /// The footer's "Log out" was clicked: drop the account.
     LogOut,
+    /// **The sign-in card's link to [`crate::api_key_ui`]**: the way in for an
+    /// account whose second factor this app cannot complete. Duo and WebAuthn
+    /// are not reachable from `bw login` either, so this is not a shortcut
+    /// past the password prompt -- it is the only door those accounts have.
+    UseApiKey,
 }
 
 /// Draws the login/unlock window body (design 3h): brand lockup, title
@@ -1769,6 +1785,17 @@ pub fn draw_login_window(
     // to fire a second login while the first is still in flight.
     if !auth_in_progress && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
         action = Some(LoginAction::Submit);
+    }
+
+    // **The escape hatch, in the flowing content rather than the footer**, so
+    // it is measured by `flow_bottom` below and the window grows for it. Only
+    // while signing in: an attached account is past the point an API key would
+    // help, and the link would be an offer to start over.
+    if status == BwStatus::Unauthenticated {
+        ui.add_space(10.0);
+        if ui.link(RichText::new(crate::api_key_ui::USE_API_KEY_LABEL).size(12.0)).clicked() {
+            action = Some(LoginAction::UseApiKey);
+        }
     }
 
     // Where the flowing content ends, in window coordinates. The caller
@@ -2085,18 +2112,24 @@ fn probe_hello(scope: &Option<(PathBuf, AccountId)>) -> HelloState {
 /// rather than a trait object, because there is exactly one call: a test hands
 /// in its own function and gets a fixed [`Authenticated`] with no server, no
 /// socket and no six hundred thousand PBKDF2 iterations, while production
-/// hands in [`derive_direct_rest`].
+/// hands in [`start_direct_rest`].
 ///
-/// `Err` is a **message for a log**, built by [`derive_direct_rest`] out of a
+/// **It answers an outcome and not a session**, which is the whole of what
+/// this branch changed here: a grant that comes back asking for a code has not
+/// failed, and reporting it as an error was what made a two-step account a
+/// dead end. See [`crate::rest::api::LoginOutcome`] and
+/// [`complete_second_factor`].
+///
+/// `Err` is a **message for a log**, built by [`start_direct_rest`] out of a
 /// [`crate::rest::api::RestError`], whose `Display` carries a status and a
 /// route and nothing of what was sent. Nothing here may put the password, the
 /// hash or the key into it.
-pub type AuthenticateFn = fn(
+pub type StartLoginFn = fn(
     server_url: &str,
     email: &str,
     device_id: &str,
     password: &[u8],
-) -> Result<Authenticated, String>;
+) -> Result<crate::rest::api::LoginOutcome, String>;
 
 /// Everything the direct-REST derivation needs that the password is not, plus
 /// the one place its answer is allowed to go.
@@ -2116,8 +2149,15 @@ pub struct DirectRestLogin {
     /// [`crate::rest::api::Device`] and `main`'s own note on where it comes
     /// from.
     pub device_id: String,
-    /// See [`AuthenticateFn`].
-    pub authenticate: AuthenticateFn,
+    /// See [`SecondFactorSeam`]. Replaces the old `authenticate` field: the
+    /// first grant is now one of three calls that move together, because a
+    /// grant that comes back asking for a code is only half a sign-in.
+    pub second_factor: SecondFactorSeam,
+    /// How the worker reaches the window's code stage. `None` on the hosts
+    /// that have no stage to show -- and a `None` here means a two-step
+    /// account simply cannot sign in on that host, which is exactly what it
+    /// meant before this change.
+    pub prompt: Option<std::sync::Arc<dyn SecondFactorPrompt + Send + Sync>>,
     /// Where a derived login goes.
     ///
     /// `main` installs this, and what it does there is the whole of Task B's
@@ -2139,23 +2179,289 @@ pub struct DirectRestLogin {
 /// What the user's device list calls this app.
 const DEVICE_NAME: &str = "Deskwarden";
 
-/// [`AuthenticateFn`] as production performs it: one [`crate::rest::api::
-/// RestClient`] against `server_url`, one `authenticate`.
+/// **What the worker tells the window when the server asks for a second
+/// factor.**
 ///
-/// Separate from the type alias so the production function has a name a reader
-/// can find, and so the seam's one production value is written in exactly one
-/// place.
-pub fn derive_direct_rest(
+/// Providers and nothing else. What those providers came out of stays on the
+/// worker thread for the life of the prompt, because it holds the derived
+/// password hash and the master key, and this struct is received by a frame
+/// closure that outlives the stage.
+///
+/// Pinned by `second_factor_boundary::the_request_carries_no_credential`,
+/// which reads this definition's own source: no runtime value can demonstrate
+/// the absence of a field.
+pub struct SecondFactorRequest {
+    /// Every provider the account offers, unsupported entries included --
+    /// `second_factor_ui::unsupported_only_message` needs them to name Duo.
+    pub providers: Vec<crate::rest::api::SecondFactor>,
+}
+
+/// **What the window tells the worker.**
+///
+/// Digits, or a request to send some, or nothing at all. What the answer is
+/// checked against is not here because it never left; the worker matches these
+/// against the one it is holding.
+///
+/// No `Debug`: [`crate::rest::api::SecondFactorAnswer`] has none, because a
+/// live one-time code is a credential for as long as it lasts, and a derived
+/// `Debug` here would be a request to give it one.
+pub enum SecondFactorCommand {
+    /// Complete the sign-in with these digits, against the provider named.
+    Answer(crate::rest::api::SecondFactorAnswer),
+    /// Email only: ask the server to send a code.
+    SendEmail,
+    /// The user closed the window or backed out. The worker drops what it is
+    /// holding and returns.
+    Abandon,
+}
+
+/// The two `rest::api` calls the prompt makes, plus the grant that starts it,
+/// as `fn` pointers.
+///
+/// A struct and not three aliases: a test that faked `finish` but let
+/// `send_email` reach the network would be a test of half a worker. A
+/// `fn`-pointer struct and not a `cfg(test)` seam, which this crate bans
+/// crate-wide, and not a trait object, because there is exactly one production
+/// value.
+///
+/// **`C` is the challenge, and it is a parameter for one reason**:
+/// [`crate::rest::api::Challenge`] has no constructor outside its own module
+/// -- deliberately, because a `cfg(test)` way to build a password-equivalent
+/// credential is exactly what that module refuses -- so a test of
+/// [`complete_second_factor`] can only exist if the loop is written against
+/// *a* challenge rather than *the* challenge. Production is `C = Challenge`
+/// and the default says so.
+///
+/// **Every `Err` here is a message for a log.** `RestError`'s `Display`
+/// carries a status and a route and nothing of what was sent; nothing in this
+/// module may put the challenge, the hash or the key into one.
+pub struct SecondFactorSeam<C = crate::rest::api::Challenge> {
+    /// The first grant -- see [`StartLoginFn`], which is where the master
+    /// password's boundary is written down.
+    /// `Ok(LoginOutcome::NeedsSecondFactor(..))` is the case this whole
+    /// feature is about.
+    pub start: StartLoginFn,
+    /// `POST /api/two-factor/send-email-login`. Every failure is the same
+    /// trouble -- the user has nothing to check either way -- so this one
+    /// carries only a log line.
+    pub send_email: fn(&C) -> Result<(), String>,
+    /// The retry, carrying the same hash the first grant derived. Its `Err`
+    /// carries the classification as well as the log line, because "the server
+    /// said no to these digits" and "the server said nothing at all" are two
+    /// different things to tell the user, and this is the only call that can
+    /// tell them apart.
+    pub finish: fn(&C, &crate::rest::api::SecondFactorAnswer) -> Result<Authenticated, GrantRefusal>,
+}
+
+/// A `Clone`/`Copy` written by hand rather than derived.
+///
+/// A derived one would require `C: Copy`, and the production `C` is
+/// [`crate::rest::api::Challenge`], which is deliberately not even `Clone`.
+/// No field is a `C` -- they are `fn` pointers, which are always `Copy` -- so
+/// the bound would forbid the one instantiation that matters.
+impl<C> Clone for SecondFactorSeam<C> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<C> Copy for SecondFactorSeam<C> {}
+
+/// Why a second-factor grant did not produce a session: what to tell the user,
+/// and what to write down.
+///
+/// The two are separate fields because they have separate audiences and
+/// separate rules. `trouble` is a variant the window may render; `log` is a
+/// `RestError`'s own `Display`, which names a status and a route and is never
+/// shown.
+pub struct GrantRefusal {
+    pub trouble: crate::second_factor_ui::Trouble,
+    pub log: String,
+}
+
+/// Which failure of a second-factor grant this is, from the user's side.
+///
+/// **The commonest case is the surprising one.** Vaultwarden answers a wrong
+/// token by re-sending the whole challenge body, so a mistyped digit arrives
+/// here as [`crate::rest::api::RestError::TwoFactorRequired`] rather than as
+/// any kind of rejection -- and a classifier that only recognised
+/// `InvalidCredentials` would tell a user with fat fingers that their network
+/// was down. Which of the four a given server sends depends on the server, so
+/// all four are read the same way.
+fn trouble_for(error: &crate::rest::api::RestError) -> crate::second_factor_ui::Trouble {
+    use crate::rest::api::RestError;
+    use crate::second_factor_ui::Trouble;
+    match error {
+        RestError::TwoFactorRequired { .. }
+        | RestError::InvalidCredentials
+        | RestError::Unauthorized
+        | RestError::Rejected { .. } => Trouble::CodeRejected,
+        // Everything else -- no answer at all, an answer this client could not
+        // read, a status with no meaning here. None of them is the user's code
+        // being wrong, and saying it was would send them to re-read a code that
+        // is perfectly good.
+        _ => Trouble::Unreachable,
+    }
+}
+
+fn start_direct_rest(
     server_url: &str,
     email: &str,
     device_id: &str,
     password: &[u8],
-) -> Result<Authenticated, String> {
+) -> Result<crate::rest::api::LoginOutcome, String> {
     let client = crate::rest::api::RestClient::new(server_url);
     let device = crate::rest::api::Device::windows_desktop(device_id, DEVICE_NAME);
-    client
-        .authenticate(email, password, &device)
+    client.authenticate(email, password, &device).map_err(|e| e.to_string())
+}
+
+fn send_direct_rest_email(challenge: &crate::rest::api::Challenge) -> Result<(), String> {
+    crate::rest::api::RestClient::new(challenge.server_url())
+        .send_email_code(challenge)
         .map_err(|e| e.to_string())
+}
+
+fn finish_direct_rest(
+    challenge: &crate::rest::api::Challenge,
+    answer: &crate::rest::api::SecondFactorAnswer,
+) -> Result<Authenticated, GrantRefusal> {
+    crate::rest::api::RestClient::new(challenge.server_url())
+        .finish_second_factor(challenge, answer)
+        .map_err(|e| GrantRefusal { trouble: trouble_for(&e), log: e.to_string() })
+}
+
+/// The seam's one production value, written in exactly one place.
+pub const PRODUCTION_SECOND_FACTOR: SecondFactorSeam = SecondFactorSeam {
+    start: start_direct_rest,
+    send_email: send_direct_rest_email,
+    finish: finish_direct_rest,
+};
+
+/// The window, as the worker sees it: hand over a request, get back the two
+/// channel ends to talk over -- or `None` if the window will not prompt.
+///
+/// A trait object here and a `fn` pointer in [`SecondFactorSeam`], and the
+/// difference is real: the seam has one production value, while this has one
+/// per host and each closes over its host's own state.
+pub trait SecondFactorPrompt {
+    #[allow(clippy::type_complexity)]
+    fn ask(
+        &self,
+        request: SecondFactorRequest,
+    ) -> Option<(
+        std::sync::mpsc::Receiver<SecondFactorCommand>,
+        std::sync::mpsc::Sender<crate::second_factor_ui::Trouble>,
+    )>;
+}
+
+/// One second-factor prompt, as the window receives it: what to ask for, where
+/// to send the answers, and where the worker's troubles arrive.
+///
+/// The `Challenge` is not in here for the reason [`SecondFactorRequest`] does
+/// not carry one. What the window gets is a provider list and two channel
+/// ends.
+pub struct PromptSession {
+    pub request: SecondFactorRequest,
+    /// The window's end of the command channel. Dropping it is how a closed
+    /// window ends [`complete_second_factor`].
+    pub commands: std::sync::mpsc::Sender<SecondFactorCommand>,
+    pub troubles: std::sync::mpsc::Receiver<crate::second_factor_ui::Trouble>,
+}
+
+/// The [`SecondFactorPrompt`] the one-window host installs: it forwards the
+/// worker's request up a channel the frame closure drains, and hands the
+/// worker back the other two ends.
+///
+/// The `Mutex` is not for contention -- exactly one worker ever asks, and it
+/// asks once -- but because `Sender` is not `Sync` and this value is shared
+/// through an `Arc` that must be `Send + Sync` to reach the worker at all.
+pub struct ChannelPrompt {
+    sessions: std::sync::Mutex<std::sync::mpsc::Sender<PromptSession>>,
+}
+
+impl SecondFactorPrompt for ChannelPrompt {
+    fn ask(
+        &self,
+        request: SecondFactorRequest,
+    ) -> Option<(
+        std::sync::mpsc::Receiver<SecondFactorCommand>,
+        std::sync::mpsc::Sender<crate::second_factor_ui::Trouble>,
+    )> {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (trouble_tx, trouble_rx) = std::sync::mpsc::channel();
+        let sent = self
+            .sessions
+            .lock()
+            .ok()?
+            .send(PromptSession { request, commands: command_tx, troubles: trouble_rx });
+        // A closed receiver is a window that has already gone. Answering
+        // `None` is what makes the worker drop the challenge and return
+        // instead of blocking on commands nobody will send.
+        sent.ok()?;
+        Some((command_rx, trouble_tx))
+    }
+}
+
+/// The two ends of a second-factor prompt: the one the worker is given, and
+/// the one the frame closure drains.
+///
+/// Built here rather than in `app_window` so that the channel's two halves are
+/// created in the same place as the type that travels over it.
+pub fn second_factor_channel() -> (
+    std::sync::Arc<dyn SecondFactorPrompt + Send + Sync>,
+    std::sync::mpsc::Receiver<PromptSession>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    (std::sync::Arc::new(ChannelPrompt { sessions: std::sync::Mutex::new(tx) }), rx)
+}
+
+/// **The prompt, from the worker thread's side.**
+///
+/// Blocks on the window's commands while holding the challenge, and returns an
+/// [`Authenticated`] or nothing. This is the function that makes a wrong digit
+/// cheap: the challenge carries the hash the first grant already derived, so a
+/// retry is one round trip and the master password is never asked for again.
+///
+/// **It blocks a detached thread on a human.** That is the design's own answer
+/// -- "either the credential survives the prompt or the user types their
+/// master password twice" -- and it is bounded on both ends: a closed command
+/// channel (the window went away) and an `Abandon` both return, and returning
+/// drops the caller's challenge, which zeroizes the hash it holds.
+///
+/// `report` carries a [`crate::second_factor_ui::Trouble`] and not a `String`,
+/// so the window cannot be handed a message built out of a `RestError` this
+/// module has not vetted.
+pub fn complete_second_factor<C>(
+    seam: &SecondFactorSeam<C>,
+    challenge: &C,
+    commands: &std::sync::mpsc::Receiver<SecondFactorCommand>,
+    report: &std::sync::mpsc::Sender<crate::second_factor_ui::Trouble>,
+) -> Option<Authenticated> {
+    use crate::second_factor_ui::Trouble;
+    // `recv()` and not `try_recv()`: this thread has nothing else to do, and a
+    // poll loop would spin for as long as it takes somebody to find their
+    // phone. `Err` is a disconnected channel, which is a closed window.
+    while let Ok(command) = commands.recv() {
+        match command {
+            SecondFactorCommand::Abandon => return None,
+            SecondFactorCommand::SendEmail => {
+                if let Err(e) = (seam.send_email)(challenge) {
+                    // The route and status reach the log; the window gets a
+                    // variant. Nothing of the challenge is in either.
+                    log::warn!("could not send the second-factor email: {e}");
+                    let _ = report.send(Trouble::EmailSendFailed);
+                }
+            }
+            SecondFactorCommand::Answer(answer) => match (seam.finish)(challenge, &answer) {
+                Ok(authenticated) => return Some(authenticated),
+                Err(refusal) => {
+                    log::warn!("the second factor was not accepted: {}", refusal.log);
+                    let _ = report.send(refusal.trouble);
+                }
+            },
+        }
+    }
+    None
 }
 
 /// **The plaintext master password's whole life, in one function that returns
@@ -2178,6 +2484,26 @@ pub fn derive_direct_rest(
 /// from a password that did not open the vault is a key whose first sync
 /// fails -- and this app's answer to that is to ask again, which it would have
 /// just finished doing.
+/// **What a direct-REST sign-in returns where a `bw` sign-in returns a
+/// session token.**
+///
+/// There is no CLI session on that path and nothing asks for one: every
+/// consumer of the token -- `start_backend`, `try_start_backend`,
+/// `run_bw_sync` -- is a `bw`-path call that short-circuits on
+/// `BackendStart::NotSelected` when direct REST is selected.
+///
+/// **So why not the empty string?** Because emptiness is read as meaning
+/// rather than absence. `away_lock::locks_the_vault` is handed
+/// `!token.is_empty()` as *whether there is a session at all*, and a
+/// direct-REST account returning `""` would tell it there is none -- so
+/// walking away from an unlocked vault would stop locking it. A sign-in
+/// that succeeded has a session, and this is how it says so.
+///
+/// Deliberately not token-shaped: a real `bw` session is 88 base64
+/// characters, so if this ever reaches a `--session` argument the failure
+/// is immediate and obvious rather than a puzzling rejection.
+pub const DIRECT_REST_SESSION: &str = "direct-rest";
+
 fn authenticate_then_wipe(
     password: String,
     run_cli: impl FnOnce(&str) -> Result<String, String>,
@@ -2193,34 +2519,102 @@ fn authenticate_then_wipe(
     // `an_unwind_does_not_release_the_master_password_in_the_clear` was
     // retargeted onto.
     let password = Zeroizing::new(password);
-    let token = run_cli(&password);
 
+    // **The direct-REST account, and the CLI is not run at all.**
+    //
+    // `Some` here means `backend_policy::direct_rest_login` found
+    // `VaultBackendChoice::DirectRest` -- this account's vault is served by
+    // talking to the server, and `bw` is not part of it. It used to run
+    // anyway, and gate this whole block on its success, which had two
+    // consequences worth naming because both were reported as bugs:
+    //
+    //  * an account with a second factor could never sign in here at all.
+    //    `bw` cannot complete one non-interactively, so `run_cli` failed,
+    //    so the block below was skipped -- including the code prompt built
+    //    to answer exactly that. The prompt was unreachable in every
+    //    configuration: with `bw` present because it failed, and without it
+    //    because it failed.
+    //  * a machine with no `bw.exe` could not sign in to an account that
+    //    never needed one.
+    //
+    // **A failure on this arm is a failed sign-in**, not a warning. On the
+    // old ordering it could be logged and swallowed because the CLI had
+    // already succeeded and the user was signed in regardless. Here there
+    // is nothing else that succeeded, so swallowing it would leave a window
+    // reporting success over a vault that cannot be read.
+    if let Some(direct) = direct {
+        let authenticated = match (direct.second_factor.start)(
+            &direct.server_url,
+            &direct.email,
+            &direct.device_id,
+            password.as_bytes(),
+        ) {
+            // Straight into the sink below, without ever being bound to a
+            // name the window can reach.
+            Ok(crate::rest::api::LoginOutcome::Done(authenticated)) => Some(authenticated),
+            // **The challenge is bound here and nowhere else.** It lives for
+            // the length of this arm and is dropped at its end; the window is
+            // told only what `SecondFactorRequest` carries. This is also why
+            // the plaintext's life is long: `complete_second_factor` blocks on
+            // a human, and the `Zeroizing` above is what makes that safe on
+            // every exit.
+            Ok(crate::rest::api::LoginOutcome::NeedsSecondFactor(challenge)) => {
+                match direct.prompt.as_ref().and_then(|prompt| {
+                    prompt.ask(SecondFactorRequest { providers: challenge.providers().to_vec() })
+                }) {
+                    Some((commands, report)) => complete_second_factor(
+                        &direct.second_factor,
+                        &challenge,
+                        &commands,
+                        &report,
+                    ),
+                    // No stage to draw it on -- a host with no code card, or
+                    // an account whose only providers are ones this app cannot
+                    // complete. Both end the sign-in below; neither is a
+                    // reason to pretend it worked.
+                    None => {
+                        log::info!(
+                            "the second factor was not completed: this window offered no \
+                             prompt for the providers this account has"
+                        );
+                        None
+                    }
+                }
+            }
+            // Surfaced rather than logged away: see this arm's opening
+            // comment. Nothing else succeeded, so there is nothing to be
+            // signed in to.
+            Err(e) => {
+                log::warn!("the direct-REST sign-in failed: {e}");
+                return Err(e);
+            }
+        };
+
+        let Some(authenticated) = authenticated else {
+            return Err("the second factor was not completed".to_string());
+        };
+        (direct.adopt)(authenticated);
+        // **Enrolment runs on this arm too**, and it is not a `bw` thing --
+        // `hello::enroll_for` seals the password for quick unlock and knows
+        // nothing about which backend serves the vault. Losing it to this
+        // reshuffle would have turned quick unlock off for exactly the
+        // accounts this branch is for.
+        enroll(&password);
+        return Ok(DIRECT_REST_SESSION.to_string());
+    }
+
+    // **The `bw serve` account: unchanged, deliberately.** This is the
+    // default backend and the path every existing install is on, so it runs
+    // the CLI exactly as it always has and enrols on exactly the same
+    // condition.
+    let token = run_cli(&password);
     if token.is_ok() {
         enroll(&password);
-        if let Some(direct) = direct {
-            match (direct.authenticate)(
-                &direct.server_url,
-                &direct.email,
-                &direct.device_id,
-                password.as_bytes(),
-            ) {
-                // Straight into the sink, on this thread, without ever being
-                // bound to a name the window can reach.
-                Ok(authenticated) => (direct.adopt)(authenticated),
-                // Logged and not surfaced: the `bw` sign-in succeeded, so the
-                // window is finished and the user is signed in. What notices
-                // there is no direct-REST login is the vault backend itself --
-                // an unfilled `LateBoundBackend` answers `Unauthorized`, which
-                // is this app's existing "sign in again" and is exactly the
-                // right answer here.
-                Err(e) => log::warn!("the direct-REST login could not be derived: {e}"),
-            }
-        }
     }
 
     // No `zeroize()` here: `password` is a `Zeroizing`, so the wipe happens on
     // the way out of this function whichever way it leaves -- including the
-    // three unwinds above, which a call here would not have covered.
+    // unwinds above, which a call here would not have covered.
     token
 }
 
@@ -2238,12 +2632,23 @@ fn spawn_auth(
     // no account at all (`StartupAccounts::NoAccountList`), where there is no
     // override to set and the CLI resolves its own.
     data_dir: Option<PathBuf>,
+    // The window's code stage, when this host has one. `None` is every host
+    // that draws no such stage, and it means a two-step account cannot finish
+    // signing in there -- which is what it meant everywhere before the stage
+    // existed.
+    second_factor: Option<std::sync::Arc<dyn SecondFactorPrompt + Send + Sync>>,
 ) {
     // Read here rather than passed in, so that all four of this window's hosts
     // get it without carrying it. `None` -- nothing installed, or this account
     // is on `bw serve` -- is byte-for-byte the behaviour this function has
     // always had.
-    let direct = crate::backend_policy::direct_rest_login();
+    //
+    // The prompt IS passed in, because it is the one part of this that differs
+    // per host: `backend_policy` installs what the process can reach, and only
+    // the caller knows whether there is a card to draw a code box on.
+    let direct = crate::backend_policy::direct_rest_login().map(|direct| {
+        crate::login_ui::DirectRestLogin { prompt: second_factor, ..direct }
+    });
     std::thread::spawn(move || {
         let token = authenticate_then_wipe(
             password,
@@ -2305,6 +2710,7 @@ pub fn build_login_frame(
     first_run: bool,
     pre_styled: bool,
     close_on_success: bool,
+    second_factor: Option<std::sync::Arc<dyn SecondFactorPrompt + Send + Sync>>,
 ) -> (eframe::NativeOptions, LoginFrameFn, LoginFrameHandles) {
     // **Every `bw` this window runs is aimed at THIS account's directory**,
     // derived from the account it was already given rather than read off the
@@ -2330,6 +2736,13 @@ pub fn build_login_frame(
     // overlay_ui::show_prompt_overlay.)
     let token: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let token_for_closure = token.clone();
+    // **The card's link to the API-key stage, reported the way the token is.**
+    // A cell and not a return value for `token`'s reason exactly: this closure
+    // is `FnMut + 'static` and can hand nothing back, and the stage that has
+    // to be entered lives in `app_window`, which owns this frame rather than
+    // being owned by it.
+    let api_key_asked: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
+    let api_key_asked_for_closure = api_key_asked.clone();
 
     // Mutable because 3h's "Log out" flips the window into the sign-in state
     // without closing it.
@@ -2647,6 +3060,7 @@ pub fn build_login_frame(
                                 form.password.clone(),
                                 enroll_hello,
                                 profile_dir.clone(),
+                                second_factor.clone(),
                             );
                             form.error = None;
                             auth_in_progress = true;
@@ -2683,6 +3097,7 @@ pub fn build_login_frame(
                                     // password came from.
                                     None,
                                     profile_dir.clone(),
+                                    second_factor.clone(),
                                 );
                                 form.error = None;
                                 auth_in_progress = true;
@@ -2747,13 +3162,19 @@ pub fn build_login_frame(
                             form.error = Some(e);
                         }
                     },
+                    // Recorded and not acted on here: this card cannot show
+                    // the API-key stage, because the stage is `app_window`'s
+                    // and this closure is one of the things it draws.
+                    Some(LoginAction::UseApiKey) => {
+                        *api_key_asked_for_closure.borrow_mut() = true;
+                    }
                     None => {}
                 }
             },
         );
     };
 
-    (options, Box::new(login_frame_fn), LoginFrameHandles { token })
+    (options, Box::new(login_frame_fn), LoginFrameHandles { token, api_key_asked })
 }
 
 /// The login UI's per-frame closure, boxed so it can be stored in a struct and
@@ -2764,6 +3185,9 @@ pub type LoginFrameFn = Box<dyn FnMut(&mut egui::Ui, &mut eframe::Frame)>;
 /// through.
 pub struct LoginFrameHandles {
     token: Rc<RefCell<Option<String>>>,
+    /// Set when the card's "Sign in with an API key" link was clicked. Taken
+    /// rather than read, for [`LoginFrameHandles::take_token`]'s reason.
+    api_key_asked: Rc<RefCell<bool>>,
 }
 
 impl LoginFrameHandles {
@@ -2777,6 +3201,14 @@ impl LoginFrameHandles {
     /// the rest of the session.
     pub fn take_token(&self) -> Option<String> {
         self.token.borrow_mut().take()
+    }
+
+    /// Whether the card's API-key link was clicked, **taken**: a second call
+    /// answers `false`. Polled every frame by `app_window`, so a cell that
+    /// kept answering `true` would re-enter the stage on every frame for the
+    /// rest of the session -- the same defect `take_token` documents.
+    pub fn take_api_key_request(&self) -> bool {
+        std::mem::take(&mut *self.api_key_asked.borrow_mut())
     }
 }
 
@@ -2799,6 +3231,10 @@ pub fn run_login_flow_for(
         // ...and a produced token is the end of the window, because there is
         // no next state for it to enter.
         true,
+        // This host has no second-factor stage: it is a blocking window
+        // that returns a session token, and a code box would need a stage
+        // machine it does not have.
+        None,
     );
 
     let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, frame| frame_fn(ui, frame));
@@ -3625,10 +4061,18 @@ Cryptography error, The decryption operation failed";
         );
     }
 
+    /// **What to actually do about it is no longer "open a terminal".** This
+    /// asserted `bw login` until the second-factor prompt existed; the window
+    /// can ask for a code itself now, and the only two-step failure that still
+    /// reaches this function is a `bw` stderr line, which carries no provider
+    /// list to be more specific with. See `two_step_message_tests`, which is
+    /// where the replacement's own guards live.
     #[test]
     fn two_step_login_says_what_to_actually_do_about_it() {
         let shown = friendly_auth_error("Two-step login is required for this account.");
-        assert!(shown.contains("bw login"), "got: {shown}");
+        assert!(shown.to_lowercase().contains("two-step"), "got: {shown}");
+        assert!(shown.contains("API key"), "got: {shown}");
+        assert!(!shown.contains("bw login"), "got: {shown}");
     }
 
     #[test]
@@ -5489,7 +5933,7 @@ pub(crate) mod password_lifetime_tests {
         // codebase's signature failure committed by the instrument built to
         // catch it. And the crate's own house rule that fixtures are built
         // before the measured window arms manufactures exactly that shape:
-        // `vault_bridge`'s `mockito::Server::new()` and `breach::spawn_check`
+        // `vault_bridge`'s `crate::test_http::server()` and `breach::spawn_check`
         // both put a live worker behind the window that measures them.
         // `rv_a_leak_on_a_thread_that_predates_the_window_is_still_this_windows_leak`
         // is that leak, made deterministic.
@@ -5898,7 +6342,7 @@ pub(crate) mod password_lifetime_tests {
     /// BOTH entry points, with no panic. Clean, while blind, from the instrument
     /// this crate built to catch exactly that -- and reached by following the
     /// crate's own house rule that fixtures are built before the measured window
-    /// arms. `vault_bridge`'s `mockito::Server::new()` and `breach::spawn_check`
+    /// arms. `vault_bridge`'s `crate::test_http::server()` and `breach::spawn_check`
     /// are two live workers of that shape.
     ///
     /// This is that leak, made deterministic, in both of its forms: plaintext
@@ -5970,7 +6414,7 @@ pub(crate) mod password_lifetime_tests {
             }),
             "a worker that existed before this window opened freed the plaintext probe INSIDE \
              it, un-wiped, and the window reported clean. Every fixture this crate builds \
-             before arming -- `mockito::Server::new()`, `breach::spawn_check` -- leaves a \
+             before arming -- `crate::test_http::server()`, `breach::spawn_check` -- leaves a \
              worker of exactly that age behind the window that measures it"
         );
         joiner.join().expect("the outsider ran");
@@ -9443,7 +9887,7 @@ pub(crate) mod password_lifetime_tests {
     /// **Fixed bytes, not derived from the password**, which is what makes an
     /// assertion about the probe an assertion about the derivation rather than
     /// about this fixture.
-    fn fake_authenticated() -> crate::rest::api::Authenticated {
+    pub(crate) fn fake_authenticated() -> crate::rest::api::Authenticated {
         crate::rest::api::Authenticated {
             session: crate::rest::api::Session::from_refresh_token(zeroize::Zeroizing::new(
                 "not-a-real-refresh-token".to_string(),
@@ -9454,14 +9898,14 @@ pub(crate) mod password_lifetime_tests {
         }
     }
 
-    /// The production shape of an [`AuthenticateFn`]: it reads the password
-    /// and returns something that is not derived from it in the clear.
+    /// The production shape of a [`StartLoginFn`]: it reads the password and
+    /// returns something that is not derived from it in the clear.
     fn tidy_authenticate(
         _server_url: &str,
         _email: &str,
         _device_id: &str,
         password: &[u8],
-    ) -> Result<crate::rest::api::Authenticated, String> {
+    ) -> Result<crate::rest::api::LoginOutcome, String> {
         // Reads every byte, so this is not "a function that ignores its
         // argument and therefore cannot leak it". `black_box` keeps the read
         // from being optimised away.
@@ -9470,10 +9914,10 @@ pub(crate) mod password_lifetime_tests {
             sum = sum.wrapping_add(*b);
         }
         std::hint::black_box(sum);
-        Ok(fake_authenticated())
+        Ok(crate::rest::api::LoginOutcome::Done(fake_authenticated()))
     }
 
-    /// **The control**: an [`AuthenticateFn`] that does what a careless one
+    /// **The control**: a [`StartLoginFn`] that does what a careless one
     /// would -- copies the password onto the heap and lets the copy go.
     ///
     /// Without this, the assertions below would pass against an instrument
@@ -9484,10 +9928,10 @@ pub(crate) mod password_lifetime_tests {
         _email: &str,
         _device_id: &str,
         password: &[u8],
-    ) -> Result<crate::rest::api::Authenticated, String> {
+    ) -> Result<crate::rest::api::LoginOutcome, String> {
         let copy = String::from_utf8(password.to_vec()).expect("the probe is UTF-8");
         drop(copy);
-        Ok(fake_authenticated())
+        Ok(crate::rest::api::LoginOutcome::Done(fake_authenticated()))
     }
 
     /// A [`DirectRestLogin`] around `authenticate`, with a sink that records
@@ -9496,8 +9940,134 @@ pub(crate) mod password_lifetime_tests {
     /// The strings here are built by the caller BEFORE the watch is armed --
     /// this function only moves them -- so their own allocations are never
     /// what a measurement below is about.
+    /// **A direct-REST account does not run the CLI, and that is the whole
+    /// of the switch-over.**
+    ///
+    /// It used to. `authenticate_then_wipe` ran `bw` first and gated the
+    /// direct block on its success, which made two things impossible at
+    /// once: signing in on a machine with no `bw.exe`, and signing in to an
+    /// account with a second factor -- because `bw` cannot complete one
+    /// non-interactively, so it failed, so the code prompt built to answer
+    /// exactly that was never reached. The prompt was unreachable in every
+    /// configuration, with `bw` and without it.
+    #[test]
+    fn a_direct_rest_account_never_spawns_the_cli() {
+        let ran_cli = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&ran_cli);
+
+        let token = authenticate_then_wipe(
+            "correct horse battery staple".to_string(),
+            move |_password| {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok("a bw session token".to_string())
+            },
+            |_password| {},
+            Some(direct_rest(tidy_authenticate, &reached)),
+        );
+
+        assert!(
+            !ran_cli.load(std::sync::atomic::Ordering::SeqCst),
+            "the CLI was spawned for an account whose vault is served by talking to the \
+             server -- which is what made a machine without bw.exe unable to sign in"
+        );
+        assert!(
+            reached.load(std::sync::atomic::Ordering::SeqCst),
+            "control: the direct-REST login was not adopted either, so this test would \
+             pass against a function that simply does nothing"
+        );
+        assert_eq!(
+            token.as_deref(),
+            Ok(DIRECT_REST_SESSION),
+            "a direct-REST sign-in must report a session; `away_lock` reads an empty \
+             token as `there is no session` and would stop locking the vault"
+        );
+    }
+
+    /// **The control for the test above**: a `bw serve` account still runs
+    /// the CLI, on the same function, so the assertion up there is about
+    /// which arm was taken and not about a function that stopped spawning
+    /// anything at all.
+    #[test]
+    fn a_bw_serve_account_still_spawns_the_cli() {
+        let ran_cli = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&ran_cli);
+
+        let token = authenticate_then_wipe(
+            "correct horse battery staple".to_string(),
+            move |_password| {
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok("a bw session token".to_string())
+            },
+            |_password| {},
+            None,
+        );
+
+        assert!(ran_cli.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(token.as_deref(), Ok("a bw session token"));
+    }
+
+    /// **A failed direct-REST sign-in fails the sign-in.**
+    ///
+    /// On the old ordering this was logged and swallowed, correctly: the CLI
+    /// had already succeeded and the user WAS signed in, so the only thing
+    /// missing was a derived key the backend would notice later. With the
+    /// CLI gone from this arm there is nothing else that succeeded, and
+    /// reporting success would put a window over a vault that cannot be read.
+    #[test]
+    fn a_failed_direct_rest_sign_in_is_not_reported_as_success() {
+        fn refuses(
+            _server_url: &str,
+            _email: &str,
+            _device_id: &str,
+            _password: &[u8],
+        ) -> Result<crate::rest::api::LoginOutcome, String> {
+            Err("401 Unauthorized at /identity/connect/token".to_string())
+        }
+        let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let token = authenticate_then_wipe(
+            "correct horse battery staple".to_string(),
+            |_password| Ok("a bw session token".to_string()),
+            |_password| {},
+            Some(direct_rest(refuses, &reached)),
+        );
+
+        assert!(token.is_err(), "a refused direct-REST sign-in reported success: {token:?}");
+        assert!(
+            !reached.load(std::sync::atomic::Ordering::SeqCst),
+            "control: something was adopted despite the grant being refused"
+        );
+    }
+
+    /// **Quick unlock is enrolled on both arms.** `hello::enroll_for` seals
+    /// the master password and knows nothing about which backend serves the
+    /// vault; losing it to the reshuffle would have turned quick unlock off
+    /// for exactly the accounts the switch-over is for.
+    #[test]
+    fn windows_hello_is_enrolled_on_both_arms() {
+        for direct in [true, false] {
+            let enrolled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen = std::sync::Arc::clone(&enrolled);
+            let reached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            let _ = authenticate_then_wipe(
+                "correct horse battery staple".to_string(),
+                |_password| Ok("a bw session token".to_string()),
+                move |_password| seen.store(true, std::sync::atomic::Ordering::SeqCst),
+                direct.then(|| direct_rest(tidy_authenticate, &reached)),
+            );
+
+            assert!(
+                enrolled.load(std::sync::atomic::Ordering::SeqCst),
+                "quick unlock was not enrolled on the {} arm",
+                if direct { "direct-REST" } else { "bw serve" }
+            );
+        }
+    }
+
     fn direct_rest(
-        authenticate: AuthenticateFn,
+        start: StartLoginFn,
         reached: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> DirectRestLogin {
         let reached = std::sync::Arc::clone(reached);
@@ -9505,7 +10075,11 @@ pub(crate) mod password_lifetime_tests {
             server_url: "https://vault.example.com".to_string(),
             email: "someone@example.com".to_string(),
             device_id: "00000000-0000-0000-0000-000000000000".to_string(),
-            authenticate,
+            second_factor: SecondFactorSeam { start, ..PRODUCTION_SECOND_FACTOR },
+            // No prompt, so the worker cannot reach a second-factor stage and
+            // the whole of what is measured here is the first grant. The
+            // completion loop has its own probe below.
+            prompt: None,
             adopt: std::sync::Arc::new(move |_authenticated| {
                 reached.store(true, std::sync::atomic::Ordering::Relaxed);
             }),
@@ -9527,6 +10101,93 @@ pub(crate) mod password_lifetime_tests {
             direct,
         );
         assert!(answer.is_ok(), "control: the fixture's CLI arm refused");
+    }
+
+    // ---- the third boundary: the prompt the worker blocks on ----------------
+    //
+    // `complete_second_factor` holds the challenge -- the derived password
+    // hash and the master key -- for as long as somebody takes to read six
+    // digits off a phone. The two guards above measure a sign-in that never
+    // reaches that arm, because `rest::api::Challenge` has no constructor
+    // outside its own module and a test cannot build one. What CAN be measured
+    // is the loop itself, over a stand-in challenge that carries the probe:
+    // whatever the real one holds, the loop must add no copy of its own.
+
+    /// A seam that reads the challenge and answers, without copying it.
+    fn tidy_seam() -> SecondFactorSeam<String> {
+        SecondFactorSeam::<String> {
+            start: |_, _, _, _| Err("the loop never grants".to_string()),
+            send_email: |challenge| {
+                std::hint::black_box(challenge.len());
+                Ok(())
+            },
+            finish: |challenge, _answer| {
+                std::hint::black_box(challenge.len());
+                Ok(fake_authenticated())
+            },
+        }
+    }
+
+    /// Drives one send and one accepted code over a challenge built INSIDE, so
+    /// that what is measured is the whole of that value's life rather than
+    /// half of it.
+    fn drive_the_prompt(seam: &SecondFactorSeam<String>) {
+        let challenge = zeroize::Zeroizing::new(probe_password());
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (report_tx, _report_rx) = std::sync::mpsc::channel();
+        cmd_tx.send(SecondFactorCommand::SendEmail).expect("the receiver is alive");
+        cmd_tx
+            .send(SecondFactorCommand::Answer(crate::rest::api::SecondFactorAnswer::new(
+                crate::rest::api::SecondFactor::Authenticator,
+                "123456",
+            )))
+            .expect("the receiver is alive");
+        let answer = complete_second_factor(seam, &challenge, &cmd_rx, &report_tx);
+        assert!(answer.is_some(), "control: the fixture's code was accepted");
+    }
+
+    /// **The prompt's loop copies nothing out of the challenge it is holding.**
+    ///
+    /// The challenge here is a `Zeroizing<String>` carrying the probe, which is
+    /// the shape of the real one's `password_hash`. The loop borrows it, hands
+    /// it to the seam and returns; nothing on that path may put it on the heap
+    /// in the clear -- and this is the path that stays open for minutes rather
+    /// than microseconds, which is why it is measured separately from the
+    /// grant.
+    #[test]
+    fn the_completion_loop_does_not_release_the_challenge_in_the_clear() {
+        let bare = probe_password();
+        assert!(
+            plaintext_reached_the_allocator(move || drop(bare)),
+            "control: an ordinary String's plaintext went past the allocator unnoticed, so \
+             every assertion below is about an instrument that sees nothing"
+        );
+
+        // The control that matters for THIS boundary: a seam that copies the
+        // challenge onto the heap and lets the copy go is seen. Without it,
+        // the assertion below would pass against a loop nobody could observe.
+        let leaky = SecondFactorSeam::<String> {
+            finish: |challenge, _answer| {
+                let copy = challenge.clone();
+                drop(copy);
+                Ok(fake_authenticated())
+            },
+            ..tidy_seam()
+        };
+        assert!(
+            plaintext_reached_the_allocator(move || drive_the_prompt(&leaky)),
+            "control: a seam that copied the challenge and dropped the copy went past \
+             unnoticed, so the assertion below is about an instrument that cannot see a leak \
+             in the loop the user waits inside"
+        );
+
+        let tidy = tidy_seam();
+        assert!(
+            !plaintext_reached_the_allocator(move || drive_the_prompt(&tidy)),
+            "the second-factor loop released the challenge's plaintext to the allocator. \
+             This loop is the one that blocks on a human: whatever it copies lives for as \
+             long as the user takes to find their phone"
+        );
     }
 
     /// **The exit the `close_on_success: false` host never takes.** A window
@@ -9653,14 +10314,14 @@ pub(crate) mod password_lifetime_tests {
         );
     }
 
-    /// An [`AuthenticateFn`] that panics where a real one can: after the
+    /// A [`StartLoginFn`] that panics where a real one can: after the
     /// password has been handed to it and before it has answered.
     fn panicking_authenticate(
         _server_url: &str,
         _email: &str,
         _device_id: &str,
         password: &[u8],
-    ) -> Result<crate::rest::api::Authenticated, String> {
+    ) -> Result<crate::rest::api::LoginOutcome, String> {
         std::hint::black_box(password.len());
         panic!("deliberate: unwinding out of a direct-REST derivation");
     }
@@ -10332,8 +10993,12 @@ mod status_deadline_tests {
             "a test module below the cut is never closed by a column-0 `}}`, so the walk ran \
              off the end of the file inside it and stopped inspecting top-level lines"
         );
+        // 12 before this branch. The second factor added four: the two that
+        // watch its worker-side boundary and its completion loop, the one over
+        // the window's end of the prompt channel, and the one that holds the
+        // retired "run `bw login` in a terminal" message down.
         assert_eq!(
-            modules, 12,
+            modules, 16,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -10444,6 +11109,540 @@ mod status_deadline_tests {
                 1,
                 "control: the string-literal exception {known:?} is not in this file exactly \
                  once, so it is stale and is widening this check for nothing"
+            );
+        }
+    }
+}
+
+/// **The second factor's boundary: what leaves the worker thread.**
+///
+/// The `Challenge` carries the derived password hash and the master key. It is
+/// born on the worker thread and dies there. These tests are the statement of
+/// that, in the two forms this crate can check: a source pin over the types
+/// that cross, and a compile-time check that the crossing types are the only
+/// ones the window is given.
+#[cfg(test)]
+mod second_factor_boundary {
+    use super::*;
+
+    /// Reads this file's own source, in the other source pins' idiom, because
+    /// the property is about a struct DEFINITION and no runtime value can show
+    /// it.
+    fn definition_of(name: &str) -> String {
+        let source = include_str!("login_ui.rs");
+        let opener = format!("pub struct {name} {{");
+        source
+            .split_once(&opener)
+            .unwrap_or_else(|| panic!("{name} must be defined in this file"))
+            .1
+            .split_once("\n}")
+            .expect("the definition must be brace-terminated")
+            .0
+            .to_string()
+    }
+
+    /// The request the worker sends UP carries providers and nothing else.
+    #[test]
+    fn the_request_carries_no_credential() {
+        let body = definition_of("SecondFactorRequest");
+        assert!(
+            body.contains("providers"),
+            "control: the definition was found and has the field this is about; got {body:?}"
+        );
+        for forbidden in ["Challenge", "MasterKey", "password", "hash", "Zeroizing"] {
+            assert!(
+                !body.contains(forbidden),
+                "SecondFactorRequest must not carry `{forbidden}`: it crosses to a frame \
+                 closure that outlives the stage. got {body:?}"
+            );
+        }
+    }
+
+    /// The command the window sends DOWN carries digits and nothing else --
+    /// in particular it does not carry the challenge back, which would mean
+    /// the window had held it.
+    #[test]
+    fn the_command_carries_no_credential() {
+        let source = include_str!("login_ui.rs");
+        let body = source
+            .split_once(concat!("pub enum SecondFactor", "Command {"))
+            .expect("SecondFactorCommand must be defined in this file")
+            .1
+            .split_once("\n}")
+            .expect("the definition must be brace-terminated")
+            .0;
+        assert!(
+            body.contains("Answer"),
+            "control: the definition was found; got {body:?}"
+        );
+        for forbidden in ["Challenge", "MasterKey", "password"] {
+            assert!(
+                !body.contains(forbidden),
+                "SecondFactorCommand must not carry `{forbidden}`; got {body:?}"
+            );
+        }
+    }
+
+    /// `SecondFactorRequest` is `Send` (it crosses the channel) and the
+    /// challenge is not in it. Compile-time, so it cannot rot.
+    #[test]
+    fn the_request_is_the_thing_that_crosses() {
+        fn assert_send<T: Send>() {}
+        assert_send::<SecondFactorRequest>();
+        assert_send::<SecondFactorCommand>();
+    }
+
+    /// The production seam is wired to the real functions and not to a stub
+    /// somebody left in while testing.
+    #[test]
+    fn the_production_seam_is_not_a_stub() {
+        // Line endings normalised first: this is a CRLF checkout of an LF
+        // blob, so a needle containing a newline matches on one machine and
+        // vacuously fails on the other. The other pins here split on a needle
+        // whose newline is the FIRST character, which survives either way;
+        // this one splits after a semicolon, and does not.
+        let source = include_str!("login_ui.rs").replace("\r\n", "\n");
+        let body = source
+            .split_once(concat!("pub const PRODUCTION_SECOND_", "FACTOR: SecondFactorSeam"))
+            .expect("the production seam must exist")
+            .1
+            .split_once(";\n")
+            .expect("the const must be terminated")
+            .0;
+        assert!(body.len() > 40, "control: the seam's body is not empty");
+        for real in ["start_direct_rest", "send_direct_rest_email", "finish_direct_rest"] {
+            assert!(body.contains(real), "the seam must be wired to {real}; got {body:?}");
+        }
+        // And the three helpers it names call `rest::api`'s own routes rather
+        // than reimplementing a grant. Read from the production half, so a
+        // fixture in a test module below cannot satisfy this.
+        let production = &source[..source.find(concat!("\n#[cfg(", "test)]")).expect("the cut")];
+        for route in ["authenticate(", "send_email_code(", "finish_second_factor("] {
+            assert!(
+                production.contains(route),
+                "no production call to rest::api's {route} -- the seam is a stub"
+            );
+        }
+    }
+
+    /// **A wrong code is not a broken network.** Vaultwarden answers a bad
+    /// token by re-sending the challenge body, so the failure that reaches
+    /// this classifier for the commonest mistake a user makes is
+    /// `TwoFactorRequired` -- and reporting that as "couldn't reach the
+    /// server" would send somebody to check their wifi over a mistyped digit.
+    #[test]
+    fn a_re_challenged_grant_reads_as_a_rejected_code() {
+        use crate::rest::api::RestError;
+        use crate::second_factor_ui::Trouble;
+
+        for rejection in [
+            RestError::TwoFactorRequired { providers: vec!["0".to_string()] },
+            RestError::InvalidCredentials,
+            RestError::Unauthorized,
+            RestError::Rejected {
+                error: "invalid_grant".to_string(),
+                description: "Two-step token is invalid.".to_string(),
+            },
+        ] {
+            assert_eq!(
+                trouble_for(&rejection),
+                Trouble::CodeRejected,
+                "{rejection:?} is how a server says no to a code"
+            );
+        }
+
+        // The control, and the reason this function exists at all: something
+        // that is NOT a rejected code must not be reported as one.
+        assert_eq!(
+            trouble_for(&RestError::Transport("dns failure".to_string())),
+            Trouble::Unreachable,
+            "a request that never got an answer is not a wrong code"
+        );
+        assert_eq!(
+            trouble_for(&RestError::Parse("access_token")),
+            Trouble::Unreachable,
+            "an answer this client could not read is not the user's code being wrong"
+        );
+    }
+
+    /// **The challenge is bound in one arm and never printed.**
+    ///
+    /// It is not `Debug`, so a `{:?}` of it would not compile -- but `Display`
+    /// is not the only way to spill one, and this file's own habit is to log
+    /// generously. What this pins is that the production half binds a
+    /// challenge in exactly one place, does not clone it, and never puts the
+    /// binding into a formatting argument.
+    #[test]
+    fn the_challenge_is_bound_once_and_never_formatted() {
+        let source = include_str!("login_ui.rs").replace("\r\n", "\n");
+        let production = &source[..source.find(concat!("\n#[cfg(", "test)]")).expect("the cut")];
+
+        assert_eq!(
+            production.matches("NeedsSecondFactor(challenge)").count(),
+            1,
+            "control: the arm that binds a challenge is not in the production half exactly \
+             once, so everything below this line is about a file that no longer has one"
+        );
+        for spill in ["{challenge", "challenge:?", "challenge.clone()", "format!(\"{challenge"] {
+            assert!(
+                !production.contains(spill),
+                "`{spill}` in login_ui's production half: the challenge holds the derived \
+                 password hash and the master key, and it is not a formatter's business"
+            );
+        }
+    }
+}
+
+/// **The completion loop, driven the way a user drives it.**
+///
+/// The challenge here is a `&'static str` and not a
+/// `crate::rest::api::Challenge`, because that type has no constructor outside
+/// its own module and must not grow one -- see [`SecondFactorSeam`]'s note on
+/// why the seam is generic. Nothing in this loop reads the challenge; it hands
+/// it back to the seam, which is exactly what production does.
+#[cfg(test)]
+mod second_factor_worker {
+    use super::password_lifetime_tests::fake_authenticated;
+    use super::*;
+    use crate::second_factor_ui::Trouble;
+    use std::sync::mpsc;
+
+    /// The stand-in challenge. What matters about it is that the loop passes
+    /// it through untouched on every attempt -- the same one, never a new
+    /// grant.
+    fn fake_challenge() -> &'static str {
+        "a challenge the loop never looks inside"
+    }
+
+    fn totp_answer(code: &str) -> SecondFactorCommand {
+        SecondFactorCommand::Answer(crate::rest::api::SecondFactorAnswer::new(
+            crate::rest::api::SecondFactor::Authenticator,
+            code,
+        ))
+    }
+
+    fn refused(log: &str) -> GrantRefusal {
+        GrantRefusal { trouble: Trouble::CodeRejected, log: log.to_string() }
+    }
+
+    /// **A wrong code is retried against the SAME challenge.** The whole point
+    /// of the feature: the hash the first grant derived is still on this
+    /// thread, so a second attempt costs one round trip and not six hundred
+    /// thousand PBKDF2 iterations plus a re-typed master password.
+    #[test]
+    fn a_rejected_code_is_retried_without_a_new_grant() {
+        static FINISHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        FINISHES.store(0, std::sync::atomic::Ordering::SeqCst);
+        STARTS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let seam = SecondFactorSeam::<&'static str> {
+            start: |_, _, _, _| {
+                STARTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err("the loop must not re-grant".to_string())
+            },
+            send_email: |_| Ok(()),
+            finish: |challenge, _answer| {
+                assert_eq!(
+                    *challenge,
+                    "a challenge the loop never looks inside",
+                    "the retry must carry the challenge the first grant produced"
+                );
+                let n = FINISHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Err(GrantRefusal {
+                        trouble: Trouble::CodeRejected,
+                        log: "400 Bad Request /identity/connect/token".to_string(),
+                    })
+                } else {
+                    Ok(fake_authenticated())
+                }
+            },
+        };
+
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (report_tx, report_rx) = mpsc::channel();
+        cmd_tx.send(totp_answer("123456")).unwrap();
+        cmd_tx.send(totp_answer("654321")).unwrap();
+
+        let outcome = complete_second_factor(&seam, &fake_challenge(), &cmd_rx, &report_tx);
+
+        assert!(outcome.is_some(), "the second code signs the user in");
+        assert_eq!(
+            FINISHES.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "control: both codes reached the server"
+        );
+        assert_eq!(
+            STARTS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a rejected code must NOT re-derive the master key -- that is the re-typed \
+             master password this feature removes"
+        );
+        let troubles: Vec<_> = report_rx.try_iter().collect();
+        assert_eq!(
+            troubles,
+            vec![Trouble::CodeRejected],
+            "the window was told exactly once, and told it was the CODE"
+        );
+    }
+
+    /// The loop reports the trouble the seam classified, and does not invent
+    /// one of its own. A server that could not be reached must not read as a
+    /// wrong code.
+    #[test]
+    fn the_reported_trouble_is_the_one_the_grant_diagnosed() {
+        let seam = SecondFactorSeam::<&'static str> {
+            start: |_, _, _, _| Err("unused".to_string()),
+            send_email: |_| Ok(()),
+            finish: |_, _| {
+                Err(GrantRefusal {
+                    trouble: Trouble::Unreachable,
+                    log: "the server could not be reached".to_string(),
+                })
+            },
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (report_tx, report_rx) = mpsc::channel();
+        cmd_tx.send(totp_answer("123456")).unwrap();
+        cmd_tx.send(SecondFactorCommand::Abandon).unwrap();
+
+        assert!(complete_second_factor(&seam, &fake_challenge(), &cmd_rx, &report_tx).is_none());
+        assert_eq!(
+            report_rx.try_iter().collect::<Vec<_>>(),
+            vec![Trouble::Unreachable],
+            "a dead network reported as a rejected code sends the user to re-read a code \
+             that was fine"
+        );
+
+        // Control on the same loop: a refusal classified as a rejected code
+        // still arrives as one, so the assertion above is about the loop
+        // forwarding a classification and not about it having one hard-coded.
+        let rejecting = SecondFactorSeam::<&'static str> {
+            finish: |_, _| Err(refused("400 Bad Request")),
+            ..seam
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (report_tx, report_rx) = mpsc::channel();
+        cmd_tx.send(totp_answer("123456")).unwrap();
+        cmd_tx.send(SecondFactorCommand::Abandon).unwrap();
+        assert!(
+            complete_second_factor(&rejecting, &fake_challenge(), &cmd_rx, &report_tx).is_none()
+        );
+        assert_eq!(report_rx.try_iter().collect::<Vec<_>>(), vec![Trouble::CodeRejected]);
+    }
+
+    /// A failed send reports `EmailSendFailed` and leaves the loop running --
+    /// the user can press the button again, and their earlier code (if any) is
+    /// still good.
+    #[test]
+    fn a_failed_send_is_not_a_rejected_code() {
+        let seam = SecondFactorSeam::<&'static str> {
+            start: |_, _, _, _| Err("unused".to_string()),
+            send_email: |_| {
+                Err("503 Service Unavailable /api/two-factor/send-email-login".to_string())
+            },
+            finish: |_, _| Ok(fake_authenticated()),
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (report_tx, report_rx) = mpsc::channel();
+        cmd_tx.send(SecondFactorCommand::SendEmail).unwrap();
+        cmd_tx.send(SecondFactorCommand::Abandon).unwrap();
+
+        let outcome = complete_second_factor(&seam, &fake_challenge(), &cmd_rx, &report_tx);
+
+        assert!(outcome.is_none(), "abandoning produces no session");
+        assert_eq!(
+            report_rx.try_iter().collect::<Vec<_>>(),
+            vec![Trouble::EmailSendFailed],
+            "a failed send must not read as a rejected code"
+        );
+    }
+
+    /// A send that worked says nothing at all: the window has already put its
+    /// own notice up, and a report would overwrite it with a message about a
+    /// failure that did not happen.
+    #[test]
+    fn a_send_that_worked_reports_nothing() {
+        let seam = SecondFactorSeam::<&'static str> {
+            start: |_, _, _, _| Err("unused".to_string()),
+            send_email: |_| Ok(()),
+            finish: |_, _| Ok(fake_authenticated()),
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (report_tx, report_rx) = mpsc::channel();
+        cmd_tx.send(SecondFactorCommand::SendEmail).unwrap();
+        cmd_tx.send(SecondFactorCommand::Abandon).unwrap();
+
+        assert!(complete_second_factor(&seam, &fake_challenge(), &cmd_rx, &report_tx).is_none());
+        assert!(
+            report_rx.try_iter().next().is_none(),
+            "a send that succeeded is not a trouble"
+        );
+    }
+
+    /// A closed command channel -- the window went away -- ends the loop and
+    /// drops the challenge, rather than blocking a detached thread forever.
+    #[test]
+    fn a_closed_window_ends_the_loop() {
+        let seam = SecondFactorSeam::<&'static str> {
+            start: |_, _, _, _| Err("unused".to_string()),
+            send_email: |_| Ok(()),
+            finish: |_, _| panic!("nothing was answered, so nothing may be finished"),
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel::<SecondFactorCommand>();
+        let (report_tx, _report_rx) = mpsc::channel();
+        drop(cmd_tx);
+        assert!(complete_second_factor(&seam, &fake_challenge(), &cmd_rx, &report_tx).is_none());
+    }
+
+    /// **A window that closed while the code was in flight does not keep the
+    /// worker alive.** The loop's own answer is `Some`, and the caller's
+    /// `adopt` sink is what decides whether that matters -- but the loop must
+    /// not go round again looking for a command nobody will send.
+    #[test]
+    fn a_successful_code_ends_the_loop_immediately() {
+        static FINISHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        FINISHES.store(0, std::sync::atomic::Ordering::SeqCst);
+        let seam = SecondFactorSeam::<&'static str> {
+            start: |_, _, _, _| Err("unused".to_string()),
+            send_email: |_| Ok(()),
+            finish: |_, _| {
+                FINISHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(fake_authenticated())
+            },
+        };
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (report_tx, _report_rx) = mpsc::channel();
+        cmd_tx.send(totp_answer("123456")).unwrap();
+        cmd_tx.send(totp_answer("999999")).unwrap();
+
+        assert!(complete_second_factor(&seam, &fake_challenge(), &cmd_rx, &report_tx).is_some());
+        assert_eq!(
+            FINISHES.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the loop kept going after it had a session, and answered a second code with a \
+             grant nobody asked for"
+        );
+    }
+}
+
+/// **The window's end of the prompt.**
+#[cfg(test)]
+mod second_factor_channel_tests {
+    use super::*;
+    use crate::rest::api::SecondFactor;
+    use crate::second_factor_ui::Trouble;
+
+    /// The request arrives whole, and the two ends the worker got are the two
+    /// ends the window is talking to.
+    #[test]
+    fn asking_hands_the_window_the_providers_and_a_working_pair_of_channels() {
+        let (prompt, sessions) = second_factor_channel();
+        let (commands, troubles) = prompt
+            .ask(SecondFactorRequest {
+                providers: vec![SecondFactor::Unsupported(7), SecondFactor::Authenticator],
+            })
+            .expect("control: a live window accepts the request");
+
+        let session = sessions.try_recv().expect("the request reached the window");
+        assert_eq!(
+            session.request.providers,
+            vec![SecondFactor::Unsupported(7), SecondFactor::Authenticator],
+            "the whole offer must arrive -- the unsupported entries are what name Duo"
+        );
+
+        // Down: the window's command reaches the worker's receiver.
+        session.commands.send(SecondFactorCommand::Abandon).expect("the worker is listening");
+        assert!(
+            matches!(commands.try_recv(), Ok(SecondFactorCommand::Abandon)),
+            "the window's command did not reach the worker's end of the channel"
+        );
+
+        // Up: the worker's trouble reaches the window's receiver.
+        troubles.send(Trouble::CodeRejected).expect("the window is listening");
+        assert_eq!(session.troubles.try_recv(), Ok(Trouble::CodeRejected));
+    }
+
+    /// **A window that has already gone is answered `None`**, which is what
+    /// makes the worker drop the challenge instead of blocking on a channel
+    /// nobody will ever send down.
+    #[test]
+    fn a_window_that_went_away_declines_the_prompt() {
+        let (prompt, sessions) = second_factor_channel();
+        drop(sessions);
+        assert!(
+            prompt
+                .ask(SecondFactorRequest { providers: vec![SecondFactor::Authenticator] })
+                .is_none(),
+            "a dead window accepted a prompt, so the worker will block forever holding the \
+             master key"
+        );
+
+        // Control: the same call against a live window is accepted, so the
+        // `None` above is about the window being gone.
+        let (prompt, _sessions) = second_factor_channel();
+        assert!(prompt
+            .ask(SecondFactorRequest { providers: vec![SecondFactor::Authenticator] })
+            .is_some());
+    }
+}
+
+/// The message this branch is named after, and what replaced it.
+#[cfg(test)]
+mod two_step_message_tests {
+    use super::*;
+
+    /// **The message that sent people to a terminal is gone.**
+    ///
+    /// This is the message `login_ui.rs:486` carried before this branch, and
+    /// the whole of the second-factor prompt exists to replace it. The
+    /// positive control is the arm beside it: a mistyped password still gets
+    /// its own wording, so a `friendly_auth_error` that had stopped matching
+    /// anything at all would fail here rather than pass.
+    #[test]
+    fn no_two_step_failure_tells_the_user_to_open_a_terminal() {
+        let two_step = friendly_auth_error("Two-step login is required");
+        assert!(
+            !two_step.contains("bw login") && !two_step.to_lowercase().contains("terminal"),
+            "got {two_step:?}"
+        );
+        assert!(
+            two_step.to_lowercase().contains("try again")
+                || two_step.to_lowercase().contains("two-step"),
+            "the arm must still SAY something about two-step login; got {two_step:?}"
+        );
+        assert!(
+            friendly_auth_error("error=The decryption operation failed")
+                .contains("master password"),
+            "control: friendly_auth_error still recognises its other arms"
+        );
+    }
+
+    /// And no other arm of it sends anybody to a terminal either -- the whole
+    /// point being that this app now has a card for the thing it used to
+    /// delegate.
+    #[test]
+    fn nothing_this_function_says_mentions_the_cli() {
+        let said: Vec<String> = [
+            "Two-step login is required",
+            "error=The decryption operation failed",
+            "invalid username or password",
+            "too many requests",
+            "ECONNREFUSED",
+            "something nobody has an arm for",
+        ]
+        .iter()
+        .map(|stderr| friendly_auth_error(stderr))
+        .collect();
+        assert!(
+            said.iter().any(|m| m.contains("master password")),
+            "control: these inputs really do reach this function's arms; got {said:?}"
+        );
+        for message in &said {
+            assert!(
+                !message.contains("bw ") && !message.to_lowercase().contains("terminal"),
+                "a user-facing sign-in message names the CLI: {message:?}"
             );
         }
     }

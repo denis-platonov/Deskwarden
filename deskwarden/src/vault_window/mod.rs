@@ -11875,7 +11875,7 @@ mod folder_drop_tests {
     //! Both halves are here: the list's entry and the returned message.
     //!
     //! These drive `move_item_into_folder` against a real `VaultCache` over a
-    //! real HTTP server (mockito), so the success path is a write that
+    //! real HTTP server ([`crate::test_http`]), so the success path is a write that
     //! actually reached a backend and the failure path is a backend that
     //! actually refused -- not a stubbed `Result`.
     use super::*;
@@ -11906,7 +11906,7 @@ mod folder_drop_tests {
 
     #[test]
     fn a_move_the_backend_accepts_files_the_item_and_says_nothing() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         // Answers the way the backend does -- with the item, carrying the
         // `revisionDate` this write minted. `move_item_into_folder` must adopt
         // THAT, not the optimistic local rebuild it painted first; see
@@ -11944,7 +11944,7 @@ mod folder_drop_tests {
         // so this is not "the failure arm forgot to touch anything" -- the
         // entry really is rewritten and really is put back. Asserted on the
         // FOLDER, which is the only thing a move may change.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _put = server.mock("PUT", "/object/item/i1").with_status(500).create();
         let cache = VaultCache::new(VaultBridge::new(server.url()));
         let (ctx, reauth) = ctx_and_reauth();
@@ -11968,7 +11968,7 @@ mod folder_drop_tests {
     fn a_refused_move_leaves_the_rest_of_the_item_untouched_too() {
         // The revert restores the whole entry, not a patched folder: anything
         // `with_folder` normalises on the way through must come back as well.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _put = server.mock("PUT", "/object/item/i1").with_status(500).create();
         let cache = VaultCache::new(VaultBridge::new(server.url()));
         let (ctx, reauth) = ctx_and_reauth();
@@ -12010,7 +12010,7 @@ mod folder_drop_tests {
         // re-authenticates. The revert must not be skipped on the way out --
         // the snapshot survives a re-auth, and a row left looking moved would
         // still be wrong when the window came back.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _put = server.mock("PUT", "/object/item/i1").with_status(401).create();
         let cache = VaultCache::new(VaultBridge::new(server.url()));
         let (ctx, reauth) = ctx_and_reauth();
@@ -13902,7 +13902,7 @@ mod spawn_vault_load_tests {
 
     #[test]
     fn a_forced_refresh_populates_and_sends_ok_when_bw_serve_is_ready() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let _items = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -13950,7 +13950,7 @@ mod spawn_vault_load_tests {
     /// not lost: it is logged one line above the send.
     #[test]
     fn a_failed_populate_reports_prose_rather_than_a_debug_rendering() {
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         // Answers, so the readiness probe passes, but fails the actual list --
         // which is what reaches `cache.populate()`'s `Err` arm rather than any
         // of the era-checked refusals around it.
@@ -14028,7 +14028,7 @@ mod spawn_vault_load_tests {
         // must be skipped entirely, leaving only the one `list_items()`
         // `populate()` itself makes. `.expect(1)` fails the mock (and this
         // test) if the endpoint is hit more than once.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let items = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -14071,7 +14071,7 @@ mod spawn_vault_load_tests {
         // `wait_for_vault_ready`, once by `populate()` -- so this is the
         // behaviour Minor 3's exemption must NOT apply when the caller does
         // not already know the backend is up.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let items = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -14115,7 +14115,7 @@ mod spawn_vault_load_tests {
         // `.expect(1)`, satisfied by the manual populate below and nothing
         // else) and nothing is painted -- `Err`, so
         // `apply_vault_load_result` keeps whatever is already on screen.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let items = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -14187,7 +14187,7 @@ mod spawn_vault_load_tests {
         // (both mocks are `.expect(1)`, spent by the manual populate), and
         // the items and folders it sends come from ONE
         // `snapshot_unless_superseded` call, so they cannot be from two eras.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let items = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -14245,7 +14245,7 @@ mod spawn_vault_load_tests {
         // fetching and strictly before it writes back. The forced refresh
         // must report a failure, not the pre-clear items, and not the empty
         // vault the clear left behind.
-        let mut server = mockito::Server::new();
+        let mut server = crate::test_http::server();
         let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
         let _items = server
             .mock("GET", "/list/object/items")

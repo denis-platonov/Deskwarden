@@ -220,7 +220,19 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rsa = "0.9"
 
 [dev-dependencies]
+# `mockito` is down to ONE user: `main.rs`'s tests. It is a different crate
+# that reaches this one through `deskwarden::`, so the library's
+# `#[cfg(test)]` `test_http` module is not visible to it at all. Everything in
+# the library moved off it -- see `src/test_http.rs` for the `os error 10054`
+# measurements that made that necessary -- and `test_http`'s
+# `no_module_in_this_crate_builds_a_mockito_server` is what keeps it moved.
 mockito = "1"
+# The engine behind `test_http::Matcher::Regex`, which five call sites use.
+# ALREADY IN THE TREE: `mockito` depends on it, at this version, for exactly
+# the same matcher. Naming it here adds a line and no crate, and it is named
+# rather than reimplemented because a hand-rolled substring match would
+# silently accept the first pattern in this crate that is a real expression.
+regex = "1"
 
 [build-dependencies]
 # Embeds assets/deskwarden.ico as the executable's icon resource (see
