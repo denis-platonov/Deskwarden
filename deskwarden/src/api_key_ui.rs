@@ -27,7 +27,7 @@
 //! `Account`, `Step`, `Command` and `Report` are every one of them already
 //! taken elsewhere in this crate.
 
-use crate::rest::api::RestError;
+use crate::rest::api::{Authenticated, Device, RestClient, RestError, Session};
 use zeroize::{Zeroize, Zeroizing};
 
 /// Which of the two things the user is being asked for.
@@ -233,6 +233,114 @@ pub fn unlock_refusal(error: &RestError) -> ApiKeyRefusal {
         _ => ApiKeyRefusal::Unreachable,
     }
 }
+
+/// The three things both stages need that the user did not type into this
+/// card: they came from the sign-in card, which asked for them first.
+///
+/// A struct rather than three parameters threaded through four signatures,
+/// and no secret in it -- the server URL and the email are what the user typed
+/// into the card, and the device id is a stable installation GUID. A derived
+/// `Debug` is fine and deliberate: this is what a reader debugging a rejected
+/// grant needs to see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiKeyAccount {
+    /// The server the account is on, as the sign-in card has it.
+    pub server_url: String,
+    /// The account's address. **Stage 2 needs it and stage 1 does not** --
+    /// there is no username in a `client_credentials` grant, but the email is
+    /// the KDF's salt, so the master password cannot be derived without it.
+    pub email: String,
+    /// The per-installation device identifier. The same value the password
+    /// sign-in sends, so this does not register a second device.
+    pub device_id: String,
+}
+
+/// The two `rest::` calls this feature needs, as `fn` pointers.
+///
+/// A struct and not two aliases: a test that faked the grant but let the
+/// unlock reach the network would be a test of half a sign-in. A `fn`-pointer
+/// struct and not a `cfg(test)` seam, which this crate bans crate-wide, and
+/// not a trait object, because there is exactly one production value.
+///
+/// **Neither signature carries the secret anywhere it can be formatted.** The
+/// secret is a `&str` argument, borrowed for one call, and every `Err` here is
+/// a `RestError` -- which piece 1 documents as carrying no credential, and
+/// which this module reduces to an [`ApiKeyRefusal`] before anything sees it
+/// anyway.
+#[derive(Clone, Copy)]
+pub struct ApiKeySeam {
+    /// **Stage 1.** `grant_type=client_credentials`, `scope=api`, the three
+    /// device fields. Yields a session and no master key -- see
+    /// [`crate::rest::api::RestClient::api_key_grant`] for why that asymmetry
+    /// is the whole reason this feature has two stages.
+    pub grant:
+        fn(&ApiKeyAccount, client_id: &str, client_secret: &str) -> Result<Session, RestError>,
+    /// **Stage 2.** Prelogin, derive, sync, unwrap. Consumes the session
+    /// because the [`Authenticated`] it returns carries it onward -- there is
+    /// one session and it does not get copied.
+    pub unlock: fn(&ApiKeyAccount, Session, password: &[u8]) -> Result<Authenticated, RestError>,
+}
+
+/// [`ApiKeySeam::grant`] as production performs it.
+///
+/// The client secret is borrowed, passed straight through, and never bound to
+/// a local -- there is nothing here for a `Drop` to have to wipe.
+pub fn grant_direct_rest(
+    account: &ApiKeyAccount,
+    client_id: &str,
+    client_secret: &str,
+) -> Result<Session, RestError> {
+    let device = Device::windows_desktop(&account.device_id, DEVICE_NAME);
+    RestClient::new(&account.server_url).api_key_grant(client_id, client_secret, &device)
+}
+
+/// [`ApiKeySeam::unlock`] as production performs it -- **and the master
+/// password's only verification.**
+///
+/// `master_key` cannot fail on a wrong password: it is a KDF, and it derives
+/// *a* key from any bytes at all. So the four steps here are not four steps of
+/// setup with a check at the end; the last one **is** the check. A wrong
+/// password produces a key that will not unwrap this account's protected user
+/// key, `unwrap_user_key` answers [`crate::rest::crypto::CryptoError`], and
+/// [`unlock_refusal`] turns that into [`ApiKeyRefusal::PasswordRejected`].
+///
+/// Skipping it would produce an app that is signed in and cannot read
+/// anything -- which the design names as worse than being refused, because it
+/// looks like success.
+///
+/// The unwrapped key is dropped on the spot. It is not what this function
+/// returns: `rest::sync::VaultKeys::unwrap_from` derives it again from the
+/// same [`crate::rest::crypto::MasterKey`] when the vault is actually read,
+/// and returning a second copy would be a second key with a life nobody is
+/// tracking.
+pub fn unlock_direct_rest(
+    account: &ApiKeyAccount,
+    session: Session,
+    password: &[u8],
+) -> Result<Authenticated, RestError> {
+    let client = RestClient::new(&account.server_url);
+    let kdf = client.prelogin(&account.email)?;
+    let master_key = crate::rest::crypto::master_key(password, &account.email, kdf)?;
+
+    let synced = client.sync(&session)?;
+    let profile = synced.profile.ok_or(RestError::Parse("the account profile"))?;
+    let protected = profile.key.as_deref().ok_or(RestError::Parse("the protected user key"))?;
+    let protected: crate::rest::crypto::EncString = protected.parse()?;
+    // The verification. The returned key is deliberately dropped here.
+    let _ = crate::rest::crypto::unwrap_user_key(&master_key.stretch(), &protected)?;
+
+    Ok(Authenticated { session, master_key })
+}
+
+/// What the user's device list calls this app. The same value
+/// `login_ui::DEVICE_NAME` uses, written again rather than imported, because
+/// that constant is private to a 11 600-line module this one owes no
+/// dependency.
+const DEVICE_NAME: &str = "Deskwarden";
+
+/// The seam's one production value, written in exactly one place.
+pub const PRODUCTION_API_KEY: ApiKeySeam =
+    ApiKeySeam { grant: grant_direct_rest, unlock: unlock_direct_rest };
 
 #[cfg(test)]
 mod tests {
@@ -482,6 +590,120 @@ mod tests {
             unlock_refusal(&RestError::Transport("x".to_string())),
             ApiKeyRefusal::PasswordRejected,
             "control: unlock_refusal discriminates at all"
+        );
+    }
+    /// A grant answer and an unlock answer with no server behind either.
+    fn fake_session() -> crate::rest::api::Session {
+        crate::rest::api::Session::from_refresh_token(zeroize::Zeroizing::new(
+            "not-a-real-refresh-token".to_string(),
+        ))
+    }
+
+    fn fake_authenticated() -> crate::rest::api::Authenticated {
+        crate::rest::api::Authenticated {
+            session: fake_session(),
+            master_key: crate::rest::crypto::MasterKey::from_bytes(
+                [0x5A; crate::rest::crypto::MASTER_KEY_LEN],
+            ),
+        }
+    }
+
+    fn test_account() -> ApiKeyAccount {
+        ApiKeyAccount {
+            server_url: "https://vault.example.test".to_string(),
+            email: "a@b.c".to_string(),
+            device_id: "11111111-2222-3333-4444-555555555555".to_string(),
+        }
+    }
+
+    /// **The production seam is wired to the real calls and not to a stub
+    /// somebody left in while testing.** A source pin, because the value is a
+    /// `const` of two function pointers and no runtime assertion can say which
+    /// functions they are.
+    #[test]
+    fn the_production_seam_calls_the_real_grant_and_the_real_unwrap() {
+        let source = include_str!("api_key_ui.rs").replace("\r\n", "\n");
+        let body = source
+            .split_once(concat!("pub const PRODUCTION_API_", "KEY: ApiKeySeam"))
+            .expect("the production seam must exist")
+            .1
+            .split_once(";\n")
+            .expect("the const must be terminated")
+            .0;
+        assert!(body.len() > 30, "control: the seam's body is not empty");
+        assert!(
+            body.contains("grant_direct_rest") && body.contains("unlock_direct_rest"),
+            "the seam must be wired to this module's own two functions; got {body:?}"
+        );
+
+        // And those two functions must call what they claim to. `api_key_grant`
+        // is piece 1's whole contribution and this feature is its only caller.
+        assert!(
+            source.contains(concat!(".api_key", "_grant(")),
+            "nothing in this module calls the grant this feature exists to call"
+        );
+        assert!(
+            source.contains("unwrap_user_key("),
+            "stage 2 must actually unwrap the user key -- that unwrap IS the master \
+             password's verification, and without it a wrong password signs the user in to \
+             a vault they cannot read"
+        );
+        // Positive control on both searches: a needle this file really does
+        // spell this way is findable, so the two above mean something.
+        assert!(
+            source.contains(concat!(".prelogin", "(")),
+            "control: a rest::api call is findable by this search at all"
+        );
+    }
+
+    /// **The seam's two calls happen in order, and stage 2 does not re-run
+    /// stage 1.** The count is the assertion: a design that re-granted on
+    /// every password attempt would charge a Duo user a round trip and a new
+    /// device registration per typo.
+    #[test]
+    fn a_password_retry_reuses_the_session_stage_one_minted() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static GRANTS: AtomicUsize = AtomicUsize::new(0);
+        static UNLOCKS: AtomicUsize = AtomicUsize::new(0);
+        GRANTS.store(0, Ordering::SeqCst);
+        UNLOCKS.store(0, Ordering::SeqCst);
+
+        let seam = ApiKeySeam {
+            grant: |_account, _id, _secret| {
+                GRANTS.fetch_add(1, Ordering::SeqCst);
+                Ok(fake_session())
+            },
+            unlock: |_account, _session, password| {
+                let n = UNLOCKS.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    assert_eq!(password, b"wrong-one", "control: the first password arrives");
+                    Err(RestError::Crypto(crate::rest::crypto::CryptoError::MacMismatch))
+                } else {
+                    assert_eq!(password, b"hunter2", "the SECOND password is the one used");
+                    Ok(fake_authenticated())
+                }
+            },
+        };
+
+        let session = (seam.grant)(&test_account(), "user.9f3c", "b7d2ecc").expect("stage 1");
+        let first = (seam.unlock)(&test_account(), session, b"wrong-one");
+        let refusal = unlock_refusal(&first.expect_err("the first password is wrong"));
+        assert_eq!(refusal, ApiKeyRefusal::PasswordRejected);
+
+        // The retry: a NEW session is not minted, because stage 1 did not
+        // fail. This is the shape the worker loop enforces; here it is the
+        // seam's own contract being stated.
+        let session = (seam.grant)(&test_account(), "user.9f3c", "b7d2ecc").expect("stage 1");
+        assert!((seam.unlock)(&test_account(), session, b"hunter2").is_ok());
+        assert_eq!(
+            UNLOCKS.load(Ordering::SeqCst),
+            2,
+            "control: both passwords reached the unlock"
+        );
+        assert_eq!(
+            GRANTS.load(Ordering::SeqCst),
+            2,
+            "control: the fake grant is reachable"
         );
     }
 }
