@@ -2153,9 +2153,19 @@ pub fn derive_direct_rest(
 ) -> Result<Authenticated, String> {
     let client = crate::rest::api::RestClient::new(server_url);
     let device = crate::rest::api::Device::windows_desktop(device_id, DEVICE_NAME);
-    client
-        .authenticate(email, password, &device)
-        .map_err(|e| e.to_string())
+    // The second-factor prompt is the other half of this branch and is not
+    // here yet, so a challenge is reported as the error it used to be. It is
+    // a `Challenge` and no longer a dead end: this is the one call site that
+    // has to grow a stage, and nothing below it needs to change when it does.
+    match client.authenticate(email, password, &device).map_err(|e| e.to_string())? {
+        crate::rest::api::LoginOutcome::Done(authed) => Ok(authed),
+        crate::rest::api::LoginOutcome::NeedsSecondFactor(challenge) => {
+            Err(crate::rest::api::RestError::TwoFactorRequired {
+                providers: challenge.providers().iter().map(|f| f.number().to_string()).collect(),
+            }
+            .to_string())
+        }
+    }
 }
 
 /// **The plaintext master password's whole life, in one function that returns
