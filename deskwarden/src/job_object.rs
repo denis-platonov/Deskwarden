@@ -1400,13 +1400,18 @@ mod tests {
         // stops repainting, drags smear across it, and Windows offers to kill
         // it. The worker is what lets the prompt keep drawing its progress bar
         // while the password is with the CLI.
-        // One, and it is in a test rather than in anything that ships:
-        // `test_http`'s gate is only a gate if two threads racing it cannot
-        // both hold a mock server, and the only way to observe that is to run
-        // two threads at it. Counted here like every other site, because a
-        // census with a "tests don't count" rule in it is a rule-shaped
-        // exemption, which is precisely what this table exists instead of.
-        ("test_http.rs", 1),
+        // Three, and none of them ships: `test_http` is test-only at its
+        // declaration in `lib.rs`. Two are the mock HTTP server itself -- the
+        // acceptor loop, and the thread that serves one connection. It was one
+        // when that module was a gate around `mockito`; it is three now that
+        // the module IS the server, because `mockito` was the `os error 10054`
+        // and a gate could only make it rarer. The third is the test that
+        // measures exactly that: eight threads of concurrent traffic, which is
+        // the only way to observe the failure the listener exists to remove.
+        // Counted here like every other site, because a census with a "tests
+        // don't count" rule in it is a rule-shaped exemption, which is
+        // precisely what this table exists instead of.
+        ("test_http.rs", 3),
         ("unlock_prompt.rs", 1),
         // Two: the About page's check, and its download-and-verify. Neither
         // can be a tick in a frame loop -- both are seconds-to-minutes of
@@ -2254,7 +2259,33 @@ mod tests {
             // The length is unchanged at 12351 because "0.11.1" and "0.12.0"
             // are the same width -- which is exactly why the CONTENT hash
             // exists beside the length rather than a length alone.
-            (12351, 0x6a6e_65da_cfe6_8b6c_u64),
+            //
+            // **Re-pinned for `regex`**, and a dependency DID move, so it is
+            // named here as this pin requires.
+            //
+            // ADDED: `regex = "1"`, from crates.io, in `[dev-dependencies]`.
+            // It is the engine behind `test_http::Matcher::Regex`, which is
+            // what five of this crate's mock-server call sites match a body
+            // with now that `test_http` is a hand-rolled listener rather than
+            // a `mockito` server. It brings NO new crate: `mockito`, still a
+            // dev-dependency for `main.rs`'s tests, already depends on
+            // `regex` at this version for the same matcher, so it and
+            // `regex-automata`, `regex-syntax` and `aho-corasick` were
+            // already in the tree. Nothing was added to `deny.toml`.
+            //
+            // NOT changed: no name removed or re-pointed, no `[patch]`,
+            // `[replace]` or `[workspace.dependencies]` table, no path or
+            // fork dependency, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. 12351 -> 13177 bytes: one dependency
+            // line, and the comments above it and above `mockito` explaining
+            // why `mockito` is down to one caller.
+            //
+            // The hash below was recomputed independently -- FNV-1a/64 over
+            // the file with CRLF normalised to LF, in a separate
+            // implementation -- rather than copied out of the failure
+            // message. A pin re-pinned to whatever the file happens to say is
+            // not a pin.
+            (13177, 0x87ce_4ab0_ecc9_5356_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

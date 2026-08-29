@@ -11638,7 +11638,7 @@ mod folder_drop_tests {
     //! Both halves are here: the list's entry and the returned message.
     //!
     //! These drive `move_item_into_folder` against a real `VaultCache` over a
-    //! real HTTP server (mockito), so the success path is a write that
+    //! real HTTP server ([`crate::test_http`]), so the success path is a write that
     //! actually reached a backend and the failure path is a backend that
     //! actually refused -- not a stubbed `Result`.
     use super::*;

@@ -1483,7 +1483,7 @@ mod tests {
     ///
     /// The LIST endpoint, not `/releases/latest`: the panel shows every
     /// release the user skipped, so one release's worth of response is no
-    /// longer what the check reads. mockito matches the path and leaves the
+    /// longer what the check reads. The mock matches the path and leaves the
     /// query to `Matcher::Any`, so the `?per_page=` is not restated here.
     const RELEASES_PATH: &str = "/repos/denis-platonov/deskwarden/releases";
 
@@ -1509,7 +1509,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -1554,7 +1554,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -1636,7 +1636,7 @@ mod tests {
         let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(format!("[{}]", releases.join(",")))
             .create();
@@ -1812,7 +1812,7 @@ mod tests {
         let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::UrlEncoded(
+            .match_query(crate::test_http::Matcher::UrlEncoded(
                 "per_page".into(),
                 RELEASES_PER_PAGE.to_string(),
             ))
@@ -2195,7 +2195,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -2237,7 +2237,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -2279,7 +2279,7 @@ mod tests {
             );
             let _m = server
                 .mock("GET", RELEASES_PATH)
-                .match_query(mockito::Matcher::Any)
+                .match_query(crate::test_http::Matcher::Any)
                 .with_status(200)
                 .with_body(release_list(&body))
                 .create();
@@ -2376,7 +2376,7 @@ mod tests {
     /// **The download pass refuses and DELETES an installer whose bytes are
     /// not the ones the release published.**
     ///
-    /// Served over a real socket by `mockito`, so the bytes travel the same
+    /// Served over a real socket by [`crate::test_http`], so the bytes travel the same
     /// path a real download does. The pair below is one server response apart:
     /// same code, same fixture size, different digest on the release.
     #[test]
@@ -2461,7 +2461,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -2484,7 +2484,7 @@ mod tests {
         }"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();
@@ -2565,7 +2565,7 @@ mod tests {
         let body = r#"{"tag_name": "v1.2.0", "assets": []}"#;
         let _m = server
             .mock("GET", RELEASES_PATH)
-            .match_query(mockito::Matcher::Any)
+            .match_query(crate::test_http::Matcher::Any)
             .with_status(200)
             .with_body(release_list(body))
             .create();

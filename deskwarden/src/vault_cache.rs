@@ -2901,7 +2901,7 @@ mod tests {
     const AFTER_FIRST_WRITE: &str = "2026-08-03T02:32:06.832Z";
     const AFTER_SECOND_WRITE: &str = "2026-08-03T02:33:03.427Z";
 
-    fn cache_with_one_dated_item(server: &mut mockito::Server) -> VaultCache {
+    fn cache_with_one_dated_item(server: &mut crate::test_http::Server) -> VaultCache {
         server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -2939,13 +2939,13 @@ mod tests {
         let mut server = crate::test_http::server();
         let cache = cache_with_one_dated_item(&mut server);
         let first = echoing_item_put(&mut server, "/object/item/1", AFTER_FIRST_WRITE)
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            .match_body(crate::test_http::Matcher::PartialJson(serde_json::json!({
                 "revisionDate": FETCHED_REVISION,
             })))
             .expect(1)
             .create();
         let second = echoing_item_put(&mut server, "/object/item/1", AFTER_SECOND_WRITE)
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            .match_body(crate::test_http::Matcher::PartialJson(serde_json::json!({
                 "revisionDate": AFTER_FIRST_WRITE,
             })))
             .expect(1)
@@ -3000,13 +3000,13 @@ mod tests {
         let mut server = crate::test_http::server();
         let cache = cache_with_one_dated_item(&mut server);
         let first = echoing_item_put(&mut server, "/object/item/1", AFTER_FIRST_WRITE)
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            .match_body(crate::test_http::Matcher::PartialJson(serde_json::json!({
                 "revisionDate": FETCHED_REVISION,
             })))
             .expect(1)
             .create();
         let second = echoing_item_put(&mut server, "/object/item/1", AFTER_SECOND_WRITE)
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            .match_body(crate::test_http::Matcher::PartialJson(serde_json::json!({
                 "revisionDate": AFTER_FIRST_WRITE,
             })))
             .expect(1)
@@ -3105,7 +3105,7 @@ mod tests {
         ]}}"#
     }
 
-    fn populated_cache_with_a_filed_item(server: &mut mockito::Server) -> VaultCache {
+    fn populated_cache_with_a_filed_item(server: &mut crate::test_http::Server) -> VaultCache {
         server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -3152,7 +3152,7 @@ mod tests {
         // `VaultBridge::move_item_to_folder` and not through `update_item` --
         // the latter omits the key and would get a 501 here.
         let _u = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION)
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "id": "1",
                 "name": "Alpha",
                 "type": 1,
@@ -3207,7 +3207,7 @@ mod tests {
         // The mock matches only a body that STATES `favorite: true`, so this
         // also pins the wire shape and not merely the in-memory result.
         let _u = echoing_item_put(&mut server, "/object/item/2", NEXT_REVISION)
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "id": "2",
                 "name": "Beta",
                 "type": 1,
@@ -3253,7 +3253,7 @@ mod tests {
         let cache = cache_for(server.url());
         assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
         let _u = echoing_item_put(&mut server, "/object/item/1", NEXT_REVISION)
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "id": "1",
                 "name": "Alpha",
                 "type": 1,
@@ -4260,10 +4260,10 @@ mod tests {
     /// `?trash=true` request each test registers separately therefore cannot
     /// be served by this mock by accident, which is what would let a
     /// `list_trash` that forgot its query silently pass here.
-    fn populated_cache(server: &mut mockito::Server) -> VaultCache {
+    fn populated_cache(server: &mut crate::test_http::Server) -> VaultCache {
         server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Missing)
+            .match_query(crate::test_http::Matcher::Missing)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(items_body())
@@ -4295,7 +4295,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(trash_body())
@@ -4322,7 +4322,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(trash_body())
@@ -4355,7 +4355,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(trash_body())
@@ -4401,7 +4401,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(500)
             .create();
 
@@ -4422,7 +4422,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(500)
             .create();
 
@@ -4441,7 +4441,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         let _a = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("archived=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(trash_body())
@@ -4469,7 +4469,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(trash_body())
@@ -4501,7 +4501,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(trash_body())
@@ -4533,7 +4533,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(trash_body())
@@ -4569,10 +4569,10 @@ mod tests {
         )
     }
 
-    fn mock_trash_with_a_token(server: &mut mockito::Server) -> mockito::Mock {
+    fn mock_trash_with_a_token(server: &mut crate::test_http::Server) -> crate::test_http::Mock {
         server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(trash_body_with_a_token())
@@ -4584,7 +4584,7 @@ mod tests {
     /// and under a name the caller's copy does not have. Deliberately hostile,
     /// because `current_revision_of` must take one key off this and nothing
     /// else.
-    fn mock_read_back_mid_settle(server: &mut mockito::Server) -> mockito::Mock {
+    fn mock_read_back_mid_settle(server: &mut crate::test_http::Server) -> crate::test_http::Mock {
         server
             .mock("GET", "/object/item/t1")
             .with_status(200)
@@ -4676,7 +4676,7 @@ mod tests {
     #[test]
     fn after_a_restore_the_next_write_carries_the_new_token() {
         // The consequence, on the wire. The PUT mock answers ONLY a body
-        // carrying the post-restore token; mockito returns 501 for anything
+        // carrying the post-restore token; the mock server returns 501 for anything
         // else, so a `set_favorite` built from a stale copy comes back `Err`.
         // This is `bw serve`'s optimistic-concurrency check, modelled.
         //
@@ -4689,7 +4689,7 @@ mod tests {
         let _g = mock_read_back_mid_settle(&mut server);
         let _p = server
             .mock("PUT", "/object/item/t1")
-            .match_body(mockito::Matcher::Regex(format!("revisionDate\":\"{TOKEN_AFTER}")))
+            .match_body(crate::test_http::Matcher::Regex(format!("revisionDate\":\"{TOKEN_AFTER}")))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(format!(
@@ -4727,7 +4727,7 @@ mod tests {
         let _g = mock_read_back_mid_settle(&mut server);
         let _p = server
             .mock("PUT", "/object/item/t1")
-            .match_body(mockito::Matcher::Regex(format!("revisionDate\":\"{TOKEN_BEFORE}")))
+            .match_body(crate::test_http::Matcher::Regex(format!("revisionDate\":\"{TOKEN_BEFORE}")))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"success":true,"data":{"id":"t1","name":"Old thing","fields":[]}}"#)
@@ -4790,7 +4790,7 @@ mod tests {
         let _d = server.mock("DELETE", "/object/item/1").with_status(200).create();
         let _t = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -4843,7 +4843,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         let purge = server
             .mock("DELETE", "/object/item/1")
-            .match_query(mockito::Matcher::Exact("permanent=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("permanent=true".into()))
             .with_status(200)
             .expect(1)
             .create();
@@ -4876,7 +4876,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         let _p = server
             .mock("DELETE", "/object/item/1")
-            .match_query(mockito::Matcher::Exact("permanent=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("permanent=true".into()))
             .with_status(500)
             .create();
 
@@ -4899,10 +4899,10 @@ mod tests {
         ]}}"#
     }
 
-    fn mock_archive_list(server: &mut mockito::Server) {
+    fn mock_archive_list(server: &mut crate::test_http::Server) {
         server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("archived=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(archive_body())
@@ -5067,7 +5067,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("archived=true".into()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(format!(
@@ -5121,7 +5121,7 @@ mod tests {
         let cache = populated_cache(&mut server);
         server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("archived=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("archived=true".into()))
             .with_status(401)
             .create();
         let _a = server.mock("POST", "/archive/item/1").with_status(401).create();
@@ -5142,12 +5142,12 @@ mod tests {
         let cache = populated_cache(&mut server);
         let _t = server
             .mock("GET", "/list/object/items")
-            .match_query(mockito::Matcher::Exact("trash=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("trash=true".into()))
             .with_status(401)
             .create();
         let _p = server
             .mock("DELETE", "/object/item/1")
-            .match_query(mockito::Matcher::Exact("permanent=true".into()))
+            .match_query(crate::test_http::Matcher::Exact("permanent=true".into()))
             .with_status(401)
             .create();
         let _r = server.mock("POST", "/restore/item/1").with_status(401).create();
@@ -5188,7 +5188,7 @@ mod tests {
     /// intermediate copies of it, and those frees are exactly what the watch
     /// would then report on.
     fn cache_with_a_probe_custom_field(
-        server: &mut mockito::Server,
+        server: &mut crate::test_http::Server,
         field_name: &str,
         field_value: &str,
     ) -> VaultCache {
@@ -5329,7 +5329,7 @@ mod tests {
     }
     // -- the optional encrypted file --------------------------------------
     //
-    // **No `mockito` anywhere below, deliberately.** Every one of these is
+    // **No mock HTTP server anywhere below, deliberately.** Every one of these is
     // about what reaches the *disk*, so the bridge is
     // `test_vault::unreachable_bridge` -- which carries a free assertion:
     // a persist path that went to the network instead of to the snapshot

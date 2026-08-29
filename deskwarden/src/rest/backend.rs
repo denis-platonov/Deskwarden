@@ -1109,7 +1109,7 @@ mod tests {
         .to_string()
     }
 
-    /// A logged-in backend against a `mockito` server that answers prelogin,
+    /// A logged-in backend against a mock server that answers prelogin,
     /// the grant and `/api/sync`.
     ///
     /// **One PBKDF2 iteration**, because the derivation is not what any test
@@ -1306,7 +1306,7 @@ mod tests {
             .mock("POST", "/api/folders")
             .match_header("Authorization", "Bearer AT-1")
             .match_request(|request| {
-                let body = request.utf8_lossy_body().expect("a body").to_string();
+                let body = request.utf8_lossy_body().to_string();
                 let json: serde_json::Value =
                     serde_json::from_str(&body).expect("the body is JSON");
                 let name = json.get("name").and_then(|v| v.as_str()).expect("a name key");
@@ -1339,7 +1339,7 @@ mod tests {
             .mock("PUT", "/api/folders/f1")
             .match_header("Authorization", "Bearer AT-1")
             .match_request(|request| {
-                let body = request.utf8_lossy_body().expect("a body").to_string();
+                let body = request.utf8_lossy_body().to_string();
                 !body.contains(FOLDER_NEEDLE) && body.contains("2.")
             })
             .with_body(folder_answer("f1", FOLDER_NEEDLE))
@@ -1496,7 +1496,7 @@ mod tests {
         // The bulk route the client used to send, which nothing may reach now.
         let bulk = server.mock("PUT", "/api/ciphers/archive").with_status(200).create();
         // The edit route, which an archive must never reach.
-        // No `expect(0)`: mockito's `matched()` reports whether the expected
+        // No `expect(0)`: `matched()` reports whether the expected
         // hit count was *met*, so an `expect(0)` mock reads as matched when it
         // was never called and this assertion would be inverted. Left at the
         // default expectation, `matched()` means "was hit", which is the
@@ -1633,7 +1633,7 @@ mod tests {
         let (mut server, backend) = logged_in();
         // Default expectation, not `expect(0)` -- see the note in
         // `an_archive_sends_a_batch_of_one_and_reads_the_answer_back`.
-        let any = server.mock("GET", mockito::Matcher::Any).with_status(200).create();
+        let any = server.mock("GET", crate::test_http::Matcher::Any).with_status(200).create();
 
         let password = backend
             .generate(&GenerateRequest::Password(PasswordRecipe::default()))
@@ -1673,7 +1673,7 @@ mod tests {
     // and delete a folder" landed, `create_folder` stopped refusing and
     // started making a real request -- so against a `logged_in()` server,
     // which mocks only prelogin, the token and the sync, it began answering
-    // `Http("the server answered 501")`: mockito's unmatched-route status.
+    // `Http("the server answered 501")`: the unmatched-route status.
     // The test was left behind by its own feature, and it survived unnoticed
     // because this crate's local runs are full of loopback failures on the
     // author's machine and this looked like one more. CI found it the day the
@@ -1711,7 +1711,7 @@ mod tests {
         .to_string();
         let put = server
             .mock("PUT", "/api/ciphers/live-1")
-            .match_body(mockito::Matcher::PartialJson(
+            .match_body(crate::test_http::Matcher::PartialJson(
                 serde_json::json!({ "aKeyNoClientModels": "keep me", "id": "live-1" }),
             ))
             .with_body(answer)
@@ -1737,7 +1737,7 @@ mod tests {
     #[test]
     fn an_edit_of_an_item_this_vault_does_not_hold_is_refused_before_anything_is_sent() {
         let (mut server, backend) = logged_in();
-        let never = server.mock("PUT", mockito::Matcher::Any).expect(0).create();
+        let never = server.mock("PUT", crate::test_http::Matcher::Any).expect(0).create();
         let mut item = backend.get_item("live-1").expect("the item");
         item.id = "not-in-this-vault".to_string();
         backend.update_item(&item).expect_err("refused");
@@ -1753,7 +1753,7 @@ mod tests {
         let put = server
             .mock("PUT", "/api/ciphers/live-1")
             .match_request(|request| {
-                let body = request.utf8_lossy_body().expect("a body").to_string();
+                let body = request.utf8_lossy_body().to_string();
                 !body.contains("NEEDLE-secret") && !body.contains("p4ssw0rd")
             })
             .with_body(cipher("live-1", "A live item", &serde_json::json!({})).to_string())
@@ -1778,7 +1778,7 @@ mod tests {
             .mock("PUT", "/api/ciphers/live-1")
             .match_request(|request| {
                 let body: serde_json::Value =
-                    serde_json::from_slice(request.body().expect("a body")).expect("json");
+                    serde_json::from_slice(request.body()).expect("json");
                 body.get("folderId").is_none()
             })
             .with_body(cipher("live-1", "A live item", &serde_json::json!({})).to_string())
@@ -1801,7 +1801,7 @@ mod tests {
             .mock("PUT", "/api/ciphers/live-1")
             .match_request(|request| {
                 let body: serde_json::Value =
-                    serde_json::from_slice(request.body().expect("a body")).expect("json");
+                    serde_json::from_slice(request.body()).expect("json");
                 let fields = body.get("fields").and_then(serde_json::Value::as_array);
                 // One field, and its *label* is encrypted too -- a custom
                 // field's name is user data on this wire.
@@ -1834,7 +1834,7 @@ mod tests {
             .mock("POST", "/api/ciphers")
             .match_request(|request| {
                 let body: serde_json::Value =
-                    serde_json::from_slice(request.body().expect("a body")).expect("json");
+                    serde_json::from_slice(request.body()).expect("json");
                 // An empty id is omitted, never sent as `""`.
                 body.get("id").is_none() && body.get("type") == Some(&serde_json::json!(1))
             })
@@ -1882,8 +1882,8 @@ mod tests {
     #[test]
     fn the_id_only_writes_do_not_pay_for_a_sync() {
         let (mut server, backend) = logged_in();
-        server.mock("PUT", mockito::Matcher::Any).create();
-        server.mock("DELETE", mockito::Matcher::Any).create();
+        server.mock("PUT", crate::test_http::Matcher::Any).create();
+        server.mock("DELETE", crate::test_http::Matcher::Any).create();
         let no_sync =
             server.mock("GET", "/api/sync?excludeDomains=true").expect(0).create();
 

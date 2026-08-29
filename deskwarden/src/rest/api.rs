@@ -1915,18 +1915,18 @@ mod tests {
         let mock = server
             .mock("POST", "/identity/connect/token")
             .match_header("Auth-Email", "YUBiLmM")
-            .match_body(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::UrlEncoded("grant_type".into(), "password".into()),
-                mockito::Matcher::UrlEncoded("client_id".into(), "desktop".into()),
-                mockito::Matcher::UrlEncoded("scope".into(), "api offline_access".into()),
-                mockito::Matcher::UrlEncoded("username".into(), "a@b.c".into()),
-                mockito::Matcher::UrlEncoded("password".into(), "HASH==".into()),
-                mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![
+                crate::test_http::Matcher::UrlEncoded("grant_type".into(), "password".into()),
+                crate::test_http::Matcher::UrlEncoded("client_id".into(), "desktop".into()),
+                crate::test_http::Matcher::UrlEncoded("scope".into(), "api offline_access".into()),
+                crate::test_http::Matcher::UrlEncoded("username".into(), "a@b.c".into()),
+                crate::test_http::Matcher::UrlEncoded("password".into(), "HASH==".into()),
+                crate::test_http::Matcher::UrlEncoded(
                     "deviceIdentifier".into(),
                     "11111111-2222-3333-4444-555555555555".into(),
                 ),
-                mockito::Matcher::UrlEncoded("deviceName".into(), "TEST-PC".into()),
-                mockito::Matcher::UrlEncoded("deviceType".into(), "6".into()),
+                crate::test_http::Matcher::UrlEncoded("deviceName".into(), "TEST-PC".into()),
+                crate::test_http::Matcher::UrlEncoded("deviceType".into(), "6".into()),
             ]))
             .with_body(token_body(3600))
             .create();
@@ -1960,7 +1960,7 @@ mod tests {
             .password_hash(PASSWORD.as_bytes());
         let grant = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "password".into(),
                 expected.to_string(),
             )]))
@@ -2153,7 +2153,7 @@ mod tests {
     /// Prelogin, plus a grant that answers "two factor required": the fixture
     /// every test below starts from. Returns the mocks so a caller can assert
     /// on how many times each was hit.
-    fn challenge_mocks(server: &mut mockito::Server) -> (mockito::Mock, mockito::Mock) {
+    fn challenge_mocks(server: &mut crate::test_http::Server) -> (crate::test_http::Mock, crate::test_http::Mock) {
         let prelogin = server
             .mock("POST", "/identity/accounts/prelogin")
             .with_body(format!(r#"{{"kdf":0,"kdfIterations":{CHALLENGE_ITERATIONS}}}"#))
@@ -2218,20 +2218,20 @@ mod tests {
         let retry = server
             .mock("POST", "/identity/connect/token")
             .match_header("Auth-Email", "YUBiLmM")
-            .match_body(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::UrlEncoded("grant_type".into(), "password".into()),
-                mockito::Matcher::UrlEncoded("client_id".into(), "desktop".into()),
-                mockito::Matcher::UrlEncoded("scope".into(), "api offline_access".into()),
-                mockito::Matcher::UrlEncoded("username".into(), "a@b.c".into()),
-                mockito::Matcher::UrlEncoded("password".into(), hash.to_string()),
-                mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![
+                crate::test_http::Matcher::UrlEncoded("grant_type".into(), "password".into()),
+                crate::test_http::Matcher::UrlEncoded("client_id".into(), "desktop".into()),
+                crate::test_http::Matcher::UrlEncoded("scope".into(), "api offline_access".into()),
+                crate::test_http::Matcher::UrlEncoded("username".into(), "a@b.c".into()),
+                crate::test_http::Matcher::UrlEncoded("password".into(), hash.to_string()),
+                crate::test_http::Matcher::UrlEncoded(
                     "deviceIdentifier".into(),
                     "11111111-2222-3333-4444-555555555555".into(),
                 ),
-                mockito::Matcher::UrlEncoded("deviceName".into(), "TEST-PC".into()),
-                mockito::Matcher::UrlEncoded("deviceType".into(), "6".into()),
-                mockito::Matcher::UrlEncoded("twoFactorProvider".into(), "0".into()),
-                mockito::Matcher::UrlEncoded("twoFactorToken".into(), "123456".into()),
+                crate::test_http::Matcher::UrlEncoded("deviceName".into(), "TEST-PC".into()),
+                crate::test_http::Matcher::UrlEncoded("deviceType".into(), "6".into()),
+                crate::test_http::Matcher::UrlEncoded("twoFactorProvider".into(), "0".into()),
+                crate::test_http::Matcher::UrlEncoded("twoFactorToken".into(), "123456".into()),
             ]))
             .with_body(token_body(3600))
             .expect(1)
@@ -2267,7 +2267,7 @@ mod tests {
         let (_prelogin, first) = challenge_mocks(&mut server);
         let rejected = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::Regex("twoFactorToken=000000".into()))
+            .match_body(crate::test_http::Matcher::Regex("twoFactorToken=000000".into()))
             .with_status(400)
             .with_body(
                 r#"{"error":"invalid_grant",
@@ -2278,7 +2278,7 @@ mod tests {
             .create();
         let accepted = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::Regex("twoFactorToken=123456".into()))
+            .match_body(crate::test_http::Matcher::Regex("twoFactorToken=123456".into()))
             .with_body(token_body(3600))
             .expect(1)
             .create();
@@ -2318,7 +2318,7 @@ mod tests {
         let (_prelogin, _grant) = challenge_mocks(&mut server);
         let send = server
             .mock("POST", "/api/two-factor/send-email-login")
-            .match_body(mockito::Matcher::Json(serde_json::json!({
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
                 "email": "a@b.c",
                 "masterPasswordHash": expected_hash().to_string(),
                 "deviceIdentifier": "11111111-2222-3333-4444-555555555555",
@@ -2348,7 +2348,7 @@ mod tests {
         server.mock("POST", "/api/two-factor/send-email-login").with_status(500).create();
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::Regex("twoFactorToken=".into()))
+            .match_body(crate::test_http::Matcher::Regex("twoFactorToken=".into()))
             .with_status(400)
             .with_body(
                 r#"{"error":"invalid_grant",
@@ -2386,15 +2386,12 @@ mod tests {
 
     /// Captures the exact form body a mock is sent, for the assertion no
     /// matcher can make: that a field is **absent**.
-    fn body_recorder() -> (std::sync::Arc<std::sync::Mutex<String>>, impl Fn(&mockito::Request) -> bool)
+    fn body_recorder() -> (std::sync::Arc<std::sync::Mutex<String>>, impl Fn(&crate::test_http::Request) -> bool)
     {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let recorder = std::sync::Arc::clone(&seen);
-        (seen, move |request: &mockito::Request| {
-            let body = request
-                .body()
-                .map(|bytes| String::from_utf8_lossy(bytes).to_string())
-                .unwrap_or_default();
+        (seen, move |request: &crate::test_http::Request| {
+            let body = request.utf8_lossy_body().to_string();
             *recorder.lock().expect("the recorder") = body;
             true
         })
@@ -2560,7 +2557,7 @@ mod tests {
         let mut server = crate::test_http::server();
         let grant = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -2568,10 +2565,10 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![
-                mockito::Matcher::UrlEncoded("grant_type".into(), "refresh_token".into()),
-                mockito::Matcher::UrlEncoded("refresh_token".into(), "RT-1".into()),
-                mockito::Matcher::UrlEncoded("client_id".into(), "desktop".into()),
+            .match_body(crate::test_http::Matcher::AllOf(vec![
+                crate::test_http::Matcher::UrlEncoded("grant_type".into(), "refresh_token".into()),
+                crate::test_http::Matcher::UrlEncoded("refresh_token".into(), "RT-1".into()),
+                crate::test_http::Matcher::UrlEncoded("client_id".into(), "desktop".into()),
             ]))
             .with_body(r#"{"access_token":"AT-2","expires_in":3600,"token_type":"Bearer"}"#)
             .expect(1)
@@ -2601,7 +2598,7 @@ mod tests {
         let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -2615,7 +2612,7 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -2645,7 +2642,7 @@ mod tests {
         let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -2653,7 +2650,7 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -2683,7 +2680,7 @@ mod tests {
         let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -2691,7 +2688,7 @@ mod tests {
             .create();
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -2816,10 +2813,10 @@ mod tests {
     /// through a real grant against the mock server. There is no constructor
     /// shortcut, because a `cfg(test)` seam into `Session` is exactly the
     /// thing this crate bans.
-    fn granted(server: &mut mockito::Server) -> (RestClient, Session) {
+    fn granted(server: &mut crate::test_http::Server) -> (RestClient, Session) {
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -2862,8 +2859,11 @@ mod tests {
 
         // Controls: the cut landed where it was meant to, both halves are real.
         assert!(production.contains("pub fn update_cipher"), "the cut lost the writers");
-        assert!(!production.contains("mockito"), "the cut left test code in the production half");
-        assert!(tests.contains("mockito"), "the cut left no test code in the test half");
+        assert!(
+            !production.contains("test_http"),
+            "the cut left test code in the production half"
+        );
+        assert!(tests.contains("test_http"), "the cut left no test code in the test half");
 
         // Five body senders in the whole module, and no more. **This was
         // three, then four, then six, and is now five.** The fourth and the
@@ -2936,7 +2936,7 @@ mod tests {
         let created = server
             .mock("POST", "/api/ciphers")
             .match_header("Authorization", "Bearer AT-1")
-            .match_body(mockito::Matcher::Json(body.clone()))
+            .match_body(crate::test_http::Matcher::Json(body.clone()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{"object":"cipher","id":"server-assigned-id","revisionDate":"2024-07-07T07:07:07Z"}"#)
@@ -2972,7 +2972,7 @@ mod tests {
         let updated = server
             .mock("PUT", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             .match_header("Authorization", "Bearer AT-1")
-            .match_body(mockito::Matcher::Json(body.clone()))
+            .match_body(crate::test_http::Matcher::Json(body.clone()))
             .with_header("content-type", "application/json")
             .with_body(r#"{"object":"cipher","id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#)
             .expect(1)
@@ -3074,14 +3074,14 @@ mod tests {
         let created = server
             .mock("POST", "/api/folders")
             .match_header("Authorization", "Bearer AT-1")
-            .match_body(mockito::Matcher::Json(body.clone()))
+            .match_body(crate::test_http::Matcher::Json(body.clone()))
             .with_body(r#"{"object":"folder","id":"server-assigned-folder"}"#)
             .expect(1)
             .create();
         let renamed = server
             .mock("PUT", "/api/folders/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             .match_header("Authorization", "Bearer AT-1")
-            .match_body(mockito::Matcher::Json(body))
+            .match_body(crate::test_http::Matcher::Json(body))
             .with_body(r#"{"object":"folder","id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}"#)
             .expect(1)
             .create();
@@ -3143,7 +3143,7 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -3153,7 +3153,7 @@ mod tests {
         let fresh = server
             .mock("POST", "/api/folders")
             .match_header("Authorization", "Bearer AT-2")
-            .match_body(mockito::Matcher::Json(body))
+            .match_body(crate::test_http::Matcher::Json(body))
             .with_body(r#"{"object":"folder","id":"server-assigned-folder"}"#)
             .expect(1)
             .create();
@@ -3171,8 +3171,8 @@ mod tests {
         let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let folder = encrypted_folder();
-        let any = server.mock("DELETE", mockito::Matcher::Any).with_status(200).create();
-        let put = server.mock("PUT", mockito::Matcher::Any).with_status(200).create();
+        let any = server.mock("DELETE", crate::test_http::Matcher::Any).with_status(200).create();
+        let put = server.mock("PUT", crate::test_http::Matcher::Any).with_status(200).create();
         for bad in ["../accounts", "a/b", "a?x=1", "", "a#b"] {
             assert_eq!(
                 client.delete_folder(&mut session, bad).expect_err("an unsafe id"),
@@ -3204,7 +3204,7 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -3214,7 +3214,7 @@ mod tests {
         let fresh = server
             .mock("POST", "/api/ciphers")
             .match_header("Authorization", "Bearer AT-2")
-            .match_body(mockito::Matcher::Json(body.clone()))
+            .match_body(crate::test_http::Matcher::Json(body.clone()))
             .with_body(r#"{"object":"cipher","id":"server-assigned-id"}"#)
             .expect(1)
             .create();
@@ -3233,7 +3233,7 @@ mod tests {
         let (client, mut session) = granted(&mut server);
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -3261,7 +3261,7 @@ mod tests {
     fn an_id_that_is_not_url_path_safe_is_refused_before_anything_is_sent() {
         let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
-        let any = server.mock("DELETE", mockito::Matcher::Any).with_status(200).create();
+        let any = server.mock("DELETE", crate::test_http::Matcher::Any).with_status(200).create();
         for bad in ["../../api/accounts", "a/b", "a?x=1", "", "a#b"] {
             assert_eq!(
                 client.hard_delete_cipher(&mut session, bad).expect_err("an unsafe id"),
@@ -3280,7 +3280,7 @@ mod tests {
         let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "password".into(),
             )]))
@@ -3291,7 +3291,7 @@ mod tests {
 
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))
@@ -3627,7 +3627,7 @@ mod tests {
     fn an_unsafe_id_is_refused_by_the_archive_routes_too() {
         let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
-        let any = server.mock("PUT", mockito::Matcher::Any).with_status(200).create();
+        let any = server.mock("PUT", crate::test_http::Matcher::Any).with_status(200).create();
         for bad in ["../../api/accounts", "a/b", "a?x=1", "", "a#b"] {
             assert_eq!(
                 client.archive_cipher(&mut session, bad).expect_err("an unsafe id"),
@@ -3660,7 +3660,7 @@ mod tests {
             .create();
         let refresh = server
             .mock("POST", "/identity/connect/token")
-            .match_body(mockito::Matcher::AllOf(vec![mockito::Matcher::UrlEncoded(
+            .match_body(crate::test_http::Matcher::AllOf(vec![crate::test_http::Matcher::UrlEncoded(
                 "grant_type".into(),
                 "refresh_token".into(),
             )]))

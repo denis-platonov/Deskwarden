@@ -709,6 +709,7 @@ dependencies = [
  "mockito",
  "pbkdf2",
  "png 0.17.16",
+ "regex",
  "rqrr",
  "rsa",
  "semver",
