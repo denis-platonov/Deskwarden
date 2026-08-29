@@ -179,6 +179,69 @@ impl Prompt {
     }
 }
 
+/// A provider number, in words the user would recognise from their own
+/// Bitwarden security settings.
+///
+/// `String` rather than `&'static str` so the unknown arm can carry the number
+/// it did not recognise. A message reading "an unrecognised method" is
+/// unreportable; one reading "an unrecognised method (9)" names the thing to
+/// look up.
+pub fn provider_name(number: u8) -> String {
+    match number {
+        2 => "Duo".to_string(),
+        6 => "Duo (organization)".to_string(),
+        7 => "a security key (WebAuthn)".to_string(),
+        4 => "a U2F security key".to_string(),
+        5 => "a remembered device".to_string(),
+        8 => "a recovery code".to_string(),
+        other => format!("an unrecognised two-step method ({other})"),
+    }
+}
+
+/// What an account whose every factor is unsupported is told.
+///
+/// `None` the instant anything is supported: the spec is explicit that
+/// `Unsupported` is not an error, and an account with WebAuthn beside an
+/// authenticator app is an ordinary prompt.
+///
+/// **The two things this message must do**, both of which the message it
+/// replaces (`login_ui::friendly_auth_error`'s two-step arm) did not:
+///
+///  * name the provider, so a Duo user is not left guessing which of their
+///    factors Deskwarden means;
+///  * name the personal API key, which IS supported
+///    ([`crate::rest::api::RestClient::api_key_grant`]) and is the same path
+///    `bw login --apikey` gives these users today. Duo and WebAuthn are not
+///    reachable from `bw login` either, so without this sentence the message
+///    is a dead end rather than a redirection.
+pub fn unsupported_only_message(offered: &[SecondFactor]) -> Option<String> {
+    if offered.is_empty() || offered.iter().any(is_supported) {
+        return None;
+    }
+    let names: Vec<String> = offered
+        .iter()
+        .map(|factor| match factor {
+            SecondFactor::Unsupported(number) => provider_name(*number),
+            // Unreachable given the guard above, and written as a name rather
+            // than an `unreachable!()` because the cost of being wrong here is
+            // the whole window dying on the one screen a blocked user sees.
+            supported => factor_title(supported).to_lowercase(),
+        })
+        .collect();
+    let list = match names.as_slice() {
+        [one] => one.clone(),
+        [first, rest @ ..] => format!("{first} and {}", rest.join(" and ")),
+        [] => return None,
+    };
+    Some(format!(
+        "This account's two-step login uses {list}, which Deskwarden cannot complete. Use a \
+         personal API key instead: create one under Account settings \u{2192} Security \u{2192} \
+         Keys in the Bitwarden web vault, then sign in here with it. You will still be asked \
+         for your master password \u{2014} the API key signs you in, the password unlocks the \
+         vault."
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +379,87 @@ mod tests {
                 "{factor:?} needs no round trip and must not offer one"
             );
         }
+    }
+
+
+    /// **The message names the provider.** "This account uses two-step login"
+    /// is what `login_ui` said before this work and it is what sent people to
+    /// a terminal to find out which factor it meant.
+    #[test]
+    fn an_unsupported_only_account_is_told_which_provider_and_what_to_do() {
+        let duo = unsupported_only_message(&[SecondFactor::Unsupported(2)])
+            .expect("control: an all-unsupported account must get a message");
+        assert!(duo.contains("Duo"), "got {duo:?}");
+        assert!(
+            duo.contains("API key"),
+            "the personal API key is the ONE path these users have; a message without it \
+             is a dead end. got {duo:?}"
+        );
+        assert!(
+            !duo.contains("bw login") && !duo.contains("terminal"),
+            "this is the message that replaces the terminal instruction; got {duo:?}"
+        );
+
+        let webauthn = unsupported_only_message(&[SecondFactor::Unsupported(7)])
+            .expect("WebAuthn-only is the other real case");
+        assert!(
+            webauthn.contains("security key") || webauthn.contains("WebAuthn"),
+            "got {webauthn:?}"
+        );
+        assert!(
+            !webauthn.contains("Duo"),
+            "the message must name THIS account's provider, not a list of every one; \
+             got {webauthn:?}"
+        );
+
+        let both = unsupported_only_message(&[
+            SecondFactor::Unsupported(2),
+            SecondFactor::Unsupported(7),
+        ])
+        .expect("two unsupported providers is still an unsupported-only account");
+        assert!(both.contains("Duo") && both.contains("security key"), "got {both:?}");
+    }
+
+    /// **The message is absent the moment anything is supported.** An account
+    /// with WebAuthn AND an authenticator app must be offered the
+    /// authenticator, not apologised to.
+    #[test]
+    fn a_supportable_account_gets_no_apology() {
+        assert_eq!(
+            unsupported_only_message(&[
+                SecondFactor::Unsupported(7),
+                SecondFactor::Authenticator
+            ]),
+            None,
+            "WebAuthn beside an authenticator app is an ordinary prompt"
+        );
+        // Positive control: the same call with the authenticator removed does
+        // produce a message, so the `None` above is about supportability and
+        // not about the function having stopped working.
+        assert!(
+            unsupported_only_message(&[SecondFactor::Unsupported(7)]).is_some(),
+            "control: the unsupported-only case still produces a message"
+        );
+        assert_eq!(
+            unsupported_only_message(&[]),
+            None,
+            "an empty offer is not a Duo account -- it is a server answer nobody can act on"
+        );
+    }
+
+    /// Every number the spec's table names, so an unfamiliar one degrades to
+    /// something reportable rather than to a bare integer in a sentence.
+    #[test]
+    fn every_known_provider_number_has_a_name() {
+        assert_eq!(provider_name(2), "Duo");
+        assert_eq!(provider_name(6), "Duo (organization)");
+        assert_eq!(provider_name(7), "a security key (WebAuthn)");
+        assert_eq!(provider_name(4), "a U2F security key");
+        assert!(
+            provider_name(99).contains("99"),
+            "an unknown provider must carry its number so a bug report can name it; got {:?}",
+            provider_name(99)
+        );
     }
 
 }
