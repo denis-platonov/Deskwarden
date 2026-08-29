@@ -6,6 +6,8 @@
 //! worker thread.
 
 use crate::rest::api::SecondFactor;
+use crate::theme;
+use eframe::egui::{self, RichText};
 use zeroize::Zeroize;
 
 /// Bitwarden's own priority order, restricted to what this app can complete.
@@ -316,6 +318,131 @@ impl Prompt {
             Trouble::EmailSendFailed => self.email_sent = false,
             Trouble::ChallengeExpired | Trouble::Unreachable => {}
         }
+    }
+}
+
+pub const CODE_LABEL: &str = "Verification code";
+pub const SWITCH_LABEL: &str = "Use a different method";
+pub const CONTINUE_LABEL: &str = "Continue";
+pub const BACK_LABEL: &str = "Back";
+
+/// What the user asked the code stage to do this frame. `None` from [`draw`]
+/// is the ordinary case: the user is still typing.
+pub enum PromptAction {
+    /// Email only: send me a code.
+    Send,
+    /// These digits, against the chosen provider.
+    ///
+    /// No `Debug` on this enum, because this variant carries a live one-time
+    /// code and [`crate::rest::api::SecondFactorAnswer`] refuses to print one.
+    Submit(crate::rest::api::SecondFactorAnswer),
+    /// Back to the master password.
+    Back,
+}
+
+/// Draws the code stage. Pure view: the caller owns the [`Prompt`] and
+/// performs the channel sends for whatever comes back, exactly as
+/// `login_ui::draw_login_window` and its caller are split.
+pub fn draw(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
+    if let Some(message) = unsupported_only_message(prompt.offered()) {
+        ui.label(RichText::new(factor_title(&SecondFactor::Unsupported(0))).size(17.0));
+        ui.add_space(8.0);
+        ui.label(RichText::new(message).size(12.0).color(theme::TEXT_MUTED));
+        ui.add_space(16.0);
+        return ui.button(BACK_LABEL).clicked().then_some(PromptAction::Back);
+    }
+
+    let Some(chosen) = prompt.chosen() else {
+        // An empty provider list. Nothing to ask for, and nothing to
+        // apologise for either -- `unsupported_only_message` answers `None`
+        // for the empty offer, so this arm exists and must say something.
+        ui.label(RichText::new(message_for(Trouble::Unreachable)).size(12.0));
+        return ui.button(BACK_LABEL).clicked().then_some(PromptAction::Back);
+    };
+
+    ui.label(RichText::new(factor_title(&chosen)).size(17.0));
+    ui.add_space(6.0);
+    ui.label(RichText::new(factor_hint(&chosen)).size(12.0).color(theme::TEXT_MUTED));
+    ui.add_space(14.0);
+
+    let mut asked = None;
+
+    if prompt.wants_send_button() {
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!prompt.busy, egui::Button::new(SEND_CODE_LABEL)).clicked() {
+                asked = Some(PromptAction::Send);
+            }
+            if prompt.email_sent {
+                ui.label(RichText::new(CODE_SENT_NOTICE).size(11.0).color(theme::TEXT_MUTED));
+            }
+        });
+        ui.add_space(10.0);
+    }
+
+    ui.label(RichText::new(CODE_LABEL).size(12.0));
+    let entry = ui.add_enabled(
+        !prompt.busy,
+        egui::TextEdit::singleline(&mut prompt.code).desired_width(f32::INFINITY),
+    );
+    // A YubiKey types its code and presses Enter itself, which is why the
+    // focus goes here on entry and why Enter submits.
+    if !prompt.busy {
+        entry.request_focus();
+    }
+    let entered = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+    if let Some(error) = prompt.error.as_deref() {
+        ui.add_space(6.0);
+        ui.label(RichText::new(error).size(11.0).color(theme::ERROR));
+    }
+
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        let ready = !prompt.busy && !prompt.code.trim().is_empty();
+        if (ui.add_enabled(ready, egui::Button::new(CONTINUE_LABEL)).clicked()
+            || (entered && ready))
+            && asked.is_none()
+        {
+            asked = Some(PromptAction::Submit(crate::rest::api::SecondFactorAnswer::new(
+                chosen.clone(),
+                prompt.code.trim(),
+            )));
+        }
+        if ui.button(BACK_LABEL).clicked() {
+            asked = Some(PromptAction::Back);
+        }
+    });
+
+    // Only the factors the user could switch TO, so a one-factor account is
+    // not offered a choice between one thing and itself.
+    let alternatives: Vec<SecondFactor> =
+        prompt.supported().into_iter().filter(|factor| *factor != chosen).collect();
+    if !alternatives.is_empty() {
+        ui.add_space(10.0);
+        ui.label(RichText::new(SWITCH_LABEL).size(11.0).color(theme::TEXT_MUTED));
+        for factor in alternatives {
+            if ui.link(factor_title(&factor)).clicked() {
+                prompt.choose(factor);
+            }
+        }
+    }
+
+    asked
+}
+
+impl Prompt {
+    /// **A code was asked for.** Says so, and deliberately does NOT ghost the
+    /// card.
+    ///
+    /// A send has no success report -- the worker answers only
+    /// [`Trouble::EmailSendFailed`], because a mail that left is not news --
+    /// so a card that went [`Prompt::busy`] here would have nothing to bring
+    /// it back, and the user would be left looking at a code box they could no
+    /// longer type into. The answer is the one control that DOES have both
+    /// answers: [`Prompt::busy`] is set when a code is submitted, and either a
+    /// trouble clears it or the sign-in ends the stage.
+    pub fn sent_a_code(&mut self) {
+        self.email_sent = true;
     }
 }
 
@@ -638,6 +765,159 @@ mod tests {
                 "{survivable:?} still has a challenge on the worker to try again against"
             );
         }
+    }
+
+
+    /// A context with `theme::apply`'s fonts actually live -- a font set
+    /// registered during a frame only becomes usable at the start of the next
+    /// one, so the throwaway frames are load-bearing. `login_ui`'s paint tests
+    /// keep their own copy of this; it is six lines, and the alternative is
+    /// making three helpers `pub(crate)` across a 10 000-line file so that one
+    /// card can be painted.
+    fn styled_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        ctx
+    }
+
+    fn raw_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(470.0, 588.0),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            // Everything else is geometry this module does not assert on.
+            _ => {}
+        }
+    }
+
+    /// Every string the card paints in one frame.
+    fn painted(prompt: &mut Prompt) -> Vec<String> {
+        let ctx = styled_context();
+        let output = ctx.run_ui(raw_input(), |ui| {
+            let _ = draw(ui, prompt);
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn says(texts: &[String], needle: &str) -> bool {
+        texts.iter().any(|t| t.contains(needle))
+    }
+
+    /// The Email card offers to send; the authenticator card does not, and the
+    /// authenticator card is the positive control that proves the harness is
+    /// painting anything at all.
+    #[test]
+    fn the_send_button_is_painted_for_email_only() {
+        let mut email = Prompt::new(vec![SecondFactor::Email {
+            masked: Some("a***@b.c".to_string()),
+        }]);
+        let email_texts = painted(&mut email);
+        assert!(
+            says(&email_texts, "a***@b.c"),
+            "control: the card painted its own hint; got {email_texts:?}"
+        );
+        assert!(says(&email_texts, SEND_CODE_LABEL), "got {email_texts:?}");
+
+        let mut totp = Prompt::new(vec![SecondFactor::Authenticator]);
+        let totp_texts = painted(&mut totp);
+        assert!(
+            says(&totp_texts, "authenticator app"),
+            "control: the authenticator card painted its own hint; got {totp_texts:?}"
+        );
+        assert!(!says(&totp_texts, SEND_CODE_LABEL), "got {totp_texts:?}");
+    }
+
+    /// The provider switch appears only when there is something to switch to.
+    #[test]
+    fn the_provider_switch_appears_only_with_more_than_one_factor() {
+        let mut two = Prompt::new(vec![SecondFactor::Authenticator, SecondFactor::YubiKey]);
+        let two_texts = painted(&mut two);
+        assert!(says(&two_texts, SWITCH_LABEL), "got {two_texts:?}");
+        assert!(
+            says(&two_texts, factor_title(&SecondFactor::Authenticator)),
+            "the factor NOT chosen must be offered by name, or the switch switches to \
+             nothing; got {two_texts:?}"
+        );
+
+        let mut one = Prompt::new(vec![SecondFactor::Authenticator]);
+        let one_texts = painted(&mut one);
+        assert!(
+            says(&one_texts, "Authenticator app"),
+            "control: the single-factor card painted its title; got {one_texts:?}"
+        );
+        assert!(!says(&one_texts, SWITCH_LABEL), "got {one_texts:?}");
+    }
+
+    /// An unsupported-only account gets the message and NO code box: a box
+    /// that cannot be submitted is worse than no box.
+    #[test]
+    fn an_unsupported_only_card_asks_for_nothing() {
+        let mut duo = Prompt::new(vec![SecondFactor::Unsupported(2)]);
+        let texts = painted(&mut duo);
+        assert!(says(&texts, "Duo"), "got {texts:?}");
+        assert!(says(&texts, "API key"), "got {texts:?}");
+        assert!(!says(&texts, CODE_LABEL), "there is nothing to type; got {texts:?}");
+        // Control: a card that CAN be answered does paint the box, so the
+        // absence above is about this account and not about a `draw` that
+        // stopped drawing.
+        let mut totp = Prompt::new(vec![SecondFactor::Authenticator]);
+        assert!(says(&painted(&mut totp), CODE_LABEL), "control: the box is painted at all");
+    }
+
+    /// The error line is painted under the box, and it is the one the trouble
+    /// named -- not a generic apology.
+    #[test]
+    fn the_message_from_a_wrong_code_is_painted() {
+        let mut prompt = Prompt::new(vec![SecondFactor::Authenticator]);
+        let before = painted(&mut prompt);
+        assert!(
+            !says(&before, message_for(Trouble::CodeRejected)),
+            "control: a prompt with no trouble paints no trouble; got {before:?}"
+        );
+        prompt.went_wrong(Trouble::CodeRejected);
+        let after = painted(&mut prompt);
+        assert!(says(&after, message_for(Trouble::CodeRejected)), "got {after:?}");
+    }
+
+
+    /// **Asking for a code must not ghost the box the code goes in.** There is
+    /// no "the mail left" report -- the worker speaks only in troubles -- so
+    /// anything set here has nothing to unset it.
+    #[test]
+    fn sending_a_code_leaves_the_card_usable() {
+        let mut prompt = Prompt::new(vec![SecondFactor::Email { masked: None }]);
+        prompt.sent_a_code();
+        assert!(prompt.email_sent, "control: the notice is what this call is for");
+        assert!(
+            !prompt.busy,
+            "a card ghosted by a send can only be un-ghosted by a failure, so a send that \
+             worked would leave the user unable to type the code it delivered"
+        );
+
+        // The control for the other direction: submitting an answer IS a state
+        // with an answer coming, and that one may ghost.
+        prompt.busy = true;
+        prompt.went_wrong(Trouble::CodeRejected);
+        assert!(!prompt.busy, "and the answer's failure brings the card back");
     }
 
 }

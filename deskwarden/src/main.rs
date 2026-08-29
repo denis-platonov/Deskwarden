@@ -6575,6 +6575,8 @@ impl VaultOps for RealVaultOps<'_> {
                             sign_in_first_run,
                             true,
                             false,
+                            // No second-factor stage on this host; see `build_login_frame`.
+                            None,
                         );
                         (frame, handles)
                     },

@@ -54,7 +54,7 @@
 //! reason those two functions exist separately from their own hosts.
 
 use crate::accounts::Account;
-use crate::{foreground, loading_ui, login_ui, theme, vault_window};
+use crate::{foreground, loading_ui, login_ui, second_factor_ui, theme, vault_window};
 use eframe::egui;
 use std::cell::RefCell;
 use std::path::Path;
@@ -166,6 +166,11 @@ pub enum Stage {
     Working,
     /// The vault -- `vault_window`'s frame.
     Vault,
+    /// **The code box** -- `second_factor_ui`'s card, over the same backdrop
+    /// the sign-in card uses. Entered only when the server asked for a second
+    /// factor, which it can only do AFTER the grant, which is why this is a
+    /// stage between the card and the spinner rather than a field on the card.
+    SecondFactor,
 }
 
 /// What happened that could move the window on.
@@ -193,6 +198,17 @@ pub enum Event {
     /// shows the sign-in card, in place, instead of `main::reauthenticate`
     /// opening one of its own.
     TeardownDone,
+    /// The sign-in worker reached `LoginOutcome::NeedsSecondFactor` and is now
+    /// blocked holding the challenge, waiting for a
+    /// `login_ui::SecondFactorCommand`.
+    SecondFactorNeeded,
+    /// The factor was accepted. From here the window is in exactly the state a
+    /// password-only sign-in leaves it in.
+    SecondFactorDone,
+    /// The user backed out of the code box, or the challenge expired. The
+    /// worker has dropped the challenge; the card is what comes next, because
+    /// starting over means a new master password.
+    SecondFactorAbandoned,
 }
 
 /// **Which of two channels the startup host's working stage is draining.**
@@ -215,6 +231,33 @@ enum WorkingOn {
     TheFirstPreparation,
     /// A lock's teardown, on the step channel [`InWindowLock`] owns.
     TheLocksTeardown,
+}
+
+/// **The code stage's whole state**: what to ask for, and the two channel ends
+/// it talks to the sign-in worker over.
+///
+/// There is no `Challenge` in here and there must not be one. The worker holds
+/// it -- see `login_ui::complete_second_factor` -- and this struct lives inside
+/// a frame closure that outlives the stage by the whole vault session.
+struct SecondFactorStage {
+    state: second_factor_ui::Prompt,
+    commands: mpsc::Sender<login_ui::SecondFactorCommand>,
+    troubles: mpsc::Receiver<second_factor_ui::Trouble>,
+    /// Set once a trouble arrives that the stage cannot continue past -- an
+    /// expired challenge, which is the one with nothing left on the worker to
+    /// retry against.
+    fatal: bool,
+}
+
+impl SecondFactorStage {
+    fn new(session: login_ui::PromptSession) -> Self {
+        Self {
+            state: second_factor_ui::Prompt::new(session.request.providers),
+            commands: session.commands,
+            troubles: session.troubles,
+            fatal: false,
+        }
+    }
 }
 
 /// Where an event leaves the window.
@@ -244,6 +287,9 @@ pub fn advance(stage: Stage, event: Event) -> Next {
         (Stage::Working, Event::WorkFailed) => Next::Close,
         (Stage::Vault, Event::Locked) => Next::Show(Stage::Working),
         (Stage::Working, Event::TeardownDone) => Next::Show(Stage::SignIn),
+        (Stage::SignIn, Event::SecondFactorNeeded) => Next::Show(Stage::SecondFactor),
+        (Stage::SecondFactor, Event::SecondFactorDone) => Next::Show(Stage::Working),
+        (Stage::SecondFactor, Event::SecondFactorAbandoned) => Next::Show(Stage::SignIn),
         (stage, _) => Next::Show(stage),
     }
 }
@@ -1136,8 +1182,25 @@ where
     // frame installs the fonts, rounds the corners and raises it, and a
     // produced token must NOT close the window -- it has two more states to
     // enter. See `login_ui::build_login_frame`.
-    let (_login_options, login_fn, login_handles) =
-        login_ui::build_login_frame(account, first_run, true, false);
+    // **The code stage's two ends.** The worker gets `second_factor_ask` and
+    // uses it to hand a provider list up; this closure drains
+    // `second_factor_asked` and turns one into a card. Built here rather than
+    // inside the closure because both cards -- the first and the lock's -- ask
+    // over the same channel, and the worker holding the challenge must not
+    // find the receiver gone between them.
+    let (second_factor_ask, second_factor_asked) = login_ui::second_factor_channel();
+    // What the code stage is showing, and where its answers go. `None` until a
+    // worker asks. Nothing in here is a challenge -- see
+    // `login_ui::SecondFactorRequest`.
+    let mut second_factor: Option<SecondFactorStage> = None;
+
+    let (_login_options, login_fn, login_handles) = login_ui::build_login_frame(
+        account,
+        first_run,
+        true,
+        false,
+        Some(second_factor_ask.clone()),
+    );
 
     // Read back after the event loop returns. `Rc<RefCell<_>>` rather than
     // return values because the update closure is `FnMut + 'static` and cannot
@@ -1250,6 +1313,81 @@ where
             log::info!("single window: showing {stage:?}");
         }
 
+        // **The token is noticed in ONE place, and it is here rather than in a
+        // stage's arm.** Two stages can be up when the sign-in worker answers
+        // -- the card, and the code box the card leads to -- and the wiring
+        // that records the session token, starts `prepare` and hands the lock
+        // its password is not something this window may have two copies of.
+        // Which stage is up decides only which event the table is asked for.
+        //
+        // The card is drawn after this, so a token produced during a frame is
+        // acted on at the top of the next one; `request_repaint` below is what
+        // makes that next frame immediate.
+        if matches!(stage, Stage::SignIn | Stage::SecondFactor) {
+            let produced_event = if stage == Stage::SecondFactor {
+                Event::SecondFactorDone
+            } else {
+                Event::SignedIn
+            };
+            // The card records its token and does NOT close the window
+            // (`close_on_success: false`); this is where that token is
+            // noticed. `take_token` takes, so this cannot fire twice.
+            let produced = login.as_mut().and_then(|(_, handles)| handles.take_token());
+            if let Some(produced) = produced {
+                // The prompt, if there was one, is over: the code was
+                // accepted. Dropping it closes the command channel, which is
+                // one of the two things that end
+                // `login_ui::complete_second_factor`.
+                second_factor = None;
+                // **The token the window ENDED with**, which is what
+                // `StartupOutcome::token` means. The lock catch clears it, so
+                // a post-lock card overwrites it here and a post-lock card the
+                // user CLOSED leaves it `None` -- which is the whole of
+                // `main`'s "closed without a session, so exit" check, a check
+                // that could never fire while this cell went on holding the
+                // first sign-in's token across a lock that threw that session
+                // away.
+                *token_for_closure.borrow_mut() = Some(produced.clone());
+                signed_in_at = Some(Instant::now());
+                // **THE FIRST CARD OR THE SECOND, told apart by the `FnOnce`
+                // itself.** `prepare` is in an `Option` because it may only
+                // run once; `take()` answering `None` therefore IS "the first
+                // sign-in already happened and this card is the lock's", and
+                // no second flag can disagree with it. The first card starts
+                // the worker; the second hands its password to the teardown
+                // worker that is already blocked waiting for one.
+                match prepare.take() {
+                    // THE WORK GOES TO A THREAD. Everything `prepare` does is
+                    // synchronous and slow -- a `bw serve` cold start alone is
+                    // regularly several seconds -- and doing any of it here
+                    // would freeze the window on the frame that is supposed to
+                    // start showing the spinner.
+                    Some(prepare) => {
+                        // `take`, not `clone`: the worker gets the only
+                        // sender, so its death is a `Disconnected` the stage
+                        // can act on.
+                        if let Some(work_tx) = work_tx.take() {
+                            std::thread::spawn(move || {
+                                let _ = work_tx.send(prepare(produced));
+                            });
+                        }
+                    }
+                    None => lock.hand_over_the_token(produced),
+                }
+                if let Next::Show(next) = advance(stage, produced_event) {
+                    stage = next;
+                    if next == Stage::Working {
+                        // Back to the seed: what is being set up after the
+                        // post-lock card is the same vault the first card was
+                        // setting up.
+                        working_message = setup_message;
+                        working_since = Some(Instant::now());
+                    }
+                }
+                ui.ctx().request_repaint();
+            }
+        }
+
         match stage {
             Stage::SignIn => {
                 // Built on demand rather than up front: the FIRST card is
@@ -1264,66 +1402,88 @@ where
                         sign_in_first_run,
                         true,
                         false,
+                        // The SAME prompt the first card got. A post-lock
+                        // sign-in is a sign-in: it can meet a second factor
+                        // for exactly the reasons the first one can.
+                        Some(second_factor_ask.clone()),
                     );
                     login = Some((frame, handles));
                 }
-                let Some((login_fn, login_handles)) = login.as_mut() else {
+                let Some((login_fn, _login_handles)) = login.as_mut() else {
                     return;
                 };
                 login_fn(ui, frame);
-                // The card records its token and does NOT close the window
-                // (`close_on_success: false`); this is where that token is
-                // noticed. `take_token` takes, so this cannot fire twice.
-                if let Some(produced) = login_handles.take_token() {
-                    // **The token the window ENDED with**, which is what
-                    // `StartupOutcome::token` means. The lock catch clears
-                    // it, so a post-lock card overwrites it here and a
-                    // post-lock card the user CLOSED leaves it `None` --
-                    // which is the whole of `main`'s "closed without a
-                    // session, so exit" check, a check that could never fire
-                    // while this cell went on holding the first sign-in's
-                    // token across a lock that threw that session away.
-                    *token_for_closure.borrow_mut() = Some(produced.clone());
-                    signed_in_at = Some(Instant::now());
-                    // **THE FIRST CARD OR THE SECOND, told apart by the
-                    // `FnOnce` itself.** `prepare` is in an `Option` because
-                    // it may only run once; `take()` answering `None`
-                    // therefore IS "the first sign-in already happened and
-                    // this card is the lock's", and no second flag can
-                    // disagree with it. The first card starts the worker; the
-                    // second hands its password to the teardown worker that
-                    // is already blocked waiting for one.
-                    match prepare.take() {
-                        // THE WORK GOES TO A THREAD. Everything `prepare`
-                        // does is synchronous and slow -- a `bw serve` cold
-                        // start alone is regularly several seconds -- and
-                        // doing any of it here would freeze the window on the
-                        // frame that is supposed to start showing the
-                        // spinner.
-                        Some(prepare) => {
-                            // `take`, not `clone`: the worker gets the only
-                            // sender, so its death is a `Disconnected` the
-                            // stage can act on.
-                            if let Some(work_tx) = work_tx.take() {
-                                std::thread::spawn(move || {
-                                    let _ = work_tx.send(prepare(produced));
-                                });
-                            }
-                        }
-                        None => lock.hand_over_the_token(produced),
-                    }
-                    if let Next::Show(next) = advance(stage, Event::SignedIn) {
+                // **The worker is blocked on this.** It has the challenge and
+                // is waiting for a command; until this stage change happens
+                // there is nothing on screen that can send one. Drained after
+                // the card is drawn so the card's own last frame is complete.
+                if let Ok(session) = second_factor_asked.try_recv() {
+                    second_factor = Some(SecondFactorStage::new(session));
+                    if let Next::Show(next) = advance(stage, Event::SecondFactorNeeded) {
                         stage = next;
-                        if next == Stage::Working {
-                            // Back to the seed: what is being set up after
-                            // the post-lock card is the same vault the first
-                            // card was setting up.
-                            working_message = setup_message;
-                            working_since = Some(Instant::now());
-                        }
                     }
                     ui.ctx().request_repaint();
                 }
+            }
+            Stage::SecondFactor => {
+                let Some(prompt) = second_factor.as_mut() else {
+                    // Nothing to draw and nothing to wait for. Treated as an
+                    // abandonment rather than as a panic: the cost of being
+                    // wrong is the whole window dying on the screen a blocked
+                    // user is looking at.
+                    if let Next::Show(next) = advance(stage, Event::SecondFactorAbandoned) {
+                        stage = next;
+                    }
+                    return;
+                };
+                for trouble in prompt.troubles.try_iter() {
+                    prompt.state.went_wrong(trouble);
+                    prompt.fatal |= trouble.is_fatal();
+                }
+                match second_factor_ui::draw(ui, &mut prompt.state) {
+                    Some(second_factor_ui::PromptAction::Send) => {
+                        // Said before the answer comes back, because the
+                        // failure path clears it (`Trouble::EmailSendFailed`)
+                        // and the success path has nothing to say. See
+                        // `Prompt::sent_a_code` for why this does not ghost
+                        // the card the way an answer does.
+                        prompt.state.sent_a_code();
+                        let _ = prompt.commands.send(login_ui::SecondFactorCommand::SendEmail);
+                    }
+                    Some(second_factor_ui::PromptAction::Submit(answer)) => {
+                        prompt.state.busy = true;
+                        let _ =
+                            prompt.commands.send(login_ui::SecondFactorCommand::Answer(answer));
+                    }
+                    Some(second_factor_ui::PromptAction::Back) => {
+                        let _ = prompt.commands.send(login_ui::SecondFactorCommand::Abandon);
+                        second_factor = None;
+                        // The card is rebuilt from scratch on the way back:
+                        // the one that is up has been sitting on its own
+                        // "signing in" state since the grant, and its worker
+                        // has just been told to go away.
+                        login = None;
+                        if let Next::Show(next) = advance(stage, Event::SecondFactorAbandoned) {
+                            stage = next;
+                        }
+                    }
+                    None => {}
+                }
+                // An expired challenge is the one trouble with nothing left on
+                // the worker to retry against, so the stage ends rather than
+                // leaving a box whose every answer will be refused.
+                if second_factor.as_ref().is_some_and(|prompt| prompt.fatal) {
+                    second_factor = None;
+                    login = None;
+                    if let Next::Show(next) = advance(stage, Event::SecondFactorAbandoned) {
+                        stage = next;
+                    }
+                }
+                // The worker's success arrives as a token on the same channel
+                // the card's does, and is noticed by the one block above this
+                // match -- which is also where this stage's prompt is let go.
+                ui.ctx().request_repaint_after(Duration::from_millis(120));
+                let _ = frame;
             }
             Stage::Working => {
                 // **This stage cannot be closed, and its ✕ says so.** It no
@@ -2024,6 +2184,19 @@ where
                     }
                 }
             }
+            // **Unreachable on this host, and returned from rather than
+            // drawn.** Nothing here builds a `login_ui::second_factor_channel`,
+            // so no worker can reach a prompt and no `SecondFactorNeeded` can
+            // be raised; the arm exists because `Stage` is one enum shared by
+            // three hosts. Reported once and left on the stage it cannot leave
+            // -- a `Close` here would end a window that has a perfectly good
+            // vault behind it.
+            Stage::SecondFactor => {
+                log::error!(
+                    "this window reached the second-factor stage, which it has no card for"
+                );
+                let _ = frame;
+            }
             Stage::Working => {
                 match loading_ui::draw_spinner_body(
                     ui,
@@ -2351,6 +2524,18 @@ where
                     close_this_window(ui.ctx(), &mut closing);
                 }
                 let _ = frame;
+            }            // Unreachable for the same reason, one step further along: this
+            // host has no sign-in card, so it has nothing that could ask for a
+            // second factor either.
+            Stage::SecondFactor => {
+                if !closing.decided() {
+                    log::error!(
+                        "the warm launch window reached the second-factor stage, which it has \
+                         no card for; closing so the startup recovery can run"
+                    );
+                    close_this_window(ui.ctx(), &mut closing);
+                }
+                let _ = frame;
             }
         }
     });
@@ -2488,7 +2673,7 @@ where
     let offline_cell = offline.clone();
 
     run_the_one_window(the_vault_windows_viewport(), move |ui, _frame| {
-        // Asked here, once per frame, so both bodies are told the same thing
+        // PromptAction here, once per frame, so both bodies are told the same thing
         // on the same frame and neither can be drawn from a stale answer.
         let local = local_copy();
         let body = match failure {
@@ -2687,6 +2872,72 @@ mod transition_tests {
              to the tray without the vault they just unlocked -- which is the half of the \
              report that was never about window count"
         );
+    }
+
+    /// **The code stage sits between the card and the spinner**, and the two
+    /// ways out of it are the two things that can happen: a completed factor
+    /// goes on to the spinner, an abandoned one goes BACK to the card.
+    #[test]
+    fn the_code_stage_sits_between_the_card_and_the_spinner() {
+        assert_eq!(
+            advance(Stage::SignIn, Event::SecondFactorNeeded),
+            Next::Show(Stage::SecondFactor)
+        );
+        assert_eq!(
+            advance(Stage::SecondFactor, Event::SecondFactorDone),
+            Next::Show(Stage::Working),
+            "a completed factor enters the spinner exactly as a password-only sign-in does"
+        );
+        assert_eq!(
+            advance(Stage::SecondFactor, Event::SecondFactorAbandoned),
+            Next::Show(Stage::SignIn),
+            "backing out returns to the card, not to a closed window: the user still has \
+             an account to sign into"
+        );
+    }
+
+    /// The stage does not become a hole in the table. A `SignedIn` arriving
+    /// while the code box is up is a no-op, not a jump past the factor.
+    #[test]
+    fn the_code_stage_ignores_events_that_are_not_about_it() {
+        assert_eq!(
+            advance(Stage::SecondFactor, Event::SignedIn),
+            Next::Show(Stage::SecondFactor),
+            "a stale SignedIn must not skip the factor"
+        );
+        assert_eq!(
+            advance(Stage::SecondFactor, Event::WorkReady),
+            Next::Show(Stage::SecondFactor)
+        );
+        // Positive control: the table still moves for the events it owns.
+        assert_eq!(
+            advance(Stage::SecondFactor, Event::SecondFactorDone),
+            Next::Show(Stage::Working)
+        );
+    }
+
+    /// And the second factor's own events do nothing to the stages they are
+    /// not about, so a request that arrives one frame late cannot drag the
+    /// vault back to a code box.
+    #[test]
+    fn the_second_factors_events_do_not_disturb_the_other_stages() {
+        for stage in [Stage::Working, Stage::Vault] {
+            for event in [
+                Event::SecondFactorNeeded,
+                Event::SecondFactorDone,
+                Event::SecondFactorAbandoned,
+            ] {
+                assert_eq!(
+                    advance(stage, event),
+                    Next::Show(stage),
+                    "{event:?} moved the window off {stage:?}"
+                );
+            }
+        }
+        // Control: the one pair among these stages that IS a transition still
+        // is, so the loop above is about events being inert and not about
+        // `advance` having stopped moving at all.
+        assert_eq!(advance(Stage::Vault, Event::Locked), Next::Show(Stage::Working));
     }
 
     #[test]
@@ -3451,6 +3702,101 @@ mod startup_window_tests {
         arm
     }
 
+    /// The startup host's code-stage arm, from its own `match` label to the
+    /// working stage's.
+    fn second_factor_arm() -> String {
+        let closure = closure();
+        let start = closure
+            .find(concat!("Stage::SecondFactor ", "=>"))
+            .expect("the closure has no second-factor stage at all");
+        let rest = &closure[start..];
+        let end = rest
+            .find(concat!("Stage::Working ", "=>"))
+            .expect("the second-factor arm is not followed by the working arm");
+        let arm = rest[..end].to_string();
+        assert!(
+            arm.len() > 1_000,
+            "the second-factor arm sliced down to {} bytes, which is not the whole of it -- \
+             the guards below would then be statements about a region that stops before the \
+             code they are about",
+            arm.len()
+        );
+        arm
+    }
+
+    /// **The one part of this feature no test can run.** `eframe::Frame` has
+    /// no public constructor, so the frame closure cannot be called at all;
+    /// what the arm DECIDES is in `advance` and is tested, and what is left is
+    /// wiring that only source position can pin.
+    ///
+    /// Three things have to be true of it, and each has been shipped false in
+    /// this crate at least once: it must draw the card, it must send what the
+    /// card asked for down the command channel, and it must never bind a
+    /// challenge.
+    #[test]
+    fn the_code_stage_draws_the_card_and_answers_it_over_the_channel() {
+        let arm = second_factor_arm();
+
+        assert!(
+            arm.contains(concat!("second_factor_ui::", "draw(")),
+            "the code stage never draws the card, so the user waits at a blank stage while a \
+             worker holds their master key: {arm}"
+        );
+        for command in ["SendEmail", "Answer(", "Abandon"] {
+            assert!(
+                arm.contains(command),
+                "the code stage never sends `{command}` -- a control that answers nothing is \
+                 the defect this crate ships most: {arm}"
+            );
+        }
+        assert!(
+            arm.contains("went_wrong("),
+            "the code stage never applies the worker's troubles, so a rejected code leaves \
+             the box full and the message absent: {arm}"
+        );
+        assert!(
+            arm.contains("is_fatal()"),
+            "the code stage never notices an expired challenge, so it keeps asking for codes \
+             against a login that no longer resumes: {arm}"
+        );
+
+        // **And it holds nothing it should not.** The window's whole safety
+        // argument is that the credential never crossed the thread boundary;
+        // a `Challenge` named anywhere in this arm would mean it had.
+        for forbidden in ["Challenge", "MasterKey", "password"] {
+            assert!(
+                !arm.contains(forbidden),
+                "`{forbidden}` in the code stage's arm: this stage is drawn by a closure that \
+                 outlives the whole vault session, and the credential belongs on the worker \
+                 thread: {arm}"
+            );
+        }
+    }
+
+    /// The stage is not merely drawable -- it is REACHABLE. The sign-in arm is
+    /// the only thing that can put the window into it, and it does that by
+    /// draining the channel the worker asks over.
+    #[test]
+    fn the_sign_in_arm_is_what_enters_the_code_stage() {
+        let closure = closure();
+        let start = closure
+            .find(concat!("Stage::SignIn ", "=>"))
+            .expect("the closure has no sign-in stage at all");
+        let arm = &closure[start..start
+            + closure[start..]
+                .find(concat!("Stage::SecondFactor ", "=>"))
+                .expect("the sign-in arm is not followed by the code stage")];
+        assert!(
+            arm.contains("second_factor_asked"),
+            "the sign-in arm never looks for a second-factor request, so the worker blocks \
+             forever holding the challenge and the card sits there saying nothing: {arm}"
+        );
+        assert!(
+            arm.contains(concat!("Event::SecondFactor", "Needed")),
+            "the sign-in arm never raises the event that enters the stage: {arm}"
+        );
+    }
+
     /// **The stage that refuses to close shows a ✕ that refuses to be clicked.**
     ///
     /// Before the spinner wore a heading there was no ✕ here at all, so the
@@ -3697,11 +4043,22 @@ mod startup_window_tests {
         // Both sub-frames are built `pre_styled`, which is what stops them
         // raising the window again from inside it. Spelled as the argument
         // lists, because a bare `true` names nothing.
+        //
+        // **Read off whitespace-squashed source**, because the login call took
+        // a fifth argument -- the second-factor prompt -- and rustfmt then
+        // broke it across lines. A needle spelled with the old single-line
+        // spacing matches nothing and passes no more, which is the shape a
+        // guard fails silently in.
+        let squashed = production.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            production.contains(concat!("build_login_frame(account, first_run, ", "true, false)")),
+            squashed.contains(concat!(
+                "build_login_frame( account, first_run, ",
+                "true, false, Some(second_factor_ask.clone()), )"
+            )),
             "the login frame is no longer built `pre_styled`/non-closing: either it re-raises \
              this window from inside it, or a produced token closes the window before the \
-             spinner and vault it is supposed to become"
+             spinner and vault it is supposed to become -- or the sign-in worker has no way \
+             to reach the code stage, which is a two-step account that cannot sign in"
         );
     }
     // -----------------------------------------------------------------

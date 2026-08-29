@@ -483,9 +483,20 @@ pub fn friendly_auth_error(stderr: &str) -> String {
         return "That email or master password didn't work. Check them and try again."
             .to_string();
     }
+    // **This arm no longer sends anybody to a terminal.** It used to read
+    // "Run `bw login` in a terminal once to complete it, then come back",
+    // which was true when this window could not prompt for a second factor.
+    // It can: see `second_factor_ui` and `app_window::Stage::SecondFactor`.
+    //
+    // What is left here is the case where a two-step failure surfaces as a
+    // CLI stderr string rather than as a `LoginOutcome::NeedsSecondFactor` --
+    // an account still on the `bw` backend. There is no provider list in a
+    // stderr line, so this cannot name the provider the way
+    // `second_factor_ui::unsupported_only_message` does; it says what happened
+    // and stops.
     if mentions(&["two-step", "two step", "two-factor", "twofactor"]) {
-        return "This account uses two-step login, which Deskwarden can't prompt for. \
-                Run `bw login` in a terminal once to complete it, then come back."
+        return "That two-step login didn't complete. Try again — and if this account \
+                uses Duo or a security key, sign in with a personal API key instead."
             .to_string();
     }
     if mentions(&["too many", "rate limit", "traffic from your network"]) {
@@ -2223,7 +2234,7 @@ pub struct SecondFactorSeam<C = crate::rest::api::Challenge> {
     /// said no to these digits" and "the server said nothing at all" are two
     /// different things to tell the user, and this is the only call that can
     /// tell them apart.
-    pub finish: fn(&C, &crate::rest::api::SecondFactorAnswer) -> Result<Authenticated, Refusal>,
+    pub finish: fn(&C, &crate::rest::api::SecondFactorAnswer) -> Result<Authenticated, GrantRefusal>,
 }
 
 /// A `Clone`/`Copy` written by hand rather than derived.
@@ -2247,7 +2258,7 @@ impl<C> Copy for SecondFactorSeam<C> {}
 /// separate rules. `trouble` is a variant the window may render; `log` is a
 /// `RestError`'s own `Display`, which names a status and a route and is never
 /// shown.
-pub struct Refusal {
+pub struct GrantRefusal {
     pub trouble: crate::second_factor_ui::Trouble,
     pub log: String,
 }
@@ -2297,10 +2308,10 @@ fn send_direct_rest_email(challenge: &crate::rest::api::Challenge) -> Result<(),
 fn finish_direct_rest(
     challenge: &crate::rest::api::Challenge,
     answer: &crate::rest::api::SecondFactorAnswer,
-) -> Result<Authenticated, Refusal> {
+) -> Result<Authenticated, GrantRefusal> {
     crate::rest::api::RestClient::new(challenge.server_url())
         .finish_second_factor(challenge, answer)
-        .map_err(|e| Refusal { trouble: trouble_for(&e), log: e.to_string() })
+        .map_err(|e| GrantRefusal { trouble: trouble_for(&e), log: e.to_string() })
 }
 
 /// The seam's one production value, written in exactly one place.
@@ -2325,6 +2336,67 @@ pub trait SecondFactorPrompt {
         std::sync::mpsc::Receiver<SecondFactorCommand>,
         std::sync::mpsc::Sender<crate::second_factor_ui::Trouble>,
     )>;
+}
+
+/// One second-factor prompt, as the window receives it: what to ask for, where
+/// to send the answers, and where the worker's troubles arrive.
+///
+/// The `Challenge` is not in here for the reason [`SecondFactorRequest`] does
+/// not carry one. What the window gets is a provider list and two channel
+/// ends.
+pub struct PromptSession {
+    pub request: SecondFactorRequest,
+    /// The window's end of the command channel. Dropping it is how a closed
+    /// window ends [`complete_second_factor`].
+    pub commands: std::sync::mpsc::Sender<SecondFactorCommand>,
+    pub troubles: std::sync::mpsc::Receiver<crate::second_factor_ui::Trouble>,
+}
+
+/// The [`SecondFactorPrompt`] the one-window host installs: it forwards the
+/// worker's request up a channel the frame closure drains, and hands the
+/// worker back the other two ends.
+///
+/// The `Mutex` is not for contention -- exactly one worker ever asks, and it
+/// asks once -- but because `Sender` is not `Sync` and this value is shared
+/// through an `Arc` that must be `Send + Sync` to reach the worker at all.
+pub struct ChannelPrompt {
+    sessions: std::sync::Mutex<std::sync::mpsc::Sender<PromptSession>>,
+}
+
+impl SecondFactorPrompt for ChannelPrompt {
+    fn ask(
+        &self,
+        request: SecondFactorRequest,
+    ) -> Option<(
+        std::sync::mpsc::Receiver<SecondFactorCommand>,
+        std::sync::mpsc::Sender<crate::second_factor_ui::Trouble>,
+    )> {
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let (trouble_tx, trouble_rx) = std::sync::mpsc::channel();
+        let sent = self
+            .sessions
+            .lock()
+            .ok()?
+            .send(PromptSession { request, commands: command_tx, troubles: trouble_rx });
+        // A closed receiver is a window that has already gone. Answering
+        // `None` is what makes the worker drop the challenge and return
+        // instead of blocking on commands nobody will send.
+        sent.ok()?;
+        Some((command_rx, trouble_tx))
+    }
+}
+
+/// The two ends of a second-factor prompt: the one the worker is given, and
+/// the one the frame closure drains.
+///
+/// Built here rather than in `app_window` so that the channel's two halves are
+/// created in the same place as the type that travels over it.
+pub fn second_factor_channel() -> (
+    std::sync::Arc<dyn SecondFactorPrompt + Send + Sync>,
+    std::sync::mpsc::Receiver<PromptSession>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    (std::sync::Arc::new(ChannelPrompt { sessions: std::sync::Mutex::new(tx) }), rx)
 }
 
 /// **The prompt, from the worker thread's side.**
@@ -2489,12 +2561,23 @@ fn spawn_auth(
     // no account at all (`StartupAccounts::NoAccountList`), where there is no
     // override to set and the CLI resolves its own.
     data_dir: Option<PathBuf>,
+    // The window's code stage, when this host has one. `None` is every host
+    // that draws no such stage, and it means a two-step account cannot finish
+    // signing in there -- which is what it meant everywhere before the stage
+    // existed.
+    second_factor: Option<std::sync::Arc<dyn SecondFactorPrompt + Send + Sync>>,
 ) {
     // Read here rather than passed in, so that all four of this window's hosts
     // get it without carrying it. `None` -- nothing installed, or this account
     // is on `bw serve` -- is byte-for-byte the behaviour this function has
     // always had.
-    let direct = crate::backend_policy::direct_rest_login();
+    //
+    // The prompt IS passed in, because it is the one part of this that differs
+    // per host: `backend_policy` installs what the process can reach, and only
+    // the caller knows whether there is a card to draw a code box on.
+    let direct = crate::backend_policy::direct_rest_login().map(|direct| {
+        crate::login_ui::DirectRestLogin { prompt: second_factor, ..direct }
+    });
     std::thread::spawn(move || {
         let token = authenticate_then_wipe(
             password,
@@ -2556,6 +2639,7 @@ pub fn build_login_frame(
     first_run: bool,
     pre_styled: bool,
     close_on_success: bool,
+    second_factor: Option<std::sync::Arc<dyn SecondFactorPrompt + Send + Sync>>,
 ) -> (eframe::NativeOptions, LoginFrameFn, LoginFrameHandles) {
     // **Every `bw` this window runs is aimed at THIS account's directory**,
     // derived from the account it was already given rather than read off the
@@ -2898,6 +2982,7 @@ pub fn build_login_frame(
                                 form.password.clone(),
                                 enroll_hello,
                                 profile_dir.clone(),
+                                second_factor.clone(),
                             );
                             form.error = None;
                             auth_in_progress = true;
@@ -2934,6 +3019,7 @@ pub fn build_login_frame(
                                     // password came from.
                                     None,
                                     profile_dir.clone(),
+                                    second_factor.clone(),
                                 );
                                 form.error = None;
                                 auth_in_progress = true;
@@ -3050,6 +3136,10 @@ pub fn run_login_flow_for(
         // ...and a produced token is the end of the window, because there is
         // no next state for it to enter.
         true,
+        // This host has no second-factor stage: it is a blocking window
+        // that returns a session token, and a code box would need a stage
+        // machine it does not have.
+        None,
     );
 
     let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, frame| frame_fn(ui, frame));
@@ -3876,10 +3966,18 @@ Cryptography error, The decryption operation failed";
         );
     }
 
+    /// **What to actually do about it is no longer "open a terminal".** This
+    /// asserted `bw login` until the second-factor prompt existed; the window
+    /// can ask for a code itself now, and the only two-step failure that still
+    /// reaches this function is a `bw` stderr line, which carries no provider
+    /// list to be more specific with. See `two_step_message_tests`, which is
+    /// where the replacement's own guards live.
     #[test]
     fn two_step_login_says_what_to_actually_do_about_it() {
         let shown = friendly_auth_error("Two-step login is required for this account.");
-        assert!(shown.contains("bw login"), "got: {shown}");
+        assert!(shown.to_lowercase().contains("two-step"), "got: {shown}");
+        assert!(shown.contains("API key"), "got: {shown}");
+        assert!(!shown.contains("bw login"), "got: {shown}");
     }
 
     #[test]
@@ -10674,10 +10772,12 @@ mod status_deadline_tests {
             "a test module below the cut is never closed by a column-0 `}}`, so the walk ran \
              off the end of the file inside it and stopped inspecting top-level lines"
         );
-        // 12 before this branch; the second factor added the two modules that
-        // watch its worker-side boundary and its completion loop.
+        // 12 before this branch. The second factor added four: the two that
+        // watch its worker-side boundary and its completion loop, the one over
+        // the window's end of the prompt channel, and the one that holds the
+        // retired "run `bw login` in a terminal" message down.
         assert_eq!(
-            modules, 14,
+            modules, 16,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -11000,8 +11100,8 @@ mod second_factor_worker {
         ))
     }
 
-    fn refused(log: &str) -> Refusal {
-        Refusal { trouble: Trouble::CodeRejected, log: log.to_string() }
+    fn refused(log: &str) -> GrantRefusal {
+        GrantRefusal { trouble: Trouble::CodeRejected, log: log.to_string() }
     }
 
     /// **A wrong code is retried against the SAME challenge.** The whole point
@@ -11029,7 +11129,7 @@ mod second_factor_worker {
                 );
                 let n = FINISHES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if n == 0 {
-                    Err(Refusal {
+                    Err(GrantRefusal {
                         trouble: Trouble::CodeRejected,
                         log: "400 Bad Request /identity/connect/token".to_string(),
                     })
@@ -11075,7 +11175,7 @@ mod second_factor_worker {
             start: |_, _, _, _| Err("unused".to_string()),
             send_email: |_| Ok(()),
             finish: |_, _| {
-                Err(Refusal {
+                Err(GrantRefusal {
                     trouble: Trouble::Unreachable,
                     log: "the server could not be reached".to_string(),
                 })
@@ -11203,5 +11303,126 @@ mod second_factor_worker {
             "the loop kept going after it had a session, and answered a second code with a \
              grant nobody asked for"
         );
+    }
+}
+
+/// **The window's end of the prompt.**
+#[cfg(test)]
+mod second_factor_channel_tests {
+    use super::*;
+    use crate::rest::api::SecondFactor;
+    use crate::second_factor_ui::Trouble;
+
+    /// The request arrives whole, and the two ends the worker got are the two
+    /// ends the window is talking to.
+    #[test]
+    fn asking_hands_the_window_the_providers_and_a_working_pair_of_channels() {
+        let (prompt, sessions) = second_factor_channel();
+        let (commands, troubles) = prompt
+            .ask(SecondFactorRequest {
+                providers: vec![SecondFactor::Unsupported(7), SecondFactor::Authenticator],
+            })
+            .expect("control: a live window accepts the request");
+
+        let session = sessions.try_recv().expect("the request reached the window");
+        assert_eq!(
+            session.request.providers,
+            vec![SecondFactor::Unsupported(7), SecondFactor::Authenticator],
+            "the whole offer must arrive -- the unsupported entries are what name Duo"
+        );
+
+        // Down: the window's command reaches the worker's receiver.
+        session.commands.send(SecondFactorCommand::Abandon).expect("the worker is listening");
+        assert!(
+            matches!(commands.try_recv(), Ok(SecondFactorCommand::Abandon)),
+            "the window's command did not reach the worker's end of the channel"
+        );
+
+        // Up: the worker's trouble reaches the window's receiver.
+        troubles.send(Trouble::CodeRejected).expect("the window is listening");
+        assert_eq!(session.troubles.try_recv(), Ok(Trouble::CodeRejected));
+    }
+
+    /// **A window that has already gone is answered `None`**, which is what
+    /// makes the worker drop the challenge instead of blocking on a channel
+    /// nobody will ever send down.
+    #[test]
+    fn a_window_that_went_away_declines_the_prompt() {
+        let (prompt, sessions) = second_factor_channel();
+        drop(sessions);
+        assert!(
+            prompt
+                .ask(SecondFactorRequest { providers: vec![SecondFactor::Authenticator] })
+                .is_none(),
+            "a dead window accepted a prompt, so the worker will block forever holding the \
+             master key"
+        );
+
+        // Control: the same call against a live window is accepted, so the
+        // `None` above is about the window being gone.
+        let (prompt, _sessions) = second_factor_channel();
+        assert!(prompt
+            .ask(SecondFactorRequest { providers: vec![SecondFactor::Authenticator] })
+            .is_some());
+    }
+}
+
+/// The message this branch is named after, and what replaced it.
+#[cfg(test)]
+mod two_step_message_tests {
+    use super::*;
+
+    /// **The message that sent people to a terminal is gone.**
+    ///
+    /// This is the message `login_ui.rs:486` carried before this branch, and
+    /// the whole of the second-factor prompt exists to replace it. The
+    /// positive control is the arm beside it: a mistyped password still gets
+    /// its own wording, so a `friendly_auth_error` that had stopped matching
+    /// anything at all would fail here rather than pass.
+    #[test]
+    fn no_two_step_failure_tells_the_user_to_open_a_terminal() {
+        let two_step = friendly_auth_error("Two-step login is required");
+        assert!(
+            !two_step.contains("bw login") && !two_step.to_lowercase().contains("terminal"),
+            "got {two_step:?}"
+        );
+        assert!(
+            two_step.to_lowercase().contains("try again")
+                || two_step.to_lowercase().contains("two-step"),
+            "the arm must still SAY something about two-step login; got {two_step:?}"
+        );
+        assert!(
+            friendly_auth_error("error=The decryption operation failed")
+                .contains("master password"),
+            "control: friendly_auth_error still recognises its other arms"
+        );
+    }
+
+    /// And no other arm of it sends anybody to a terminal either -- the whole
+    /// point being that this app now has a card for the thing it used to
+    /// delegate.
+    #[test]
+    fn nothing_this_function_says_mentions_the_cli() {
+        let said: Vec<String> = [
+            "Two-step login is required",
+            "error=The decryption operation failed",
+            "invalid username or password",
+            "too many requests",
+            "ECONNREFUSED",
+            "something nobody has an arm for",
+        ]
+        .iter()
+        .map(|stderr| friendly_auth_error(stderr))
+        .collect();
+        assert!(
+            said.iter().any(|m| m.contains("master password")),
+            "control: these inputs really do reach this function's arms; got {said:?}"
+        );
+        for message in &said {
+            assert!(
+                !message.contains("bw ") && !message.to_lowercase().contains("terminal"),
+                "a user-facing sign-in message names the CLI: {message:?}"
+            );
+        }
     }
 }
