@@ -57,7 +57,7 @@
 //! truncated names, and `--write` for the write pass described above.
 
 use deskwarden::app_match::AppMatch;
-use deskwarden::rest::api::{Device, RestClient};
+use deskwarden::rest::api::{Device, LoginOutcome, RestClient};
 use deskwarden::rest::backend::RestBackend;
 use deskwarden::rest::sync::decrypt_vault;
 use deskwarden::vault_backend::VaultBackend;
@@ -119,9 +119,17 @@ fn main() {
     // list on the server says what made the entry.
     let device = Device::windows_desktop("deskwarden-rest-probe", "Deskwarden REST probe");
     let mut authed = match client.authenticate(email, password.as_bytes(), &device) {
-        Ok(a) => {
+        Ok(LoginOutcome::Done(a)) => {
             println!("  ok -- {:?}", a.session);
             a
+        }
+        // This probe has no prompt and no stage to draw one on. Completing
+        // the factor is `login_ui`'s job; what this can usefully do is name
+        // the providers, which is what somebody running the probe against a
+        // two-step account wants to see.
+        Ok(LoginOutcome::NeedsSecondFactor(challenge)) => {
+            println!("  needs a second factor -- {:?}", challenge.providers());
+            std::process::exit(1);
         }
         Err(e) => {
             println!("  FAILED: {e}");
