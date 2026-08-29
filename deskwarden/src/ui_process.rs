@@ -223,32 +223,76 @@ pub enum Farewell {
     CloseIt { pid: u32 },
 }
 
-/// Whether a shutting-down daemon leaves its UI window running.
+/// **Why the open UI window is being closed**, which is not the same question
+/// as why the daemon is going away.
 ///
-/// **`Quit` closes it, and every other way the daemon can go away leaves it
-/// alone.** That distinction is the whole content of this function, and it is
-/// the same distinction [`UiSpawnPlan::joins_the_daemons_job`] is about, drawn
-/// one level up: a daemon *restart* -- an update, a crash, a manual kill --
-/// must not close the user's window, because the daemon comes back, brings
-/// `bw serve` up on the same port and the window's next request succeeds. A
-/// **Quit** is not a restart. Nothing comes back. The quit handler has just
-/// killed `bw serve`, cleared the vault cache, the breach results and the
-/// clipboard, precisely so that nothing decrypted outlives the moment the user
-/// said to go away -- and a vault window left running is a process still
-/// showing that user's entire decrypted vault, on screen, with no app behind
-/// it and no auto-lock timer that means anything any more. Leaving it is the
-/// one case where the loose coupling stops being a feature.
-///
-/// The cost is an edit in progress in that window, which is why this is not
-/// reached from anything but the tray's *Quit*.
-pub fn farewell_to_an_open_window(reason: DaemonExit, open: Option<u32>) -> Farewell {
-    match (reason, open) {
-        (DaemonExit::UserQuit, Some(pid)) => Farewell::CloseIt { pid },
-        _ => Farewell::NothingOpen,
+/// [`DaemonExit`] answers the second and converts into this; it keeps its own
+/// name because the quit path genuinely is asking a daemon-lifecycle question.
+/// The third reason is not a daemon lifecycle event at all -- the daemon is
+/// running, will keep running, and has just been told by Windows that the
+/// person using it left the machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhyClose {
+    /// The tray's *Quit*: the user asked for the app to be gone. The quit
+    /// handler has just killed `bw serve` and cleared the vault cache, the
+    /// breach results and the clipboard, precisely so that nothing decrypted
+    /// outlives the moment the user said to go away -- and a vault window left
+    /// running is a process still showing that user's entire decrypted vault,
+    /// on screen, with no app behind it and no auto-lock timer that means
+    /// anything any more.
+    DaemonIsQuitting,
+    /// The process is ending and expects to be back -- an update swapping the
+    /// binary, or a crash. **The window stays up.** This is the same
+    /// distinction [`UiSpawnPlan::joins_the_daemons_job`] is about, drawn one
+    /// level up: the daemon comes back, brings `bw serve` up on the same port,
+    /// and the window's next request succeeds.
+    DaemonIsRestarting,
+    /// Windows reported that the user walked away -- Win+L, a session switch,
+    /// or a suspend -- **and `away_lock::locks_the_vault` said that locks this
+    /// vault**. That gate is why this arm carries no preference of its own: a
+    /// value of this variant cannot exist unless the user's own auto-lock
+    /// setting already answered yes.
+    ///
+    /// The daemon is not going anywhere. What is going away is the decrypted
+    /// vault, and the largest piece of it is in another process.
+    TheUserWalkedAway,
+}
+
+impl From<DaemonExit> for WhyClose {
+    fn from(exit: DaemonExit) -> Self {
+        match exit {
+            DaemonExit::UserQuit => WhyClose::DaemonIsQuitting,
+            DaemonExit::Restart => WhyClose::DaemonIsRestarting,
+        }
     }
 }
 
-/// Why the daemon is going away. See [`farewell_to_an_open_window`].
+/// Whether the daemon closes the UI window it has open.
+///
+/// **Two of the three reasons close it and one does not**, and that
+/// distinction is the whole content of this function. A daemon *restart* must
+/// not close the user's window, because the daemon comes back and recovery is
+/// a retry rather than a handshake. A **Quit** is not a restart: nothing comes
+/// back. A **workstation lock** is not a restart either, and is the one reason
+/// here that leaves the daemon alive -- what ends is the decrypted vault, and
+/// this process is holding the visible copy of it.
+///
+/// The cost of both closing arms is an edit in progress in that window. It is
+/// the same cost the window's own idle auto-lock already charges, which closes
+/// the viewport without asking (`vault_window::idle_frame` -> `IdleFrame::Lock`).
+pub fn farewell_to_an_open_window(reason: WhyClose, open: Option<u32>) -> Farewell {
+    match (reason, open) {
+        (WhyClose::DaemonIsQuitting | WhyClose::TheUserWalkedAway, Some(pid)) => {
+            Farewell::CloseIt { pid }
+        }
+        // Matched rather than caught by a wildcard so that a fourth reason is
+        // a compile error here -- the one place that has to weigh it -- rather
+        // than a silent inheritance of "leave it alone".
+        (WhyClose::DaemonIsRestarting, _) | (_, None) => Farewell::NothingOpen,
+    }
+}
+
+/// Why the daemon is going away. See [`WhyClose`], which this converts into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DaemonExit {
     /// The tray's *Quit*: the user asked for the app to be gone.
@@ -521,33 +565,6 @@ mod tests {
     }
 
     #[test]
-    fn quitting_closes_the_vault_window_rather_than_leaving_it_showing_the_vault() {
-        assert_eq!(
-            farewell_to_an_open_window(DaemonExit::UserQuit, Some(4242)),
-            Farewell::CloseIt { pid: 4242 },
-            "the quit handler kills bw serve and clears the cache, the breach results and \
-             the clipboard so that nothing decrypted outlives the moment the user said to \
-             go away. A vault window left running is that user's whole decrypted vault, on \
-             screen, with no app behind it"
-        );
-    }
-
-    #[test]
-    fn a_restart_leaves_the_window_alone_because_the_daemon_is_coming_back() {
-        assert_eq!(
-            farewell_to_an_open_window(DaemonExit::Restart, Some(4242)),
-            Farewell::NothingOpen,
-            "an update or a crash must not close the user's open window mid-edit; that is \
-             the whole reason the child is not in the kill-on-close job"
-        );
-    }
-
-    #[test]
-    fn a_quit_with_no_window_open_has_nothing_to_close() {
-        assert_eq!(farewell_to_an_open_window(DaemonExit::UserQuit, None), Farewell::NothingOpen);
-    }
-
-    #[test]
     fn a_locked_window_is_still_locked_when_the_result_file_is_lost() {
         let locked = UiVaultResult { locked: true, ..Default::default() };
         let recovered = UiVaultResult::union(None, UiVaultResult::from_exit_code(locked.exit_code()));
@@ -657,5 +674,61 @@ mod tests {
                  what crosses the process boundary and it must stay free of secrets"
             );
         }
+    }
+
+    /// **A workstation lock closes the window, and it is the same decision
+    /// function that says so.**
+    ///
+    /// This arm is only ever reached downstream of
+    /// `away_lock::locks_the_vault`, which is what makes it correct for this
+    /// function to have no opinion about `auto_lock`: by the time a
+    /// `TheUserWalkedAway` exists, the gate has already been passed.
+    #[test]
+    fn walking_away_closes_the_vault_window() {
+        assert_eq!(
+            farewell_to_an_open_window(WhyClose::TheUserWalkedAway, Some(4242)),
+            Farewell::CloseIt { pid: 4242 },
+            "a decrypted vault rendered on screen must not survive the moment its owner              locked the workstation and left; the daemon's own cache and bw serve are torn              down in the same breath and this process is the only thing left holding one"
+        );
+        assert_eq!(
+            farewell_to_an_open_window(WhyClose::TheUserWalkedAway, None),
+            Farewell::NothingOpen,
+            "no window open is nothing to close -- the ordinary tray-only state this whole              feature was originally written for"
+        );
+    }
+
+    /// The positive control on the test above: adding the third arm must not
+    /// have flattened the distinction the first two arms exist to draw. A
+    /// `match` that had degenerated into `Some(pid) => CloseIt` would pass
+    /// every assertion above and fail exactly this one.
+    #[test]
+    fn a_restart_still_leaves_the_window_alone_now_that_a_third_reason_exists() {
+        assert_eq!(
+            farewell_to_an_open_window(WhyClose::DaemonIsRestarting, Some(4242)),
+            Farewell::NothingOpen,
+            "an update or a crash must still not close the user's window mid-edit"
+        );
+        assert_eq!(
+            farewell_to_an_open_window(WhyClose::DaemonIsQuitting, Some(4242)),
+            Farewell::CloseIt { pid: 4242 },
+            "control: the quit arm the two callers below rely on is unchanged"
+        );
+    }
+
+    /// The two existing call sites pass a `DaemonExit`. The conversion must be
+    /// the identity they were relying on, or this refactor silently changes
+    /// what quitting does.
+    #[test]
+    fn the_daemon_exit_reasons_convert_to_the_same_decisions_they_made_before() {
+        assert_eq!(
+            farewell_to_an_open_window(DaemonExit::UserQuit.into(), Some(7)),
+            Farewell::CloseIt { pid: 7 }
+        );
+        assert_eq!(
+            farewell_to_an_open_window(DaemonExit::Restart.into(), Some(7)),
+            Farewell::NothingOpen
+        );
+        assert_eq!(WhyClose::from(DaemonExit::UserQuit), WhyClose::DaemonIsQuitting);
+        assert_eq!(WhyClose::from(DaemonExit::Restart), WhyClose::DaemonIsRestarting);
     }
 }

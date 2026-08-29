@@ -6162,7 +6162,9 @@ impl UiWindows {
     /// file nobody will ever read is one the user's config directory should
     /// not keep.
     fn close_on_quit(&mut self, config_dir: &Path) {
-        let reason = deskwarden::ui_process::DaemonExit::UserQuit;
+        let reason = deskwarden::ui_process::WhyClose::from(
+            deskwarden::ui_process::DaemonExit::UserQuit,
+        );
         if let deskwarden::ui_process::Farewell::CloseIt { pid } =
             deskwarden::ui_process::farewell_to_an_open_window(reason, self.vault_pid())
         {
