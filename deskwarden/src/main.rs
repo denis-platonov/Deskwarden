@@ -7525,9 +7525,15 @@ enum ResettleOutcome {
 /// **Harmless in every other state.** `locks_the_vault` is asked first and is
 /// given `!token.is_empty()`, so an already-locked vault, a launch that never
 /// got a session, and a startup that stood autofill down all leave with
-/// nothing done. A vault WINDOW being open cannot reach here at all: that
-/// window runs its own nested loop and this one is not being pumped while it
-/// is up -- and its own idle auto-lock is what covers the user there.
+/// nothing done.
+///
+/// **A vault window being open is now the case this function most needs to
+/// handle**, and until this change it was the one it could not. The window
+/// runs in a process of its own, the daemon's loop pumps throughout, and
+/// `ui.close_because_the_user_walked_away` above is what reaches it. The
+/// in-daemon fallback window -- opened only when no UI process could be
+/// started -- is still a nested loop that this pump does not run beneath, and
+/// its own idle auto-lock is still what covers the user there.
 #[allow(clippy::too_many_arguments)]
 fn lock_after_walking_away(
     est: &mut SessionEstate,
