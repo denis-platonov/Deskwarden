@@ -242,6 +242,83 @@ pub fn unsupported_only_message(offered: &[SecondFactor]) -> Option<String> {
     ))
 }
 
+/// Why the prompt is showing a message.
+///
+/// Four variants and not one `String`, because the *behaviour* differs and not
+/// only the wording: a rejected code empties the box, a failed send does not,
+/// and an expired challenge ends the stage. A `String` error would put that
+/// decision in the caller, where nothing tests it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Trouble {
+    /// The server said no to these digits.
+    CodeRejected,
+    /// [`crate::rest::api::RestClient::send_email_code`] failed, which
+    /// `rest::api` reports as its own [`crate::rest::api::RestError::
+    /// CodeNotSent`] precisely so it cannot be confused with this next one.
+    /// **Not** a rejected code: the user has nothing to check.
+    EmailSendFailed,
+    /// The challenge no longer resumes -- the server expired it, or the worker
+    /// holding it is gone. There is no hash left to retry with, so this one
+    /// ends the stage.
+    ChallengeExpired,
+    /// Neither the grant nor the send got an answer at all.
+    Unreachable,
+}
+
+impl Trouble {
+    /// Whether the stage can continue. `false` for exactly one variant, and it
+    /// is the variant with nothing on the worker to retry against.
+    pub fn is_fatal(self) -> bool {
+        matches!(self, Trouble::ChallengeExpired)
+    }
+}
+
+/// One line the user can act on, per trouble.
+pub fn message_for(trouble: Trouble) -> &'static str {
+    match trouble {
+        Trouble::CodeRejected => {
+            "That code didn't work. Check it and try again \u{2014} codes change every 30 \
+             seconds."
+        }
+        Trouble::EmailSendFailed => {
+            "Deskwarden couldn't send the code. Check your connection, then try Send code \
+             again."
+        }
+        Trouble::ChallengeExpired => {
+            "This sign-in took too long and has expired. Enter your master password again to \
+             start over."
+        }
+        Trouble::Unreachable => {
+            "Couldn't reach the server. Check your connection \u{2014} and the server URL, if \
+             this is a self-hosted account."
+        }
+    }
+}
+
+impl Prompt {
+    /// Applies a failure to the prompt.
+    ///
+    /// **`CodeRejected` is the arm this feature exists for**: it empties the
+    /// code box and touches nothing else. The master password is not here to
+    /// clear -- it is on the worker thread, still holding the derived hash --
+    /// which is precisely why a wrong digit no longer costs a re-typed master
+    /// password.
+    pub fn went_wrong(&mut self, trouble: Trouble) {
+        self.busy = false;
+        self.error = Some(message_for(trouble).to_string());
+        match trouble {
+            Trouble::CodeRejected => {
+                self.code.zeroize();
+                self.code.clear();
+            }
+            // The box is left exactly as it was: a send that failed may be the
+            // SECOND send, and the code from the first one is still good.
+            Trouble::EmailSendFailed => self.email_sent = false,
+            Trouble::ChallengeExpired | Trouble::Unreachable => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,6 +537,107 @@ mod tests {
             "an unknown provider must carry its number so a bug report can name it; got {:?}",
             provider_name(99)
         );
+    }
+
+
+    /// The three failures say three different things. A shared "That didn't
+    /// work" would tell a user whose code never arrived to check the code they
+    /// do not have.
+    #[test]
+    fn the_three_troubles_do_not_share_a_message() {
+        let rejected = message_for(Trouble::CodeRejected);
+        let send_failed = message_for(Trouble::EmailSendFailed);
+        let expired = message_for(Trouble::ChallengeExpired);
+
+        assert!(rejected.contains("code"), "got {rejected:?}");
+        assert!(
+            send_failed.contains("send") || send_failed.contains("sent"),
+            "the email failure must be about SENDING, not about a code the user never \
+             received; got {send_failed:?}"
+        );
+        assert!(
+            !send_failed.contains("didn't work") && !send_failed.contains("Check it"),
+            "the email failure must not read as a rejected code; got {send_failed:?}"
+        );
+        assert!(
+            expired.contains("master password") || expired.contains("again"),
+            "an expired challenge means starting over, and the message has to say so; \
+             got {expired:?}"
+        );
+
+        let all = [rejected, send_failed, expired, message_for(Trouble::Unreachable)];
+        for (i, a) in all.iter().enumerate() {
+            for b in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "two troubles share one message");
+            }
+        }
+    }
+
+    /// **A rejected code clears the box and nothing else.** This is the whole
+    /// behaviour this feature exists to produce: the master password lives on
+    /// the worker thread and is not asked for again, and the provider the user
+    /// picked is still picked.
+    #[test]
+    fn a_rejected_code_clears_the_code_and_keeps_the_provider() {
+        let mut prompt = Prompt::new(vec![
+            SecondFactor::Authenticator,
+            SecondFactor::Email { masked: None },
+        ]);
+        prompt.choose(SecondFactor::Email { masked: None });
+        prompt.email_sent = true;
+        prompt.code.push_str("123457");
+        prompt.busy = true;
+
+        prompt.went_wrong(Trouble::CodeRejected);
+
+        assert!(prompt.code.is_empty(), "the fat-fingered digits are gone");
+        assert_eq!(
+            prompt.chosen(),
+            Some(SecondFactor::Email { masked: None }),
+            "the user's provider choice survives a wrong code"
+        );
+        assert!(
+            prompt.email_sent,
+            "the code that was sent is still valid -- re-typing it must not require \
+             sending a second one"
+        );
+        assert!(!prompt.busy, "the buttons come back");
+        assert_eq!(prompt.error.as_deref(), Some(message_for(Trouble::CodeRejected)));
+    }
+
+    /// A failed SEND leaves the box alone: there may be nothing in it, and if
+    /// there is, it is a code from an earlier send that is still good.
+    #[test]
+    fn a_failed_send_leaves_the_box_alone() {
+        let mut prompt = Prompt::new(vec![SecondFactor::Email { masked: None }]);
+        prompt.code.push_str("123456");
+        prompt.busy = true;
+
+        prompt.went_wrong(Trouble::EmailSendFailed);
+
+        assert_eq!(prompt.code, "123456", "a send failure is not a code failure");
+        assert!(!prompt.email_sent, "nothing was sent, so nothing may claim it was");
+        assert!(!prompt.busy);
+        assert_eq!(
+            prompt.error.as_deref(),
+            Some(message_for(Trouble::EmailSendFailed))
+        );
+    }
+
+    /// Only one trouble ends the stage, and it is the one with nothing left on
+    /// the worker to retry against.
+    #[test]
+    fn only_an_expired_challenge_is_fatal() {
+        assert!(
+            Trouble::ChallengeExpired.is_fatal(),
+            "control: the fatal variant is the expired challenge"
+        );
+        for survivable in [Trouble::CodeRejected, Trouble::EmailSendFailed, Trouble::Unreachable] {
+            assert!(
+                !survivable.is_fatal(),
+                "{survivable:?} still has a challenge on the worker to try again against"
+            );
+        }
     }
 
 }
