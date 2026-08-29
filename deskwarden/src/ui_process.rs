@@ -189,6 +189,10 @@ pub fn reap_step(answer: Result<Option<Option<i32>>, ()>) -> Reap {
 pub enum UiOpenDecision {
     /// Nothing is open for this surface; start one.
     Spawn,
+    /// One is open but HIDDEN, because `keep_ui_loaded` kept its process
+    /// resident after a plain close. Show that one; it cannot be raised,
+    /// because a hidden viewport has no window to raise.
+    ShowTheHiddenOne { pid: u32 },
     /// One is already open. Bring *that* one forward; do not start a second.
     FocusTheOpenOne { pid: u32 },
 }
@@ -206,10 +210,15 @@ pub enum UiOpenDecision {
 /// record that a window exists: it is what the spawn returned, it is what the
 /// result file is named by, and it is what the focus below is aimed at. There
 /// is no second registry to disagree with it.
-pub fn open_decision(already_open: Option<u32>) -> UiOpenDecision {
-    match already_open {
-        Some(pid) => UiOpenDecision::FocusTheOpenOne { pid },
-        None => UiOpenDecision::Spawn,
+/// `hidden` is whether that open window has hidden itself after a plain
+/// close. It is a second argument rather than a third state of
+/// `already_open` because the pid means the same thing either way -- the
+/// process exists and is ours -- and only what to DO with it differs.
+pub fn open_decision(already_open: Option<u32>, hidden: bool) -> UiOpenDecision {
+    match (already_open, hidden) {
+        (Some(pid), true) => UiOpenDecision::ShowTheHiddenOne { pid },
+        (Some(pid), false) => UiOpenDecision::FocusTheOpenOne { pid },
+        (None, _) => UiOpenDecision::Spawn,
     }
 }
 
@@ -460,6 +469,33 @@ pub fn forget_result(path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    /// A hidden window is SHOWN, not spawned and not raised. Raising is
+    /// what `FocusTheOpenOne` does and it cannot work here: there is no
+    /// window on screen for `raise_process` to bring forward.
+    #[test]
+    fn a_hidden_window_is_shown() {
+        assert_eq!(
+            open_decision(Some(77), true),
+            UiOpenDecision::ShowTheHiddenOne { pid: 77 }
+        );
+    }
+
+    /// A visible window is still focused, and still nothing is spawned.
+    /// Two vault windows on one vault is two editors of the same records.
+    #[test]
+    fn a_visible_window_is_still_focused() {
+        assert_eq!(open_decision(Some(77), false), UiOpenDecision::FocusTheOpenOne { pid: 77 });
+    }
+
+    /// No window at all is a spawn whatever `hidden` says -- there is
+    /// nothing to hide. The `true` arm is not reachable in production, and
+    /// is asserted so that a future caller passing a stale flag cannot
+    /// turn "no window" into "show the window that is not there".
+    #[test]
+    fn no_window_is_still_a_spawn() {
+        assert_eq!(open_decision(None, false), UiOpenDecision::Spawn);
+        assert_eq!(open_decision(None, true), UiOpenDecision::Spawn);
+    }
     /// The one case that hides: the setting is on and the user just
     /// closed the window with nothing to report.
     #[test]
@@ -606,13 +642,13 @@ mod tests {
 
     #[test]
     fn a_surface_with_nothing_open_spawns() {
-        assert_eq!(open_decision(None), UiOpenDecision::Spawn);
+        assert_eq!(open_decision(None, false), UiOpenDecision::Spawn);
     }
 
     #[test]
     fn a_surface_that_is_already_open_is_focused_rather_than_opened_again() {
         assert_eq!(
-            open_decision(Some(4242)),
+            open_decision(Some(4242), false),
             UiOpenDecision::FocusTheOpenOne { pid: 4242 },
             "two vault windows on one vault is two editors of the same records; the second              request brings the first window forward"
         );

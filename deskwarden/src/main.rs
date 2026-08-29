@@ -5975,6 +5975,14 @@ struct OpenUiWindow {
     /// Only ever logged. How long the user had the window up is the number
     /// that made the blocking version's cost visible, and it stays visible.
     opened_at: Instant,
+    /// Whether this window has hidden itself after a plain close, which
+    /// it does only when `keep_ui_loaded` is on.
+    ///
+    /// **A hidden window is still an OPEN window** for the one-window
+    /// rule: the next *Open Vault* shows this one rather than starting a
+    /// second process on the same vault. The flag says how to bring it
+    /// back, not whether it is there.
+    hidden: bool,
 }
 
 /// **The UI processes the daemon has open, one slot per surface.**
@@ -6015,7 +6023,8 @@ impl UiWindows {
     /// (`pump_windows_messages`) and drains the hotkey, the foreground
     /// watcher and the tray besides.
     fn ask_for_the_vault_window(&mut self) -> bool {
-        match deskwarden::ui_process::open_decision(self.vault_pid()) {
+        let hidden = self.vault.as_ref().is_some_and(|open| open.hidden);
+        match deskwarden::ui_process::open_decision(self.vault_pid(), hidden) {
             deskwarden::ui_process::UiOpenDecision::FocusTheOpenOne { pid } => {
                 // **Not a second window.** With the loop live, the tray is
                 // clickable while a window is up, so this is now a case that
@@ -6028,6 +6037,42 @@ impl UiWindows {
                      ({raised:?}) rather than opening a second one"
                 );
                 true
+            }
+            deskwarden::ui_process::UiOpenDecision::ShowTheHiddenOne { pid } => {
+                // **A window that will not come back is replaced, not
+                // refused.** If the process died between hiding and now,
+                // or never created its event, a `false` here would leave
+                // the slot occupied by a corpse -- and under the
+                // one-window rule that is an *Open Vault* that never
+                // opens again. The fallback is the ordinary cold path,
+                // so the cost of getting this wrong is a slow open
+                // rather than no open.
+                if deskwarden::ui_show::ask_to_show(
+                    &deskwarden::ui_show::ShowEnv::production(),
+                    pid,
+                ) {
+                    log::info!(
+                        "asked the hidden vault window (process {pid}) to show itself"
+                    );
+                    if let Some(open) = self.vault.as_mut() {
+                        open.hidden = false;
+                    }
+                    return true;
+                }
+                log::warn!(
+                    "the hidden vault window (process {pid}) did not answer the show \
+                     request; forgetting it and starting a fresh one"
+                );
+                if let Some(mut open) = self.vault.take() {
+                    let _ = open.child.kill();
+                }
+                match spawn_the_vault_window_in_its_own_process() {
+                    Some(open) => {
+                        self.vault = Some(open);
+                        true
+                    }
+                    None => false,
+                }
             }
             deskwarden::ui_process::UiOpenDecision::Spawn => {
                 match spawn_the_vault_window_in_its_own_process() {
@@ -6197,7 +6242,7 @@ fn spawn_the_vault_window_in_its_own_process() -> Option<OpenUiWindow> {
         plan.program.display(),
         plan.args.join(" ")
     );
-    Some(OpenUiWindow { child, pid, opened_at: Instant::now() })
+    Some(OpenUiWindow { child, pid, opened_at: Instant::now(), hidden: false })
 }
 
 /// **What a finished UI process reported**, from its exit code and its file.
