@@ -6465,6 +6465,12 @@ impl VaultOps for RealVaultOps<'_> {
             // `run_vault_loop` reopens the window with an empty box, which is
             // what any other route into this window has always given.
             self.initial_search.take().unwrap_or_default(),
+            // **This host is the DAEMON's in-process fallback**, reached only
+            // when a UI process could not be spawned. It must never hide: a
+            // hidden window here would keep the daemon's own event loop
+            // standing in for a window nobody can see, and the OpenGL driver
+            // is already mapped into this process for the rest of its life.
+            None,
         );
 
         // **Everything the off-thread closures need, taken BEFORE the estate
@@ -10200,6 +10206,57 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // whether it may skip the readiness wait before its first `populate()`.
     let backend_already_running = backend_is_listening();
 
+    // **What this process does instead of exiting, when the setting says
+    // it may stay loaded.**
+    //
+    // `None` is today's behaviour and the default. `Some` is a window
+    // that hides on a plain close and waits to be shown again -- see
+    // `ui_process::on_close` for which closes qualify, and `ui_show` for
+    // how the daemon asks.
+    let hide = settings.keep_ui_loaded.then(|| {
+        let signal = (deskwarden::ui_show::ShowEnv::production().create)(
+            &deskwarden::ui_show::signal_name(std::process::id()),
+        );
+        // **The slot this process holds while it is USING the vault**,
+        // released while hidden. Without that release the setting would
+        // silently pin `bw serve` up: `stop_backend_if_idle` asks
+        // `vault_service::anyone_else_attached`, so a hidden child that
+        // stayed attached would hold ~111 MB of backend against a user
+        // who turned `keep_backend_running` OFF for exactly that reason.
+        // Two settings, two answers, neither quietly deciding the other.
+        let env = deskwarden::vault_service::windows_env();
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(
+            deskwarden::vault_service::attach(&env),
+        ));
+        let slot_for_hidden = std::rc::Rc::clone(&slot);
+        let slot_for_shown = std::rc::Rc::clone(&slot);
+        vault_window::HideHooks {
+            wait_for_show: std::sync::Arc::new(move || {
+                // `INFINITE`: there is nothing to poll for, and a timed
+                // wait would be a loop that woke up forever to learn
+                // nothing -- the same reasoning `single_instance`'s
+                // takeover listener gives for the same call. A daemon
+                // that goes away kills this process rather than leaving
+                // it waiting; see `close_on_quit`.
+                signal.as_ref().is_some_and(|s| {
+                    s.wait(windows::Win32::System::Threading::INFINITE)
+                })
+            }),
+            on_hidden: Box::new(move || {
+                if slot_for_hidden.borrow_mut().take().is_some() {
+                    log::info!(
+                        "released this window's vault attachment while hidden, so the \
+                         backend may stop behind it"
+                    );
+                }
+            }),
+            on_shown: Box::new(move || {
+                let env = deskwarden::vault_service::windows_env();
+                *slot_for_shown.borrow_mut() = deskwarden::vault_service::attach(&env);
+            }),
+        }
+    });
+
     let result = vault_window::run(
         cache,
         fill_stats::FillStats::new(config_dir.join("fill-stats.json")),
@@ -10209,6 +10266,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         settings.auto_lock(),
         backend_already_running,
         accounts_state,
+        hide,
     );
 
     // **The way home.** See `ui_process`: the file carries the two outcomes

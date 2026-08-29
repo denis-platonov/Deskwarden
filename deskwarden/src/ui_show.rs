@@ -68,6 +68,18 @@ impl Drop for Signal {
     }
 }
 
+// **A kernel handle belongs to the process, not to a thread**, and waiting on
+// an event from a thread other than the one that created it is what
+// `WaitForSingleObject` is for -- `single_instance`'s takeover listener does
+// exactly that with its own event.
+//
+// It has to cross a thread here because the wait must NOT run on the frame
+// thread: a hidden window whose frame thread is blocked could never paint the
+// show it is waiting for. The handle is owned by this `Signal`, closed once in
+// `Drop`, and never duplicated, so there is no second owner to race with.
+unsafe impl Send for Signal {}
+unsafe impl Sync for Signal {}
+
 /// The kernel calls this module makes, behind `fn` pointers so a caller can
 /// be tested without them.
 ///

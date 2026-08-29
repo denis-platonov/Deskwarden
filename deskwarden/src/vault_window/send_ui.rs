@@ -5137,7 +5137,15 @@ mod source_pins {
                 // out of the env -- only `env.sync` does that, and it is
                 // pinned to one, one file down -- so this is still the count
                 // of every place that could.
-                vec![("main.rs", 4), ("vault_window/mod.rs", 5)],
+                //
+                // **Three in `main.rs`, not four, since the startup door
+                // stopped drawing in the daemon.** That branch built a vault
+                // frame in this process and named the type to do it; the
+                // window now runs in a process of its own and the branch asks
+                // `UiWindows` for it instead. One construction fewer is one
+                // fewer place that could reach the pointer, which is the
+                // direction this pin wants.
+                vec![("main.rs", 3), ("vault_window/mod.rs", 5)],
             ),
         ] {
             let files = crate_sources();
