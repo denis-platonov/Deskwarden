@@ -100,7 +100,7 @@ pub struct MockServer {
     /// server to `mockito`'s pool -- before [`Drop`] hands the permit on. A
     /// waiting test that got the permit first would otherwise be racing this
     /// server's teardown.
-    server: mockito::ServerGuard,
+    server: mockito::Server,
     /// The thread that took the permit, so a server dropped on a different
     /// thread than it was built on still returns the permit exactly once
     /// without corrupting that other thread's re-entrancy count.
@@ -133,7 +133,10 @@ pub fn server() -> MockServer {
         *held += 1;
     }
 
-    MockServer { server: mockito::Server::new(), owner: std::thread::current().id() }
+    MockServer {
+        server: mockito::Server::new_with_opts(mockito::ServerOpts::default()),
+        owner: std::thread::current().id(),
+    }
 }
 
 impl Deref for MockServer {
