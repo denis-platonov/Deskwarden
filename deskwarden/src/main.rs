@@ -12642,8 +12642,7 @@ mod tests {
             .split_once(concat!("fn close_because_the_user_walked_", "away("))
             .expect("control: the away-lock close must be defined in this file")
             .1
-            .split_once("
-    }")
+            .split_once("\n    }")
             .expect("the method must be brace-terminated at method indentation")
             .0;
         assert!(
@@ -12696,8 +12695,7 @@ mod tests {
             .split_once(concat!("fn lock_after_walking_", "away("))
             .expect("control: the away-lock effect must be defined in this file")
             .1
-            .split_once("
-fn ")
+            .split_once("\nfn ")
             .expect("the function must be followed by another item")
             .0;
 
