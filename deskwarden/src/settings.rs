@@ -769,6 +769,28 @@ pub struct Settings {
     /// vault window is open; reads come from `VaultCache` either way, so
     /// autofill is unaffected.
     pub keep_backend_running: bool,
+    /// Whether the vault window's process stays resident, hidden, after a
+    /// plain close.
+    ///
+    /// `false` (the default) is today's behaviour: closing the window ends
+    /// its process, and the next open is a cold start -- measured at 263 ms
+    /// to the first frame and 5.65 s to 1668 items on screen. `true` keeps
+    /// that process alive with its viewport hidden, so every reopen is
+    /// immediate, at the cost of roughly 100 MB held while the vault is
+    /// unlocked.
+    ///
+    /// **The sibling of [`Settings::keep_backend_running`] above, and the
+    /// same shape of trade**, with one difference worth knowing: this
+    /// memory is held in a process that can be killed, not in the tray for
+    /// the life of the session. That is only true because the window runs
+    /// in a process of its own; before that split, "keep the UI loaded"
+    /// would have meant keeping the OpenGL driver in the daemon until
+    /// sign-out, which is the defect the split was for.
+    ///
+    /// **Off by default, and an older `settings.json` without this field
+    /// parses as off.** A memory cost nobody chose is exactly the report
+    /// this work came from.
+    pub keep_ui_loaded: bool,
     /// Whether the overlay may raise itself at all -- **for any window, not
     /// only a matched one**.
     ///
@@ -1242,6 +1264,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             keep_backend_running: true,
+            keep_ui_loaded: false,
             prompt_on_match: true,
             check_breaches: false,
             fetch_icons: true,
@@ -1377,6 +1400,7 @@ impl Settings {
     pub fn persist_preferences(&self, path: &Path) -> std::io::Result<()> {
         let Settings {
             keep_backend_running,
+            keep_ui_loaded,
             prompt_on_match,
             check_breaches,
             fetch_icons,
@@ -1410,6 +1434,7 @@ impl Settings {
         } = self;
         let mut on_disk = Self::load(path);
         on_disk.keep_backend_running = *keep_backend_running;
+        on_disk.keep_ui_loaded = *keep_ui_loaded;
         on_disk.prompt_on_match = *prompt_on_match;
         on_disk.check_breaches = *check_breaches;
         on_disk.fetch_icons = *fetch_icons;
@@ -1666,6 +1691,9 @@ mod tests {
         let path = temp_path("round-trip");
         let written = Settings {
             read_through_cache: false,
+            // Opposite of the default, like every field here: a save that
+            // dropped it would show up as a mismatch rather than as a pass.
+            keep_ui_loaded: true,
             // Deliberately the opposite of the default, so a round trip that
             // silently dropped this field would show up as a mismatch here
             // rather than as a service that quietly stopped being enabled.
@@ -1720,6 +1748,41 @@ mod tests {
     #[test]
     fn the_disk_cache_is_off_by_default() {
         assert!(!Settings::default().cache_vault_to_disk);
+    }
+
+    /// **Off unless asked for.** This setting spends ~100 MB for speed,
+    /// and a memory cost nobody chose is the complaint this whole split
+    /// came from ("tray again is 50Mb").
+    #[test]
+    fn keeping_the_ui_loaded_is_off_by_default() {
+        assert!(!Settings::default().keep_ui_loaded);
+    }
+
+    /// An older file predates the field. Absent must read as off, for the
+    /// same reason the default is off -- an upgrade must not start holding
+    /// a process the user never asked for.
+    #[test]
+    fn a_settings_file_without_the_field_keeps_the_ui_unloaded() {
+        let path = temp_path("no-keep-ui-loaded");
+        std::fs::write(&path, r#"{"keep_backend_running": false}"#).unwrap();
+        assert!(!Settings::load(&path).keep_ui_loaded);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// It survives a save. `persist_preferences` re-reads the file and
+    /// copies field by field, so a field omitted from that list is
+    /// silently discarded on every save -- which is a setting that will
+    /// not stay on.
+    #[test]
+    fn keeping_the_ui_loaded_survives_persist_preferences() {
+        let path = temp_path("persist-keep-ui-loaded");
+        let settings = Settings { keep_ui_loaded: true, ..Settings::default() };
+        settings.persist_preferences(&path).unwrap();
+        assert!(
+            Settings::load(&path).keep_ui_loaded,
+            "the setting was dropped on save, so turning it on in Preferences would not stick"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1919,6 +1982,9 @@ mod tests {
         let path = temp_path("auto-lock-round-trip");
         let written = Settings {
             read_through_cache: false,
+            // Opposite of the default, like every field here: a save that
+            // dropped it would show up as a mismatch rather than as a pass.
+            keep_ui_loaded: true,
             // Deliberately the opposite of the default, so a round trip that
             // silently dropped this field would show up as a mismatch here
             // rather than as a service that quietly stopped being enabled.
@@ -2570,6 +2636,9 @@ mod tests {
         let path = temp_path("geometry-round-trip");
         let written = Settings {
             read_through_cache: false,
+            // Opposite of the default, like every field here: a save that
+            // dropped it would show up as a mismatch rather than as a pass.
+            keep_ui_loaded: true,
             // Deliberately the opposite of the default, so a round trip that
             // silently dropped this field would show up as a mismatch here
             // rather than as a service that quietly stopped being enabled.
