@@ -12865,6 +12865,13 @@ mod tests {
     /// walked-away lock is: a handover that skipped it would leave the
     /// outgoing instance's copied password pasteable, which is precisely the
     /// harm that makes the takeover a request instead of a `TerminateProcess`.
+    /// **The fifth is the UI process's own**, run before an update replaces
+    /// the running binary. It is the same event as the daemon's
+    /// shutdown-for-update clear and clears under the same `Quit`, because
+    /// the window process is about to end for the same reason -- and it has
+    /// its own clipboard state to answer for: a copy made in the vault
+    /// window is made by THAT process, so a clear performed only in the
+    /// daemon would leave it pasteable.
     #[test]
     fn both_shutdown_paths_clear_the_clipboard_as_a_quit() {
         let source = include_str!("main.rs");
@@ -12872,13 +12879,14 @@ mod tests {
             source
                 .matches(concat!("clipboard::clear_if_still_ours_", "for("))
                 .count(),
-            4,
-            "expected the tray Quit, the shutdown-for-update path, the takeover handover and \
-             the walked-away lock, and no others"
+            5,
+            "expected the tray Quit, the shutdown-for-update path, the takeover handover, \
+             the walked-away lock and the UI process's own before-install clear, and no \
+             others"
         );
         assert_eq!(
             source.matches(concat!("clipboard::ClearTrigger::Qu", "it")).count(),
-            3,
+            4,
             "a shutdown path is clearing under some trigger other than `Quit`"
         );
         // **The walked-away lock clears under `Lock`, the same trigger the
