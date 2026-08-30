@@ -5706,14 +5706,6 @@ mod tests {
         }
     }
 
-    /// **The copy is the requirement here, not a detail of the page.**
-    ///
-    /// Off is the default, and a person who turns this on has decided to put
-    /// a door into their vault. The sentence they read while deciding is this
-    /// one, so a future edit that quietly drops the uncomfortable half of it
-    /// fails a test rather than shipping -- `disk_cache_description`'s rule,
-    /// on the row with more at stake.
-    #[test]
     /// **The row says what it costs, not only what it buys.**
     ///
     /// The backend row beside it names its ~111 MB; this one holds about
@@ -5738,6 +5730,13 @@ mod tests {
         );
     }
 
+    /// **The copy is the requirement here, not a detail of the page.**
+    ///
+    /// Off is the default, and a person who turns this on has decided to put
+    /// a door into their vault. The sentence they read while deciding is this
+    /// one, so a future edit that quietly drops the uncomfortable half of it
+    /// fails a test rather than shipping -- `disk_cache_description`'s rule,
+    /// on the row with more at stake.
     #[test]
     fn the_off_copy_says_what_turning_it_on_would_do() {
         let text = service_description(false);
