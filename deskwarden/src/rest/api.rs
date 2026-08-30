@@ -1765,7 +1765,11 @@ fn is_url_path_safe(id: &str) -> bool {
 /// Built on [`crate::record::seal::base64_into`] rather than a second encoder
 /// so there is one base64 implementation in the crate. The two substitutions
 /// and the padding are the whole of the difference (RFC 4648 section 5).
-fn base64_url_no_pad(bytes: &[u8]) -> String {
+///
+/// `pub(crate)` for its second caller, [`crate::rest::send_crypto::SendKey`],
+/// whose fragment is the same encoding for the same reason: a `+` or a `/` in
+/// a URL fragment is a link that copies cleanly and opens nothing.
+pub(crate) fn base64_url_no_pad(bytes: &[u8]) -> String {
     let mut out = String::new();
     crate::record::seal::base64_into(&mut out, bytes);
     out.truncate(out.trim_end_matches('=').len());
