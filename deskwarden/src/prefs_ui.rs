@@ -340,27 +340,33 @@ fn read_through_description(cache_on: bool) -> &'static str {
 ///  * it names the residual attacker in plain terms rather than implying the
 ///    file is safe from everything;
 ///  * it never uses the word "secure". It describes what gates the file.
-fn disk_cache_description(hello_available: bool) -> &'static str {
-    if hello_available {
-        "Deskwarden opens instantly after a restart and autofill works the moment it starts, \
-         instead of waiting about 8 seconds for the Bitwarden backend.\n\n\
-         The copy contains your usernames, passwords, notes and two-factor secrets. It is \
-         encrypted with a key that Windows Hello keeps in this PC's TPM chip, so a copied disk \
-         cannot be read on another machine. It is not deleted when your vault locks — only when \
-         you log out, or after 7 days. Anyone who can run programs as you on this PC and pass \
-         Windows Hello can read it."
-    } else {
-        // Deliberately not a silent downgrade to a DPAPI-only file under this
-        // same label. The TPM binding is the entire value of the setting --
-        // it is the one property that distinguishes it from a plain
-        // DPAPI-wrapped dump, which was considered and rejected -- and a
-        // weaker file offered under copy that promises one would be a
-        // straightforwardly misleading security claim.
-        "Unavailable — needs Windows Hello.\n\n\
-         This copy is protected by a key held in your PC's TPM chip, which only Windows Hello \
-         can release. Without Hello there is no such key, and Deskwarden will not store your \
-         vault on disk under weaker protection than this setting describes. Set Hello up in \
-         Windows Settings → Accounts → Sign-in options."
+fn disk_cache_description() -> &'static str {
+    {
+        // **This paragraph used to promise a TPM, and the promise was the
+        // reason the setting could not be used.**
+        //
+        // The copy was sealed with a key only Windows Hello could release,
+        // so every launch asked -- and when the prompt did not appear,
+        // startup waited for it forever and the app did not start at all.
+        // The key is now stored beside the file and protected by Windows
+        // the way `user_key_store`'s is; see `vault_disk_cache`'s own doc.
+        //
+        // **Saying so is not optional.** A file protected by DPAPI, offered
+        // under copy that names a TPM, is exactly the misleading security
+        // claim the old comment here refused to make -- and it would be
+        // this app making it. The sentence changed because the file did.
+        //
+        // It still obeys this module's rules for such copy: it names what
+        // is in the file, what gates it, and who can read it anyway,
+        // without ever using the word "secure".
+        "Deskwarden opens instantly after a restart and autofill works the moment it \
+         starts, instead of waiting for the vault to be fetched again.\n\n\
+         The copy contains your usernames, passwords, notes and two-factor secrets. It \
+         is encrypted with a key kept on this PC and protected by Windows — the same \
+         protection as the key that unlocks your vault. Anyone who can run programs as \
+         you on this PC can read it, and so can someone who takes this disk and knows \
+         your Windows password. It is not deleted when your vault locks — only when you \
+         log out, or after 7 days."
     }
 }
 
@@ -3157,13 +3163,19 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
 /// rather than silently downgraded to something weaker under the same label.
 fn draw_disk_cache_card(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
-        let hello_available = (state.hello_available)();
+        // **No Hello gate.** The setting used to be ghosted whenever
+        // Windows Hello was unavailable, because the file could not be
+        // sealed without it. It can now, so a machine without Hello is
+        // simply a machine that can use this setting -- and leaving the
+        // row grey would be refusing a feature for a reason that stopped
+        // existing.
         state.settings.cache_vault_to_disk = child_toggle_row(
             ui,
             DISK_CACHE_LABEL,
-            disk_cache_description(hello_available),
+            disk_cache_description(),
             state.settings.cache_vault_to_disk,
-            hello_available,
+            // Always live now: nothing about this row depends on Hello.
+            true,
         );
         row_separator(ui);
         // The child of the row above: with no copy permitted there is nothing
@@ -6681,12 +6693,11 @@ mod tests {
     /// fails a test rather than shipping.
     #[test]
     fn the_available_disk_cache_copy_states_the_survives_a_lock_behaviour() {
-        let text = disk_cache_description(true);
+        let text = disk_cache_description();
         assert!(text.contains("usernames, passwords, notes and two-factor secrets"));
         assert!(text.contains("not deleted when your vault locks"));
         assert!(text.contains("log out"));
         assert!(text.contains("7 days"));
-        assert!(text.contains("TPM"));
         assert!(
             text.contains("Anyone who can run programs as you"),
             "the copy stopped naming the residual attacker"
@@ -6697,15 +6708,39 @@ mod tests {
         );
     }
 
+    /// **The copy does not promise a TPM, because the file no longer has
+    /// one.**
+    ///
+    /// This replaces a test that asserted the opposite: that the row read
+    /// "Unavailable -- needs Windows Hello" and promised no weaker file would
+    /// be written. Both were true until the key moved to the same protection
+    /// `user_key_store` uses, and the old test's subject no longer exists --
+    /// keeping it would have pinned the defect.
+    ///
+    /// What replaces it is the stronger claim, and the one that matters: a
+    /// file protected by Windows, offered under copy naming a TPM, would be
+    /// this app making a false security claim to somebody deciding whether to
+    /// write their vault to disk.
     #[test]
-    fn the_unavailable_disk_cache_copy_explains_why_and_offers_no_weaker_option() {
-        let text = disk_cache_description(false);
-        assert!(text.starts_with("Unavailable"));
-        assert!(text.contains("Windows Hello"));
-        assert!(text.contains("Sign-in options"));
+    fn the_disk_cache_copy_claims_no_protection_the_file_does_not_have() {
+        let text = disk_cache_description();
+        for lie in ["TPM", "Windows Hello", "Hello"] {
+            assert!(
+                !text.contains(lie),
+                "the disk-cache copy still names `{lie}`, but the file is sealed with a key \
+                 protected by Windows and nothing else -- promising more than the file has \
+                 is the one thing this paragraph may never do: {text}"
+            );
+        }
         assert!(
-            text.contains("weaker protection"),
-            "the copy stopped saying that no lesser file is written instead"
+            text.contains("protected by Windows"),
+            "control: the copy no longer says what DOES gate the file, so the assertions \
+             above would pass on a paragraph that promises nothing at all: {text}"
+        );
+        assert!(
+            text.contains("takes this disk"),
+            "the copy names the program-running-as-you attacker but not the stolen-disk one, \
+             which is the protection that went when the TPM key did"
         );
         assert!(
             !text.to_lowercase().contains("secure"),
@@ -6713,17 +6748,37 @@ mod tests {
         );
     }
 
+    /// **A machine without Windows Hello can use the disk cache.**
+    ///
+    /// This replaces a test that asserted the opposite -- that the row was
+    /// drawn with a reason it could not be used, pointing at Windows
+    /// Settings. That reason stopped existing when the file's key stopped
+    /// needing Hello to unseal, so the old test's subject is gone; what would
+    /// be a loosening is deleting it and asserting nothing in its place.
+    ///
+    /// The claim now is the useful one: Hello's absence changes nothing about
+    /// this row.
     #[test]
-    fn the_vault_page_draws_the_disk_cache_row_with_the_reason_when_hello_is_missing() {
-        let painted = paint_vault_with_hello(false);
+    fn the_disk_cache_row_is_usable_without_windows_hello() {
+        let without = paint_vault_with_hello(false);
         assert!(
-            painted.contains(DISK_CACHE_LABEL),
+            without.contains(DISK_CACHE_LABEL),
             "the disk-cache row is not on the Vault page at all: {:?}",
-            painted.strings()
+            without.strings()
         );
         assert!(
-            painted.any_containing("Sign-in options"),
-            "the reason a user cannot turn it on is not readable on the page"
+            !without.any_containing("Sign-in options"),
+            "the page still sends the user to Windows Settings to enable Hello for a file \
+             that no longer needs it"
+        );
+        // Control: the row reads the same with Hello present, so the
+        // assertion above is about a row that is live either way rather than
+        // one that has quietly vanished from this page.
+        let with = paint_vault_with_hello(true);
+        assert!(
+            with.contains(DISK_CACHE_LABEL),
+            "control: the row is missing even with Hello available, so the page changed in \
+             some way this test cannot see"
         );
     }
 
@@ -8976,7 +9031,7 @@ mod tests {
                 // would pass this test while making it meaningless.
                 assert!(
                     painted.contains(official_crypto_description(self_hosted))
-                        && painted.contains(disk_cache_description(hello)),
+                        && painted.contains(disk_cache_description()),
                     "hello={hello} self_hosted={self_hosted}: the page did not paint the copy \
                      under test; got {:?}",
                     painted.strings()
