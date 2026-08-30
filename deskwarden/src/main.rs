@@ -10482,6 +10482,26 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         }
     }
 
+    // **And the Breaches page's scan environment, for the same reason.**
+    //
+    // `breach_scan` refuses to begin any work without a process-wide
+    // `ScanEnv` -- `prefs_ui`'s own doc says only `main.rs` installs one --
+    // so without this the page would draw, accept a click, and quietly do
+    // nothing at all. That is a worse failure than the Updates page's,
+    // which at least says it is broken.
+    {
+        let cache_for_scan = std::sync::Arc::clone(&cache);
+        let installed = deskwarden::breach_scan::install_env(deskwarden::breach_scan::ScanEnv {
+            items: std::sync::Arc::new(move || cache_for_scan.items()),
+            check: deskwarden::breach_scan::live_check(),
+            history_path: deskwarden::scan_history::default_path(),
+        });
+        debug_assert!(installed, "the scan environment was installed twice");
+        if !installed {
+            log::error!("the scan environment was already installed in this UI process");
+        }
+    }
+
     // Something to paint on the first frame, exactly as it is for the daemon.
     // The window's own `spawn_vault_load` replaces it from `bw serve`.
     let _ = cache.load_from_disk();
