@@ -405,6 +405,33 @@ fn main() {
         log::error!("panicked: {info}");
     }));
 
+    // **Read here rather than below, because the gate underneath it asks a
+    // question only this file can answer**: whether this account's vault is
+    // served by `bw serve` at all. It used to be loaded after the CLI had
+    // already been demanded, which is precisely why the demand could not be
+    // conditional.
+    let settings_path = config_dir.join("settings.json");
+    let settings = settings::Settings::load(&settings_path);
+    // The active account's server, for `backend_policy::choose` below. A
+    // fresh install has no active account and no server, which `choose`
+    // reads as not-self-hosted and therefore `BwServe` -- the safe answer,
+    // and the one that keeps a first run behaving exactly as it did.
+    // **Through `resolve_startup`, not the raw list.** That list off disk has
+    // not been through the `relativeDataDir` refusal, the active-account
+    // exclusion or the duplicate-id dedupe, and
+    // `nothing_offers_an_account_without_going_through_accounts_state` exists
+    // because reading it directly bypasses all three. `None` for the minting
+    // argument, so this asks a question and changes nothing -- the real
+    // resolve, the one allowed to mint, still happens below.
+    let startup_server_url = match accounts::resolve_startup(
+        &settings.accounts,
+        settings.active_account.as_ref(),
+        None,
+    ) {
+        accounts::StartupAccounts::Ready { active, .. } => active.server_url.clone(),
+        _ => None,
+    };
+
     // Verified once, up front, before anything below spawns the CLI or shows
     // the login window: `bw_serve`/`login_ui` hand this binary the user's
     // master password and, afterwards, their live session token. Refusing to
@@ -419,15 +446,46 @@ fn main() {
              Deskwarden should fix this.",
         );
     };
+    // **Whether a missing `bw.exe` is fatal depends on the account.**
+    //
+    // On a `bw serve` account it is: that binary IS the vault, and
+    // carrying on would mean a window over nothing. On a direct-REST
+    // account it is the expected state -- the vault is reached by talking
+    // to the server, and since 0.13.0 even signing in does not spawn the
+    // CLI. Refusing to start there was demanding a dependency the app had
+    // stopped using.
+    //
+    // The answer comes from `settings.json`, which is why it is read a few
+    // lines earlier than it used to be. `backend_policy::choose` is a pure
+    // function of two values in that file, and it is the same function the
+    // rest of the app decides this with -- so this cannot disagree with
+    // the backend that is actually built later.
+    let bw_is_this_accounts_vault = matches!(
+        backend_policy::choose(startup_server_url.as_deref(), settings.use_official_bw_crypto),
+        backend_policy::VaultBackendChoice::BwServe
+    );
     if !bw_exe.exists() {
-        fatal_startup_error(&format!(
-            "Deskwarden needs the Bitwarden CLI (bw.exe) and could not find it.\n\nExpected it \
-             at:\n{}\n\nInstall the Bitwarden CLI, or reinstall Deskwarden (its installer \
-             downloads a signed copy for you).",
+        if bw_is_this_accounts_vault {
+            fatal_startup_error(&format!(
+                "Deskwarden needs the Bitwarden CLI (bw.exe) and could not find it.\n\nExpected \
+                 it at:\n{}\n\nInstall the Bitwarden CLI, or reinstall Deskwarden (its \
+                 installer downloads a signed copy for you).",
+                bw_exe.display()
+            ));
+        }
+        log::info!(
+            "no bw.exe at {}, and this account does not need one: its vault is served by \
+             talking to the server",
             bw_exe.display()
-        ));
+        );
+    } else {
+        // **Checked whenever it EXISTS, not only when it is the backend.**
+        // This is a supply-chain control, and "we no longer need bw" must
+        // not quietly become "we no longer check bw": an account switch
+        // can make a `bw serve` account active later in this same process,
+        // and this is the only place the signature is verified.
+        check_bw_signature(&bw_exe);
     }
-    check_bw_signature(&bw_exe);
 
     // Resolved and verified exactly once, here. Everything that later spawns
     // the CLI -- `bw_serve`, `login_ui`, including the one call that hands
@@ -466,8 +524,8 @@ fn main() {
     // here reads that field -- `vault_window` re-reads the file when it opens
     // -- and the preferences save below goes through `persist_preferences`
     // precisely so a stale copy of it can never be written back.
-    let settings_path = config_dir.join("settings.json");
-    let settings = settings::Settings::load(&settings_path);
+    // (`settings_path` and `settings` are read above the `bw.exe` gate,
+    // which needs them to decide whether that binary is required at all.)
 
     // **The clipboard module is told the user's clearing preferences here,
     // and again at each of the two places a preference edit lands.** It holds
@@ -19059,7 +19117,56 @@ mod tests {
             );
         }
 
-        /// **Every window claims the visibility name, hidable or not.**
+        /// **A missing `bw.exe` is fatal only when `bw serve` is the vault.**
+    ///
+    /// The gate used to be unconditional, and it ran BEFORE `settings.json`
+    /// was read -- so it could not have been conditional even in principle.
+    /// A direct-REST account, which since 0.13.0 does not spawn the CLI even
+    /// to sign in, still could not start the app without it.
+    ///
+    /// Ordering is what this pins, because ordering is what was wrong: the
+    /// settings read has to reach the gate, and the fatal arm has to sit
+    /// inside the backend condition rather than beside it.
+    #[test]
+    fn a_missing_bw_is_only_fatal_when_bw_serve_is_the_vault() {
+        let whole = include_str!("main.rs");
+        let source = whole.split(concat!("#[cfg(", "test)]")).next().expect("a half");
+
+        let read = source
+            .find(concat!("let settings = settings::Settings::", "load(&settings_path)"))
+            .expect("control: `main` no longer reads settings.json at all");
+        let gate = source
+            .find(concat!("if !bw_exe.", "exists() {"))
+            .expect("control: the bw.exe gate is gone, so this pins nothing");
+        assert!(
+            read < gate,
+            "settings.json is read AFTER the bw.exe gate, so the gate cannot know whether \
+             this account's vault is served by bw serve -- which is the state in which it \
+             was unconditional"
+        );
+
+        let after = &source[gate..];
+        let fatal = after
+            .find(concat!("fatal_startup_", "error"))
+            .expect("control: the gate no longer refuses anything, on any backend");
+        let guard = after
+            .find("bw_is_this_accounts_vault")
+            .expect("the gate does not consult the backend choice at all");
+        assert!(
+            guard < fatal,
+            "the gate reaches `fatal_startup_error` before it consults the backend, so a \
+             direct-REST account still cannot start without a CLI it never uses"
+        );
+
+        assert!(
+            after.contains(concat!("check_bw_", "signature(&bw_exe)")),
+            "the signature check went with the requirement. `we no longer need bw` must not \
+             become `we no longer check bw`: an account switch can make a bw serve account \
+             active later in this same process, and this is the only place it is verified"
+        );
+    }
+
+    /// **Every window claims the visibility name, hidable or not.**
         ///
         /// The daemon asks that name whether the vault is in use, of every
         /// window there is. This claim was first written INSIDE the
