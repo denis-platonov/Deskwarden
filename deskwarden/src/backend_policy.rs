@@ -252,7 +252,31 @@ pub struct BackendEnv {
     /// `bw serve` off and put nothing in its place, which is the one outcome
     /// this module's own docs have called worse than not shipping at all.
     pub direct: Option<crate::login_ui::DirectRestLogin>,
+    /// How a worker thread reaches this account's live REST credentials.
+    /// `Some` exactly when `choice` is [`VaultBackendChoice::DirectRest`],
+    /// and paired by [`install_env`] for the same reason [`Self::direct`] is.
+    ///
+    /// A closure rather than the value, because the value is read off disk
+    /// and can change under the process: `main` installs it over the same
+    /// per-account `UserKeyStore` that the login sink writes, so a Send
+    /// cannot be signed with a credential the vault is not being read
+    /// through.
+    ///
+    /// **A token refreshed during a Send is not written back through this.**
+    /// The next Send refreshes again from the stored token, which costs one
+    /// round trip; three worker threads writing that file to save it is the
+    /// worse trade.
+    pub credentials: Option<Credentials>,
 }
+
+/// A reader for the active account's REST credentials.
+///
+/// An `Arc<dyn Fn>` and not a value: see [`BackendEnv::credentials`]. Named
+/// rather than written out at three call sites so the `Send + Sync` bound --
+/// which is what makes it reachable from a worker thread at all -- is stated
+/// once.
+pub type Credentials =
+    std::sync::Arc<dyn Fn() -> Option<crate::rest::api::Authenticated> + Send + Sync>;
 
 /// The installed environment.
 ///
@@ -280,6 +304,16 @@ pub fn install_env(env: BackendEnv) -> bool {
         log::error!(
             "refusing to select the direct-REST vault backend with no way to log in to it; \
              staying on `bw serve`"
+        );
+        return false;
+    }
+    // The second half of the same pairing, and refused for the same stated
+    // reason: a `DirectRest` environment with no credential reader gates
+    // `bw serve` off and leaves every Send, on a screen that offers three
+    // buttons, permanently `Locked`.
+    if env.choice == VaultBackendChoice::DirectRest && env.credentials.is_none() {
+        log::error!(
+            "refusing to select the direct-REST vault backend with no way to read its              credentials; staying on `bw serve`"
         );
         return false;
     }
@@ -391,8 +425,27 @@ pub fn direct_rest_login() -> Option<crate::login_ui::DirectRestLogin> {
     })
 }
 
+/// The active account's REST credentials, for the Sends worker.
+///
+/// Gated on the choice and not merely on the field, word for word
+/// [`direct_rest_login`]'s reasoning: a Send signed with a credential the
+/// vault is not being read through is the "reads from one backend, writes to
+/// the other" state this module exists to prevent.
+#[must_use]
+pub fn direct_rest_credentials() -> Option<Credentials> {
+    with_env(|env| {
+        env.filter(|env| env.choice == VaultBackendChoice::DirectRest)
+            .and_then(|env| env.credentials.clone())
+    })
+}
+
+/// `pub` so that `vault_window`'s backend-branch tests take the SAME
+/// [`ENV_LOCK`] these do. [`ENV`] is process-wide and this suite runs in
+/// parallel; a second lock in another module would not exclude this one, and
+/// a leaked `DirectRest` gates `bw serve` off for every later test in the
+/// process.
 #[cfg(test)]
-mod tests {
+pub mod tests {
     /// The four combinations, walked -- because the spec claimed one of them
     /// was a configuration nobody wants and that claim was wrong. `bw serve`
     /// with a cache-first read is the feature the disk cache was BUILT for:
@@ -433,8 +486,76 @@ mod tests {
     /// test in the same process.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn hold_the_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    pub fn hold_the_env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A credential reader that answers `None`.
+    ///
+    /// It is the *presence* of the reader that `install_env` pairs on, not
+    /// what it answers -- a signed-out account has a reader that finds
+    /// nothing, and that is `SendError::Locked`, not a malformed environment.
+    fn some_credentials() -> Option<Credentials> {
+        Some(std::sync::Arc::new(|| None))
+    }
+
+    /// **Paired with the choice, exactly as `direct` is.** A `BwServe`
+    /// environment must not hand out REST credentials: a Send signed with a
+    /// credential the vault is not being read through is the "reads from one
+    /// backend, writes to the other" state this module exists to prevent.
+    #[test]
+    fn credentials_are_handed_out_only_to_the_backend_that_uses_them() {
+        let _guard = hold_the_env_lock();
+        assert!(install_env(BackendEnv {
+            choice: VaultBackendChoice::BwServe,
+            direct: None,
+            credentials: some_credentials(),
+        }));
+        assert!(
+            direct_rest_credentials().is_none(),
+            "a bw serve account was handed direct-REST credentials"
+        );
+        uninstall_env();
+
+        // The positive control: the same accessor answers `Some` for the
+        // backend that does use them, or the assertion above would pass
+        // against an accessor that always answered `None`.
+        assert!(install_env(BackendEnv {
+            choice: VaultBackendChoice::DirectRest,
+            direct: Some(a_login()),
+            credentials: some_credentials(),
+        }));
+        assert!(direct_rest_credentials().is_some());
+        uninstall_env();
+    }
+
+    /// The other half of `install_env`'s pairing, refused for the reason the
+    /// missing-login half is: a `DirectRest` account with no credential
+    /// reader gates `bw serve` off and can then publish nothing.
+    #[test]
+    fn direct_rest_without_credentials_is_refused_and_changes_nothing() {
+        let _guard = hold_the_env_lock();
+        uninstall_env();
+        assert!(!install_env(BackendEnv {
+            choice: VaultBackendChoice::DirectRest,
+            direct: Some(a_login()),
+            credentials: None,
+        }));
+        assert_eq!(
+            selected(),
+            VaultBackendChoice::BwServe,
+            "a `DirectRest` choice with no credential reader was installed anyway"
+        );
+
+        // The positive control: the same call WITH a reader is accepted, so
+        // the refusal above is about the missing half and not about
+        // `install_env` refusing everything.
+        assert!(install_env(BackendEnv {
+            choice: VaultBackendChoice::DirectRest,
+            direct: Some(a_login()),
+            credentials: some_credentials(),
+        }));
+        uninstall_env();
     }
 
     /// A direct-REST login with no server and no network behind it: every `fn`
@@ -479,6 +600,7 @@ mod tests {
         assert!(install_env(BackendEnv {
             choice: VaultBackendChoice::DirectRest,
             direct: Some(a_login()),
+            credentials: some_credentials(),
         }));
         assert_eq!(selected(), VaultBackendChoice::DirectRest);
         assert!(!bw_serve_is_selected(), "`bw serve` is still selected on a direct-REST account");
@@ -501,6 +623,7 @@ mod tests {
         assert!(install_env(BackendEnv {
             choice: VaultBackendChoice::DirectRest,
             direct: Some(a_login()),
+            credentials: some_credentials(),
         }));
         assert_eq!(selected(), VaultBackendChoice::DirectRest);
 
@@ -508,6 +631,7 @@ mod tests {
         assert!(install_env(BackendEnv {
             choice: VaultBackendChoice::BwServe,
             direct: None,
+            credentials: some_credentials(),
         }));
         assert_eq!(selected(), VaultBackendChoice::BwServe);
         assert!(
@@ -520,6 +644,7 @@ mod tests {
         assert!(install_env(BackendEnv {
             choice: VaultBackendChoice::DirectRest,
             direct: Some(a_login()),
+            credentials: some_credentials(),
         }));
         assert_eq!(selected(), VaultBackendChoice::DirectRest);
         uninstall_env();
@@ -538,6 +663,7 @@ mod tests {
         assert!(!install_env(BackendEnv {
             choice: VaultBackendChoice::DirectRest,
             direct: None,
+            credentials: some_credentials(),
         }));
         assert_eq!(
             selected(),
@@ -553,6 +679,7 @@ mod tests {
         assert!(install_env(BackendEnv {
             choice: VaultBackendChoice::DirectRest,
             direct: Some(a_login()),
+            credentials: some_credentials(),
         }));
         assert_eq!(selected(), VaultBackendChoice::DirectRest);
         uninstall_env();
@@ -571,6 +698,7 @@ mod tests {
         assert!(install_env(BackendEnv {
             choice: VaultBackendChoice::BwServe,
             direct: Some(a_login()),
+            credentials: some_credentials(),
         }));
         assert!(bw_serve_is_selected());
         assert!(
@@ -585,6 +713,7 @@ mod tests {
         assert!(install_env(BackendEnv {
             choice: VaultBackendChoice::DirectRest,
             direct: Some(a_login()),
+            credentials: some_credentials(),
         }));
         assert!(direct_rest_login().is_some());
         uninstall_env();

@@ -1428,12 +1428,19 @@ impl RestClient {
 
     /// `GET /api/sends` -- every Send this account has, still encrypted.
     ///
+    /// **Named `fetch_sends` and not `list_sends`**, which is the obvious
+    /// name and is taken: `crate::send::list_sends` is the up-to-sixty-second
+    /// blocking `bw send list`, and
+    /// `send_ui::source_pins::the_blocking_fetch_has_exactly_one_call_site_in_the_whole_crate`
+    /// counts that name across the crate by text. A REST call sharing the
+    /// spelling would not widen that guard so much as blind it.
+    ///
     /// **Its own route rather than `/api/sync`'s `sends` array**, though the
     /// sync carries them: [`crate::rest::sync`] is explicit that Sends are
     /// out of its scope, and teaching the vault's mapper to carry a second
     /// kind of record so that one screen can avoid one request would put
     /// Sends on the path every autofill takes.
-    pub fn list_sends(&self, session: &mut Session) -> Result<serde_json::Value, RestError> {
+    pub fn fetch_sends(&self, session: &mut Session) -> Result<serde_json::Value, RestError> {
         let url = format!("{}/api/sends", self.base_url);
         self.refreshing(session, |session| {
             self.value_from(self.bearer(self.sync_agent.get(&url), session).call())
@@ -3323,7 +3330,7 @@ mod tests {
             .expect(1)
             .create();
 
-        assert!(client.list_sends(&mut session).is_ok());
+        assert!(client.fetch_sends(&mut session).is_ok());
         assert!(client.delete_send(&mut session, "send-1").is_ok());
         listed.assert();
         revoked.assert();

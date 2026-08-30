@@ -225,7 +225,7 @@ pub fn list(
     session: &mut Session,
     keys: &VaultKeys,
 ) -> Result<Vec<SendSummary>, SendError> {
-    let answer = client.list_sends(session).map_err(|e| map_error(e, Ambiguity::Safe))?;
+    let answer = client.fetch_sends(session).map_err(|e| map_error(e, Ambiguity::Safe))?;
     // `data` is the paged envelope Bitwarden's list routes use; a server that
     // answered a bare array is read too, rather than reported as empty.
     let rows = answer
@@ -248,6 +248,75 @@ pub fn delete(client: &RestClient, session: &mut Session, id: &str) -> Result<()
 /// needs a `MappedSend` fixture, and a `MappedSend` has no constructor but
 /// [`encrypt_plan`] -- which is the whole point of the type. Sharing the
 /// plan fixture is a narrower door than a second constructor.
+// ---- the three the vault window calls ---------------------------------------
+
+/// The client and the live session for the account this process is serving.
+///
+/// Assembled per operation out of process facts rather than held: an account
+/// switch replaces both, and a handle taken a frame earlier is a handle to
+/// somebody else's vault. A missing credential is [`SendError::Locked`],
+/// whose existing sentence is already the right one.
+fn active_account() -> Result<(RestClient, crate::rest::api::Authenticated), SendError> {
+    let login = crate::backend_policy::direct_rest_login().ok_or(SendError::Locked)?;
+    let read = crate::backend_policy::direct_rest_credentials().ok_or(SendError::Locked)?;
+    let authenticated = read().ok_or(SendError::Locked)?;
+    Ok((RestClient::new(login.server_url), authenticated))
+}
+
+/// The user key, unwrapped from a fresh `/api/sync`.
+///
+/// One extra round trip per create and per list, and the reason it is paid
+/// rather than cached: [`VaultKeys::unwrap_from`] is the one place in this
+/// crate that knows how to do this, and a second copy of the key held beside
+/// the backend's own would be a second thing to invalidate on a lock. A
+/// revoke pays nothing -- it needs no key at all.
+fn vault_keys(
+    client: &RestClient,
+    authenticated: &crate::rest::api::Authenticated,
+    ambiguity: Ambiguity,
+) -> Result<VaultKeys, SendError> {
+    let response =
+        client.sync(&authenticated.session).map_err(|e| map_error(e, ambiguity))?;
+    let profile = response
+        .profile
+        .as_ref()
+        .ok_or_else(|| SendError::Rejected("Bitwarden's answer carried no profile.".to_string()))?;
+    let (keys, _) = VaultKeys::unwrap_from(&authenticated.master_key, profile)
+        .map_err(|_| SendError::Locked)?;
+    Ok(keys)
+}
+
+/// Publishes one text Send for the active direct-REST account.
+pub fn create_on_active_account(
+    plan: &SendPlan,
+    now: &dyn SendClock,
+) -> Result<crate::send::CreatedSend, SendError> {
+    // Validated before anything reaches the network, so a refused plan costs
+    // no round trip and answers in the composer's own sentence.
+    if let Some(problem) = validate_plan(plan) {
+        return Err(SendError::Rejected(problem.to_string()));
+    }
+    let (client, mut authenticated) = active_account()?;
+    // **`Safe`, not `Ambiguous`.** This is the sync that happens BEFORE the
+    // create; a failure here published nothing, and reporting it as
+    // `TimedOut` would send the user to hunt for a link that cannot exist.
+    let keys = vault_keys(&client, &authenticated, Ambiguity::Safe)?;
+    create(&client, &mut authenticated.session, &keys, plan, now)
+}
+
+/// Every Send this account has, as the rows the screen shows.
+pub fn list_on_active_account() -> Result<Vec<SendSummary>, SendError> {
+    let (client, mut authenticated) = active_account()?;
+    let keys = vault_keys(&client, &authenticated, Ambiguity::Safe)?;
+    list(&client, &mut authenticated.session, &keys)
+}
+
+/// Revokes one Send. **No sync and no key**: a revoke names a record.
+pub fn delete_on_active_account(id: &str) -> Result<(), SendError> {
+    let (client, mut authenticated) = active_account()?;
+    delete(&client, &mut authenticated.session, id)
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;

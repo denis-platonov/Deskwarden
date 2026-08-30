@@ -11554,8 +11554,20 @@ fn settle_the_vault_backend(
         }) as std::sync::Arc<dyn Fn(rest::api::Authenticated) + Send + Sync>
     };
 
+    // **The same store `adopt` writes, read rather than written.** One
+    // source, so a Send cannot be signed with a credential the vault is not
+    // being read through. A refresh performed during a Send is not written
+    // back here: that costs the next Send one refresh round trip, and three
+    // worker threads writing this file to save it is the worse trade.
+    let credentials = {
+        let key_store =
+            user_key_store::UserKeyStore::new(accounts::user_key_path_for(config_dir, &account.id));
+        std::sync::Arc::new(move || key_store.load()) as backend_policy::Credentials
+    };
+
     backend_policy::BackendEnv {
         choice: VaultBackendChoice::DirectRest,
+        credentials: Some(credentials),
         direct: Some(login_ui::DirectRestLogin {
             server_url,
             email: account.email.clone(),
@@ -11582,6 +11594,7 @@ fn bw_serve_env() -> backend_policy::BackendEnv {
     backend_policy::BackendEnv {
         choice: backend_policy::VaultBackendChoice::BwServe,
         direct: None,
+        credentials: None,
     }
 }
 

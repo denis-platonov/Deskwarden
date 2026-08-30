@@ -4340,8 +4340,19 @@ mod source_pins {
     #[test]
     fn the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account() {
         let expected = squashed(&format!(
+            // **Re-pinned by `2026-08-30-sends-without-the-cli`, and the addition
+            // is the backend branch and nothing else.** The `bw serve` arm below
+            // it is textually what it was, which is the property that matters:
+            // this equality is what says the CLI path did not change, and it now
+            // also says a REST account returns BEFORE reaching it. The branch
+            // reads `backend_policy::selected()` here rather than taking it from
+            // the frame for the same reason `active_data_dir` is read here -- an
+            // account switch replaces both between the frame and the thread.
             "session: &str, ) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> \
-             {{ let data_dir = crate::bw_path::active_data_{}(); \
+             {{ if crate::backend_policy::selected() == \
+             crate::backend_policy::VaultBackendChoice::DirectRest {{ \
+             return crate::rest::send::list_on_active_account(); }} \
+             let data_dir = crate::bw_path::active_data_{}(); \
              crate::send::cli_send_{}({}(), data_dir.as_deref(), session)",
             "dir",
             "list",

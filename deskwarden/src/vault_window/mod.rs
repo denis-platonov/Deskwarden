@@ -6755,6 +6755,14 @@ mod send_fetch_thread {
     pub(super) fn real_send_list(
         session: &str,
     ) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
+        // Read here and not captured from the frame, exactly as the profile
+        // directory below is and for the same reason: an account switch
+        // replaces this between the frame and the thread.
+        if crate::backend_policy::selected()
+            == crate::backend_policy::VaultBackendChoice::DirectRest
+        {
+            return crate::rest::send::list_on_active_account();
+        }
         // Read on the fetching thread, not captured from the frame: `bw_path`
         // keeps the active account's profile directory as process state
         // precisely so that every spawn in this crate reaches the same
@@ -8022,6 +8030,17 @@ mod send_delete_thread {
     /// blocking half is a plain function and not something only reachable
     /// through `std::thread::spawn`.
     pub(super) fn real_send_delete(id: &str, name: &str, session: &str) -> SendDeleteReport {
+        // Read here and not captured from the frame, exactly as the profile
+        // directory below is and for the same reason: an account switch
+        // replaces this between the frame and the thread.
+        if crate::backend_policy::selected()
+            == crate::backend_policy::VaultBackendChoice::DirectRest
+        {
+            return match crate::rest::send::delete_on_active_account(id) {
+                Ok(()) => SendDeleteReport::Deleted { name: name.to_string() },
+                Err(error) => SendDeleteReport::Failed { name: name.to_string(), error },
+            };
+        }
         // Read on the revoking thread, not captured from the frame:
         // `bw_path` keeps the active account's profile directory as process
         // state precisely so that every spawn in this crate reaches the same
@@ -8689,8 +8708,31 @@ mod send_create_thread {
         // state precisely so that every spawn in this crate reaches the same
         // account, and a copy taken a frame earlier is a copy that can be
         // stale.
-        let data_dir = crate::bw_path::active_data_dir();
         let name = plan.name.trim().to_string();
+        // Read here and not captured from the frame, exactly as the profile
+        // directory below is and for the same reason: an account switch
+        // replaces this between the frame and the thread.
+        if crate::backend_policy::selected()
+            == crate::backend_policy::VaultBackendChoice::DirectRest
+        {
+            // The same real clock the CLI arm passes, so the two backends
+            // stamp the same instant: the one the user pressed Create at.
+            return match crate::rest::send::create_on_active_account(
+                plan,
+                &crate::send::SystemClock,
+            ) {
+                Ok(created) => {
+                    SendCreateReport::Created { name, access_url: created.access_url }
+                }
+                Err(error) => SendCreateReport::Failed { name, error },
+            };
+        }
+        // Read on the creating thread, not captured from the frame:
+        // `bw_path` keeps the active account's profile directory as process
+        // state precisely so that every spawn in this crate reaches the same
+        // account, and a copy taken a frame earlier is a copy that can be
+        // stale.
+        let data_dir = crate::bw_path::active_data_dir();
         match crate::send::cli_send_create(
             create_job(),
             data_dir.as_deref(),
@@ -27743,6 +27785,83 @@ mod send_delete_wiring {
         let attempts = probe.attempts();
         drop(probe);
         (report, attempts)
+    }
+
+    /// Installs a `DirectRest` environment for the life of the guard, and
+    /// puts it back.
+    ///
+    /// A guard and not two bare calls: `backend_policy`'s `ENV` is
+    /// process-wide, and a leaked `DirectRest` gates `bw serve` off for every
+    /// later test in this process -- including the CLI control below, which
+    /// would then pass for the wrong reason. It takes `backend_policy`'s own
+    /// lock, so these tests and that module's cannot see each other's
+    /// environments.
+    /// The guard is held and never read: what it does is exclude the other
+    /// tests, and it does that by existing until this value drops.
+    struct InstalledDirectRest(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl InstalledDirectRest {
+        /// A credential reader that finds nothing -- a signed-out
+        /// direct-REST account. The environment is well-formed; the answer is
+        /// `Locked`, which is what makes the REST arm's arrival observable
+        /// without a server.
+        fn with_no_credentials() -> Self {
+            let guard = crate::backend_policy::tests::hold_the_env_lock();
+            assert!(
+                crate::backend_policy::install_env(crate::backend_policy::BackendEnv {
+                    choice: crate::backend_policy::VaultBackendChoice::DirectRest,
+                    direct: Some(crate::login_ui::DirectRestLogin {
+                        server_url: "https://vault.invalid".to_string(),
+                        email: "nobody@example.invalid".to_string(),
+                        device_id: "an-invented-device-id".to_string(),
+                        second_factor: crate::login_ui::PRODUCTION_SECOND_FACTOR,
+                        prompt: None,
+                        adopt: std::sync::Arc::new(|_| {
+                            unreachable!("no login happens in this test")
+                        }),
+                    }),
+                    credentials: Some(std::sync::Arc::new(|| None)),
+                }),
+                "the environment this test is about was refused, so it asserts nothing"
+            );
+            Self(guard)
+        }
+    }
+
+    impl Drop for InstalledDirectRest {
+        fn drop(&mut self) {
+            crate::backend_policy::uninstall_env();
+        }
+    }
+
+    /// **A direct-REST account starts no process.** The probe is
+    /// thread-local, so this must be a call this test makes on its own
+    /// thread -- which is exactly why `real_send_delete` is a plain blocking
+    /// function and not something only reachable through a spawn.
+    #[test]
+    fn a_direct_rest_account_revokes_without_a_child() {
+        let _installed = InstalledDirectRest::with_no_credentials();
+        let (report, attempts) = spawns_of_one_revoke("send-id-42");
+        assert_eq!(attempts.len(), 0, "a direct-REST revoke spawned `bw`: {attempts:?}");
+        // With no credentials installed the answer is `Locked`, and that is
+        // the assertion that proves the REST arm was reached at all -- a `0`
+        // spawn count alone would also be produced by a function that
+        // returned early for an unrelated reason.
+        assert!(
+            matches!(report, SendDeleteReport::Failed { error: SendError::Locked, .. }),
+            "the REST arm was not the one that answered: {report:?}"
+        );
+    }
+
+    /// The control, and the one that matters most: **nothing installed still
+    /// goes to the CLI.** Every test process, `examples/ui_preview` and every
+    /// `bw serve` account are this case.
+    #[test]
+    fn with_no_environment_installed_the_revoke_is_still_a_child() {
+        let _lock = crate::backend_policy::tests::hold_the_env_lock();
+        crate::backend_policy::uninstall_env();
+        let (_report, attempts) = spawns_of_one_revoke("send-id-42");
+        assert_eq!(attempts.len(), 1, "the bw serve path stopped spawning `bw`: {attempts:?}");
     }
 
     /// **THE CRITICAL ASSERTION, at the wiring's own entry point.**
