@@ -234,6 +234,38 @@ impl SymmetricKey {
         mac.copy_from_slice(&bytes[KEY_LEN..]);
         Ok(Self { enc, mac })
     }
+
+    /// A key built from **64 bytes this process derived**, rather than from
+    /// the plaintext of a protected key off a wire.
+    ///
+    /// The same split as [`Self::from_64`] and deliberately a different entry
+    /// point: `from_64` takes a slice and can fail on its length, because its
+    /// input is somebody else's ciphertext. This takes an array, so there is
+    /// no length to check and no error to invent, and the caller is
+    /// [`crate::rest::send_crypto`]'s HKDF output.
+    pub(crate) fn from_okm(okm: &[u8; SYMMETRIC_KEY_LEN]) -> Self {
+        let mut enc = Zeroizing::new([0u8; KEY_LEN]);
+        let mut mac = Zeroizing::new([0u8; KEY_LEN]);
+        enc.copy_from_slice(&okm[..KEY_LEN]);
+        mac.copy_from_slice(&okm[KEY_LEN..]);
+        Self { enc, mac }
+    }
+
+    /// The 64 bytes back, `enc || mac`. **`pub(crate)` and for vectors
+    /// only.**
+    ///
+    /// It exists because the only external statement this crate can make
+    /// about [`crate::rest::send_crypto`]'s derivation is a comparison
+    /// against Bitwarden's published base64, and a key whose bytes cannot be
+    /// read cannot be compared to a published value. Nothing in production
+    /// calls it.
+    #[cfg(test)]
+    pub(crate) fn expose_okm(&self) -> [u8; SYMMETRIC_KEY_LEN] {
+        let mut out = [0u8; SYMMETRIC_KEY_LEN];
+        out[..KEY_LEN].copy_from_slice(&*self.enc);
+        out[KEY_LEN..].copy_from_slice(&*self.mac);
+        out
+    }
 }
 
 // ---- the key derivation function -------------------------------------------

@@ -102,5 +102,7 @@ pub mod api;
 /// rather than faked. See its own docs for what one call costs.
 pub mod backend;
 pub mod crypto;
+/// A Send's own key hierarchy, which is not the vault's. Pure; no I/O.
+pub mod send_crypto;
 pub mod sync;
 pub mod write;
