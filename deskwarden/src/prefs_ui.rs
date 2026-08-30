@@ -129,7 +129,14 @@ const RESET_BUTTON_WIDTH: f32 = 72.0;
 // Copy
 // ---------------------------------------------------------------------------
 
-const BACKEND_LABEL: &str = "Keep the Bitwarden backend running";
+/// The `bw serve` lifetime row's label.
+///
+/// **Names the CLI, because that is what a user will find in Task Manager**,
+/// which its own reason for naming `bw` at all has always been. It said
+/// "Bitwarden backend" while the row was drawn on both backends and had to
+/// cover a case where the thing running was not `bw`. It is only ever drawn to
+/// somebody who has the CLI now, so it can say so.
+const BACKEND_LABEL: &str = "Keep the Bitwarden CLI running";
 
 /// The label for [`crate::settings::Settings::keep_ui_loaded`].
 const UI_LOADED_LABEL: &str = "Open the vault instantly";
@@ -149,7 +156,15 @@ const UI_LOADED_DESCRIPTION: &str =
      immediately next time. Holds about 100 MB while the vault is unlocked. \
      Locking, switching account or changing these settings closes it fully.";
 
-/// The description under [`BACKEND_LABEL`], in its two states.
+/// The description under [`BACKEND_LABEL`].
+///
+/// **No longer a function of a `bool`, and that is the change.** It had a
+/// second arm that read "there is nothing here to decide" -- a row whose only
+/// content was that it did not apply. [`draw_backend_card`] now omits the row
+/// entirely on the backend that has no subprocess, so there is no second state
+/// left to describe; see
+/// `docs/superpowers/specs/2026-08-30-preferences-per-backend-design.md` for
+/// the hide-versus-ghost rule and why this row falls on the hide side of it.
 ///
 /// # Why this row is a child of the one above it, and why it moved pages
 ///
@@ -176,16 +191,9 @@ const UI_LOADED_DESCRIPTION: &str =
 /// running backend would ghost the row a restart later than the switch that
 /// caused it, so the user would turn `bw` back on and find this row still
 /// grey with nothing on the page explaining the delay.
-fn backend_description(bw_selected: bool) -> &'static str {
-    if bw_selected {
-        "Faster, and uses about 110 MB while idle. Off runs it only while the vault window is \
-         open; autofill is unaffected either way."
-    } else {
-        "Only applies when the official Bitwarden CLI is doing the crypto -- the switch above. \
-         With Deskwarden talking to your server itself there is no background process to keep \
-         running, so there is nothing here to decide."
-    }
-}
+const BACKEND_DESCRIPTION: &str =
+    "Faster, and uses about 110 MB while idle. Off runs it only while the vault window is \
+     open; autofill is unaffected either way.";
 
 /// The backend choice's label.
 ///
@@ -210,7 +218,10 @@ fn backend_description(bw_selected: bool) -> &'static str {
 /// turned it off. `the_backend_row_is_on_when_bw_is_the_backend` pins it
 /// against [`crate::backend_policy::choose`] rather than against the field,
 /// so an inversion anywhere between the pill and the decision fails.
-const OFFICIAL_CRYPTO_LABEL: &str = "Use official bw for crypto";
+///
+/// It said "Use official bw for crypto": "bw" is a filename and "crypto" is a
+/// word about internals, and neither is what the user is choosing between.
+const OFFICIAL_CRYPTO_LABEL: &str = "Use the official Bitwarden CLI";
 
 /// The description shown under the [`OFFICIAL_CRYPTO_LABEL`] toggle, in its
 /// two states.
@@ -288,6 +299,48 @@ fn account_is_self_hosted(status: Option<AccountStatus>) -> bool {
             crate::backend_policy::is_self_hosted(server.as_deref())
         }
         _ => false,
+    }
+}
+
+/// Whether this page shows the rows that are only about the `bw serve`
+/// subprocess.
+///
+/// **Reached through [`crate::backend_policy::choose`], never re-decided
+/// here.** That is [`account_is_self_hosted`]'s rule one function above, and
+/// it is load-bearing in the same way: a page with its own idea of "which
+/// backend" is a page whose switch and whose rows can disagree by one edit.
+///
+/// # It reads the CHOSEN backend, not the running one
+///
+/// `use_official_bw_crypto` is captured once, by `main`'s `BackendSettlement`,
+/// so the click does not take effect until the next launch. This still follows
+/// the *live* value, which is what the backend row's gate did before it and
+/// for the same reason: a row that disappeared a restart after the switch that
+/// removed it would leave the user looking at a page that disagrees with the
+/// click they just made.
+fn cli_rows_are_shown(server: Option<&str>, use_official_bw_crypto: bool) -> bool {
+    matches!(
+        crate::backend_policy::choose(server, use_official_bw_crypto),
+        crate::backend_policy::VaultBackendChoice::BwServe
+    )
+}
+
+/// The server this page's account is on, or `None` for everything that is not
+/// a signed-in account with one.
+///
+/// `None` is bitwarden.com **by definition** and not "not known yet" --
+/// [`crate::backend_policy::is_self_hosted`] says so in as many words -- so
+/// the `Checking` and `SignedOut` arms landing here is the safe direction and
+/// not an oversight: unknown counts as official, and the `bw` rows are the
+/// ones a user already had.
+///
+/// One reader for the two call sites in [`draw_backend_card`], so a mid-frame
+/// status arrival cannot give the switch and the row below it different
+/// answers.
+fn account_server(status: &Option<AccountStatus>) -> Option<&str> {
+    match status {
+        Some(AccountStatus::SignedIn { server, .. }) => server.as_deref(),
+        _ => None,
     }
 }
 
@@ -674,7 +727,7 @@ const ACCOUNT_LABEL: &str = "Bitwarden account";
 /// thing for both would make the page assert the second one for three seconds
 /// every time it is opened.
 const ACCOUNT_CHECKING: &str = "Checking...";
-const ACCOUNT_CHECKING_NOTE: &str = "Asking the Bitwarden CLI which account is signed in.";
+const ACCOUNT_CHECKING_NOTE: &str = "Asking which account is signed in.";
 const ACCOUNT_SIGNED_OUT: &str = "Not signed in";
 /// **One sentence for two situations, because this build cannot tell them
 /// apart.** `login_ui::unknown_status_details` returns the same value for a
@@ -682,12 +735,16 @@ const ACCOUNT_SIGNED_OUT: &str = "Not signed in";
 /// that answered honestly that nobody is signed in. Saying only "not signed
 /// in" would be a claim this page cannot support; saying both is the honest
 /// width of what is known.
+///
+/// It named the Bitwarden CLI, which is only one of the two things that can
+/// fail to answer: on the built-in client the status comes from `rest::api`
+/// and no CLI is running at all.
 const ACCOUNT_SIGNED_OUT_NOTE: &str =
-    "No account is signed in, or the Bitwarden CLI could not be reached to ask.";
-/// A signed-in account whose address the CLI did not report. Not blank, and
+    "No account is signed in, or Deskwarden could not reach the vault to ask.";
+/// A signed-in account whose address was not reported. Not blank, and
 /// not silently "signed in" either -- the row promises to say WHICH account.
 const ACCOUNT_NO_EMAIL: &str = "Signed in";
-const ACCOUNT_NO_EMAIL_NOTE: &str = "The Bitwarden CLI did not report the address.";
+const ACCOUNT_NO_EMAIL_NOTE: &str = "The address for this account was not reported.";
 /// Under a known address: which server this vault lives on.
 const ACCOUNT_SERVER_PREFIX: &str = "Signed in at ";
 
@@ -1050,8 +1107,14 @@ impl Section {
             // reason it always did -- the keys mean nothing while nothing is
             // listening, and a reader who has not grasped that there IS an
             // endpoint cannot weigh them.
+            // **It said "which backend holds this vault", and "backend" is
+            // this codebase's word for `bw serve`.** The subtitle is painted
+            // on both products, so it was one more sentence naming machinery
+            // half its readers do not have -- the defect the per-backend split
+            // was for, one line above the rows it was drawn over.
+            // `the_built_in_vault_page_names_no_subprocess` caught it.
             Section::Vault => {
-                "Which backend holds this vault, and what is kept of it on this PC."
+                "Where this vault comes from, and what is kept of it on this PC."
             }
             // Names the door before the keys, for the reason the page draws
             // them in that order: the keys mean nothing while nothing is
@@ -3058,15 +3121,21 @@ fn backend_switch_row(ui: &mut Ui, switch: BackendSwitch) -> Option<RowAction> {
 /// [`crate::backend_policy::choose`] goes on answering `BwServe` is a switch
 /// that lies.
 ///
-/// The child is gated on [`crate::backend_policy::choose`] itself, over the
-/// account's server and the **live** value of the parent -- so the two rows
-/// agree within one frame rather than one restart, and there is no second
-/// copy here of what "which backend" means.
+/// The child is gated on [`crate::backend_policy::choose`] itself, through
+/// [`cli_rows_are_shown`], over the account's server and the **live** value of
+/// the parent -- so the two rows agree within one frame rather than one
+/// restart, and there is no second copy here of what "which backend" means.
 ///
-/// Both use [`child_toggle_row`] rather than hiding: a row that vanishes is a
-/// row a user cannot find out about, and the returned value is the stored one
-/// unchanged, so a click on a configuration this app cannot serve writes
-/// nothing.
+/// # The parent ghosts and the child hides, two rows apart
+///
+/// The parent is a [`child_toggle_row`]: on an account the built-in client
+/// cannot serve it goes grey under a sentence naming the remedy, and the
+/// returned value is the stored one unchanged, so a click writes nothing. The
+/// child is not drawn at all on the backend that has no subprocess, because
+/// there is no remedy for it to name -- the remedy would be the switch one row
+/// above it -- and the only sentence a ghost could carry there is a confession
+/// about internals. See
+/// `docs/superpowers/specs/2026-08-30-preferences-per-backend-design.md`.
 fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         // Read once and shared by both rows: two calls could answer
@@ -3113,27 +3182,28 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
                 Some(RowAction::Ask) | None => {}
             }
         }
+        let server = account_server(&status);
+        // **Hidden, not ghosted, and the two rows above show why the
+        // distinction is not a preference.** The switch above is ghosted on an
+        // account that cannot use the built-in client, because that is a
+        // remedy the user can act on -- change the server -- and grey is the
+        // promise that the row comes back. This row has no remedy to offer: on
+        // the built-in client there is no subprocess, and the only sentence a
+        // ghost could carry is a confession about how the app is built.
+        if cli_rows_are_shown(server, state.settings.use_official_bw_crypto) {
+            row_separator(ui);
+            state.settings.keep_backend_running = toggle_row(
+                ui,
+                BACKEND_LABEL,
+                BACKEND_DESCRIPTION,
+                state.settings.keep_backend_running,
+            );
+        }
         row_separator(ui);
-        let server = match &status {
-            Some(AccountStatus::SignedIn { server, .. }) => server.as_deref(),
-            _ => None,
-        };
-        let bw_selected = matches!(
-            crate::backend_policy::choose(server, state.settings.use_official_bw_crypto),
-            crate::backend_policy::VaultBackendChoice::BwServe
-        );
-        state.settings.keep_backend_running = child_toggle_row(
-            ui,
-            BACKEND_LABEL,
-            backend_description(bw_selected),
-            state.settings.keep_backend_running,
-            bw_selected,
-        );
-        row_separator(ui);
-        // **Not a `child_toggle_row`.** The backend row above is ghosted
-        // when `bw serve` is not the backend, because it describes a
-        // process that would not exist. This one is about Deskwarden's own
-        // window and is true on every backend, so it is never ghosted.
+        // **Not gated, and never was.** This is about Deskwarden's own window
+        // and is true on every backend -- see `Settings::keep_ui_loaded`. It
+        // is the row most likely to be swept up by a careless split, because
+        // it shares a card with the one row that goes.
         state.settings.keep_ui_loaded = toggle_row(
             ui,
             UI_LOADED_LABEL,
@@ -8808,6 +8878,12 @@ mod tests {
     /// since moved on to its own page; the mirror-image test below pins that
     /// it left. Two pages that were briefly one are exactly the pair where a
     /// half-finished split leaves a duplicate.
+    ///
+    /// **This is the `bw` page.** `paint_vault_with_hello` publishes no
+    /// account status, so `is_self_hosted` answers false and `choose` answers
+    /// `BwServe`. On the built-in client `BACKEND_LABEL` is deliberately
+    /// absent; see
+    /// `the_row_about_the_subprocess_is_absent_where_there_is_no_subprocess`.
     #[test]
     fn every_setting_that_decides_where_the_vault_comes_from_is_on_the_vault_page() {
         let vault = paint_vault_with_hello(true);
@@ -8920,8 +8996,8 @@ mod tests {
 
     /// One frame of the Vault page for an account on `server`, with the
     /// crypto toggle at `use_official`. Both inputs are needed together:
-    /// [`backend_description`]'s gate is `backend_policy::choose` over the
-    /// pair, and neither alone decides it.
+    /// [`cli_rows_are_shown`] is `backend_policy::choose` over the pair, and
+    /// neither alone decides it.
     fn paint_vault_for(server: Option<&'static str>, use_official: bool) -> Painted {
         let ctx = tall_context();
         let mut settings = Settings::default();
@@ -8945,59 +9021,183 @@ mod tests {
         tall_frame(&ctx, &mut state, &[])
     }
 
-    /// **The defect this card was rebuilt to remove.**
+    /// **The defect this task removes, asserted from the other side.**
     ///
-    /// `backend_policy::should_run` answers `false` for `DirectRest`
-    /// whatever `keep_backend_running` says, so on a self-hosted account with
-    /// the crypto toggle off this row governs nothing. It used to be a plain
-    /// `toggle_row` on General -- a live-looking switch, two pages from the
-    /// setting that made it meaningless, which is what the owner reported as
-    /// "kinda same settings and very confusing".
-    ///
-    /// Asserted through the ghosted copy rather than through a pixel: the
-    /// sentence is what tells the user *why* it is unavailable, and a ghost
-    /// with the enabled sentence under it would be the same defect wearing
-    /// grey.
+    /// `backend_policy::should_run` answers `false` for `DirectRest` whatever
+    /// `keep_backend_running` says, so on a self-hosted account with the
+    /// crypto toggle off this row governs nothing. This test used to say the
+    /// row went *grey* there, under a sentence ending "there is nothing here
+    /// to decide" -- a row whose only content was that it did not apply. It
+    /// now says the row is not there, and the three combinations where it IS a
+    /// real decision are unchanged from the version this replaces.
     #[test]
-    fn the_backend_row_goes_quiet_when_there_is_no_backend_to_keep_running() {
+    fn the_row_about_the_subprocess_is_absent_where_there_is_no_subprocess() {
         let direct = paint_vault_for(Some("self"), false);
         assert!(
-            direct.contains(backend_description(false)),
-            "a self-hosted account with `bw` crypto off still offers to keep a subprocess it \
-             does not have; got {:?}",
+            !direct.contains(BACKEND_LABEL),
+            "a self-hosted account with the built-in client is still offered a row about a \
+             subprocess it does not have; got {:?}",
             direct.strings()
         );
+        // The positive control, and it is the whole reason this is not a
+        // vacuous pass: the page is not blank. The two rows that are true on
+        // every backend are still on it.
+        assert!(
+            direct.contains(UI_LOADED_LABEL) && direct.contains(DISK_CACHE_LABEL),
+            "the built-in page painted nothing, so the absence above is about a failed paint \
+             and not about the row; got {:?}",
+            direct.strings()
+        );
+        // And the row's own copy is gone with it -- a hidden row whose
+        // paragraph was still painted somewhere would be the same lie with no
+        // label on it.
+        assert!(
+            !direct.contains(BACKEND_DESCRIPTION),
+            "the row is hidden but its description is still on the page"
+        );
 
-        // Every other combination is `BwServe`, so the row is live and says
-        // what the trade is. All three are driven, because a gate that read
-        // only the toggle -- or only the server -- would pass one of them.
+        // Every other combination is `bw serve`, so the row decides something
+        // and is drawn with the copy that says what the trade is. All three,
+        // because a gate that read only the toggle -- or only the server --
+        // would pass one of them.
         for (server, use_official, why) in [
-            (Some("self"), true, "self-hosted, `bw` crypto on"),
-            (None, false, "bitwarden.com, `bw` crypto off"),
-            (None, true, "bitwarden.com, `bw` crypto on"),
+            (Some("self"), true, "self-hosted, official CLI chosen"),
+            (None, false, "bitwarden.com, opted out -- but it cannot opt out"),
+            (None, true, "bitwarden.com, official CLI chosen"),
         ] {
             let painted = paint_vault_for(server, use_official);
             assert!(
-                painted.contains(backend_description(true)),
-                "{why} is served by `bw serve`, so this row decides something and must say \
-                 so; got {:?}",
+                painted.contains(BACKEND_LABEL) && painted.contains(BACKEND_DESCRIPTION),
+                "{why} is served by `bw serve`, so this row decides something and must be \
+                 drawn saying so; got {:?}",
                 painted.strings()
             );
         }
     }
 
-    /// The ghosted copy has to point at the switch above it, or a user who
-    /// finds the row grey has nowhere to go. The whole reason the two rows
-    /// are one card is that this sentence can name a neighbour instead of
-    /// sending the reader to another page.
+    /// **The count, which is the half a `contains` loop is structurally blind
+    /// to.** Five pills on the `bw` page and four on the built-in one, and
+    /// both numbers spelled out rather than derived, so a row added to either
+    /// page has to be re-pinned here deliberately.
+    ///
+    /// **A ghosted row still paints its pill**, which is the whole of
+    /// [`child_toggle_row`]'s argument made visible: grey says "this is a
+    /// control you do not have here", where absence says nothing at all. So
+    /// `read_through_cache` counts even though `Settings::default` leaves the
+    /// disk copy off, and the difference between these two numbers is exactly
+    /// the one row this split hides rather than ghosts.
     #[test]
-    fn the_ghosted_backend_copy_names_the_switch_that_disabled_it() {
-        let text = backend_description(false);
-        assert!(
-            text.contains("the switch above"),
-            "the unavailable copy does not say what would make it available: {text:?}"
+    fn the_vault_page_paints_one_fewer_pill_on_the_built_in_client() {
+        assert_eq!(
+            paint_vault_for(Some("self"), true).count_of_size(TOGGLE_SIZE),
+            5,
+            "the `bw` Vault page's five pills: the backend switch, `keep_backend_running`, \
+             `keep_ui_loaded`, `cache_vault_to_disk`, and `read_through_cache` ghosted \
+             under it"
+        );
+        assert_eq!(
+            paint_vault_for(Some("self"), false).count_of_size(TOGGLE_SIZE),
+            4,
+            "the built-in Vault page must lose exactly one pill -- `keep_backend_running` -- \
+             and keep the other four: the switch back, `keep_ui_loaded`, the disk copy and \
+             its ghosted child"
         );
     }
+
+    // **`the_ghosted_backend_copy_names_the_switch_that_disabled_it` is gone
+    // with the sentence it guarded**, and this note is here instead of a
+    // weakened version of it. It pinned that the ghosted row said "the switch
+    // above" so a user who found it grey had somewhere to go. The row is not
+    // ghosted any more -- it is absent on the backend that has no subprocess,
+    // because the only thing a ghost could have said there was that the row
+    // did not apply. What replaces it is
+    // `the_built_in_vault_page_names_no_subprocess`, which is a stronger claim
+    // about the same page: no row on it names `bw serve` at all, the switch's
+    // own row excepted by name.
+
+    /// **The rule the owner asked for, as a scan rather than as an
+    /// understanding: on the built-in client, nothing on the Vault page names
+    /// the machinery.**
+    ///
+    /// One exemption, and it is named here rather than left implicit: the
+    /// backend switch itself. It has to name both backends, because naming
+    /// them is the choice it is asking the user to make -- a switch that hid
+    /// what it was switching between would be unusable. That is the whole of
+    /// the exemption, and confining it to one row is what makes it affordable.
+    #[test]
+    fn the_built_in_vault_page_names_no_subprocess() {
+        let painted = paint_vault_for(Some("self"), false);
+        let switch_copy = official_crypto_description(true);
+        let offending: Vec<&str> = painted
+            .strings()
+            .into_iter()
+            // The exemption, matched on the switch's own two strings rather
+            // than on a substring, so a new row cannot claim it by accident.
+            .filter(|s| *s != OFFICIAL_CRYPTO_LABEL && *s != switch_copy)
+            .filter(|s| {
+                s.contains("bw serve") || s.contains("Bitwarden CLI") || s.contains("backend")
+            })
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "the built-in client's Vault page names machinery it does not have, outside the \
+             one row that is allowed to: {offending:?}"
+        );
+
+        // **Two controls, and both are needed.**
+        //
+        // The page really painted something...
+        assert!(
+            painted.contains(DISK_CACHE_LABEL),
+            "the scan above found nothing because the page drew nothing"
+        );
+        // ...and the exempt row really is on it, so the filter is excusing a
+        // string that is actually there rather than one that never was.
+        assert!(
+            painted.contains(OFFICIAL_CRYPTO_LABEL),
+            "the exempted switch is not on the page, so the exemption is excusing nothing"
+        );
+        // ...and the needles find something on the OTHER page, so they are
+        // needles that can match.
+        let bw_page = paint_vault_for(Some("self"), true);
+        assert!(
+            bw_page.strings().iter().any(|s| s.contains("Bitwarden CLI")),
+            "the `bw` page does not name the CLI either, so this scan cannot tell the two \
+             pages apart"
+        );
+    }
+
+    /// **The two labels name a program the user can find, not a concept from
+    /// this codebase.**
+    ///
+    /// "backend" is this file's word for `bw serve`; "bw" is a filename;
+    /// "crypto" is a word about internals. The rows are read by somebody
+    /// deciding where their vault comes from, and the design's rule is that
+    /// this switch is the ONE place in the window where the machinery is
+    /// named -- so it had better name it the way the user will meet it.
+    #[test]
+    fn the_two_backend_labels_name_the_cli_and_not_this_codebases_words() {
+        for label in [BACKEND_LABEL, OFFICIAL_CRYPTO_LABEL] {
+            assert!(
+                label.contains("Bitwarden CLI"),
+                "{label:?} does not name the program the user will see in Task Manager"
+            );
+            assert!(
+                !label.to_lowercase().contains("crypto"),
+                "{label:?} names an internal concept the user is not choosing between"
+            );
+            assert!(
+                !label.to_lowercase().contains("backend"),
+                "{label:?} uses this file's own word for `bw serve`"
+            );
+        }
+        // The control: the two are still different rows, and the one about
+        // keeping it running still says so. Without this, both could collapse
+        // to the same string and pass every assertion above.
+        assert_ne!(BACKEND_LABEL, OFFICIAL_CRYPTO_LABEL);
+        assert!(BACKEND_LABEL.contains("running"), "the row no longer says what it decides");
+    }
+
 
     /// **Every row on this page, and every paragraph under it, is readable on
     /// the real window without scrolling.**
@@ -9010,12 +9210,20 @@ mod tests {
     /// row nobody can reach, and one of these four rows is the switch the
     /// owner was trapped by.
     ///
-    /// **All four copy combinations**, because the descriptions are what
-    /// make this page long and each pair is a different length: the crypto
+    /// **All the copy combinations**, because the descriptions are what
+    /// make this page long and each is a different length: the crypto
     /// row's three-paragraph copy appears only on a self-hosted account, and
     /// the disk-cache row's Hello explanation only where Hello is missing.
     /// A test that measured the default state alone would be measuring the
     /// shortest page this screen can draw.
+    ///
+    /// **`use_official` is the third axis, and it is new.** Self-hosted with
+    /// the switch off is the shortest the page can be -- the row about the
+    /// `bw serve` subprocess is not drawn there at all -- and a page that lost
+    /// a row is a page whose layout changed. `(self_hosted = false,
+    /// use_official = false)` is the same page as `(self_hosted = false,
+    /// use_official = true)`, because bitwarden.com cannot opt out; it is
+    /// driven anyway, as the control that says so.
     ///
     /// Measured on `TALL_BODY` and compared against `BODY_SIZE.y`, which is
     /// not a fiction here but the only way to see an overflow: a page whose
@@ -9025,25 +9233,27 @@ mod tests {
     fn the_whole_vault_page_is_readable_without_scrolling() {
         for hello in [false, true] {
             for self_hosted in [false, true] {
-                let painted = paint_vault_copy(hello, self_hosted);
-                // The premise: this really is the long copy. Without it a
-                // future edit that shortened the descriptions to nothing
-                // would pass this test while making it meaningless.
-                assert!(
-                    painted.contains(official_crypto_description(self_hosted))
-                        && painted.contains(disk_cache_description()),
-                    "hello={hello} self_hosted={self_hosted}: the page did not paint the copy \
-                     under test; got {:?}",
-                    painted.strings()
-                );
-                let bottom = content_bottom(&painted);
-                assert!(
-                    bottom < BODY_SIZE.y,
-                    "hello={hello} self_hosted={self_hosted}: the Vault page runs to y={bottom} \
-                     on a body {} tall and has no scroll region, so its last row is one nobody \
-                     can reach",
-                    BODY_SIZE.y
-                );
+                for use_official in [false, true] {
+                    let painted = paint_vault_copy(hello, self_hosted, use_official);
+                    // The premise: this really is the long copy. Without it a
+                    // future edit that shortened the descriptions to nothing
+                    // would pass this test while making it meaningless.
+                    assert!(
+                        painted.contains(official_crypto_description(self_hosted))
+                            && painted.contains(disk_cache_description()),
+                        "hello={hello} self_hosted={self_hosted} use_official={use_official}: \
+                         the page did not paint the copy under test; got {:?}",
+                        painted.strings()
+                    );
+                    let bottom = content_bottom(&painted);
+                    assert!(
+                        bottom < BODY_SIZE.y,
+                        "hello={hello} self_hosted={self_hosted} use_official={use_official}: \
+                         the Vault page runs to y={bottom} on a body {} tall and has no scroll \
+                         region, so its last row is one nobody can reach",
+                        BODY_SIZE.y
+                    );
+                }
             }
         }
 
@@ -9085,10 +9295,16 @@ mod tests {
 
     /// The Vault page with the copy each of its two ghostable rows shows in
     /// the named state: Hello present or missing, on a self-hosted server or
-    /// on the official cloud.
-    fn paint_vault_copy(hello: bool, self_hosted: bool) -> Painted {
+    /// on the official cloud, with the backend switch on or off.
+    ///
+    /// The third input is what makes the shortest page reachable: with a
+    /// self-hosted server and the switch off, the row about the `bw serve`
+    /// subprocess is not drawn.
+    fn paint_vault_copy(hello: bool, self_hosted: bool, use_official: bool) -> Painted {
         let ctx = tall_context();
-        let mut state = PrefsState::new(Settings::default());
+        let mut settings = Settings::default();
+        settings.use_official_bw_crypto = use_official;
+        let mut state = PrefsState::new(settings);
         state.section = Section::Vault;
         state.show_hello_available(if hello { || true } else { || false });
         state.show_account_source(if self_hosted {
@@ -9557,6 +9773,89 @@ mod tests {
         assert!(!account_is_self_hosted(None));
     }
 
+    /// **The whole partition, as one table**: eight combinations, and the
+    /// single `DirectRest` row is the only one that hides anything.
+    ///
+    /// Driven through this page's own predicate rather than through `choose`
+    /// directly, because the mutation this guards is a page that re-decides
+    /// "which backend" for itself and drifts from the switch above the row.
+    #[test]
+    fn the_cli_rows_are_shown_for_every_account_except_the_built_in_one() {
+        let self_hosted = Some("https://vault.example.com");
+        let official = Some("https://vault.bitwarden.com");
+        let unknown = Some("");
+
+        // The one arm that hides: positively self-hosted AND opted out.
+        assert!(
+            !cli_rows_are_shown(self_hosted, false),
+            "the built-in client has no `bw serve`, so the rows about it must not be drawn"
+        );
+
+        // Every other combination is `bw serve`, so the rows decide something
+        // and are drawn. All seven, because a predicate that read only the
+        // toggle -- or only the server -- would pass some of them.
+        for (server, use_official, why) in [
+            (self_hosted, true, "self-hosted, official CLI chosen"),
+            (official, true, "bitwarden.com, official CLI chosen"),
+            (official, false, "bitwarden.com, opted out -- but it cannot opt out"),
+            (unknown, true, "unknown server, official CLI chosen"),
+            (unknown, false, "unknown server counts as official"),
+            (None, true, "no server URL is bitwarden.com by definition"),
+            (None, false, "no server URL is bitwarden.com by definition"),
+        ] {
+            assert!(
+                cli_rows_are_shown(server, use_official),
+                "{why}: this account is served by `bw serve`, so the rows about it are real"
+            );
+        }
+    }
+
+    /// **The predicate is `backend_policy`'s answer and not a second one.**
+    ///
+    /// Without this, `cli_rows_are_shown` could be written as
+    /// `is_self_hosted(server) == false || use_official` -- which happens to
+    /// agree today and would drift the first time `choose` gained an input.
+    #[test]
+    fn the_predicate_is_exactly_the_backend_policy_decision() {
+        use crate::backend_policy::{choose, VaultBackendChoice};
+        for server in
+            [None, Some(""), Some("https://vault.example.com"), Some("https://bitwarden.eu")]
+        {
+            for use_official in [true, false] {
+                assert_eq!(
+                    cli_rows_are_shown(server, use_official),
+                    choose(server, use_official) == VaultBackendChoice::BwServe,
+                    "the page disagrees with `backend_policy::choose` for \
+                     server={server:?} use_official={use_official}"
+                );
+            }
+        }
+    }
+
+    /// The server reader, including the two states that are not a signed-in
+    /// account. `Checking` is the one that matters: it lasted 2.8 seconds on
+    /// the machine this page's account row was reported from, and it must read
+    /// as "unknown", which `is_self_hosted` already treats as official.
+    #[test]
+    fn the_page_reads_the_server_off_the_status_and_nothing_else() {
+        assert_eq!(
+            account_server(&Some(AccountStatus::SignedIn {
+                email: None,
+                server: Some("https://vault.example.com".to_string()),
+            })),
+            Some("https://vault.example.com")
+        );
+        // `None` for bitwarden.com by definition -- `backend_policy`'s rule,
+        // not this page's.
+        assert_eq!(
+            account_server(&Some(AccountStatus::SignedIn { email: None, server: None })),
+            None
+        );
+        assert_eq!(account_server(&Some(AccountStatus::Checking)), None);
+        assert_eq!(account_server(&Some(AccountStatus::SignedOut)), None);
+        assert_eq!(account_server(&None), None);
+    }
+
     // -- no page of prose ---------------------------------------------------
 
     /// Body rectangles that are a control rather than the card they sit in.
@@ -10018,6 +10317,33 @@ mod tests {
             "a page that has not asked yet must not assert that nobody is signed in: {:?}",
             checking.strings()
         );
+    }
+
+    /// **About's account row named the Bitwarden CLI three times,
+    /// unconditionally, on a page a built-in-client user reads too.**
+    ///
+    /// Not ghosted and not hedged: it asserted a program was asked. These are
+    /// the three sentences, and the fix is to name what the app did rather
+    /// than what it did it with -- which is the altitude the whole split is
+    /// about. On the built-in client the status comes from `rest::api` and no
+    /// CLI is running at all.
+    #[test]
+    fn the_account_row_says_what_happened_and_not_which_program_did_it() {
+        for note in [ACCOUNT_CHECKING_NOTE, ACCOUNT_NO_EMAIL_NOTE, ACCOUNT_SIGNED_OUT_NOTE] {
+            assert!(
+                !note.contains("Bitwarden CLI"),
+                "{note:?} names a program that is not running on the built-in client"
+            );
+            // The control: each note still says something. A note emptied to
+            // pass the assertion above would leave the row reading as a field
+            // that failed to load, which is the defect these constants were
+            // written for.
+            assert!(note.len() > 20, "{note:?} was emptied rather than reworded");
+        }
+        // And they are still three different sentences -- "we have not asked
+        // yet" and "nobody is signed in" are opposite facts.
+        assert_ne!(ACCOUNT_CHECKING_NOTE, ACCOUNT_SIGNED_OUT_NOTE);
+        assert_ne!(ACCOUNT_NO_EMAIL_NOTE, ACCOUNT_SIGNED_OUT_NOTE);
     }
 
     /// **The row is never blank, in any state.**
