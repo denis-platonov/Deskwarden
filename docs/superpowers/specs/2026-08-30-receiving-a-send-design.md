@@ -496,15 +496,56 @@ a recipient to go and check a Sends list that is not theirs.
 
 ## 6. What this does not settle
 
-* **Whether the account's own server implements either route.** The server
-  driving this work is a third-party Bitwarden-compatible implementation on
-  Cloudflare Workers, and `rest/mod.rs` already instructs the reader to treat
-  the API as a subset. Nothing in Bitwarden's source can say what that server
-  answers. The probe is built so that the *answer* to this is what the code
-  does rather than what the design assumed: a server with neither route
-  answers `404` at both, and the honest refusal for that case — "this server
-  does not offer Send links to this app" — is a sentence the plan must
-  require, not a case the plan may leave to a generic error.
+* **Whether the account's own server implements either route. Still open, and
+  it is the one thing on this branch that no amount of code could close.** The
+  server driving this work is a third-party Bitwarden-compatible
+  implementation on Cloudflare Workers, and `rest/mod.rs` already instructs the
+  reader to treat the API as a subset. Nothing in Bitwarden's source can say
+  what that server answers.
+
+  What shipped is the refusal this section asked for, not an assumption. A
+  server with neither route answers `404` at both and is told so in its own
+  sentence — "This server does not offer Send links to this app. Open the link
+  in a browser instead." — which is `rest::send::neither_route`, asserted
+  distinct from the "gone" sentence by
+  `a_server_that_speaks_neither_route_says_so_rather_than_blaming_the_link`.
+
+  **One thing the implementation had to add to make that sentence reachable at
+  all**, and it is worth recording because the design as written could not
+  produce it. §2.4 requires a dead link to say "this Send is gone" on both
+  paths, including on a legacy `404`; this section requires a legacy `404` to
+  say "neither route" when the server has neither. Those are the same status
+  code on the same route with opposite sentences, and nothing in the legacy
+  answer separates them. What separates them is what the *token endpoint* did
+  first: a server that answered `400 unsupported_grant_type` has an identity
+  server and is therefore an older Bitwarden, so its `404` is about the Send; a
+  server that answered `404` at `/identity/connect/token` has no token endpoint
+  at all, so its `404` is about the server. `SendGrantRefusal::GrantAbsent`
+  therefore carries a `GrantAbsence` saying which of its two causes fired. The
+  probe order is unchanged and the fallback trigger is still exactly those two
+  answers; only the memory of which one is new.
+
+  ### The live check, which is the only thing that can settle this
+
+  It needs a real account against a real server and could not be run from the
+  implementation session. To settle it:
+
+  1. Publish a text Send **with** a share password, from this app's own
+     Sends screen, on the direct-REST account. Copy the link.
+  2. Receive it, in this app, on the same account. Note which sentence, if
+     any, comes back. Confirm which route answered by watching the requests:
+     one `POST /identity/connect/token` with `grant_type=send_access` means
+     the token route; a `400 unsupported_grant_type` followed by
+     `POST /api/sends/access/{id}` means the fallback; a `404` at the token
+     endpoint followed by a `404` at the legacy path means neither, and the
+     refusal above is correct and final for this server.
+  3. Repeat **without** a password, and again with a Send whose max access
+     count has been exhausted — the third is what distinguishes "gone" from
+     "no route", and it is the case the `GrantAbsence` split exists for.
+  4. Record the three answers here, replacing this procedure.
+
+  Until that is done, the shipped behaviour is a probe that refuses honestly
+  rather than a probe that is known to succeed.
 * **A split web-vault/API deployment.** `access_url`'s doc already flags that
   this client assumes one origin for both; the parse in §3.1 inherits that
   assumption and refuses rather than guessing when a link's origin is not the
