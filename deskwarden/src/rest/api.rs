@@ -162,6 +162,24 @@ const SYNC_DEADLINE: Duration = Duration::from_secs(120);
 /// re-tune how long a save hangs for.
 const WRITE_DEADLINE: Duration = Duration::from_secs(30);
 
+/// The deadline on the two anonymous Send-access routes and on the grant that
+/// feeds them.
+///
+/// **Its own number because of one server behaviour that no other request in
+/// this module faces**: the legacy access route answers a *wrong share
+/// password* only after a deliberate `await Task.Delay(2000)` --
+/// `SendsController.Access`, which sleeps two seconds before throwing, on
+/// purpose, to blunt guessing. A deadline that did not comfortably exceed
+/// that would turn "you typed the wrong password" into "the server did not
+/// answer", which is the one sentence that sends a user to check their
+/// connection when what is wrong is their typing.
+///
+/// The same 30s as [`WRITE_DEADLINE`], which is fifteen times the delay, and
+/// deliberately not shared with it for [`WRITE_DEADLINE`]'s own stated
+/// reason: a save deadline someone later tunes should not silently re-tune
+/// how long a wrong share password takes to be reported.
+const SEND_ACCESS_DEADLINE: Duration = Duration::from_secs(30);
+
 /// How long before an access token's deadline it is treated as already
 /// expired.
 ///
@@ -190,6 +208,24 @@ const SCOPE: &str = "api offline_access";
 /// credential the caller already holds. Bitwarden's own server refuses
 /// `offline_access` on this grant for that reason.
 const API_KEY_SCOPE: &str = "api";
+
+/// The custom OAuth grant that mints a bearer for **one Send**.
+///
+/// Pinned against `SendAccessConstants.TokenRequest` in `bitwarden/server`
+/// (`src/Identity/IdentityServer/RequestValidators/SendAccess/`), which is
+/// also where the four request field names below come from.
+const SEND_ACCESS_GRANT: &str = "send_access";
+
+/// The client id and scope that grant is asked for with.
+///
+/// **These two are not in `SendAccessConstants`**, which pins only the request
+/// fields -- so they are pinned *here*, against
+/// `apps/cli/src/tools/send/commands/receive.command.ts` on `bitwarden/clients`
+/// `main`, and the source is named the way [`crate::rest::crypto`] names the
+/// origin of its vectors. They are not [`CLIENT_ID`] and not [`SCOPE`]: this
+/// grant is not a login and asks for none of a login's authority.
+const SEND_ACCESS_CLIENT_ID: &str = "send";
+const SEND_ACCESS_SCOPE: &str = "api.send.access";
 
 /// Bitwarden's `DeviceType` for a Windows desktop client.
 ///
@@ -739,6 +775,147 @@ struct TokenResponse {
     expires_in: Option<u64>,
 }
 
+/// A `send_access` bearer: authority over **one Send**, and nothing else.
+///
+/// **Not `Debug`**, by the rule [`Challenge`], `service_token::Token` and
+/// `SendInvocation` follow. **No `Clone` and no cache**, which is a decision
+/// rather than an omission: the token is single-purpose and short-lived, it is
+/// worth nothing after the one request it is minted for, and the official CLI
+/// declines to cache one for a reason that applies here in full -- a token
+/// minted against one server must never be reachable by a request to another.
+/// It is dropped where it is spent.
+///
+/// A different type from [`Session`] on purpose. [`RestClient::bearer`] takes
+/// a `&Session` and cannot be handed this; nothing that takes this can be
+/// handed the vault's.
+pub struct SendAccessToken(Zeroizing<String>);
+
+impl SendAccessToken {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why a `send_access` grant did not produce a token, in the identity
+/// server's own vocabulary.
+///
+/// The arms are `SendAccessConstants`'s error codes, which arrive in a
+/// `send_access_error_type` field. They are kept apart rather than folded into
+/// one "refused" because the screen says something different for each, and a
+/// design that read them as one would ask for a password when the Send is
+/// gone.
+///
+/// **Not `PartialEq` by derive alone**: it is, so that a test can assert on
+/// the variant rather than on a string, which is the whole point of the type.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendGrantRefusal {
+    /// **The only arm that may send a caller to the legacy route.**
+    ///
+    /// Reachable from exactly two answers -- `400 unsupported_grant_type`,
+    /// which is Duende's own answer and the only thing that string can mean,
+    /// and a `404` at `/identity/connect/token`, which a Bitwarden server
+    /// always has. Both mean "this server has never heard of this grant" and
+    /// neither can mean anything about the Send.
+    GrantAbsent,
+    /// `password_hash_b64_required` -- ask for the share password and retry.
+    PasswordRequired,
+    /// `password_hash_b64_invalid` -- the share password was wrong.
+    PasswordInvalid,
+    /// `email_required` or `email_and_otp_required` -- an e-mail-gated Send,
+    /// which this app cannot open. Refused **by name**, never as "gone".
+    EmailRequired,
+    /// `send_id_invalid`. The server's own readme says this covers a Send that
+    /// is disabled, expired, past its deletion date or out of accesses, as
+    /// well as an id with no matching Send -- which is why one sentence
+    /// serves all of them.
+    SendGone,
+    /// Anything else the server said. **Never a fallback trigger.**
+    Other(RestError),
+}
+
+/// A grant response, turned into a token or refused.
+///
+/// **A missing or non-numeric `expires_in` is a refusal, not an eternal
+/// token.** [`RestClient::session_from`]'s own guard and the reason
+/// `receive.command.ts` gives for its: a `NaN` expiry is one `isExpired()`
+/// reads as "not expired" forever. `expires_in` is typed `u64`, so a string or
+/// a `null` fails the parse below rather than becoming a `None` this accepts.
+fn send_access_token_from(value: &serde_json::Value) -> Result<SendAccessToken, SendGrantRefusal> {
+    let parsed: TokenResponse = serde_json::from_value(value.clone())
+        .map_err(|_| SendGrantRefusal::Other(RestError::Parse("the token response")))?;
+    let Some(token) = parsed.access_token else {
+        return Err(SendGrantRefusal::Other(RestError::Parse("an access token")));
+    };
+    if parsed.expires_in.is_none() {
+        return Err(SendGrantRefusal::Other(RestError::Parse("a usable expires_in")));
+    }
+    Ok(SendAccessToken(token))
+}
+
+/// One `400` from the `send_access` grant, classified.
+///
+/// The order is the load-bearing part. `unsupported_grant_type` is checked
+/// **first and on its own**, because it is the one answer that is about the
+/// route rather than about the Send; every named `send_access_error_type`
+/// below it means the grant exists and is talking about this Send, and must
+/// never reach [`SendGrantRefusal::GrantAbsent`].
+fn send_grant_refusal_from(json: &serde_json::Value) -> SendGrantRefusal {
+    if string_at(json, "error") == "unsupported_grant_type" {
+        return SendGrantRefusal::GrantAbsent;
+    }
+    match string_at(json, "send_access_error_type").as_str() {
+        "password_hash_b64_required" => SendGrantRefusal::PasswordRequired,
+        "password_hash_b64_invalid" => SendGrantRefusal::PasswordInvalid,
+        "email_required" | "email_and_otp_required" => SendGrantRefusal::EmailRequired,
+        "send_id_invalid" => SendGrantRefusal::SendGone,
+        // Not a code this client knows. It is still a 400 the grant answered,
+        // so it is `Other` and not `GrantAbsent`: a server that answered the
+        // grant at all is a server that has it.
+        _ => SendGrantRefusal::Other(classify_json_400(json)),
+    }
+}
+
+/// The legacy route's body, **mapped rather than hand-built**.
+///
+/// Its only constructor takes the Send's key and calls
+/// [`crate::rest::send_crypto::SendKey::password_hash`], so no caller can
+/// assemble `{"password": ...}` itself and no caller can put a share password
+/// on the wire in the clear. This is [`crate::rest::send::MappedSend`]'s rule
+/// applied to the one other Send body this module sends, and it is what keeps
+/// `the_only_json_bodies_this_module_sends_are_mapped_ciphers_and_the_prelogin`
+/// counting zero hand-built bodies.
+///
+/// That census reads this file's text, so nothing above it spells a
+/// body-sending call in prose: a comment that did would be counted as a
+/// request and would make the pin argue with itself.
+pub struct MappedSendAccess {
+    body: serde_json::Value,
+}
+
+impl MappedSendAccess {
+    /// The body for one Send, with the share password hashed under that Send's
+    /// own key -- or an explicit `null` when there is no password.
+    ///
+    /// `null` and a hash are different bodies and only one of them is what a
+    /// server expects for a Send with no password, so the absent case is an
+    /// explicit null rather than a missing key: that is the shape
+    /// `SendAccessRequestModel` declares.
+    pub(crate) fn for_key(
+        key: &crate::rest::send_crypto::SendKey,
+        password: Option<&str>,
+    ) -> Self {
+        Self {
+            body: serde_json::json!({
+                "password": password.map(|p| key.password_hash(p).to_string()),
+            }),
+        }
+    }
+
+    pub(crate) fn body(&self) -> &serde_json::Value {
+        &self.body
+    }
+}
+
 // ---- the client -------------------------------------------------------------
 
 /// A Bitwarden-compatible server, addressed directly.
@@ -758,6 +935,14 @@ pub struct RestClient {
     sync_agent: TotalBounded,
     /// The cipher write endpoints. See [`WRITE_DEADLINE`].
     write_agent: TotalBounded,
+    /// **The Send-access routes, and nothing else.** See
+    /// [`SEND_ACCESS_DEADLINE`] for the number, and
+    /// [`RestClient::mint_send_access_token`] for why these three requests are
+    /// on an agent of their own rather than on [`Self::auth_agent`]: a request
+    /// addressed by a link the user pasted must not be reachable from the code
+    /// that puts the vault's bearer on a request, and a separate field is what
+    /// lets a source pin say so by counting.
+    anon_agent: TotalBounded,
 }
 
 impl RestClient {
@@ -769,6 +954,7 @@ impl RestClient {
             auth_agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, AUTH_DEADLINE),
             sync_agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, SYNC_DEADLINE),
             write_agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, WRITE_DEADLINE),
+            anon_agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, SEND_ACCESS_DEADLINE),
         }
     }
 
@@ -1459,6 +1645,138 @@ impl RestClient {
         self.refreshing(session, |session| {
             self.unit_from(self.bearer(self.write_agent.delete(&url), session).call())
         })
+    }
+
+    // ---- receiving a Send from a link --------------------------------------
+    //
+    // **Three requests that are never given the vault's session**, on
+    // `anon_agent`, and that is the property the whole path is arranged
+    // around. See `crate::rest::send::receive` for the probe these are the
+    // legs of, and `docs/superpowers/specs/2026-08-30-receiving-a-send-design.md`
+    // for why there are two routes to one answer at all.
+
+    /// `POST {base}/identity/connect/token` with the `send_access` grant.
+    ///
+    /// The four fields are `SendAccessConstants.TokenRequest`'s; the client id
+    /// and the scope are pinned at [`SEND_ACCESS_CLIENT_ID`] against the
+    /// official CLI, which is the only place they are written down.
+    ///
+    /// **The send id travels in the token, not in a path**, which is the whole
+    /// shape difference between this era's route and the previous one.
+    ///
+    /// # Errors
+    ///
+    /// [`SendGrantRefusal`], whose arms are the server's own vocabulary.
+    /// [`SendGrantRefusal::GrantAbsent`] is the **only** one that means "this
+    /// server does not have this route", and it is reachable from exactly two
+    /// answers -- a `400 unsupported_grant_type`, which is Duende's own answer
+    /// and the only thing that string can mean, and a `404` at the token
+    /// endpoint, which a Bitwarden server always has. Every other answer here
+    /// means the grant *is* supported and is talking about this Send.
+    pub fn mint_send_access_token(
+        &self,
+        access_id: &str,
+        password_hash: Option<&str>,
+    ) -> Result<SendAccessToken, SendGrantRefusal> {
+        let mut fields = vec![
+            ("grant_type", SEND_ACCESS_GRANT),
+            ("client_id", SEND_ACCESS_CLIENT_ID),
+            ("scope", SEND_ACCESS_SCOPE),
+            ("send_id", access_id),
+        ];
+        // Only when there is one: a server that has not asked for a password
+        // gets no `password_hash_b64` field at all, rather than an empty one.
+        if let Some(hash) = password_hash {
+            fields.push(("password_hash_b64", hash));
+        }
+
+        let url = format!("{}/identity/connect/token", self.base_url);
+        // **No `Auth-Email` and no device fields.** This grant carries no
+        // account name, because it is not an account that is being
+        // authenticated -- it is one Send.
+        let response = self.anon_agent.post(&url).send_form(&fields);
+        match response {
+            Ok(ok) => {
+                let value: serde_json::Value = ok
+                    .into_json()
+                    .map_err(|_| SendGrantRefusal::Other(RestError::Parse("a JSON body")))?;
+                send_access_token_from(&value)
+            }
+            // The one status whose body is worth more than its
+            // classification, exactly as in [`Self::grant`]: read once, here,
+            // because a `ureq::Response` can only be consumed once.
+            Err(ureq::Error::Status(400, body)) => {
+                Err(send_grant_refusal_from(&json_body_of(body)))
+            }
+            // A token endpoint always exists on a Bitwarden server, so a 404
+            // here is unambiguous: this is not a server that has one.
+            Err(ureq::Error::Status(404, _)) => Err(SendGrantRefusal::GrantAbsent),
+            Err(ureq::Error::Status(code, _)) => {
+                Err(SendGrantRefusal::Other(RestError::Status(code)))
+            }
+            Err(e @ ureq::Error::Transport(_)) => {
+                Err(SendGrantRefusal::Other(RestError::Transport(e.to_string())))
+            }
+        }
+    }
+
+    /// `POST {base}/api/sends/access` with the **Send's** bearer and an empty
+    /// body -- the current route.
+    ///
+    /// The header is set here rather than through [`Self::bearer`], and that
+    /// is the point rather than an omission: [`Self::bearer`] takes a
+    /// [`Session`], which is the vault's own credential, and this function
+    /// must not be able to reach it. `send_ui`'s
+    /// `nothing_on_the_anonymous_agent_is_given_the_vault_session` counts
+    /// exactly that.
+    pub fn access_send_with_token(
+        &self,
+        token: &SendAccessToken,
+    ) -> Result<serde_json::Value, RestError> {
+        let url = format!("{}/api/sends/access", self.base_url);
+        // `Zeroizing` for [`Self::bearer`]'s reason: the header value is the
+        // whole credential with seven characters in front of it.
+        let header = Zeroizing::new(format!("Bearer {}", token.as_str()));
+        // A `null` JSON body and not a bare `.call()`: the official client
+        // sends `null` with a JSON content type here, and a server that reads
+        // the body before the route would answer 415 to a POST with no
+        // content type at all. The send id is in the bearer, so there is
+        // nothing else for the body to carry.
+        self.value_from(
+            self.anon_agent
+                .post(&url)
+                .set("Authorization", &header)
+                .send_json(serde_json::Value::Null),
+        )
+    }
+
+    /// `POST {base}/api/sends/access/{access_id}` with `{"password": ...}` --
+    /// the legacy route, kept for servers older than `v2026.8.0`.
+    ///
+    /// `access` is a [`MappedSendAccess`], whose only constructor hashes,
+    /// for [`Self::create_send`]'s reason exactly: a hand-built body here
+    /// would be the user's share password in the clear. Nothing in this module
+    /// formats it.
+    ///
+    /// **`Send-Id`** is sent to match the official client. Every server tag
+    /// examined has the check for it commented out, but it costs nothing, it
+    /// is what a server that turns the check back on will require, and it
+    /// carries no secret -- the id is already in the path.
+    pub fn access_send_anonymously(
+        &self,
+        access_id: &str,
+        access: &MappedSendAccess,
+    ) -> Result<serde_json::Value, RestError> {
+        if !is_url_path_safe(access_id) {
+            return Err(RestError::UnsafeId);
+        }
+        let url = format!("{}/api/sends/access/{}", self.base_url, access_id);
+        self.value_from(
+            self.anon_agent
+                .post(&url)
+                .set("Send-Id", access_id)
+                .send_json(access.body()),
+        )
     }
 
     // ---- the plumbing ------------------------------------------------------
@@ -3023,7 +3341,7 @@ mod tests {
         // between them account for all five.
         assert_eq!(
             production.matches("send_json(").count(),
-            7,
+            9,
             "a new JSON body sender appeared in rest::api"
         );
         // Two of them are the cipher writers, and both send a mapped cipher.
@@ -3064,6 +3382,25 @@ mod tests {
             1,
             "the Send endpoint stopped sending a MappedSend"
         );
+        // **The eighth is the legacy Send-access body**, and it is a mapped
+        // type for the same reason the create's is: `MappedSendAccess`'s only
+        // constructor takes the Send's key and hashes, so the share password
+        // cannot reach this module in the clear and no caller can assemble
+        // `{"password": ...}` itself.
+        assert_eq!(
+            production.matches("send_json(access.body())").count(),
+            1,
+            "the legacy Send-access route stopped sending a MappedSendAccess"
+        );
+        // **The ninth carries no data at all.** The token route's body is a
+        // literal `null` -- the send id is in the bearer, not in the body --
+        // and it is named here rather than left to the total so that a body
+        // with something in it cannot hide behind this one's allowance.
+        assert_eq!(
+            production.matches("send_json(serde_json::Value::Null)").count(),
+            1,
+            "the token Send-access route stopped sending an empty body"
+        );
 
         // And there is **no** hand-built body left anywhere: the four mapped
         // sends above are the write agent's only `post`/`put` with content.
@@ -3080,8 +3417,543 @@ mod tests {
             production.matches("self.write_agent.post(&url), session).send_json").count()
                 + production.matches("self.write_agent.put(&url), session).send_json").count(),
             5,
-            "the write agent gained another body-carrying call"
+            "the write agent gained another body-carrying call -- and a receive that moved \
+             this number is a receive that was handed the vault's session"
         );
+
+        // **The forms, enumerated too, and this is new ground.** A form body
+        // is invisible to every `send_json` count above it, and a count that
+        // cannot see a body is a count that can be evaded: the whole
+        // `send_access` grant could have been written as a hand-built form
+        // without moving any number in this test. So the module's `send_form(`
+        // sites are named here the way its JSON ones are.
+        assert_eq!(
+            production.matches("send_form(").count(),
+            4,
+            "a new form body sender appeared in rest::api"
+        );
+        // The API-key grant and the refresh each build their field list at the
+        // call site, so each is one whole `send_form(&[..])`.
+        assert_eq!(
+            production.matches("self.auth_agent.post(&url).send_form(&fields)").count(),
+            1,
+            "the API-key grant stopped sending its own field list, or gained a twin"
+        );
+        assert_eq!(
+            production.matches("self.auth_agent.post(&url).send_form(&[").count(),
+            1,
+            "the refresh stopped sending its own field list, or gained a twin"
+        );
+        // The password grant is the one that sets `Auth-Email` first, which is
+        // why it is spelled differently from the two above.
+        assert_eq!(
+            production.matches(".set(\"Auth-Email\", &auth_email)\n            .send_form(&fields)").count(),
+            1,
+            "the password grant stopped sending `Auth-Email` with its field list"
+        );
+        // The fourth is the Send-access grant, and it is on `anon_agent`
+        // rather than `auth_agent` -- which is the whole of what says it
+        // cannot be handed a vault credential. It carries a PBKDF2 hash of the
+        // share password and nothing else.
+        assert_eq!(
+            production.matches("self.anon_agent.post(&url).send_form(&fields)").count(),
+            1,
+            "the send-access grant stopped being a form on the anonymous agent"
+        );
+    }
+
+    /// **Nothing on the anonymous agent is given the vault's session.**
+    ///
+    /// A type cannot say this on its own. [`RestClient::bearer`] takes a
+    /// `&Session`, and any of the three Send-access functions *could* have
+    /// been given one and passed it -- the compiler would be content. So the
+    /// production half is read.
+    ///
+    /// **The positive control is the whole point of the test.** A slice cut
+    /// wrong, or a needle spelled differently from the source, makes every
+    /// count zero -- and every zero assertion below would then pass while
+    /// reaching nothing at all. That is this house's named defect and this is
+    /// exactly where it would live, so the first assertion is that the same
+    /// read finds `self.bearer(self.write_agent` more than never.
+    #[test]
+    fn nothing_on_the_anonymous_agent_is_given_the_vault_session() {
+        let source = include_str!("api.rs").replace("\r\n", "\n");
+        let marker = "\n#[cfg(test)]\nmod tests {";
+        let cut = source.find(marker).expect("the test module marker was not found");
+        let production = &source[..cut];
+
+        // Controls: the cut landed where it was meant to, and both halves are
+        // real -- the same three the census makes, for the same reason.
+        assert!(production.contains("pub fn update_cipher"), "the cut lost the writers");
+        assert!(!production.contains("test_http"), "the cut left test code in production");
+
+        // **The control.** If this is zero the needle is wrong or the slice
+        // is, and every assertion below is vacuous.
+        assert!(
+            production.matches("self.bearer(self.write_agent").count() > 0,
+            "control: `self.bearer(self.write_agent` is not in this file's production at all, \
+             so the zero assertions below are searching text they could never have found"
+        );
+        // The second control: the anonymous agent exists and is used more than
+        // once, so "no `bearer` on it" is a statement about live code.
+        assert!(
+            production.matches("anon_agent").count() >= 4,
+            "control: `anon_agent` occurs only {} times, which is fewer than the field, its \
+             construction and the three requests account for",
+            production.matches("anon_agent").count()
+        );
+
+        assert_eq!(
+            production.matches("self.bearer(self.anon_agent").count(),
+            0,
+            "a request on the anonymous agent was handed the vault's session. These three \
+             requests are addressed by a link the user pasted; the token that unlocks the \
+             whole vault must never travel on one"
+        );
+        // And the session must not reach them by any other spelling either:
+        // the three signatures are read and `Session` is asserted absent from
+        // each. A `&mut Session` parameter is how it would arrive.
+        for signature in [
+            "pub fn mint_send_access_token(",
+            "pub fn access_send_with_token(",
+            "pub fn access_send_anonymously(",
+        ] {
+            let at = production
+                .find(signature)
+                .unwrap_or_else(|| panic!("control: {signature:?} is not in production"));
+            let params = &production[at..];
+            let close = params.find(") ->").expect("the signature is never closed");
+            assert!(
+                !params[..close].contains("Session"),
+                "{signature:?} takes a `Session`. A receive is addressed by a link and must \
+                 be handed no vault credential at all"
+            );
+        }
+        // The control for the loop above: a function that DOES take one is
+        // found by the same read, so this cannot pass for a search that never
+        // matches the word.
+        let at = production.find("pub fn create_send(").expect("control: the create is here");
+        let close = production[at..].find(") ->").expect("the signature is never closed");
+        assert!(
+            production[at..at + close].contains("Session"),
+            "control: `create_send`'s signature does not spell `Session`, so the absence \
+             assertions above are looking for a word this read cannot find"
+        );
+    }
+
+    // ---- receiving a Send from a link ---------------------------------------
+
+    /// An invented access id. Never a real one; nothing here reaches a real
+    /// server.
+    const ACCESS_ID: &str = "an-invented-access-id";
+
+    /// A `send_access` grant answer, shaped like the real one.
+    fn send_token_body() -> &'static str {
+        r#"{"access_token":"SEND-AT-1","expires_in":300,"token_type":"Bearer",
+            "scope":"api.send.access"}"#
+    }
+
+    /// One `400` from the grant, with a named `send_access_error_type`.
+    fn send_error_body(code: &str) -> String {
+        format!(r#"{{"error":"invalid_grant","send_access_error_type":"{code}"}}"#)
+    }
+
+    /// **Every field the identity server requires, and only those.**
+    ///
+    /// Named here because `client_id` and `scope` are NOT in the server's
+    /// `SendAccessConstants` and have no other pin in this repository -- they
+    /// come from `receive.command.ts` on `bitwarden/clients` `main`.
+    #[test]
+    fn the_send_access_grant_sends_every_field_the_identity_server_requires() {
+        let mut server = crate::test_http::server();
+        let mock = server
+            .mock("POST", "/identity/connect/token")
+            .match_body(crate::test_http::Matcher::AllOf(vec![
+                crate::test_http::Matcher::UrlEncoded("grant_type".into(), "send_access".into()),
+                crate::test_http::Matcher::UrlEncoded("client_id".into(), "send".into()),
+                crate::test_http::Matcher::UrlEncoded("scope".into(), "api.send.access".into()),
+                crate::test_http::Matcher::UrlEncoded("send_id".into(), ACCESS_ID.into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(send_token_body())
+            .expect(1)
+            .create();
+
+        RestClient::new(server.url())
+            .mint_send_access_token(ACCESS_ID, None)
+            .expect("the grant mints a token");
+        mock.assert();
+    }
+
+    /// **The password hash reaches the form, and no vault secret does.**
+    ///
+    /// The control is the first assertion: the hash IS found in the body, so a
+    /// test searching a body that was never sent cannot pass the absences
+    /// below it.
+    #[test]
+    fn the_grant_carries_the_send_password_hash_and_no_vault_secret() {
+        let mut server = crate::test_http::server();
+        let with_hash = server
+            .mock("POST", "/identity/connect/token")
+            .match_body(crate::test_http::Matcher::UrlEncoded(
+                "password_hash_b64".into(),
+                "AN-INVENTED-HASH".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(send_token_body())
+            .expect(1)
+            .create();
+
+        RestClient::new(server.url())
+            .mint_send_access_token(ACCESS_ID, Some("AN-INVENTED-HASH"))
+            .expect("the grant mints a token");
+        // The control: the hash matcher fired, so the body exists and was read.
+        with_hash.assert();
+
+        // And the absences, on a second server so the matcher above cannot be
+        // what satisfies them: no master password hash, no session token, no
+        // device identity. This grant authenticates one Send, not an account.
+        let mut bare = crate::test_http::server();
+        let no_vault_secret = bare
+            .mock("POST", "/identity/connect/token")
+            .match_body(crate::test_http::Matcher::AllOf(vec![
+                crate::test_http::Matcher::UrlEncoded("grant_type".into(), "send_access".into()),
+            ]))
+            .match_header("Auth-Email", crate::test_http::Matcher::Missing)
+            .match_header("Authorization", crate::test_http::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(send_token_body())
+            .expect(1)
+            .create();
+        RestClient::new(bare.url())
+            .mint_send_access_token(ACCESS_ID, None)
+            .expect("the grant mints a token");
+        no_vault_secret.assert();
+    }
+
+    /// **The classification table, every arm.** One mock per
+    /// `send_access_error_type`, and the assertion is on the VARIANT and never
+    /// on a string. A design that read these as one "refused" is a design that
+    /// asks for a password when the Send is gone.
+    #[test]
+    fn every_named_send_access_error_maps_to_its_own_refusal() {
+        for (code, expected) in [
+            ("password_hash_b64_required", SendGrantRefusal::PasswordRequired),
+            ("password_hash_b64_invalid", SendGrantRefusal::PasswordInvalid),
+            ("email_required", SendGrantRefusal::EmailRequired),
+            ("email_and_otp_required", SendGrantRefusal::EmailRequired),
+            ("send_id_invalid", SendGrantRefusal::SendGone),
+        ] {
+            let mut server = crate::test_http::server();
+            server
+                .mock("POST", "/identity/connect/token")
+                .with_status(400)
+                .with_header("content-type", "application/json")
+                .with_body(send_error_body(code))
+                .create();
+            let refusal = RestClient::new(server.url())
+                .mint_send_access_token(ACCESS_ID, None)
+                .err()
+                .unwrap_or_else(|| panic!("{code} was not a refusal at all"));
+            assert_eq!(refusal, expected, "{code} was classified as {refusal:?}");
+        }
+    }
+
+    /// **The fallback trigger is exactly two answers.**
+    ///
+    /// Positive half: `400 unsupported_grant_type` and a bare `404` at
+    /// `/identity/connect/token` each give `GrantAbsent`.
+    ///
+    /// Negative half, in the SAME test: every arm of the table above, plus a
+    /// `500`, plus a transport failure, gives something that is NOT
+    /// `GrantAbsent`. Without the negative half this passes for a mapper that
+    /// answers `GrantAbsent` to everything -- which would send a user with a
+    /// wrong password down the legacy route on a server that has no legacy
+    /// route, and answer "this Send is gone".
+    #[test]
+    fn only_a_server_that_does_not_know_the_grant_may_send_us_to_the_old_route() {
+        // The two that MAY fall back.
+        let mut unsupported = crate::test_http::server();
+        unsupported
+            .mock("POST", "/identity/connect/token")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":"unsupported_grant_type"}"#)
+            .create();
+        assert_eq!(
+            RestClient::new(unsupported.url()).mint_send_access_token(ACCESS_ID, None).err(),
+            Some(SendGrantRefusal::GrantAbsent),
+            "`unsupported_grant_type` is Duende's own answer and is the one string that means \
+             this server has never heard of the grant"
+        );
+
+        let mut absent = crate::test_http::server();
+        absent.mock("POST", "/identity/connect/token").with_status(404).create();
+        assert_eq!(
+            RestClient::new(absent.url()).mint_send_access_token(ACCESS_ID, None).err(),
+            Some(SendGrantRefusal::GrantAbsent),
+            "a token endpoint always exists on a Bitwarden server, so a 404 at it is \
+             unambiguous"
+        );
+
+        // And every answer that MAY NOT. Each of these means the grant exists
+        // and is talking about this Send.
+        for body in [
+            send_error_body("password_hash_b64_required"),
+            send_error_body("password_hash_b64_invalid"),
+            send_error_body("email_required"),
+            send_error_body("email_and_otp_required"),
+            send_error_body("send_id_invalid"),
+            r#"{"error":"invalid_grant","error_description":"something else"}"#.to_string(),
+            r#"{"error":"invalid_client"}"#.to_string(),
+        ] {
+            let mut server = crate::test_http::server();
+            server
+                .mock("POST", "/identity/connect/token")
+                .with_status(400)
+                .with_header("content-type", "application/json")
+                .with_body(body.clone())
+                .create();
+            let refusal = RestClient::new(server.url())
+                .mint_send_access_token(ACCESS_ID, None)
+                .err()
+                .expect("a 400 is a refusal");
+            assert_ne!(
+                refusal,
+                SendGrantRefusal::GrantAbsent,
+                "{body} was read as `GrantAbsent`, which would send this user to a route the \
+                 server may not have and report their live Send as gone"
+            );
+        }
+
+        // A 500 is not a missing route either.
+        let mut broken = crate::test_http::server();
+        broken.mock("POST", "/identity/connect/token").with_status(500).create();
+        assert_ne!(
+            RestClient::new(broken.url()).mint_send_access_token(ACCESS_ID, None).err(),
+            Some(SendGrantRefusal::GrantAbsent),
+            "a 500 is a server that broke, not a server without the route"
+        );
+
+        // Nor is a transport failure: nothing was answered at all, so nothing
+        // is known about which routes exist.
+        let refusal = RestClient::new("http://127.0.0.1:1")
+            .mint_send_access_token(ACCESS_ID, None)
+            .err()
+            .expect("an unreachable server is a refusal");
+        assert_ne!(
+            refusal,
+            SendGrantRefusal::GrantAbsent,
+            "a transport failure was read as a missing route, so an offline user would be \
+             told their Send is gone"
+        );
+    }
+
+    /// **A token with no usable expiry is refused, not treated as eternal.**
+    ///
+    /// [`a_server_that_sends_no_expires_in_must_not_be_assumed_to_have_sent_one`]
+    /// is the precedent; `receive.command.ts`'s own comment is the reason -- a
+    /// `NaN` expiry is one `isExpired()` reads as "not expired" forever.
+    #[test]
+    fn a_grant_answer_with_no_usable_expiry_is_refused() {
+        for body in [
+            r#"{"access_token":"SEND-AT-1","token_type":"Bearer"}"#,
+            r#"{"access_token":"SEND-AT-1","expires_in":null}"#,
+            r#"{"access_token":"SEND-AT-1","expires_in":"soon"}"#,
+            r#"{"expires_in":300}"#,
+        ] {
+            let mut server = crate::test_http::server();
+            server
+                .mock("POST", "/identity/connect/token")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(body)
+                .create();
+            assert!(
+                RestClient::new(server.url()).mint_send_access_token(ACCESS_ID, None).is_err(),
+                "{body} was accepted as a usable token"
+            );
+        }
+
+        // The control: the whole answer IS accepted, so this test cannot pass
+        // for a parser that refuses every grant response there is.
+        let mut good = crate::test_http::server();
+        good.mock("POST", "/identity/connect/token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(send_token_body())
+            .create();
+        assert!(
+            RestClient::new(good.url()).mint_send_access_token(ACCESS_ID, None).is_ok(),
+            "a well-formed grant answer is refused, so the refusals above prove nothing"
+        );
+    }
+
+    /// **`POST /api/sends/access`** -- the bare path, with the SEND token in
+    /// the bearer. The mock matches the exact path, so a request that kept an
+    /// `{id}` segment does not reach it.
+    #[test]
+    fn the_token_route_posts_to_the_bare_access_path_with_the_send_bearer() {
+        let mut server = crate::test_http::server();
+        server
+            .mock("POST", "/identity/connect/token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(send_token_body())
+            .create();
+        let client = RestClient::new(server.url());
+        let token = client.mint_send_access_token(ACCESS_ID, None).expect("a token");
+
+        let access = server
+            .mock("POST", "/api/sends/access")
+            .match_header("Authorization", "Bearer SEND-AT-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"acc-1","type":0,"text":{"text":"2.a|b|c","hidden":false}}"#)
+            .expect(1)
+            .create();
+
+        let answer = client.access_send_with_token(&token).expect("the access answers");
+        access.assert();
+        assert_eq!(answer["id"], "acc-1", "the answer was not read back");
+    }
+
+    /// **`POST /api/sends/access/{accessId}`** with `{"password": ...}` and the
+    /// `Send-Id` header, matching `send-api.service.ts` at `cli-v2025.8.0`.
+    ///
+    /// Two mocks: with a password and without. `null` and a hash are different
+    /// bodies, and only one of them is what a server expects for a Send that
+    /// has no password.
+    #[test]
+    fn the_anonymous_route_posts_the_password_body_to_the_id_path() {
+        let key = crate::rest::send_crypto::SendKey::from_bytes([6u8; 16]);
+        let hash = key.password_hash("an-invented-share-password").to_string();
+
+        let mut server = crate::test_http::server();
+        let with_password = server
+            .mock("POST", format!("/api/sends/access/{ACCESS_ID}").as_str())
+            .match_header("Send-Id", ACCESS_ID)
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
+                "password": hash,
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"acc-1","type":0}"#)
+            .expect(1)
+            .create();
+
+        let client = RestClient::new(server.url());
+        client
+            .access_send_anonymously(
+                ACCESS_ID,
+                &MappedSendAccess::for_key(&key, Some("an-invented-share-password")),
+            )
+            .expect("the access answers");
+        with_password.assert();
+
+        // Without one, the body is an explicit `null` and not a missing key --
+        // which is the shape `SendAccessRequestModel` declares.
+        let mut bare = crate::test_http::server();
+        let no_password = bare
+            .mock("POST", format!("/api/sends/access/{ACCESS_ID}").as_str())
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({
+                "password": serde_json::Value::Null,
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"acc-1","type":0}"#)
+            .expect(1)
+            .create();
+        RestClient::new(bare.url())
+            .access_send_anonymously(ACCESS_ID, &MappedSendAccess::for_key(&key, None))
+            .expect("the access answers");
+        no_password.assert();
+
+        // And the share password itself is nowhere in either body: the mapped
+        // type hashes, and the hash is not the password.
+        assert!(
+            !hash.contains("an-invented-share-password"),
+            "the share password reached the request in the clear"
+        );
+    }
+
+    /// **Neither anonymous route may be handed the user's vault token.**
+    ///
+    /// A `Session` is granted in this test and deliberately not passed. The
+    /// mocks assert `Authorization` is either absent or the Send's own token,
+    /// and never `Bearer AT-1`.
+    ///
+    /// Control, in the same test: a `create_send` against the same server DOES
+    /// carry `Bearer AT-1`. A matcher that never fires would otherwise pass
+    /// both halves.
+    #[test]
+    fn the_vault_session_never_reaches_a_request_addressed_by_a_link() {
+        let mut server = crate::test_http::server();
+        let (client, mut session) = granted(&mut server);
+
+        // The legacy route: no `Authorization` header at all. It is anonymous.
+        let legacy = server
+            .mock("POST", format!("/api/sends/access/{ACCESS_ID}").as_str())
+            .match_header("Authorization", crate::test_http::Matcher::Missing)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"acc-1","type":0}"#)
+            .expect(1)
+            .create();
+        let key = crate::rest::send_crypto::SendKey::from_bytes([6u8; 16]);
+        client
+            .access_send_anonymously(ACCESS_ID, &MappedSendAccess::for_key(&key, None))
+            .expect("the access answers");
+        legacy.assert();
+
+        // The token route: the SEND's bearer, and never the vault's. The
+        // grant's own mock is registered after `granted`'s, so it is the one
+        // that matches the `send_access` body.
+        server
+            .mock("POST", "/identity/connect/token")
+            .match_body(crate::test_http::Matcher::UrlEncoded(
+                "grant_type".into(),
+                "send_access".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(send_token_body())
+            .create();
+        let token = client.mint_send_access_token(ACCESS_ID, None).expect("a token");
+        let bearer = server
+            .mock("POST", "/api/sends/access")
+            .match_header("Authorization", "Bearer SEND-AT-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"acc-1","type":0}"#)
+            .expect(1)
+            .create();
+        client.access_send_with_token(&token).expect("the access answers");
+        bearer.assert();
+
+        // **The control.** The same client, on the same server, DOES send the
+        // vault's bearer when the route is one the vault owns -- so the two
+        // assertions above are about these routes and not about a matcher that
+        // never fires.
+        let create = server
+            .mock("POST", "/api/sends")
+            .match_header("Authorization", "Bearer AT-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"send-1","accessId":"acc-1"}"#)
+            .expect(1)
+            .create();
+        let mapped = crate::rest::send::encrypt_plan(
+            &crate::rest::send::tests::a_plan(),
+            &crate::rest::send::tests::keys(),
+            &crate::send::FixedClock(1_786_408_997_148),
+        )
+        .expect("the plan maps");
+        client.create_send(&mut session, &mapped).expect("the create answers");
+        create.assert();
     }
 
     /// The whole of what a create must put on the wire: the method, the path,
