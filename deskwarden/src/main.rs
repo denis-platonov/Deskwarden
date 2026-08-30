@@ -10960,7 +10960,7 @@ fn offline_open_failure(load: &deskwarden::vault_disk_cache::DiskCacheLoad) -> &
         DiskCacheLoad::Loaded { .. } => "it opened, and this line should not have been reached",
         DiskCacheLoad::Absent => "there is no copy on this machine",
         DiskCacheLoad::Rejected(reason) => reason.as_str(),
-        DiskCacheLoad::Unavailable(_) => "Windows Hello did not unlock it",
+        DiskCacheLoad::Unavailable(_) => "the key for the copy on this machine could not be read",
         DiskCacheLoad::Corrupt(_) => "the file on this machine could not be decrypted",
     }
 }
@@ -14795,10 +14795,10 @@ mod tests {
     ///
     /// **The cache is `test_vault::cache_with_items` rather than a disk
     /// restore, and that is a crate boundary and not a shortcut.** The
-    /// `DiskCacheEnv` fixtures that substitute the Hello step live behind
+    /// `DiskCacheEnv` fixtures that substitute the sealing key live behind
     /// `#[cfg(test)]` in the library, so this binary cannot reach them, and
-    /// the alternative -- a real `DiskCache` -- would derive a real Windows
-    /// Hello key. What this test owns is therefore the second link of the
+    /// the alternative -- a real `DiskCache` -- would mint a real key file in
+    /// the user's own directory. What this test owns is therefore the second link of the
     /// chain: *given* items in the cache, the engine is armed from them and
     /// nothing else moves. The first link -- an encrypted file becomes those
     /// items, without the file or its age being touched -- is

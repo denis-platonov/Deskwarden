@@ -9,31 +9,54 @@
 //!
 //! 1. A random 32-byte **content key** encrypts the snapshot (AES-256-GCM),
 //!    with the plaintext header as additional authenticated data.
-//! 2. That content key is itself sealed (AES-256-GCM) under a key derived
-//!    from a **Windows Hello** signature -- `hello.rs`'s existing pattern
-//!    applied to a second secret, under its own domain-separation label.
+//! 2. That content key is itself sealed (AES-256-GCM) under this account's
+//!    **sealing key** -- 32 random bytes minted once and kept DPAPI-wrapped
+//!    in `vault-cache-key.bin` beside the cache, exactly the shape
+//!    [`crate::user_key_store`] uses for the master key.
 //! 3. The whole thing is DPAPI-wrapped, exactly as `hello.bin` is.
 //!
-//! The property that justifies the feature: Hello's private key lives in
-//! this machine's TPM, so a stolen or imaged disk plus the Windows account
-//! password yields the header and two ciphertexts and nothing else. DPAPI
-//! alone cannot make that claim, because DPAPI derives from the Windows
-//! account credentials, which travel with the image.
+//! ## Why the sealing key is not a Windows Hello signature any more
+//!
+//! It was, until 2026-08-30, and the argument for that was TPM binding: a
+//! stolen or imaged disk plus the Windows account password would yield the
+//! header and two ciphertexts and nothing else. The argument was true and it
+//! was still the wrong trade, for two reasons that are not about
+//! cryptography.
+//!
+//! **It gated a derivative more strictly than the original.** On a
+//! direct-REST account the master key -- the thing that opens the *whole*
+//! vault, that never expires and cannot be revoked -- sits in
+//! [`crate::user_key_store`], DPAPI-wrapped and nothing more; Preferences
+//! says so to the user in as many words. An attacker who can run programs as
+//! this user takes that file and never looks at this one. So the Hello gate
+//! defended nothing that was not already reachable without it, and its whole
+//! practical effect was a prompt.
+//!
+//! **And that prompt was on the startup path.** Deriving the key asked the
+//! credential to sign a challenge, which is what puts the OS dialog on
+//! screen. On a machine where the dialog did not appear, startup waited for
+//! it forever: daemon alive, no window, no further log line. Turning the
+//! setting on made the app stop starting. The rule that replaces it is
+//! flat -- **nothing on a startup path may block on UI** -- and the way this
+//! module keeps it is that its key comes from a file, not from a person.
+//!
+//! Quick unlock (`hello::enroll_for`) still prompts, and should: there the
+//! prompt is the feature the user asked for, not a toll on launching.
 //!
 //! The header is plaintext *inside* the DPAPI envelope on purpose. DPAPI
-//! unwrapping is silent and non-interactive, so the app can read the header,
-//! decide the file is expired or belongs to a different account, and delete
-//! it **without ever popping a Hello prompt** for a file it is about to
-//! throw away.
+//! unwrapping is silent and non-interactive, so the app can read the header
+//! and decide the file is expired or belongs to a different account before
+//! touching a key at all -- which was what kept a doomed file from costing a
+//! prompt, and now keeps it from costing a mint.
 //!
-//! ## What is testable without Hello hardware, and how
+//! ## What is testable without touching the OS, and how
 //!
 //! Two things here reach the OS and nothing in this crate's test suite may:
-//! the Hello signature and DPAPI. Both are behind [`DiskCacheEnv`]'s `fn`
+//! DPAPI, and the sealing key's file. Both are behind [`DiskCacheEnv`]'s `fn`
 //! pointers -- `single_instance::TakeoverEnv`'s idiom -- so every decision on
 //! this side of the seam (the format, the header checks, which failures
-//! delete the file and which leave it) is driven directly, and no test
-//! derives a key, pops a prompt, or wraps a byte.
+//! delete the file and which leave it) is driven directly, and no test mints
+//! a key or wraps a byte.
 
 use crate::vault_bridge::{Folder, VaultItem};
 use aes_gcm::aead::{Aead, Payload};
@@ -43,11 +66,7 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use windows::core::HSTRING;
-use windows::Security::Credentials::{
-    KeyCredentialCreationOption, KeyCredentialManager, KeyCredentialStatus,
-};
-use windows::Security::Cryptography::CryptographicBuffer;
+use windows::Security::Credentials::KeyCredentialManager;
 use zeroize::{Zeroize, Zeroizing};
 
 /// File magic, so a foreign or truncated file is rejected before anything
@@ -60,7 +79,7 @@ const MAGIC: &[u8; 4] = b"DWVC";
 /// **2 since the body was split into a facts section and per-item secrets.**
 ///
 /// A version 1 file is refused by [`check_header`] as
-/// [`RejectReason::UnknownVersion`] -- unread, and with no Hello prompt,
+/// [`RejectReason::UnknownVersion`] -- unread, without touching a key,
 /// because the header is plaintext inside the DPAPI envelope. It is deleted
 /// rather than migrated: this is a rebuildable cache with a seven-day life,
 /// and a migration is code that runs once and is wrong forever after.
@@ -99,29 +118,28 @@ const CONTENT_KEY_LEN: usize = 32;
 pub(crate) const FILE_NAME: &str = "vault-cache.bin";
 pub(crate) const TMP_FILE_NAME: &str = "vault-cache.bin.tmp";
 
-/// The same Hello key credential quick unlock uses. One credential, two
-/// sealed blobs, separated by their derivation labels -- see [`KDF_LABEL`]
-/// below and `hello.rs`'s own.
-const CREDENTIAL_NAME: &str = "deskwarden-quick-unlock";
+/// The sealing key's own file, beside the cache in the same account
+/// directory. Separate from `vault-cache.bin` rather than a field inside it
+/// for the reason [`stored_seal_key`] gives: a cache file is thrown away for
+/// half a dozen ordinary reasons, and a key that went with it would be a key
+/// rotated by expiry.
+pub(crate) const KEY_FILE_NAME: &str = "vault-cache-key.bin";
 
-/// Distinct from `hello.rs`'s challenge. The spec only requires the *label*
-/// to differ; a distinct challenge is strictly additional separation at no
-/// cost.
-const CHALLENGE: &[u8] = b"deskwarden vault cache challenge v1";
+/// Four bytes at the front of the sealing key's plaintext, so a file that is
+/// not one of these is refused rather than read as key material.
+/// [`crate::user_key_store`]'s reason exactly: DPAPI already refuses another
+/// Windows user, so this catches *our own* mistake -- a `session.bin` copied
+/// over this path, or this layout changed without its version.
+const KEY_MAGIC: &[u8; 4] = b"DWCK";
 
-/// Domain separation from quick unlock's key. Sharing `hello.rs`'s label
-/// would make the two sealed blobs cross-decryptable, which is sloppy for
-/// no gain.
-///
-/// **Deliberately not mixed with an account suffix**, which is the one place
-/// this differs from `hello.rs`'s derivation. Accounts are separated here by
-/// the file's location -- one `vault-cache.bin` inside each account's own
-/// directory, beside its `session.bin` and `hello.bin` -- and by the header's
-/// account fingerprint, which refuses a file belonging to anyone else before
-/// a key is derived at all. Mixing the suffix in as well would mean a fresh
-/// Hello prompt at every account switch, for separation those two already
-/// provide.
-const KDF_LABEL: &[u8] = b"deskwarden vault cache aes key v1";
+/// The key file's half-written name. Named beside its file rather than
+/// computed at the two places that touch it, so log out cannot forget one.
+pub(crate) const KEY_TMP_FILE_NAME: &str = "vault-cache-key.bin.tmp";
+
+/// Bumped only for an incompatible change to the key file's layout. An
+/// unknown version mints a fresh key rather than erroring, which costs one
+/// rebuilt cache.
+const KEY_FORMAT_VERSION: u8 = 1;
 
 /// Plaintext metadata, inside the DPAPI envelope and outside the sealed
 /// body. Also the body's AAD, so none of it can be edited without failing
@@ -231,9 +249,9 @@ pub fn check_header(
 /// Builds the complete file body (everything that goes *inside* the DPAPI
 /// envelope).
 ///
-/// Takes the Hello-derived key as a parameter, and there is deliberately no
-/// other way to build a file. If a path ever appears that writes one without
-/// a Hello seal, the setting's description becomes a false security claim.
+/// Takes the sealing key as a parameter, and there is deliberately no other
+/// way to build a file. If a path ever appears that writes one without a
+/// seal, the setting's description becomes a false security claim.
 /// # The header is sealed over, so it is built here rather than passed whole
 ///
 /// `facts_len` and `index` are outputs of the sealing, not inputs to it: the
@@ -242,7 +260,7 @@ pub fn check_header(
 /// discovered fields back before serialising it -- which matters because the
 /// header is the AAD, so it has to be final before anything is bound to it.
 pub(crate) fn encode_file(
-    hello_key: &[u8; 32],
+    seal_key: &[u8; 32],
     header: &CacheHeader,
     facts: &[u8],
     snapshot: &DiskSnapshot,
@@ -289,7 +307,7 @@ pub(crate) fn encode_file(
         .map_err(|e| format!("no randomness for the content key: {e}"))?;
 
 
-    let sealed_key = seal(hello_key, content_key.as_slice(), None)?;
+    let sealed_key = seal(seal_key, content_key.as_slice(), None)?;
     let (body, sealed_index) = seal_body(&content_key, &header_bytes, facts, &items)?;
     // The arithmetic above and the sealing here must agree, or every offset
     // in the file is a lie that only shows up as a refusal months later.
@@ -307,8 +325,8 @@ pub(crate) fn encode_file(
 }
 
 /// Reads the plaintext header and splits out the spans the body needs.
-/// **Performs no key derivation**, which is what lets a doomed file be
-/// deleted without a Hello prompt.
+/// **Touches no key at all**, which is what lets a doomed file be deleted
+/// without so much as unwrapping the sealing key.
 pub(crate) fn parse_header(bytes: &[u8]) -> Result<(CacheHeader, Parsed), String> {
     let mut cursor = 0usize;
     let take = |cursor: &mut usize, n: usize| -> Result<&[u8], String> {
@@ -358,16 +376,16 @@ pub(crate) fn parse_header(bytes: &[u8]) -> Result<(CacheHeader, Parsed), String
     ))
 }
 
-/// Unseals the content key under the Hello-derived key.
+/// Unseals the content key under this account's sealing key.
 ///
 /// Split out because version 2 has three readers of it -- the whole-snapshot
 /// load below, the facts section, and one item at a time -- and each of them
 /// needing its own copy of this unwrap is how the three come to disagree.
 pub(crate) fn content_key_of(
-    hello_key: &[u8; 32],
+    seal_key: &[u8; 32],
     parsed: &Parsed,
 ) -> Result<Zeroizing<[u8; CONTENT_KEY_LEN]>, String> {
-    let content_key = unseal(hello_key, &parsed.sealed_key, None)?;
+    let content_key = unseal(seal_key, &parsed.sealed_key, None)?;
     let content_key: [u8; CONTENT_KEY_LEN] = content_key
         .as_slice()
         .try_into()
@@ -377,7 +395,7 @@ pub(crate) fn content_key_of(
 
 /// The whole snapshot, given a content key already unwrapped.
 ///
-/// Split from [`decode_body_from_hello`] because `load` now unwraps the key
+/// Split from the whole-file decode because `load` now unwraps the key
 /// in its shared preamble and would otherwise unwrap it twice -- which is
 /// not merely wasteful: two unwraps are two places that can disagree about
 /// what a bad key means.
@@ -587,12 +605,10 @@ fn unseal(key: &[u8; 32], blob: &[u8], aad: Option<&[u8]>) -> Result<Zeroizing<V
 /// The outside-world half of the disk cache, as **`fn` pointers**.
 ///
 /// `single_instance::TakeoverEnv`'s idiom, and the constraint that forces it
-/// is the same one, in its strictest form: **no test in this crate may pop a
-/// Windows Hello prompt or call DPAPI.** The first needs a live user at the
-/// machine and would rotate nothing but would ask a person for a fingerprint
-/// in the middle of `cargo test`; the second is a real Win32 call against the
-/// user's own credentials. Both are one line each and neither carries a
-/// decision.
+/// is the same one: **no test in this crate may call DPAPI or write into the
+/// real account directory.** Both are real Win32 / filesystem effects against
+/// the user's own machine, and neither carries a decision this module could
+/// get wrong.
 ///
 /// What is left on this side of the seam is everything that can be wrong: the
 /// format, the order the header is checked in, which failures delete the file
@@ -603,9 +619,13 @@ pub struct DiskCacheEnv {
     pub wrap: fn(&[u8]) -> Result<Vec<u8>, String>,
     /// The inverse. A failure here means the file cannot be ours.
     pub unwrap: fn(&[u8]) -> Result<Vec<u8>, String>,
-    /// **The step that puts the OS's Hello dialog on screen**, and the only
-    /// way a key is ever obtained.
-    pub hello_key: fn() -> Result<Zeroizing<[u8; 32]>, String>,
+    /// **The only way a sealing key is ever obtained**, and deliberately a
+    /// step that cannot show UI -- see the module doc's account of the launch
+    /// this feature used to hang.
+    ///
+    /// Takes the account's directory because the key lives in a file beside
+    /// the cache: one key per account, minted on first use.
+    pub seal_key: fn(&Path) -> Result<Zeroizing<[u8; 32]>, String>,
 }
 
 impl DiskCacheEnv {
@@ -620,7 +640,7 @@ impl DiskCacheEnv {
                 crate::session_store::unprotect(bytes)
                     .map_err(|e| format!("DPAPI could not unwrap the vault cache: {e}"))
             },
-            hello_key: hello_derived_key,
+            seal_key: stored_seal_key,
         }
     }
 }
@@ -707,11 +727,13 @@ pub enum DiskCacheLoad {
     },
     /// No file. Nothing happened, nothing was prompted.
     Absent,
-    /// The header disqualified it. Deleted, unread, with no Hello prompt.
+    /// The header disqualified it. Deleted, unread, without touching a key.
     Rejected(RejectReason),
-    /// Hello could not be satisfied (cancelled, not enrolled, revoked).
-    /// The file is **left in place**: a cancelled biometric is a user
-    /// decision, not a reason to throw away their cache.
+    /// The sealing key could not be read or minted -- DPAPI refused, or the
+    /// key file could not be written. The file is **left in place**: this
+    /// session cannot open it, but a later one on a healthier machine can,
+    /// and deleting a readable cache over a transient failure is the one
+    /// mistake that cannot be undone.
     Unavailable(String),
     /// The header was fine but the body would not open. Deleted -- a blob
     /// that can never be opened again is worse than no blob.
@@ -728,9 +750,13 @@ impl PartialEq for DiskCacheLoad {
     }
 }
 
-/// Whether Windows Hello is set up on this machine at all. The cache needs
-/// `available`, not `enrolled`: quick unlock is not a prerequisite, since
-/// the cache creates its own credential when none exists.
+/// Whether Windows Hello is set up on this machine at all.
+///
+/// **Nothing in this module needs it any more** -- the sealing key is DPAPI
+/// alone, see the module doc. This is kept because `prefs_ui` still asks it
+/// to decide what the disk-cache row says and whether it is offered, and that
+/// copy is a user-facing security claim that has to be re-decided by the
+/// owner rather than quietly rewritten here.
 pub fn hello_available() -> bool {
     KeyCredentialManager::IsSupportedAsync()
         .and_then(|op| op.get())
@@ -756,10 +782,10 @@ pub struct DiskCache {
     env: DiskCacheEnv,
     /// The file this process has open, if [`Self::load_facts`] opened one.
     ///
-    /// **Held so that opening one item costs neither a read nor a prompt.**
+    /// **Held so that opening one item costs neither a read nor an unwrap.**
     /// The whole point of version 2 is that a fill can reach one secret; if
-    /// each reach re-read the file and re-derived the content key, it would
-    /// pop Windows Hello per password, which is unusable.
+    /// each reach re-read the file and re-unsealed the content key, every
+    /// password would cost two file reads and a DPAPI call.
     ///
     /// What is retained is ciphertext plus one key. The key is the thing
     /// that matters, and it is dropped by [`Self::close`] -- which the same
@@ -782,6 +808,11 @@ struct OpenFile {
 }
 
 struct Paths {
+    /// Kept alongside the two derived paths because the sealing key is
+    /// obtained *from the directory*, not from the cache file: asking
+    /// `file.parent()` for it would let a path with no parent -- which
+    /// `Path::parent` permits -- mint a key somewhere nobody chose.
+    dir: PathBuf,
     file: PathBuf,
     tmp: PathBuf,
 }
@@ -789,24 +820,27 @@ struct Paths {
 impl Paths {
     fn in_dir(dir: &Path) -> Self {
         Self {
+            dir: dir.to_path_buf(),
             file: dir.join(FILE_NAME),
             tmp: dir.join(TMP_FILE_NAME),
         }
     }
 }
 
-/// The Hello-derived key for this session.
+/// The sealing key for this session.
 ///
-/// Acquired at most once per launch -- on the startup load, or when the
-/// setting is switched on -- because the spec requires a rewrite after every
-/// populate *and every mutation*, and deriving per write would pop a
-/// biometric prompt on every item edit.
+/// Read (or minted) at most once per account per launch, because the spec
+/// requires a rewrite after every populate *and every mutation*, and going
+/// back to the file per write would be a read and an unwrap on every item
+/// edit.
 ///
-/// A cancelled or failed acquisition is **not retried** for the rest of the
-/// session: retrying at the next write would pop a Hello prompt out of
-/// nowhere at an arbitrary moment. `given_up` records that, so the difference
-/// between "not tried yet" and "tried and refused" is in the state rather
-/// than inferred from a `None`.
+/// A failed acquisition is **not retried** for the rest of the session. The
+/// prompt that rule was written for is gone, but the rule still earns its
+/// place: what can fail now is the filesystem or DPAPI, and neither gets
+/// better between two writes a second apart -- retrying would turn one
+/// logged failure into one per mutation. `given_up` records it, so the
+/// difference between "not tried yet" and "tried and failed" is in the state
+/// rather than inferred from a `None`.
 #[derive(Default)]
 struct KeyState {
     key: Option<[u8; 32]>,
@@ -840,12 +874,19 @@ impl DiskCache {
     /// Called by the account switch **before** it authenticates, for
     /// `SessionStore::path`'s reason exactly: a write issued after the switch
     /// began but against the outgoing account's path is a mutation no
-    /// end-state assertion catches. The session key is deliberately kept --
-    /// the credential and the label are the same for every account, so
-    /// re-deriving would be one more Hello prompt for no separation the file's
-    /// location and the header's fingerprint do not already provide.
+    /// end-state assertion catches.
+    ///
+    /// **The session key goes with it**, which is the one thing that changed
+    /// when the key stopped being Hello-derived. It used to be kept because
+    /// re-deriving cost a prompt and bought no separation the file's location
+    /// and the header's fingerprint did not already provide. The key is now
+    /// per-directory -- one `vault-cache-key.bin` per account -- so keeping it
+    /// would seal the incoming account's vault under the outgoing account's
+    /// key, and every later load would find a file it could not open. Reading
+    /// the right one costs a file read and no UI.
     pub fn repoint(&self, dir: &Path) {
         *self.lock_paths() = Paths::in_dir(dir);
+        *self.lock_key() = KeyState::default();
     }
 
     /// The file this cache reads and writes.
@@ -853,12 +894,17 @@ impl DiskCache {
         self.lock_paths().file.clone()
     }
 
-    /// Pops the Hello prompt if the key has not been acquired yet. Used by
-    /// the Preferences toggle so that enabling the setting is itself the
-    /// confirmation gesture.
+    /// Reads this account's sealing key, minting one if there is none yet.
+    /// Used by the Preferences toggle, which wants to fail *before* the
+    /// setting flips if the key cannot be established at all.
+    ///
+    /// **Shows nothing and waits for nobody.** It used to pop the Hello
+    /// prompt and double as the confirmation gesture; the gesture is now the
+    /// toggle itself.
     pub fn acquire_key(&self) -> Result<(), String> {
+        let dir = self.lock_paths().dir.clone();
         let mut state = self.lock_key();
-        self.ensure_key(&mut state).map(|_| ())
+        self.ensure_key(&mut state, &dir).map(|_| ())
     }
 
     /// Whether a key is held for this session. Not a secret, and not the key:
@@ -867,18 +913,18 @@ impl DiskCache {
         self.lock_key().key.is_some()
     }
 
-    /// **Whether a copy is sitting on this machine that this session declined
-    /// to open.**
+    /// **Whether a copy is sitting on this machine that this session could
+    /// not open.**
     ///
-    /// The one state [`DiskCacheLoad`] cannot express. A cancelled Hello
-    /// prompt answers [`DiskCacheLoad::Unavailable`] and sets `given_up`, and
+    /// The one state [`DiskCacheLoad`] cannot express. A failed key read
+    /// answers [`DiskCacheLoad::Unavailable`] and sets `given_up`, and
     /// the file is still there, untouched -- unlike
     /// [`DiskCacheLoad::Rejected`], which has already deleted it, and unlike
     /// [`DiskCacheLoad::Absent`], where there was never one. A caller that
     /// reads only the load outcome therefore cannot tell "there is no local
     /// copy" from "there is one and you dismissed the fingerprint prompt",
-    /// and the offline screens would tell a user who fumbled a prompt that
-    /// their vault copy does not exist.
+    /// and the offline screens would tell a user whose key file was
+    /// momentarily unreadable that their vault copy does not exist.
     ///
     /// `given_up` **and** the file, both: `given_up` alone would answer `true`
     /// on a machine with no file at all, which is the same lie in the other
@@ -890,18 +936,17 @@ impl DiskCache {
         self.lock_key().given_up && self.lock_paths().file.exists()
     }
 
-    /// **Lets one more Hello prompt happen**, after a cancelled or failed one.
+    /// **Lets one more key attempt happen**, after a failed one.
     ///
-    /// `given_up` exists so a refusal is never retried *on its own* -- see
-    /// `KeyState`: a retry at the next write would pop a biometric prompt out
-    /// of nowhere while the user was editing an item. That reasoning is about
-    /// prompts nobody asked for, and it is the only reasoning `given_up`
-    /// carries. It says nothing about a user pressing a button labelled
-    /// *Continue offline*, which is a request for exactly this prompt, at
-    /// exactly this moment.
+    /// `given_up` exists so a failure is never retried *on its own* -- see
+    /// `KeyState`: a retry at the next write would repeat a logged failure
+    /// once per mutation. That reasoning is about attempts nobody asked for,
+    /// and it is the only reasoning `given_up` carries. It says nothing about
+    /// a user pressing a button labelled *Continue offline*, which is a
+    /// request for exactly this attempt, at exactly this moment.
     ///
     /// So this is not a loosening of that rule: it is the one gesture the rule
-    /// was never about. Without it, a fingerprint prompt dismissed by accident
+    /// was never about. Without it, one transient DPAPI or filesystem failure
     /// would put the local copy out of reach for the rest of the session while
     /// the screen went on offering it -- a button that does nothing, which is
     /// the treatment `prefs_ui` refuses.
@@ -911,14 +956,19 @@ impl DiskCache {
         self.lock_key().given_up = false;
     }
 
-    fn ensure_key(&self, state: &mut KeyState) -> Result<[u8; 32], String> {
+    /// `dir` is passed rather than read from `self.paths` because every
+    /// caller already holds the key lock, and taking the paths lock under it
+    /// would be the one place in this type where the two are nested.
+    fn ensure_key(&self, state: &mut KeyState, dir: &Path) -> Result<[u8; 32], String> {
         if let Some(key) = state.key {
             return Ok(key);
         }
         if state.given_up {
-            return Err("Windows Hello was not available earlier in this session".to_string());
+            return Err(
+                "the vault cache's key could not be read earlier in this session".to_string(),
+            );
         }
-        match (self.env.hello_key)() {
+        match (self.env.seal_key)(dir) {
             Ok(key) => {
                 state.key = Some(*key);
                 Ok(*key)
@@ -933,13 +983,13 @@ impl DiskCache {
     /// Reads, validates, and (if everything checks out) decrypts the file.
     ///
     /// Order matters and is the point: DPAPI unwrap and header validation
-    /// come first and derive no key, so an expired, foreign, or
-    /// wrong-version file is deleted without the user being asked for a
-    /// biometric on behalf of a file about to be thrown away.
+    /// come first and touch no key, so an expired, foreign, or
+    /// wrong-version file is deleted without a sealing key being read or
+    /// minted on behalf of a file about to be thrown away.
     pub fn load(&self, fingerprint: &str) -> DiskCacheLoad {
         let file = self.lock_paths().file.clone();
         // The same preamble `load_facts` runs, so the two cannot drift in
-        // which failures delete the file or when Hello is asked.
+        // which failures delete the file or when the key is read.
         let (header, parsed, key) = match self.opened_file(fingerprint) {
             Ok(v) => v,
             Err(refusal) => return refusal.into_load(),
@@ -967,7 +1017,7 @@ impl DiskCache {
                 }
             }
             Err(e) => {
-                log::warn!("the vault cache could not be decrypted ({e}); deleting it");
+                log::info!("the vault cache could not be decrypted ({e}); rebuilding it");
                 let _ = std::fs::remove_file(&file);
                 DiskCacheLoad::Corrupt(e)
             }
@@ -978,7 +1028,7 @@ impl DiskCache {
     ///
     /// Everything before the decryption is [`Self::load`]'s, unchanged: the
     /// header is checked, an expired or foreign file is deleted without a
-    /// prompt, and Hello is asked only once the file is known to be ours.
+    /// key, and the key is read only once the file is known to be ours.
     /// What differs is what comes back -- the facts, and **no secret at all**
     /// -- and that the content key is retained so [`Self::open_item`] costs
     /// nothing.
@@ -1002,7 +1052,7 @@ impl DiskCache {
                 DiskFactsLoad::Loaded { facts, written_at }
             }
             Err(e) => {
-                log::warn!("the vault cache's facts could not be decrypted ({e}); deleting it");
+                log::info!("the vault cache's facts could not be decrypted ({e}); rebuilding it");
                 let _ = std::fs::remove_file(&file);
                 DiskFactsLoad::Corrupt(e)
             }
@@ -1036,7 +1086,7 @@ impl DiskCache {
     ///
     /// Called wherever the in-memory snapshot is emptied. The file stays on
     /// disk -- it is meant to survive a lock -- but this process stops being
-    /// able to read it until the user unlocks and Hello is asked again.
+    /// able to read it until the user unlocks and the file is opened again.
     pub fn close(&self) {
         if let Ok(mut slot) = self.open.lock() {
             *slot = None;
@@ -1044,7 +1094,8 @@ impl DiskCache {
     }
 
     /// The shared preamble of [`Self::load`] and [`Self::load_facts`]:
-    /// read, unwrap, parse, check the header, and only then ask Hello.
+    /// read, unwrap, parse, check the header, and only then reach for the
+    /// sealing key.
     ///
     /// Returns the load result to hand straight back on any refusal, so the
     /// two entry points cannot drift in which failures delete the file.
@@ -1052,9 +1103,9 @@ impl DiskCache {
         &self,
         fingerprint: &str,
     ) -> Result<(CacheHeader, Parsed, Zeroizing<[u8; CONTENT_KEY_LEN]>), DiskFactsLoad> {
-        let (file, tmp) = {
+        let (dir, file, tmp) = {
             let paths = self.lock_paths();
-            (paths.file.clone(), paths.tmp.clone())
+            (paths.dir.clone(), paths.file.clone(), paths.tmp.clone())
         };
         // A leftover temp file is a write that was interrupted. Removed here,
         // in the shared preamble, so both entry points clean it up -- it was
@@ -1095,7 +1146,7 @@ impl DiskCache {
         }
         let key = {
             let mut state = self.lock_key();
-            match self.ensure_key(&mut state) {
+            match self.ensure_key(&mut state, &dir) {
                 Ok(key) => key,
                 Err(e) => {
                     log::info!("not using the vault cache this session: {e}");
@@ -1106,7 +1157,16 @@ impl DiskCache {
         let content_key = match content_key_of(&key, &parsed) {
             Ok(k) => k,
             Err(e) => {
-                log::warn!("the vault cache's content key would not open ({e}); deleting it");
+                // **Where a cache written by an older Deskwarden lands**, and
+                // the reason this is `info` rather than `warn`: a file sealed
+                // under the old Hello-derived key cannot be opened with this
+                // one, and every machine that had the setting on takes this
+                // branch exactly once. That is a cache miss, not a fault --
+                // the file is deleted and the next populate writes a fresh
+                // one, which is what a cache is for. Nothing above this shows
+                // `Corrupt` to the user; `main` logs it and goes to the
+                // backend.
+                log::info!("the vault cache's content key would not open ({e}); rebuilding it");
                 let _ = std::fs::remove_file(&file);
                 return Err(DiskFactsLoad::Corrupt(e));
             }
@@ -1116,13 +1176,21 @@ impl DiskCache {
 
     /// Writes the snapshot. Atomic: a full write to `.tmp` followed by a
     /// rename over the target, so a crash mid-write cannot leave a truncated
-    /// file whose corruption would cost a Hello prompt to discover.
+    /// file whose corruption would only be discovered on the next launch.
     ///
-    /// **Errors if no session key is held, and there is deliberately no
-    /// fallback that writes without one.** This is the property the setting's
-    /// description rests on: no path in this crate can produce a file that is
-    /// not sealed under a Hello-derived key, because [`encode_file`] takes
-    /// that key as a parameter and this is its only caller.
+    /// **There is deliberately no fallback that writes without a key.** This
+    /// is the property the setting's description rests on: no path in this
+    /// crate can produce a file that is not sealed, because [`encode_file`]
+    /// takes the key as a parameter and this is its only caller.
+    ///
+    /// It *establishes* the key rather than demanding one already held, which
+    /// it could not do while the key came from Hello -- a prompt in the middle
+    /// of saving an edit was unacceptable, so the key had to be taken at a
+    /// moment the user had chosen. Reading or minting a file is silent, so
+    /// that constraint is gone, and its absence closes a real gap: after an
+    /// account switch (see [`Self::repoint`]) the incoming account may have no
+    /// cache to load, in which case nothing before this would have obtained
+    /// its key and every write for the rest of the session would have failed.
     /// `facts` is opaque: whatever the caller wants readable without opening
     /// a secret. This module seals it and records its length; it has no
     /// opinion about what a projection contains, because that is a decision
@@ -1135,10 +1203,9 @@ impl DiskCache {
         folders: &[Folder],
     ) -> Result<(), String> {
         let key = {
-            let state = self.lock_key();
-            state
-                .key
-                .ok_or_else(|| "no Windows Hello key for the vault cache this session".to_string())?
+            let dir = self.lock_paths().dir.clone();
+            let mut state = self.lock_key();
+            self.ensure_key(&mut state, &dir)?
         };
 
         let header = CacheHeader {
@@ -1225,8 +1292,14 @@ impl DiskCache {
 /// `unenroll_for` returns nothing: the account is going either way, and the
 /// window that would show the error is about to be replaced by a sign-in
 /// card.
+/// **The key goes too.** Its file is not the cache, so nothing else deletes
+/// it -- `delete` deliberately leaves it, because a re-auth or a disabled
+/// setting may be followed by another write and rotating the key there is
+/// churn. Log out is the one moment where the account is gone from this
+/// machine, and leaving thirty-two bytes that sealed a vault behind is the
+/// liability this function's whole doc is about.
 pub fn forget_for(dir: &Path) {
-    for name in [FILE_NAME, TMP_FILE_NAME] {
+    for name in [FILE_NAME, TMP_FILE_NAME, KEY_FILE_NAME, KEY_TMP_FILE_NAME] {
         if let Err(e) = std::fs::remove_file(dir.join(name)) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 log::error!(
@@ -1238,102 +1311,154 @@ pub fn forget_for(dir: &Path) {
     }
 }
 
-/// Runs the Hello-gated signature and derives this module's AES key from it.
-/// This is the step that pops the OS verification dialog.
+/// This account's sealing key: the 32 random bytes in
+/// `<dir>/vault-cache-key.bin`, minted on first use.
 ///
-/// **Never `ReplaceExisting`.** `hello.rs` bans it for the same reason and
-/// says so at length: the credential named [`CREDENTIAL_NAME`] is shared with
-/// quick unlock and with every account, and replacing it rotates its private
-/// key, which changes the signature, which destroys every enrolment derived
-/// from it. Open first; only create -- with `FailIfExists` -- when there is
-/// nothing to open.
-fn hello_derived_key() -> Result<Zeroizing<[u8; 32]>, String> {
-    let name = HSTRING::from(CREDENTIAL_NAME);
-
-    // `KeyCredentialManager` has no way to be told which window to parent its
-    // prompt to, so the only lever is to be the foreground process when the
-    // prompt is created. `hello.rs` does the same, immediately before each
-    // call that can show one, and for the same reported symptom: "Windows PIN
-    // screen launches in background".
-    let _ = crate::foreground::raise_this_process();
-
-    let opened = KeyCredentialManager::OpenAsync(&name)
-        .and_then(|op| op.get())
-        .map_err(|e| format!("Windows Hello is unavailable: {e}"))?;
-
-    let credential = match opened.Status() {
-        Ok(KeyCredentialStatus::Success) => opened
-            .Credential()
-            .map_err(|e| format!("Windows Hello returned no credential: {e}"))?,
-        Ok(KeyCredentialStatus::NotFound) => {
-            let created = KeyCredentialManager::RequestCreateAsync(
-                &name,
-                KeyCredentialCreationOption::FailIfExists,
-            )
-            .and_then(|op| op.get())
-            .map_err(|e| format!("Windows Hello is unavailable: {e}"))?;
-            match created.Status() {
-                Ok(KeyCredentialStatus::Success) => created
-                    .Credential()
-                    .map_err(|e| format!("Windows Hello returned no credential: {e}"))?,
-                Ok(KeyCredentialStatus::UserCanceled) => {
-                    return Err("Windows Hello was cancelled.".to_string())
-                }
-                Ok(other) => return Err(format!("Windows Hello failed ({other:?})")),
-                Err(e) => return Err(format!("Windows Hello failed: {e}")),
-            }
-        }
-        Ok(KeyCredentialStatus::UserCanceled) => {
-            return Err("Windows Hello was cancelled.".to_string())
-        }
-        Ok(other) => return Err(format!("Windows Hello failed ({other:?})")),
-        Err(e) => return Err(format!("Windows Hello failed: {e}")),
-    };
-
-    // Again, immediately before the call that shows the prompt: the
-    // create/open above may itself have shown one, in which case the broker
-    // took the foreground and the raise at the top is already stale.
-    let _ = crate::foreground::raise_this_process();
-
-    let challenge = CryptographicBuffer::CreateFromByteArray(CHALLENGE)
-        .map_err(|e| format!("could not build the Hello challenge buffer: {e}"))?;
-    let signed = credential
-        .RequestSignAsync(&challenge)
-        .and_then(|op| op.get())
-        .map_err(|e| format!("Windows Hello signing failed: {e}"))?;
-
-    match signed.Status() {
-        Ok(KeyCredentialStatus::Success) => {}
-        Ok(KeyCredentialStatus::UserCanceled) => {
-            return Err("Windows Hello was cancelled.".to_string())
-        }
-        Ok(other) => return Err(format!("Windows Hello verification failed ({other:?})")),
-        Err(e) => return Err(format!("Windows Hello verification failed: {e}")),
-    }
-
-    let signature_buffer = signed
-        .Result()
-        .map_err(|e| format!("Windows Hello returned no signature: {e}"))?;
-    let mut signature = windows::core::Array::<u8>::new();
-    CryptographicBuffer::CopyToByteArray(&signature_buffer, &mut signature)
-        .map_err(|e| format!("could not read the Hello signature: {e}"))?;
-
-    let key = derive_key(&signature);
-    // The signature is the key material; don't leave a copy behind.
-    let signature_bytes: &mut [u8] = &mut signature;
-    signature_bytes.zeroize();
-    Ok(key)
+/// **The whole of what replaced the Windows Hello signature**, and the reason
+/// the app starts again -- see the module doc. Every step here is silent and
+/// non-interactive; there is no path through it that can wait for a person.
+///
+/// # Why a file of random bytes rather than something derived
+///
+/// DPAPI protects data, it does not yield a key, and its output is not
+/// deterministic -- so "DPAPI-derived key" is not a thing that exists. What
+/// does exist is the shape [`crate::user_key_store`] already uses for the
+/// master key, which is strictly more valuable than anything this seals: mint
+/// randomness once, keep it DPAPI-wrapped, unwrap it on use.
+///
+/// # Why its own file
+///
+/// The cache file is deleted for half a dozen ordinary reasons -- expiry, a
+/// foreign fingerprint, a re-auth, an unknown format version. A key stored
+/// inside it would be a key rotated by each of those, which is churn with no
+/// security in it, and the account's directory is already where its
+/// `session.bin`, `hello.bin` and `userkey.bin` live.
+///
+/// # Why an unreadable key file mints a new one instead of failing
+///
+/// The only thing lost is a cache that could not have been read anyway: the
+/// bytes that sealed it are gone. Failing here would leave the app with no
+/// key, no cache, and a permanent error, when minting leaves it with a cache
+/// rebuilt at the next populate. A DPAPI *call* failing is a different
+/// matter -- that says this Windows user's credentials are not available, and
+/// it is returned as an error rather than papered over with a fresh key that
+/// could not be stored either.
+fn stored_seal_key(dir: &Path) -> Result<Zeroizing<[u8; 32]>, String> {
+    seal_key_in(
+        dir,
+        |bytes| crate::session_store::protect(bytes).map_err(|e| e.to_string()),
+        |bytes| crate::session_store::unprotect(bytes).map_err(|e| e.to_string()),
+    )
 }
 
-/// `SHA-256(label ‖ signature)` → AES-256 key. Pure, and split out for
-/// `hello::derive_key`'s reason: it is the only part of the key path that can
-/// be tested without Hello hardware, and the label is the whole of what keeps
-/// this blob and quick unlock's from being cross-decryptable.
-fn derive_key(signature: &[u8]) -> Zeroizing<[u8; 32]> {
-    let mut hasher = Sha256::new();
-    hasher.update(KDF_LABEL);
-    hasher.update(signature);
-    Zeroizing::new(hasher.finalize().into())
+/// [`stored_seal_key`] with DPAPI as two ordinary parameters.
+///
+/// **Not a second seam.** `DiskCacheEnv` is this module's one `fn`-pointer
+/// struct and stays that way; these are arguments, exactly as
+/// `hello::open_blob` takes its key-getter, and there is one production
+/// caller directly above that always passes the real pair. What it buys is
+/// that the decisions here -- mint when there is no file, mint when the
+/// stored bytes are not ours, reject a bad DPAPI call rather than minting
+/// over it, and hand back the *same* key the second time -- are testable
+/// without any test in this crate calling DPAPI.
+fn seal_key_in(
+    dir: &Path,
+    protect: impl Fn(&[u8]) -> Result<Vec<u8>, String>,
+    unprotect: impl Fn(&[u8]) -> Result<Vec<u8>, String>,
+) -> Result<Zeroizing<[u8; 32]>, String> {
+    let path = dir.join(KEY_FILE_NAME);
+    match std::fs::read(&path) {
+        Ok(wrapped) => match unprotect(&wrapped) {
+            Ok(plain) => {
+                let plain = Zeroizing::new(plain);
+                match parse_seal_key(&plain) {
+                    Some(key) => return Ok(key),
+                    None => log::warn!(
+                        "the vault cache's key file at {} is not one of ours; minting a new key                          and rebuilding the cache",
+                        path.display()
+                    ),
+                }
+            }
+            // Not an error: a key this Windows user cannot unwrap is a key
+            // that can never open the cache beside it again, so there is
+            // nothing to preserve by refusing. The mint below is checked, and
+            // if DPAPI is genuinely unavailable it fails there with a real
+            // message rather than here with a guess.
+            Err(e) => log::warn!(
+                "the vault cache's key file at {} could not be unwrapped ({e}); minting a new                  key and rebuilding the cache",
+                path.display()
+            ),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "could not read {}: {e}",
+                path.display()
+            ))
+        }
+    }
+    mint_seal_key(dir, &path, protect)
+}
+
+/// The stored plaintext, checked. `None` for anything that is not one of
+/// ours, which the caller answers by minting.
+///
+/// A `Zeroizing` return and a plain `Option`: [`crate::user_key_store`]'s
+/// rule that there is no error type here for a byte to hide in.
+fn parse_seal_key(plain: &[u8]) -> Option<Zeroizing<[u8; 32]>> {
+    if plain.len() != KEY_MAGIC.len() + 1 + 32 {
+        return None;
+    }
+    if &plain[..KEY_MAGIC.len()] != KEY_MAGIC {
+        return None;
+    }
+    if plain[KEY_MAGIC.len()] != KEY_FORMAT_VERSION {
+        return None;
+    }
+    let key: [u8; 32] = plain[KEY_MAGIC.len() + 1..].try_into().ok()?;
+    Some(Zeroizing::new(key))
+}
+
+/// Mints 32 random bytes, stores them DPAPI-wrapped at `path`, and returns
+/// them.
+///
+/// **The write is checked and its failure is returned.** A key that was
+/// handed out but not stored would seal a cache file that the next launch
+/// could never open -- a cache rebuilt on every start, which is the exact
+/// outcome this feature exists to avoid and the one that would be hardest to
+/// notice, because everything would appear to work.
+///
+/// Written to a temp name and renamed, for the cache file's reason: a crash
+/// between the two must not leave a truncated key on the path the next launch
+/// reads.
+fn mint_seal_key(
+    dir: &Path,
+    path: &Path,
+    protect: impl Fn(&[u8]) -> Result<Vec<u8>, String>,
+) -> Result<Zeroizing<[u8; 32]>, String> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    getrandom::getrandom(key.as_mut_slice())
+        .map_err(|e| format!("no randomness for the vault cache's key: {e}"))?;
+
+    let mut plain = Zeroizing::new(Vec::with_capacity(KEY_MAGIC.len() + 1 + 32));
+    plain.extend_from_slice(KEY_MAGIC);
+    plain.push(KEY_FORMAT_VERSION);
+    plain.extend_from_slice(key.as_slice());
+    let wrapped =
+        protect(&plain).map_err(|e| format!("DPAPI could not wrap the vault cache's key: {e}"))?;
+
+    std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    let tmp = dir.join(KEY_TMP_FILE_NAME);
+    std::fs::write(&tmp, &wrapped).map_err(|e| format!("could not write {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not replace {}: {e}", path.display())
+    })?;
+    log::info!(
+        "minted a new key for the encrypted vault copy at {}",
+        path.display()
+    );
+    Ok(key)
 }
 
 /// `pub(crate)` so `vault_cache`'s own disk tests can build a [`DiskCache`]
@@ -1369,16 +1494,16 @@ pub(crate) mod tests {
         assert!(rendered.contains("work"), "control: the folders did not come back either");
     }
 
-    /// One item, by id, out of the file `load_facts` left open -- with no
-    /// second Hello prompt, which is what the retained content key is for.
+    /// One item, by id, out of the file `load_facts` left open -- without
+    /// going back for the key, which is what the retained content key is for.
     #[test]
-    fn open_item_reaches_one_secret_without_asking_hello_again() {
-        let dir = temp_dir_for("open-item-no-second-prompt");
-        HELLO_ASKED.store(0, Ordering::SeqCst);
-        let cache = DiskCache::new(&dir, env(counting_hello));
+    fn open_item_reaches_one_secret_without_asking_for_the_key_again() {
+        let dir = temp_dir_for("open-item-no-second-key-read");
+        KEY_ASKED.store(0, Ordering::SeqCst);
+        let cache = DiskCache::new(&dir, env(counting_key));
         let snap = snapshot();
 
-        cache.acquire_key().expect("the substituted Hello step");
+        cache.acquire_key().expect("the substituted key step");
         cache
             .write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders)
             .unwrap();
@@ -1388,14 +1513,15 @@ pub(crate) mod tests {
         assert_eq!(opened.id, id);
 
         // **Once for the whole session.** A write, a facts load and an item
-        // open, and the user was asked for a biometric a single time. Per-item
-        // opens are the thing version 2 exists to allow, and a design that
-        // prompted for each one would be unusable -- a fill would sit behind
-        // a Hello dialog every time.
+        // open, and the key file was read a single time. Per-item opens are
+        // the thing version 2 exists to allow, and a fill that re-read and
+        // re-unwrapped the key for every password would pay two file reads
+        // and a DPAPI call each time.
         assert_eq!(
-            HELLO_ASKED.load(Ordering::SeqCst),
+            KEY_ASKED.load(Ordering::SeqCst),
             1,
-            "Hello was asked more than once, so reaching a password prompts the user"
+            "the sealing key was fetched more than once, so reaching a password costs a \
+             file read and a DPAPI call every time"
         );
     }
 
@@ -1584,11 +1710,11 @@ pub(crate) mod tests {
     /// unwraps a key just to read a whole body any more, and a function kept
     /// alive for tests is a function that stops matching what runs.
     fn decode_body(
-        hello_key: &[u8; 32],
+        seal_key: &[u8; 32],
         header: &CacheHeader,
         parsed: &Parsed,
     ) -> Result<DiskSnapshot, String> {
-        let content_key = content_key_of(hello_key, parsed)?;
+        let content_key = content_key_of(seal_key, parsed)?;
         decode_body_with(&content_key, header, parsed)
     }
 
@@ -1596,26 +1722,30 @@ pub(crate) mod tests {
         [seed; 32]
     }
 
-    /// The Hello step, substituted. Two of them, so "a file written under a
-    /// different key" is expressible without any hardware.
-    fn key_seven() -> Result<Zeroizing<[u8; 32]>, String> {
+    /// The sealing-key step, substituted: a fixed key, ignoring the
+    /// directory. It ignores the directory on purpose -- these tests are
+    /// about the file format and the load order, and a fixture that varied
+    /// with the path would make every one of them depend on `temp_dir_for`'s
+    /// naming. The tests that *are* about the real per-directory key drive
+    /// [`stored_seal_key`]'s pure parts directly.
+    fn key_seven(_dir: &Path) -> Result<Zeroizing<[u8; 32]>, String> {
         Ok(Zeroizing::new(key(7)))
     }
 
-    /// How many times the substituted Hello step has been asked.
+    /// How many times the substituted key step has been asked.
     ///
-    /// A static because `DiskCacheEnv::hello_key` is a `fn` pointer and
+    /// A static because `DiskCacheEnv::seal_key` is a `fn` pointer and
     /// cannot close over a counter -- the same reason every other seam in
     /// this crate counts this way.
-    static HELLO_ASKED: AtomicUsize = AtomicUsize::new(0);
+    static KEY_ASKED: AtomicUsize = AtomicUsize::new(0);
 
-    fn counting_hello() -> Result<Zeroizing<[u8; 32]>, String> {
-        HELLO_ASKED.fetch_add(1, Ordering::SeqCst);
+    fn counting_key(_dir: &Path) -> Result<Zeroizing<[u8; 32]>, String> {
+        KEY_ASKED.fetch_add(1, Ordering::SeqCst);
         Ok(Zeroizing::new(key(7)))
     }
 
-    fn hello_cancelled() -> Result<Zeroizing<[u8; 32]>, String> {
-        Err("Windows Hello was cancelled.".to_string())
+    fn key_unavailable(_dir: &Path) -> Result<Zeroizing<[u8; 32]>, String> {
+        Err("the vault cache's key file could not be read".to_string())
     }
 
     /// DPAPI, substituted. Identity rather than a fake cipher: what this
@@ -1625,12 +1755,20 @@ pub(crate) mod tests {
         Ok(bytes.to_vec())
     }
 
-    /// A test env whose Hello step is `hello`, with DPAPI stubbed out.
-    pub(crate) fn env(hello: fn() -> Result<Zeroizing<[u8; 32]>, String>) -> DiskCacheEnv {
+    /// DPAPI, substituted for the key file's own tests -- the same identity
+    /// as [`no_wrap`], separately named because `seal_key_in` takes it as an
+    /// ordinary argument rather than through the env.
+    fn wrap_identity(bytes: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(bytes.to_vec())
+    }
+
+    /// A test env whose sealing-key step is `seal_key`, with DPAPI stubbed
+    /// out.
+    pub(crate) fn env(seal_key: fn(&Path) -> Result<Zeroizing<[u8; 32]>, String>) -> DiskCacheEnv {
         DiskCacheEnv {
             wrap: no_wrap,
             unwrap: no_wrap,
-            hello_key: hello,
+            seal_key,
         }
     }
 
@@ -1639,15 +1777,15 @@ pub(crate) mod tests {
     /// *after* Hello has been satisfied.
     pub(crate) fn cache_with_key(dir: &Path) -> DiskCache {
         let cache = DiskCache::new(dir, env(key_seven));
-        cache.acquire_key().expect("the substituted Hello step cannot fail");
+        cache.acquire_key().expect("the substituted key step cannot fail");
         cache
     }
 
-    /// A cache over `dir` whose Hello step always refuses -- the shape of a
-    /// session where the user cancelled the prompt. Nothing it does derives a
-    /// key, so no test using it can reach a real biometric.
-    pub(crate) fn cache_that_declines_hello(dir: &Path) -> DiskCache {
-        DiskCache::new(dir, env(hello_cancelled))
+    /// A cache over `dir` whose sealing-key step always fails -- the shape of
+    /// a session where the key file cannot be read or minted. Nothing it does
+    /// touches the real filesystem's key.
+    pub(crate) fn cache_whose_key_is_unavailable(dir: &Path) -> DiskCache {
+        DiskCache::new(dir, env(key_unavailable))
     }
 
     fn item(id: &str) -> VaultItem {
@@ -1892,23 +2030,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn this_modules_key_derivation_is_not_quick_unlocks() {
-        // The two sealed blobs must not be cross-decryptable. `hello.rs`'s
-        // label is private to that module, so this asserts the property that
-        // makes it hold: the label this module hashes is its own, and the
-        // string it holds is not the one quick unlock uses.
-        assert_eq!(KDF_LABEL, b"deskwarden vault cache aes key v1");
-        assert_ne!(KDF_LABEL, b"deskwarden hello quick-unlock aes key v1");
-        assert_ne!(CHALLENGE, b"deskwarden hello quick-unlock challenge v1");
-        // And the derivation really depends on the label rather than on the
-        // signature alone.
-        let mut plain = Sha256::new();
-        plain.update(b"signature");
-        let unlabelled: [u8; 32] = plain.finalize().into();
-        assert_ne!(*derive_key(b"signature"), unlabelled);
-    }
-
-    #[test]
     fn unknown_item_and_folder_fields_survive_a_disk_round_trip() {
         // This codebase has shipped a dropped-unknown-field bug four times,
         // in four different structs. The disk path must not become the fifth,
@@ -2118,7 +2239,7 @@ pub(crate) mod tests {
             DiskCacheEnv {
                 wrap: no_wrap,
                 unwrap: refuse,
-                hello_key: key_seven,
+                seal_key: key_seven,
             },
         );
         assert_eq!(
@@ -2159,7 +2280,7 @@ pub(crate) mod tests {
         // is unavailable (Hello cancelled), nothing must be written at all.
         // There is no unencrypted fallback path, by construction.
         let dir = temp_dir_for("nokey");
-        let cache = DiskCache::new(&dir, env(hello_cancelled));
+        let cache = DiskCache::new(&dir, env(key_unavailable));
         assert!(!cache.has_session_key());
         let snap = snapshot();
         assert!(cache.write("fp", &facts_for(&snap.folders), &snap.items, &snap.folders).is_err());
@@ -2171,7 +2292,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_cancelled_hello_leaves_the_file_alone_and_is_not_retried() {
+    fn an_unavailable_key_leaves_the_file_alone_and_is_not_retried() {
         // Two rules in one place, both from the spec's error handling: a
         // cancelled biometric is a user decision, so the cache stays; and it
         // must not re-prompt later in the session, so the second attempt
@@ -2185,7 +2306,7 @@ pub(crate) mod tests {
             &snap,
         );
 
-        let cache = DiskCache::new(&dir, env(hello_cancelled));
+        let cache = DiskCache::new(&dir, env(key_unavailable));
         assert!(matches!(cache.load("fp"), DiskCacheLoad::Unavailable(_)));
         assert!(
             dir.join(FILE_NAME).exists(),
@@ -2205,7 +2326,7 @@ pub(crate) mod tests {
     /// one situation: `Unavailable` is what the *load* says, and this is what
     /// is left on the disk afterwards.
     #[test]
-    fn a_declined_prompt_over_a_real_file_is_visible_as_a_copy_that_is_still_there() {
+    fn an_unavailable_key_over_a_real_file_is_visible_as_a_copy_that_is_still_there() {
         let dir = temp_dir_for("declined");
         let snap = snapshot();
         write_file_with_key(
@@ -2215,7 +2336,7 @@ pub(crate) mod tests {
             &snap,
         );
 
-        let cache = DiskCache::new(&dir, env(hello_cancelled));
+        let cache = DiskCache::new(&dir, env(key_unavailable));
         assert!(
             !cache.declined_copy_on_disk(),
             "a copy was reported as declined before anything had asked for a key"
@@ -2231,9 +2352,9 @@ pub(crate) mod tests {
     /// **Both halves are required**, and this is the other one: a session that
     /// gave up on a machine with no file has no copy to offer.
     #[test]
-    fn a_declined_prompt_with_no_file_offers_nothing() {
+    fn an_unavailable_key_with_no_file_offers_nothing() {
         let dir = temp_dir_for("declined-nofile");
-        let cache = DiskCache::new(&dir, env(hello_cancelled));
+        let cache = DiskCache::new(&dir, env(key_unavailable));
         assert!(cache.acquire_key().is_err());
         assert!(
             !cache.declined_copy_on_disk(),
@@ -2257,15 +2378,16 @@ pub(crate) mod tests {
             &snap,
         );
 
-        // Refuses once, then answers -- the shape of a user who cancelled the
-        // prompt and then asked for the copy. A `static` counter rather than a
-        // capturing closure, because the seam is an `fn` pointer.
+        // Fails once, then answers -- the shape of a transient key-file
+        // failure followed by the user asking for the copy. A `static` counter
+        // rather than a capturing closure, because the seam is an `fn`
+        // pointer.
         static ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
-        fn once_refusing() -> Result<Zeroizing<[u8; 32]>, String> {
+        fn once_refusing(dir: &Path) -> Result<Zeroizing<[u8; 32]>, String> {
             if ATTEMPTS.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Err("Windows Hello was cancelled.".to_string());
+                return Err("the vault cache's key file could not be read".to_string());
             }
-            key_seven()
+            key_seven(dir)
         }
 
         ATTEMPTS.store(0, Ordering::SeqCst);
@@ -2418,15 +2540,183 @@ pub(crate) mod tests {
         assert!(!doomed.join(FILE_NAME).exists());
     }
 
+    /// **The startup path cannot reach Windows Hello.**
+    ///
+    /// This is the whole defect, asserted two ways, because either one alone
+    /// can pass while the app hangs.
+    ///
+    /// By pointer identity: what `production()` will call is
+    /// [`stored_seal_key`] and nothing else. A future edit that points the
+    /// field at a prompting function fails here rather than at a launch that
+    /// never finishes -- which is how this shipped, since a hang produces no
+    /// error to notice.
+    ///
+    /// And by source, because pointer identity only says "it is this
+    /// function", not "this function shows no UI": the production half of
+    /// this file must name none of the three `KeyCredential` calls that put
+    /// the OS dialog on screen. `stored_seal_key` could grow one and stay the
+    /// same pointer.
     #[test]
-    fn the_key_is_derived_once_per_session_however_many_writes_there_are() {
-        // Deriving per write would pop a biometric prompt on every item edit,
-        // which is why the key is cached. Asserted through a seam that counts
-        // its own calls in a thread-local rather than a global.
+    fn productions_sealing_key_cannot_reach_windows_hello() {
+        // Pointer identity. The `as usize` casts are what `export_wiring`
+        // does: `fn` items are zero-sized distinct types, so they have to be
+        // coerced to a common `fn` pointer type before they compare.
+        let production: fn(&Path) -> Result<Zeroizing<[u8; 32]>, String> =
+            DiskCacheEnv::production().seal_key;
+        let expected: fn(&Path) -> Result<Zeroizing<[u8; 32]>, String> = stored_seal_key;
+        assert_eq!(
+            production as usize, expected as usize,
+            "production's sealing key does not come from the key file"
+        );
+
+        // POSITIVE CONTROL for the comparison itself. Without it this test
+        // would still pass if every `fn` pointer in the build compared equal
+        // -- which is not hypothetical: identical zero-argument bodies have
+        // been merged by the linker before.
+        let other: fn(&Path) -> Result<Zeroizing<[u8; 32]>, String> = key_seven;
+        assert_ne!(
+            production as usize, other as usize,
+            "control: two different functions compared equal, so the assertion above proves \
+             nothing"
+        );
+
+        // Source. `concat!`-split so no needle matches its own declaration
+        // here, and the search is cut at `mod tests` so this very block does
+        // not satisfy it -- the idiom `hello.rs` and `main.rs` both use.
+        let source = include_str!("vault_disk_cache.rs");
+        let cut = source
+            .find(concat!("mod ", "tests {"))
+            .expect("the test module opener must be findable, or the cut below is the whole file");
+        let production_half = &source[..cut];
+        for prompting in [
+            concat!("RequestSign", "Async"),
+            concat!("RequestCreate", "Async"),
+            concat!("KeyCredentialManager::", "OpenAsync"),
+        ] {
+            assert_eq!(
+                production_half.matches(prompting).count(),
+                0,
+                "the production half of this module names {prompting}, which is a call that can \
+                 put a Windows Hello dialog on a startup path"
+            );
+        }
+
+        // POSITIVE CONTROL for the scan. Three counts of zero are exactly
+        // what a broken needle, a bad cut, or a renamed file produce, and
+        // this repo has shipped a test that passed because it never reached
+        // the thing it named. `IsSupportedAsync` is in the production half
+        // (`hello_available`, which `prefs_ui` still calls) and shows the
+        // same haystack answering non-zero for a real needle.
+        assert!(
+            production_half
+                .matches(concat!("IsSupported", "Async"))
+                .count()
+                > 0,
+            "control: the scan found nothing at all, so the three zeroes above are the \
+             mechanism failing rather than the property holding"
+        );
+    }
+
+    /// **A missing key file mints one**, stores it, and hands it back.
+    ///
+    /// Driven through [`seal_key_in`] with DPAPI as identity, so no test
+    /// calls the real thing -- the module doc's rule.
+    #[test]
+    fn a_missing_key_file_mints_one() {
+        let dir = temp_dir_for("mint-a-key");
+        let path = dir.join(KEY_FILE_NAME);
+        // The premise. Without this the test could be reading a key some
+        // earlier run left behind and calling it a mint.
+        assert!(!path.exists(), "control: the key file was already there");
+
+        let key = seal_key_in(&dir, wrap_identity, wrap_identity).expect("a key should be minted");
+
+        assert!(path.exists(), "the minted key was not stored");
+        assert_ne!(*key, [0u8; 32], "the minted key is all zeroes, so it is not random");
+        // It is really *in* the file, in this module's own layout -- a mint
+        // that returned bytes it did not store would leave every launch
+        // rebuilding the cache, which is the failure hardest to notice
+        // because everything appears to work.
+        let stored = std::fs::read(&path).expect("the key file");
+        assert_eq!(
+            parse_seal_key(&stored).map(|k| *k),
+            Some(*key),
+            "the file does not hold the key that was handed out"
+        );
+        // And no half-written file was left behind by the rename.
+        assert!(!dir.join(KEY_TMP_FILE_NAME).exists());
+    }
+
+    /// **A second read returns the same key.**
+    ///
+    /// The property the feature rests on: a key that changed per launch would
+    /// make every start find a cache it cannot open, silently rebuild it, and
+    /// buy nothing at all -- while looking exactly like success.
+    #[test]
+    fn a_second_read_returns_the_same_key() {
+        let dir = temp_dir_for("stable-key");
+        let first = seal_key_in(&dir, wrap_identity, wrap_identity).expect("the mint");
+        let second = seal_key_in(&dir, wrap_identity, wrap_identity).expect("the read");
+        assert_eq!(*first, *second, "the sealing key changed between two reads");
+
+        // POSITIVE CONTROL. `assert_eq!` on two keys passes just as happily
+        // if the function always returns a constant, or if both calls minted
+        // and the equality is an artifact of a broken mint. A *different*
+        // directory must produce a *different* key, which pins both: the
+        // value comes from the file, and the file is per account.
+        let other_dir = temp_dir_for("stable-key-other");
+        let elsewhere = seal_key_in(&other_dir, wrap_identity, wrap_identity).expect("the mint");
+        assert_ne!(
+            *first, *elsewhere,
+            "control: two accounts' directories yielded the same key, so the equality above is \
+             not evidence the key was read back from anywhere"
+        );
+
+        // And the round trip really goes through the file rather than through
+        // some retained state: a key file replaced with rubbish is not ours,
+        // so the next read mints a fresh one instead of failing.
+        std::fs::write(dir.join(KEY_FILE_NAME), b"not one of ours").unwrap();
+        let after = seal_key_in(&dir, wrap_identity, wrap_identity).expect("a fresh mint");
+        assert_ne!(
+            *first, *after,
+            "an unusable key file was not replaced, so the stored bytes are not what is read"
+        );
+    }
+
+    /// A DPAPI *call* that fails is an error, not a silent re-mint.
+    ///
+    /// The distinction [`seal_key_in`] draws: unreadable stored bytes cost a
+    /// rebuilt cache and nothing else, but a machine whose DPAPI refuses
+    /// cannot store a new key either, and minting over the old one there
+    /// would throw away a cache that a healthy later session could have read.
+    #[test]
+    fn a_refusing_dpapi_is_an_error_rather_than_a_fresh_key() {
+        fn refuse(_: &[u8]) -> Result<Vec<u8>, String> {
+            Err("0x8009000b".to_string())
+        }
+        let dir = temp_dir_for("dpapi-refuses-the-key");
+        assert!(seal_key_in(&dir, refuse, wrap_identity).is_err());
+        assert!(
+            !dir.join(KEY_FILE_NAME).exists(),
+            "a key file was written even though wrapping it failed"
+        );
+
+        // POSITIVE CONTROL: the same call with a working `protect` succeeds,
+        // so the error above is DPAPI's refusal and not some unrelated reason
+        // this directory could never produce a key.
+        assert!(seal_key_in(&dir, wrap_identity, wrap_identity).is_ok());
+    }
+
+    #[test]
+    fn the_key_is_fetched_once_per_session_however_many_writes_there_are() {
+        // Going back to the key file per write would be a read and a DPAPI
+        // unwrap on every item edit, which is why the key is cached. Asserted
+        // through a seam that counts its own calls in a thread-local rather
+        // than a global.
         thread_local! {
             static CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         }
-        fn counted() -> Result<Zeroizing<[u8; 32]>, String> {
+        fn counted(_dir: &Path) -> Result<Zeroizing<[u8; 32]>, String> {
             CALLS.with(|c| c.set(c.get() + 1));
             Ok(Zeroizing::new([7u8; 32]))
         }
