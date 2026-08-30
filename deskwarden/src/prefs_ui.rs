@@ -763,7 +763,22 @@ const ACCOUNT_SERVER_PREFIX: &str = "Signed in at ";
 /// as "empty but we know it for sure".
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccountStatus {
-    /// A `bw status` is in flight and has not answered yet.
+    /// A lookup is in flight and has not answered yet.
+    ///
+    /// **Nothing in production publishes this any more.** It existed for one
+    /// caller: `main` spawned a `bw status` at startup to learn the account's
+    /// address, that spawn took 2.8 seconds on the machine this row was
+    /// reported from, and a Preferences window opened during it had to say
+    /// something other than "Not signed in" -- the two being opposite claims,
+    /// not shades of the same one. There is no lookup: the address is read off
+    /// the `Account` or off the sign-in that established it, both of which
+    /// answer on the frame they are asked, so the row goes straight from
+    /// nothing published to the final answer.
+    ///
+    /// Kept because it is what this page should say if anything ever is in
+    /// flight again, and because deleting a variant with its own wording,
+    /// its own arm and its own paint tests is a `prefs_ui` change rather than
+    /// part of removing the spawns.
     Checking,
     /// The CLI reported a signed-in account. `email` is `None` when it
     /// reported one without an address; `server` is `None` for Bitwarden's

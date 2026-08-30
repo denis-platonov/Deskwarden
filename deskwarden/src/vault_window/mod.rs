@@ -301,32 +301,6 @@ fn geometry_to_record(
     })
 }
 
-/// How this window gets the account email and server URL its toolbar shows:
-/// already in hand, or on its way.
-///
-/// **The window does not wait for them.** They come from `bw status`, which
-/// spawns the Bitwarden CLI and regularly takes 1-3 seconds on Windows (2.39s
-/// measured on the user's machine), and `open_vault_window` used to call it
-/// synchronously before eframe was even asked for a window -- so on a prefetch
-/// miss the user clicked the tray and looked at nothing at all for that long.
-/// What that call fetches is an avatar's initials and the host a favicon is
-/// fetched from; neither is worth a second of blank screen.
-///
-/// [`Pending`](Self::Pending) is therefore the miss: the fetch runs on its own
-/// thread, the window opens immediately, and the details are drained frame by
-/// frame exactly the way [`spawn_vault_load`]'s item list already is -- the
-/// same mechanism, not a second one. `Ready` is the hit (`main`'s prefetch, or
-/// the startup window's own off-thread `bw status`), where the toolbar has
-/// them on its very first frame and nothing appears late.
-pub enum AccountDetails {
-    /// Known before the window opens. The common case: `main` prefetches on a
-    /// thread at startup and re-warms the cache from every window's result.
-    Ready(crate::login_ui::BwStatusDetails),
-    /// Not known yet, arriving over this channel. Never waited on -- see
-    /// `details_rx`'s drain in [`build_frame`]'s closure.
-    Pending(Receiver<crate::login_ui::BwStatusDetails>),
-}
-
 pub struct VaultWindowResult {
     pub locked: bool,
     /// True if a write in this window failed with `VaultError::Unauthorized`
@@ -410,20 +384,21 @@ pub struct VaultWindowResult {
     /// is expected to refuse — but the caller re-asks anyway, the way the switch
     /// re-asks `switchable()`.
     pub remove_account: bool,
-    /// The account details this session ENDED UP WITH -- handed in
-    /// [`AccountDetails::Ready`], or drained from the channel while the window
-    /// was up. `None` only when the window was closed before a
-    /// [`Pending`](AccountDetails::Pending) fetch reported back.
+    /// The account details this session was BUILT WITH, handed straight back.
     ///
-    /// **Not an outcome; the warm cache.** `open_vault_window` keeps one
-    /// `cached_status_details` so the *next* open pays no `bw status` spawn,
-    /// and it used to be refilled with the value that open had already
-    /// blocked on. Nothing blocks on one any more, so the value the window
-    /// actually used has to come back out the way every other thing the
-    /// window learns does -- through here. Read by the caller immediately, so
-    /// the account switch and the lock recovery still invalidate it
-    /// afterwards: a stale email under a new account is worse than a blank
-    /// one.
+    /// `None` only for a window constructed without them at all, which
+    /// production never does -- every host passes a value now.
+    ///
+    /// **Not an outcome, and no longer a cache that saves anything.** It was
+    /// the warm cache: `open_vault_window` kept one so the *next* open paid no
+    /// `bw status` spawn, and it had to come back out through here because the
+    /// window's own fetch was the only thing that knew the answer on a miss.
+    /// There is no spawn and no miss -- the details are read off the `Account`
+    /// (`login_ui::account_details_for`) or off the sign-in that established
+    /// them (`login_ui::SignedInIdentity`) -- so what this carries now is
+    /// simply what the window showed. It is still read by the caller
+    /// immediately, and the account switch and the lock recovery still clear
+    /// it: a stale email under a new account is worse than a blank one.
     pub account_details: Option<crate::login_ui::BwStatusDetails>,
 }
 
@@ -474,19 +449,18 @@ pub fn build_frame(
     cache: std::sync::Arc<VaultCache>,
     fill_stats: FillStats,
     // The account email (the toolbar avatar's initials) and the server URL
-    // (the host a favicon is fetched from), either in hand or on their way --
-    // see [`AccountDetails`]. Passed in from `main.rs`'s single
-    // `check_bw_status_details()` call rather than this function calling it
-    // again itself -- that call spawns the `bw` CLI (~1-3s on Windows), and
-    // this window used to pay that cost twice on every open (once here, once
-    // in `main.rs`) with no UI feedback before the window even appeared.
+    // (the host a favicon is fetched from), **always in hand**.
     //
-    // An enum rather than the two `Option<String>`s it used to be, because
-    // "not known yet" and "known to be absent" are different states and only
-    // the second may be painted as an answer: the toolbar draws an EMPTY
-    // avatar circle while a fetch is in flight and favicons wait for the
-    // server URL rather than guessing it (see the drain in the closure).
-    details: AccountDetails,
+    // This used to be an `AccountDetails` enum with a `Pending(Receiver<_>)`
+    // arm, because the values came from a `bw status` that spawned the
+    // Bitwarden CLI and regularly took 1-3 seconds on Windows (2.39s measured
+    // on the user's machine): the window opened without them and drained them
+    // frame by frame so as not to freeze. Nothing spawns any more -- the
+    // caller reads them off the `Account` or off the sign-in that just
+    // happened (`login_ui::account_details_for`,
+    // `login_ui::SignedInIdentity`) -- so "not known yet" is not a state this
+    // window can be in, and the toolbar is named on its first frame.
+    details: crate::login_ui::BwStatusDetails,
     session_token: String,
     // Directory the on-disk favicon cache lives in (`main.rs`'s
     // `project_dirs.cache_dir().join("icons")`). Not created here --
@@ -567,7 +541,7 @@ pub fn build_frame(
 pub fn build_frame_with_search(
     cache: std::sync::Arc<VaultCache>,
     fill_stats: FillStats,
-    details: AccountDetails,
+    details: crate::login_ui::BwStatusDetails,
     session_token: String,
     icon_cache_dir: std::path::PathBuf,
     auto_lock: AutoLock,
@@ -658,32 +632,32 @@ pub fn build_frame_with_search(
     // by Auto, Prompt and the global hotkey, each of which holds `main.rs`'s
     // own injector directly and never went through this window.
 
-    // **The account details, and the fact that this window never waits for
-    // them.** On a hit they are here already and every frame including the
-    // first paints them. On a miss `details_rx` is `Some` and these two stay
-    // `None` until the drain in the closure below fills them in -- which is
-    // the whole change: the 2.39s `bw status` spawn that used to happen
-    // before eframe was asked for a window now happens beside a window that
-    // is already up.
-    let (ready, mut details_rx) = match details {
-        AccountDetails::Ready(details) => (Some(details), None),
-        AccountDetails::Pending(rx) => (None, Some(rx)),
-    };
-    let mut server_url = ready.as_ref().and_then(|d| d.server_url.clone());
-    let mut account_email = ready.as_ref().and_then(|d| d.user_email.clone());
+    // **The account details, known before the first frame.** There is no
+    // second state to be in: the `Pending` channel and its per-frame drain are
+    // gone with the `bw status` spawn that fed them, so these two are what the
+    // toolbar paints from the very first frame onwards.
+    let ready = Some(details);
+    let server_url = ready.as_ref().and_then(|d| d.server_url.clone());
+    let account_email = ready.as_ref().and_then(|d| d.user_email.clone());
+    // **The About page is reachable as a modal over THIS window**, and reads a
+    // published value rather than a parameter -- see
+    // `prefs_ui::publish_account_status`. Published here, on the way in, so
+    // that modal names the account this window is showing.
+    if let Some(details) = ready.as_ref() {
+        crate::prefs_ui::publish_account_status(crate::prefs_ui::account_status_of(details));
+    }
     // What the caller re-warms its cache from -- see
     // `VaultWindowResult::account_details`. Seeded whole on the `Ready` path
-    // (the window used those, so the next open should too) and set by the
-    // drain below on the `Pending` one. The whole struct, never one rebuilt
-    // from the two fields this window happens to read: `status` is the third
-    // field and this window has no business inventing it.
+    // (the window used those, so the next open should too). The whole struct,
+    // never one rebuilt from the two fields this window happens to read:
+    // `status` is the third field and this window has no business inventing
+    // it.
+    //
+    // Seeded ONCE and never written again: there is no late arrival left to
+    // overwrite it with, so the value the caller gets back is by construction
+    // the value the window painted from.
     let account_details: Rc<RefCell<Option<crate::login_ui::BwStatusDetails>>> =
         Rc::new(RefCell::new(ready));
-    let account_details_for_closure = account_details.clone();
-    // When this frame was built, for the arrival log below. Not `opened_at`
-    // in `main`: that clock now stops at the eframe handoff, because there is
-    // nothing left between the click and the window for it to measure.
-    let details_requested_at = Instant::now();
 
     let locked = Rc::new(RefCell::new(false));
     let locked_for_closure = locked.clone();
@@ -1559,47 +1533,29 @@ pub fn build_frame_with_search(
             }
         }
 
-        // The account details, arriving from the thread `open_vault_window`
-        // spawned instead of waiting for. Non-blocking exactly like the vault
-        // load below and for the same reason: this window opened without
-        // them, and a blocking receive here would be the freeze this whole
-        // change removes, just moved inside the window where it would look
-        // like a hang instead of a slow launch.
-        //
-        // One shot -- `details_rx` is dropped once a value lands, so this
-        // costs one `try_recv` per frame until then and nothing afterwards.
-        let arrived = details_rx.as_ref().and_then(|rx| rx.try_recv().ok());
-        if let Some(details) = arrived {
-            log::info!(
-                "vault window: account details arrived {:?} after the window was handed to \
-                 eframe (email {}, server {})",
-                details_requested_at.elapsed(),
-                if details.user_email.is_some() { "present" } else { "absent" },
-                if details.server_url.is_some() { "present" } else { "absent" },
-            );
-            // **The About page is reachable as a modal over THIS window**,
-            // and reads a published value rather than a parameter -- see
-            // `prefs_ui::publish_account_status`. Published from here, where
-            // the answer lands, so that modal names the account this window
-            // is already showing instead of the "Checking..." startup put up
-            // seconds ago.
-            crate::prefs_ui::publish_account_status(crate::prefs_ui::account_status_of(&details));
-            server_url = details.server_url.clone();
-            account_email = details.user_email.clone();
-            *account_details_for_closure.borrow_mut() = Some(details);
-            details_rx = None;
-        }
+        // **The per-frame drain is gone.** It polled a channel a `bw status`
+        // thread reported into, because this window used to open before the
+        // account it belongs to had a name. The name is now a parameter that
+        // was read off an `Account` at no cost, so there is nothing in flight
+        // to poll for and nothing that can arrive late.
+
         // Whether the favicon base URL is KNOWN, not merely present:
         // `favicon::icon_base_url(None)` is Bitwarden's own cloud, which is
         // the right answer for an account that has no `serverUrl` and the
         // wrong one for a self-hosted account whose URL simply has not
         // arrived yet. `ensure_icon_loaded` marks every id it touches as
         // requested and the on-disk icon cache is keyed by DOMAIN ALONE, so
-        // guessing here would not just draw the wrong icons in this window --
-        // it would write them to disk under the right domain and serve them
-        // to every later window that does know the server. Icons wait; the
-        // rows they sit on do not.
-        let icon_base_known = details_rx.is_none();
+        // guessing would not just draw the wrong icons in this window -- it
+        // would write them to disk under the right domain and serve them to
+        // every later window that does know the server.
+        //
+        // **Unconditionally true now, and that is a stronger claim than the
+        // one it replaces.** It used to read `details_rx.is_none()`: the URL
+        // is known once the fetch has answered. There is no fetch, so the URL
+        // is known on the first frame, and no window ever suppresses its
+        // icons waiting for one.
+        let icon_base_known = true;
+
         // Whether icons may be fetched at all, and where from -- the two
         // halves of the same decision, built once here and handed to both
         // call sites below so they cannot disagree.
@@ -5532,7 +5488,7 @@ impl VaultFrameHandles {
 pub fn run(
     cache: std::sync::Arc<VaultCache>,
     fill_stats: FillStats,
-    details: AccountDetails,
+    details: crate::login_ui::BwStatusDetails,
     session_token: String,
     icon_cache_dir: std::path::PathBuf,
     auto_lock: AutoLock,
@@ -18979,33 +18935,43 @@ mod account_details_tests {
         );
     }
 
-    /// The drain is non-blocking, like every other drain in this closure.
+    /// **The account details reach this window as a VALUE, and there is no
+    /// channel left to block on.**
     ///
-    /// `recv()` here would be the freeze this change removes, moved inside the
-    /// window where it looks like a hang instead of a slow launch: the frame
-    /// closure would sit on the channel and the window would stop repainting,
-    /// stop dragging and stop closing for the whole `bw status` spawn.
+    /// This used to assert that the per-frame drain used `try_recv` and never
+    /// `recv`, because the details came from a `bw status` spawn: a blocking
+    /// receive in the frame closure would have frozen the window for the
+    /// length of the CLI call -- the launch wait moved inside the window,
+    /// where it looks like a hang.
+    ///
+    /// The stronger claim replaces it. The values are read off the `Account`
+    /// or off the sign-in that established them, so there is no receiver in
+    /// this frame at all, and the failure the old test guarded against is not
+    /// reachable rather than merely detected.
     #[test]
     fn the_frame_never_blocks_on_the_account_details() {
         let production = production();
+        // Over the CODE only, because the comment beside `icon_base_known`
+        // names the receiver it replaced -- and a guard that a reworded
+        // comment can trip is not the one to have here.
         assert!(
-            production
-                .contains(concat!("details_rx.as_ref().and_then(|rx| rx.try_", "recv().ok())")),
-            "the frame no longer drains the account-details channel with `try_recv`"
+            !code_only(production).contains(concat!("details_", "rx")),
+            "the frame has an account-details receiver again. Whatever fills it has to be a \
+             spawn, and a frame that polls it either blocks the window or paints an unnamed \
+             toolbar until it answers"
         );
         assert!(
-            !production.contains(concat!("details_rx.", "recv()")),
-            "the frame closure BLOCKS on the account details, which freezes the window for as \
-             long as the `bw` CLI takes -- exactly the wait this change moved off the open, \
-             now paid with a window on screen that does not respond"
+            !production.contains(concat!("AccountDeta", "ils::")),
+            "the `Ready`/`Pending` split is back, so `Pending` is a state this window can be \
+             in and the toolbar can once again open with nobody's name on it"
         );
-        // Positive control: `recv` is findable in this file at all, so the
-        // negative above is about `details_rx` and not about a needle that
-        // could never match anything.
+        // Positive control: the details themselves ARE still what this window
+        // is built with, so the two negatives above are about the channel and
+        // not about a parameter that quietly disappeared.
         assert!(
-            production.contains(concat!("try_", "recv()")),
-            "control: this file has no channel drains at all, so the assertion above says \
-             nothing"
+            production.contains(concat!("let account_email = ready.as_ref().and_then", "(")),
+            "control: this window no longer reads an account email at all, so the assertions \
+             above say nothing about how it gets one"
         );
     }
 
@@ -19046,8 +19012,17 @@ mod account_details_tests {
     #[test]
     fn no_icon_is_fetched_before_the_server_url_is_known() {
         let production = production();
+        // **The recorded fact is now unconditionally `true`, and that is a
+        // stronger guarantee than the one it replaces.** It used to be
+        // `details_rx.is_none()` -- the URL is known once the `bw status`
+        // fetch has answered -- so every window opened on a cache miss
+        // suppressed its icons for the length of a CLI spawn. There is no
+        // fetch, so the URL is known on the first frame. The guard itself is
+        // kept, and the loop below still requires every call site to be
+        // behind it: what the flag protects against is a future in which the
+        // server URL is once again not known at the top of the frame.
         assert!(
-            production.contains(concat!("let icon_base_known = details_rx.is_", "none();")),
+            production.contains(concat!("let icon_base_known = ", "true;")),
             "nothing in the frame records whether the favicon base URL is known yet"
         );
 
@@ -23225,12 +23200,12 @@ mod export_wiring {
                 "http://127.0.0.1:1",
             ))),
             crate::fill_stats::FillStats::new(dir.0.join("fill-stats.json")),
-            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+            crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
                 // `None`, so no favicon is fetched for any host.
                 server_url: None,
-            }),
+            },
             HARNESS_SESSION.to_string(),
             dir.0.join("icons"),
             // So the auto-lock countdown cannot end the session underneath
@@ -23402,11 +23377,11 @@ mod export_wiring {
                 "http://127.0.0.1:1",
             ))),
             crate::fill_stats::FillStats::new(dir.0.join("fill-stats.json")),
-            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+            crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
                 server_url: None,
-            }),
+            },
             HARNESS_SESSION.to_string(),
             dir.0.join("icons"),
             AutoLock::Never,
@@ -23582,12 +23557,12 @@ mod export_wiring {
                 "http://127.0.0.1:1",
             ))),
             crate::fill_stats::FillStats::new(dir.0.join("fill-stats.json")),
-            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+            crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
                 // `None`, so no favicon is fetched for any host.
                 server_url: None,
-            }),
+            },
             HARNESS_SESSION.to_string(),
             dir.0.join("icons"),
             // So the auto-lock countdown cannot end the session underneath
@@ -24813,12 +24788,12 @@ mod send_delete_wiring {
                 "http://127.0.0.1:1",
             ))),
             crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
-            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+            crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
                 // `None`, so no favicon is fetched for any host.
                 server_url: None,
-            }),
+            },
             FRAME_SESSION.to_string(),
             scratch.join("icons"),
             // So the auto-lock countdown cannot end the session underneath
@@ -25350,11 +25325,11 @@ mod send_delete_wiring {
                 "http://127.0.0.1:1",
             ))),
             crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
-            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+            crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
                 server_url: None,
-            }),
+            },
             FRAME_SESSION.to_string(),
             scratch.join("icons"),
             crate::settings::AutoLock::Never,
@@ -26705,11 +26680,11 @@ mod send_delete_wiring {
                 "http://127.0.0.1:1",
             ))),
             crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
-            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+            crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
                 server_url: None,
-            }),
+            },
             FRAME_SESSION.to_string(),
             scratch.join("icons"),
             crate::settings::AutoLock::Never,
@@ -26878,11 +26853,11 @@ mod send_delete_wiring {
                 "http://127.0.0.1:1",
             ))),
             crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
-            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+            crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
                 server_url: None,
-            }),
+            },
             FRAME_SESSION.to_string(),
             scratch.join("icons"),
             crate::settings::AutoLock::Never,
@@ -27019,11 +26994,11 @@ mod send_delete_wiring {
                 "http://127.0.0.1:1",
             ))),
             crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
-            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+            crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
                 server_url: None,
-            }),
+            },
             FRAME_SESSION.to_string(),
             scratch.join("icons"),
             crate::settings::AutoLock::Never,
@@ -27143,11 +27118,11 @@ mod send_delete_wiring {
                 "http://127.0.0.1:1",
             ))),
             crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
-            AccountDetails::Ready(crate::login_ui::BwStatusDetails {
+            crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
                 server_url: None,
-            }),
+            },
             FRAME_SESSION.to_string(),
             scratch.join("icons"),
             crate::settings::AutoLock::Never,

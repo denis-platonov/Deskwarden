@@ -1230,6 +1230,12 @@ fn main() {
     // by the engine rebuild below the branch. See there for what it costs to
     // get wrong.
     let mut the_startup_window_tore_the_session_down = false;
+    // **The address the startup sign-in card learned, carried out of the
+    // branch that owns the window.** `None` on the warm-launch path, which
+    // shows no card. Adopted into `settings.json` below, once `estate` exists
+    // and the account it is checked against is settled -- see
+    // `adopt_startup_prefetch`.
+    let mut the_startup_windows_identity: Option<login_ui::SignedInIdentity> = None;
 
     // **Both arms below END with a `SessionEstate`, and everything after the
     // branch reads it.**
@@ -1624,6 +1630,11 @@ fn main() {
         .account
         .map(|(config_dir, account)| (config_dir.to_path_buf(), account.clone()));
     let sign_in_first_run = login.first_run;
+    // The account the vault toolbar falls back to naming, owned for the same
+    // `'static` reason `sign_in_account` is. Read only when the window showed
+    // NO sign-in card -- a resumed session, whose account was named on some
+    // earlier launch.
+    let account_for_the_toolbar: Option<Account> = login.account.map(|(_, a)| a.clone());
 
     let cache_for_vault = cache.clone();
     let fill_stats_for_vault = fill_stats.clone();
@@ -1709,7 +1720,7 @@ fn main() {
                 // ON THE MAIN THREAD, in the frame that drains the worker. The
                 // cache has to be filled BEFORE the vault frame is built, or
                 // the window's first vault frame paints an empty vault as data.
-                move |token, work: &mut StartupWork| {
+                move |token, work: &mut StartupWork, signed_in| {
                     // Annotated: without it, deref coercion picks
                     // `&mut [VaultItem]` and `mem::take` asks for a `Default`
                     // slice.
@@ -1724,11 +1735,17 @@ fn main() {
                     let (_options, frame, handles) = vault_window::build_frame(
                         cache_for_vault.clone(),
                         fill_stats_for_vault,
-                        // `Ready`, not a fetch of its own: `StartupWork::
-                        // produce` already asked `bw status` on the worker
-                        // thread, beside the spinner this window was showing at
-                        // the time.
-                        vault_window::AccountDetails::Ready(work.details.clone()),
+                        // **Whose vault this is, and not one process was
+                        // spawned to find out.** `StartupWork::produce` used
+                        // to end with a `bw status` on the worker thread; the
+                        // sign-in card that ran before it already knew the
+                        // answer, and on a launch that showed no card the
+                        // account on disk does. See
+                        // `the_details_this_window_opens_with`.
+                        the_details_this_window_opens_with(
+                            signed_in,
+                            account_for_the_toolbar.as_ref(),
+                        ),
                         token.to_string(),
                         icon_cache_dir_for_vault,
                         auto_lock_for_vault,
@@ -1823,6 +1840,7 @@ fn main() {
     // branch so the engine rebuild below it can ask. See
     // `app_window::StartupOutcome::tore_the_session_down`.
     the_startup_window_tore_the_session_down = outcome.tore_the_session_down;
+    the_startup_windows_identity = outcome.identity.clone();
 
     // Closing the card is the same gesture, and costs the same thing, as
     // closing the old login window: every downstream operation needs a session.
@@ -1897,7 +1915,10 @@ fn main() {
         None => {
             // The window ended before the work landed -- the user closed it,
             // or `WORKING_DEADLINE` fired on a worker still blocked in the
-            // readiness probe or in `check_bw_status_details`.
+            // backend start or the readiness probe. Those are the only two
+            // phases left: the `bw status` that used to be a third one is
+            // gone, and so is the thirty seconds `WORKING_DEADLINE` charged
+            // for it.
             //
             // **The worker may well have started a backend by then**, and this
             // arm used to state the opposite and pass `None` down. It no longer
@@ -2162,39 +2183,53 @@ fn main() {
     // that window can still switch, add or remove.
     let mut fill_proof = deskwarden::app::FillProof::default();
 
-    // Prefetches the account email + server URL the vault window's toolbar
-    // needs (see `open_vault_window`), on its own thread: `bw status`
-    // regularly takes 1-3s to spawn on Windows, and `open_vault_window`
-    // used to call it inline in the tray-click handler, so every "Open
-    // Vault" -- including the very first one -- waited that long before the
-    // window even appeared. Polled non-blockingly below, same shape as
-    // `update_rx`; `open_vault_window` still falls back to a synchronous
-    // call itself if a click lands before this has reported back. Its answer
-    // is drained into the estate's `details`, which both arms above seeded
-    // `None` because at neither of their ends had this thread been spawned.
-    // **Which account the prefetch is ABOUT, carried with its answer.** `bw
-    // status` reports on whatever profile the CLI is pointed at when it runs,
-    // and this one is spawned before the startup window's outcome is dispatched
-    // -- a window that can switch, add or remove an account. Its answer can
-    // therefore land describing somebody else. Checked at the drain rather than
-    // assumed, because what is done with it now is not only a toolbar label:
-    // `learn_active_account_details` WRITES it into `settings.json`, and an
-    // address learned into the wrong account is the hash bug with a worse
-    // failure mode.
-    let prefetch_for = estate.active_account.as_ref().map(|a| a.id.clone());
-    let (status_details_tx, status_details_rx) =
-        mpsc::channel::<(Option<accounts::AccountId>, login_ui::BwStatusDetails)>();
-    // Published BEFORE the thread starts, so a Preferences window opened
-    // during the lookup says "Checking..." rather than "Not signed in". The
-    // answer took 2.8 seconds to arrive on the machine this row was reported
-    // from, so that window is not hypothetical -- and the two states are
-    // opposite claims, not shades of the same one.
-    prefs_ui::publish_account_status(prefs_ui::AccountStatus::Checking);
-    {
-        let tx = status_details_tx.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send((prefetch_for, login_ui::check_bw_status_details()));
-        });
+    // **THE ACCOUNT LEARNS ITS OWN ADDRESS HERE, AND NOTHING IS SPAWNED TO
+    // FIND IT.**
+    //
+    // This was a `std::thread::spawn` of `bw status` whose answer was drained
+    // out of the idle loop below, non-blockingly, because the spawn regularly
+    // took 1-3s on Windows (2.8s on the machine the About row was reported
+    // from) and every "Open Vault" that beat it opened an unnamed toolbar. The
+    // thread, the channel, the drain, the "Checking..." state the About page
+    // showed while it ran and the warm cache the answer filled are all gone
+    // with it: the address arrives with the sign-in that established it, which
+    // is strictly earlier than any `bw status` could have reported it.
+    //
+    // **The account-id guard is kept verbatim**, and it still has a job. The
+    // identity was established inside the startup window, and that window can
+    // switch, add or remove an account before it ends -- so its answer can
+    // land describing somebody else, exactly as the prefetch's could. What is
+    // done with it is not only a toolbar label: `learn_active_account_details`
+    // WRITES it into `settings.json`, and an address learned into the wrong
+    // account is the 32-character-hash bug with a worse failure mode.
+    //
+    // `None` here is the warm-launch path, which showed no card. Its account
+    // was named by the card on some earlier launch, so there is nothing to
+    // learn and the row is read straight off the account.
+    match the_startup_windows_identity.take() {
+        Some(identity) => {
+            if let Some(adopted) = adopt_startup_prefetch(
+                &settings_path,
+                &mut estate.accounts,
+                &mut estate.active_account,
+                identity.account.as_ref(),
+                identity.as_details(),
+            ) {
+                // Published only from the ADOPTED answer, never from the raw
+                // one: an email under the wrong account is the same wrong
+                // claim on the About page that it is in `settings.json`.
+                prefs_ui::publish_account_status(prefs_ui::account_status_of(&adopted));
+                estate.details = Some(adopted);
+            }
+        }
+        None => {
+            // Read off the account rather than asked of the CLI. There is no
+            // "Checking..." state any more because there is nothing to wait
+            // for: this is the final answer on the frame it is computed.
+            let details = login_ui::account_details_for(estate.active_account.as_ref());
+            prefs_ui::publish_account_status(prefs_ui::account_status_of(&details));
+            estate.details = Some(details);
+        }
     }
 
     // **There is no download channel here any more, and no
@@ -2777,9 +2812,6 @@ fn main() {
                                     );
                                     login_ui::run_login_flow_for(login.account, login.first_run)
                                 },
-                                // Asked of a NAMED directory. The active-profile
-                                // form would report the account being left.
-                                login_ui::check_bw_status_details_in,
                                 &mut resettle,
                             );
                             Some(("add an account".to_string(), outcome))
@@ -3366,40 +3398,13 @@ fn main() {
             last_update_check = Instant::now();
         }
 
-        // Non-blocking: whenever the prefetch thread (or a fallback
-        // synchronous call inside `open_vault_window`) reports back, keep
-        // the cache warm so the next "Open Vault" doesn't pay the `bw
-        // status` spawn again.
-        if let Ok((about, details)) = status_details_rx.try_recv() {
-            // Everything this answer is allowed to DO -- the staleness guard,
-            // the two copies it teaches, and the `settings.json` write -- lives
-            // in `adopt_startup_prefetch`, which is a plain function the tests
-            // call with account A's answer and account B active. What is left
-            // here is the one thing that cannot move: the cache this loop owns,
-            // filled from what that function hands back.
-            //
-            // The shape matters as much as the split. There is exactly ONE
-            // account id passed in -- the one the prefetch was started FOR --
-            // because the id this app is on NOW is read inside, off
-            // `active_account`. So the guard cannot be handed the active
-            // account twice, and the answer cannot be used without binding it.
-            if let Some(adopted) = adopt_startup_prefetch(
-                &settings_path,
-                &mut estate.accounts,
-                &mut estate.active_account,
-                about.as_ref(),
-                details,
-            ) {
-                // Published only from the ADOPTED answer, never from the raw
-                // one: `adopt_startup_prefetch` returns `None` when the
-                // prefetch describes the account this app started on rather
-                // than the one it is on now, and an email under the wrong
-                // account is the same wrong claim on this page that it is in
-                // `settings.json`.
-                prefs_ui::publish_account_status(prefs_ui::account_status_of(&adopted));
-                estate.details = Some(adopted);
-            }
-        }
+        // **There is no `bw status` drain here any more.** It polled a channel
+        // a startup thread reported a `bw status` into; the account's address
+        // is now established by the sign-in that produced it and adopted --
+        // through this same `adopt_startup_prefetch`, behind this same
+        // account-id guard -- above the loop, on the statement after the
+        // startup window ends. Nothing arrives late, so nothing has to be
+        // polled for.
 
         // The automatic check's answer, drained so the channel does not grow
         // and so the finding is logged from the loop rather than from the
@@ -5969,15 +5974,17 @@ fn rebuild_the_vault_after_the_lock(
             rebuildable
         })
         .map(|published| {
-            // A fetch of its own, alongside the frame
-            // rather than in front of it: the teardown
-            // deliberately empties the cached details, so
-            // there is nothing to reuse.
-            let details = account_details_source(None, |tx| {
-                std::thread::spawn(move || {
-                    let _ = tx.send(login_ui::check_bw_status_details());
-                });
-            });
+            // **Read off the account, not asked of the CLI.**
+            // This was a `bw status` on a thread, drained by
+            // the rebuilt frame -- the teardown deliberately
+            // empties the cached details, so there was
+            // nothing to reuse and the post-lock toolbar
+            // opened unnamed. The account is right here and
+            // already carries its address: the lock threw
+            // away a session, not an identity.
+            let details = login_ui::account_details_for(
+                published.accounts.as_ref().map(|state| state.active()),
+            );
             let (_options, frame, handles) = vault_window::build_frame(
                 Arc::clone(&published.cache),
                 fill_stats,
@@ -6610,22 +6617,24 @@ impl VaultOps for RealVaultOps<'_> {
         // and GPU setup is not free either), and which one dominates depends on
         // what the backend was doing beforehand.
         let opened_at = Instant::now();
-        // **Never waited for.** This used to be a `bw status` spawn on a miss
-        // -- 2.39s measured on the user's machine -- run BEFORE eframe was
-        // asked for a window, so the click produced nothing on screen at all
-        // for that long. What it fetches is the toolbar avatar's initials and
-        // the host favicons come from; the window opens without them and they
-        // fill in, exactly the way the item list already does.
+        // **Nothing is fetched and nothing is waited for.** This was a `bw
+        // status` spawn on a cache miss -- 2.39s measured on the user's
+        // machine -- run BEFORE eframe was asked for a window, so a tray click
+        // that missed the prefetch produced nothing on screen at all for that
+        // long. Then it was a spawn running BESIDE the window, which opened
+        // with an unnamed toolbar for those two seconds instead. It is now
+        // three fields read off the `Account` this process is on, so the first
+        // frame has them and there is no miss to have a path for.
         //
-        // The cache is refilled from the RESULT now (just below the window),
-        // not here: on a miss there is nothing to refill it with yet, and the
-        // value the window ended up with is the one the next open should
-        // reuse. See `account_details_source`.
-        let details = account_details_source(est.details.take(), |tx| {
-            std::thread::spawn(move || {
-                let _ = tx.send(login_ui::check_bw_status_details());
-            });
-        });
+        // `est.details` is still taken -- it is what a resettle CLEARS to say
+        // "the identity you had is not the one you have" -- but it is a
+        // preference, not a cache that saves a spawn: an empty one costs
+        // nothing to refill now.
+        let details = est
+            .details
+            .take()
+            .unwrap_or_else(|| login_ui::account_details_for(est.active_account.as_ref()));
+        prefs_ui::publish_account_status(prefs_ui::account_status_of(&details));
 
         // Read once, before the `if` below might short-circuit past it, and
         // reused for the vault frame's own `backend_already_running`
@@ -6657,22 +6666,16 @@ impl VaultOps for RealVaultOps<'_> {
         // and which is invisible to any timing inside the frame closure, since
         // the first closure call happens after all of it.
         //
-        // The account details are named here rather than timed: on a hit the
-        // toolbar has them on its first frame, and on a miss the fetch is
-        // running beside this window instead of in front of it, so the only
-        // honest number for it is the one the window itself logs when it
-        // arrives ("account details arrived ... after the window was handed
-        // to eframe").
+        // The account details are not timed, because there is nothing left to
+        // time: they were read off the `Account` a few lines up. What is worth
+        // logging is whether they NAME anybody, which is the one thing that
+        // can still be missing -- an account that has never signed in.
         log::info!(
-            "vault window: handing off to eframe after {:?} (backend was {}, account details \
-             were {})",
+            "vault window: handing off to eframe after {:?} (backend was {}, the account is \
+             {})",
             opened_at.elapsed(),
             if backend_already_running { "already up" } else { "being started" },
-            match details {
-                vault_window::AccountDetails::Ready(_) => "prefetched",
-                vault_window::AccountDetails::Pending(_) =>
-                    "not prefetched; fetching alongside the window",
-            }
+            if details.user_email.is_some() { "named" } else { "not named yet" }
         );
         // **The vault FRAME, not `vault_window::run`.** `run` owns an event
         // loop, and an event loop is exactly what this window must not give up
@@ -7140,9 +7143,6 @@ impl VaultOps for RealVaultOps<'_> {
                             let login = login_context(deps.config_dir, Some(prepared), deps.first_run_account);
                             login_ui::run_login_flow_for(login.account, login.first_run)
                         },
-                        // Asked of a NAMED directory. The active-profile form would
-                        // report the account being left.
-                        login_ui::check_bw_status_details_in,
                         &mut resettle,
                     );
                     report_account_action("add an account", outcome);
@@ -8441,8 +8441,7 @@ fn add_account(
     state: &mut accounts::AccountsState,
     active_account: &mut Account,
     store: &mut session_store::SessionStore,
-    mut sign_in: impl FnMut(&Account) -> Option<String>,
-    mut account_details: impl FnMut(Option<&Path>) -> login_ui::BwStatusDetails,
+    mut sign_in: impl FnMut(&Account) -> Option<login_ui::SignedInSession>,
     resettle: impl FnMut(&Path, &Account, &session_store::SessionStore) -> ResettleReport,
 ) -> SwitchOutcome {
     if !state.can_add() {
@@ -8464,7 +8463,6 @@ fn add_account(
             return SwitchOutcome::RolledBack { reason };
         }
     };
-    let prepared_dir = accounts::data_dir_for(config_dir, &prepared.id);
     // Everything from here to the persist below has to end in either a write
     // that names `prepared_dir` or a delete of it. There is no third answer,
     // and that is the invariant `a_failed_persist_strands_no_signed_in_profile`
@@ -8480,24 +8478,31 @@ fn add_account(
     // reaches the CLI as an argument instead, through
     // `login_ui::profile_dir_for`, which derives it from the account the
     // window was already handed.
-    let token = sign_in(&prepared);
+    let session = sign_in(&prepared);
 
-    let Some(token) = token else {
+    let Some(session) = session else {
         log::info!("the sign-in for the new account was closed; nothing was added");
         accounts::discard_prepared_account(config_dir, &prepared.id);
         return SwitchOutcome::Declined;
     };
+    let token = session.token;
 
-    // The label the switcher shows, asked of the new account's OWN directory
-    // rather than of whatever profile this process is pointed at — which is the
-    // previous account's again by now. An account minted by
-    // `prepare_new_account` carries an empty email until exactly here, and a
-    // blank row is one the user cannot tell from any other.
-    let details = account_details(Some(&prepared_dir));
+    // **The label the switcher shows, taken from the sign-in that just
+    // happened rather than from a `bw status` run after it.**
+    //
+    // This used to be an injected named-directory status read against
+    // `prepared_dir` -- a `bw` CLI spawn, unconditional, and run even for a
+    // direct-REST account whose vault the CLI has nothing to do with. What it
+    // was for is the address, and the address is the string the user typed
+    // into the sign-in window a moment ago: `login_ui::SignedInIdentity`
+    // carries it out of that window, so nothing has to be asked. An account
+    // minted by `prepare_new_account` carries an empty email until exactly
+    // here, and a blank row is one the user cannot tell from any other.
+    let details = session.identity.as_details();
     if details.user_email.is_none() {
         log::warn!(
-            "the new account signed in but `bw status` named no address for it, so it will \
-             appear in the account list with no address on it"
+            "the new account signed in but named no address for itself, so it will appear in \
+             the account list with no address on it"
         );
     }
     let added = Account {
@@ -10548,14 +10553,17 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // The window's own `spawn_vault_load` replaces it from `bw serve`.
     let _ = cache.load_from_disk();
 
-    // Off the thread that has not opened the window yet -- the `bw` spawn is
-    // 1-3 seconds on Windows, and paid in front of the window it would be
-    // 1-3 seconds of nothing on screen. The window paints an empty avatar
-    // until this arrives.
-    let (details_tx, details_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = details_tx.send(login_ui::check_bw_status_details());
-    });
+    // **The UI process's own copy of the spawn, and it is gone too.**
+    //
+    // This is a separate binary path from the daemon's: the split-process
+    // build runs the vault window over here, and this thread paid the same
+    // 1-3 second `bw status` the daemon used to -- which is why the window
+    // painted an empty avatar until it answered. It reads the account this
+    // process resolved at startup instead. The daemon owns `settings.json`
+    // and is the only writer of that account's address (through
+    // `learn_active_account_details`), so this side only ever reads.
+    let details = login_ui::account_details_for(active_account.as_ref());
+    prefs_ui::publish_account_status(prefs_ui::account_status_of(&details));
 
     // Asked of the port rather than of a child handle: this process has no
     // child. `bw serve` is the daemon's, and all this window needs to know is
@@ -10669,7 +10677,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     let result = vault_window::run(
         cache,
         fill_stats::FillStats::new(config_dir.join("fill-stats.json")),
-        vault_window::AccountDetails::Pending(details_rx),
+        details,
         session_token,
         icon_cache_dir,
         settings.auto_lock(),
@@ -11387,7 +11395,11 @@ fn authenticate_for_switch(
     store: &session_store::SessionStore,
     login: LoginContext<'_>,
 ) -> Option<String> {
-    let token = login_ui::run_login_flow_for(login.account, login.first_run)?;
+    // The identity is dropped: a switch targets an account this app already
+    // has an entry for, and that entry already carries whatever address it was
+    // added with. The account that needs one learned is the account being
+    // ADDED, and that is `add_account`'s `sign_in`, which keeps it.
+    let token = login_ui::run_login_flow_for(login.account, login.first_run)?.token;
     if let Err(e) = store.save(&token) {
         log::error!("failed to persist the session token for the account switched to: {e}");
     }
@@ -12066,7 +12078,6 @@ struct StartupWork {
     /// removes.
     child: Result<(), String>,
     items: Result<Vec<deskwarden::vault_bridge::VaultItem>, String>,
-    details: login_ui::BwStatusDetails,
 }
 
 impl StartupWork {
@@ -12147,62 +12158,67 @@ impl StartupWork {
             // same waste `resettle_session_with` already refuses to make.
             Err(e) => Err(format!("the vault backend did not start: {e}")),
         };
-        // Last, and unconditional: the toolbar's account name and server come
-        // from here, and a window that shows the vault with no idea whose it is
-        // is worse than one that waited another moment for the answer.
-        //
-        // The BOUNDED form, and that is the whole of review's Important here.
-        // The unbounded one is a bare `Command::output()`, so the only limit on
-        // this line used to be `app_window::WORKING_DEADLINE` -- which bounds
-        // the window, not the child. When it fired the spawn was still running
-        // and the user had sat in front of a frozen spinner for the entire
-        // budget, a budget whose own doc named this phase as one of the three
-        // it covered. `login_ui::STATUS_DEADLINE` is what covers it now, and
-        // `WORKING_DEADLINE` charges this phase that number instead of guessing
-        // at `BACKEND_OP_TIMEOUT`. "Another moment" above is 30s and no longer
-        // a figure of speech.
-        let details = login_ui::check_bw_status_details_bounded();
-        Self { child, items, details }
+        // **There is no third phase here any more.** This function used to end
+        // with a `bw status`, bounded by `login_ui::STATUS_DEADLINE`, because
+        // the toolbar's account name and server came from it -- and the window
+        // charged `app_window::WORKING_DEADLINE` thirty seconds for the
+        // privilege of a cosmetic label. Both are gone. The name and the
+        // server now come from the card that ran BEFORE this worker
+        // (`login_ui::SignedInIdentity`, handed to `build_vault` as its third
+        // argument) or, on a launch that showed no card, off the `Account`
+        // itself. Neither costs a process, so neither can be slow and neither
+        // needs a deadline.
+        Self { child, items }
     }
 }
 
-/// Where a vault window's account details come from: the warm cache if it has
-/// them, otherwise a fetch that runs BESIDE the window rather than in front of
-/// it.
+/// **Whose vault a window opens naming, decided without spawning anything.**
 ///
-/// **The blocking call this replaces is the whole point.** `open_vault_window`
-/// began with a synchronous `bw status` on the miss path -- a `bw` CLI
-/// spawn, measured at 2.39s on the user's machine -- and it ran before eframe
-/// was asked for a window, so a tray click that missed the prefetch produced
-/// nothing on screen for that long. The miss is not exotic: the prefetch is
-/// only a thread started at launch, and the cache is deliberately emptied on
-/// every re-auth and every account switch.
+/// Two sources, in order, and the order is the whole of it:
 ///
-/// `spawn` is handed the `Sender` and is expected to start a thread; it is a
-/// parameter so this decision can be tested without a `bw` CLI, and so the
-/// hit path can be shown to never call it. The one production caller passes a
-/// `std::thread::spawn` of `check_bw_status_details`.
-fn account_details_source(
-    cached: Option<login_ui::BwStatusDetails>,
-    spawn: impl FnOnce(mpsc::Sender<login_ui::BwStatusDetails>),
-) -> vault_window::AccountDetails {
-    match cached {
-        Some(details) => {
-            // The warm-cache path: the vault window will paint these details
-            // immediately, so the About page -- reachable as a modal over
-            // that very window -- must not still be showing whatever was
-            // published at startup.
-            prefs_ui::publish_account_status(prefs_ui::account_status_of(&details));
-            vault_window::AccountDetails::Ready(details)
-        }
+/// 1. `signed_in` -- the identity the sign-in card in THIS window just
+///    established. Preferred because it is the only source that can name a
+///    FIRST INSTALL: `accounts::resolve_startup` mints that account with an
+///    empty email, and until the address is typed into the card nothing on
+///    this machine knows it.
+/// 2. The `Account` on disk, for a launch that showed no card because a stored
+///    session was still good. That account was named on an earlier launch, by
+///    source 1.
+///
+/// **The identity is used only if it is ABOUT this account**, and that guard
+/// is not decoration: the startup window can add, remove and switch accounts,
+/// so an identity established in it can outlive the account it describes. An
+/// address written under the wrong account is the defect
+/// `learn_active_account_details` exists to prevent, and this is the same
+/// check one layer out. A mismatch falls back to source 2 rather than
+/// inventing anything.
+///
+/// **What replaced a `bw status`.** This used to be `account_details_source`,
+/// which either reused a cached answer or started a thread to run a `bw`
+/// CLI spawn measured at 2.39s -- and a `vault_window::AccountDetails::Pending`
+/// channel the window drained frame by frame so it would not block on it.
+/// There is nothing to wait for any more, so there is no channel, no thread,
+/// no warm cache to keep in step with account switches, and no window that
+/// paints an unnamed toolbar for its first two seconds.
+fn the_details_this_window_opens_with(
+    signed_in: Option<&login_ui::SignedInIdentity>,
+    account: Option<&Account>,
+) -> login_ui::BwStatusDetails {
+    let about_this_account = signed_in.filter(|identity| {
+        prefetch_still_describes_the_active_account(
+            identity.account.as_ref(),
+            account.map(|a| &a.id),
+        )
+    });
+    match about_this_account {
+        Some(identity) => identity.as_details(),
         None => {
-            log::info!(
-                "vault window: account details were not prefetched; fetching them on a thread \
-                 and opening the window without them"
-            );
-            let (tx, rx) = mpsc::channel();
-            spawn(tx);
-            vault_window::AccountDetails::Pending(rx)
+            if signed_in.is_some() {
+                log::info!(
+                    "the sign-in in this window describes the account it started on, not the                      one it is on now; the toolbar is named off the account instead"
+                );
+            }
+            login_ui::account_details_for(account)
         }
     }
 }
@@ -14332,8 +14348,10 @@ mod tests {
             .expect("`StartupWork::produce` must still exist")
             .1;
         let body = after
-            .split_once(concat!("fn account_details", "_source("))
-            .expect("`account_details_source` must still be the function defined after it")
+            .split_once(concat!("fn the_details_this_window_opens", "_with("))
+            .expect(
+                "`the_details_this_window_opens_with` must still be the function defined                  after it",
+            )
             .0;
         assert!(
             body.len() < after.len(),
@@ -14392,7 +14410,11 @@ mod tests {
             // that -- so the guard had stopped finding the call it is here to
             // order and was failing outright rather than checking anything.
             concat!("wait_for_vault", "_ready(vault.as_ref(), schedule)"),
-            concat!("login_ui::check_bw_", "status_details_bounded()"),
+            // The `bw status` that used to be the second entry here is gone
+            // -- see `the_startup_worker_spawns_nothing_to_name_the_account`.
+            // One entry rather than two, and the loop is kept rather than
+            // inlined because the ordering claim is about every blocking call
+            // in `produce`, not about this particular one.
         ] {
             let at = body
                 .find(later)
@@ -14406,46 +14428,52 @@ mod tests {
         }
     }
 
-    /// **The third phase is bounded, and `WORKING_DEADLINE` may say so.**
+    /// **THE THIRD PHASE IS GONE, NOT MERELY BOUNDED.**
     ///
-    /// `login_ui::check_bw_status_details` is a bare `Command::output()`. Left
-    /// on this line it made `app_window::WORKING_DEADLINE`'s third term -- a
-    /// documented `BACKEND_OP_TIMEOUT` for "an untimed `bw` spawn" -- a
-    /// statement about nothing: the deadline bounded the WINDOW, the spawn ran
-    /// on regardless, and the number in the doc was a guess at how long a call
-    /// nobody was timing might take. `produce` must call the form that carries
-    /// `login_ui::STATUS_DEADLINE`, and must not call the unbounded one.
+    /// `produce` used to end with a `bw status`, and this test required it to
+    /// be the form carrying `login_ui::STATUS_DEADLINE`: the bare one is a
+    /// `Command::output()` with no timeout, so `app_window::WORKING_DEADLINE`
+    /// -- which bounds the WINDOW -- would fire with the child still running
+    /// and the user would have watched a frozen spinner through the whole
+    /// budget.
     ///
-    /// A ban paired with the positive rather than only the positive: adding a
-    /// second, unbounded status call beside the bounded one would leave the
-    /// positive green while restoring the unbounded phase.
+    /// The stronger claim replaces it. The toolbar's account name and server
+    /// come from the sign-in card that ran before this worker
+    /// (`login_ui::SignedInIdentity`) or off the `Account` on disk
+    /// (`login_ui::account_details_for`); neither spawns a process, so there
+    /// is nothing here to bound. `app_window`'s
+    /// `the_deadline_covers_every_phase_the_worker_runs` is the other half:
+    /// it asserts that the watchdog no longer charges for the phase this test
+    /// asserts is not run.
     #[test]
-    fn the_startup_worker_bounds_the_status_call_the_deadline_charges_for() {
+    fn the_startup_worker_spawns_nothing_to_name_the_account() {
         let body = the_produce_body();
-        let banned = concat!("check_bw_status_details", "();");
-        assert!(
-            body.contains(concat!("check_bw_status_details_bo", "unded();")),
-            "`produce` no longer runs its `bw status` under a deadline of its own, so \
-             `app_window::WORKING_DEADLINE`'s third term is a fiction again and the user can \
-             watch a frozen spinner for the whole budget"
-        );
+        let banned = concat!("check_bw_status", "_details");
         assert!(
             !body.contains(banned),
-            "`produce` calls the UNBOUNDED `check_bw_status_details()`; it is a bare \
-             `Command::output()` with no timeout, and the window deadline that appears to \
-             cover it does not"
+            "`produce` runs a `bw status` again. Whatever it wants from it, the window is \
+             already able to answer -- and this call is charged to \
+             `app_window::WORKING_DEADLINE`, the watchdog that can throw a healthy sign-in \
+             away, so the user pays for it with a frozen spinner"
         );
-        // Positive control for that negative: the banned needle really does
-        // match the spelling it bans, and really does NOT match the bounded
-        // form -- so `!contains` passing means the unbounded call is absent
-        // rather than the needle being unmatchable or matching both.
+        // Positive control for that negative: the needle really does match
+        // every spelling of the call, so `!contains` passing means the call is
+        // absent rather than the needle being unmatchable.
+        for spelling in [
+            concat!("let d = login_ui::check_bw_status", "_details();"),
+            concat!("let d = login_ui::check_bw_status", "_details_bounded();"),
+            concat!("login_ui::check_bw_status", "_details_in(dir)"),
+        ] {
+            assert!(
+                spelling.contains(banned),
+                "control: {spelling:?} would not be caught by the ban above"
+            );
+        }
+        // And that the region searched is really `produce`, not an empty
+        // slice that every ban passes against.
         assert!(
-            concat!("let d = login_ui::check_bw_status_details", "();").contains(banned),
-            "control: the banned spelling does not match itself"
-        );
-        assert!(
-            !concat!("let d = login_ui::check_bw_status_details_bo", "unded();").contains(banned),
-            "control: the ban also matches the bounded form, so it could never distinguish them"
+            body.contains(concat!("wait_for_vault", "_ready(")),
+            "control: the sliced region is not `produce`'s body"
         );
     }
 
@@ -16576,89 +16604,159 @@ mod tests {
         }
     }
 
-    /// **What the vault window is opened WITH, now that it is never opened
-    /// LATE.**
+    /// **WHAT THE VAULT WINDOW IS OPENED WITH, NOW THAT NOTHING IS SPAWNED
+    /// TO FIND OUT.**
     ///
     /// The user's own two measurements of the same click: `account details
     /// ready in 300ns` (the prefetch had landed) and `account details ready in
     /// 2.3911946s` (it had not, so `open_vault_window` spawned the `bw` CLI
     /// and waited) -- the second of those 2.39 seconds spent before eframe was
-    /// asked for a window, i.e. with nothing on screen at all. The window does
-    /// not wait any more; these tests are what says so.
+    /// asked for a window, i.e. with nothing on screen at all. There is no
+    /// spawn on either path any more, so there is no second measurement to
+    /// make.
+    ///
+    /// **The risk these tests exist for is not the speed.** Reading the
+    /// account instead of asking `bw status` is only correct while something
+    /// OTHER than `bw status` writes that account's email, because
+    /// `accounts::resolve_startup` and `accounts::prepare_new_account` both
+    /// mint accounts with an empty one. The writer is the sign-in card
+    /// (`login_ui::SignedInIdentity`), and
+    /// `a_first_install_is_named_by_the_sign_in_and_not_by_the_empty_account`
+    /// is the test that fails if it ever stops being.
     mod the_account_details_a_window_opens_with {
         use super::*;
 
-        fn some_details(email: &str) -> login_ui::BwStatusDetails {
-            login_ui::BwStatusDetails {
-                status: login_ui::BwStatus::Unlocked,
+        fn account_named(id: &str, email: &str) -> Account {
+            Account {
+                id: accounts::AccountId::parse(&id.repeat(32)).expect("a 32-hex test id"),
+                email: email.to_string(),
+                server_url: Some("https://vault.example.eu".to_string()),
+            }
+        }
+
+        fn identity_for(id: &str, email: &str) -> login_ui::SignedInIdentity {
+            login_ui::SignedInIdentity {
+                account: Some(accounts::AccountId::parse(&id.repeat(32)).expect("a 32-hex test id")),
                 user_email: Some(email.to_string()),
                 server_url: Some("https://vault.example.eu".to_string()),
             }
         }
 
-        /// The hit: the prefetch (or the last window's own result) already has
-        /// them, so nothing is fetched and the toolbar is complete on the
-        /// first frame.
+        /// **THE WHOLE RISK OF REMOVING THE SPAWNS, STATED AS A TEST.**
+        ///
+        /// A first install mints its account with `email: String::new()` --
+        /// nobody has signed in, so there is nothing to record. The naive
+        /// spawn-free fix reads `Account::email` and stops there, which works
+        /// on every machine whose `settings.json` was already populated by an
+        /// earlier `bw status` and produces a PERMANENTLY NAMELESS account on
+        /// a fresh one: `accounts::account_label` falls back to the id, so
+        /// every menu names a 32-character hash. That defect has shipped
+        /// once.
+        ///
+        /// The account here is minted-shaped -- empty email -- and the
+        /// identity is what the user typed into the card that has just
+        /// succeeded. The address must come from the identity.
         #[test]
-        fn a_warm_cache_is_handed_to_the_window_ready_and_starts_no_fetch() {
-            let mut fetches = 0;
-            let source =
-                account_details_source(Some(some_details("held@example.eu")), |_tx| fetches += 1);
-
-            assert_eq!(
-                fetches, 0,
-                "a cache hit still started a `bw status` fetch -- the spawn this change was \
-                 made to avoid, now paid on every open instead of only on a miss"
+        fn a_first_install_is_named_by_the_sign_in_and_not_by_the_empty_account() {
+            let minted = account_named("a", "");
+            let details = the_details_this_window_opens_with(
+                Some(&identity_for("a", "new@example.eu")),
+                Some(&minted),
             );
-            match source {
-                vault_window::AccountDetails::Ready(details) => assert_eq!(
-                    details.user_email.as_deref(),
-                    Some("held@example.eu"),
-                    "the window was handed details that are not the cached ones"
-                ),
-                vault_window::AccountDetails::Pending(_) => panic!(
-                    "a cache HIT was handed to the window as pending: the toolbar would open \
-                     blank and fill in later even though the answer was already in hand"
-                ),
-            }
-        }
-
-        /// The miss, which is the whole bug: it must produce a CHANNEL, not an
-        /// answer. An answer here can only have been obtained by blocking.
-        #[test]
-        fn a_miss_hands_the_window_a_channel_and_leaves_the_fetch_to_a_thread() {
-            let (started_tx, started_rx) = mpsc::channel();
-            let answer = some_details("fetched@example.eu");
-            let source = account_details_source(None, move |tx| {
-                std::thread::spawn(move || {
-                    let _ = started_tx.send(());
-                    let _ = tx.send(answer);
-                });
-            });
-
-            let rx = match source {
-                vault_window::AccountDetails::Pending(rx) => rx,
-                vault_window::AccountDetails::Ready(_) => panic!(
-                    "the miss path answered with the details themselves, which it can only do \
-                     by WAITING for the `bw` CLI -- the window is opened seconds late again, \
-                     with nothing on screen while it waits"
-                ),
-            };
+            assert_eq!(
+                details.user_email.as_deref(),
+                Some("new@example.eu"),
+                "a freshly minted account came back NAMELESS from a window whose sign-in card \
+                 had just been given the address. Every menu that names this account -- the \
+                 tray's Accounts submenu, the vault window's account menu -- would show its \
+                 32-character directory id instead, permanently, because nothing else on this \
+                 machine ever learns the address"
+            );
+            assert_eq!(
+                details.status,
+                login_ui::BwStatus::Unlocked,
+                "the account the user has just signed in to is not reported as signed in, so \
+                 Preferences > About says `Not signed in` over an open vault"
+            );
+            // Positive control on the failure this test is guarding: the
+            // account alone really is nameless, so the assertion above is
+            // carried by the identity and not by the fallback.
             assert!(
-                started_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
-                "the miss path never started the fetch at all, so the toolbar would stay blank \
-                 for the whole session and the next open would be cold too"
-            );
-            assert_eq!(
-                rx.recv_timeout(Duration::from_secs(5))
-                    .expect("the fetch's answer never reached the window's channel")
-                    .user_email
-                    .as_deref(),
-                Some("fetched@example.eu"),
-                "the channel handed to the window does not carry what the fetch produced"
+                login_ui::account_details_for(Some(&minted)).user_email.is_none(),
+                "control: the minted account is not actually nameless, so this test would \
+                 pass against the naive fix it exists to fail"
             );
         }
 
+        /// The resumed launch: no card was shown, so there is no identity, and
+        /// the account on disk -- named on some earlier launch by the test
+        /// above -- is what the toolbar reads.
+        #[test]
+        fn a_launch_that_showed_no_card_is_named_off_the_account() {
+            let details = the_details_this_window_opens_with(
+                None,
+                Some(&account_named("a", "held@example.eu")),
+            );
+            assert_eq!(
+                details.user_email.as_deref(),
+                Some("held@example.eu"),
+                "a window opened on a resumed session cannot name its own account"
+            );
+            assert_eq!(
+                details.server_url.as_deref(),
+                Some("https://vault.example.eu"),
+                "the favicon host was not read off the account, so a self-hosted vault's \
+                 icons would be fetched from Bitwarden's cloud"
+            );
+        }
+
+        /// **The wrong-account hazard, which the spawn had too.** The startup
+        /// window can switch, add or remove an account before it ends, so the
+        /// identity it produced can describe somebody else by the time it is
+        /// read. Falling back is the only safe answer: writing one account's
+        /// address under another's id is the same defect with a worse failure
+        /// mode.
+        #[test]
+        fn an_identity_about_another_account_is_not_used_to_name_this_one() {
+            let details = the_details_this_window_opens_with(
+                Some(&identity_for("b", "other@example.eu")),
+                Some(&account_named("a", "mine@example.eu")),
+            );
+            assert_eq!(
+                details.user_email.as_deref(),
+                Some("mine@example.eu"),
+                "an address established for account b was used to name account a -- the \
+                 hash bug with a worse failure mode, because this value is also what \
+                 `learn_active_account_details` persists"
+            );
+            // Positive control: the same identity DOES name its own account,
+            // so the assertion above is the guard rejecting it and not the
+            // identity being empty.
+            assert_eq!(
+                the_details_this_window_opens_with(
+                    Some(&identity_for("b", "other@example.eu")),
+                    Some(&account_named("b", "")),
+                )
+                .user_email
+                .as_deref(),
+                Some("other@example.eu"),
+                "control: this identity names nobody at all, so the rejection above proves \
+                 nothing about the guard"
+            );
+        }
+
+        /// The app with no account list at all
+        /// (`accounts::StartupAccounts::NoAccountList`): nothing to read, and
+        /// the same answer a failed `bw status` gave.
+        #[test]
+        fn an_app_with_no_account_reports_exactly_what_a_failed_spawn_did() {
+            assert_eq!(
+                the_details_this_window_opens_with(None, None),
+                login_ui::unknown_status_details(),
+                "an app with no account invents a second unauthenticated-looking state for \
+                 the rest of the app to disagree about"
+            );
+        }
         /// **`RealVaultOps::open_window`'s body** -- the window-open region,
         /// which S3 lifted verbatim out of `open_vault_window`'s loop.
         ///
@@ -16670,6 +16768,19 @@ mod tests {
         /// status calls -- the startup prefetch thread, and
         /// `StartupWork::produce`, which runs on the worker `app_window`
         /// spawns. Neither is on the path a window opens from; this is.
+        /// Any spelling of a `bw status`, with no trailing `(` so that
+        /// handing one on as a function item is caught as well as calling one
+        /// -- handing it on is as much a use as making the call.
+        fn status_call() -> &'static str {
+            concat!("check_bw_status", "_details")
+        }
+
+        /// What each half of the region reads INSTEAD: the account's own three
+        /// fields, at no cost.
+        fn details_read() -> &'static str {
+            concat!("login_ui::account_details", "_for(")
+        }
+
         fn open_vault_window_body() -> String {
             // **Plus the lifted rebuild.** One of this region's two status
             // calls -- the rebuilt vault's own fetch -- left `open_window`
@@ -16703,105 +16814,63 @@ mod tests {
             );
             // Control that the rebuild half really joined the region: without
             // it, a `body_of` that silently sliced something else would leave
-            // this guard reading one call again.
+            // this guard reading the open alone.
+            //
+            // The needle is what each half now READS instead of spawning --
+            // `account_details_for`, once at the open and once at the rebuild
+            // -- because the two `bw status` calls it used to count are gone.
             assert_eq!(
-                body.matches(status_call()).count(),
+                body.matches(details_read()).count(),
                 2,
-                "the region holds {} status call(s), not the two it has had since the lock \
-                 rebuilt the vault in place -- one at the open, one at the rebuild",
-                body.matches(status_call()).count()
+                "the region holds {} account-details read(s), not the two it has had since \
+                 the lock rebuilt the vault in place -- one at the open, one at the rebuild",
+                body.matches(details_read()).count()
             );
             body.to_string()
         }
 
-        /// Every synchronous `bw status` call left on the path a window opens
-        /// from is inside a thread spawn.
+        /// **NO `bw status` RUNS ON THE PATH A WINDOW OPENS FROM AT ALL --
+        /// not on the frame thread, and not on a thread beside it.**
         ///
-        /// The runtime tests above check the DECISION; this checks that no
-        /// call site quietly makes it again on the thread that has not opened
-        /// the window yet. Written as "every occurrence, nearest preceding
-        /// spawn" rather than a count of call sites, because a second one
-        /// would be just as acceptable -- on a thread.
-        /// `()` in the needle, so `check_bw_status_details_in(` -- a different
-        /// function, called from the account flows -- is not matched by the
-        /// prefix.
-        fn status_call() -> &'static str {
-            concat!("check_bw_status", "_details()")
-        }
-
-        /// Whether the status call at `at` is inside a thread spawn.
+        /// This used to be the weaker claim, and the weaker claim was the best
+        /// available: the two calls in this region had to be INSIDE a
+        /// `std::thread::spawn`, because a synchronous one meant 2.4 seconds
+        /// of nothing on screen before eframe was asked for a window. Spawned,
+        /// they cost a window that opens with an unnamed toolbar and fills it
+        /// in a couple of seconds later instead -- better, and still visible.
         ///
-        /// A 200-byte backward window, not "anywhere earlier in the file":
-        /// anywhere-earlier is satisfied by any of the eight unrelated spawns
-        /// in `main`, which says nothing about this call. Both call sites
-        /// spell `spawn(move || { let _ = tx.send(` before reaching it, which
-        /// is about 60 bytes. Exercised against a fabricated blocking snippet
-        /// below, so the window is known to be able to answer `false`.
-        fn is_inside_a_spawn(source: &str, at: usize) -> bool {
-            let spawn = concat!("std::thread::", "spawn(move ||");
-            let before = &source[..at];
-            match before.rfind(spawn) {
-                Some(nearest) => before.len() - nearest < 200,
-                None => false,
-            }
-        }
-
+        /// Both calls are gone. The toolbar's account name and server URL are
+        /// read off the `Account` (`login_ui::account_details_for`), so the
+        /// first frame has them and there is no thread to put anything on. A
+        /// call reappearing here would be a spawn back on this path whichever
+        /// thread it ran on, which is why the ban no longer has a
+        /// spawned-is-acceptable arm.
         #[test]
-        fn no_status_call_in_this_file_runs_on_the_thread_a_window_opens_from() {
+        fn no_status_call_in_this_file_runs_on_the_path_a_window_opens_from() {
             let body = open_vault_window_body();
             let call = status_call();
-
-            let sites: Vec<usize> = body.match_indices(call).map(|(at, _)| at).collect();
-            let body = body.as_str();
             assert_eq!(
-                sites.len(),
-                2,
-                "expected the two fetches this method makes to call {call:?} -- the one when \
-                 the window opens on a cache miss, and the one that warms the vault frame the \
-                 in-place lock REBUILDS, whose details the teardown deliberately emptied; \
-                 found {} -- none at all means a miss path stopped fetching and that cache can \
-                 never warm up again",
-                sites.len()
+                body.matches(call).count(),
+                0,
+                "the window-open path runs `{call}` again. Whether or not it is on a thread, \
+                 that is a `bw` CLI spawn on the path a tray click takes -- and what it \
+                 fetches, the account's own email and server URL, is already on the `Account` \
+                 this process is running as"
             );
-            for at in sites {
+            // Positive controls. The region is really the window-open region
+            // (asserted inside `open_vault_window_body`), and the needle
+            // really does match the call it bans -- so a count of zero means
+            // the call is absent rather than the needle being unmatchable.
+            for spelling in [
+                concat!("login_ui::check_bw_status", "_details()"),
+                concat!("login_ui::check_bw_status", "_details_bounded()"),
+                concat!("login_ui::check_bw_status", "_details_in,"),
+            ] {
                 assert!(
-                    is_inside_a_spawn(body, at),
-                    "a {call:?} call at byte {at} is not inside a thread spawn: it spawns the \
-                     `bw` CLI on whichever thread reached it, which for `open_vault_window` is \
-                     the thread that has not opened the window yet -- 2.4 seconds of nothing \
-                     on screen"
+                    spelling.contains(call),
+                    "control: {spelling:?} would not be caught by the ban above"
                 );
             }
-        }
-
-        /// The control for the test above, and the reason its window is 200
-        /// bytes rather than "somewhere earlier": the same predicate, given
-        /// the shape this change REMOVED, has to answer `false`.
-        #[test]
-        fn the_spawn_check_rejects_the_blocking_call_this_change_removed() {
-            let call = status_call();
-            let blocking = format!(
-                "let status_details = match cached_status_details.take() {{ Some(d) => d, None \
-                 => login_ui::{call} }};"
-            );
-            let at = blocking.find(call).expect("the fabricated snippet lost its call");
-            assert!(
-                !is_inside_a_spawn(&blocking, at),
-                "control: the predicate accepts a plain synchronous call, so the test above \
-                 would pass against exactly the code it exists to forbid"
-            );
-
-            // And the positive half: a spawned call is accepted, so a `false`
-            // from the predicate means something.
-            let spawned = format!(
-                "std::thread::spawn(move || {{ let _ = tx.send(login_ui::{call}); }});"
-            );
-            let at = spawned.find(call).expect("the fabricated snippet lost its call");
-            assert!(
-                is_inside_a_spawn(&spawned, at),
-                "control: the predicate rejects even a spawned call, so it can never be \
-                 satisfied and asserts nothing"
-            );
         }
 
         /// The cache is still refilled with what the open used -- and refilled
@@ -22677,10 +22746,15 @@ mod tests {
             let decision = concat!("prefetch_still_describes_the_active", "_account(");
             assert_eq!(
                 production.matches(decision).count(),
-                2,
-                "expected the definition and exactly one call site -- inside \
-                 `adopt_startup_prefetch`; if the call is gone the decision is a pure function \
-                 nothing consults, and any answer is adopted onto whatever account is active"
+                3,
+                "expected the definition and exactly two call sites -- inside \
+                 `adopt_startup_prefetch`, which decides what is WRITTEN, and inside \
+                 `the_details_this_window_opens_with`, which decides what is SHOWN. The \
+                 second is deliberately the same guard rather than a second one: the identity \
+                 the startup window produced can describe an account that window then \
+                 switched away from, and that hazard is identical in both places. If a call \
+                 is gone the decision is a pure function nothing consults, and any answer is \
+                 adopted onto whatever account is active"
             );
 
             let adopt = concat!("adopt_startup_", "prefetch(");
@@ -22692,7 +22766,14 @@ mod tests {
                  absent one means the tested function is dead code"
             );
 
-            let drain = concat!("if let Ok((about, details)) = status_details_rx.try_", "recv() {");
+            // **There is no drain any more.** This used to slice the frame
+            // loop's `status_details_rx.try_recv()` block: a `bw status`
+            // thread reported into that channel and the loop polled it. The
+            // address is established by the sign-in that produced it, so it
+            // comes home on `StartupOutcome::identity` and is adopted on the
+            // statement after the window ends -- through this same function,
+            // behind this same guard. What is sliced is that statement.
+            let drain = concat!("match the_startup_windows_identity.", "take() {");
             let block = block_after(drain);
             // Bound, not discarded. `let _ = adopt_startup_prefetch(..);
             // if true {` -- the repo's signature defect -- has nothing to put
@@ -22703,7 +22784,7 @@ mod tests {
             let bound = concat!("if let Some(adopted) = adopt_startup_", "prefetch(");
             assert!(
                 block.contains(bound),
-                "the startup `bw status` answer is not drained through \
+                "the startup window's identity is not adopted through \
                  `adopt_startup_prefetch`, or its result is not bound -- so nothing the tests \
                  drive decides whether it is adopted: {block:?}"
             );
@@ -22711,9 +22792,9 @@ mod tests {
             // account's instead is the mutation that makes the guard compare
             // the active account with itself and answer `true` for any `Some`.
             assert!(
-                block.contains(concat!("about.as_", "ref(),")),
-                "the id the prefetch was started FOR is not what the drain hands over, so the \
-                 guard is deciding about some other pair of accounts: {block:?}"
+                block.contains(concat!("identity.account.as_", "ref(),")),
+                "the id the SIGN-IN was for is not what the adoption hands over, so the guard \
+                 is deciding about some other pair of accounts: {block:?}"
             );
             assert!(
                 !block.contains(concat!("estate.active_account.as_ref().map(|a| &", "a.id)")),
@@ -22737,9 +22818,9 @@ mod tests {
                 "expected exactly one place the drain caches what it was handed back: {block:?}"
             );
             assert!(
-                !block.contains(concat!("estate.details = Some(", "details")),
-                "the RAW prefetch is cached rather than what the guarded function handed back, \
-                 so a dropped answer is cached anyway: {block:?}"
+                !block.contains(concat!("estate.details = Some(identity.as_", "details()")),
+                "the RAW identity is cached rather than what the guarded function handed back, \
+                 so an answer the guard dropped is shown anyway: {block:?}"
             );
         }
 
@@ -24697,6 +24778,27 @@ mod tests {
         }
     }
 
+    /// What a sign-in window hands `add_account` back: a token AND the
+    /// identity it was produced for.
+    ///
+    /// The two are one value on purpose. `add_account` used to take the token
+    /// here and then run a `bw status` against the new account's directory to
+    /// find out whose it was -- a CLI spawn, unconditional, and run even for a
+    /// direct-REST account the CLI has nothing to do with. The address is the
+    /// string the user typed into the card, so the window carries it out.
+    fn session_signed_in_as(email: &str) -> login_ui::SignedInSession {
+        login_ui::SignedInSession {
+            token: "session-token".to_string(),
+            identity: login_ui::SignedInIdentity {
+                // `None`: `add_account` records against the account it
+                // PREPARED, which the caller of this helper is not naming.
+                account: None,
+                user_email: Some(email.to_string()),
+                server_url: Some("https://vault.example.com".to_string()),
+            },
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Filling in the email an account was minted without.
     // ---------------------------------------------------------------------
@@ -25289,7 +25391,6 @@ mod tests {
                 );
                 None
             },
-            |_| panic!("`bw status` was asked about an account nobody signed in to"),
             |_, _, _| panic!("the app was resettled for an account nobody signed in to"),
         );
 
@@ -25364,7 +25465,6 @@ mod tests {
         let seen = std::cell::RefCell::new(None);
         // And what the rest of the process can see while it runs.
         let global_during = std::cell::RefCell::new(None);
-        let asked_about = std::cell::RefCell::new(None);
         let outcome = add_account(
             cfg.path(),
             &settings_path,
@@ -25375,11 +25475,7 @@ mod tests {
                 *seen.borrow_mut() =
                     Some(Some(accounts::data_dir_for(cfg.path(), &prepared.id)));
                 *global_during.borrow_mut() = Some(bw_path::active_data_dir());
-                Some("session-token".to_string())
-            },
-            |dir| {
-                *asked_about.borrow_mut() = Some(dir.map(Path::to_path_buf));
-                signed_in_as("new@example.com")
+                Some(session_signed_in_as("new@example.com"))
             },
             |_, _, _| ResettleReport::Settled,
         );
@@ -25422,13 +25518,20 @@ mod tests {
              above is about the window and not about a global that never changes"
         );
 
-        // And the email came from asking the CLI about that same directory,
-        // rather than about whatever profile this process happens to be on.
+        // **And the email came out of the SIGN-IN, with no `bw status` at
+        // all.** This used to assert that the status was asked of the new
+        // account's own directory rather than of whatever profile the process
+        // happened to be on -- a real hazard, because the process is back on
+        // the OLD account's directory by the time `add_account` reaches that
+        // line. There is nothing to aim at any more: the address is the one
+        // the user typed into the card that just succeeded, and it cannot
+        // describe another account because no other account's window produced
+        // it. The claim is now the stronger one, made where the value lands.
         assert_eq!(
-            asked_about.into_inner().expect("the status was never read"),
-            Some(accounts::data_dir_for(cfg.path(), &state.active().id)),
-            "`bw status` was asked about the wrong profile, so the account would be labelled \
-             with somebody else's address"
+            state.active().email,
+            "new@example.com",
+            "the new account was added under the wrong address, or under none -- and it is \
+             the sign-in's own answer, so there is no profile for it to have been read from"
         );
     }
 
@@ -25456,8 +25559,7 @@ mod tests {
             &mut state,
             &mut active,
             &mut store,
-            |_| Some("session-token".to_string()),
-            |_| signed_in_as("new@example.com"),
+            |_| Some(session_signed_in_as("new@example.com")),
             |_, _, _| ResettleReport::Settled,
         );
 
@@ -25536,7 +25638,6 @@ mod tests {
             &mut active,
             &mut store,
             |_| panic!("a sign-in was opened for an account that may not be added"),
-            |_| panic!("`bw status` was run for an account that may not be added"),
             |_, _, _| panic!("the app was resettled for an account that may not be added"),
         );
         assert_eq!(outcome, SwitchOutcome::Declined);
@@ -25563,8 +25664,7 @@ mod tests {
                 &mut open,
                 &mut active,
                 &mut store,
-                |_| Some("session-token".to_string()),
-                |_| signed_in_as("new@example.com"),
+                |_| Some(session_signed_in_as("new@example.com")),
                 |_, _, _| ResettleReport::Settled,
             ),
             SwitchOutcome::Switched
@@ -25614,9 +25714,8 @@ mod tests {
                     b"sealed",
                 )
                 .unwrap();
-                Some("session-token".to_string())
+                Some(session_signed_in_as("new@example.com"))
             },
-            |_| signed_in_as("new@example.com"),
             |_, to, _| {
                 if to.id == a.id {
                     ResettleReport::Settled
@@ -25735,9 +25834,8 @@ mod tests {
                     b"{\"profile\":\"signed in\"}",
                 )
                 .unwrap();
-                Some("session-token".to_string())
+                Some(session_signed_in_as("new@example.com"))
             },
-            |_| signed_in_as("new@example.com"),
             |_, _, _| ResettleReport::Settled,
         );
 
@@ -25828,11 +25926,18 @@ mod tests {
             (concat!("run_login", "_flow("), production),
             // No trailing paren on this one: `check_bw_status_details_in` is
             // spelled without one where it is handed on as a function item,
-            // and handing it on is as much a direct call as making one. The
-            // needle covers the active-profile form
-            // (`check_bw_status_details`) too, which is worse still -- it would
-            // label the new account with whatever profile this process is on.
-            (concat!("check_bw_status_", "details"), production),
+            // and handing it on is as much a direct call as making one.
+            //
+            // **The control moved to `login_ui.rs`, and that move IS the
+            // finding.** It used to be `production` -- this file's own
+            // production half -- because `add_account` took the status read as
+            // an injected argument and `main` passed the real one in at two
+            // call sites. `add_account` does not take one at all now: the new
+            // account's address comes out of the sign-in that just created it
+            // (`login_ui::SignedInSession`), so no `bw status` is run for an
+            // added account on either backend. The needle is no longer spelled
+            // anywhere in this file, which is why its control cannot be here.
+            (concat!("check_bw_status_", "details"), login_ui_source.as_str()),
             (concat!("fatal_startup", "_error("), production),
             (concat!("start_", "backend("), production),
         ] {
@@ -30418,7 +30523,13 @@ mod startup_shape_tests {
         let reads: &[&str] = &[
             concat!("estate.settings.keep_backend_", "running"),
             concat!("estate.accounts.as_", "ref()"),
-            concat!("estate.active_account.as_ref().map(|a| a.id.", "clone())"),
+            // Was `estate.active_account.as_ref().map(|a| a.id.clone())` --
+            // the account id the `bw status` prefetch was started FOR. The
+            // prefetch is gone (nothing is spawned to name the account any
+            // more), and what reads the estate on that line now is the
+            // account itself, for exactly the same reason: a teardown inside
+            // the window can have rewritten it.
+            concat!("login_ui::account_details_for(estate.active_account.as_", "ref())"),
             // **The seeding dispatch, which now hands over the WHOLE estate.**
             // It used to spell the cache, the engine and
             // the live prompt setting here, one argument each to
