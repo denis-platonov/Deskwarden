@@ -10,6 +10,19 @@ things can still change between minor versions.
 
 ## Unreleased
 
+## 0.13.2 - 2026-08-30
+
+### Fixed
+
+- **The whole app could vanish when you pressed CTRL+ALT+B on a window with
+  no saved login** -- taking the tray, the vault window and an unlocked
+  session with it, and leaving nothing in the log. Drawing a card with an
+  empty piece of text read an invalid address and Windows killed the process
+  outright. Not new in 0.13, but easy to meet.
+- **The Updates page said it could not check for updates.** It was right:
+  the window that draws Preferences had not been told how. Same for the
+  Breaches page, which would have accepted a click and done nothing.
+
 ## 0.13.1 - 2026-08-29
 
 ### Fixed

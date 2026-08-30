@@ -2295,7 +2295,7 @@ mod tests {
             // implementation -- rather than copied out of the failure
             // message. A pin re-pinned to whatever the file happens to say is
             // not a pin.
-            (13177, 0xd274_be9e_d4a4_41d2_u64),
+            (13177, 0x5fee_fb01_d83c_6fb7_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
