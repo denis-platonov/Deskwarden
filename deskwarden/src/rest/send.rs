@@ -14,7 +14,9 @@
 //! `send::plan_to_invocation` already sends to the CLI -- so this is parity
 //! with the other backend and not a subtraction from it.
 
-use crate::rest::api::{RestClient, RestError, Session};
+use crate::rest::api::{
+    GrantAbsence, MappedSendAccess, RestClient, RestError, SendGrantRefusal, Session,
+};
 use crate::rest::crypto::{decrypt, encrypt, CryptoError, EncString};
 use crate::rest::send_crypto::{access_url, SendKey};
 use crate::rest::sync::VaultKeys;
@@ -317,6 +319,231 @@ pub fn delete_on_active_account(id: &str) -> Result<(), SendError> {
     delete(&client, &mut authenticated.session, id)
 }
 
+// ---- receiving a Send from a link -------------------------------------------
+//
+// The design is `docs/superpowers/specs/2026-08-30-receiving-a-send-design.md`,
+// and its §1 and §2 are the investigation that makes the shape below
+// non-obvious. In short: there is no stable anonymous-access route. The
+// bearer route arrived in server `v2026.1.1`; the anonymous one was REMOVED in
+// `v2026.8.0`; they overlapped for seven releases, and the official client
+// probes for neither.
+
+/// The whole receive, both routes, one answer.
+///
+/// # Why the token route is tried first
+///
+/// **The order is forced, not aesthetic.** The legacy route has no clean "I am
+/// not here" signal: a server that has removed it answers `404`, and a server
+/// that still has it answers `404` for a Send that is disabled, expired, past
+/// its deletion date or out of accesses. Same status code, opposite meanings.
+/// A client that probed the old route first would tell a user with a perfectly
+/// good link that their Send is gone.
+///
+/// The grant, by contrast, has one: `unsupported_grant_type` is Duende's own
+/// answer and is the only thing that string can mean, and a token endpoint is
+/// something every Bitwarden server has. So the grant is asked first, and
+/// **only** [`SendGrantRefusal::GrantAbsent`] falls through. Every other
+/// answer -- password required, password invalid, e-mail required, send gone
+/// -- means the grant exists and is talking about this Send.
+///
+/// The probe costs one extra request, and only against old servers.
+///
+/// # Errors
+///
+/// [`SendError::Rejected`] with the sentence to show, or [`SendError::Offline`]
+/// for a transport failure. **Never [`SendError::TimedOut`]**: see
+/// [`Ambiguity`] -- a receive publishes nothing, so there is no link for a
+/// failure here to have left behind.
+pub fn receive(
+    client: &RestClient,
+    link: &crate::rest::send_link::SendLink,
+    password: Option<&str>,
+) -> Result<zeroize::Zeroizing<String>, SendError> {
+    // Hashed once, here, and handed to whichever route answers: it is the same
+    // value in both eras (`SendKey::password_hash`), and deriving it twice
+    // would be two hundred thousand PBKDF2 iterations for one request.
+    let hash = password.map(|p| link.key().password_hash(p));
+
+    let answer = match client.mint_send_access_token(link.access_id(), hash.as_deref().map(String::as_str))
+    {
+        Ok(token) => client
+            .access_send_with_token(&token)
+            .map_err(|e| map_error(e, Ambiguity::Safe))?,
+        // **The one refusal that may fall back**, and it carries which of its
+        // two causes fired because that decides what a `404` from the old
+        // route means. See [`GrantAbsence`].
+        Err(SendGrantRefusal::GrantAbsent(absence)) => {
+            access_legacy(client, link, password, absence)?
+        }
+        Err(SendGrantRefusal::PasswordRequired) => return Err(needs_password()),
+        Err(SendGrantRefusal::PasswordInvalid) => return Err(wrong_password()),
+        Err(SendGrantRefusal::EmailRequired) => return Err(email_gated()),
+        Err(SendGrantRefusal::SendGone) => return Err(gone()),
+        Err(SendGrantRefusal::Other(e)) => return Err(map_error(e, Ambiguity::Safe)),
+    };
+
+    text_from(&answer, link.key())
+}
+
+/// The legacy anonymous route, and its answers in the same vocabulary.
+///
+/// `absence` is what the token endpoint did, and it is the whole of how a
+/// `404` here is read -- the one place in this module where the meaning of a
+/// status code depends on an earlier request.
+fn access_legacy(
+    client: &RestClient,
+    link: &crate::rest::send_link::SendLink,
+    password: Option<&str>,
+    absence: GrantAbsence,
+) -> Result<Value, SendError> {
+    let access = MappedSendAccess::for_key(link.key(), password);
+    match client.access_send_anonymously(link.access_id(), &access) {
+        Ok(answer) => Ok(answer),
+        // `401` on this route is the server asking for the share password --
+        // `SendAccessResult.PasswordRequired`, which the controller throws an
+        // `UnauthorizedAccessException` for. It is NOT the vault being locked,
+        // which is what `map_error` would have made of it.
+        Err(RestError::Unauthorized) => Err(needs_password()),
+        // `404` is `SendAccessResult.Denied` on a server that has this route,
+        // and "no such route" on one that does not. Which it is was decided
+        // before this request was made.
+        Err(RestError::Status(404)) => match absence {
+            GrantAbsence::GrantUnknownToTokenEndpoint => Err(gone()),
+            GrantAbsence::NoTokenEndpoint => Err(neither_route()),
+        },
+        // `400 "Invalid password."` -- the arm the server takes a deliberate
+        // two-second delay before, which is why the receive deadline is sized
+        // the way it is.
+        Err(RestError::Rejected { ref description, .. })
+            if description.to_lowercase().contains("invalid password") =>
+        {
+            Err(wrong_password())
+        }
+        // Every other `400` on this route is "could not locate send", which
+        // the controller throws a `BadRequestException` for. It means the same
+        // thing to the user as a denial.
+        Err(RestError::Rejected { .. }) => Err(gone()),
+        Err(other) => Err(map_error(other, Ambiguity::Safe)),
+    }
+}
+
+/// One `SendAccessResponseModel`, as the text it carries.
+///
+/// **One parser for both eras, and that is deliberate.** The class is the same
+/// on both routes -- the bearer route returns `new SendAccessResponseModel(send)`
+/// exactly as the anonymous one did -- and two parsers for one shape is how
+/// the two come to disagree about what a readable Send is.
+fn text_from(
+    answer: &Value,
+    key: &SendKey,
+) -> Result<zeroize::Zeroizing<String>, SendError> {
+    // Bitwarden's `SendType`: 0 text, 1 file. `summary_from`'s rule, and the
+    // same default: an absent `type` is read as a text Send rather than
+    // refused, because that is what every text Send this app makes carries.
+    if answer.get("type").and_then(Value::as_i64).unwrap_or(0) != 0 {
+        return Err(file_send());
+    }
+    let sealed = answer
+        .get("text")
+        .and_then(|t| t.get("text"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            SendError::Rejected("That Send carried no text this app could read.".to_string())
+        })?;
+    let sealed: EncString = sealed
+        .parse()
+        .map_err(|_| SendError::Rejected("That Send's text could not be read.".to_string()))?;
+    let cipher_key = key.cipher_key().map_err(|_| link_key_wrong())?;
+    let plain = decrypt(&cipher_key, &sealed).map_err(|_| link_key_wrong())?;
+    let text = String::from_utf8(plain.to_vec()).map_err(|_| link_key_wrong())?;
+    Ok(zeroize::Zeroizing::new(text))
+}
+
+// ---- the sentences, each its own function so none can quietly become another
+
+/// The share password is needed and was not given.
+fn needs_password() -> SendError {
+    SendError::Rejected("That Send is protected by a share password.".to_string())
+}
+
+/// The share password was given and was wrong.
+fn wrong_password() -> SendError {
+    SendError::Rejected("That share password is not right.".to_string())
+}
+
+/// The Send is not there to be read, for any of the reasons that amount to the
+/// same thing to whoever holds the link.
+fn gone() -> SendError {
+    SendError::Rejected(
+        "That Send is no longer available. It may have expired, been revoked, or reached the \
+         number of times it could be opened."
+            .to_string(),
+    )
+}
+
+/// **An e-mail-gated Send, refused by name.**
+///
+/// It must not be reachable from [`gone`]'s sentence: this link is *live*, and
+/// a user told it was dead would stop asking the sender for a working one.
+fn email_gated() -> SendError {
+    SendError::Rejected(
+        "That Send asks the recipient to prove an e-mail address, which Deskwarden cannot do \
+         yet. Open it in a browser instead."
+            .to_string(),
+    )
+}
+
+/// A file Send, refused by name rather than decrypted into nonsense.
+fn file_send() -> SendError {
+    SendError::Rejected(
+        "That is a file Send, which Deskwarden cannot download yet. Open it in a browser \
+         instead."
+            .to_string(),
+    )
+}
+
+/// **The server has neither route.** Not the link's fault, and the sentence
+/// must not blame it -- see the design's §6, which is the case this app could
+/// not settle from Bitwarden's source at all.
+fn neither_route() -> SendError {
+    SendError::Rejected(
+        "This server does not offer Send links to this app. Open the link in a browser \
+         instead."
+            .to_string(),
+    )
+}
+
+/// The answer arrived and the key in the link does not open it.
+fn link_key_wrong() -> SendError {
+    SendError::Rejected(
+        "That Send could not be decrypted with the key in its link. Copy the whole link and \
+         try again."
+            .to_string(),
+    )
+}
+
+/// Reads one Send from a link, for the active direct-REST account.
+///
+/// **No `VaultKeys` and no `/api/sync`, and no credential of any kind.** The
+/// key is in the link -- that is what a Send *is* -- so unlike
+/// [`create_on_active_account`] and [`list_on_active_account`] this pays no
+/// sync round trip, and unlike all three of them it never reads
+/// `backend_policy::direct_rest_credentials`. It needs the account only to
+/// know which server is ours, which is the comparison
+/// [`crate::rest::send_link::parse`] makes and refuses on.
+pub fn receive_on_active_account(
+    url: &str,
+    password: Option<&str>,
+) -> Result<zeroize::Zeroizing<String>, SendError> {
+    let login = crate::backend_policy::direct_rest_login().ok_or(SendError::Locked)?;
+    let client = RestClient::new(login.server_url);
+    // Parsed against the client's own normalised base URL rather than the raw
+    // configured string, so a trailing slash cannot make a link foreign.
+    let link = crate::rest::send_link::parse(url, client.base_url())?;
+    receive(&client, &link, password)
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -511,5 +738,446 @@ pub mod tests {
             SendError::Offline
         );
         assert_eq!(map_error(RestError::Unauthorized, Ambiguity::Safe), SendError::Locked);
+    }
+
+    // ---- receiving a Send from a link ---------------------------------------
+
+    const ACCESS_ID: &str = "an-invented-access-id";
+    const SHARED_TEXT: &str = "the-invented-text-inside-the-send";
+
+    /// The 16 bytes an invented link carries. Never a real key.
+    fn a_link_key() -> SendKey {
+        SendKey::from_bytes([6u8; 16])
+    }
+
+    /// A whole invented link on `base`, in the shape `access_url` builds.
+    fn a_link(base: &str) -> String {
+        access_url(base, ACCESS_ID, &a_link_key())
+    }
+
+    /// **One `SendAccessResponseModel`, used by BOTH routes' mocks.**
+    ///
+    /// One fixture rather than two is what makes
+    /// [`both_routes_are_read_by_the_same_parser`] mean anything: the class is
+    /// the same in both eras, so a test that fed each route its own fixture
+    /// could not notice the two parsers drifting apart.
+    fn a_send_answer() -> String {
+        let cipher_key = a_link_key().cipher_key().expect("derives");
+        let text = encrypt(&cipher_key, SHARED_TEXT.as_bytes()).expect("encrypts").to_string();
+        let name = encrypt(&cipher_key, b"An invented Send").expect("encrypts").to_string();
+        serde_json::json!({
+            "id": ACCESS_ID,
+            "type": 0,
+            "name": name,
+            "text": { "text": text, "hidden": true },
+            "file": Value::Null,
+            "expirationDate": Value::Null,
+            "creatorIdentifier": Value::Null,
+        })
+        .to_string()
+    }
+
+    /// Mocks a grant that mints a token.
+    fn mint_ok(server: &mut crate::test_http::Server) {
+        server
+            .mock("POST", "/identity/connect/token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"access_token":"SEND-AT-1","expires_in":300}"#)
+            .create();
+    }
+
+    /// Mocks a grant that refuses with a named `send_access_error_type`.
+    fn mint_refuses(server: &mut crate::test_http::Server, body: &str) {
+        server
+            .mock("POST", "/identity/connect/token")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(body)
+            .create();
+    }
+
+    /// Mocks an OLD server: the token endpoint exists and does not know the
+    /// grant. This is the answer -- and the ONLY 400 -- that may fall back.
+    fn mint_is_unknown(server: &mut crate::test_http::Server) {
+        mint_refuses(server, r#"{"error":"unsupported_grant_type"}"#);
+    }
+
+    /// **The happy path on a NEW server**: the grant, then the bare access
+    /// path, then the text.
+    ///
+    /// The legacy route is mocked with `.expect(0)` so a probe that called it
+    /// anyway fails HERE rather than silently costing a request against every
+    /// modern server.
+    #[test]
+    fn a_server_that_mints_a_token_is_never_asked_the_old_route() {
+        let mut server = crate::test_http::server();
+        mint_ok(&mut server);
+        let token_route = server
+            .mock("POST", "/api/sends/access")
+            .match_header("Authorization", "Bearer SEND-AT-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_send_answer())
+            .expect(1)
+            .create();
+        let legacy = server
+            .mock("POST", format!("/api/sends/access/{ACCESS_ID}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_send_answer())
+            .expect(0)
+            .create();
+
+        let client = RestClient::new(server.url());
+        let link = crate::rest::send_link::parse(&a_link(client.base_url()), client.base_url())
+            .expect("the link parses");
+        let text = receive(&client, &link, None).expect("the Send is read");
+
+        assert_eq!(&*text, SHARED_TEXT, "the text did not come out of the token route");
+        token_route.assert();
+        legacy.assert();
+    }
+
+    /// **The happy path on an OLD server**: the grant answers
+    /// `unsupported_grant_type`, the legacy route answers, and the text that
+    /// comes out is IDENTICAL to the one the new-server test got from the same
+    /// fixture.
+    ///
+    /// That equality is the whole user-facing claim of the design's §2.4 --
+    /// the same Send, the same text, the same screen, on either server -- and
+    /// it is asserted rather than described.
+    #[test]
+    fn an_old_server_yields_the_same_text_through_the_fallback() {
+        let mut server = crate::test_http::server();
+        mint_is_unknown(&mut server);
+        let legacy = server
+            .mock("POST", format!("/api/sends/access/{ACCESS_ID}").as_str())
+            .match_header("Send-Id", ACCESS_ID)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_send_answer())
+            .expect(1)
+            .create();
+
+        let client = RestClient::new(server.url());
+        let link = crate::rest::send_link::parse(&a_link(client.base_url()), client.base_url())
+            .expect("the link parses");
+        let text = receive(&client, &link, None).expect("the Send is read");
+
+        assert_eq!(&*text, SHARED_TEXT, "the fallback produced different text");
+        legacy.assert();
+    }
+
+    /// **One parser for both eras.** The same fixture through both routes must
+    /// produce byte-identical output -- the guard against the two paths
+    /// growing separate parsers, which is how they would come to disagree
+    /// about what a readable Send is.
+    #[test]
+    fn both_routes_are_read_by_the_same_parser() {
+        let mut new_server = crate::test_http::server();
+        mint_ok(&mut new_server);
+        new_server
+            .mock("POST", "/api/sends/access")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_send_answer())
+            .create();
+        let new_client = RestClient::new(new_server.url());
+        let new_link =
+            crate::rest::send_link::parse(&a_link(new_client.base_url()), new_client.base_url())
+                .expect("parses");
+        let through_token = receive(&new_client, &new_link, None).expect("the token route reads");
+
+        let mut old_server = crate::test_http::server();
+        mint_is_unknown(&mut old_server);
+        old_server
+            .mock("POST", format!("/api/sends/access/{ACCESS_ID}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_send_answer())
+            .create();
+        let old_client = RestClient::new(old_server.url());
+        let old_link =
+            crate::rest::send_link::parse(&a_link(old_client.base_url()), old_client.base_url())
+                .expect("parses");
+        let through_legacy = receive(&old_client, &old_link, None).expect("the legacy route reads");
+
+        assert_eq!(*through_token, *through_legacy, "the two routes read the same answer apart");
+        // The control: the shared answer is not empty, so this is not two
+        // parsers agreeing that a Send contains nothing.
+        assert_eq!(&*through_token, SHARED_TEXT);
+    }
+
+    /// **A server with neither route is refused by name.**
+    ///
+    /// `404` at identity AND `404` at the legacy path is not "this Send is
+    /// gone" -- it is "this server does not offer Send links to this app", and
+    /// the sentence says so. This is the design's §6 case, which no Bitwarden
+    /// source could settle.
+    ///
+    /// Two controls. The same fixture with the legacy route PRESENT succeeds,
+    /// so this is about the server and not about the fixture. And an OLD
+    /// server -- one whose token endpoint answered `unsupported_grant_type`,
+    /// so it has an identity server -- gets the "gone" sentence for the same
+    /// `404`, which is the distinction the whole arm exists for.
+    #[test]
+    fn a_server_that_speaks_neither_route_says_so_rather_than_blaming_the_link() {
+        let mut neither = crate::test_http::server();
+        neither.mock("POST", "/identity/connect/token").with_status(404).create();
+        neither
+            .mock("POST", format!("/api/sends/access/{ACCESS_ID}").as_str())
+            .with_status(404)
+            .create();
+        let client = RestClient::new(neither.url());
+        let link = crate::rest::send_link::parse(&a_link(client.base_url()), client.base_url())
+            .expect("parses");
+        let refusal = receive(&client, &link, None).expect_err("neither route answers");
+
+        assert_eq!(refusal, neither_route(), "a server with no routes blamed the link");
+        assert_ne!(
+            refusal,
+            gone(),
+            "a server with no Send routes was reported as a dead link, which sends the user to \
+             ask for a new link that will fail in exactly the same way"
+        );
+
+        // **Control one:** the same fixture, on a server that HAS the legacy
+        // route, is read.
+        let mut has_legacy = crate::test_http::server();
+        has_legacy.mock("POST", "/identity/connect/token").with_status(404).create();
+        has_legacy
+            .mock("POST", format!("/api/sends/access/{ACCESS_ID}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_send_answer())
+            .create();
+        let client = RestClient::new(has_legacy.url());
+        let link = crate::rest::send_link::parse(&a_link(client.base_url()), client.base_url())
+            .expect("parses");
+        assert_eq!(
+            &*receive(&client, &link, None).expect("the legacy route reads"),
+            SHARED_TEXT,
+            "control: the fixture cannot be read even where the route exists"
+        );
+
+        // **Control two, and the reason `GrantAbsence` is not a bare flag:**
+        // the SAME `404` from the legacy route means "gone" when the token
+        // endpoint answered rather than 404'd.
+        let mut old = crate::test_http::server();
+        mint_is_unknown(&mut old);
+        old.mock("POST", format!("/api/sends/access/{ACCESS_ID}").as_str())
+            .with_status(404)
+            .create();
+        let client = RestClient::new(old.url());
+        let link = crate::rest::send_link::parse(&a_link(client.base_url()), client.base_url())
+            .expect("parses");
+        assert_eq!(
+            receive(&client, &link, None).expect_err("the Send is denied"),
+            gone(),
+            "an expired Send on an OLD server was reported as a server without Send links"
+        );
+    }
+
+    /// **The password path, on both routes, from the same two inputs.**
+    ///
+    /// `401` (legacy) and `password_hash_b64_required` (grant) both mean
+    /// "ask"; a wrong password on either says "wrong password" and never
+    /// "gone". Four cases, one table -- and the two sentences are asserted
+    /// unequal, so a later edit cannot quietly collapse them.
+    #[test]
+    fn a_password_protected_send_asks_once_and_names_a_wrong_password_on_both_routes() {
+        assert_ne!(needs_password(), wrong_password(), "the two password sentences have merged");
+        assert_ne!(wrong_password(), gone(), "a wrong password reads as a dead link");
+
+        // The grant's two.
+        for (body, expected) in [
+            (r#"{"send_access_error_type":"password_hash_b64_required"}"#, needs_password()),
+            (r#"{"send_access_error_type":"password_hash_b64_invalid"}"#, wrong_password()),
+        ] {
+            let mut server = crate::test_http::server();
+            mint_refuses(&mut server, body);
+            // `.expect(0)`: none of these may reach the old route. They all
+            // mean the grant exists and is talking about this Send.
+            let legacy = server
+                .mock("POST", format!("/api/sends/access/{ACCESS_ID}").as_str())
+                .with_status(200)
+                .with_body(a_send_answer())
+                .expect(0)
+                .create();
+            let client = RestClient::new(server.url());
+            let link = crate::rest::send_link::parse(&a_link(client.base_url()), client.base_url())
+                .expect("parses");
+            assert_eq!(
+                receive(&client, &link, Some("an-invented-share-password"))
+                    .expect_err("the grant refused"),
+                expected,
+                "{body} did not produce its own sentence"
+            );
+            legacy.assert();
+        }
+
+        // The legacy route's two, reached through an old server.
+        for (status, body, expected) in [
+            (401, String::new(), needs_password()),
+            (400, r#"{"message":"Invalid password."}"#.to_string(), wrong_password()),
+        ] {
+            let mut server = crate::test_http::server();
+            mint_is_unknown(&mut server);
+            server
+                .mock("POST", format!("/api/sends/access/{ACCESS_ID}").as_str())
+                .with_status(status)
+                .with_header("content-type", "application/json")
+                .with_body(body.clone())
+                .create();
+            let client = RestClient::new(server.url());
+            let link = crate::rest::send_link::parse(&a_link(client.base_url()), client.base_url())
+                .expect("parses");
+            assert_eq!(
+                receive(&client, &link, Some("an-invented-share-password"))
+                    .expect_err("the legacy route refused"),
+                expected,
+                "a {status} on the legacy route did not produce its own sentence"
+            );
+        }
+
+        // **The control for all four:** the same fixture with a password that
+        // the server accepts is read, so none of the above is passing because
+        // a password-carrying receive always fails.
+        let mut server = crate::test_http::server();
+        mint_ok(&mut server);
+        server
+            .mock("POST", "/api/sends/access")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_send_answer())
+            .create();
+        let client = RestClient::new(server.url());
+        let link = crate::rest::send_link::parse(&a_link(client.base_url()), client.base_url())
+            .expect("parses");
+        assert_eq!(
+            &*receive(&client, &link, Some("an-invented-share-password")).expect("reads"),
+            SHARED_TEXT
+        );
+    }
+
+    /// **An e-mail-gated Send is not reported as a dead link.**
+    ///
+    /// Asserted as an inequality between the two sentences, so a later edit
+    /// cannot quietly collapse them: this link is LIVE, and a user told it was
+    /// dead stops asking the sender for a working one.
+    #[test]
+    fn an_email_gated_send_is_not_reported_as_a_dead_link() {
+        for code in ["email_required", "email_and_otp_required"] {
+            let mut server = crate::test_http::server();
+            mint_refuses(&mut server, &format!(r#"{{"send_access_error_type":"{code}"}}"#));
+            let client = RestClient::new(server.url());
+            let link = crate::rest::send_link::parse(&a_link(client.base_url()), client.base_url())
+                .expect("parses");
+            let refusal = receive(&client, &link, None).expect_err("an e-mail-gated Send");
+            assert_eq!(refusal, email_gated(), "{code} did not get the e-mail sentence");
+            assert_ne!(refusal, gone(), "{code} was reported as a dead link");
+        }
+        assert_ne!(email_gated(), gone(), "the two sentences have merged");
+        assert!(
+            email_gated().user_message().contains("e-mail"),
+            "the refusal does not say what it is asking for"
+        );
+    }
+
+    /// A `type` that is not 0 is refused **by name** -- a file Send -- and not
+    /// decrypted into nonsense.
+    #[test]
+    fn a_file_send_is_refused_in_its_own_words() {
+        let mut answer: Value = serde_json::from_str(&a_send_answer()).expect("the fixture");
+        answer["type"] = json!(1);
+        assert_eq!(
+            text_from(&answer, &a_link_key()).expect_err("a file Send"),
+            file_send(),
+            "a file Send was not refused by name"
+        );
+        assert_ne!(file_send(), gone(), "a file Send reads as a dead link");
+
+        // The control: the SAME fixture as type 0 is read, so this is about
+        // the type and not about the fixture.
+        let text = serde_json::from_str(&a_send_answer()).expect("the fixture");
+        assert_eq!(&*text_from(&text, &a_link_key()).expect("a text Send"), SHARED_TEXT);
+    }
+
+    /// **A receive can never report a link it might have published.**
+    ///
+    /// A receive publishes nothing, so `Ambiguity::Ambiguous` must be
+    /// unreachable here: a transport failure is `Offline` and never
+    /// `TimedOut`, whose sentence tells the reader to go and check a Sends
+    /// list that is not theirs.
+    ///
+    /// Control: the same mapper WITH `Ambiguous` does give `TimedOut`, so this
+    /// is about this call site and not about a mapper that lost the arm.
+    #[test]
+    fn a_receive_can_never_report_a_link_it_might_have_published() {
+        // Port 1 on loopback: nothing listens, so this is a transport failure
+        // and no request is answered.
+        let client = RestClient::new("http://127.0.0.1:1");
+        let link = crate::rest::send_link::parse(&a_link("http://127.0.0.1:1"), "http://127.0.0.1:1")
+            .expect("parses");
+        let failure = receive(&client, &link, None).expect_err("nothing is listening");
+        assert_eq!(failure, SendError::Offline, "an unreachable server was not reported as one");
+        assert_ne!(
+            failure,
+            SendError::TimedOut,
+            "a receive claimed a Send may now be public. It publishes nothing"
+        );
+        assert!(!failure.is_ambiguous(), "a receive reported an ambiguous outcome");
+
+        // The control: the mapper still HAS the ambiguous arm, so the
+        // assertions above are about this call site.
+        assert_eq!(
+            map_error(RestError::Transport("connection reset".to_string()), Ambiguity::Ambiguous),
+            SendError::TimedOut,
+            "control: the mapper no longer produces `TimedOut` at all"
+        );
+    }
+
+    /// A Send whose text the link's key does not open is a named failure and
+    /// not empty text -- and it is not the "gone" sentence either.
+    #[test]
+    fn a_send_the_links_key_cannot_open_is_a_failure_and_not_empty_text() {
+        let answer: Value = serde_json::from_str(&a_send_answer()).expect("the fixture");
+        let someone_elses = SendKey::from_bytes([7u8; 16]);
+        assert_eq!(
+            text_from(&answer, &someone_elses).expect_err("the wrong key"),
+            link_key_wrong()
+        );
+        // The control: the right key reads the same answer.
+        assert_eq!(&*text_from(&answer, &a_link_key()).expect("the right key"), SHARED_TEXT);
+    }
+
+    /// **Every sentence this path can show is distinct.**
+    ///
+    /// Written as one test over the whole set rather than as pairs, because
+    /// the failure being guarded against is two of them being made equal by an
+    /// edit that was only trying to reword one -- and a pairwise test only
+    /// covers the pairs somebody thought of.
+    #[test]
+    fn no_two_receive_refusals_say_the_same_thing() {
+        let all = [
+            ("needs_password", needs_password()),
+            ("wrong_password", wrong_password()),
+            ("gone", gone()),
+            ("email_gated", email_gated()),
+            ("file_send", file_send()),
+            ("neither_route", neither_route()),
+            ("link_key_wrong", link_key_wrong()),
+        ];
+        for (i, (name, left)) in all.iter().enumerate() {
+            assert!(
+                !left.user_message().is_empty(),
+                "control: {name} has no sentence at all, so every comparison below is between \
+                 empty strings"
+            );
+            for (other, right) in &all[i + 1..] {
+                assert_ne!(left, right, "{name} and {other} say the same thing");
+            }
+        }
     }
 }

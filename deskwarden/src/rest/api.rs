@@ -816,7 +816,14 @@ pub enum SendGrantRefusal {
     /// and a `404` at `/identity/connect/token`, which a Bitwarden server
     /// always has. Both mean "this server has never heard of this grant" and
     /// neither can mean anything about the Send.
-    GrantAbsent,
+    ///
+    /// **It carries which of the two fired, and that is load-bearing rather
+    /// than descriptive.** The legacy route answers `404` both for a Send that
+    /// is expired or exhausted and for a route that is not there, and those
+    /// need opposite sentences. Which one a `404` means is decided entirely by
+    /// what the token endpoint did first -- see [`GrantAbsence`] -- so the
+    /// caller cannot tell them apart unless this arm remembers.
+    GrantAbsent(GrantAbsence),
     /// `password_hash_b64_required` -- ask for the share password and retry.
     PasswordRequired,
     /// `password_hash_b64_invalid` -- the share password was wrong.
@@ -831,6 +838,31 @@ pub enum SendGrantRefusal {
     SendGone,
     /// Anything else the server said. **Never a fallback trigger.**
     Other(RestError),
+}
+
+/// *How* a server failed to know the `send_access` grant, which decides what a
+/// later `404` from the legacy route means.
+///
+/// This distinction exists because one status code carries two opposite
+/// meanings and nothing in the legacy answer itself separates them:
+///
+/// * A server that answered `unsupported_grant_type` **has a token endpoint**
+///   -- it parsed the request and refused the grant by name. That is an older
+///   Bitwarden, and an older Bitwarden has the legacy route. So a `404` from
+///   it is about the **Send**: disabled, expired, past deletion, or out of
+///   accesses.
+/// * A server that answered `404` at `/identity/connect/token` has no token
+///   endpoint at all, which no Bitwarden server is. So a `404` from the legacy
+///   route too is about the **server**: it does not offer Send links to this
+///   app, and telling that user their link is dead would be blaming a link
+///   that is fine.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum GrantAbsence {
+    /// `400 unsupported_grant_type`. The token endpoint answered; this is an
+    /// older server, and the legacy route is expected to be there.
+    GrantUnknownToTokenEndpoint,
+    /// `404` at `/identity/connect/token`. There is no token endpoint here.
+    NoTokenEndpoint,
 }
 
 /// A grant response, turned into a token or refused.
@@ -861,7 +893,7 @@ fn send_access_token_from(value: &serde_json::Value) -> Result<SendAccessToken, 
 /// never reach [`SendGrantRefusal::GrantAbsent`].
 fn send_grant_refusal_from(json: &serde_json::Value) -> SendGrantRefusal {
     if string_at(json, "error") == "unsupported_grant_type" {
-        return SendGrantRefusal::GrantAbsent;
+        return SendGrantRefusal::GrantAbsent(GrantAbsence::GrantUnknownToTokenEndpoint);
     }
     match string_at(json, "send_access_error_type").as_str() {
         "password_hash_b64_required" => SendGrantRefusal::PasswordRequired,
@@ -1710,7 +1742,9 @@ impl RestClient {
             }
             // A token endpoint always exists on a Bitwarden server, so a 404
             // here is unambiguous: this is not a server that has one.
-            Err(ureq::Error::Status(404, _)) => Err(SendGrantRefusal::GrantAbsent),
+            Err(ureq::Error::Status(404, _)) => {
+                Err(SendGrantRefusal::GrantAbsent(GrantAbsence::NoTokenEndpoint))
+            }
             Err(ureq::Error::Status(code, _)) => {
                 Err(SendGrantRefusal::Other(RestError::Status(code)))
             }
@@ -1771,12 +1805,36 @@ impl RestClient {
             return Err(RestError::UnsafeId);
         }
         let url = format!("{}/api/sends/access/{}", self.base_url, access_id);
-        self.value_from(
-            self.anon_agent
-                .post(&url)
-                .set("Send-Id", access_id)
-                .send_json(access.body()),
-        )
+        let response = self
+            .anon_agent
+            .post(&url)
+            .set("Send-Id", access_id)
+            .send_json(access.body());
+        match response {
+            // **The one status whose body is worth more than its
+            // classification on this route**, and it is intercepted here for
+            // the same reason [`Self::grant`] intercepts its own: two
+            // different 400s arrive and the caller must tell them apart.
+            //
+            // This is an `/api` route, so its errors are `{"message": ...}` --
+            // *not* the `{"error", "error_description"}` shape
+            // [`classify_json_400`] reads, which is the identity server's.
+            // Passed through `value_from` the two would both arrive as an
+            // empty [`RestError::Rejected`], and "Invalid password." would be
+            // indistinguishable from "Could not locate send" -- which is
+            // exactly the sentence a user must not see for a password they
+            // simply mistyped.
+            Err(ureq::Error::Status(400, body)) => {
+                let json = json_body_of(body);
+                let message = string_at(&json, "message");
+                if message.is_empty() {
+                    Err(classify_json_400(&json))
+                } else {
+                    Err(RestError::Rejected { error: String::new(), description: message })
+                }
+            }
+            other => self.value_from(other),
+        }
     }
 
     // ---- the plumbing ------------------------------------------------------
@@ -3685,7 +3743,7 @@ mod tests {
             .create();
         assert_eq!(
             RestClient::new(unsupported.url()).mint_send_access_token(ACCESS_ID, None).err(),
-            Some(SendGrantRefusal::GrantAbsent),
+            Some(SendGrantRefusal::GrantAbsent(GrantAbsence::GrantUnknownToTokenEndpoint)),
             "`unsupported_grant_type` is Duende's own answer and is the one string that means \
              this server has never heard of the grant"
         );
@@ -3694,7 +3752,7 @@ mod tests {
         absent.mock("POST", "/identity/connect/token").with_status(404).create();
         assert_eq!(
             RestClient::new(absent.url()).mint_send_access_token(ACCESS_ID, None).err(),
-            Some(SendGrantRefusal::GrantAbsent),
+            Some(SendGrantRefusal::GrantAbsent(GrantAbsence::NoTokenEndpoint)),
             "a token endpoint always exists on a Bitwarden server, so a 404 at it is \
              unambiguous"
         );
@@ -3721,9 +3779,8 @@ mod tests {
                 .mint_send_access_token(ACCESS_ID, None)
                 .err()
                 .expect("a 400 is a refusal");
-            assert_ne!(
-                refusal,
-                SendGrantRefusal::GrantAbsent,
+            assert!(
+                !matches!(refusal, SendGrantRefusal::GrantAbsent(_)),
                 "{body} was read as `GrantAbsent`, which would send this user to a route the \
                  server may not have and report their live Send as gone"
             );
@@ -3732,9 +3789,11 @@ mod tests {
         // A 500 is not a missing route either.
         let mut broken = crate::test_http::server();
         broken.mock("POST", "/identity/connect/token").with_status(500).create();
-        assert_ne!(
-            RestClient::new(broken.url()).mint_send_access_token(ACCESS_ID, None).err(),
-            Some(SendGrantRefusal::GrantAbsent),
+        assert!(
+            !matches!(
+                RestClient::new(broken.url()).mint_send_access_token(ACCESS_ID, None),
+                Err(SendGrantRefusal::GrantAbsent(_))
+            ),
             "a 500 is a server that broke, not a server without the route"
         );
 
@@ -3744,9 +3803,8 @@ mod tests {
             .mint_send_access_token(ACCESS_ID, None)
             .err()
             .expect("an unreachable server is a refusal");
-        assert_ne!(
-            refusal,
-            SendGrantRefusal::GrantAbsent,
+        assert!(
+            !matches!(refusal, SendGrantRefusal::GrantAbsent(_)),
             "a transport failure was read as a missing route, so an offline user would be \
              told their Send is gone"
         );
