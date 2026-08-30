@@ -301,7 +301,13 @@ fn utc_parts(millis: i64) -> (i64, u32, u32, u32, u32, u32, u32) {
 
 /// The instant a Send planned `days` from `now` should be deleted, in the
 /// shape `bw send template` emits: `2026-08-18T00:43:17.148Z`.
-fn deletion_date(days: u8, now: &dyn SendClock) -> String {
+///
+/// **`pub(crate)`, and the reason is one instant.** [`crate::rest::send`]
+/// stamps the same field for the direct-REST backend. A second copy of this
+/// arithmetic beside the first is exactly how two backends come to disagree
+/// about when a link dies -- the failure [`crate::local_time`] was extracted
+/// to end.
+pub(crate) fn deletion_date(days: u8, now: &dyn SendClock) -> String {
     let (y, mo, d, h, mi, s, ms) =
         utc_parts(now.now_unix_millis() + i64::from(days) * MILLIS_PER_DAY);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")

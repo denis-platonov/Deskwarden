@@ -1398,6 +1398,62 @@ impl RestClient {
         })
     }
 
+    // ---- writing one Send ---------------------------------------------------
+
+    /// `POST /api/sends` -- a new **text** Send.
+    ///
+    /// `send` is a [`crate::rest::send::MappedSend`], which only
+    /// [`crate::rest::send::encrypt_plan`] can produce, for the reason
+    /// [`Self::create_folder`] takes a [`MappedFolder`]: the body carries the
+    /// user's secret in encrypted form, and the type is what keeps a
+    /// hand-built one -- which for a Send would be the cleartext body -- out
+    /// of this module. Nothing here formats the body.
+    ///
+    /// Returns the server's own copy: the `id` it assigned and the `accessId`
+    /// the link is built from. **The link itself is not in the answer** and
+    /// cannot be: it carries a key this client generated and the server has
+    /// never seen in the clear.
+    pub fn create_send(
+        &self,
+        session: &mut Session,
+        send: &crate::rest::send::MappedSend,
+    ) -> Result<serde_json::Value, RestError> {
+        let url = format!("{}/api/sends", self.base_url);
+        self.refreshing(session, |session| {
+            self.value_from(
+                self.bearer(self.write_agent.post(&url), session).send_json(send.body()),
+            )
+        })
+    }
+
+    /// `GET /api/sends` -- every Send this account has, still encrypted.
+    ///
+    /// **Its own route rather than `/api/sync`'s `sends` array**, though the
+    /// sync carries them: [`crate::rest::sync`] is explicit that Sends are
+    /// out of its scope, and teaching the vault's mapper to carry a second
+    /// kind of record so that one screen can avoid one request would put
+    /// Sends on the path every autofill takes.
+    pub fn list_sends(&self, session: &mut Session) -> Result<serde_json::Value, RestError> {
+        let url = format!("{}/api/sends", self.base_url);
+        self.refreshing(session, |session| {
+            self.value_from(self.bearer(self.sync_agent.get(&url), session).call())
+        })
+    }
+
+    /// `DELETE /api/sends/{id}` -- the revoke.
+    ///
+    /// Through [`Self::unit_from`], on [`Self::delete_folder`]'s reasoning
+    /// exactly: what this asserts is that a Send is **gone**, and a
+    /// path-scoped status is that answer whole. There is nothing for a body
+    /// to confirm, and an error for a delete that worked would push a user
+    /// into revoking twice.
+    pub fn delete_send(&self, session: &mut Session, id: &str) -> Result<(), RestError> {
+        let url = self.send_url(id)?;
+        self.refreshing(session, |session| {
+            self.unit_from(self.bearer(self.write_agent.delete(&url), session).call())
+        })
+    }
+
     // ---- the plumbing ------------------------------------------------------
 
     /// The token discipline every authenticated call in this module shares:
@@ -1452,6 +1508,26 @@ impl RestClient {
             return Err(RestError::UnsafeId);
         }
         Ok(format!("{}/api/folders/{}", self.base_url, id))
+    }
+
+    /// `{base}/api/sends/{id}`, with the id checked first -- [`Self::cipher_url`]'s
+    /// check applied to the third id this module puts in a path, from the
+    /// same [`is_url_path_safe`], so three id kinds cannot be validated by
+    /// three rules.
+    fn send_url(&self, id: &str) -> Result<String, RestError> {
+        if !is_url_path_safe(id) {
+            return Err(RestError::UnsafeId);
+        }
+        Ok(format!("{}/api/sends/{}", self.base_url, id))
+    }
+
+    /// The server root this client was configured with.
+    ///
+    /// `pub(crate)` and a borrow: [`crate::rest::send`] assembles a Send's
+    /// access URL from it. See that module for the one deployment shape this
+    /// gets wrong.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// Puts the bearer token on a request.
@@ -2878,7 +2954,7 @@ mod tests {
         // between them account for all five.
         assert_eq!(
             production.matches("send_json(").count(),
-            6,
+            7,
             "a new JSON body sender appeared in rest::api"
         );
         // Two of them are the cipher writers, and both send a mapped cipher.
@@ -2909,6 +2985,16 @@ mod tests {
             1,
             "the email second factor stopped sending its own body, or gained a twin"
         );
+        // The seventh is the Send create, and it is a mapped type for the
+        // same reason the four above it are: `MappedSend` has no constructor
+        // but `rest::send::encrypt_plan`, so the body that reaches this
+        // module has already been encrypted under the Send's own key. A
+        // hand-built one would be the user's cleartext.
+        assert_eq!(
+            production.matches("send_json(send.body())").count(),
+            1,
+            "the Send endpoint stopped sending a MappedSend"
+        );
 
         // And there is **no** hand-built body left anywhere: the four mapped
         // sends above are the write agent's only `post`/`put` with content.
@@ -2924,7 +3010,7 @@ mod tests {
         assert_eq!(
             production.matches("self.write_agent.post(&url), session).send_json").count()
                 + production.matches("self.write_agent.put(&url), session).send_json").count(),
-            4,
+            5,
             "the write agent gained another body-carrying call"
         );
     }
@@ -3124,6 +3210,128 @@ mod tests {
             .delete_folder(&mut session, "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             .expect("an empty 204 is a delete that happened");
         deleted.assert();
+    }
+
+    // ---- the Send endpoints ------------------------------------------------
+
+    /// A mapped Send body, out of `rest::send`'s own encrypter -- there is no
+    /// other constructor, which is the property these tests are the first
+    /// place to feel.
+    fn encrypted_send() -> crate::rest::send::MappedSend {
+        crate::rest::send::encrypt_plan(
+            &crate::rest::send::tests::a_plan(),
+            &crate::rest::send::tests::keys(),
+            &crate::send::FixedClock(0),
+        )
+        .expect("the plan maps")
+    }
+
+    /// **Every field the server needs, and nothing the user typed.** Modelled
+    /// on the cipher create beside it.
+    #[test]
+    fn creating_a_send_posts_the_encrypted_body_to_the_sends_route() {
+        let mut server = crate::test_http::server();
+        let (client, mut session) = granted(&mut server);
+        let send = encrypted_send();
+        let body = send.body().clone();
+        let created = server
+            .mock("POST", "/api/sends")
+            .match_header("Authorization", "Bearer AT-1")
+            .match_body(crate::test_http::Matcher::Json(body.clone()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":"send-1","accessId":"acc-1","deletionDate":"2026-09-06T00:43:17.148Z"}"#)
+            .expect(1)
+            .create();
+
+        let answer = client.create_send(&mut session, &send).expect("the send is created");
+        created.assert();
+        assert_eq!(
+            answer.get("accessId").and_then(|v| v.as_str()),
+            Some("acc-1"),
+            "the server's own accessId is what comes back"
+        );
+
+        // The same assertion from the other side, on the exact bytes
+        // `match_body` accepted: the plan's secret body is not among them,
+        // and -- the positive control -- the ciphertext that replaced it is.
+        let sent = serde_json::to_string(&body).expect("serializable");
+        assert!(
+            !sent.contains("correct-horse-battery-staple"),
+            "the Send's plaintext reached the request body"
+        );
+        assert!(
+            body["text"]["text"].as_str().expect("a text field").starts_with("2."),
+            "the body carried no ciphertext at all, so the absence above proves nothing"
+        );
+    }
+
+    /// A refusal is the server's own words, through the same
+    /// [`classify_json_400`] every other write uses -- not a new error
+    /// vocabulary for one feature.
+    ///
+    /// **The body is `error_description`, not `message`.** That is what
+    /// `classify_json_400` reads, and it is a module-wide property rather
+    /// than a Send one: a server that says `message` instead is one whose
+    /// sentence a cipher create and a folder create already lose too. Pinning
+    /// the shape this module actually reads keeps that fact visible; teaching
+    /// the classifier a second key would change every route in the file and
+    /// is not what this plan is.
+    #[test]
+    fn a_refused_send_carries_the_servers_own_sentence() {
+        let mut server = crate::test_http::server();
+        let (client, mut session) = granted(&mut server);
+        let _refused = server
+            .mock("POST", "/api/sends")
+            .with_status(400)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"error":"invalid_request","error_description":"You must be a premium user to send files."}"#,
+            )
+            .expect(1)
+            .create();
+
+        match client.create_send(&mut session, &encrypted_send()) {
+            Err(RestError::Rejected { description, .. }) => {
+                assert!(description.contains("premium"), "the server's words were lost: {description}");
+            }
+            other => panic!("expected a Rejected, got {other:?}"),
+        }
+    }
+
+    /// The list is a `GET`, and the delete is path-scoped with the id
+    /// checked -- the same `is_url_path_safe` gate the cipher and folder
+    /// routes already use, so an id carrying a `/` cannot aim a `DELETE`
+    /// somewhere else.
+    #[test]
+    fn sends_are_listed_and_revoked_on_their_own_routes() {
+        let mut server = crate::test_http::server();
+        let (client, mut session) = granted(&mut server);
+        let listed = server
+            .mock("GET", "/api/sends")
+            .match_header("Authorization", "Bearer AT-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[]}"#)
+            .expect(1)
+            .create();
+        let revoked = server
+            .mock("DELETE", "/api/sends/send-1")
+            .match_header("Authorization", "Bearer AT-1")
+            .with_status(200)
+            .with_body("")
+            .expect(1)
+            .create();
+
+        assert!(client.list_sends(&mut session).is_ok());
+        assert!(client.delete_send(&mut session, "send-1").is_ok());
+        listed.assert();
+        revoked.assert();
+
+        assert!(
+            matches!(client.delete_send(&mut session, "../ciphers/x"), Err(RestError::UnsafeId)),
+            "an id that is not path-safe must be refused before it is a URL"
+        );
     }
 
     /// The token discipline, on a folder write: one 401, one refresh, one

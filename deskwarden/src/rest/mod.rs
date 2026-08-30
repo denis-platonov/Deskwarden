@@ -31,14 +31,20 @@
 //! update, trash, restore and hard delete for *ciphers*, and create and
 //! delete for *folders*.
 //!
-//! Still missing, and each is what keeps `bw.exe` on the machine: **Sends**
-//! (`send.rs` runs the CLI through `CliSendRunner`), **attachments** (not
-//! decrypted by [`sync`], not creatable or deletable by [`write`]), and
-//! **organisations** (decrypted, but never shown working against a real
-//! server).
+//! **Sends** are here now, in [`send`] and [`send_crypto`]: a text Send can
+//! be published, listed and revoked without `bw.exe`. Two halves of the
+//! feature are not, and each is named rather than left to be discovered --
+//! **file Sends** (creatable on neither backend today, so listing and
+//! revoking them is parity and not a subtraction) and **receiving a Send
+//! from a link**, which still runs `send::cli_send_receive`.
+//!
+//! Still missing, and each is what keeps `bw.exe` on the machine: that
+//! receive path, **attachments** (not decrypted by [`sync`], not creatable
+//! or deletable by [`write`]), and **organisations** (decrypted, but never
+//! shown working against a real server).
 //!
 //! This paragraph said "no folder write" until folder writes landed and
-//! nobody came back to it -- a module doc that lists what is missing is a
+//! nobody came back to it, and it said Sends were absent until they were not -- a module doc that lists what is missing is a
 //! promise to keep the list current, and it is the kind of sentence a
 //! reader trusts precisely because it is inconvenient. Two-factor
 //! authentication is
@@ -102,6 +108,8 @@ pub mod api;
 /// rather than faked. See its own docs for what one call costs.
 pub mod backend;
 pub mod crypto;
+/// Sends over REST: the three operations `crate::send` runs the CLI for.
+pub mod send;
 /// A Send's own key hierarchy, which is not the vault's. Pure; no I/O.
 pub mod send_crypto;
 pub mod sync;

@@ -1096,8 +1096,13 @@ fn plaintext(key: &SymmetricKey, raw: &str) -> Result<Zeroizing<String>, CryptoE
     Ok(Zeroizing::new(text.to_string()))
 }
 
+/// `pub` for the same reason [`crate::rest::crypto::tests`] is, and with the
+/// same limit: a sibling module's tests need a `VaultKeys` fixture, and the
+/// alternative was a production constructor for one -- a `pub fn` that builds
+/// a key set out of raw bytes, which is a wider door than a shared test
+/// helper. No production item changed to allow this.
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::rest::crypto::master_key;
     use crate::rest::crypto::tests::{
@@ -1113,6 +1118,15 @@ mod tests {
             *b = seed.wrapping_mul(31).wrapping_add(u8::try_from(i % 251).expect("under 251"));
         }
         key_from_64(&bytes)
+    }
+
+    /// A [`VaultKeys`] holding the given user key and no organisations.
+    ///
+    /// For `crate::rest::send`'s tests: a Send's key is wrapped under the
+    /// user key and never under an organisation's, so an empty `orgs` is the
+    /// whole of what that path needs.
+    pub fn keys_from_user(bytes: &[u8; 64]) -> VaultKeys {
+        VaultKeys { user: key_from_64(bytes), orgs: Vec::new() }
     }
 
     /// The 64 bytes behind [`key`], for sealing a key *as* a payload.

@@ -5705,6 +5705,14 @@ mod source_pins {
         "send.rs: pub trait SendClock {",
         "send.rs: pub struct FixedClock(pub i64);",
         "send.rs: pub struct SystemClock;",
+        // Re-pinned by `2026-08-30-sends-without-the-cli`, and a
+        // widening of exactly nothing that this wall guards: it computes
+        // a date string and reaches no runner, no invocation and no
+        // child. It went from private to `pub(crate)` so that
+        // `crate::rest::send` stamps the SAME instant in the SAME format
+        // as the CLI path, rather than growing a second copy of the
+        // arithmetic that the two backends could then disagree over.
+        "send.rs: pub(crate) fn deletion_date(days: u8, now: &dyn SendClock) -> String {",
         // `zone` was added beside `now` when the sentence stopped naming the
         // UTC day and started naming the user's own. Both are injected, and
         // that is the point of both: nothing in `send.rs` reads the machine's
