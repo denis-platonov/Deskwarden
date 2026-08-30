@@ -8458,6 +8458,22 @@ mod send_receive_thread {
             Ok(body) => RecordImportReport::Read(Box::new(
                 crate::record::payload::read_json(&body),
             )),
+            // **The one place `bw.exe`'s absence is still a real loss, said
+            // as a missing tool rather than as a bad link.** A user told only
+            // that the link could not be read goes and checks the link, which
+            // is the wrong thing to check: three of the four Send operations
+            // work on this account without `bw` at all, and this one does
+            // not. Only the two arms that mean "there was no CLI to run" are
+            // rephrased -- a server refusal, a timeout or a wrong share
+            // password still say what they are.
+            Err(
+                error @ (crate::send::SendError::NoVerifiedCli(_)
+                | crate::send::SendError::SpawnFailed(_)),
+            ) => RecordImportReport::Failed(format!(
+                "{} ({})",
+                crate::vault_window::send_ui::RECEIVE_NEEDS_THE_CLI,
+                error.user_message()
+            )),
             Err(error) => RecordImportReport::Failed(error.user_message().to_string()),
         }
     }

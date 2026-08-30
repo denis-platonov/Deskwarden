@@ -55,6 +55,30 @@ pub const SCOPE_SUBTEXT: &str =
 /// The tag drawn on a Send this app could not have created.
 pub const FILE_TAG: &str = "FILE";
 
+/// What the tag means, spelled out, when the list actually contains one.
+///
+/// **A three-letter tag is a label, not an explanation.** A user who sees
+/// `FILE` beside a Send learns that this row differs from the others and
+/// nothing about how -- in particular not that the two buttons on it still
+/// work. The sentence is the design's own
+/// (`2026-08-30-sends-without-the-cli-design.md`, section 2), and it says the
+/// limit and the remedy in that order: this app sends text, and a file Send
+/// made elsewhere is still yours to copy or revoke from here.
+///
+/// Painted only when a file Send is present, so a list of text Sends is not
+/// told about a restriction it has not met.
+pub const FILE_SEND_EXPLANATION: &str = "Deskwarden can send text, not files. This Send holds a      file, so you can copy its link or delete it here, but it was made somewhere else.";
+
+/// What a Send **read from a link** needs, when reading one fails for want of
+/// the CLI.
+///
+/// The one genuine subtraction in dropping `bw.exe` for Sends, and it is said
+/// as a missing tool rather than left to surface as a bad link: a user told
+/// "that link could not be read" goes and checks the link, which is fine.
+/// The second sentence is there because without it the first reads as "Sends
+/// are broken", which is false in three operations out of four.
+pub const RECEIVE_NEEDS_THE_CLI: &str = "Reading a Send from a link needs Bitwarden's      command-line tool. Publishing, listing and revoking your own Sends do not.";
+
 /// What the pane says when the account genuinely has no Sends. A **claim**,
 /// and only reachable from a fetch that succeeded -- see [`pane_state`].
 pub const EMPTY_HEADLINE: &str = "You have no Sends.";
@@ -789,6 +813,17 @@ pub fn draw_send_pane(
             .size(12.0)
             .color(theme::TEXT_FAINT),
     );
+    // Only when there is one to explain. `SCOPE_SUBTEXT` above already says
+    // what this app does; this says what the `FILE` tag on a row in front of
+    // the user means, and a list with no such row has no tag to explain.
+    if matches!(state, SendPaneState::Rows(rows) if rows.iter().any(|r| r.is_file)) {
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(FILE_SEND_EXPLANATION)
+                .size(12.0)
+                .color(theme::TEXT_FAINT),
+        );
+    }
     ui.add_space(12.0);
 
     // **The same sentence is never printed twice.** A failed fetch reaches
@@ -2429,6 +2464,82 @@ mod paint_tests {
             })
             .collect();
         pane_state(Some(&Ok(sends)), &FixedClock(NOW))
+    }
+
+    /// **The `FILE` tag is explained, and only where there is one.**
+    ///
+    /// A three-letter tag beside a name says a row is different and not how,
+    /// and the difference that matters is that the row's two buttons still
+    /// work. The control is on the second half: a list of text Sends must NOT
+    /// carry the sentence, or this test would pass over a pane that printed
+    /// it unconditionally and told every user about a restriction they had
+    /// not met.
+    #[test]
+    fn a_file_send_in_the_list_is_explained_and_a_list_without_one_is_not() {
+        let with_a_file = SendPaneState::Rows(vec![
+            summary_row("a text Send", false),
+            summary_row("report.pdf", true),
+        ]);
+        let (painted, _) = paint(&with_a_file, None, min_pane_size());
+        assert!(
+            painted.has(FILE_SEND_EXPLANATION),
+            "a file Send was listed with nothing saying what its tag means: {:?}",
+            painted.text
+        );
+        // The control: the tag itself is there too, so the sentence is
+        // explaining something the user can actually see.
+        assert!(painted.has(FILE_TAG), "the row carried no FILE tag to explain");
+
+        let text_only = SendPaneState::Rows(vec![summary_row("a text Send", false)]);
+        let (painted, _) = paint(&text_only, None, min_pane_size());
+        assert!(
+            !painted.has(FILE_SEND_EXPLANATION),
+            "a list of text Sends was told about a restriction it has not met"
+        );
+        // The control for THAT: the pane really painted, so the absence above
+        // is about this sentence and not about an empty screen.
+        assert!(painted.has(SCOPE_SUBTEXT), "nothing was painted at all: {:?}", painted.text);
+    }
+
+    /// A `SendRow` for the two assertions above.
+    fn summary_row(name: &str, is_file: bool) -> SendRow {
+        SendRow {
+            id: format!("id-of-{name}"),
+            name: name.to_string(),
+            access_url: "https://vault.example.com/#/send/acc/AAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            expiry: "Expires in 7 days".to_string(),
+            is_file,
+        }
+    }
+
+    /// **The receive sentence names the tool and then limits the claim.**
+    ///
+    /// Two properties, and the second is the one that is easy to lose: it
+    /// must not read as "Sends need the CLI", which is false for three of the
+    /// four operations and is exactly the impression a user would take from
+    /// the first sentence alone.
+    #[test]
+    fn the_receive_sentence_says_what_is_missing_without_condemning_what_is_not() {
+        assert!(
+            RECEIVE_NEEDS_THE_CLI.contains("command-line tool"),
+            "the sentence does not name the thing that is missing: {RECEIVE_NEEDS_THE_CLI}"
+        );
+        for kept in ["Publishing", "listing", "revoking"] {
+            assert!(
+                RECEIVE_NEEDS_THE_CLI.contains(kept),
+                "{kept:?} is not named as still working, so the sentence reads as `Sends need                  the CLI`: {RECEIVE_NEEDS_THE_CLI}"
+            );
+        }
+        // The control: the two sentences are not the same sentence, so an
+        // assertion satisfied by either is satisfied by the right one.
+        assert!(
+            !FILE_SEND_EXPLANATION.contains("command-line"),
+            "the file sentence and the receive sentence have merged"
+        );
+        assert!(
+            !RECEIVE_NEEDS_THE_CLI.contains("file"),
+            "the receive sentence has picked up the file restriction"
+        );
     }
 
     /// The subtext is on screen at the minimum window size. It is the whole
