@@ -10,6 +10,31 @@ things can still change between minor versions.
 
 ## Unreleased
 
+## 0.14.0 - 2026-08-30
+
+### Keeping an encrypted copy on this PC no longer asks for anything
+
+Turning that setting on used to stop Deskwarden starting at all: it wanted
+Windows Hello every launch, and when the prompt did not appear it waited for
+it forever, with no window and nothing in the log.
+
+The copy is now protected the same way the key that unlocks your vault
+already is — kept on this PC, protected by Windows. **No prompt, ever.** A PC
+without Windows Hello can use the setting now, which it could not before.
+
+**What that means, plainly:** anyone who can run programs as you on this PC
+can read the copy, and so can someone who takes this disk and knows your
+Windows password. That is the same protection your vault key already had, and
+the same trade other password managers make when you tell them not to lock.
+When it locks is still yours to choose, under **Lock the vault when you step
+away**.
+
+The setting's description said it was protected by a TPM chip. That stopped
+being true and now says what actually gates the file.
+
+**Your existing copy is rebuilt once** on first launch after updating, because
+the old one cannot be opened with the new key. Nothing is lost — it is a cache.
+
 ## 0.13.2 - 2026-08-30
 
 ### Fixed
