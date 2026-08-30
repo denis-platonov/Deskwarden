@@ -4,9 +4,17 @@
 //! outbound-publishing action in this app; everything else is local. That
 //! makes an accidental Send a real harm, and a Send that cannot be revoked a
 //! worse one -- so the feature lands list-and-delete before create, and this
-//! module is deliberately the half that can do neither. **Nothing here spawns
-//! a process.** [`SendRunner`] is a trait with no production implementation
-//! yet; the only implementation in the crate today is the test fake below.
+//! module is deliberately the half that can do neither.
+//!
+//! **That is no longer where this module stands, and the sentence that
+//! said so outlived it.** It read "Nothing here spawns a process" and
+//! called `SendRunner` a trait with no production implementation. Both
+//! were true for one step. `CliSendRunner` below runs `bw`, which is why
+//! Sends are one of the last things keeping that binary on the machine.
+//! What remains true, and is load-bearing wherever it is repeated, is
+//! that no implementation of the trait is `pub`: the runner is private,
+//! so nothing outside this module can publish a Send by supplying its
+//! own.
 //!
 //! ## What was measured about `bw`, and what follows from it
 //!
@@ -1047,9 +1055,11 @@ pub fn parse_send_list(stdout: &str) -> Result<Vec<SendSummary>, SendError> {
 
 /// Runs one [`SendInvocation`] and hands back what `bw` said.
 ///
-/// **There is no production implementation in this crate yet**, and that is
-/// the whole point of the step order: with only the fake below, nothing in
-/// this app can publish anything. Step 2 adds the real one.
+/// **The production implementation is `CliSendRunner`, and it is private.**
+/// This said there was none, which was true until step 2 added it. What it
+/// was protecting still holds in the form that matters: no implementation
+/// is `pub`, so a caller outside this module cannot supply its own runner
+/// and publish through it.
 pub trait SendRunner {
     fn run(&self, inv: &SendInvocation) -> Result<RawOutput, SendError>;
 
