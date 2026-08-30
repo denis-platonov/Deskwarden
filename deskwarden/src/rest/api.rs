@@ -1859,6 +1859,37 @@ pub(crate) fn base64_url_no_pad(bytes: &[u8]) -> String {
     out.replace('+', "-").replace('/', "_")
 }
 
+/// The inverse of [`base64_url_no_pad`], and **a reader of untrusted text**.
+///
+/// Its one caller is [`crate::rest::send_link::parse`], which is handed a URL
+/// the user pasted from somewhere this app did not write. So the alphabet is
+/// checked *before* anything is substituted: a `+` or a `/` is not base64url
+/// and is refused rather than quietly accepted, exactly as
+/// [`crate::record::seal::base64_from`] -- the one decoder in this crate,
+/// which this delegates to rather than duplicating -- refuses a stray
+/// character rather than skipping a byte.
+///
+/// `None` for anything that is not exactly unpadded base64url. Padding is
+/// re-added here because `base64_from` is a standard-base64 reader and wants
+/// whole four-character groups; a length that is `1 mod 4` encodes no whole
+/// byte at all and is refused outright.
+pub(crate) fn base64_url_decode(text: &str) -> Option<Vec<u8>> {
+    if text.is_empty()
+        || !text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    let mut standard = text.replace('-', "+").replace('_', "/");
+    match standard.len() % 4 {
+        0 => {}
+        2 => standard.push_str("=="),
+        3 => standard.push('='),
+        // One leftover character carries six bits and therefore no whole byte.
+        _ => return None,
+    }
+    crate::record::seal::base64_from(&standard)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1895,6 +1926,37 @@ mod tests {
         // base64 and must come out as "_-8".
         assert_eq!(base64_url_no_pad(&[0xff, 0xef]), "_-8");
         assert_eq!(base64_url_no_pad(b""), "");
+    }
+
+    /// **The decoder is the encoder's inverse, and it refuses everything
+    /// else.** It reads a key out of a URL somebody else wrote, so the
+    /// negative half is the point: a `+`, a `/`, a `=` or any other stray
+    /// character is a refusal and never a byte quietly skipped.
+    #[test]
+    fn base64url_decoding_inverts_the_encoding_and_refuses_anything_else() {
+        // RFC 4648 section 10's vectors again, run backwards through the
+        // encoder's own answers -- so a decoder that disagreed with the
+        // encoder about the two substituted characters fails here.
+        for original in [b"f".to_vec(), b"foobar".to_vec(), vec![0xff, 0xef], vec![6u8; 16]] {
+            let encoded = base64_url_no_pad(&original);
+            assert_eq!(
+                base64_url_decode(&encoded).as_deref(),
+                Some(original.as_slice()),
+                "{encoded:?} did not decode back to what encoded it"
+            );
+        }
+        // The two substituted characters specifically: `_-8` is 0xff 0xef and
+        // the STANDARD spelling of the same bytes must be refused, because it
+        // is not what a Bitwarden link carries.
+        assert_eq!(base64_url_decode("_-8").as_deref(), Some([0xffu8, 0xef].as_slice()));
+        assert_eq!(base64_url_decode("/+8"), None, "standard base64 is not base64url");
+        assert_eq!(base64_url_decode("/+8="), None, "padded standard base64 is not base64url");
+
+        // Refusals: padding, whitespace, a stray character, and a length that
+        // encodes no whole byte.
+        for bad in ["Zg==", "Zg=", "Zm9v YmFy", "Zm9vYmFy!", "Z", "ZZZZZ", ""] {
+            assert_eq!(base64_url_decode(bad), None, "{bad:?} was decoded rather than refused");
+        }
     }
 
     #[test]

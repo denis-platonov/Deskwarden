@@ -112,5 +112,8 @@ pub mod crypto;
 pub mod send;
 /// A Send's own key hierarchy, which is not the vault's. Pure; no I/O.
 pub mod send_crypto;
+/// One pasted Send link, taken apart -- and refused when its host is not the
+/// account's own. Pure; no I/O.
+pub mod send_link;
 pub mod sync;
 pub mod write;
