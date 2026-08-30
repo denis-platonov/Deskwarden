@@ -291,6 +291,48 @@ fn account_is_self_hosted(status: Option<AccountStatus>) -> bool {
     }
 }
 
+/// Whether this page shows the rows that are only about the `bw serve`
+/// subprocess.
+///
+/// **Reached through [`crate::backend_policy::choose`], never re-decided
+/// here.** That is [`account_is_self_hosted`]'s rule one function above, and
+/// it is load-bearing in the same way: a page with its own idea of "which
+/// backend" is a page whose switch and whose rows can disagree by one edit.
+///
+/// # It reads the CHOSEN backend, not the running one
+///
+/// `use_official_bw_crypto` is captured once, by `main`'s `BackendSettlement`,
+/// so the click does not take effect until the next launch. This still follows
+/// the *live* value, which is what the backend row's gate did before it and
+/// for the same reason: a row that disappeared a restart after the switch that
+/// removed it would leave the user looking at a page that disagrees with the
+/// click they just made.
+fn cli_rows_are_shown(server: Option<&str>, use_official_bw_crypto: bool) -> bool {
+    matches!(
+        crate::backend_policy::choose(server, use_official_bw_crypto),
+        crate::backend_policy::VaultBackendChoice::BwServe
+    )
+}
+
+/// The server this page's account is on, or `None` for everything that is not
+/// a signed-in account with one.
+///
+/// `None` is bitwarden.com **by definition** and not "not known yet" --
+/// [`crate::backend_policy::is_self_hosted`] says so in as many words -- so
+/// the `Checking` and `SignedOut` arms landing here is the safe direction and
+/// not an oversight: unknown counts as official, and the `bw` rows are the
+/// ones a user already had.
+///
+/// One reader for the two call sites in [`draw_backend_card`], so a mid-frame
+/// status arrival cannot give the switch and the row below it different
+/// answers.
+fn account_server(status: &Option<AccountStatus>) -> Option<&str> {
+    match status {
+        Some(AccountStatus::SignedIn { server, .. }) => server.as_deref(),
+        _ => None,
+    }
+}
+
 /// The encrypted disk cache's label. It names the file rather than the
 /// benefit, because the benefit ("opens instantly") is not the part a user
 /// has to weigh.
@@ -9555,6 +9597,89 @@ mod tests {
         // as official, which is the direction that leaves the row ghosted
         // rather than clickable for an account it could not serve.
         assert!(!account_is_self_hosted(None));
+    }
+
+    /// **The whole partition, as one table**: eight combinations, and the
+    /// single `DirectRest` row is the only one that hides anything.
+    ///
+    /// Driven through this page's own predicate rather than through `choose`
+    /// directly, because the mutation this guards is a page that re-decides
+    /// "which backend" for itself and drifts from the switch above the row.
+    #[test]
+    fn the_cli_rows_are_shown_for_every_account_except_the_built_in_one() {
+        let self_hosted = Some("https://vault.example.com");
+        let official = Some("https://vault.bitwarden.com");
+        let unknown = Some("");
+
+        // The one arm that hides: positively self-hosted AND opted out.
+        assert!(
+            !cli_rows_are_shown(self_hosted, false),
+            "the built-in client has no `bw serve`, so the rows about it must not be drawn"
+        );
+
+        // Every other combination is `bw serve`, so the rows decide something
+        // and are drawn. All seven, because a predicate that read only the
+        // toggle -- or only the server -- would pass some of them.
+        for (server, use_official, why) in [
+            (self_hosted, true, "self-hosted, official CLI chosen"),
+            (official, true, "bitwarden.com, official CLI chosen"),
+            (official, false, "bitwarden.com, opted out -- but it cannot opt out"),
+            (unknown, true, "unknown server, official CLI chosen"),
+            (unknown, false, "unknown server counts as official"),
+            (None, true, "no server URL is bitwarden.com by definition"),
+            (None, false, "no server URL is bitwarden.com by definition"),
+        ] {
+            assert!(
+                cli_rows_are_shown(server, use_official),
+                "{why}: this account is served by `bw serve`, so the rows about it are real"
+            );
+        }
+    }
+
+    /// **The predicate is `backend_policy`'s answer and not a second one.**
+    ///
+    /// Without this, `cli_rows_are_shown` could be written as
+    /// `is_self_hosted(server) == false || use_official` -- which happens to
+    /// agree today and would drift the first time `choose` gained an input.
+    #[test]
+    fn the_predicate_is_exactly_the_backend_policy_decision() {
+        use crate::backend_policy::{choose, VaultBackendChoice};
+        for server in
+            [None, Some(""), Some("https://vault.example.com"), Some("https://bitwarden.eu")]
+        {
+            for use_official in [true, false] {
+                assert_eq!(
+                    cli_rows_are_shown(server, use_official),
+                    choose(server, use_official) == VaultBackendChoice::BwServe,
+                    "the page disagrees with `backend_policy::choose` for \
+                     server={server:?} use_official={use_official}"
+                );
+            }
+        }
+    }
+
+    /// The server reader, including the two states that are not a signed-in
+    /// account. `Checking` is the one that matters: it lasted 2.8 seconds on
+    /// the machine this page's account row was reported from, and it must read
+    /// as "unknown", which `is_self_hosted` already treats as official.
+    #[test]
+    fn the_page_reads_the_server_off_the_status_and_nothing_else() {
+        assert_eq!(
+            account_server(&Some(AccountStatus::SignedIn {
+                email: None,
+                server: Some("https://vault.example.com".to_string()),
+            })),
+            Some("https://vault.example.com")
+        );
+        // `None` for bitwarden.com by definition -- `backend_policy`'s rule,
+        // not this page's.
+        assert_eq!(
+            account_server(&Some(AccountStatus::SignedIn { email: None, server: None })),
+            None
+        );
+        assert_eq!(account_server(&Some(AccountStatus::Checking)), None);
+        assert_eq!(account_server(&Some(AccountStatus::SignedOut)), None);
+        assert_eq!(account_server(&None), None);
     }
 
     // -- no page of prose ---------------------------------------------------
