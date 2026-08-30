@@ -94,6 +94,28 @@ pub fn effective_auto_lock(
     }
 }
 
+/// **Whether THIS window may stay loaded, re-read rather than remembered.**
+///
+/// `started_with` is what `settings.json` said when this process started,
+/// which is what decided whether it has [`HideHooks`] at all.
+/// `edited` is what the gear's modal has said since.
+///
+/// The same shape as [`effective_auto_lock`] and for the same reason: a
+/// preference the user changed in this window must bind in this window.
+/// The off-direction is the sharp one -- a user who has just turned *Open
+/// the vault instantly* off and then closed the window would otherwise
+/// watch the process stay resident anyway, which is the setting appearing
+/// not to work at the exact moment it is being tested.
+fn effective_keep_ui_loaded(
+    edited: Option<&crate::settings::Settings>,
+    started_with: bool,
+) -> bool {
+    match edited {
+        Some(edited) => edited.keep_ui_loaded,
+        None => started_with,
+    }
+}
+
 /// What one frame of the idle timer decides.
 ///
 /// Split out of [`run`]'s update closure so it can be tested at all: `run`
@@ -1328,6 +1350,12 @@ pub fn build_frame_with_search(
     // thread touches -- 0 nothing yet, 1 show, 2 the wait failed.
     let hide_hooks = hide;
     let hidden = std::rc::Rc::new(std::cell::Cell::new(false));
+    // **The fourth cell: whether the daemon already has this window's
+    // preferences edit.** Not part of the outcome the daemon reads -- it is a
+    // fact about the CHANNEL -- and deliberately separate from
+    // `edited_settings`, whose "`Some` for the rest of the window's life"
+    // contract five readers depend on. See `deliver_if_needed`.
+    let delivered = std::rc::Rc::new(std::cell::Cell::new(false));
     let waiting_for_show = std::rc::Rc::new(std::cell::Cell::new(false));
     let woken = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
 
@@ -1388,6 +1416,11 @@ pub fn build_frame_with_search(
                 ui.ctx(),
                 hide_hooks.as_ref(),
                 &hidden,
+                &delivered,
+                // `hide_hooks` being `Some` IS `keep_ui_loaded` having been on
+                // when this process started -- see `HideHooks`'s own doc -- so
+                // this is that startup value rather than a second copy of it.
+                hide_hooks.is_some(),
                 &locked_for_closure,
                 &needs_reauth_for_closure,
                 &edited_settings_for_closure,
@@ -2173,6 +2206,11 @@ pub fn build_frame_with_search(
                 ui.ctx(),
                 hide_hooks.as_ref(),
                 &hidden,
+                &delivered,
+                // `hide_hooks` being `Some` IS `keep_ui_loaded` having been on
+                // when this process started -- see `HideHooks`'s own doc -- so
+                // this is that startup value rather than a second copy of it.
+                hide_hooks.is_some(),
                 &locked_for_closure,
                 &needs_reauth_for_closure,
                 &edited_settings_for_closure,
@@ -2180,7 +2218,34 @@ pub fn build_frame_with_search(
                 &add_account_for_closure,
                 &remove_account_for_closure,
             ),
-            ChromeAction::Minimize => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+            // **Minimize is not a hide, and must not become one.**
+            //
+            // It sends the viewport command and nothing else: no
+            // `close_or_hide`, no hide rule, no hook. A minimized window
+            // is still IN USE -- it has a taskbar button, the user
+            // restores it with one click and no daemon involvement, and it
+            // is holding a decrypted vault on a machine its owner is
+            // sitting at. So it keeps the visibility name (`vault_is_in_use`
+            // must go on answering `true`, or save-memory would stop
+            // `bw serve` under a window one click from the foreground) and
+            // it keeps its vault-service attachment.
+            //
+            // A hide is the opposite on every count: no taskbar button, no
+            // way back except the daemon's named event, attachment dropped
+            // precisely so the backend may stop.
+            //
+            // **And it is deliberately NOT gated on `keep_ui_loaded`.**
+            // Gating it would make that setting change what the minimize
+            // button does, and would leave a window with the setting off
+            // unminimizable. The reported defect's "only goes on minimize"
+            // was this path being the one that happened to keep the
+            // process -- the fix is that a close keeps it too, not that a
+            // minimize stops.
+            //
+            // `the_minimize_arm_does_not_go_through_the_hide_rule` pins it.
+            ChromeAction::Minimize => {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true))
+            }
             ChromeAction::None => {}
         }
         ui.spacing_mut().item_spacing.y = saved_item_spacing_y;
@@ -4944,8 +5009,33 @@ pub fn build_frame_with_search(
         if let Some(state) = prefs.as_mut() {
             let action = crate::prefs_ui::draw_prefs_modal(ui.ctx(), state);
             *edited_settings_for_closure.borrow_mut() = Some(state.settings.clone());
+            // **Every frame the modal is up, the delivery is owed again.**
+            // The cell above is rewritten every frame, so a second visit to
+            // the gear that changes something must be re-delivered on its own
+            // dismissal and on the close. Over-delivering costs one file write
+            // and one `SetEvent` -- the daemon's write-back is guarded by
+            // `edited != settings` -- while under-delivering loses a setting.
+            //
+            // The RESET is per frame; the DELIVERY is on dismissal and on
+            // close. If a future change ever moves the delivery into this
+            // block unconditionally, it becomes a write per frame and has to
+            // be debounced.
+            delivered.set(false);
             if action == crate::prefs_ui::PrefsAction::Close {
                 prefs = None;
+                // **Hand it to the daemon now, not at the close.** The
+                // window is staying open, and a preference the user just
+                // changed should bind now -- which is what the tray's
+                // Preferences item has always done. Before this, a
+                // `keep_backend_running` change made here did nothing
+                // until the window closed.
+                //
+                // A `None` hook set is a window with `keep_ui_loaded`
+                // off, which has no channel and does not need one: it
+                // will exit and the result file will carry this.
+                if let Some(hooks) = hide_hooks.as_ref() {
+                    let _ = deliver_if_needed(hooks, &edited_settings_for_closure, &delivered);
+                }
             }
         }
 
@@ -5062,6 +5152,8 @@ fn close_or_hide(
     ctx: &egui::Context,
     hooks: Option<&HideHooks>,
     hidden: &std::rc::Rc<std::cell::Cell<bool>>,
+    delivered: &std::rc::Rc<std::cell::Cell<bool>>,
+    started_keep_ui_loaded: bool,
     locked: &Rc<RefCell<bool>>,
     needs_reauth: &Rc<RefCell<bool>>,
     edited_settings: &Rc<RefCell<Option<crate::settings::Settings>>>,
@@ -5081,7 +5173,23 @@ fn close_or_hide(
         add_account: *add_account.borrow(),
         remove_account: *remove_account.borrow(),
     };
-    if crate::ui_process::on_close(true, &crossing) == crate::ui_process::OnClose::Exit {
+    // **Deliver before deciding.** This covers Alt+F4 with the modal still
+    // up -- the case the every-frame write into `edited_settings` exists
+    // for -- and is a no-op when the modal's own dismissal already
+    // delivered. A refusal here means no daemon is holding the doorbell,
+    // and the window then closes so the result file can carry the edit,
+    // which is exactly what it did before this feature.
+    let settings_delivered = deliver_if_needed(hooks, edited_settings, delivered);
+    // **The setting is re-read, not remembered.** A user who has just
+    // turned *Open the vault instantly* off in this window's own modal
+    // must not watch this process stay loaded. See
+    // `effective_keep_ui_loaded`, and `effective_auto_lock` for the
+    // precedent in the same file.
+    let keep_loaded =
+        effective_keep_ui_loaded(crossing.edited_settings.as_ref(), started_keep_ui_loaded);
+    if crate::ui_process::on_close(keep_loaded, &crossing, settings_delivered)
+        == crate::ui_process::OnClose::Exit
+    {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         return;
     }
@@ -5093,6 +5201,42 @@ fn close_or_hide(
          immediate"
     );
     ctx.request_repaint();
+}
+
+/// **Whether there is nothing left for the daemon to hear about the
+/// settings**, delivering them first if there is.
+///
+/// `true` means the daemon either has this window's preferences edit or
+/// there was never one to have. `false` means an edit exists and could not
+/// be handed over, and the caller must therefore end this process so the
+/// result file can carry it.
+///
+/// Idempotent: once `delivered` is set, this neither writes nor presses
+/// anything, so the two call sites (the modal's dismissal and the close)
+/// cost one delivery between them rather than one each.
+fn deliver_if_needed(
+    hooks: &HideHooks,
+    edited_settings: &Rc<RefCell<Option<crate::settings::Settings>>>,
+    delivered: &std::rc::Rc<std::cell::Cell<bool>>,
+) -> bool {
+    if delivered.get() {
+        return true;
+    }
+    let borrowed = edited_settings.borrow();
+    let Some(settings) = borrowed.as_ref() else {
+        // Nothing outstanding is not a refusal; the gear was never opened.
+        return true;
+    };
+    if (hooks.deliver_settings)(settings) {
+        delivered.set(true);
+        true
+    } else {
+        log::info!(
+            "no daemon answered this window's settings delivery; it will close rather than \
+             hide, so the edit reaches the daemon in the result file"
+        );
+        false
+    }
 }
 
 /// **What a window does instead of closing, when its process may stay
@@ -5120,6 +5264,22 @@ pub struct HideHooks {
     /// Called on the frame thread just after the viewport is shown
     /// again. Production retakes the attachment slot.
     pub on_shown: Box<dyn Fn()>,
+    /// **Hand a preferences edit to the daemon while this window stays
+    /// alive**, returning whether it landed.
+    ///
+    /// This is the second transport `crate::ui_process::on_close`'s relaxed
+    /// rule depends on. Production writes
+    /// `crate::ui_process::edited_settings_path` and presses
+    /// `crate::ui_show::settings_name`; `false` means nobody is holding that
+    /// doorbell, and the window must then fall back to the only transport
+    /// there has ever been -- exiting, with the settings in the result file.
+    ///
+    /// Boxed and taking `&Settings` rather than owning it, because the
+    /// cell it comes from is NOT emptied by a delivery: `edited_settings`
+    /// stays `Some` for the rest of the window's life (five readers depend
+    /// on that) and re-delivery on exit is harmless -- the daemon's
+    /// write-back is guarded by `edited != settings`.
+    pub deliver_settings: Box<dyn Fn(&crate::settings::Settings) -> bool>,
 }
 
 pub struct VaultFrameEnv {
@@ -10722,6 +10882,210 @@ mod hide_shape_tests {
             "Alt+F4 is not intercepted, so the OS close path would end the process while \
              the titlebar's X hides it -- two answers to one gesture"
         );
+    }
+}
+
+/// **The live settings channel, from the window's side.**
+///
+/// Nothing here reaches the kernel or the disk: the file write and the
+/// `SetEvent` are `main.rs`'s production `deliver_settings` hook, and this
+/// module drives the decisions around it with a hook of its own.
+#[cfg(test)]
+mod hide_delivery_tests {
+    use super::*;
+
+    /// A hook set whose delivery answer is `answer` and which counts its
+    /// attempts. The other three hooks do nothing: no test here hides a real
+    /// viewport.
+    fn hooks_answering(
+        answer: &std::rc::Rc<std::cell::Cell<bool>>,
+        attempts: &std::rc::Rc<std::cell::Cell<usize>>,
+    ) -> HideHooks {
+        let answer = std::rc::Rc::clone(answer);
+        let attempts = std::rc::Rc::clone(attempts);
+        HideHooks {
+            wait_for_show: std::sync::Arc::new(|| false),
+            on_hidden: Box::new(|| {}),
+            on_shown: Box::new(|| {}),
+            deliver_settings: Box::new(move |_| {
+                attempts.set(attempts.get() + 1);
+                answer.get()
+            }),
+        }
+    }
+
+    /// **The modal's live value wins, in BOTH directions**, the way
+    /// `effective_auto_lock`'s does.
+    ///
+    /// The off-direction is the one this feature makes reachable: before it,
+    /// an edited `keep_ui_loaded` forced the window to exit, so the stale
+    /// parameter could never be consulted. After it, a window started with the
+    /// setting on whose user has just turned it off would otherwise hide --
+    /// and a user who just asked for the process not to stay loaded would
+    /// watch it stay loaded.
+    #[test]
+    fn the_modal_decides_whether_this_window_may_stay_loaded() {
+        let off = crate::settings::Settings { keep_ui_loaded: false, ..Default::default() };
+        let on = crate::settings::Settings { keep_ui_loaded: true, ..Default::default() };
+
+        assert!(
+            !effective_keep_ui_loaded(Some(&off), true),
+            "the window was started with the setting on and the user has just turned it off; \
+             it must not stay loaded"
+        );
+        assert!(
+            effective_keep_ui_loaded(Some(&on), false),
+            "the user turned it on in this window's own modal and it did not take effect"
+        );
+        assert!(
+            effective_keep_ui_loaded(None, true),
+            "control: with no modal ever opened the startup value must still decide"
+        );
+        assert!(!effective_keep_ui_loaded(None, false));
+    }
+
+    /// **Delivery is attempted once, and its ANSWER is believed.**
+    ///
+    /// `false` means no daemon is holding the doorbell, and the window must
+    /// then keep the old transport: exit, and carry the settings home in the
+    /// result file. `true` means a live daemon has the payload and the window
+    /// is free to hide.
+    ///
+    /// The two halves are each other's control: an implementation that always
+    /// returned `true` fails the first assertion, and one that always returned
+    /// `false` fails the second.
+    #[test]
+    fn a_refused_delivery_is_not_recorded_as_delivered() {
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let answer = std::rc::Rc::new(std::cell::Cell::new(false));
+        let hooks = hooks_answering(&answer, &attempts);
+
+        let edited: Rc<RefCell<Option<crate::settings::Settings>>> =
+            Rc::new(RefCell::new(Some(crate::settings::Settings::default())));
+        let delivered = std::rc::Rc::new(std::cell::Cell::new(false));
+
+        assert!(
+            !deliver_if_needed(&hooks, &edited, &delivered),
+            "a refused delivery reported success"
+        );
+        assert!(!delivered.get(), "a refused delivery was recorded as delivered");
+        assert_eq!(attempts.get(), 1);
+
+        answer.set(true);
+        assert!(
+            deliver_if_needed(&hooks, &edited, &delivered),
+            "an accepted delivery reported failure"
+        );
+        assert!(delivered.get());
+        assert_eq!(attempts.get(), 2, "control: the retry after a refusal never reached the hook");
+
+        // Already delivered: no second attempt, and still `true`.
+        assert!(deliver_if_needed(&hooks, &edited, &delivered));
+        assert_eq!(attempts.get(), 2, "an already-delivered edit was sent a second time");
+    }
+
+    /// **Nothing to deliver is a delivered state, not a refusal.** A window
+    /// that never opened the gear has nothing outstanding, so `close_or_hide`
+    /// must not read "no delivery happened" as "an edit is being withheld".
+    #[test]
+    fn a_window_that_never_opened_the_gear_has_nothing_outstanding() {
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let answer = std::rc::Rc::new(std::cell::Cell::new(true));
+        let hooks = hooks_answering(&answer, &attempts);
+        let edited: Rc<RefCell<Option<crate::settings::Settings>>> = Rc::new(RefCell::new(None));
+        let delivered = std::rc::Rc::new(std::cell::Cell::new(false));
+
+        assert!(deliver_if_needed(&hooks, &edited, &delivered));
+        assert_eq!(attempts.get(), 0, "an empty cell was delivered to the daemon anyway");
+
+        // Control: the same hooks DO reach the daemon when there is something
+        // to deliver, so the zero above is not zero because the hook is dead.
+        *edited.borrow_mut() = Some(crate::settings::Settings::default());
+        assert!(deliver_if_needed(&hooks, &edited, &delivered));
+        assert_eq!(attempts.get(), 1, "control: a real edit never reached the hook either");
+    }
+
+    /// **A window whose user has just turned the setting OFF does not hide**,
+    /// even with its edit delivered.
+    ///
+    /// This case is only reachable because of this branch: before it, an
+    /// edited `keep_ui_loaded` forced an exit, so the stale startup value was
+    /// never consulted. The user's very first act after turning *Open the
+    /// vault instantly* off is to close the window and see whether it worked.
+    #[test]
+    fn turning_the_setting_off_in_the_modal_stops_this_window_hiding() {
+        let turned_off =
+            crate::settings::Settings { keep_ui_loaded: false, ..Default::default() };
+        let crossing = crate::ui_process::UiVaultResult {
+            edited_settings: Some(turned_off.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::ui_process::on_close(
+                effective_keep_ui_loaded(Some(&turned_off), true),
+                &crossing,
+                true,
+            ),
+            crate::ui_process::OnClose::Exit,
+            "the user turned the setting off and the process stayed loaded anyway"
+        );
+
+        // Control: the same delivered edit with the setting left ON does hide,
+        // so the assertion above is not passing because nothing ever hides.
+        let left_on = crate::settings::Settings { keep_ui_loaded: true, ..Default::default() };
+        assert_eq!(
+            crate::ui_process::on_close(
+                effective_keep_ui_loaded(Some(&left_on), true),
+                &crate::ui_process::UiVaultResult {
+                    edited_settings: Some(left_on),
+                    ..Default::default()
+                },
+                true,
+            ),
+            crate::ui_process::OnClose::Hide
+        );
+    }
+
+    /// **Minimize is not a hide, and now says so.**
+    ///
+    /// The reported defect's second sentence -- "only goes on minimize" -- was
+    /// a minimized window keeping its process by never running
+    /// `close_or_hide` at all. That is CORRECT and stays: a minimized window
+    /// has a taskbar button, is restored without the daemon, and is still
+    /// using the vault, so it must keep the visibility name and the
+    /// attachment. This pins that the `Minimize` arm neither consults the hide
+    /// rule nor touches the hooks, so a future "unify close and minimize"
+    /// cannot quietly make a minimized window drop its attachment and strand
+    /// `bw serve`.
+    #[test]
+    fn the_minimize_arm_does_not_go_through_the_hide_rule() {
+        let source = include_str!("mod.rs");
+        let arm = source
+            .split(concat!("ChromeAction::Min", "imize =>"))
+            .nth(1)
+            .expect("the Minimize arm")
+            .split(concat!("ChromeAction::N", "one"))
+            .next()
+            .expect("the arm ends before the None arm");
+        assert!(
+            arm.contains(concat!("Minim", "ized(true)")),
+            "control: this is not the Minimize arm any more, so the assertions below \
+             are reading the wrong text"
+        );
+        for forbidden in [
+            concat!("close_or_", "hide"),
+            concat!("on_", "close"),
+            concat!("hide_", "hooks"),
+            concat!("deliver_if_", "needed"),
+        ] {
+            assert!(
+                !arm.contains(forbidden),
+                "the Minimize arm now mentions `{forbidden}`. A minimized window is still IN \
+                 USE -- taskbar button, one-click restore, decrypted vault on a machine its \
+                 owner is at -- so it must keep the visibility name and the vault attachment \
+                 that a hide deliberately drops"
+            );
+        }
     }
 }
 
@@ -20343,7 +20707,13 @@ mod preferences_modal_wiring_tests {
             // 60 as of `keep_ui_loaded`, which added `mod hide_shape_tests`
             // -- that hiding is a viewport command sent from inside the
             // running app, and that the eframe host is entered exactly once.
-            modules, 60,
+            // 61 as of the live settings channel, which added
+            // `mod hide_delivery_tests` -- that a delivery's answer is
+            // believed, that nothing outstanding is not a refusal, and that
+            // the modal's live `keep_ui_loaded` beats the startup value.
+            // Raised deliberately: one more module must now be a clean,
+            // column-0, gated block that the walk really reaches.
+            modules, 61,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"

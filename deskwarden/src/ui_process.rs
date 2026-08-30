@@ -428,30 +428,40 @@ pub enum OnClose {
 
 /// **Whether this close hides the window or ends its process.**
 ///
-/// Hiding is safe for exactly one result: the empty one. Every field of
-/// [`UiVaultResult`] is something the daemon acts on, and the only way any
-/// of them reaches the daemon is this process exiting -- the result file
-/// is named by pid and read when the child is reaped. A process that hid
-/// while holding a set field would be a lock, a switch or a settings edit
-/// that silently never happened.
+/// Every field of [`UiVaultResult`] is something the daemon acts on, and a
+/// window that hid while holding one it had not delivered would be a lock,
+/// a switch or a settings edit that silently never happened.
 ///
-/// **This deliberately does not mirror `vault_follow_up`'s `Done`.** That
-/// function answers a different question -- what the daemon does next --
-/// and it does not read `edited_settings`, because by the time it is
-/// consulted the daemon has already applied that field (`main.rs:7121`,
-/// which also runs `apply_disk_cache_change` from it). Hiding on `Done`
-/// alone would swallow a preferences edit and leave the daemon running
-/// against settings the user had changed.
-/// `the_hide_rule_is_stricter_than_done` in `main.rs` holds the two
-/// together, over every combination of the six fields.
+/// **Five of the six can only travel by this process exiting.** They are
+/// each a *reason the window closed* -- the daemon's answer to every one
+/// is `resettle_session` or an account settle, and it needs the window
+/// gone to run either. So they still force an exit, whatever else is true.
+///
+/// **`edited_settings` is the exception, and it always was the odd one
+/// out**: its own doc says it is "not a reason the window closed -- the
+/// window closed for whatever it closed for, and this rides along". It now
+/// has a second route home -- `vault_window::HideHooks::deliver_settings`, a
+/// file and a doorbell the daemon reads while this process is still alive --
+/// and `settings_delivered` says whether that route was taken. It is a
+/// parameter rather than a field of the result because it is a fact about
+/// the CHANNEL, not about the window's outcome: the result crossing the
+/// process boundary is unchanged, and the daemon never sees this flag.
+///
+/// **This still does not mirror `vault_follow_up`'s `Done`.** That
+/// function does not read `edited_settings` at all, because by the time it
+/// is consulted the daemon has applied it. Hiding on `Done` alone would
+/// hide an UNDELIVERED edit, which is the defect this whole rule exists to
+/// prevent. `the_hide_rule_is_stricter_than_done` in `main.rs` holds the
+/// two together over every combination of the six fields, at both values
+/// of this flag.
 #[must_use]
-pub fn on_close(keep_loaded: bool, result: &UiVaultResult) -> OnClose {
+pub fn on_close(keep_loaded: bool, result: &UiVaultResult, settings_delivered: bool) -> OnClose {
     let nothing_to_report = !result.locked
         && !result.needs_reauth
         && !result.add_account
         && !result.remove_account
         && result.switch_to.is_none()
-        && result.edited_settings.is_none();
+        && (result.edited_settings.is_none() || settings_delivered);
     if keep_loaded && nothing_to_report {
         OnClose::Hide
     } else {
@@ -494,6 +504,76 @@ pub fn read_result(path: &Path) -> Option<UiVaultResult> {
         Err(e) => {
             log::warn!("could not read the UI process's result file at {}: {e}", path.display());
             None
+        }
+    }
+}
+
+/// **Where a resident UI process leaves a preferences edit for the daemon
+/// to pick up, without exiting to deliver it.**
+///
+/// Named by pid for [`result_path`]'s reasons, and a DIFFERENT name from
+/// it: that file is the child's last act and is deleted by the daemon
+/// after the reap, so sharing it would be a truncating write racing a
+/// delete across two processes.
+pub fn edited_settings_path(config_dir: &Path, pid: u32) -> PathBuf {
+    config_dir.join(format!("ui-settings-{pid}.json"))
+}
+
+/// Write a preferences edit for the daemon, **atomically**.
+///
+/// Temp-then-rename rather than `fs::write`, because unlike the result
+/// file this one is read while both processes are alive. `fs::write`
+/// truncates before it writes, so a daemon that polled on a timer could
+/// read an empty file. Production never polls on a timer -- it reads only
+/// after the doorbell, which is set after this returns -- and the rename
+/// is the belt to that braces: a second delivery over the first cannot be
+/// observed half-applied either.
+pub fn write_edited_settings(path: &Path, settings: &Settings) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(settings).map_err(io::Error::other)?;
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, json)?;
+    // `fs::rename` is `MoveFileEx` with `REPLACE_EXISTING` on Windows, so
+    // this lands over an earlier delivery rather than failing on it.
+    std::fs::rename(&temp, path)
+}
+
+/// Read a preferences edit, from the daemon, after the doorbell rang.
+///
+/// `None` for every failure -- absent, unreadable, unparseable -- and each
+/// is the same thing from the daemon's side: nothing to apply. Logged
+/// rather than silent, for [`read_result`]'s reason: a consistently
+/// unparseable file presents to the user as "settings changed in the vault
+/// window sometimes do not stick".
+#[must_use]
+pub fn read_edited_settings(path: &Path) -> Option<Settings> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<Settings>(&text) {
+            Ok(settings) => Some(settings),
+            Err(e) => {
+                log::warn!(
+                    "a UI process's settings delivery at {} did not parse ({e})",
+                    path.display()
+                );
+                None
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            log::warn!(
+                "could not read a UI process's settings delivery at {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Delete a delivery once it has been applied. Best effort, for
+/// [`forget_result`]'s reason.
+pub fn forget_edited_settings(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != io::ErrorKind::NotFound {
+            log::warn!("could not delete {} after applying it: {e}", path.display());
         }
     }
 }
@@ -544,14 +624,14 @@ mod tests {
     /// closed the window with nothing to report.
     #[test]
     fn a_plain_close_hides_when_the_setting_is_on() {
-        assert_eq!(on_close(true, &UiVaultResult::default()), OnClose::Hide);
+        assert_eq!(on_close(true, &UiVaultResult::default(), true), OnClose::Hide);
     }
 
     /// **Off means today's behaviour, exactly.** With the setting off no
     /// result hides, or the setting would not be a setting.
     #[test]
     fn nothing_hides_when_the_setting_is_off() {
-        assert_eq!(on_close(false, &UiVaultResult::default()), OnClose::Exit);
+        assert_eq!(on_close(false, &UiVaultResult::default(), true), OnClose::Exit);
     }
 
     /// **Every outcome the daemon acts on exits**, so the result file, the
@@ -561,40 +641,95 @@ mod tests {
     #[test]
     fn every_outcome_the_daemon_acts_on_exits() {
         let locked = UiVaultResult { locked: true, ..Default::default() };
-        assert_eq!(on_close(true, &locked), OnClose::Exit, "a lock must reach the daemon");
+        assert_eq!(on_close(true, &locked, true), OnClose::Exit, "a lock must reach the daemon");
 
         let reauth = UiVaultResult { needs_reauth: true, ..Default::default() };
-        assert_eq!(on_close(true, &reauth), OnClose::Exit, "a re-auth must reach the daemon");
+        assert_eq!(on_close(true, &reauth, true), OnClose::Exit, "a re-auth must reach the daemon");
 
         let switch =
             UiVaultResult { switch_to: Some(AccountId::generate()), ..Default::default() };
-        assert_eq!(on_close(true, &switch), OnClose::Exit, "a switch must reach the daemon");
+        assert_eq!(on_close(true, &switch, true), OnClose::Exit, "a switch must reach the daemon");
 
         let add = UiVaultResult { add_account: true, ..Default::default() };
-        assert_eq!(on_close(true, &add), OnClose::Exit, "an add must reach the daemon");
+        assert_eq!(on_close(true, &add, true), OnClose::Exit, "an add must reach the daemon");
 
         let remove = UiVaultResult { remove_account: true, ..Default::default() };
-        assert_eq!(on_close(true, &remove), OnClose::Exit, "a remove must reach the daemon");
+        assert_eq!(on_close(true, &remove, true), OnClose::Exit, "a remove must reach the daemon");
     }
 
-    /// **A preferences edit exits too, and this is the subtle one.**
+    /// **An UNDELIVERED preferences edit still exits, which is the old rule
+    /// exactly.**
     ///
-    /// `vault_follow_up` returns `Done` for it -- editing preferences is
-    /// not a reason a window closed -- but the daemon reads
-    /// `edited_settings` ABOVE that match (`main.rs:7121`): it copies the
-    /// edited settings into its own estate and runs
-    /// `apply_disk_cache_change`. A window that hid after a visit to the
-    /// gear would withhold both, and the daemon would go on running
-    /// against settings the user had changed.
+    /// The only route `edited_settings` ever had to the daemon was this
+    /// process ending. A window that hid holding an edit nobody had taken
+    /// would withhold the estate copy, `apply_disk_cache_change`,
+    /// `persist_preferences` and the clipboard re-install -- all four.
     #[test]
-    fn a_preferences_edit_exits_even_though_its_follow_up_is_done() {
+    fn an_undelivered_preferences_edit_still_exits() {
         let geared =
             UiVaultResult { edited_settings: Some(Settings::default()), ..Default::default() };
         assert_eq!(
-            on_close(true, &geared),
+            on_close(true, &geared, false),
             OnClose::Exit,
-            "the window hid holding edited settings, so the daemon never applied them"
+            "the window hid holding an edit no daemon had taken, so it never arrived"
         );
+    }
+
+    /// **A DELIVERED preferences edit hides, and this is the whole defect.**
+    ///
+    /// `edited_settings` stays `Some` for the rest of a window's life, so
+    /// under the old rule one visit to the gear made every later close an
+    /// exit -- and the gear is where *Open the vault instantly* lives. The
+    /// user turned the setting on and was rewarded with a cold start and a
+    /// Windows Hello prompt on the very next open.
+    ///
+    /// It may hide now because the edit is no longer being withheld: the
+    /// daemon took it over the live channel while this window was still up.
+    #[test]
+    fn a_delivered_preferences_edit_hides() {
+        let geared =
+            UiVaultResult { edited_settings: Some(Settings::default()), ..Default::default() };
+        assert_eq!(
+            on_close(true, &geared, true),
+            OnClose::Hide,
+            "a visit to Preferences still ends the process, which is the reported defect"
+        );
+    }
+
+    /// **Delivery relaxes ONE field and no other.** A locked window exits
+    /// however delivered its settings are: a lock is a reason the window
+    /// closed and the daemon's whole response to it is a teardown this
+    /// process has to be gone for.
+    #[test]
+    fn delivering_settings_does_not_excuse_any_other_outcome() {
+        for (what, result) in [
+            ("a lock", UiVaultResult { locked: true, ..Default::default() }),
+            ("a re-auth", UiVaultResult { needs_reauth: true, ..Default::default() }),
+            ("an add", UiVaultResult { add_account: true, ..Default::default() }),
+            ("a remove", UiVaultResult { remove_account: true, ..Default::default() }),
+            (
+                "a switch",
+                UiVaultResult { switch_to: Some(AccountId::generate()), ..Default::default() },
+            ),
+        ] {
+            let with_settings = UiVaultResult {
+                edited_settings: Some(Settings::default()),
+                ..result.clone()
+            };
+            assert_eq!(
+                on_close(true, &result, true),
+                OnClose::Exit,
+                "{what} must reach the daemon"
+            );
+            assert_eq!(
+                on_close(true, &with_settings, true),
+                OnClose::Exit,
+                "{what} hid because the settings beside it had been delivered"
+            );
+        }
+        // Control: the empty result DOES hide under the same flag, so the
+        // loop above is not passing because nothing ever hides.
+        assert_eq!(on_close(true, &UiVaultResult::default(), true), OnClose::Hide);
     }
     use super::*;
 
@@ -766,6 +901,99 @@ mod tests {
 
         forget_result(&path);
         assert!(read_result(&path).is_none(), "the file is deleted once it has been read");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scratch directory, in this module's own idiom -- this crate has no
+    /// `tempfile` dev-dependency, so `%TEMP%` keyed by pid and line is what
+    /// every filesystem test here uses.
+    fn scratch(tag: &str, line: u32) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deskwarden-ui-settings-{tag}-{}-{line}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// **A different file from the result**, and that is the point: the result
+    /// file is written once on the way out and deleted by the daemon after the
+    /// reap. A live channel sharing it would be a truncating write racing a
+    /// delete.
+    #[test]
+    fn the_live_settings_file_is_not_the_result_file() {
+        let dir = Path::new(r"C:\config");
+        assert_ne!(edited_settings_path(dir, 77), result_path(dir, 77));
+        assert_ne!(edited_settings_path(dir, 77), edited_settings_path(dir, 78));
+        assert!(
+            edited_settings_path(dir, 77).to_string_lossy().contains("77"),
+            "not named by pid, so a dead window's file could be read as a live one's"
+        );
+    }
+
+    /// **A reader never sees half a file**, because the write lands by rename.
+    ///
+    /// Asserted by writing a SECOND, different settings over the first and
+    /// reading back: a truncate-in-place implementation passes the round trip
+    /// but leaves a window in which the file is empty. The temp file is
+    /// asserted gone, which is the observable consequence of the rename
+    /// actually being the landing.
+    #[test]
+    fn an_edited_settings_file_lands_whole_and_leaves_no_temp_behind() {
+        let dir = scratch("whole", line!());
+        let path = edited_settings_path(&dir, 77);
+
+        assert!(
+            read_edited_settings(&path).is_none(),
+            "control: read something before anything was written"
+        );
+
+        let first = Settings::default();
+        write_edited_settings(&path, &first).expect("the write should succeed");
+        assert_eq!(read_edited_settings(&path).as_ref(), Some(&first));
+
+        let second = Settings { check_breaches: !first.check_breaches, ..first.clone() };
+        write_edited_settings(&path, &second).expect("the second write should succeed");
+        assert_eq!(
+            read_edited_settings(&path).as_ref(),
+            Some(&second),
+            "the second delivery did not replace the first"
+        );
+
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readable")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "the write left temp files behind: {strays:?}");
+
+        forget_edited_settings(&path);
+        assert!(
+            read_edited_settings(&path).is_none(),
+            "the daemon deleted the file and can still read it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unparseable is `None` and a log line, never a panic -- the same answer
+    /// `read_result` gives, and for the same reason: the daemon's response to
+    /// a file it cannot read is to act on nothing, and the user's response is
+    /// to change the setting again.
+    #[test]
+    fn an_unparseable_delivery_is_ignored_rather_than_fatal() {
+        let dir = scratch("unparseable", line!());
+        let path = edited_settings_path(&dir, 77);
+        std::fs::write(&path, "{ not json").expect("writable");
+        assert!(read_edited_settings(&path).is_none());
+
+        // Control: the same path with real content reads back, so the
+        // assertion above is not passing because the path is wrong.
+        write_edited_settings(&path, &Settings::default()).expect("writable");
+        assert!(
+            read_edited_settings(&path).is_some(),
+            "control: a valid file did not read either"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

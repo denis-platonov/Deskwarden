@@ -70,6 +70,27 @@ pub fn visible_name(pid: u32) -> String {
     format!(r"Local\Deskwarden-UI-Visible-{pid}")
 }
 
+/// **The name a UI process presses to say "I have edited settings for
+/// you".**
+///
+/// The mirror of [`signal_name`]: that one is the daemon asking the child
+/// to show itself, this one is the child asking the daemon to read a file.
+/// Same `Local\` scope and same per-pid keying for the same two reasons --
+/// a global name would cross between users, and a name without the pid
+/// would let a dead process's doorbell be answered on behalf of a live one.
+///
+/// **Created by the DAEMON**, right after the spawn that produces the pid,
+/// and polled with `Signal::wait(0)` once per pass of `main`'s loop. A
+/// blocking wait is impossible there: that loop is what drains the hotkey
+/// and answers the tray.
+///
+/// Auto-reset, like [`signal_name`]'s and unlike `single_instance`'s: this
+/// means *there is something to read now*, which is a token to be consumed.
+#[must_use]
+pub fn settings_name(pid: u32) -> String {
+    format!(r"Local\Deskwarden-UI-Settings-{pid}")
+}
+
 /// A live handle to the event, closed when this is dropped.
 pub struct Signal(HANDLE);
 
@@ -237,6 +258,56 @@ mod tests {
         assert!(name.contains("1234"), "not per-process: {name}");
         assert_ne!(name, signal_name(1234), "the state and the message share a name");
         assert_ne!(visible_name(1234), visible_name(1235));
+    }
+
+    /// A THIRD name, and the third one is the daemon's ear rather than the
+    /// child's. Sharing a name with either of the other two would have the
+    /// daemon consuming the child's show signal, or the child's visibility
+    /// mutex answering a question about settings.
+    #[test]
+    fn the_settings_doorbell_is_its_own_name() {
+        let name = settings_name(1234);
+        assert!(name.starts_with(r"Local\"), "not logon-session scoped: {name}");
+        assert!(name.contains("1234"), "not per-process: {name}");
+        assert_ne!(name, signal_name(1234), "the doorbell shares a name with the show signal");
+        assert_ne!(
+            name,
+            visible_name(1234),
+            "the doorbell shares a name with the visibility mutex"
+        );
+        assert_ne!(settings_name(1234), settings_name(1235));
+    }
+
+    /// **Over the real kernel, in the direction production uses it**: the
+    /// daemon creates and polls with a zero timeout, the child sets, and one
+    /// set is consumed by one read.
+    ///
+    /// The zero-timeout poll is the whole point -- `main`'s loop is what
+    /// answers the hotkey and can never block -- so it is what is asserted,
+    /// not a convenient long wait.
+    #[test]
+    fn the_daemon_can_poll_the_doorbell_without_blocking() {
+        // A pid this process does not have, so a parallel test that really is
+        // this process cannot collide with it.
+        let pid = std::process::id() ^ 0x3333;
+        let env = ShowEnv::production();
+        let ear = (env.create)(&settings_name(pid)).expect("the event should be creatable");
+
+        assert!(!ear.wait(0), "the doorbell rang before anybody pressed it");
+        assert!((env.set)(&settings_name(pid)), "pressing the doorbell failed");
+        assert!(ear.wait(0), "a rung doorbell did not read as rung on a zero-timeout poll");
+        assert!(
+            !ear.wait(0),
+            "the doorbell did not auto-reset; one edit would be applied forever"
+        );
+    }
+
+    /// Nobody listening is a clean `false`. The child reads that as "keep the
+    /// old transport": do not hide, exit and carry the settings home in the
+    /// result file, exactly as before this feature.
+    #[test]
+    fn pressing_a_doorbell_nobody_holds_fails_cleanly() {
+        assert!(!(ShowEnv::production().set)(&settings_name(0xFFFF_FFE0)));
     }
 
     /// **Held means visible, and the holding really is observable from

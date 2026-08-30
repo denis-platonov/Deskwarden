@@ -829,8 +829,16 @@ mod tests {
             // and `the_daemon_never_blocks_on_a_ui_process_pin` from the
             // other. All are `#[cfg(test)] mod` at column 0 below the cut,
             // which is exactly what this walk counts.
-            (6, 6, 0),
-            "below `main.rs`'s cut there are no longer exactly six opened-and-closed test \
+            //
+            // **EIGHT since the live settings channel.** The window that can
+            // hand the daemon a preferences edit without exiting added
+            // `the_live_settings_channel` (the loop's ordering and the
+            // doorbell's ownership) and `the_one_settings_write_back`
+            // (`apply_edited_settings`, driven directly over a real disk
+            // cache). Raised deliberately, and it asserts MORE than six did:
+            // two further modules must now be clean, gated, column-0 blocks.
+            (8, 8, 0),
+            "below `main.rs`'s cut there are no longer exactly eight opened-and-closed test \
              modules: {modules} opened, {closes} closed, ending at depth {depth}. THIS IS A \
              REAL, NON-ENVIRONMENTAL FAILURE -- this test does no I/O and is not among the \
              mockito-port-collision failures documented for this machine. Do not step over \
