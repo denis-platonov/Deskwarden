@@ -10446,6 +10446,42 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
             ),
         },
     );
+    // **The About page's update flow, installed HERE as well as in the
+    // daemon.**
+    //
+    // Preferences is drawn by this process now, and `update_panel` answers
+    // out of a module-level environment that each process installs for
+    // itself. The daemon installed one and this process did not, so the
+    // Updates page reported "This build cannot check for updates. Please
+    // report it -- it is a defect, not a setting." It was right: the page was
+    // asking a module nobody had told anything.
+    //
+    // Same class as the vault backend below -- a process split that moved a
+    // surface without moving what the surface reads.
+    //
+    // `before_install` clears this process's cache and the clipboard, exactly
+    // as the daemon's does for its own: an installer about to replace the
+    // running binary should not leave a decrypted vault behind it.
+    {
+        let cache_for_install = std::sync::Arc::clone(&cache);
+        let installed = deskwarden::update_panel::install_env(deskwarden::update_panel::UpdateEnv {
+            current_version: Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("CARGO_PKG_VERSION is not valid semver"),
+            api_base: GITHUB_API_BASE.to_string(),
+            download_dir: project_dirs.cache_dir().join("updates"),
+            before_install: std::sync::Arc::new(move || {
+                cache_for_install.clear();
+                deskwarden::clipboard::clear_if_still_ours_for(
+                    deskwarden::clipboard::ClearTrigger::Quit,
+                );
+            }),
+        });
+        debug_assert!(installed, "the update environment was installed twice");
+        if !installed {
+            log::error!("the update environment was already installed in this UI process");
+        }
+    }
+
     // Something to paint on the first frame, exactly as it is for the daemon.
     // The window's own `spawn_vault_load` replaces it from `bw serve`.
     let _ = cache.load_from_disk();
