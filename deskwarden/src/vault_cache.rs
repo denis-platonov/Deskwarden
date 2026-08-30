@@ -5629,19 +5629,19 @@ mod tests {
         );
     }
 
-    /// **A cancelled prompt leaves a copy that the app can still see.**
+    /// **A key this session cannot read leaves a copy the app can still see.**
     ///
     /// `load_from_disk` answers `Unavailable` and the file stays put, so
     /// nothing in that outcome distinguishes it from a machine with no copy at
     /// all. `disk_copy_awaiting_key` is what the offline screens ask instead.
     #[test]
-    fn a_copy_left_by_a_cancelled_prompt_is_still_reported_as_being_there() {
+    fn a_copy_left_by_an_unreadable_key_is_still_reported_as_being_there() {
         let (writer, dir) = cache_with_disk("awaiting-key", true);
         seed(&writer);
 
         let reader = VaultCache::with_disk_cache(
             crate::test_vault::unreachable_bridge(),
-            crate::vault_disk_cache::tests::cache_that_declines_hello(&dir),
+            crate::vault_disk_cache::tests::cache_whose_key_is_unavailable(&dir),
             "fp".to_string(),
             true,
         );
@@ -5663,13 +5663,13 @@ mod tests {
 
     /// The same file, with the setting off: inert, and offered to nobody.
     #[test]
-    fn a_disabled_cache_offers_no_copy_even_when_a_declined_one_is_there() {
+    fn a_disabled_cache_offers_no_copy_even_when_an_unopened_one_is_there() {
         let (writer, dir) = cache_with_disk("awaiting-key-off", true);
         seed(&writer);
 
         let reader = VaultCache::with_disk_cache(
             crate::test_vault::unreachable_bridge(),
-            crate::vault_disk_cache::tests::cache_that_declines_hello(&dir),
+            crate::vault_disk_cache::tests::cache_whose_key_is_unavailable(&dir),
             "fp".to_string(),
             false,
         );

@@ -6362,9 +6362,9 @@ mod fill_dispatch_tests {
     /// The harness is the whole chain and nothing is stubbed in the middle:
     ///
     ///  1. a `VaultCache` over a real `DiskCache` in a scratch directory
-    ///     writes the item to a real encrypted file (the Hello step and DPAPI
-    ///     are the `DiskCacheEnv` `fn`-pointer fixtures, so nothing derives a
-    ///     hardware key and nothing calls DPAPI -- that is the ONLY
+    ///     writes the item to a real encrypted file (the sealing key and DPAPI
+    ///     are the `DiskCacheEnv` `fn`-pointer fixtures, so nothing touches a
+    ///     real key file and nothing calls DPAPI -- that is the ONLY
     ///     substitution);
     ///  2. a SECOND, independent `VaultCache` -- built the way `main` builds
     ///     it, before anything spawns a backend -- restores from that file
