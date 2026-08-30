@@ -27,10 +27,21 @@
 //!   whole cipher, so the body is built by laying the modelled fields **over**
 //!   the JSON [`sync`] retained, never from the model alone.
 //!
-//! **Item writes, and nothing else.** [`api`] gained create, update, trash,
-//! restore and hard delete for *ciphers*. There is still no folder write, no
-//! Send, no attachment upload and no app wiring: nothing in this crate
-//! constructs an [`api::RestClient`]. Two-factor authentication is
+//! **What is written over REST, and what is not.** [`api`] does create,
+//! update, trash, restore and hard delete for *ciphers*, and create and
+//! delete for *folders*.
+//!
+//! Still missing, and each is what keeps `bw.exe` on the machine: **Sends**
+//! (`send.rs` runs the CLI through `CliSendRunner`), **attachments** (not
+//! decrypted by [`sync`], not creatable or deletable by [`write`]), and
+//! **organisations** (decrypted, but never shown working against a real
+//! server).
+//!
+//! This paragraph said "no folder write" until folder writes landed and
+//! nobody came back to it -- a module doc that lists what is missing is a
+//! promise to keep the list current, and it is the kind of sentence a
+//! reader trusts precisely because it is inconvenient. Two-factor
+//! authentication is
 //! *completed* now rather than refused by name: authenticator, email and
 //! YubiKey, plus the personal API-key grant for the accounts none of those
 //! reach. See [`api::LoginOutcome`] and [`api::Challenge`].
