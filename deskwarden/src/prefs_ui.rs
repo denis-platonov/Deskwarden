@@ -243,8 +243,8 @@ fn official_crypto_description(self_hosted: bool) -> &'static str {
         "On (the default), Deskwarden's vault goes through the official Bitwarden CLI — the \
          `bw` program — which holds your keys in a background process of its own.\n\n\
          Off is much lighter and faster — Deskwarden's built-in client talks to your server \
-         itself, so no background process keeps running (the Bitwarden CLI is still used to \
-         sign in) — but \
+         itself, so no background process keeps running, and signing in no longer uses the \
+         CLI either — but \
          in that case your passwords are stored in the app: the \
          key that unlocks your vault is kept on this PC, protected by Windows, and unlike a \
          session it never expires. Anyone who can run programs as you on this PC can use it.\n\n\
@@ -5704,6 +5704,32 @@ mod tests {
             expires_unix,
             scopes: vec![Scope { subject: Subject::All, access: Access::Read }],
         }
+    }
+
+    /// **The built-in-client row does not claim the CLI signs you in.**
+    ///
+    /// It said "(the Bitwarden CLI is still used to sign in)" until the
+    /// switch-over made that false, and the owner read it in the running app
+    /// before anything here noticed. Copy that describes machinery goes stale
+    /// the moment the machinery moves, and this row's whole job is to be the
+    /// sentence somebody weighs before deciding where their master key lives.
+    ///
+    /// The positive control is the surrounding clause, so this fails if the
+    /// paragraph is rewritten out from under it rather than passing on a
+    /// needle that no longer matches anything.
+    #[test]
+    fn the_built_in_client_row_does_not_say_the_cli_signs_you_in() {
+        let copy = official_crypto_description(true);
+        assert!(
+            copy.contains("signing in no longer uses the"),
+            "control: the clause this test is about is gone from the row, so the assertion \
+             below is about a paragraph that no longer exists: {copy}"
+        );
+        assert!(
+            !copy.contains("still used to sign in"),
+            "the row tells the user the Bitwarden CLI signs them in, which stopped being \
+             true when the direct-REST path took the CLI out of authenticate_then_wipe"
+        );
     }
 
     /// **The row says what it costs, not only what it buys.**
