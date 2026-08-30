@@ -3407,6 +3407,24 @@ mod win32 {
                 right: scale(at.right()),
                 bottom: scale(at.bottom()),
             };
+            // **Nothing to draw, and drawing nothing would crash.**
+            //
+            // An empty `Vec<u16>` has no allocation, so `as_mut_ptr` gives
+            // Rust's dangling sentinel -- the type's alignment, which for
+            // `u16` is the literal address 2. `DrawTextW` reads through that
+            // pointer even when it is told the length is zero, so an empty
+            // string here is an access violation at address 0x2 inside
+            // `DrawTextExWorker`.
+            //
+            // It kills the whole app rather than the card: the fault happens
+            // inside a window procedure, so Windows raises
+            // STATUS_FATAL_USER_CALLBACK_EXCEPTION and terminates the process
+            // without unwinding -- the panic hook never runs and nothing
+            // reaches the log. The owner met it as the tray, the vault window
+            // and an unlocked session vanishing on one CTRL+ALT+B.
+            if run.is_empty() {
+            return;
+            }
             let mut chars: Vec<u16> = run.encode_utf16().collect();
             // `DT_NOPREFIX`: these are the app's own words, and an `&` in one
             // of them is an ampersand rather than a mnemonic.
