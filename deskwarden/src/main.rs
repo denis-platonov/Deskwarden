@@ -10369,15 +10369,83 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         return UI_COULD_NOT_START;
     };
 
-    let cache = Arc::new(VaultCache::with_disk_cache(
-        VaultBridge::new(BW_SERVE_URL),
-        vault_disk_cache::DiskCache::new(
-            &disk_cache_dir(&config_dir, active_account.as_ref()),
-            vault_disk_cache::DiskCacheEnv::production(),
-        ),
-        disk_cache_fingerprint(active_account.as_ref()),
-        settings.cache_vault_to_disk,
-    ));
+    // **Which backend this window reads through, asked rather than assumed.**
+    //
+    // This was `VaultBridge::new(BW_SERVE_URL)` unconditionally, which was
+    // harmless while the window drew inside the daemon and became a defect
+    // the moment it moved into a process of its own: the DAEMON consults
+    // `backend_policy` and correctly declines to start `bw serve` for a
+    // direct-REST account, while this process went on polling the port
+    // `bw serve` would have listened on. Nothing was there, so the window
+    // spent its whole deadline timing out and showed "Your vault could not
+    // be loaded" over a vault that was perfectly reachable by the route the
+    // account actually uses.
+    //
+    // The log said both halves on consecutive lines -- "this account is
+    // served directly over REST", then a connect timeout against
+    // localhost:8087 -- which is what a process deciding one thing and
+    // doing another looks like from outside.
+    //
+    // Read from `settings.json` rather than through
+    // `backend_policy::selected()`, because this process installs no
+    // environment; `choose` is the same pure function that answer comes
+    // from, so the two cannot disagree.
+    //
+    // The cache is built inside each arm rather than over an
+    // `Arc<dyn VaultBackend>`: `with_disk_cache` takes `impl VaultBackend`,
+    // and an `Arc<dyn _>` does not implement the trait it points at.
+    let disk = vault_disk_cache::DiskCache::new(
+        &disk_cache_dir(&config_dir, active_account.as_ref()),
+        vault_disk_cache::DiskCacheEnv::production(),
+    );
+    let fingerprint = disk_cache_fingerprint(active_account.as_ref());
+    let to_disk = settings.cache_vault_to_disk;
+    let cache = Arc::new(
+        match backend_policy::choose(
+            active_account.as_ref().and_then(|a| a.server_url.as_deref()),
+            settings.use_official_bw_crypto,
+        ) {
+            backend_policy::VaultBackendChoice::DirectRest => {
+                // Both halves or neither: the stored key, and the server it
+                // was derived against. Missing either means this window
+                // cannot read the vault directly -- and falling back to
+                // `bw serve` would be the original defect in the other
+                // direction, talking to a backend the daemon has
+                // deliberately not started.
+                let stored = active_account.as_ref().and_then(|a| {
+                    deskwarden::user_key_store::UserKeyStore::new(
+                        accounts::user_key_path_for(&config_dir, &a.id),
+                    )
+                    .load()
+                    .zip(a.server_url.clone())
+                });
+                let Some((authenticated, server_url)) = stored else {
+                    log::error!(
+                        "this account is served directly over REST, but this window has no \
+                         stored vault key and server to read it with; sign in with Deskwarden \
+                         once so the key is saved"
+                    );
+                    return UI_COULD_NOT_START;
+                };
+                log::info!("this window reads the vault directly over REST at {server_url}");
+                VaultCache::with_disk_cache(
+                    rest::backend::RestBackend::new(
+                        rest::api::RestClient::new(server_url),
+                        authenticated,
+                    ),
+                    disk,
+                    fingerprint,
+                    to_disk,
+                )
+            }
+            backend_policy::VaultBackendChoice::BwServe => VaultCache::with_disk_cache(
+                VaultBridge::new(BW_SERVE_URL),
+                disk,
+                fingerprint,
+                to_disk,
+            ),
+        },
+    );
     // Something to paint on the first frame, exactly as it is for the daemon.
     // The window's own `spawn_vault_load` replaces it from `bw serve`.
     let _ = cache.load_from_disk();
@@ -19117,7 +19185,47 @@ mod tests {
             );
         }
 
-        /// **A missing `bw.exe` is fatal only when `bw serve` is the vault.**
+        /// **The UI process asks which backend to read through.**
+    ///
+    /// It hardcoded `VaultBridge::new(BW_SERVE_URL)`, which was harmless
+    /// while the window drew inside the daemon and became a defect the moment
+    /// it moved into a process of its own: the daemon consults
+    /// `backend_policy` and correctly declines to start `bw serve` for a
+    /// direct-REST account, while the window went on polling the port it
+    /// would have listened on. Shipped in 0.13.0; the owner met it as "Your
+    /// vault could not be loaded" after a 56-second timeout, over a vault
+    /// that was perfectly reachable.
+    #[test]
+    fn the_ui_process_chooses_its_backend_instead_of_assuming_bw_serve() {
+        // `production_half_of_this_file`, not a split on the first
+        // `#[cfg(test)]`: this file interleaves test modules, and the first
+        // one comes long before `run_as_a_ui_process` -- so a naive cut looks
+        // for the entry point in a slice that ends before it.
+        let source = super::production_half_of_this_file();
+        let child = source
+            .split_once("fn run_as_a_ui_process")
+            .expect("control: the UI process entry point was renamed")
+            .1;
+
+        assert!(
+            child.contains(concat!("backend_policy::", "choose(")),
+            "the UI process builds its vault cache without asking which backend serves this \
+             account, so a direct-REST account gets a window polling a `bw serve` the daemon \
+             has deliberately not started"
+        );
+        assert!(
+            child.contains(concat!("rest::backend::", "RestBackend::new(")),
+            "the UI process has no direct-REST arm, so consulting the policy would change \
+             nothing about what it talks to"
+        );
+        assert!(
+            child.contains(concat!("VaultBridge::", "new(BW_SERVE_URL)")),
+            "control: the `bw serve` arm is gone too, so the assertions above would pass on \
+             a window that can no longer reach the default backend either"
+        );
+    }
+
+    /// **A missing `bw.exe` is fatal only when `bw serve` is the vault.**
     ///
     /// The gate used to be unconditional, and it ran BEFORE `settings.json`
     /// was read -- so it could not have been conditional even in principle.
