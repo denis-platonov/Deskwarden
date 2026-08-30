@@ -2389,6 +2389,16 @@ fn main() {
         // here: a lock is `resettle_session`, the one hardened
         // teardown-and-repopulate sequence in this app, and it must keep being
         // reached from the code that already reaches it.
+        // **A preferences edit from a window that is still open.** Above
+        // the reap deliberately: if this pass both takes a delivery and
+        // finds the window gone, the live edit is applied first and the
+        // result file's copy of it is then a no-op at
+        // `apply_edited_settings`'s `edited == *settings` guard. The other
+        // order would apply the same edit twice, which is harmless but
+        // would log the disk-cache change twice.
+        if let Some(edited) = ui_windows.take_edited_settings(&config_dir) {
+            apply_edited_settings(&estate.cache, &mut estate.settings, &settings_path, edited);
+        }
         if let Some(result) = ui_windows.poll_the_vault_window(&config_dir) {
             estate = open_vault_window(
                 estate,
@@ -2590,43 +2600,18 @@ fn main() {
                 // changed `keep_backend_running` takes effect on the very
                 // next iteration rather than waiting for the next launch.
                 let edited = prefs_ui::run(estate.settings.clone());
-                if edited != estate.settings {
-                    // Before the save, and it can refuse: see
-                    // `apply_disk_cache_change`. Nothing else in this block
-                    // has a side effect that has to happen in a particular
-                    // order relative to the write, which is why this is the
-                    // only one hoisted above it.
-                    if !apply_disk_cache_change(
-                        &estate.cache,
-                        estate.settings.cache_vault_to_disk,
-                        edited.cache_vault_to_disk,
-                    ) {
-                        estate.settings.cache_vault_to_disk = false;
-                    } else {
-                        estate.settings.cache_vault_to_disk = edited.cache_vault_to_disk;
-                    }
-                    let keep_disk_cache = estate.settings.cache_vault_to_disk;
-                    estate.settings = settings::Settings {
-                        cache_vault_to_disk: keep_disk_cache,
-                        ..edited
-                    };
-                    // `persist_preferences`, never a whole-struct save: this
-                    // binding's `vault_window` is whatever was on disk at
-                    // startup, and `vault_window::run` has been writing a
-                    // fresh geometry straight to the file every time the
-                    // window closed. Saving the struct here wrote that stale
-                    // value back and silently reverted the saved geometry;
-                    // see `Settings::persist_preferences`.
-                    if let Err(e) = estate.settings.persist_preferences(&settings_path) {
-                        log::warn!("could not save settings: {e}");
-                    }
-                    // Re-installed from the same struct that was just
-                    // persisted, so the clipboard is working to what the file
-                    // says rather than to what it was told at startup. Inside
-                    // the `edited != settings` branch on purpose: a visit to
-                    // Preferences that changed nothing has nothing to install.
-                    deskwarden::clipboard::configure(estate.settings.clipboard_clearing());
-                }
+                // **The first of the three shells for the same page**, and
+                // the write-back is one function so that the other two cannot
+                // drift from it -- see `apply_edited_settings`, which carries
+                // the `apply_disk_cache_change` ordering, the
+                // `persist_preferences`-not-`save` rule and the clipboard
+                // re-install.
+                apply_edited_settings(
+                    &estate.cache,
+                    &mut estate.settings,
+                    &settings_path,
+                    edited,
+                );
                 // The vault window is not the only blocking one, and this is
                 // the other one the TRAY can open: repeat clicks on
                 // Preferences queue behind it exactly the same way and used to
@@ -6067,7 +6052,14 @@ struct OpenUiWindow {
     /// Only ever logged. How long the user had the window up is the number
     /// that made the blocking version's cost visible, and it stays visible.
     opened_at: Instant,
-
+    /// **The daemon's ear for a preferences edit from a window that is still
+    /// open**, created at the spawn that produced `pid`.
+    ///
+    /// `None` is survivable: the child's press then answers `false` and it
+    /// falls back to exiting with the edit in the result file, which is the
+    /// behaviour before this channel existed. See
+    /// [`UiWindows::take_edited_settings`].
+    settings_doorbell: Option<deskwarden::ui_show::Signal>,
 }
 
 /// **The UI processes the daemon has open, one slot per surface.**
@@ -6246,6 +6238,14 @@ impl UiWindows {
             deskwarden::ui_process::forget_result(&deskwarden::ui_process::result_path(
                 config_dir, pid,
             ));
+            // **And the live channel's file.** A killed window never gets to
+            // deliver, so whatever it had written is not going to be read; the
+            // only thing that would take it is `take_edited_settings`, and the
+            // slot it reads through has just been emptied. Tidied here for
+            // `forget_result`'s reason: the config directory is the user's.
+            deskwarden::ui_process::forget_edited_settings(
+                &deskwarden::ui_process::edited_settings_path(config_dir, pid),
+            );
         }
     }
 
@@ -6299,7 +6299,45 @@ impl UiWindows {
             deskwarden::ui_process::forget_result(&deskwarden::ui_process::result_path(
                 config_dir, pid,
             ));
+            // **And the live channel's file.** A killed window never gets to
+            // deliver, so whatever it had written is not going to be read; the
+            // only thing that would take it is `take_edited_settings`, and the
+            // slot it reads through has just been emptied. Tidied here for
+            // `forget_result`'s reason: the config directory is the user's.
+            deskwarden::ui_process::forget_edited_settings(
+                &deskwarden::ui_process::edited_settings_path(config_dir, pid),
+            );
         }
+    }
+
+    /// **Take a preferences edit the open window delivered while staying
+    /// alive**, if it rang for one.
+    ///
+    /// Polled with a ZERO timeout, once per pass of `main`'s loop, beside
+    /// the `try_wait` on the child and the `is_held` on the visibility
+    /// name. A blocking wait is impossible here: this loop is what drains
+    /// the hotkey, watches the foreground and answers the tray.
+    ///
+    /// Read only after the doorbell, never on a timer, which is what makes
+    /// the file whole when it is read: the child writes it and then
+    /// presses. The file is deleted once taken, so a second pass cannot
+    /// apply it twice -- though applying it twice would be harmless, since
+    /// `apply_edited_settings` is guarded by `edited != *settings`.
+    fn take_edited_settings(&self, config_dir: &Path) -> Option<settings::Settings> {
+        let open = self.vault.as_ref()?;
+        if !open.settings_doorbell.as_ref()?.wait(0) {
+            return None;
+        }
+        let path = deskwarden::ui_process::edited_settings_path(config_dir, open.pid);
+        let edited = deskwarden::ui_process::read_edited_settings(&path);
+        deskwarden::ui_process::forget_edited_settings(&path);
+        if edited.is_some() {
+            log::info!(
+                "the vault window (process {}) delivered a preferences edit without closing",
+                open.pid
+            );
+        }
+        edited
     }
 
     fn poll_the_vault_window(
@@ -6411,7 +6449,28 @@ fn spawn_the_vault_window_in_its_own_process() -> Option<OpenUiWindow> {
         plan.program.display(),
         plan.args.join(" ")
     );
-    Some(OpenUiWindow { child, pid, opened_at: Instant::now() })
+    // **Created by the daemon, pressed by the child.** The mirror of the
+    // show signal, which the child creates and the daemon presses. Made
+    // here rather than lazily because "the daemon is listening" is what
+    // the child's `SetEvent` answer MEANS: a doorbell created only when
+    // somebody thought to would have the child concluding no daemon
+    // exists and exiting to deliver a setting the daemon was ready to
+    // take.
+    //
+    // `None` is survivable and is not a failure to spawn: the child's
+    // press then returns `false`, and it falls back to exiting with the
+    // edit in the result file -- exactly the behaviour before this
+    // feature.
+    let settings_doorbell = (deskwarden::ui_show::ShowEnv::production().create)(
+        &deskwarden::ui_show::settings_name(pid),
+    );
+    if settings_doorbell.is_none() {
+        log::warn!(
+            "could not create the settings doorbell for UI process {pid}; a preferences \
+             edit made in that window will close it rather than being delivered live"
+        );
+    }
+    Some(OpenUiWindow { child, pid, opened_at: Instant::now(), settings_doorbell })
 }
 
 /// **What a finished UI process reported**, from its exit code and its file.
@@ -6426,6 +6485,15 @@ fn what_the_vault_ui_process_reported(
     let path = deskwarden::ui_process::result_path(config_dir, pid);
     let from_file = deskwarden::ui_process::read_result(&path);
     deskwarden::ui_process::forget_result(&path);
+    // **And the live channel's file, if this window left one behind.** A
+    // delivery the daemon consumed is already gone -- `take_edited_settings`
+    // deletes it -- but a window that wrote it and then exited before the
+    // doorbell was polled leaves one, and the result file below carries the
+    // same edit anyway. Nothing is lost by deleting it: this pid is gone, so
+    // nothing will ever read that name again.
+    deskwarden::ui_process::forget_edited_settings(
+        &deskwarden::ui_process::edited_settings_path(config_dir, pid),
+    );
     let crossing = ui_vault_outcome(pid, code, from_file);
     log::info!("UI process {pid} came home with {crossing:?}");
 
@@ -7340,42 +7408,16 @@ fn run_vault_loop(
         // change is not lost) a second chance to be discarded. What makes "opened
         // at some point" safe is that this block cannot branch: `vault_follow_up`
         // is what decides what happens next, and it does not read this field.
+        // The gear inside the vault window is the SECOND shell for the same
+        // page, and it owes the disk cache, the file and the clipboard exactly
+        // what the tray's handler owes them. All three live in
+        // `apply_edited_settings`, which is the ONE write-back: wiring any of
+        // them into one shell only was this file's house defect.
+        //
+        // One line, one read of the field, and no jump -- see
+        // `nothing_outside_the_two_branch_bodies_may_jump`, which counts both.
         if let Some(edited) = result.edited_settings.clone() {
-            if edited != est.settings {
-                // The gear inside the vault window is the SECOND shell for
-                // the same page, and it owes the disk cache the same side
-                // effect the tray's handler performs -- see
-                // `apply_disk_cache_change`. Wiring it into one shell only is
-                // this file's house defect.
-                let keep_disk_cache = apply_disk_cache_change(
-                    &est.cache,
-                    est.settings.cache_vault_to_disk,
-                    edited.cache_vault_to_disk,
-                ) && edited.cache_vault_to_disk;
-                est.settings = settings::Settings {
-                    cache_vault_to_disk: keep_disk_cache,
-                    ..edited
-                };
-                // `persist_preferences`, never a whole-struct `save`. This
-                // struct's `vault_window` field is whatever was on disk when
-                // `main` loaded it at startup, and `vault_window::run` has just
-                // written a fresh geometry straight to the same file on its way
-                // out of the call above. A whole-struct write here would put
-                // that stale geometry back and silently revert the size and
-                // position the user just left the window at -- the identical
-                // trap the tray's preferences handler documents at its own call
-                // site. `persist_preferences` re-reads the file and overwrites
-                // only the two preference fields, so the geometry survives.
-                if let Err(e) = est.settings.persist_preferences(deps.settings_path) {
-                    log::warn!("could not save settings: {e}");
-                }
-                // The second of the two places a preference edit lands --
-                // the gear inside the vault window -- and it owes the
-                // clipboard the same re-install the tray's handler does.
-                // Missing it here would mean a clipboard setting changed from
-                // the vault window took effect only on the next launch.
-                deskwarden::clipboard::configure(est.settings.clipboard_clearing());
-            }
+            apply_edited_settings(&est.cache, &mut est.settings, deps.settings_path, edited);
         }
 
         // **The three things the titlebar's account menu can ask for, ranked
@@ -10597,6 +10639,30 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                 *visible_for_shown.borrow_mut() =
                     (env.hold)(&deskwarden::ui_show::visible_name(std::process::id()));
             }),
+            deliver_settings: {
+                let config_dir = config_dir.clone();
+                Box::new(move |edited: &deskwarden::settings::Settings| {
+                    // **The file first, the doorbell second**, and the
+                    // daemon reads only on the doorbell -- so it can never
+                    // see a file that is not finished. The write itself
+                    // lands by rename for the second delivery's sake.
+                    let path = deskwarden::ui_process::edited_settings_path(
+                        &config_dir,
+                        std::process::id(),
+                    );
+                    if let Err(e) = deskwarden::ui_process::write_edited_settings(&path, edited) {
+                        log::warn!("could not write this window's settings delivery ({e})");
+                        return false;
+                    }
+                    // `false` means nobody holds the doorbell: no daemon,
+                    // or one that could not create it. The caller reads
+                    // that as "close rather than hide", so the edit goes
+                    // home in the result file instead.
+                    (deskwarden::ui_show::ShowEnv::production().set)(
+                        &deskwarden::ui_show::settings_name(std::process::id()),
+                    )
+                })
+            },
         }
     });
 
@@ -11202,6 +11268,52 @@ fn apply_disk_cache_change(cache: &VaultCache, before: bool, after: bool) -> boo
         }
         _ => true,
     }
+}
+
+/// **Apply one edited `Settings` to the daemon's estate.**
+///
+/// The disk-cache side effect (which can refuse), the assignment, the
+/// preferences-only save, and the clipboard re-install -- in that order,
+/// because [`apply_disk_cache_change`] must decide before the value it may
+/// veto is written anywhere.
+///
+/// **Three shells reach this and it is deliberately one function.** The
+/// tray's Preferences item, the gear inside the vault window, and the live
+/// channel a resident window delivers over
+/// (`deskwarden::ui_process::read_edited_settings`). Two copies of this
+/// already existed and the vault loop's carried a comment calling the
+/// duplication "this file's house defect"; a third copy is what this
+/// replaces.
+///
+/// `persist_preferences`, never a whole-struct `save`: `settings.vault_window`
+/// is whatever was on disk at startup, and `vault_window::run` writes fresh
+/// geometry straight to the same file on its way out. A whole-struct write
+/// here silently reverts the size and position the user just left.
+///
+/// The clipboard is re-installed from the same struct that was just
+/// persisted, so it is working to what the file says rather than to what it
+/// was told at startup -- and inside the `edited != *settings` guard on
+/// purpose: a visit to Preferences that changed nothing has nothing to
+/// install.
+fn apply_edited_settings(
+    cache: &VaultCache,
+    settings: &mut settings::Settings,
+    settings_path: &Path,
+    edited: settings::Settings,
+) {
+    if edited == *settings {
+        return;
+    }
+    let keep_disk_cache = apply_disk_cache_change(
+        cache,
+        settings.cache_vault_to_disk,
+        edited.cache_vault_to_disk,
+    ) && edited.cache_vault_to_disk;
+    *settings = settings::Settings { cache_vault_to_disk: keep_disk_cache, ..edited };
+    if let Err(e) = settings.persist_preferences(settings_path) {
+        log::warn!("could not save settings: {e}");
+    }
+    deskwarden::clipboard::configure(settings.clipboard_clearing());
 }
 
 fn disk_cache_dir(config_dir: &Path, active_account: Option<&Account>) -> std::path::PathBuf {
@@ -12815,47 +12927,78 @@ mod tests {
     /// re-fixing, with the delay making it harder to notice rather than
     /// easier.
     ///
-    /// Source-level because none of the four sites is reachable from a test:
-    /// two are inside `run_tray_loop`, the third is inside the vault window's
-    /// follow-up, and the fourth is the UI process's own startup. Counted
-    /// rather than merely found, so a site that loses its call reds this
-    /// instead of shipping.
+    /// Source-level because none of the sites is reachable from a test: the
+    /// edit sites are behind a message loop, a window and two processes, and
+    /// the startup ones are `main` itself. Counted rather than merely found,
+    /// so a site that loses its call reds this instead of shipping.
+    ///
+    /// **Re-stated 2026-08-30, and it now asserts MORE than it did.** The
+    /// three shells for the Preferences page -- the tray's item, the gear in
+    /// the vault window, and the live channel a resident window delivers over
+    /// -- used to be three copies of the write-back, and this test counted
+    /// three `configure` calls plus the startup one. Counting is the weak
+    /// form of the property: a fourth shell would simply have bumped the
+    /// number. They are now ONE function, [`apply_edited_settings`], so the
+    /// guarantee is structural and is asserted as such: every shell reaches
+    /// the write-back, and the write-back configures. A shell that landed an
+    /// edit without re-installing the clipboard would be a shell that did not
+    /// go through the one write-back, and the caller count below is what
+    /// refuses it.
     #[test]
     fn every_place_a_preference_edit_lands_reinstalls_the_clipboard_policy() {
-        let source = include_str!("main.rs");
+        let production = production_half_of_this_file();
         let call = concat!("clipboard::config", "ure(");
         assert_eq!(
-            source.matches(call).count(),
-            4,
-            "expected four `configure` calls -- the daemon's startup, the tray's Preferences \
-             handler, the vault window's `edited_settings`, and the UI process's own startup \
-             -- and found {}. A missing one is a clipboard preference that only takes effect \
-             on the next launch. The fourth is not a duplicate of the first: since the \
+            production.matches(call).count(),
+            3,
+            "expected three `configure` calls -- the daemon's startup, the UI process's own \
+             startup, and the ONE write-back every preference edit lands in -- and found {}. \
+             A missing one is a clipboard preference that only takes effect on the next \
+             launch. The UI process's is not a duplicate of the daemon's: since the \
              daemon/UI split the copies are MADE in the UI process, so it is that process \
              whose clearing timers the preference has to reach",
-            source.matches(call).count()
+            production.matches(call).count()
         );
-        // The two edit sites take the value off the struct that was just
-        // persisted, not off a copy loaded at startup: installing a stale
-        // struct would be worse than not installing at all, because it would
-        // look wired.
-        assert_eq!(
-            source.matches(concat!("estate.settings.clipboard_clear", "ing()")).count(),
-            1,
-            "the tray's Preferences handler no longer installs the settings it just saved"
+
+        // **The write-back's own `configure` is INSIDE it**, which is what
+        // makes the caller count below a guarantee rather than a coincidence.
+        let write_back = body_of(production, concat!("fn apply_edited_", "settings("));
+        assert!(
+            write_back.contains(call),
+            "the one write-back no longer re-installs the clipboard, so every shell that \
+             lands a preference edit now leaves the clearing timers on the previous \
+             values:\n{write_back}"
         );
-        assert_eq!(
-            source.matches(concat!("est.settings.clipboard_clear", "ing()")).count(),
-            1,
-            "the vault window's follow-up no longer installs the settings it just saved"
+        // ...and it installs the struct it just persisted, not a copy loaded
+        // at startup: installing a stale struct would be worse than not
+        // installing at all, because it would look wired.
+        assert!(
+            write_back.contains(concat!("settings.clipboard_clear", "ing()")),
+            "the write-back installs something other than the settings it just saved"
         );
-        // And both startups -- the daemon's and the UI process's -- install
-        // the file they just loaded. Four, because the needle is a suffix of
-        // the two above.
+
+        // **Every shell goes through it.** Three calls, matching the three
+        // shells the write-back's own doc names; the definition is excluded by
+        // slicing the production half at the `fn`.
+        let calls = production
+            .matches(concat!("apply_edited_", "settings("))
+            .count()
+            - 1;
         assert_eq!(
-            source.matches(concat!("settings.clipboard_clear", "ing()")).count(),
-            4,
-            "control: the four installs no longer read the value from a `Settings` at all"
+            calls, 3,
+            "expected exactly three callers of the one write-back -- the tray's Preferences \
+             item, the vault loop's `edited_settings`, and the daemon's live channel -- and \
+             found {calls}. A fourth shell that does not go through it is a preference edit \
+             that skips `apply_disk_cache_change`, `persist_preferences` and the clipboard \
+             re-install all at once"
+        );
+
+        // Control: the two startups still read the value off a `Settings` at
+        // all, so the three above are not three of something else.
+        assert_eq!(
+            production.matches(concat!("settings.clipboard_clear", "ing()")).count(),
+            3,
+            "control: the three installs no longer read the value from a `Settings` at all"
         );
     }
 
@@ -19397,46 +19540,70 @@ mod tests {
         /// Walked over all 64 combinations of the six fields rather than a
         /// few chosen ones, because the interesting case is the one nobody
         /// thought to write down.
+        ///
+        /// **Re-pinned 2026-08-30, and deliberately not relaxed.** `on_close`
+        /// grew a `settings_delivered` flag, because `edited_settings` gained
+        /// a second route to the daemon that does not require exiting -- see
+        /// `docs/superpowers/specs/2026-08-30-closing-the-window-keeps-it-loaded-design.md`.
+        /// The property here is unchanged; one of its inputs moved. So the
+        /// walk runs TWICE:
+        ///
+        /// - **undelivered** must count exactly 1 -- byte-for-byte the old
+        ///   rule, which is the control proving the flag is load-bearing
+        ///   rather than ignored;
+        /// - **delivered** must count exactly 2 -- the empty result and the
+        ///   `edited_settings`-only one, which is the control proving the
+        ///   relaxation is ONE combination and not a widening. A rule that had
+        ///   dropped the `locked` conjunct would count 4 here and fail.
+        ///
+        /// Hide implies `Done` in both passes, and it holds for the
+        /// newly-hiding combination for the reason this test was written: a
+        /// result carrying only `edited_settings` lands on `Done`, because
+        /// editing preferences is not a reason a window closed.
         #[test]
         fn the_hide_rule_is_stricter_than_done() {
-            let mut hides = 0;
-            for bits in 0u8..64 {
-                let crossing = deskwarden::ui_process::UiVaultResult {
-                    locked: bits & 1 != 0,
-                    needs_reauth: bits & 2 != 0,
-                    add_account: bits & 4 != 0,
-                    remove_account: bits & 8 != 0,
-                    switch_to: (bits & 16 != 0)
-                        .then(deskwarden::accounts::AccountId::generate),
-                    edited_settings: (bits & 32 != 0)
-                        .then(deskwarden::settings::Settings::default),
-                };
-                let window = VaultWindowResult {
-                    locked: crossing.locked,
-                    needs_reauth: crossing.needs_reauth,
-                    edited_settings: crossing.edited_settings.clone(),
-                    switch_to: crossing.switch_to.clone(),
-                    add_account: crossing.add_account,
-                    remove_account: crossing.remove_account,
-                    account_details: None,
-                };
-                if deskwarden::ui_process::on_close(true, &crossing)
-                    == deskwarden::ui_process::OnClose::Hide
-                {
-                    hides += 1;
-                    assert_eq!(
-                        vault_follow_up(&window),
-                        VaultFollowUp::Done,
-                        "a result that hides does not land on `Done`, so hiding it loses \
-                         whatever the daemon would have done about it: {crossing:?}"
-                    );
+            for (delivered, expected_hides) in [(false, 1), (true, 2)] {
+                let mut hides = 0;
+                for bits in 0u8..64 {
+                    let crossing = deskwarden::ui_process::UiVaultResult {
+                        locked: bits & 1 != 0,
+                        needs_reauth: bits & 2 != 0,
+                        add_account: bits & 4 != 0,
+                        remove_account: bits & 8 != 0,
+                        switch_to: (bits & 16 != 0)
+                            .then(deskwarden::accounts::AccountId::generate),
+                        edited_settings: (bits & 32 != 0)
+                            .then(deskwarden::settings::Settings::default),
+                    };
+                    let window = VaultWindowResult {
+                        locked: crossing.locked,
+                        needs_reauth: crossing.needs_reauth,
+                        edited_settings: crossing.edited_settings.clone(),
+                        switch_to: crossing.switch_to.clone(),
+                        add_account: crossing.add_account,
+                        remove_account: crossing.remove_account,
+                        account_details: None,
+                    };
+                    if deskwarden::ui_process::on_close(true, &crossing, delivered)
+                        == deskwarden::ui_process::OnClose::Hide
+                    {
+                        hides += 1;
+                        assert_eq!(
+                            vault_follow_up(&window),
+                            VaultFollowUp::Done,
+                            "a result that hides does not land on `Done`, so hiding it loses \
+                             whatever the daemon would have done about it \
+                             (settings_delivered={delivered}): {crossing:?}"
+                        );
+                    }
                 }
+                assert_eq!(
+                    hides, expected_hides,
+                    "control: with settings_delivered={delivered}, exactly {expected_hides} \
+                     of the 64 combinations should hide. {hides} did, so this test is not \
+                     pinning what it says it pins"
+                );
             }
-            assert_eq!(
-                hides, 1,
-                "control: exactly one of the 64 combinations should hide -- the empty one. \
-                 {hides} did, so this test is not pinning what it says it pins"
-            );
         }
 
         /// The one ordering the branches have always had, now stated where it
@@ -19908,7 +20075,13 @@ mod tests {
             // Positive controls: the region really contains the two things that
             // happen in it, so it is neither empty nor some other slice.
             for (marker, what) in [
-                (concat!("persist_pre", "ferences("), "the settings write-back"),
+                // The write-back is ONE function now (`apply_edited_settings`)
+                // rather than an inline `persist_preferences` call, so this
+                // control follows it. Narrower than the old needle, not wider:
+                // `persist_preferences(` would also match the tray's shell and
+                // any future third caller, while this names the one line that
+                // has to be in this span.
+                (concat!("apply_edited_", "settings("), "the settings write-back"),
                 (concat!("learn_active_account", "_details("), "the account-details refill"),
             ] {
                 assert!(
@@ -20086,7 +20259,10 @@ mod tests {
                 resettle.as_str(),
                 concat!("ops.account_", "action("),
                 concat!("ops.resettle_after_lost_", "session("),
-                concat!("persist_pre", "ferences("),
+                // The write-back, which is one call to `apply_edited_settings`
+                // since the three shells were de-duplicated. Same control, at
+                // the write-back's new spelling.
+                concat!("apply_edited_", "settings("),
                 concat!("loop_", "step("),
             ] {
                 assert!(
@@ -30886,9 +31062,17 @@ mod startup_shape_tests {
             // `no_door_assigns_the_pending_search_pin` and
             // `the_daemon_never_blocks_on_a_ui_process_pin` from the process
             // split. `below_cut`'s own reading of this file counts the same
-            // six.
+            // number.
+            //
+            // **Eight since the live settings channel**, which added
+            // `the_live_settings_channel` (the loop's ordering and the
+            // doorbell's ownership) and `the_one_settings_write_back`
+            // (`apply_edited_settings`, driven over a real disk cache).
+            // Raised deliberately, and it asserts MORE than six did: two
+            // further modules must now be clean, gated, column-0 blocks that
+            // this walk really reaches.
             modules,
-            6,
+            8,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -31889,5 +32073,196 @@ mod the_daemon_never_blocks_on_a_ui_process_pin {
         let planted = format!("    let status = {OLD_BLOCKER}&mut child);");
         assert!(planted.contains(OLD_BLOCKER));
         assert!(!production().contains(&planted));
+    }
+}
+
+/// **The live settings channel, from the daemon's side.**
+#[cfg(test)]
+mod the_live_settings_channel {
+    /// **The live settings channel is read ABOVE the reap**, so that a pass
+    /// which both takes a delivery and finds the window gone applies the live
+    /// copy first and lets the result file's identical copy fall out at
+    /// `apply_edited_settings`'s equality guard.
+    #[test]
+    fn the_loop_takes_a_live_settings_delivery_before_it_reaps_the_window() {
+        let source = include_str!("main.rs");
+        let take = source
+            .find(concat!("ui_windows.take_edited_", "settings("))
+            .expect("the live take");
+        let reap = source
+            .find(concat!("ui_windows.poll_the_vault_", "window("))
+            .expect("the reap");
+        assert!(
+            take < reap,
+            "the reap comes first, so a settings edit is applied twice and the disk-cache \
+             change is logged twice"
+        );
+    }
+
+    /// **The daemon creates the doorbell, and it does so at the spawn.**
+    ///
+    /// The child's `SetEvent` answer is the whole failure signal -- `false`
+    /// means "no daemon, exit and use the result file". A doorbell created
+    /// later than the spawn would make that answer say "no daemon" during a
+    /// window in which there certainly is one.
+    #[test]
+    fn the_doorbell_is_created_beside_the_spawn_that_names_it() {
+        let source = include_str!("main.rs");
+        let spawn = source
+            .split(concat!("fn spawn_the_vault_window_in_its_own_", "process"))
+            .nth(1)
+            .expect("the spawn function");
+        let body = spawn.split("\nfn ").next().expect("the function body");
+        assert!(
+            body.contains(concat!("ui_show::settings_", "name")),
+            "the settings doorbell is not created where the window is spawned"
+        );
+        assert!(
+            body.contains(concat!("ShowEnv::production().", "create")),
+            "control: the doorbell is named here but not created here"
+        );
+    }
+}
+
+/// **The one place a preference edit lands**, driven directly.
+///
+/// Three shells reach `apply_edited_settings` and none of them can be run
+/// from a test -- the tray's is behind a message loop, the vault loop's is
+/// behind a window, the live channel's is behind two processes. The function
+/// they share can be, so it is.
+#[cfg(test)]
+mod the_one_settings_write_back {
+    use super::*;
+
+    /// A scratch directory of this test's own, in the same idiom every other
+    /// filesystem test in this file uses -- `%TEMP%`, never
+    /// `%APPDATA%\Deskwarden`, and keyed by pid and thread so a parallel run
+    /// cannot collide.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deskwarden-one-write-back-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    /// A cache whose disk half is real and lives in `dir`.
+    ///
+    /// The backend points at port 0, which nothing listens on: this exercises
+    /// the disk side effect and must never reach a vault.
+    fn cache_over(dir: &std::path::Path) -> VaultCache {
+        VaultCache::with_disk_cache(
+            VaultBridge::new("http://127.0.0.1:0"),
+            vault_disk_cache::DiskCache::new(dir, vault_disk_cache::DiskCacheEnv::production()),
+            "a-test-fingerprint".to_string(),
+            false,
+        )
+    }
+
+    /// **The one place a preference edit lands, and it runs the disk-cache
+    /// side effect.**
+    ///
+    /// Asserted at the point of effect -- files on disk -- rather than over a
+    /// boolean, because `apply_disk_cache_change` is a side effect that can
+    /// REFUSE, and a test that read the flag back would pass against a
+    /// function that never called it.
+    ///
+    /// **The two directions are observed differently, and deliberately so.**
+    /// Turning it ON acquires the sealing key, which mints a key file beside
+    /// the cache -- that mint is a filesystem effect only
+    /// `enable_disk_persistence` produces, and it happens whether or not
+    /// there is a vault to write. It does NOT write the encrypted copy here:
+    /// `VaultCache::persist` returns early on an unpopulated snapshot, and
+    /// this cache has never been near a vault. Turning it OFF deletes the
+    /// encrypted copy, which is asserted against a real file planted at the
+    /// path the cache addresses -- a populate would have put one there, and
+    /// `disable_disk_persistence` has to remove whatever is there.
+    #[test]
+    fn applying_an_edit_turns_the_disk_cache_on_and_off_for_real() {
+        let dir = scratch("on-and-off");
+        let settings_path = dir.join("settings.json");
+        let cache = cache_over(&dir);
+        let file = cache.disk_cache_path().expect("this cache has a disk half");
+
+        // Control: nothing on disk before anybody asks for it.
+        let before: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readable")
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+        assert!(
+            before.is_empty() && !file.exists(),
+            "control: the scratch directory was not empty before the edit that fills it: \
+             {before:?}"
+        );
+
+        let mut settings = settings::Settings {
+            cache_vault_to_disk: false,
+            ..settings::Settings::default()
+        };
+        let turn_it_on = settings::Settings { cache_vault_to_disk: true, ..settings.clone() };
+        apply_edited_settings(&cache, &mut settings, &settings_path, turn_it_on);
+        assert!(
+            settings.cache_vault_to_disk,
+            "the edit did not reach the estate, so `apply_disk_cache_change` refused it"
+        );
+        assert!(
+            settings::Settings::load(&settings_path).cache_vault_to_disk,
+            "the edit was not persisted"
+        );
+        let after_on: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readable")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n != "settings.json")
+            .collect();
+        assert!(
+            !after_on.is_empty(),
+            "turning the disk cache on left the directory holding nothing but settings.json, \
+             so the sealing key was never acquired and `apply_disk_cache_change` was not run \
+             from the one write-back"
+        );
+
+        // The encrypted copy a populate would have written. This cache has
+        // never seen a vault, so it is planted rather than produced -- what is
+        // under test is that the OFF edit deletes whatever is there.
+        std::fs::write(&file, b"an encrypted vault copy").expect("the file should be writable");
+        assert!(file.exists(), "control: the planted copy was not written");
+
+        let turn_it_off = settings::Settings { cache_vault_to_disk: false, ..settings.clone() };
+        apply_edited_settings(&cache, &mut settings, &settings_path, turn_it_off);
+        assert!(!settings.cache_vault_to_disk);
+        assert!(
+            !file.exists(),
+            "turning the disk cache off left the encrypted copy on disk; \
+             `apply_disk_cache_change` was not run from the one write-back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An edit that changes nothing writes nothing -- the `edited != *settings`
+    /// guard both existing shells had, kept in the extraction.
+    #[test]
+    fn an_edit_that_changes_nothing_does_not_touch_the_file() {
+        let dir = scratch("no-change");
+        let settings_path = dir.join("settings.json");
+        let cache = cache_over(&dir);
+        let mut settings = settings::Settings::default();
+
+        let unchanged = settings.clone();
+        apply_edited_settings(&cache, &mut settings, &settings_path, unchanged);
+        assert!(
+            !settings_path.exists(),
+            "a visit to the gear that changed nothing still wrote settings.json"
+        );
+
+        // Control: the same call with a real change DOES write, so the
+        // assertion above is not passing because nothing works.
+        let a_real_change =
+            settings::Settings { check_breaches: !settings.check_breaches, ..settings.clone() };
+        apply_edited_settings(&cache, &mut settings, &settings_path, a_real_change);
+        assert!(settings_path.exists(), "control: a real change did not write either");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
