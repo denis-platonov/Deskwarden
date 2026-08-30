@@ -10,6 +10,18 @@ things can still change between minor versions.
 
 ## Unreleased
 
+## 0.13.1 - 2026-08-29
+
+### Fixed
+
+- **The vault window could not load on a self-hosted account that talks to
+  the server directly.** It showed "Your vault could not be loaded" after a
+  long wait, over a vault that was perfectly reachable. The window had moved
+  into its own process in 0.13.0 and kept asking for the vault through the
+  Bitwarden CLI's local server -- which, on that kind of account, Deskwarden
+  correctly never starts. It now reads through the same backend the rest of
+  the app uses.
+
 ## 0.13.0 - 2026-08-29
 
 ### Two-step login works, and the Bitwarden CLI is no longer in the way
