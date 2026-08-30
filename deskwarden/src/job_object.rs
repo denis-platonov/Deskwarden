@@ -1381,21 +1381,27 @@ mod tests {
         ("http_agent.rs", 4),
         ("injector/mod.rs", 1),
         ("injector/sequence.rs", 1),
-        ("login_ui.rs", 10),
-        // Eleven. It was twelve until design turn 7 moved the recovery's
-        // readiness wait into `app_window::run_recovery`, which starts that
-        // probe itself, once per attempt -- so the spawn that used to sit
-        // behind `loading_ui::show_while` here is gone with the window it fed.
-        // Twelve since the daemon/UI split: `run_as_a_ui_process` fetches the
-        // account details on a thread rather than in front of the window it
-        // has not opened yet -- the same 1-3s `bw` spawn, and the same reason,
-        // as the two `check_bw_status_details` spawns already counted here.
-        // Eleven again once the STARTUP door stopped drawing in the daemon:
-        // that branch built a vault frame here and fetched its toolbar
-        // details on a thread of its own, and both went when the window moved
-        // into a process of its own. The window still makes that fetch -- in
-        // the child, on the line counted just above.
-        ("main.rs", 11),
+        // Seven. It was ten until the `bw status` spawns went: this file ran
+        // one behind `check_bw_status_details_bounded`, and the bounded-wait
+        // apparatus around it (`status_details_within`) existed to stop a
+        // caller blocking on that thread. The account email and server URL
+        // those threads fetched are now read off the `Account`
+        // (`login_ui::account_details_for`) or off the sign-in that
+        // established them (`login_ui::SignedInIdentity`), neither of which
+        // spawns anything -- so the threads went with the work.
+        ("login_ui.rs", 7),
+        // Six. It was eleven, and the five that went were every thread this
+        // file started to run a `bw status`: the startup prefetch, the vault
+        // window's own fetch, the post-lock rebuild's, the UI process's copy
+        // of it, and `add_account`'s. All five wanted the same two strings --
+        // an account email for the toolbar avatar and a server URL for the
+        // favicon host -- from a CLI spawn measured at 2.39s. They are read
+        // off the `Account` now (`login_ui::account_details_for`) or off the
+        // sign-in that established them (`login_ui::SignedInIdentity`), so
+        // there is no work left for a thread to be doing off the frame
+        // thread. The UI process's line went with them: it is a separate
+        // binary path, and it paid the same spawn.
+        ("main.rs", 6),
         ("picker_ui.rs", 2),
         // One: the `bw unlock` behind the daemon's unlock prompt. It cannot be
         // inline for a reason stronger than the frame-loop one every entry

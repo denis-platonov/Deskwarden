@@ -7267,7 +7267,7 @@ mod source_pins {
 mod frame_promptness {
     use super::super::frame_env_seam::stubbed;
     use super::super::{
-        build_frame, AccountDetails, SendListSender, VaultLoadFailure, VaultLoadRequest,
+        build_frame, SendListSender, VaultLoadFailure, VaultLoadRequest,
     };
     use crate::login_ui::{BwStatus, BwStatusDetails};
     use crate::vault_bridge::VaultItem;
@@ -7875,12 +7875,12 @@ mod frame_promptness {
             ))),
             crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
             // `Ready`, so no `bw status` channel and no drain waiting on one.
-            AccountDetails::Ready(BwStatusDetails {
+            BwStatusDetails {
                 status: BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
                 // `None`, so no favicon is fetched for any host.
                 server_url: None,
-            }),
+            },
             HARNESS_SESSION.to_string(),
             scratch.join("icons"),
             // `Never`, so the auto-lock countdown cannot end the session

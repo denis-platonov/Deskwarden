@@ -168,24 +168,151 @@ pub fn check_bw_status_details_with_session(session_token: Option<&str>) -> BwSt
         })
 }
 
-/// [`check_bw_status`] plus the account email and server URL, for the login
-/// window's 3h chrome.
-pub fn check_bw_status_details() -> BwStatusDetails {
-    check_bw_status_details_in(crate::bw_path::active_data_dir().as_deref())
-}
-
-/// [`check_bw_status_details`] asked of a **named** profile directory.
+/// [`check_bw_status`] plus the account email and server URL, asked of a
+/// **named** profile directory.
 ///
-/// Every caller that has an account in hand uses this form rather than
-/// [`check_bw_status_details`]: `add_account` asks it about the directory the
-/// new sign-in landed in, which is not the one this process is pointed at. A
-/// version that ignored its argument would answer for whatever profile the
-/// process happens to be on, and the new account would inherit the previous
-/// account's address.
+/// **The active-profile form is gone.** `check_bw_status_details()` read
+/// `bw_path::active_data_dir()` and answered for whatever profile this process
+/// happened to be pointed at; its five callers all wanted a toolbar label and
+/// all of them now read the `Account` instead (see [`account_details_for`]).
+/// What is left is this one, whose argument is the point: `build_login_frame`
+/// asks it about the directory the window it is building was handed, which on
+/// an account switch or an add is not the one the process is on.
 pub fn check_bw_status_details_in(data_dir: Option<&Path>) -> BwStatusDetails {
     bw_status_stdout_in(data_dir, None)
         .map(|stdout| parse_bw_status_details(&stdout))
         .unwrap_or_else(unknown_status_details)
+}
+
+/// **The account's identity without asking `bw status` for it.**
+///
+/// Every consumer of a `BwStatusDetails` outside the login window wants three
+/// things -- an email for the avatar and the account menu, a server URL for
+/// the favicon host, and a status for the About page's account row -- and all
+/// three are already on the [`Account`] this app is running as. Reading them
+/// off it costs nothing; asking the CLI cost a process spawn measured at
+/// 2.39s on the user's machine, on the paths whose entire purpose is to be
+/// fast.
+///
+/// **`status` is derived from whether the address is known, and that is not a
+/// shortcut.** This function is not a session probe and must not be mistaken
+/// for one: it answers "does this app know whose account this is", which is
+/// exactly what the About row and the toolbar were showing. An account that
+/// has never signed in carries an empty email (`accounts::resolve_startup`
+/// and `prepare_new_account` mint it that way), and
+/// [`BwStatus::Unauthenticated`] is what `bw status` answered for it too --
+/// so a first install reads the same as it always did. Once a sign-in has
+/// happened, [`crate::login_ui::SignedInIdentity`] is what fills the email
+/// in, and this reads [`BwStatus::Unlocked`] from then on.
+///
+/// **The email is the thing that makes this non-circular.** Reading `email`
+/// off the account works only because something other than `bw status` now
+/// writes it: the login form the user typed it into. See
+/// [`identity_after_sign_in`].
+pub fn account_details_for(account: Option<&Account>) -> BwStatusDetails {
+    let Some(account) = account else {
+        // `StartupAccounts::NoAccountList`: no account, so nothing is known
+        // about one. The same answer a failed spawn gave.
+        return unknown_status_details();
+    };
+    let user_email = (!account.email.trim().is_empty()).then(|| account.email.clone());
+    BwStatusDetails {
+        status: if user_email.is_some() {
+            BwStatus::Unlocked
+        } else {
+            BwStatus::Unauthenticated
+        },
+        user_email,
+        server_url: account.server_url.clone(),
+    }
+}
+
+/// **The identity a SUCCESSFUL sign-in establishes, taken from the form the
+/// user filled in rather than from a `bw status` that follows it.**
+///
+/// This is the writer that makes [`account_details_for`] safe. Without it,
+/// reading `Account::email` would be circular: `resolve_startup` and
+/// `prepare_new_account` both mint accounts with an empty email, and the only
+/// writers of that field were fed by a `bw status` spawn. Remove the spawns
+/// and keep only the read, and a fresh install gets an account that is
+/// PERMANENTLY nameless -- `accounts::account_label` falls back to the id, so
+/// every menu names a 32-character hash. That defect has shipped once
+/// already; `main`'s `learn_active_account_details` records it.
+///
+/// The two arms are the two things the login card can be doing:
+///
+/// * **Signing in** ([`BwStatus::Unauthenticated`]): the email box is on
+///   screen and `typed` is what the user put in it. It is the address `bw
+///   login` was just run with, so it is the address of the account that now
+///   exists -- known here strictly before any `bw status` could report it.
+///   This is the first-install path and the added-account path.
+/// * **Unlocking** (locked or unlocked): there is no email box, and the
+///   address is the one the window was opened knowing. `known` carries it
+///   through unchanged rather than overwriting a real address with the empty
+///   string a hidden field holds.
+///
+/// Both backends run out of this one function: the CLI arm and the direct-REST
+/// arm of the sign-in worker differ in what they do with the password, not in
+/// where the address came from.
+pub fn identity_after_sign_in(
+    account: Option<&AccountId>,
+    typed: &str,
+    known: Option<&str>,
+    server_url: Option<&str>,
+) -> SignedInIdentity {
+    let typed = typed.trim();
+    SignedInIdentity {
+        account: account.cloned(),
+        user_email: if typed.is_empty() {
+            known.map(str::to_string).filter(|s| !s.trim().is_empty())
+        } else {
+            Some(typed.to_string())
+        },
+        server_url: server_url.map(str::to_string).filter(|s| !s.trim().is_empty()),
+    }
+}
+
+/// What a successful sign-in established about the account it signed in to.
+///
+/// Carries the account id it is ABOUT, for the reason `main`'s startup
+/// prefetch carries one: an answer that names no account can be written into
+/// whichever account happens to be active when it lands, and an address
+/// learned into the wrong account is worse than no address at all. `main`
+/// runs it through the same id guard
+/// (`prefetch_still_describes_the_active_account`) the prefetch already used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedInIdentity {
+    /// The account the window was opened for. `None` on a
+    /// `StartupAccounts::NoAccountList` app, which has no account to record
+    /// anything against.
+    pub account: Option<AccountId>,
+    pub user_email: Option<String>,
+    pub server_url: Option<String>,
+}
+
+impl SignedInIdentity {
+    /// The same three fields in the shape every consumer already reads.
+    ///
+    /// A sign-in that just succeeded is by definition an unlocked vault, so
+    /// this is the one place [`BwStatus::Unlocked`] is asserted rather than
+    /// derived.
+    pub fn as_details(&self) -> BwStatusDetails {
+        BwStatusDetails {
+            status: BwStatus::Unlocked,
+            user_email: self.user_email.clone(),
+            server_url: self.server_url.clone(),
+        }
+    }
+}
+
+/// A produced session token together with the identity that produced it.
+///
+/// One value rather than two returns because the two are established in the
+/// same instant by the same arm, and a caller that could take one without the
+/// other is a caller that can record a session for an account it cannot name.
+pub struct SignedInSession {
+    pub token: String,
+    pub identity: SignedInIdentity,
 }
 
 /// What `bw status` is taken to have said when it did not say anything: no
@@ -206,87 +333,22 @@ pub fn unknown_status_details() -> BwStatusDetails {
     }
 }
 
-/// How long anything may wait on a `bw status` before deciding it is not
-/// coming.
-///
-/// **Deliberately much shorter than `bw_serve::BACKEND_OP_TIMEOUT` (90s),
-/// which is the number this crate uses for the other untimed `bw` spawns**,
-/// and the difference is not impatience -- it is what the two failures cost.
-/// `BACKEND_OP_TIMEOUT` bounds *starting the backend*: give up early there
-/// and there is no vault. This bounds `bw status`, whose only consumer is the
-/// account name, address and server the vault window's toolbar shows
-/// (`StartupWork::produce` -> `vault_window::AccountDetails::Ready`). Give up
-/// early here and the toolbar is missing a name; the vault still opens, the
-/// session is still good, and nothing the user did is thrown away.
-///
-/// That asymmetry runs the other way too, and is the reason this number is
-/// small rather than merely bounded: this phase's budget is charged to
-/// `app_window::WORKING_DEADLINE`, the watchdog that CAN throw a healthy
-/// sign-in away. Every second credited to a cosmetic phase is a second the
-/// window spends refusing to give up on a `bw status` nobody is waiting to
-/// read.
-///
-/// Thirty seconds. `bw status` is a single CLI spawn, measured at 2.39s on
-/// the user's machine (see `main`'s `account_details_source`), so this is
-/// over ten times a real one and still an order of magnitude away from the
-/// backend-start budget. A literal rather than a borrowed constant: it is a
-/// claim about how long ONE `bw status` takes, and nothing in `bw_serve`
-/// should be able to move it.
-pub const STATUS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Waits up to `budget` for a `bw status` that `spawn` is expected to run on
-/// a thread, and reports [`unknown_status_details`] if it does not arrive.
-///
-/// **The decision, separated from the spawning.** `check_bw_status_details`
-/// is a bare `Command::output()` with no timeout of its own, and every caller
-/// that has a deadline was previously bounding only *itself*: the window's
-/// watchdog would fire while the `bw` child was still running, and the user
-/// had by then watched a frozen spinner through a budget that claimed to
-/// cover this call and did not. This is what actually covers it.
-///
-/// It bounds the WAIT, not the child -- the `bw` process is left to finish
-/// and its answer is dropped. That is the same trade `main`'s
-/// `resettle_session_with` already makes against `BACKEND_OP_TIMEOUT`
-/// ("giving up and proceeding anyway is strictly safer"), and it is the only
-/// one available: `std::process::Child` has no timed wait, and killing a
-/// `bw status` mid-flight to save a toolbar label would be a worse bargain
-/// than dropping the label.
-///
-/// `spawn` is a parameter for the reason `account_details_source`'s is: it is
-/// how the timeout decision gets tested without a `bw` CLI, a real profile
-/// directory, or thirty seconds of waiting.
-pub fn status_details_within(
-    budget: std::time::Duration,
-    spawn: impl FnOnce(std::sync::mpsc::Sender<BwStatusDetails>),
-) -> BwStatusDetails {
-    let (tx, rx) = std::sync::mpsc::channel();
-    spawn(tx);
-    match rx.recv_timeout(budget) {
-        Ok(details) => details,
-        Err(e) => {
-            log::warn!(
-                "`bw status` did not answer within {budget:?} ({e}); opening without the \
-                 account name and server. The `bw` process is left to finish on its own -- \
-                 this bounds the wait, not the child."
-            );
-            unknown_status_details()
-        }
-    }
-}
-
-/// [`check_bw_status_details`] that cannot hold its caller for longer than
-/// [`STATUS_DEADLINE`].
-///
-/// The form `StartupWork::produce` calls, and the reason
-/// `app_window::WORKING_DEADLINE` can now name a real bound for its third
-/// phase instead of borrowing the backend-start budget as a guess.
-pub fn check_bw_status_details_bounded() -> BwStatusDetails {
-    status_details_within(STATUS_DEADLINE, |tx| {
-        std::thread::spawn(move || {
-            let _ = tx.send(check_bw_status_details());
-        });
-    })
-}
+// **THE BOUNDED-WAIT APPARATUS IS GONE, AND SO IS WHAT IT WAS BOUNDING.**
+//
+// `STATUS_DEADLINE`, `status_details_within` and
+// `check_bw_status_details_bounded` lived here. All three existed for one
+// reason: five callers ran `bw status` purely to learn the account's email and
+// server URL for a toolbar label, the spawn measured 2.39s on the user's
+// machine, and one of those callers -- `StartupWork::produce` -- ran it inside
+// a window whose watchdog was firing while the `bw` child was still going.
+//
+// None of those callers exist. The email and the server URL are read off the
+// `Account` (`account_details_for`) or off the sign-in that established them
+// (`SignedInIdentity`), neither of which spawns a process, so there is no wait
+// to bound and no deadline to charge `app_window::WORKING_DEADLINE` for. The
+// one `bw status` this file still runs is `check_bw_status_details_in`, in
+// `build_login_frame`, and it is not a label lookup: it decides whether this
+// window asks for a master password or an email AND a master password.
 
 /// Runs `bw logout`, for 3h's "Log out" footer action. Already being logged
 /// out counts as success -- the goal state is "no account", however we got
@@ -2743,6 +2805,12 @@ pub fn build_login_frame(
     // being owned by it.
     let api_key_asked: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
     let api_key_asked_for_closure = api_key_asked.clone();
+    // **The third cell, and the reason this window is now the app's identity
+    // source.** Published on a successful auth beside the token, and read by
+    // both hosts. See `SignedInIdentity`: without it, removing the `bw status`
+    // spawns would leave a fresh install with an account nothing can name.
+    let identity: Rc<RefCell<Option<SignedInIdentity>>> = Rc::new(RefCell::new(None));
+    let identity_for_closure = identity.clone();
 
     // Mutable because 3h's "Log out" flips the window into the sign-in state
     // without closing it.
@@ -2755,6 +2823,17 @@ pub fn build_login_frame(
     let (choice, url) = ServerChoice::from_configured(details.server_url.as_deref());
     form.server_choice = choice;
     form.server_url = url;
+    // **The server this window's sign-in will actually talk to**, which is
+    // what the identity has to carry -- not the dropdown's enum, which cannot
+    // name a self-hosted URL, and not the initial value, which the user is
+    // free to change before submitting. Starts as whatever the CLI is already
+    // pointed at (the unlock path never leaves it) and is rewritten below by
+    // the one line that runs `bw config server`, so the recorded URL and the
+    // configured one cannot disagree.
+    let mut configured_server = details.server_url.clone();
+    // Owned for the closure, for `hello_scope`'s reason: the identity is
+    // published from inside it, after this function's borrows are gone.
+    let identity_account: Option<AccountId> = account.map(|(_, a)| a.id.clone());
     // Probed once: Hello support doesn't change mid-dialog, and enrollment
     // changes only through the actions handled below.
     let mut hello_state = probe_hello(&hello_scope);
@@ -2916,6 +2995,22 @@ pub fn build_login_frame(
                     if let AuthOutcome::Succeeded(session_token) =
                         apply_auth_result(result, &mut form)
                     {
+                        // **Beside the token, in the same arm, and only
+                        // here.** This is the moment the app learns whose
+                        // account this is without asking a `bw status`: the
+                        // address is the one in the box the user just
+                        // submitted (or, on an unlock, the one this window
+                        // opened knowing), and the server is the one
+                        // `configure_server_in` was just run with. Published
+                        // BEFORE the `close_on_success` viewport command, so
+                        // the host that ends its window here still has it to
+                        // read afterwards.
+                        *identity_for_closure.borrow_mut() = Some(identity_after_sign_in(
+                            identity_account.as_ref(),
+                            &form.email,
+                            account_email.as_deref(),
+                            configured_server.as_deref(),
+                        ));
                         *token_for_closure.borrow_mut() = Some(session_token);
                         // The token is recorded either way; what differs is
                         // whether producing one ENDS THE WINDOW.
@@ -3007,7 +3102,18 @@ pub fn build_login_frame(
                                 // the user is already signed into.
                                 Some(url) => match configure_server_in(&url, profile_dir.as_deref())
                                 {
-                                    Ok(()) => true,
+                                    Ok(()) => {
+                                        // The identity's server URL, set from
+                                        // the SAME string the CLI was just
+                                        // configured with. Recorded on the
+                                        // success of that call and not
+                                        // beside it, so a failed
+                                        // `bw config server` cannot leave
+                                        // this window about to record a
+                                        // server it never reached.
+                                        configured_server = Some(url);
+                                        true
+                                    }
                                     Err(e) => {
                                         log::warn!("bw config server failed: {e}");
                                         form.error = Some(e);
@@ -3174,7 +3280,7 @@ pub fn build_login_frame(
         );
     };
 
-    (options, Box::new(login_frame_fn), LoginFrameHandles { token, api_key_asked })
+    (options, Box::new(login_frame_fn), LoginFrameHandles { token, api_key_asked, identity })
 }
 
 /// The login UI's per-frame closure, boxed so it can be stored in a struct and
@@ -3188,6 +3294,11 @@ pub struct LoginFrameHandles {
     /// Set when the card's "Sign in with an API key" link was clicked. Taken
     /// rather than read, for [`LoginFrameHandles::take_token`]'s reason.
     api_key_asked: Rc<RefCell<bool>>,
+    /// **Whose account the sign-in was for**, set in the same arm as `token`.
+    /// NOT taken: unlike the other two this drives nothing, so a second read
+    /// re-learns the same address rather than re-entering a stage, and both
+    /// hosts read it AFTER they have taken the token.
+    identity: Rc<RefCell<Option<SignedInIdentity>>>,
 }
 
 impl LoginFrameHandles {
@@ -3210,6 +3321,17 @@ impl LoginFrameHandles {
     pub fn take_api_key_request(&self) -> bool {
         std::mem::take(&mut *self.api_key_asked.borrow_mut())
     }
+
+    /// The identity the last successful sign-in in this window established,
+    /// **cloned rather than taken** -- see the field's doc.
+    ///
+    /// `None` means no sign-in has succeeded in this window yet, which for
+    /// a caller that has just taken a token can only be the API-key stage:
+    /// that stage has no card, so its token comes off its own worker and
+    /// there is no form here to have learned an address from.
+    pub fn signed_in_identity(&self) -> Option<SignedInIdentity> {
+        self.identity.borrow().clone()
+    }
 }
 
 /// Opens the sign-in window in its OWN event loop and blocks until it closes.
@@ -3221,7 +3343,7 @@ impl LoginFrameHandles {
 pub fn run_login_flow_for(
     account: Option<(&Path, &Account)>,
     first_run: bool,
-) -> Option<String> {
+) -> Option<SignedInSession> {
     let (options, mut frame_fn, handles) = build_login_frame(
         account,
         first_run,
@@ -3242,7 +3364,24 @@ pub fn run_login_flow_for(
     // `None` means the user closed the window with the X button rather than
     // completing the flow. What that *costs* is the caller's to decide, and
     // is decided in exactly one place: [`run_login_flow`].
-    handles.take_token()
+    //
+    // The identity is read only on the token's arm, and that ordering is the
+    // whole guarantee: `signed_in_identity` is `None` exactly when no sign-in
+    // succeeded, so it can never be built from a window the user closed.
+    handles.take_token().map(|token| SignedInSession {
+        identity: handles.signed_in_identity().unwrap_or_else(|| {
+            // Unreachable through this host: it has no API-key stage, so the
+            // only producer of a token here is the card's success arm, which
+            // publishes both. Answered rather than panicked because losing an
+            // address is a blank label and panicking is a lost sign-in.
+            log::error!(
+                "the login window produced a session token without an identity; the account \
+                 will keep whatever address it already had"
+            );
+            SignedInIdentity { account: None, user_email: None, server_url: None }
+        }),
+        token,
+    })
 }
 
 /// The login flow for the two callers that genuinely cannot continue without
@@ -3263,7 +3402,11 @@ pub fn run_login_flow_for(
 /// quick unlock -- which is the one login window every user meets.
 pub fn run_login_flow(account: Option<(&Path, &Account)>, first_run: bool) -> String {
     match run_login_flow_for(account, first_run) {
-        Some(session_token) => session_token,
+        // **The identity is dropped here, and only here.** This wrapper's one
+        // caller is the UI process's own sign-in, which has no `AccountsState`
+        // to record an address into -- the daemon owns `settings.json`. Every
+        // caller that CAN record one takes `run_login_flow_for` instead.
+        Some(session) => session.token,
         None => {
             // Exit cleanly with a logged reason rather than a raw panic
             // backtrace: every downstream operation needs a session.
@@ -4476,7 +4619,15 @@ mod login_entry_point_tests {
         // `String`, or the fatal wrapper starts returning `Option`, this stops
         // compiling -- which is the failure. Task 9's switch is built on that
         // `Option` being there.
-        let cancellable: fn(Option<(&Path, &Account)>, bool) -> Option<String> = run_login_flow_for;
+        //
+        // **The cancellable half now answers with a `SignedInSession`, not a
+        // bare token**, and that is pinned here too: the identity travels with
+        // the token because the two are established in the same arm, and a
+        // caller that could take one without the other is a caller that can
+        // record a session for an account it cannot name. `add_account` is
+        // exactly that caller -- it used to run a `bw status` to find out.
+        let cancellable: fn(Option<(&Path, &Account)>, bool) -> Option<SignedInSession> =
+            run_login_flow_for;
         let fatal: fn(Option<(&Path, &Account)>, bool) -> String = run_login_flow;
         assert!(
             !std::ptr::eq(cancellable as *const (), fatal as *const ()),
@@ -10624,167 +10775,236 @@ mod login_frame_host_tests {
     }
 }
 
-/// **`bw status` is bounded, and the bound is a decision that can be read.**
+/// **THE APP LEARNS WHOSE ACCOUNT IT IS ON WITHOUT SPAWNING A PROCESS.**
 ///
-/// The defect: `check_bw_status_details` is a bare `Command::output()`, and
-/// the only thing that claimed to cover it was
-/// `app_window::WORKING_DEADLINE` -- which bounds the WINDOW. When it fired
-/// the `bw` child was still running and the user had watched a frozen spinner
-/// through the whole budget.
+/// This module replaced `status_deadline_tests`, which guarded the bounded
+/// wait around a `bw status` that five callers ran purely to learn an account
+/// email and server URL. The bound is gone because the spawn is gone; what is
+/// guarded now is the pair that replaced it, and the failure mode is worse
+/// than a slow window. [`account_details_for`] READS `Account::email`, and
+/// `accounts::resolve_startup` and `accounts::prepare_new_account` both mint
+/// accounts with that field empty -- so the read is only correct while
+/// [`identity_after_sign_in`] is what fills it in. If that stops being true,
+/// a fresh install gets an account no menu can ever name.
 ///
 /// Last module in the file on purpose: every source-position guard above
 /// slices at the FIRST `#[cfg(test)]`, so a test module introduced higher up
 /// would silently empty `production()` and vacate them all.
 #[cfg(test)]
-mod status_deadline_tests {
+mod identity_without_a_spawn_tests {
     use super::*;
-    use std::sync::mpsc::Sender;
-    use std::time::{Duration, Instant};
 
-    fn answered(email: &str) -> BwStatusDetails {
-        BwStatusDetails {
-            status: BwStatus::Unlocked,
-            user_email: Some(email.to_string()),
-            server_url: Some("https://vault.example".to_string()),
+    /// This file above its FIRST `#[cfg(test)]`, sliced here rather than
+    /// borrowed from a module above because those helpers are private to it.
+    /// Every needle below is assembled with `concat!` so that writing it here
+    /// cannot move the cut this function makes.
+    fn production() -> &'static str {
+        let source = include_str!("login_ui.rs");
+        let cut = source.find(concat!("#[cfg(", "test)]")).expect("this file has test modules");
+        &source[..cut]
+    }
+
+    /// `build_login_frame`'s body: its signature to the host that follows it.
+    fn builder_body() -> &'static str {
+        let production = production();
+        let at = production
+            .find(concat!("pub fn build_login", "_frame("))
+            .expect("no `build_login_frame` in this file");
+        let end = production
+            .find(concat!("pub fn run_login_flow", "_for("))
+            .expect("no `run_login_flow_for` in this file");
+        assert!(at < end, "control: the builder is expected above its own-event-loop host");
+        let body = &production[at..end];
+        assert!(
+            body.len() > 5000,
+            "the sliced window body is {} bytes, which is not the window: every assertion              over it would pass against nothing",
+            body.len()
+        );
+        body
+    }
+
+    fn account(email: &str, server: Option<&str>) -> Account {
+        Account {
+            id: AccountId::parse(&"a".repeat(32)).expect("a 32-hex test id"),
+            email: email.to_string(),
+            server_url: server.map(str::to_string),
         }
     }
 
-    /// Control for every negative below: an answer that arrives inside the
-    /// budget is passed straight through, so a `status_details_within` that
-    /// simply always returned "unknown" would fail here rather than looking
-    /// like a working timeout.
+    /// **THE DEFECT THIS WHOLE CHANGE HAD TO AVOID.**
+    ///
+    /// `prepare_new_account` and `resolve_startup` mint an account with
+    /// `email: String::new()`. Read alone, that account is nameless forever:
+    /// `accounts::account_label` falls back to the id, and every menu names a
+    /// 32-character hash. The sign-in form is the writer, and this is the pair
+    /// stated in one test -- nameless before, named after, from the address
+    /// the user typed and nothing else.
     #[test]
-    fn an_answer_inside_the_budget_is_reported_verbatim() {
-        let got = status_details_within(Duration::from_secs(30), |tx: Sender<BwStatusDetails>| {
-            tx.send(answered("someone@example.test")).unwrap();
-        });
-        assert_eq!(got.status, BwStatus::Unlocked);
-        assert_eq!(got.user_email.as_deref(), Some("someone@example.test"));
-        assert_eq!(got.server_url.as_deref(), Some("https://vault.example"));
-    }
-
-    /// **The defect, as behaviour.** A `bw status` that never answers must
-    /// cost the caller its budget and not a second more. Before the bound the
-    /// only limit was the child's own, which is none.
-    #[test]
-    fn a_status_that_never_answers_costs_the_budget_and_not_the_child_s_lifetime() {
-        let budget = Duration::from_millis(150);
-        let started = Instant::now();
-        let got = status_details_within(budget, |tx: Sender<BwStatusDetails>| {
-            // Holds its sender for far longer than the budget, exactly as a
-            // wedged `bw` child does. Never joined -- that is the point: the
-            // caller must not be waiting on it.
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(20));
-                let _ = tx.send(answered("late@example.test"));
-            });
-        });
-        let waited = started.elapsed();
-
+    fn a_minted_account_is_nameless_until_the_sign_in_form_names_it() {
+        let minted = account("", None);
+        let before = account_details_for(Some(&minted));
         assert_eq!(
-            got, unknown_status_details(),
-            "a `bw status` that did not answer must read as the same 'we do not know' a failed \
-             spawn produces, not as a second unauthenticated-looking state"
+            before.user_email, None,
+            "control: the minted account already has an address, so this test cannot show \
+             where the address comes from"
         );
-        assert!(
-            waited >= budget,
-            "the wait returned before its own budget ({waited:?} < {budget:?}), so this proves \
-             nothing about a bound -- it would pass against a function that never waited at all"
+        assert_eq!(
+            before.status,
+            BwStatus::Unauthenticated,
+            "an account nobody has signed in to is reported as signed in; Preferences > \
+             About would claim a session that does not exist"
         );
-        assert!(
-            waited < Duration::from_secs(10),
-            "the caller waited {waited:?} on a sender that does not answer for 20s, so the \
-             budget is not bounding anything and the spinner is frozen for the child's \
-             lifetime -- the whole defect"
+
+        let learned = identity_after_sign_in(
+            Some(&minted.id),
+            // What the user typed into the card's email box.
+            "  typed@example.eu  ",
+            None,
+            Some("https://vault.example.eu"),
+        );
+        assert_eq!(
+            learned.user_email.as_deref(),
+            Some("typed@example.eu"),
+            "the address the user just signed in with was not carried out of the window, so \
+             nothing on this machine will ever know it and the account stays a hash"
+        );
+        assert_eq!(
+            learned.account.as_ref(),
+            Some(&minted.id),
+            "the identity does not say WHICH account it is about, so `main` cannot tell it \
+             apart from one established for an account the window then switched away from"
+        );
+
+        // And the round trip: an account that has learned it reads back named.
+        let named = account("typed@example.eu", Some("https://vault.example.eu"));
+        assert_eq!(
+            account_details_for(Some(&named)),
+            BwStatusDetails {
+                status: BwStatus::Unlocked,
+                user_email: Some("typed@example.eu".to_string()),
+                server_url: Some("https://vault.example.eu".to_string()),
+            },
+            "an account that HAS an address does not read back as one, so learning it \
+             changed nothing the toolbar can see"
         );
     }
 
-    /// A worker that dies without sending -- the panicked-thread case -- must
-    /// be the same "unknown", and must NOT cost the full budget: `recv_timeout`
-    /// reports `Disconnected` the moment the sender drops.
+    /// The unlock path has no email box: the field is empty because it is not
+    /// on screen, not because the account has no address. Overwriting a real
+    /// address with that empty string is how a signed-in account would go
+    /// nameless on its second sign-in.
     #[test]
-    fn a_worker_that_dies_without_answering_is_unknown_immediately() {
-        let started = Instant::now();
-        let got = status_details_within(Duration::from_secs(30), |tx: Sender<BwStatusDetails>| {
-            drop(tx);
+    fn an_unlock_keeps_the_address_the_window_opened_knowing() {
+        let learned = identity_after_sign_in(
+            None,
+            "",
+            Some("known@example.eu"),
+            Some("https://vault.example.eu"),
+        );
+        assert_eq!(
+            learned.user_email.as_deref(),
+            Some("known@example.eu"),
+            "an unlock blanked the account's address, because it read a form field that the \
+             unlock card does not draw"
+        );
+        // Positive control: the typed value wins when there IS one, so the
+        // assertion above is the fallback firing rather than `typed` being
+        // ignored outright.
+        assert_eq!(
+            identity_after_sign_in(None, "typed@example.eu", Some("known@example.eu"), None)
+                .user_email
+                .as_deref(),
+            Some("typed@example.eu"),
+            "control: the typed address is ignored even when present, so this function \
+             cannot name a first install at all"
+        );
+    }
+
+    /// Blank is blank, wherever it comes from. A whitespace-only field is not
+    /// an address, and an empty `serverUrl` is not a self-hosted server --
+    /// `favicon::icon_base_url` treats `Some("")` as a host and would fetch
+    /// icons from nowhere.
+    #[test]
+    fn whitespace_is_not_an_address_and_not_a_server() {
+        let learned = identity_after_sign_in(None, "   ", Some("  "), Some("  "));
+        assert_eq!(learned.user_email, None);
+        assert_eq!(learned.server_url, None);
+        assert_eq!(
+            account_details_for(Some(&account("   ", None))).user_email,
+            None,
+            "an account whose email is whitespace reads as named, so the toolbar draws \
+             initials from nothing and the About page claims a session"
+        );
+    }
+
+    /// An app with no `Account` at all (`StartupAccounts::NoAccountList`)
+    /// must answer EXACTLY what a failed spawn answered. A second
+    /// unauthenticated-looking value is a second state for the rest of the
+    /// app to disagree about -- the reason `unknown_status_details` exists.
+    #[test]
+    fn no_account_answers_exactly_what_a_failed_spawn_did() {
+        assert_eq!(account_details_for(None), unknown_status_details());
+    }
+
+    /// **`SignedInIdentity::as_details` asserts `Unlocked` rather than
+    /// deriving it**, and that is the one place in this pair where the status
+    /// is not a function of the email. A sign-in that just succeeded IS an
+    /// unlocked vault.
+    #[test]
+    fn a_successful_sign_in_reports_an_unlocked_vault() {
+        let details = SignedInIdentity {
+            account: None,
+            user_email: Some("who@example.eu".to_string()),
+            server_url: None,
+        }
+        .as_details();
+        assert_eq!(
+            details.status,
+            BwStatus::Unlocked,
+            "the vault the user has just unlocked is reported locked"
+        );
+        assert_eq!(details.user_email.as_deref(), Some("who@example.eu"));
+    }
+
+    /// **The card publishes the identity in the same arm that publishes the
+    /// token, and BEFORE it asks the window to close.**
+    ///
+    /// A source guard because the arm runs only inside a live eframe event
+    /// loop. The ordering is what `run_login_flow_for` depends on: it reads
+    /// the identity after taking the token, and a publish placed after the
+    /// `close_on_success` viewport command would still be correct here but is
+    /// the kind of ordering that gets rearranged -- so the arm is pinned as a
+    /// whole.
+    #[test]
+    fn the_identity_is_published_with_the_token_and_before_the_close() {
+        let body = builder_body();
+        let publish = concat!("*identity_for_closure.borrow_mut() = Some(identity_after_sign", "_in(");
+        let token = concat!("*token_for_closure.borrow_mut() = Some(session_", "token);");
+        let close = concat!("if close_on_", "success {");
+        let at_publish = body.find(publish).unwrap_or_else(|| {
+            panic!(
+                "the sign-in card no longer publishes an identity. Nothing else on a first \
+                 install knows the address the user typed, so every menu naming that account \
+                 would name its 32-character directory id instead -- permanently"
+            )
         });
-        assert_eq!(got, unknown_status_details());
+        let at_token = body.find(token).expect("the card must still record its session token");
+        let at_close = body[at_token..]
+            .find(close)
+            .map(|offset| offset + at_token)
+            .expect("the card must still be able to end its own window on success");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "a dead worker made the caller sit out the whole budget rather than being noticed \
-             when its sender dropped"
+            at_publish < at_token,
+            "the identity is published after the token rather than with it; the two are one \
+             fact and a caller can now take the token without it"
+        );
+        assert!(
+            at_token < at_close,
+            "control: the token is recorded after the window is asked to close, so the \
+             ordering this test reads is not the one the card has"
         );
     }
 
-    /// The budget is honoured as given rather than clamped to some internal
-    /// favourite: two different budgets must produce two different waits.
-    #[test]
-    fn a_longer_budget_really_does_wait_longer() {
-        let wait_for = |budget: Duration| {
-            let started = Instant::now();
-            let _ = status_details_within(budget, |tx: Sender<BwStatusDetails>| {
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(20));
-                    let _ = tx.send(answered("late@example.test"));
-                });
-            });
-            started.elapsed()
-        };
-        let short = wait_for(Duration::from_millis(50));
-        let long = wait_for(Duration::from_millis(600));
-        assert!(
-            long > short,
-            "the budget is ignored: {long:?} for a 600ms budget is no longer than {short:?} for \
-             a 50ms one, so `status_details_within` is waiting on something of its own choosing"
-        );
-    }
-
-    /// **The wiring.** The pure decision above is worth nothing if the
-    /// production call does not apply it. Deleting `STATUS_DEADLINE` from
-    /// `check_bw_status_details_bounded`, or unwrapping it back to a bare
-    /// `check_bw_status_details()`, fails here.
-    #[test]
-    fn the_bounded_form_applies_the_deadline_to_a_spawned_status() {
-        let source: &str = include_str!("login_ui.rs");
-        let body = source
-            .split_once(concat!("pub fn check_bw_status_details_bo", "unded()"))
-            .expect("the bounded form must still exist")
-            .1
-            .split_once(concat!("#[cfg(", "test)]"))
-            .expect("a test module must still follow the production code")
-            .0;
-        assert!(
-            body.len() < source.len(),
-            "control: the split isolated a region rather than keeping the whole file"
-        );
-        assert!(
-            body.contains(concat!("status_details_wi", "thin(STATUS_DEADLINE,")),
-            "the bounded form no longer applies `STATUS_DEADLINE` -- so `bw status` is untimed \
-             again and `app_window::WORKING_DEADLINE`'s third term is a fiction once more"
-        );
-        assert!(
-            body.contains(concat!("thread::sp", "awn(")),
-            "the bounded form no longer runs `bw status` on a thread, so `recv_timeout` has \
-             nothing to time out ON and the bound cannot fire"
-        );
-    }
-
-    /// The number itself, argued rather than asserted equal to itself.
-    #[test]
-    fn the_status_deadline_is_generous_against_a_real_bw_status_and_cheap_against_the_watchdog() {
-        // ~2.39s measured warm (see `main`'s `account_details_source`).
-        assert!(
-            STATUS_DEADLINE >= Duration::from_secs(24),
-            "{STATUS_DEADLINE:?} is less than ten times a measured `bw status`; a slow machine \
-             would lose the toolbar's account name routinely"
-        );
-        assert!(
-            STATUS_DEADLINE < crate::bw_serve::BACKEND_OP_TIMEOUT,
-            "the account name is now budgeted as generously as starting the backend itself -- \
-             but its failure only blanks a label, while the watchdog this is charged to can \
-             throw away the whole sign-in"
-        );
-    }
     // -----------------------------------------------------------------
     // The region BELOW the cut -- the half no source guard in this file
     // reads.

@@ -119,41 +119,30 @@ const READINESS_ATTEMPTS: u64 = 11;
 ///      11 `list_items()` calls, so the real worst case is 30s of sleeping plus
 ///      110s of waiting on a backend that answers slowly instead of not at all:
 ///      ~140s, not 30s.
-///   3. `login_ui::check_bw_status_details_bounded()`, unconditional and on the
-///      failure path too -- and **the one phase that now bounds ITSELF**. The
-///      bare `check_bw_status_details` is a `Command::output()` with no
-///      timeout, and while `produce` called it this term was the only one here
-///      that described nothing: it charged `BACKEND_OP_TIMEOUT` because "an
-///      untimed `bw` spawn costs what the others do", but no clock was on the
-///      spawn at all. When this deadline fired the child was still running and
-///      the user had watched a frozen spinner through the whole budget. The
-///      bounded form waits `login_ui::STATUS_DEADLINE` and then reports
-///      "unknown", so the term is read from the constant that actually bounds
-///      the phase, the same way phase 2 reads `READ_DEADLINE`.
+/// **There is no third phase.** `produce` used to end with a
+/// `login_ui::check_bw_status_details_bounded()` -- a `bw status` spawn,
+/// unconditional and on the failure path too -- and this sum credited it
+/// `login_ui::STATUS_DEADLINE` (30s). The spawn is gone: the toolbar's account
+/// name and server come from the sign-in card that ran BEFORE this worker
+/// (`login_ui::SignedInIdentity`) or, on a launch that showed no card, off the
+/// `Account` on disk. Neither costs a process, so neither is a phase and
+/// neither owes this budget anything.
 ///
-/// Hence 90 + (30 + 11*10) + 30 = **260s**, down 60s from the 320s that
-/// credited phase 3 with a backend-start budget it was not spending. A shorter
-/// deadline here is the better one, not a concession: the 60s given back was
-/// time the window spent refusing to give up on a `bw status` whose only
-/// consumer is the toolbar's account label. `STATUS_DEADLINE` is small for
-/// exactly that reason (see its own doc) -- losing that phase costs a label,
-/// while losing this deadline's race costs the whole sign-in.
-///
-/// The step before that fixed phase 2: the sum used to credit it 30s and come
-/// to 210s, which a slow-but-healthy startup can exceed while still on its way
-/// to succeeding.
+/// Hence 90 + (30 + 11*10) = **230s**, down 30s again. Each shortening of this
+/// number has been the same trade and it goes the same way: the seconds given
+/// back were seconds the window spent refusing to give up on something whose
+/// only consumer was a label, while losing this deadline's race costs the
+/// whole sign-in.
 ///
 /// Still deliberately generous where generosity is what is at stake: this is a
 /// watchdog on a stage the user cannot leave by any other route, and a false
-/// timeout on a slow machine throws away a healthy sign-in. Phases 1 and 2
-/// remain bounds on the WINDOW rather than on their subprocesses -- 230s of
-/// this total is still a budget the worker can overrun while `produce` runs on.
-/// Phase 3 is the first one where the worker itself stops waiting.
+/// timeout on a slow machine throws away a healthy sign-in. Both remaining
+/// phases are bounds on the WINDOW rather than on their subprocesses -- the
+/// whole total is a budget the worker can overrun while `produce` runs on.
 pub const WORKING_DEADLINE: Duration = Duration::from_secs(
     crate::bw_serve::BACKEND_OP_TIMEOUT.as_secs()
         + crate::bw_serve::READINESS_DEADLINE.as_secs()
-        + READINESS_ATTEMPTS * crate::vault_bridge::READ_DEADLINE.as_secs()
-        + crate::login_ui::STATUS_DEADLINE.as_secs(),
+        + READINESS_ATTEMPTS * crate::vault_bridge::READ_DEADLINE.as_secs(),
 );
 
 /// What the one window is showing.
@@ -593,6 +582,23 @@ pub struct StartupOutcome<P> {
     /// window on the card instead -- the same fact `login_ui::
     /// run_login_flow_for` reports with `None`, and it costs the same thing.
     pub token: Option<String>,
+    /// **Whose account the sign-in in this window was for**, learned from the
+    /// login form rather than from a `bw status` spawn.
+    ///
+    /// This is what replaced the startup `bw status`. `main` mints a
+    /// first-install account with an EMPTY email -- nobody has signed in yet,
+    /// so there is nothing to record -- and until the sign-in that this
+    /// window runs, nothing on this machine knows the address. The spawn used
+    /// to be how it was learned afterwards; this is how it is learned
+    /// *during*, at no cost. `main` runs it through
+    /// `learn_active_account_details`, behind the same account-id guard the
+    /// prefetch used.
+    ///
+    /// `None` means no sign-in succeeded in this window, which is either a
+    /// closed card (so [`Self::token`] is `None` too) or a launch that
+    /// resumed a stored session without showing one (so the account is
+    /// already named).
+    pub identity: Option<crate::login_ui::SignedInIdentity>,
     /// Whatever the caller's `prepare` returned. `None` means the window ended
     /// before the work landed, which after [`run`] returns can only be a
     /// sign-in the user abandoned.
@@ -1233,7 +1239,19 @@ pub fn run<P, W, V, T, B>(
 where
     P: Send + 'static,
     W: FnOnce(String) -> P + Send + 'static,
-    V: FnOnce(&str, &mut P) -> Option<(vault_window::VaultFrameFn, vault_window::VaultFrameHandles)>
+    // **The identity is the third argument, and it is why this host can build
+    // a NAMED vault toolbar on a first install.** The worker that produced `P`
+    // ran before the account had an address on disk; the card that ran before
+    // IT is where the address was typed. Handed here rather than fetched
+    // there, so no stage of this window has to spawn a `bw status` to find out
+    // whose vault it is showing. `None` on a launch that resumed a stored
+    // session without showing a card -- in which case the account is already
+    // named and the caller reads it off the account.
+    V: FnOnce(
+            &str,
+            &mut P,
+            Option<&login_ui::SignedInIdentity>,
+        ) -> Option<(vault_window::VaultFrameFn, vault_window::VaultFrameHandles)>
         + 'static,
     T: FnOnce(&mpsc::Sender<TeardownStep>, mpsc::Receiver<String>) + Send + 'static,
     B: FnOnce(
@@ -1323,6 +1341,17 @@ where
     // explained one. See `StartupOutcome::locked_without_a_teardown`.
     let locked_without_a_teardown: Rc<RefCell<bool>> = Rc::new(RefCell::new(false));
 
+    // **Whose account signed in here**, carried out beside the token so that
+    // `main` can record it without a `bw status` spawn. This host is the one
+    // that matters most for that: it is the FIRST-INSTALL window, and a
+    // first-install account is minted with an empty email that nothing else
+    // can fill in. See `login_ui::SignedInIdentity`.
+    //
+    // Unlike the token, this is NOT cleared by the lock catch: a lock does not
+    // change whose account this is, and the post-lock card would only re-learn
+    // the same address.
+    let identity: Rc<RefCell<Option<login_ui::SignedInIdentity>>> = Rc::new(RefCell::new(None));
+    let identity_for_closure = identity.clone();
     let token_for_closure = token.clone();
     let prepared_for_closure = prepared.clone();
     let vault_handles_for_closure = vault_handles.clone();
@@ -1445,6 +1474,16 @@ where
                 // that could never fire while this cell went on holding the
                 // first sign-in's token across a lock that threw that session
                 // away.
+                // **Read from the card that produced the token, in the same
+                // block that notices it.** `signed_in_identity` clones rather
+                // than takes, so reading it after `take_token` is not a race
+                // with anything -- and the API-key stage, which has no card,
+                // simply leaves whatever the previous card learned.
+                if let Some(learned) =
+                    login.as_ref().and_then(|(_, handles)| handles.signed_in_identity())
+                {
+                    *identity_for_closure.borrow_mut() = Some(learned);
+                }
                 *token_for_closure.borrow_mut() = Some(produced.clone());
                 signed_in_at = Some(Instant::now());
                 // **THE FIRST CARD OR THE SECOND, told apart by the `FnOnce`
@@ -1701,7 +1740,11 @@ where
                             Ok(mut work) => {
                                 let signed_in = token_for_closure.borrow().clone();
                                 let built = match (build_vault.take(), signed_in.as_deref()) {
-                                    (Some(build), Some(token)) => build(token, &mut work),
+                                    (Some(build), Some(token)) => build(
+                                        token,
+                                        &mut work,
+                                        identity_for_closure.borrow().as_ref(),
+                                    ),
                                     _ => None,
                                 };
                                 *prepared_for_closure.borrow_mut() = Some(work);
@@ -1942,11 +1985,13 @@ where
     // expression would still be borrowing `token` at the end of the statement,
     // after the `Rc` it borrows from has already been dropped.
     let token = token.borrow_mut().take();
+    let identity = identity.borrow_mut().take();
     let prepared = prepared.borrow_mut().take();
     let tore_the_session_down = *tore_down.borrow();
     let locked_without_a_teardown = *locked_without_a_teardown.borrow();
     StartupOutcome {
         token,
+        identity,
         prepared,
         vault,
         stages,
@@ -3397,30 +3442,43 @@ mod working_watchdog_tests {
     #[test]
     fn the_deadline_covers_every_phase_the_worker_runs() {
         use crate::bw_serve::{BACKEND_OP_TIMEOUT, READINESS_DEADLINE, readiness_schedule};
-        use crate::login_ui::STATUS_DEADLINE;
         use crate::vault_bridge::READ_DEADLINE;
         assert_eq!(
             WORKING_DEADLINE,
-            BACKEND_OP_TIMEOUT
-                + READINESS_DEADLINE
-                + READ_DEADLINE * READINESS_ATTEMPTS as u32
-                + STATUS_DEADLINE,
+            BACKEND_OP_TIMEOUT + READINESS_DEADLINE + READ_DEADLINE * READINESS_ATTEMPTS as u32,
             "the working stage's deadline is no longer the sum of what actually bounds the \
-             three phases `StartupWork::produce` runs -- an untimed backend start, the \
-             readiness probe's sleeps AND its per-attempt bridge reads, and a `bw status` \
-             bounded by `STATUS_DEADLINE` -- so a healthy-but-slow startup can be cut off"
+             TWO phases `StartupWork::produce` runs -- an untimed backend start, and the \
+             readiness probe's sleeps AND its per-attempt bridge reads -- so a \
+             healthy-but-slow startup can be cut off"
         );
-        // **The third term is a real bound and not a borrowed guess.** It was
-        // `BACKEND_OP_TIMEOUT` while the phase was an untimed `Command::output()`
-        // -- a number describing a call nothing was timing. Reading
-        // `STATUS_DEADLINE` here is only honest while `produce` actually applies
-        // it, which `main.rs`'s
-        // `the_startup_worker_bounds_the_status_call_the_deadline_charges_for`
-        // is the other half of.
+        // **There is no third term any more, and its absence is asserted
+        // rather than merely omitted.** The third phase was a `bw status`
+        // spawn credited `login_ui::STATUS_DEADLINE`; the toolbar's account
+        // name now comes off the sign-in card or the `Account` on disk, at no
+        // cost. A term for it reappearing here would mean the spawn had come
+        // back, and this module would be budgeting for work nobody does.
+        //
+        // Asserted over the CONST'S OWN DEFINITION and not over the module,
+        // because the way the phase would come back is a fourth term added to
+        // that sum -- and prose above and below this line discusses the
+        // deadline it used to charge, which a module-wide scan would match.
+        let definition = include_str!("app_window.rs")
+            .split_once("pub const WORKING_DEADLINE: Duration = Duration::from_secs(")
+            .expect("the working stage's deadline must still be declared in this module")
+            .1
+            .split_once(");")
+            .expect("its declaration must be terminated")
+            .0;
         assert!(
-            STATUS_DEADLINE < BACKEND_OP_TIMEOUT,
-            "the status phase is budgeted as heavily as starting the backend again, which is \
-             the guess this term replaced rather than the bound it is supposed to be"
+            definition.contains("BACKEND_OP_TIMEOUT"),
+            "control: the slice is not the deadline's definition, so the negative below \
+             proves nothing"
+        );
+        assert!(
+            !definition.contains("login_ui"),
+            "the working stage's deadline charges for a `login_ui` phase again. The only one \
+             it ever charged for was a `bw status` spawn, and the startup worker no longer \
+             runs one -- so either the spawn is back, or the budget is paying for it anyway"
         );
         // **The claim `READINESS_ATTEMPTS` makes, checked against the real
         // function rather than agreed with it.** `wait_for_vault_ready` calls
@@ -3444,52 +3502,46 @@ mod working_watchdog_tests {
              sleep budget, which is the mistake this sum was rewritten to fix"
         );
 
-        // **The absolute bounds -- and the only ones here that are.** Every
+        // **The one absolute bound -- and the only one here that is.** Every
         // assertion above is a restatement of `WORKING_DEADLINE`'s own
-        // definition: each right-hand side is a sub-expression of it, so
-        // `WORKING_DEADLINE` minus the nominal three-phase budget is identically
-        // `READINESS_ATTEMPTS * READ_DEADLINE`, which is never negative -- it
-        // cannot fail however far the source constants move. Not a
+        // definition: each right-hand side is a sub-expression of it, so none
+        // of them can fail however far the source constants move. Not a
         // hypothetical: halving `BACKEND_OP_TIMEOUT` drops this deadline from
-        // 260s to 215s with all of the above green, which is precisely what the
-        // comment that used to stand here claimed could not happen. The two
-        // below are compared against LITERALS declared in this module, so
-        // nothing in `bw_serve` or `vault_bridge` can move both sides at once.
+        // 230s to 185s with all of the above green. The one below is compared
+        // against a LITERAL declared in this module, so nothing in `bw_serve`
+        // or `vault_bridge` can move both sides at once.
         assert!(
             WORKING_DEADLINE <= SPINNER_PATIENCE,
             "the working stage may now hold a window the user cannot close for longer than \
              anyone will sit in front of it ({WORKING_DEADLINE:?} > {SPINNER_PATIENCE:?}); \
              past this the watchdog is not a way out, it is Task Manager with extra steps"
         );
-        assert!(
-            WORKING_DEADLINE >= MINIMUM_STARTUP_GRACE,
-            "the working stage now abandons a startup after {WORKING_DEADLINE:?}, less than the \
-             {MINIMUM_STARTUP_GRACE:?} a cold start can legitimately need -- so a sign-in that \
-             is merely slow is thrown away and the user is sent back through a fresh login for \
-             nothing, which is the one harm this deadline's generosity exists to avoid"
-        );
-        // **The floor's own argument, checked.** `MINIMUM_STARTUP_GRACE` is a
-        // literal so that rearranging the source constants cannot move it -- but
-        // a literal nothing checks is just a number someone once liked. Its
-        // stated reason is that it clears the part of the startup still bounded
-        // only by this WINDOW and not by the worker itself: phases 1 and 2. The
-        // status phase is excluded on purpose, because `produce` now bounds it.
-        // Unlike the two assertions above this one CAN fail on a source-constant
-        // change, and that is the point: if the untimed phases grow past the
-        // floor, the floor's argument is stale and has to be re-made rather than
-        // silently outgrown.
+        // **THE FLOOR IS RETIRED, AND ITS OWN ARGUMENT IS WHAT RETIRED IT.**
+        //
+        // `MINIMUM_STARTUP_GRACE` was a literal 240s asserted to sit strictly
+        // between "the part of startup only this window bounds" and
+        // `WORKING_DEADLINE`. It could occupy that gap only because a third
+        // phase -- the `bw status`, credited `STATUS_DEADLINE` -- padded the
+        // deadline above the phases it covered. That phase is gone, so
+        // `WORKING_DEADLINE` IS the sum of the window-bounded phases: the two
+        // ends of the gap have met, and a floor between them cannot exist.
+        //
+        // Nothing is lost, and the retired assertion is what says so. It
+        // required `MINIMUM_STARTUP_GRACE < WORKING_DEADLINE` on the grounds
+        // that "a floor equal to the sum is not a margin, it is the same claim
+        // written twice" -- and the equality at the top of this test is now
+        // exactly that claim, made once. The deadline cannot fall below what a
+        // cold start needs, not because a literal forbids it, but because it
+        // is derived from the same constants: halve `BACKEND_OP_TIMEOUT` and
+        // both sides move together. That is the scenario the floor was written
+        // to catch, and the structure now makes it unreachable rather than
+        // merely detected.
         let still_unbounded_by_the_worker =
             BACKEND_OP_TIMEOUT + READINESS_DEADLINE + READ_DEADLINE * READINESS_ATTEMPTS as u32;
-        assert!(
-            MINIMUM_STARTUP_GRACE > still_unbounded_by_the_worker,
-            "the floor ({MINIMUM_STARTUP_GRACE:?}) no longer clears the \
-             {still_unbounded_by_the_worker:?} of startup that only this window bounds, so it \
-             has stopped protecting a slow-but-healthy cold start from being thrown away"
-        );
-        assert!(
-            MINIMUM_STARTUP_GRACE < WORKING_DEADLINE,
-            "the floor has caught up with the deadline it is a floor ON; a floor equal to the \
-             sum is not a margin, it is the same claim written twice"
+        assert_eq!(
+            WORKING_DEADLINE, still_unbounded_by_the_worker,
+            "the deadline has drifted away from the phases it covers: it is either paying for \
+             work nobody does or cutting off work somebody does"
         );
     }
 
@@ -3503,44 +3555,18 @@ mod working_watchdog_tests {
     /// definition rather than a restatement of it.
     ///
     /// Unchanged when phase 3 stopped being an untimed spawn and the deadline
-    /// fell to 260s. This is a claim about a PERSON -- how long anyone will sit
-    /// in front of a spinner with no way out -- and nothing about how the app
-    /// spends the time changes it. It simply has more headroom now.
+    /// fell to 260s, and unchanged again when phase 3 stopped existing at all
+    /// and it fell to 230s. This is a claim about a PERSON -- how long anyone
+    /// will sit in front of a spinner with no way out -- and nothing about how
+    /// the app spends the time changes it. It simply has more headroom now.
     const SPINNER_PATIENCE: Duration = Duration::from_secs(6 * 60);
 
-    /// The shortest deadline a startup may ever be given before the window
-    /// abandons it.
-    ///
-    /// **Four minutes -- re-argued, not relaxed.** It was five, and the argument
-    /// was that the three phases can legitimately cost ~5m20s on a cold `bw
-    /// serve`. That reasoning was sound while phase 3 was an untimed `bw status`
-    /// credited a 90s backend-start budget. It is not sound now:
-    /// `StartupWork::produce` calls `check_bw_status_details_bounded`, which
-    /// stops waiting after `login_ui::STATUS_DEADLINE` and reports "unknown", so
-    /// that phase CANNOT cost more than 30s however slow the machine is. A
-    /// five-minute floor now asserts time no phase is able to spend, and the
-    /// only thing it could do is force a future deadline to be padded past the
-    /// work it covers.
-    ///
-    /// Four minutes is where the same argument lands at the real phase costs.
-    /// What the floor protects is the part still bounded only by this WINDOW and
-    /// not by the worker: phase 1's untimed backend start (`BACKEND_OP_TIMEOUT`,
-    /// 90s) plus phase 2's sleeps and per-attempt bridge reads (30s + 11x10s),
-    /// which is 230s of work a slow-but-healthy cold start can genuinely
-    /// consume, and cutting it off costs the user the entire sign-in they have
-    /// just completed while buying nothing -- the recovery `main` runs
-    /// afterwards starts the same backend over again from scratch. 240s clears
-    /// that with the smallest margin that is still a margin, and leaves the
-    /// guard its teeth: halving `BACKEND_OP_TIMEOUT` yields 215s and trips this,
-    /// which is the exact scenario this floor was written for.
-    ///
-    /// Still a LITERAL and deliberately not a sum of the constants
-    /// `WORKING_DEADLINE` is built from -- a floor spelled with those moves
-    /// whenever they do, which is how a 320s deadline could have become 230s
-    /// with this whole file green. Re-deriving the literal when a phase's real
-    /// bound changes is the intended way to change it; rearranging the source
-    /// constants is not.
-    const MINIMUM_STARTUP_GRACE: Duration = Duration::from_secs(4 * 60);
+    // **`MINIMUM_STARTUP_GRACE` was here, and is gone.** A literal 240s floor
+    // under `WORKING_DEADLINE`, which could only exist while a `bw status`
+    // phase padded that deadline above the phases it covered. See
+    // `the_deadline_covers_every_phase_the_worker_runs`, which retired it and
+    // says why the equality it now asserts is the same claim the floor was
+    // making.
 }
 
 /// **The window's own close, run for real.**
