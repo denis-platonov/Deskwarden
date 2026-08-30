@@ -28,38 +28,26 @@ on:
     # coverage run, a Mesa download plus an eleven-surface screenshot walk,
     # and a per-commit `cargo check`. None of it could have found anything.
     #
-    # Stated as paths-ignore rather than a paths allowlist on purpose: an
-    # allowlist silently stops running when somebody adds a new source
-    # directory, and a CI that quietly stops guarding is worse than one that
-    # runs too often.
+    # **There is deliberately no path filter here, and there was one for a
+    # day.** It ignored `**.md` and `docs/**` so a documentation push would
+    # not run the matrix -- added to save Actions minutes, which was the
+    # wrong reason: this repository is PUBLIC, and public repositories run
+    # standard GitHub-hosted runners for free. It saved nothing anybody pays
+    # for. See docs/ci-and-actions-minutes.md, which measured where the
+    # account's minutes actually went (a private fork's macOS nightly).
     #
-    # `.github/**` is deliberately NOT ignored -- a change to this file must
-    # run this file.
+    # What it cost was real. Branch protection requires three of these jobs,
+    # and a run skipped by a path filter reports NO STATUS -- not a green
+    # one. A documentation-only pull request would therefore wait forever on
+    # checks that never arrive, and no amount of re-running fixes it. The
+    # remedy would have been a second workflow declaring no-op jobs under the
+    # same three names, kept in step with them for ever.
     #
-    # THE TRAP, and read it before turning on branch protection. A run
-    # skipped by paths-ignore does not report a status AT ALL; it is not a
-    # green one. If any job here is made a REQUIRED STATUS CHECK, every
-    # documentation-only pull request will sit forever waiting on a check
-    # that will never arrive, and no amount of re-running fixes it. The
-    # documented remedy is a companion workflow with the INVERSE filter
-    # (`paths:` where this says `paths-ignore:`) declaring jobs of exactly
-    # these four names whose only step is `run: 'true'`, so the required
-    # names always report. It is deliberately not added here: two workflows
-    # exposing the same four check names, with nothing yet requiring them,
-    # is its own confusion. Add it at the same time as branch protection,
-    # not before. See docs/ci-and-actions-minutes.md §4.1.
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "LICENSE"
-      - ".gitignore"
+    # A filter that saves no money, in exchange for a merge that cannot
+    # complete and a workflow to maintain, is a bad trade. Running the matrix
+    # on a README commit costs wall-clock nobody is waiting on.
   pull_request:
     branches: ["main"]
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
-      - "LICENSE"
-      - ".gitignore"
   # Manual runs can pick the runner. Default false, so nothing changes
   # unless somebody deliberately asks for the local machine. See the
   # "runner" job below -- and the security note above it -- before using it.
