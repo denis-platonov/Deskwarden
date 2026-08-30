@@ -31,20 +31,30 @@
 //! update, trash, restore and hard delete for *ciphers*, and create and
 //! delete for *folders*.
 //!
-//! **Sends** are here now, in [`send`] and [`send_crypto`]: a text Send can
-//! be published, listed and revoked without `bw.exe`. Two halves of the
-//! feature are not, and each is named rather than left to be discovered --
-//! **file Sends** (creatable on neither backend today, so listing and
-//! revoking them is parity and not a subtraction) and **receiving a Send
-//! from a link**, which still runs `send::cli_send_receive`.
+//! **Sends** are here now, in [`send`], [`send_crypto`] and [`send_link`]:
+//! a text Send can be published, listed, revoked **and read from a link**
+//! without `bw.exe`. Receiving probes two routes, because there is no stable
+//! one -- the anonymous `POST /api/sends/access/{id}` was removed in server
+//! `v2026.8.0` and the bearer `POST /api/sends/access` only arrived in
+//! `v2026.1.1` -- and the user is never told which answered. See
+//! `docs/superpowers/specs/2026-08-30-receiving-a-send-design.md`.
 //!
-//! Still missing, and each is what keeps `bw.exe` on the machine: that
-//! receive path, **attachments** (not decrypted by [`sync`], not creatable
-//! or deletable by [`write`]), and **organisations** (decrypted, but never
-//! shown working against a real server).
+//! Three halves of the feature are still refused, each **by name** rather
+//! than left to be discovered as a generic failure: **file Sends** (neither
+//! creatable nor downloadable here; listing and revoking them is parity, and
+//! a file link is refused in its own words), **e-mail-gated Sends** (a
+//! `v2026.1.1+` feature needing a mail round trip and a code entry this app
+//! has no screen for), and **a link on a host that is not the account's own
+//! server**, which is refused rather than followed.
+//!
+//! Still missing, and each is what keeps `bw.exe` on the machine:
+//! **attachments** (not decrypted by [`sync`], not creatable or deletable by
+//! [`write`]) and **organisations** (decrypted, but never shown working
+//! against a real server). The receive path is no longer on this list.
 //!
 //! This paragraph said "no folder write" until folder writes landed and
-//! nobody came back to it, and it said Sends were absent until they were not -- a module doc that lists what is missing is a
+//! nobody came back to it, and it said Sends were absent until they were not,
+//! and it said receiving still ran the CLI until it did not -- a module doc that lists what is missing is a
 //! promise to keep the list current, and it is the kind of sentence a
 //! reader trusts precisely because it is inconvenient. Two-factor
 //! authentication is
@@ -108,7 +118,7 @@ pub mod api;
 /// rather than faked. See its own docs for what one call costs.
 pub mod backend;
 pub mod crypto;
-/// Sends over REST: the three operations `crate::send` runs the CLI for.
+/// Sends over REST: the four operations `crate::send` runs the CLI for.
 pub mod send;
 /// A Send's own key hierarchy, which is not the vault's. Pure; no I/O.
 pub mod send_crypto;

@@ -4485,6 +4485,127 @@ mod source_pins {
         );
     }
 
+    /// **`real_send_receive` is the whole of the fetch, as an equality.**
+    ///
+    /// [`the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account`]'s
+    /// shape and its reason, applied to the receive now that it has two arms.
+    /// A whole-body equality rather than a set of needles because a needle
+    /// pins the SPELLING of an identifier and says nothing about what it is
+    /// bound to, nor about what runs before it: the measured defect that
+    /// retired the needle version of the list's pin was one inserted statement
+    /// above the pinned line, which left every needle word-perfect.
+    ///
+    /// Three properties, and the equality holds all three at once:
+    ///
+    ///  1. **A `DirectRest` account returns BEFORE the CLI arm.** Not merely
+    ///     that a branch exists -- that the `return` is inside it, so no
+    ///     `bw.exe` is reached and `RECEIVE_NEEDS_THE_CLI` cannot be produced.
+    ///  2. **The `bw serve` arm is textually what it was.** This equality is
+    ///     what says the CLI path did not change while a second one was added
+    ///     beside it, which is the whole promise made to a user on the
+    ///     official CLI.
+    ///  3. **Neither arm is handed anything of the account's.** A receive is
+    ///     addressed by a link; the link is the credential. A parameter or a
+    ///     `let` that brought one in changes this string.
+    ///
+    /// Comments are blanked first, so this pins the code and not the prose
+    /// around it -- the body carries a long comment about the branch, and an
+    /// equality that included it would fail on a typo fix.
+    #[test]
+    fn the_delegated_receive_reads_the_link_on_the_backend_the_policy_chose() {
+        let expected = squashed(&format!(
+            "link: &str) -> RecordImportReport {{ \
+             if crate::backend_policy::selected() == \
+             crate::backend_policy::VaultBackendChoice::DirectRest {{ \
+             return match crate::rest::send::{}(link, None) {{ \
+             Ok(body) => RecordImportReport::Read(Box::new( \
+             crate::record::payload::read_json(&body), )), \
+             Err(error) => RecordImportReport::Failed(error.user_message().to_string()), }}; }} \
+             let data_dir = crate::bw_path::active_data_{}(); \
+             match crate::send::cli_send_{}({}(), data_dir.as_deref(), link, None) {{ \
+             Ok(body) => RecordImportReport::Read(Box::new( \
+             crate::record::payload::read_json(&body), )), \
+             Err( error @ (crate::send::SendError::NoVerifiedCli(_) \
+             | crate::send::SendError::SpawnFailed(_)), \
+             ) => RecordImportReport::Failed(format!( \" \", \
+             crate::vault_window::send_ui::RECEIVE_NEEDS_THE_CLI, error.user_message() )), \
+             Err(error) => RecordImportReport::Failed(error.user_message().to_string()), }}",
+            concat!("receive_on_active_", "account"),
+            "dir",
+            "receive",
+            concat!("receive_", "job"),
+        ));
+        let actual = squashed(&sanitized(&body_of(concat!("real_send_", "receive"), "    ")));
+        assert_eq!(
+            actual, expected,
+            "`real_send_receive` is no longer exactly one link read on the chosen backend. \
+             Anything at all added, removed or rebound here fails -- including a credential \
+             brought into either arm, and including a `DirectRest` branch that falls THROUGH \
+             to the CLI instead of returning"
+        );
+
+        // The two arms are reached from nowhere else. A second caller of
+        // either is unproven ground for which backend it runs on -- and for
+        // the CLI one, for which thread.
+        assert_eq!(
+            production().matches(concat!("crate::send::cli_send_", "receive(")).count(),
+            1,
+            "`cli_send_receive` is called somewhere other than `real_send_receive`"
+        );
+        assert_eq!(
+            production()
+                .matches(concat!("crate::rest::send::receive_on_active_", "account("))
+                .count(),
+            1,
+            "`receive_on_active_account` is called somewhere other than `real_send_receive`"
+        );
+    }
+
+    /// **`RECEIVE_NEEDS_THE_CLI` survives for the CLI and is unreachable for
+    /// the built-in client.**
+    ///
+    /// The sentence itself does not move -- a user on `bw serve` is not
+    /// affected by this branch at all, and
+    /// [`the_receive_sentence_says_what_is_missing_without_condemning_what_is_not`]
+    /// still holds its wording. What is new is where it can be produced from,
+    /// and that is a property of the body above rather than of the string, so
+    /// it is asserted against the same two slices.
+    ///
+    /// Control, and it is the half that makes this mean anything: the sentence
+    /// IS still produced in the `bw serve` arm, found by the same read. A slice
+    /// cut wrong would report both halves as satisfied.
+    #[test]
+    fn the_cli_sentence_survives_for_the_cli_and_is_gone_for_the_built_in_client() {
+        let body = sanitized(&body_of(concat!("real_send_", "receive"), "    "));
+        let (direct, cli) = body
+            .split_once(concat!("let data_dir = crate::bw_path::active_data_", "dir"))
+            .expect("control: the CLI arm's first statement is gone, so this test cut nothing");
+
+        // **The control.** The sentence is produced in the CLI half, so the
+        // absence below is a statement about live code and not about a needle
+        // that matches nothing anywhere.
+        assert!(
+            cli.contains("RECEIVE_NEEDS_THE_CLI"),
+            "control: the `bw serve` arm no longer names RECEIVE_NEEDS_THE_CLI at all, so the \
+             assertion below is searching text it could never have found"
+        );
+        assert!(
+            !direct.contains("RECEIVE_NEEDS_THE_CLI"),
+            "the built-in client can reach the sentence that tells a user to install \
+             Bitwarden's command-line tool. It does not need one: it reads the link itself"
+        );
+        // And the built-in half reaches no `bw` at all -- the sentence is the
+        // symptom, the spawn is the thing.
+        assert!(
+            !direct.contains(concat!("cli_send_", "receive")),
+            "the built-in client arm reaches a `bw send receive`"
+        );
+        assert!(
+            cli.contains(concat!("cli_send_", "receive")),
+            "control: the `bw serve` arm no longer spawns a `bw send receive`"
+        );
+    }
+
     /// **The real fetch runs `bw send list`, in this window's job, with the
     /// session it was given.**
     ///

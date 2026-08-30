@@ -8606,6 +8606,28 @@ mod send_receive_thread {
     /// takes the `Option` and this passes `None`; the day a record Send is
     /// given a share password, this is the line that grows an argument.
     pub(super) fn real_send_receive(link: &str) -> RecordImportReport {
+        // **The built-in client reads the link itself, and returns before any
+        // of the CLI path below exists.** `real_send_list`'s branch, in the
+        // same position and read the same way -- from
+        // `backend_policy::selected()` here rather than from the frame,
+        // because an account switch replaces it between the frame and this
+        // thread.
+        //
+        // `receive_on_active_account` needs no vault credential at all: the
+        // key is in the link. So this arm reaches the same
+        // `RecordImportReport::Read` as the one below it with nothing of the
+        // account's in hand, and `RECEIVE_NEEDS_THE_CLI` -- which is about a
+        // missing `bw.exe` -- is unreachable from it.
+        if crate::backend_policy::selected()
+            == crate::backend_policy::VaultBackendChoice::DirectRest
+        {
+            return match crate::rest::send::receive_on_active_account(link, None) {
+                Ok(body) => RecordImportReport::Read(Box::new(
+                    crate::record::payload::read_json(&body),
+                )),
+                Err(error) => RecordImportReport::Failed(error.user_message().to_string()),
+            };
+        }
         // Read on the fetching thread, not captured from the frame:
         // `bw_path` keeps the active account's profile directory as process
         // state precisely so every spawn in this crate reaches the same
