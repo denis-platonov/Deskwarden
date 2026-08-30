@@ -247,7 +247,15 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny@^0.20
+          # **A bare major.minor, not a semver operator.** install-action
+          # rejects `^0.20` outright -- "semver operators are not supported
+          # in 'tool' input option" -- which failed the whole Tests job when
+          # this replaced `cargo install`. It accepts an exact version or a
+          # `major.minor` prefix, and 0.20 is the floor the config needs:
+          # `unmaintained = "workspace"` is a key 0.16.4 had removed and 0.20
+          # reintroduced, so an older cargo-deny reads this repo's config as
+          # invalid.
+          tool: cargo-deny@0.20
 
       - name: Audit licences and advisories
         working-directory: deskwarden
