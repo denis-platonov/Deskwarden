@@ -7554,9 +7554,113 @@ mod export_thread {
     where
         P: FnOnce() -> Option<PathBuf>,
     {
-        pick_and_export_with(pick, session, || {
-            vault_export::real_runner(export_job())
+        pick_and_export_with(pick, session, real_export_runner)
+    }
+
+    /// **The one place this window decides which backend does the export**,
+    /// and the whole of that decision.
+    ///
+    /// `real_send_list`'s line, in `real_send_list`'s position and for its
+    /// reasons: the choice is read HERE, on the worker thread, and not
+    /// captured from the frame, because an account switch replaces it between
+    /// the click and the export. Everything below this function is shared --
+    /// `run_export` sweeps, stages, judges and promotes identically for both
+    /// answers, because the backend is a runner and not a code path through
+    /// that function.
+    ///
+    /// **Why the branch is not in `vault_export` itself.** That file is one
+    /// of the two `job_object::tests::the_two_job_bearing_modules_cannot_name_a_bare_command`
+    /// governs, and its RULE 7 closes the set of items it may NAME -- a
+    /// helper it can call is a helper that could start a `bw` outside the
+    /// kill-on-close job on its behalf, invisibly to the probe. Putting the
+    /// REST branch there would have meant widening that allow-list by four
+    /// items to buy nothing; putting it here costs nothing and is where the
+    /// Sends branches already are.
+    pub(super) fn real_export_runner() -> vault_export::ExportRunner {
+        if crate::backend_policy::selected()
+            == crate::backend_policy::VaultBackendChoice::DirectRest
+        {
+            return rest_export_runner();
+        }
+        vault_export::real_runner(export_job())
+    }
+
+    /// The direct-REST runner: it builds the archive in this process and
+    /// stages it where the CLI would have written one.
+    ///
+    /// **It starts no child, so there is no job to put one in.** That is not
+    /// a weakening of the guarantee `export_job` carries; it is the guarantee
+    /// becoming vacuous, and `export_wiring::a_direct_rest_export_starts_no_child_process`
+    /// asserts it at `job_object`'s spawn probe rather than here in prose.
+    ///
+    /// # What it holds, and for how long
+    ///
+    /// `rest::export::export_document` hands back a `Zeroizing<String>`, and
+    /// it is dropped -- wiped -- before the file is read back. Its contents
+    /// are the server's own ciphertext throughout: that module decrypts
+    /// nothing and re-encrypts nothing, so **no vault plaintext exists on
+    /// this path at any moment**, which is the property the CLI path had for
+    /// free by doing the work in another process.
+    ///
+    /// # Why it reads the file back rather than trusting the buffer
+    ///
+    /// `observe_partial` is called for the same reason `CliExportRunner::run`
+    /// calls it: `classify` must judge the FILE. A short write, a full disk
+    /// or an antivirus truncation all leave a document this process believes
+    /// it produced and the user cannot restore from, and only the bytes on
+    /// disk can answer that.
+    fn rest_export_runner() -> vault_export::ExportRunner {
+        vault_export::ExportRunner::from_fn(|plan, _session| {
+            let document = match crate::rest::export::export_document() {
+                Ok(document) => document,
+                Err(problem) => return nothing_was_exported(rest_sentence(problem)),
+            };
+            if let Err(e) = std::fs::write(plan.partial_path(), document.as_bytes()) {
+                return nothing_was_exported(format!(
+                    "The export could not be written to {} ({e}).",
+                    plan.partial_path().display()
+                ));
+            }
+            drop(document);
+
+            let (written, head) = vault_export::observe_partial(plan);
+            vault_export::RawExport {
+                exit_ok: true,
+                stderr: String::new(),
+                written,
+                head,
+            }
         })
+    }
+
+    /// One `ExportProblem`, as the sentence the report will carry.
+    ///
+    /// `Locked` becomes [`vault_export::LOCKED_SENTENCE`] and nothing else,
+    /// because that constant is the one string in this program written to
+    /// satisfy `vault_export::SESSION_VOCABULARY` -- which is what routes a
+    /// locked account to `ExportOutcome::SessionInvalid` through `classify`'s
+    /// single table, rather than through a second judgement made here.
+    fn rest_sentence(problem: crate::rest::export::ExportProblem) -> String {
+        match problem {
+            crate::rest::export::ExportProblem::Locked => {
+                vault_export::LOCKED_SENTENCE.to_string()
+            }
+            crate::rest::export::ExportProblem::Failed(why) => why,
+        }
+    }
+
+    /// An observation for a run that produced no file at all.
+    ///
+    /// `written` is `Err`, not `Ok(0)`: nothing looked, so nothing knows.
+    /// `vault_export::RawExport`'s own doc is where that distinction is
+    /// argued, and this is the REST twin of its private `nothing_ran`.
+    fn nothing_was_exported(why: String) -> vault_export::RawExport {
+        vault_export::RawExport {
+            exit_ok: false,
+            stderr: why,
+            written: Err("no export was produced, so nothing was checked".to_string()),
+            head: Vec::new(),
+        }
     }
 
     /// [`pick_and_export`] with the runner as a value too, **and the only one
@@ -21318,6 +21422,14 @@ mod export_wiring {
     /// `CliExportRunner` and `job_object::spawn_in_job` are all the ones that
     /// ship, which is what makes the recorded value a fact about production.
     fn spawns_of_one_export(destination: PathBuf) -> (ExportReport, Vec<crate::job_object::spawn_probe::Attempt>) {
+        // **The environment lock, and it is load-bearing rather than tidy.**
+        // `real_export_runner` reads `backend_policy::selected()`, which is
+        // process-wide state other tests in this binary install. Without this
+        // guard a `DirectRest` environment installed elsewhere would send this
+        // export down a path that starts no child at all, and this helper
+        // would report zero spawns in a test about which job the child joins.
+        let _env = crate::backend_policy::tests::hold_the_env_lock();
+
         // `export_command` refuses outright unless startup recorded a
         // signature-verified CLI. First-wins and idempotent, so this is safe
         // however the test order falls out, and the path is a fiction nothing
@@ -24225,14 +24337,293 @@ mod export_wiring {
         let body = concat!(
             "pub(super) fn pick_and_", "export<P>(pick: P, session: &str) -> ExportReport \
              where P: FnOnce() -> Option<PathBuf>, { pick_and_export_with(pick, session, \
-             || { vault_export::real_runner(export_job()) }) }"
+             real_export_runner) }"
         );
         assert_eq!(
             squashed(production()).matches(body).count(),
             1,
             "`pick_and_export` is no longer exactly the delegation to \
-             `pick_and_export_with` with the production runner over this window's own \
-             job -- anything else here is a verdict decided above `run_export`"
+             `pick_and_export_with` with the production runner -- anything else here is a \
+             verdict decided above `run_export`"
+        );
+
+        // **AND THE HOP THE RUNNER MOVED BEHIND, pinned as a second
+        // equality.** This needle used to spell `vault_export::real_runner(
+        // export_job())` inline, so one assertion covered both "this is only
+        // a delegation" and "the job is this window's". The runner is a named
+        // function now, and a pin that stopped there would have stopped
+        // saying anything at all about the job -- so the second half is
+        // pinned in its own right, on the function the first half names.
+        //
+        // The pair asserts MORE than the one it replaces: it still holds the
+        // job, and it additionally holds that the direct-REST branch is
+        // exactly one early return over `backend_policy::selected()` with
+        // nothing else in it -- a second condition, a second call or a
+        // reordering that let a `bw serve` account take the REST arm all fail
+        // here and none of them could have failed before.
+        let branch = concat!(
+            "pub(super) fn real_export_", "runner() -> vault_export::ExportRunner { if \
+             crate::backend_policy::selected() == \
+             crate::backend_policy::VaultBackendChoice::DirectRest { return \
+             rest_export_runner(); } vault_export::real_runner(export_job()) }"
+        );
+        assert_eq!(
+            squashed(production()).matches(branch).count(),
+            1,
+            "`real_export_runner` is no longer exactly one `selected()` branch over the \
+             production CLI runner and this window's own job. Either a `bw serve` account \
+             can now be sent down the REST arm, or the export child has stopped joining \
+             the kill-on-close job this window holds"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The direct-REST arm: an export with no `bw.exe` in it.
+    //
+    // Every test here holds `backend_policy`'s environment lock, for
+    // `spawns_of_one_export`'s reason: the choice `real_export_runner` reads
+    // is process-wide.
+    // -----------------------------------------------------------------
+
+    /// A direct-REST environment whose credential reader finds nothing -- a
+    /// signed-out direct-REST account. The environment is well-formed; the
+    /// answer is `Locked`, which is what makes the REST arm observable
+    /// without a server. `send_delete_wiring::InstalledDirectRest`'s shape.
+    ///
+    /// The guard is held and never read: what it does is exclude the other
+    /// tests, and it does that by existing until this value drops.
+    struct ExportingDirectRest(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl ExportingDirectRest {
+        fn signed_out() -> Self {
+            let guard = crate::backend_policy::tests::hold_the_env_lock();
+            assert!(
+                crate::backend_policy::install_env(crate::backend_policy::BackendEnv {
+                    choice: crate::backend_policy::VaultBackendChoice::DirectRest,
+                    direct: Some(crate::login_ui::DirectRestLogin {
+                        server_url: "https://vault.invalid".to_string(),
+                        email: "nobody@example.invalid".to_string(),
+                        device_id: "an-invented-device-id".to_string(),
+                        second_factor: crate::login_ui::PRODUCTION_SECOND_FACTOR,
+                        prompt: None,
+                        adopt: std::sync::Arc::new(|_| {
+                            unreachable!("no login happens in this test")
+                        }),
+                    }),
+                    credentials: Some(std::sync::Arc::new(|| None)),
+                }),
+                "the environment this test is about was refused, so it asserts nothing"
+            );
+            Self(guard)
+        }
+    }
+
+    impl Drop for ExportingDirectRest {
+        fn drop(&mut self) {
+            crate::backend_policy::uninstall_env();
+        }
+    }
+
+    /// A scratch directory that removes itself.
+    struct ExportTempDir(PathBuf);
+
+    impl ExportTempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "deskwarden-export-wiring-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a scratch directory under the system temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for ExportTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// **A direct-REST export starts no child process**, and it is observed
+    /// at `job_object`'s spawn probe rather than read out of this file's
+    /// text.
+    ///
+    /// This is the property the whole branch exists for: the account this
+    /// runs for may have no `bw.exe` on the machine at all, so an export that
+    /// still reached `CreateProcess` would fail for a reason the user cannot
+    /// act on -- and, worse, would do so through a code path that has a
+    /// signature check and a kill-on-close job hanging off it, both of which
+    /// would then be load-bearing for nothing.
+    #[test]
+    fn a_direct_rest_export_starts_no_child_process() {
+        crate::bw_path::remember_verified_bw_exe(PathBuf::from(
+            r"C:\deskwarden-test\first\bw.exe",
+        ));
+        let temp = ExportTempDir::new("nochild");
+        let destination = temp.0.join("vault.json");
+
+        let installed = ExportingDirectRest::signed_out();
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let report = export_thread::pick_and_export(
+            {
+                let destination = destination.clone();
+                move || Some(destination)
+            },
+            "session-token",
+        );
+        let attempts = probe.attempts();
+        drop(probe);
+        drop(installed);
+
+        assert!(
+            attempts.is_empty(),
+            "a direct-REST export reached `spawn_in_job` {} time(s): it is starting a child \
+             process for an account that has no CLI",
+            attempts.len()
+        );
+        assert!(
+            matches!(
+                report,
+                ExportReport::Done {
+                    outcome: crate::vault_export::ExportOutcome::SessionInvalid,
+                    ..
+                }
+            ),
+            "a signed-out direct-REST account reported {report:?} rather than a stale session"
+        );
+        assert!(
+            !destination.exists(),
+            "a failed export wrote the name the user picked"
+        );
+        assert!(
+            !temp.0.join("vault.json.dw-partial").exists(),
+            "a failed export left its staging file in the user's folder"
+        );
+
+        // Control: the very same call on the OTHER backend DOES reach the
+        // spawn, so the emptiness above is a fact about this branch and not
+        // about a probe that never recorded anything.
+        let (_, cli_attempts) = spawns_of_one_export(destination);
+        assert_eq!(
+            cli_attempts.len(),
+            1,
+            "control: a `bw serve` export no longer reaches the spawn either, so the \
+             assertion above proves nothing"
+        );
+    }
+
+    /// **The archive `rest::export` really builds is one `vault_export` will
+    /// promote.**
+    ///
+    /// The two halves of this feature live in two files and neither imports
+    /// the other's judgement: `rest::export` decides what an `encrypted_json`
+    /// document is, and `vault_export::classify` decides whether the bytes on
+    /// disk are one. Nothing else in this crate asks whether those two agree,
+    /// and a disagreement is silent in the worst direction -- a perfectly good
+    /// export discarded and reported as `Unconfirmed`.
+    ///
+    /// It is driven through `pick_and_export_with`, so the plan, the staging
+    /// name, the sweep, the observation, the classification and the promotion
+    /// are all the production ones; only the document's origin is a fixture,
+    /// because a real one needs a server.
+    #[test]
+    fn the_archive_the_rest_path_builds_is_one_the_export_will_promote() {
+        let sync: crate::rest::sync::SyncResponse = serde_json::from_value(serde_json::json!({
+            "profile": { "key": "2.x|y|z" },
+            "folders": [],
+            "ciphers": [{
+                "id": "c-1", "organizationId": null, "type": 1, "deletedDate": null,
+                "name": "2.name|iv|mac",
+                "login": { "username": "2.u|i|m", "password": "2.p|i|m" }
+            }]
+        }))
+        .expect("the fixture parses");
+        let keys = crate::rest::sync::tests::keys_from_user(&[3u8; 64]);
+        let document = crate::rest::export::encrypted_json(&sync, &keys, "guid")
+            .expect("the document builds");
+        let bytes = document.as_bytes().to_vec();
+
+        let temp = ExportTempDir::new("realdoc");
+        let destination = temp.0.join("vault.json");
+        let staged = bytes.clone();
+        let report = export_thread::pick_and_export_with(
+            {
+                let destination = destination.clone();
+                move || Some(destination)
+            },
+            "session-token",
+            move || {
+                crate::vault_export::ExportRunner::from_fn(move |plan, _session| {
+                    std::fs::write(plan.partial_path(), &staged)
+                        .expect("stages the real document");
+                    let (written, head) = crate::vault_export::observe_partial(plan);
+                    crate::vault_export::RawExport {
+                        exit_ok: true,
+                        stderr: String::new(),
+                        written,
+                        head,
+                    }
+                })
+            },
+        );
+
+        assert!(
+            matches!(
+                report,
+                ExportReport::Done {
+                    outcome: crate::vault_export::ExportOutcome::Written,
+                    ..
+                }
+            ),
+            "the document `rest::export` builds is not one this app will promote: {report:?}"
+        );
+        assert_eq!(
+            std::fs::read(&destination).expect("the archive is under the chosen name"),
+            bytes,
+            "the promotion moved something other than the document that was built"
+        );
+
+        // Control: the SAME wiring, handed the plaintext `json` export
+        // envelope instead -- `encrypted: false`, no key-validation field --
+        // must NOT be promoted, or the assertion above would confirm any
+        // bytes at all.
+        let plain_destination = temp.0.join("plaintext.json");
+        let plain: Vec<u8> =
+            b"{\n  \"encrypted\": false,\n  \"folders\": [],\n  \"items\": []\n}".to_vec();
+        let plain_report = export_thread::pick_and_export_with(
+            {
+                let plain_destination = plain_destination.clone();
+                move || Some(plain_destination)
+            },
+            "session-token",
+            move || {
+                crate::vault_export::ExportRunner::from_fn(move |plan, _session| {
+                    std::fs::write(plan.partial_path(), &plain).expect("stages the control");
+                    let (written, head) = crate::vault_export::observe_partial(plan);
+                    crate::vault_export::RawExport {
+                        exit_ok: true,
+                        stderr: String::new(),
+                        written,
+                        head,
+                    }
+                })
+            },
+        );
+        assert!(
+            matches!(
+                plain_report,
+                ExportReport::Done {
+                    outcome: crate::vault_export::ExportOutcome::Unconfirmed,
+                    ..
+                }
+            ),
+            "control: a plaintext export was confirmed as an encrypted one: {plain_report:?}"
+        );
+        assert!(
+            !plain_destination.exists(),
+            "control: an unconfirmed export was promoted to the user's chosen name anyway"
         );
     }
 

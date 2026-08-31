@@ -47,6 +47,13 @@
 //! has no screen for), and **a link on a host that is not the account's own
 //! server**, which is refused rather than followed.
 //!
+//! **Exporting the vault** is here now too, in [`export`]: the
+//! `encrypted_json` archive `crate::vault_export` used to spawn `bw export`
+//! for is a projection of the ciphertext a sync already carries, so it costs
+//! one `GET /api/sync` and one encryption (the file's key-validation field)
+//! and no decryption at all. Password-protected export is not offered on
+//! either backend; see `vault_export`'s own docs for why.
+//!
 //! Still missing, and each is what keeps `bw.exe` on the machine:
 //! **attachments** (not decrypted by [`sync`], not creatable or deletable by
 //! [`write`]) and **organisations** (decrypted, but never shown working
@@ -118,6 +125,9 @@ pub mod api;
 /// rather than faked. See its own docs for what one call costs.
 pub mod backend;
 pub mod crypto;
+/// One `encrypted_json` vault export, built from the ciphertext a sync
+/// already carries. Pure but for a single `GET /api/sync`; no request body.
+pub mod export;
 /// Sends over REST: the four operations `crate::send` runs the CLI for.
 pub mod send;
 /// A Send's own key hierarchy, which is not the vault's. Pure; no I/O.

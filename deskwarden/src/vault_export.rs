@@ -1,12 +1,34 @@
-//! Exports the vault to a file, by spawning the Bitwarden CLI beside the
-//! running `bw serve`.
+//! Exports the vault to a file — by spawning the Bitwarden CLI beside the
+//! running `bw serve`, or, on a direct-REST account, by building the same
+//! archive in this process.
 //!
 //! **Why a spawn at all, when everything else in this crate talks to the
 //! server.** `bw serve` has no export endpoint: export is a CLI-only verb.
 //! There is no request `vault_bridge` could send that would produce a vault
-//! archive, so this one operation runs the `bw` binary directly — the same
-//! binary `bw_path::bw_command` already guarantees is the signature-checked
-//! one, never a `Command::new` built here on the bare binary name.
+//! archive, so on the `bw serve` backend this one operation runs the `bw`
+//! binary directly — the same binary `bw_path::bw_command` already guarantees
+//! is the signature-checked one, never a `Command::new` built here on the
+//! bare binary name.
+//!
+//! # The two backends, and where they meet
+//!
+//! A `DirectRest` account has no `bw.exe` to spawn, and it does not need one:
+//! an `encrypted_json` export is a **projection of the ciphertext the server
+//! already sent**, so `crate::rest::export` builds the document and a runner
+//! stages it. **That branch is not in this file**, and its absence here is
+//! the design rather than an oversight: it lives in
+//! `vault_window::export_thread::real_export_runner`, which is where
+//! `vault_window`'s `real_send_*` helpers put the same branch, and it is
+//! kept out of here by `job_object`'s RULE 7 -- the allow-list of items a
+//! job-bearing runner may name at all. This module stays a file that knows
+//! about one `bw.exe` and nothing else.
+//!
+//! What that buys is that **everything downstream of the runner is shared**:
+//! the plan, the `.dw-partial` staging name, the sweep, the observation, the
+//! classification and the promotion all run byte for byte as they did, on
+//! both backends. The one thing this file says about the other backend is
+//! [`LOCKED_SENTENCE`], which is here because it has to satisfy
+//! [`SESSION_VOCABULARY`], which is here.
 //!
 //! # Only `encrypted_json`, and why the other formats are not a setting
 //!
@@ -82,12 +104,20 @@ pub const PARTIAL_SUFFIX: &str = ".dw-partial";
 /// to land in the output file.
 ///
 /// Both are literal keys the `encrypted_json` writer emits near the start of
-/// the document; a `csv` or plaintext `json` export contains neither.
+/// the document, and **both are required** -- see
+/// [`looks_like_an_encrypted_envelope`], where this used to be `any` and that
+/// was a hole rather than a nicety.
 const ENVELOPE_MARKERS: [&str; 2] = ["\"encrypted\"", "encKeyValidation_DO_NOT_EDIT"];
 
-/// Words the CLI uses when the session it was handed is no longer good. Kept
+/// Words that say the session an export was handed is no longer good. Kept
 /// separate from generic failure so the UI can say "unlock and try again"
 /// instead of showing the raw stderr.
+///
+/// These are the CLI's own words. **They are also the vocabulary the REST
+/// runner deliberately writes into**: see [`LOCKED_SENTENCE`], which is the
+/// sentence a locked direct-REST account produces so that it reaches
+/// [`ExportOutcome::SessionInvalid`] through this one table rather than
+/// through a second classification path. One judgement, two backends.
 const SESSION_VOCABULARY: [&str; 5] = [
     "not logged in",
     "vault is locked",
@@ -316,11 +346,33 @@ pub fn classify(raw: &RawExport) -> ExportOutcome {
 
 /// `true` if these bytes open like an `encrypted_json` export.
 ///
-/// Guards against the CLI exiting 0 having written something that is not the
-/// format that was asked for — a plaintext export, or an error document.
+/// Guards against a runner reporting success having written something that is
+/// not the format that was asked for — a plaintext export, or an error
+/// document.
+///
+/// # `all`, and it used to be `any`
+///
+/// [`ENVELOPE_MARKERS`]' doc used to say "a `csv` or plaintext `json` export
+/// contains neither", and half of that is false. Bitwarden's plaintext
+/// exporter opens its document `{ "encrypted": false, ...`, so a plaintext
+/// export contains the FIRST marker in full. Under `any` this function
+/// confirmed one — `bw export --format json`, the file with every password on
+/// it in the clear — and [`run_export`] then promoted it to the name the user
+/// picked with the success sentence under it.
+///
+/// It was unreachable through this app, which asks only for
+/// [`EXPORT_FORMAT`]. It stopped being unreachable the moment a second
+/// backend could hand these bytes over, and it was found by the *control* of
+/// `vault_window::export_wiring::the_archive_the_rest_path_builds_is_one_the_export_will_promote`
+/// — a control written to prove that test was not vacuous, which failed
+/// instead.
+///
+/// `all` is strictly narrower than `any`: every document this confirms now,
+/// the old version confirmed too. Nothing that used to be exported stops
+/// being exported.
 fn looks_like_an_encrypted_envelope(head: &[u8]) -> bool {
     let text = String::from_utf8_lossy(head);
-    ENVELOPE_MARKERS.iter().any(|m| text.contains(m))
+    ENVELOPE_MARKERS.iter().all(|m| text.contains(m))
 }
 
 /// The `Command` that would run this export, built but not spawned.
@@ -437,6 +489,19 @@ impl ExportRunner {
         }
     }
 }
+
+/// The sentence a locked direct-REST account produces.
+///
+/// It contains `"vault is locked"`, which is a [`SESSION_VOCABULARY`] entry,
+/// and that is **deliberate rather than incidental**: it is what routes this
+/// failure through [`classify`]'s one table to
+/// [`ExportOutcome::SessionInvalid`], instead of adding a second way for an
+/// outcome to be decided. `vault_window::export_wiring::a_locked_direct_rest_account_leaves_no_file_behind`
+/// asserts the whole round trip rather than the substring, so a reworded
+/// sentence that stopped reaching that outcome would fail rather than pass
+/// quietly.
+pub const LOCKED_SENTENCE: &str =
+    "The vault is locked, so nothing was exported. Unlock Deskwarden and try again.";
 
 /// The runner that really spawns the CLI.
 ///
@@ -994,6 +1059,45 @@ mod tests {
             .to_vec()
     }
 
+    /// **A plaintext export is not an encrypted one, and this app must
+    /// never promote one as if it were.**
+    ///
+    /// `bw export --format json` opens `{ "encrypted": false, ...`, which
+    /// contains one of the two [`ENVELOPE_MARKERS`] in full. While
+    /// [`looks_like_an_encrypted_envelope`] took `any` of them, this file --
+    /// every password on this machine in the clear -- was classified
+    /// [`ExportOutcome::Written`] and renamed onto the path the user chose,
+    /// under the success colour.
+    #[test]
+    fn a_plaintext_export_is_never_confirmed_as_an_encrypted_one() {
+        let plaintext = |head: &str| RawExport {
+            exit_ok: true,
+            stderr: String::new(),
+            written: Ok(41_233),
+            head: head.as_bytes().to_vec(),
+        };
+        for head in [
+            concat!("{", "\"encrypted\":false,\"folders\":[],\"items\":[]}"),
+            concat!("{", "\n  \"encrypted\": false,\n  \"folders\": [],\n  \"items\": []\n}"),
+        ] {
+            assert_eq!(
+                classify(&plaintext(head)),
+                ExportOutcome::Unconfirmed,
+                "a plaintext export was confirmed as an encrypted archive: {head}"
+            );
+        }
+
+        // Control: the SAME shape with the key-validation field present is
+        // confirmed, so the refusals above are about the missing marker and
+        // not about a check that refuses everything.
+        assert_eq!(
+            classify(&plaintext(
+                concat!("{", "\"encrypted\":true,\"encKeyValidation_DO_NOT_EDIT\":\"2.abc\"}"),
+            )),
+            ExportOutcome::Written,
+            "control: a real encrypted envelope is no longer confirmed either"
+        );
+    }
     #[test]
     fn classify_decides_every_row_of_the_table() {
         let rows: Vec<(&str, RawExport, ExportOutcome)> = vec![

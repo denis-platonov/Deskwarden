@@ -10,6 +10,24 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Exporting your vault no longer needs the Bitwarden CLI
+
+If you have turned **Use official bw for crypto** off, **Export vault...**
+used to reach for `bw.exe` anyway — the one row on that menu that still did.
+It does not any more: Deskwarden now writes the archive itself.
+
+The file is the same file. It is a Bitwarden `encrypted_json` export --
+encrypted under your account's own key, so it imports back into Bitwarden
+with no password to remember and no password to lose -- and every value in it
+is the ciphertext Bitwarden's own server sent, copied across without being
+decrypted on the way. Nothing about your vault exists in the clear at any
+point, which is exactly what was true when the CLI wrote it.
+
+What is in the file is unchanged too: your own items, without the ones in the
+trash, without any that belong to an organisation, and without attachments.
+That is what `bw export` has always put in this format.
+
+
 ## 0.14.0 - 2026-08-30
 
 ### Keeping an encrypted copy on this PC no longer asks for anything
