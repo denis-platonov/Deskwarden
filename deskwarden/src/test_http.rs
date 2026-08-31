@@ -125,6 +125,8 @@ use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use zeroize::Zeroizing;
+
 // ---------------------------------------------------------------------------
 // requests
 // ---------------------------------------------------------------------------
@@ -881,7 +883,17 @@ fn serve_one(request: &Request, stream: &TcpStream, state: &Mutex<State>) -> boo
         Some(at) => {
             let mock = &mut state.mocks[at];
             mock.hits += 1;
-            let body = mock.response_body.bytes(request);
+            // Wrapped for the reason [`render`] states: this is a copy of the
+            // response body on a thread the test that asked for it does not
+            // control, and the crate's allocator probe watches every thread.
+            //
+            // What this covers is the copy itself. A [`ResponseBody::Fixed`]
+            // body is cloned into an exactly-sized buffer, so there is nothing
+            // else; a [`ResponseBody::FromRequest`] body is built by a closure
+            // this module does not own, and whatever that closure grows through
+            // on its way to a `Vec` is the closure's. No such mock carries a
+            // probe today, and one that did would be back to the same race.
+            let body = Zeroizing::new(mock.response_body.bytes(request));
             render(mock.status, &mock.response_headers, &body, close)
         }
         None => {
@@ -1016,8 +1028,37 @@ fn read_chunked(reader: &mut BufReader<&TcpStream>) -> Option<Vec<u8>> {
 ///
 /// `Content-Length` is always present, because it is what lets the client frame
 /// the body and read the next response off the same connection.
-fn render(status: usize, headers: &[(String, String)], body: &[u8], close: bool) -> Vec<u8> {
-    let mut out = format!("HTTP/1.1 {status} {}\r\n", reason(status)).into_bytes();
+///
+/// # Why the rendered response is [`Zeroizing`], and why the body is reserved
+///
+/// **A mock body is a test's plaintext, and this server serves it from a thread
+/// that test does not control.** The crate's allocator probe
+/// ([`crate::login_ui::password_lifetime_tests`]) scans **every** thread's
+/// frees while any window is armed, deliberately: a probe verdict that ignored
+/// other threads would read clean while blind. So a connection thread that
+/// frees a probe-bearing response buffer while a test has a window open puts
+/// bytes that are nobody's leak onto that test's global channel.
+///
+/// That was not hypothetical. `vault_bridge::tests::`
+/// `generate_hands_back_a_password_that_does_not_reach_the_allocator_in_the_clear`
+/// failed about half of full-suite runs on exactly this: instrumenting the
+/// probe's hits by thread showed **two** hits per response from this thread --
+/// the body clone in `serve_one` and this rendered buffer -- and under load one
+/// of them landed after the client had its answer and the test had opened the
+/// window that measures the value alone. The test was right to refuse a verdict
+/// it could not honour; the bytes it was refusing over were this server's.
+///
+/// The answer is at the source rather than in any verdict: this thread does not
+/// release a response body in the clear at all. The wipe covers the buffer that
+/// is dropped, so the body must not be written into a buffer that then grows --
+/// the `reserve` below is the other half of the same fix, not a speed tweak.
+fn render(
+    status: usize,
+    headers: &[(String, String)],
+    body: &[u8],
+    close: bool,
+) -> Zeroizing<Vec<u8>> {
+    let mut out = Zeroizing::new(format!("HTTP/1.1 {status} {}\r\n", reason(status)).into_bytes());
     for (field, value) in headers {
         out.extend_from_slice(format!("{field}: {value}\r\n").as_bytes());
     }
@@ -1034,6 +1075,12 @@ fn render(status: usize, headers: &[(String, String)], body: &[u8], close: bool)
         out.extend_from_slice(b"connection: close\r\n");
     }
     out.extend_from_slice(b"\r\n");
+    // Room for the body BEFORE a byte of it is written. Everything above is
+    // head, which never carries a test's secret; the moment the body goes in,
+    // a `Vec` that has to grow hands its old buffer -- plaintext and all --
+    // back to the allocator, and the wipe on THIS buffer's drop cannot reach
+    // a buffer that is already gone.
+    out.reserve(body.len());
     out.extend_from_slice(body);
     out
 }
