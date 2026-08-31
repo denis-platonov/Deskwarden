@@ -457,7 +457,16 @@ pub fn account_label(account: &Account) -> &str {
 /// one -- because this predicate gates the one write that is allowed to
 /// choose an account's backend, and widening it would let that write reach an
 /// established account.
-fn is_a_fresh_mint(account: &Account) -> bool {
+///
+/// **`pub(crate)` for one other caller, and it is the same question.**
+/// [`crate::login_ui::login_card_source`] asks whether the login card may read
+/// its identity off the record instead of spawning `bw status`, and the answer
+/// turns on exactly this: a mint has nothing on its record to read, and an
+/// established account has a CLI that may know something the record does not.
+/// Duplicating the two-field test beside that call site would be a second
+/// opinion of what a fresh account looks like, drifting from this one -- the
+/// same defect the doc above is written against.
+pub(crate) fn is_a_fresh_mint(account: &Account) -> bool {
     account.email.is_empty() && account.server_url.is_none()
 }
 

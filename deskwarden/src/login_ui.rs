@@ -261,6 +261,14 @@ pub enum LoginCardSource {
     /// get the answer -- it was a spawn asking a CLI that has never seen this
     /// account, and getting `unauthenticated` back for a vault whose master
     /// key is on disk and working.
+    ///
+    /// **A fresh mint takes this arm too, and for the stronger reason.** An
+    /// account nobody has signed into has no profile for `bw` to have an
+    /// opinion about, and on a first install there is no `bw.exe` to ask --
+    /// the spawn could only fail and log. What it draws from the empty record
+    /// is the "nobody is signed in" card, which is the correct card and the
+    /// same one the failed spawn produced. See [`login_card_source`], which
+    /// decides that before it consults [`crate::backend_policy::choose`].
     TheAccount,
     /// **`bw status`, in this account's own profile directory**, through
     /// [`check_bw_status_details_in`].
@@ -286,24 +294,53 @@ pub enum LoginCardSource {
 /// a switch or an add is not the active one -- the same reason
 /// [`profile_dir_for`] exists.
 ///
-/// # A fresh install is [`LoginCardSource::TheCli`], by construction
+/// # A fresh mint asks nobody, and that is decided BEFORE `choose`
 ///
 /// `accounts::prepare_new_account` and `accounts::resolve_startup` both mint
 /// an account with `email: String::new()` **and `server_url: None`**, and
 /// `choose` cannot answer `DirectRest` without a positively self-hosted URL --
-/// `is_self_hosted(None)` is `false` on that function's first line. So an
-/// account that has never signed in cannot reach the arm that would read its
-/// own empty email, whatever the crypto preference says.
+/// `is_self_hosted(None)` is `false` on that function's first line. So left to
+/// `choose`, a fresh install took [`LoginCardSource::TheCli`] and spent a `bw
+/// status` spawn on it, which on a machine with no `bw.exe` -- every machine,
+/// at that moment, because nothing has downloaded one yet -- failed and logged
+/// `cannot run \`bw status\``. A fresh install must not touch `bw.exe` at all,
+/// so the mint is short-circuited here.
 ///
-/// That is the whole of the first-run safety here, and it is a property of
-/// `choose` rather than of a guard written beside it.
-/// `a_freshly_minted_account_still_asks_the_cli` pins it against the real
-/// `prepare_new_account` rather than against a hand-built `Account`.
+/// **It costs nothing, because the CLI had nothing to say.** The arm it skips
+/// answers [`unknown_status_details`] on a machine with no CLI, and that is
+/// field-for-field what [`account_details_for`] answers for a nameless
+/// account: `Unauthenticated`, no email, no server. The card drawn is
+/// identical -- the "nobody is signed in" card, which is the right card for an
+/// account nobody has signed into. Only the spawn and the error line are gone.
+///
+/// # An ESTABLISHED bitwarden.com account still asks, and this is the trap
+///
+/// It also carries `server_url: None` -- `None` means bitwarden.com to
+/// `backend_policy` by definition -- so the discriminator here is
+/// **fresh-mint versus established, NOT `server_url.is_none()`**. Widening it
+/// to the server field would take the CLI away from an account whose login
+/// `bw` is holding: a `bw logout` in a terminal, or a restored profile
+/// directory, is state the [`Account`] record cannot see, and reading the
+/// address off it there would draw a master-password box, run `bw unlock`, and
+/// come back with "You are not logged in" and no email box on screen to
+/// correct it with. See [`LoginCardSource::TheCli`].
+///
+/// The predicate is `accounts::is_a_fresh_mint`, borrowed rather than
+/// rewritten, because a second copy of "what a fresh account looks like" is
+/// exactly what would drift. `a_freshly_minted_account_asks_nobody` pins this
+/// against the real `prepare_new_account`, and its positive control pins that
+/// an established bitwarden.com account still reaches the CLI.
 #[must_use]
 pub fn login_card_source(
     account: Option<&Account>,
     use_official_bw_crypto: bool,
 ) -> LoginCardSource {
+    // Before `choose`, because `choose` reads a server URL and a mint has
+    // none -- it cannot tell this case from an established bitwarden.com
+    // account, which is the one that must keep the spawn.
+    if account.is_some_and(crate::accounts::is_a_fresh_mint) {
+        return LoginCardSource::TheAccount;
+    }
     match crate::backend_policy::choose(
         account.and_then(|a| a.server_url.as_deref()),
         use_official_bw_crypto,
@@ -5238,6 +5275,86 @@ mod login_entry_point_tests {
                  not be dropped here"
             );
         }
+    }
+
+    /// **THE CREDENTIALS THE USER ALREADY TYPED ARE THE ONES `bw` GETS.**
+    ///
+    /// The owner's requirement for the acquisition modal, in full: "once user
+    /// enters credentials against the bw.com - hijack it and show modal, then
+    /// pass those creds to the bw". The hijack is the CLI gate inside the
+    /// `Submit` arm; this is the *then*. When the modal closes on a successful
+    /// install it sets `action_after_setup = Some(LoginAction::Submit)` and
+    /// `resume_submit_after_setup = true`, and the next frame re-enters the
+    /// same `Submit` arm -- past the gate this time -- and hands
+    /// `form.password` to the sign-in worker. The user presses Continue once.
+    ///
+    /// **What makes that safe is an absence, which is why it is pinned.** The
+    /// window body never ASSIGNS `form.password` anywhere: it only reads it,
+    /// at the blank-field check and at the hand-off. So there is no path on
+    /// which the modal, or the frames it spans, can drop what was typed. A
+    /// single `form.password = String::new()` added anywhere in this body --
+    /// a plausible "clear the field while the modal is up" tidy-up -- silently
+    /// breaks the requirement into "type your password again", and every other
+    /// test in this file stays green.
+    ///
+    /// A source pin because observing it needs a live eframe event loop, a
+    /// 37 MB download and a `bw.exe`.
+    #[test]
+    fn the_modal_resumes_the_sign_in_with_the_password_already_typed() {
+        let body = window_body_code();
+
+        // The resume itself: the modal's close arm re-enters Submit rather
+        // than leaving the user to press Continue a second time.
+        for required in [
+            concat!("action_after_setup = Some(LoginAction::", "Submit)"),
+            concat!("resume_submit_after_setup = ", "installed"),
+            // And the gate honours it, so the resumed submit does not re-open
+            // the modal it just came out of.
+            concat!("&& !resume_submit_after", "_setup"),
+        ] {
+            assert!(
+                body.contains(required),
+                "the acquisition modal no longer resumes the sign-in the user was already \
+                 attempting ({required} is gone). After the download they would be returned \
+                 to a form and have to press Continue again"
+            );
+        }
+
+        // **The absence.** Reads are fine; a write is the defect.
+        let writes: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with("form.password") && line.contains('='))
+            .filter(|line| !line.contains("=="))
+            .collect();
+        assert!(
+            writes.is_empty(),
+            "the login window assigns `form.password` ({writes:?}). The acquisition modal spans \
+             many frames between the user typing their password and `bw login` receiving it, \
+             and any write in this body can land in that gap -- the user is sent back to \
+             retype a password they already entered, which is the continuity the CLI hand-off \
+             exists to preserve"
+        );
+
+        // **Positive controls.** The slice really contains the field and the
+        // hand-off, and the predicate really would catch a write -- an empty
+        // `writes` from a body that never mentions the password at all would
+        // pass the assertion above while proving nothing.
+        for required in [concat!("&form.", "password,"), concat!("form.password.", "clone()")] {
+            assert!(
+                body.contains(required),
+                "control: {required} is not in the sliced body, so this test is reading text \
+                 that is not the sign-in path and its absence assertion is vacuous"
+            );
+        }
+        let planted = "        form.password = String::new();";
+        assert!(
+            planted.trim().starts_with("form.password")
+                && planted.contains('=')
+                && !planted.contains("=="),
+            "control: the predicate does not catch the write it exists to catch, so the \
+             assertion above cannot fail for the reason it claims"
+        );
     }
 }
 
@@ -11489,14 +11606,26 @@ mod login_frame_host_tests {
 /// [`crate::backend_policy::choose`] now -- [`login_card_source`] -- and the
 /// two things worth guarding are the two arms.
 ///
-/// **The trap this module is built around.** The account arm reads
-/// `Account::email`, and `accounts::prepare_new_account` mints that field
-/// empty. A gate that let a never-signed-in account onto it would be a change
-/// that works perfectly on any machine that has signed in before -- including
-/// the author's -- and misbehaves only on a first install. So the fresh-install
-/// case is tested against the REAL `prepare_new_account`, with a control
-/// asserting the minted account really is empty at that moment, and the
-/// assertion is that it still takes the CLI arm.
+/// **The trap this module is built around**, and it has since turned over. The
+/// account arm reads `Account::email`, and `accounts::prepare_new_account`
+/// mints that field empty -- so the first version of this gate kept a fresh
+/// install on the CLI arm to stop it reading a name that is not there. That
+/// bought nothing and cost a spawn: on a first install there is no `bw.exe`
+/// yet, so the spawn failed and logged `cannot run bw status`, and the
+/// `unknown_status_details` it fell back to is field-for-field what the
+/// account arm answers for a nameless account anyway. The mint takes the
+/// account arm now and a fresh install touches `bw.exe` nowhere.
+///
+/// **The trap that replaced it is sharper.** An established bitwarden.com
+/// account carries `server_url: None` too, and for it the spawn is
+/// load-bearing -- `bw` holds that login and the record cannot see a
+/// `bw logout`. So the discriminator is `accounts::is_a_fresh_mint`, not the
+/// server field, and the pair
+/// `a_freshly_minted_account_asks_nobody` /
+/// `an_established_bitwarden_com_account_still_asks_the_cli` is written so
+/// that the wrong discriminator fails the second. The fresh-install case is
+/// tested against the REAL `prepare_new_account`, with a control asserting the
+/// minted account really is empty at that moment.
 ///
 /// **The other half of this pair already existed.**
 /// `a_direct_rest_account_never_spawns_the_cli`, above, pins that SUBMITTING
@@ -11648,18 +11777,28 @@ mod the_sign_in_asks_no_cli_tests {
         );
     }
 
-    /// **THE TRAP, PINNED AGAINST THE REAL MINT.**
+    /// **A FRESH INSTALL ASKS NOBODY, PINNED AGAINST THE REAL MINT.**
     ///
     /// `prepare_new_account` mints `email: String::new()` and
-    /// `server_url: None`. A gate that let that account onto the account arm
-    /// would be invisible on any machine that has ever signed in.
+    /// `server_url: None`, and `backend_policy::choose` reads that `None` as
+    /// bitwarden.com -- so left to `choose` this account spawned `bw status`,
+    /// on the one machine guaranteed to have no `bw.exe`: a failed spawn and a
+    /// logged error on the default path of a first launch.
     ///
     /// Built from the real function rather than from a hand-written `Account`
     /// literal on purpose: a literal is this test's opinion of what a fresh
     /// account looks like, and the defect would be that opinion drifting from
     /// `accounts.rs`.
+    ///
+    /// **The positive control is the other half and it is the load-bearing
+    /// half**: an ESTABLISHED bitwarden.com account carries the same
+    /// `server_url: None`, and it must still ask. See
+    /// `an_established_bitwarden_com_account_still_asks_the_cli`, and the
+    /// in-test control below that runs the same seam on that fixture -- a
+    /// discriminator written as `server_url.is_none()` passes every assertion
+    /// in the first half of this test and fails there.
     #[test]
-    fn a_freshly_minted_account_still_asks_the_cli() {
+    fn a_freshly_minted_account_asks_nobody() {
         let cfg = Scratch::new("fresh");
         let minted = crate::accounts::prepare_new_account(cfg.path())
             .expect("a new account must be preparable");
@@ -11681,50 +11820,196 @@ mod the_sign_in_asks_no_cli_tests {
         );
 
         // **Whatever the crypto preference says.** The setting is the other
-        // half of `choose`, and neither value may put a nameless account on
-        // the arm that reads its name.
+        // half of `choose`, and `true` is what the `serde` default puts on a
+        // mint -- so the `true` row IS the first launch, and neither value may
+        // spend a spawn on it.
         for use_official_bw_crypto in [true, false] {
             assert_eq!(
                 login_card_source(Some(&minted), use_official_bw_crypto),
-                LoginCardSource::TheCli,
-                "a never-signed-in account was routed to the arm that reads `Account::email`, \
-                 and that field is empty -- on a first install this window would decide what \
-                 to draw from an account that knows nothing, with `use_official_bw_crypto = \
-                 {use_official_bw_crypto}`"
+                LoginCardSource::TheAccount,
+                "a never-signed-in account was routed to the CLI arm, which on a first install \
+                 spawns a `bw.exe` that is not there yet and logs `cannot run bw status` -- \
+                 with `use_official_bw_crypto = {use_official_bw_crypto}`"
             );
 
-            // And end to end: the answer is the CLI's, unchanged, byte for
-            // byte -- which is the claim "a fresh install is unaffected"
-            // actually makes.
+            // **End to end, through the seam that panics.** This is the whole
+            // "no spawn" assertion: production's `ask_the_cli` is
+            // `check_bw_status_details_in`, so reaching that pointer here is a
+            // spawn in production.
             assert_eq!(
                 login_card_details_through(
-                    A_CLI_THAT_ANSWERS,
+                    A_CLI_THAT_MUST_NOT_BE_ASKED,
                     Some(&minted),
                     Some(&crate::accounts::data_dir_for(cfg.path(), &minted.id)),
                     use_official_bw_crypto,
                 ),
-                the_cli_answered(),
-                "a first install's login card no longer opens on what `bw status` said about \
-                 its own profile directory"
+                account_details_for(Some(&minted)),
+                "a first install's login card no longer opens on what the account itself knows"
             );
         }
 
-        // **The control that shows the two arms are distinguishable here at
-        // all.** A nameless account's own answer is `unknown_status_details`,
-        // which is what a FAILED spawn answers too -- so a test that compared
-        // against that would pass on either arm. This is why `the_cli_answered`
-        // is a value neither arm can produce honestly.
+        // **And what it opens knowing is the card a first install should
+        // see**, identical to what the failed spawn used to produce: nobody is
+        // signed in, so draw the email box and the server dropdown.
         assert_eq!(
             account_details_for(Some(&minted)),
             unknown_status_details(),
-            "control: a minted account's own answer is no longer indistinguishable from a \
-             failed spawn, so the sentinel above is guarding a difference that was already \
-             visible -- re-read what this test is for"
+            "the fresh install's card changed shape when the spawn was removed -- the point of \
+             removing it was that `bw status` had nothing to add here"
+        );
+        assert_eq!(
+            account_details_for(Some(&minted)).status,
+            BwStatus::Unauthenticated,
+            "a first install would be shown an UNLOCK form -- a master-password box for an \
+             account that has never been signed into"
+        );
+
+        // ================== THE POSITIVE CONTROLS ==================
+        //
+        // Everything above is an absence, and an absence is what a test that
+        // never reached the thing it names also reports.
+
+        // **One: the seam is wired to something.** The same seam, the same
+        // call, on an account that must take the CLI arm. If this does not
+        // panic, `A_CLI_THAT_MUST_NOT_BE_ASKED` is inert and every assertion
+        // above proves nothing.
+        let established_official = account("who@example.com", None);
+        let reached = std::panic::catch_unwind(|| {
+            login_card_details_through(
+                A_CLI_THAT_MUST_NOT_BE_ASKED,
+                Some(&established_official),
+                Some(Path::new("some-profile-dir")),
+                true,
+            )
+        });
+        assert!(
+            reached.is_err(),
+            "control: the seam's `ask_the_cli` was not reached even for an established \
+             bitwarden.com account, so it is not wired to anything and the no-panic assertions \
+             above are vacuous"
+        );
+
+        // **Two: the discriminator is the mint, not the missing server.**
+        // `established_official` has `server_url: None`, exactly as the mint
+        // does -- the two differ ONLY in the email. A gate written as
+        // `server_url.is_none()` satisfies the whole first half of this test
+        // and fails right here.
+        assert_eq!(
+            established_official.server_url, None,
+            "control: the established fixture grew a server URL, so it no longer distinguishes \
+             the mint test from a `server_url.is_none()` gate -- which is the one wrong \
+             discriminator this test exists to catch"
+        );
+        assert_eq!(
+            login_card_source(Some(&established_official), true),
+            LoginCardSource::TheCli,
+            "an established bitwarden.com account stopped asking the CLI. On that backend `bw` \
+             holds the login, and a `bw logout` in a terminal or a restored profile directory \
+             is state the `Account` cannot see -- this account would be drawn a \
+             master-password box and get \"You are not logged in\" back with no email box to \
+             correct it with"
+        );
+
+        // Three: the two arms are distinguishable by value at all. A mint's
+        // own answer is `unknown_status_details`, which is also what a FAILED
+        // spawn answers -- which is exactly why the assertions above are
+        // written against the SEAM being reached and not against the returned
+        // value.
+        assert_eq!(
+            login_card_details_through(
+                A_CLI_THAT_ANSWERS,
+                Some(&established_official),
+                Some(Path::new("some-profile-dir")),
+                true,
+            ),
+            the_cli_answered(),
+            "control: the CLI arm does not return what the CLI said"
         );
         assert_ne!(
             the_cli_answered(),
             unknown_status_details(),
             "control: the sentinel is what an unasked CLI answers, so seeing it proves nothing"
+        );
+    }
+
+    /// **THE REGRESSION THAT IS INVISIBLE UNTIL A USER HITS IT.**
+    ///
+    /// An established bitwarden.com account carries `server_url: None`, the
+    /// same as a fresh mint, and it must keep the `bw status` spawn: on the
+    /// `bw serve` backend `bw` is what holds the login, and the `Account`
+    /// record cannot see a `bw logout` run in a terminal or a profile
+    /// directory restored from a backup. Read the address off the record there
+    /// and the card draws a master-password box, runs `bw unlock`, and comes
+    /// back with "You are not logged in" and nowhere on screen to fix it.
+    ///
+    /// Stated separately from `a_freshly_minted_account_asks_nobody` -- which
+    /// carries the same claim as its control -- because this one is the
+    /// behaviour a user notices, and a test whose name says so is what makes
+    /// the failure legible when it fires.
+    #[test]
+    fn an_established_bitwarden_com_account_still_asks_the_cli() {
+        // Established: it has an address, so a sign-in has completed. No
+        // server, because bitwarden.com IS `None` to `backend_policy` -- which
+        // is the entire reason this account is confusable with a mint.
+        let established = account("who@example.com", None);
+
+        // Control on the fixture, before the assertions that rest on it.
+        assert!(
+            !crate::accounts::is_a_fresh_mint(&established),
+            "control: the fixture is a fresh mint, so this test is about the OTHER case and \
+             asserts nothing about an established account"
+        );
+        assert_eq!(
+            established.server_url, None,
+            "control: the fixture is not the `server_url: None` shape a mint also has, so it \
+             no longer discriminates against a `server_url.is_none()` gate"
+        );
+
+        for use_official_bw_crypto in [true, false] {
+            // `false` is included on purpose. `is_self_hosted(None)` is
+            // `false`, so `choose` answers `BwServe` for bitwarden.com whatever
+            // the crypto preference says -- the direct-REST client is for
+            // self-hosted servers only, and this account is not on it.
+            assert_eq!(
+                crate::backend_policy::choose(None, use_official_bw_crypto),
+                VaultBackendChoice::BwServe,
+                "control: `backend_policy::choose` no longer puts a bitwarden.com account on \
+                 `bw serve`, so the expectation below is about a backend that moved"
+            );
+            assert_eq!(
+                login_card_source(Some(&established), use_official_bw_crypto),
+                LoginCardSource::TheCli,
+                "an established bitwarden.com account stopped asking `bw status`, with \
+                 `use_official_bw_crypto = {use_official_bw_crypto}` -- the fresh-mint \
+                 short-circuit has widened onto the account it must never reach"
+            );
+            assert_eq!(
+                login_card_details_through(
+                    A_CLI_THAT_ANSWERS,
+                    Some(&established),
+                    Some(Path::new("some-profile-dir")),
+                    use_official_bw_crypto,
+                ),
+                the_cli_answered(),
+                "the card for an established bitwarden.com account no longer opens on what \
+                 `bw status` said about its own profile directory"
+            );
+        }
+
+        // **The discriminating control.** The same account with the one field
+        // that makes it a mint blanked takes the OTHER arm -- so the arm above
+        // is chosen by the predicate and not returned unconditionally.
+        let minted = account("", None);
+        assert!(
+            crate::accounts::is_a_fresh_mint(&minted),
+            "control: blanking the email did not produce a fresh mint, so the pair below is \
+             not the comparison this test claims to make"
+        );
+        assert_eq!(
+            login_card_source(Some(&minted), true),
+            LoginCardSource::TheAccount,
+            "control: both sides of the fresh-mint discriminator answer `TheCli`, so the \
+             assertions above hold against a gate that was never added"
         );
     }
 
@@ -11744,12 +12029,27 @@ mod the_sign_in_asks_no_cli_tests {
             // whatever the setting says.
             (Some("https://vault.bitwarden.com"), false, LoginCardSource::TheCli),
             (Some("https://vault.bitwarden.com"), true, LoginCardSource::TheCli),
-            // No server recorded: a minted account, and `is_self_hosted`
-            // answers `false` for it by its own first line.
+            // No server recorded, which is bitwarden.com: `is_self_hosted`
+            // answers `false` for `None` by its own first line. Every row here
+            // is an ESTABLISHED account -- `account()` gives them all an
+            // address -- which is what keeps the `choose` pairing below valid.
+            // A fresh mint is short-circuited AHEAD of `choose` and so cannot
+            // be a row in a table asserting the two agree; it has its own
+            // tests, `a_freshly_minted_account_asks_nobody` and
+            // `an_established_bitwarden_com_account_still_asks_the_cli`.
             (None, false, LoginCardSource::TheCli),
             (None, true, LoginCardSource::TheCli),
         ] {
             let a = account("who@example.eu", server);
+            // The precondition the `choose` pairing rests on: a fresh mint is
+            // decided before `choose` runs, so a mint row would fail the
+            // pairing for the right reason and make this table unreadable.
+            assert!(
+                !crate::accounts::is_a_fresh_mint(&a),
+                "control: row {server:?} is a fresh mint, which `login_card_source` answers \
+                 ahead of `backend_policy::choose` -- the pairing assertion below is not \
+                 applicable to it"
+            );
             assert_eq!(
                 login_card_source(Some(&a), official),
                 expected,
