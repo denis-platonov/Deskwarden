@@ -1886,6 +1886,210 @@ mod tests {
         assert!(matches!(blocks[1], NotesBlock::Blank));
     }
 
+    /// Everything one block would paint, its markup excluded by construction.
+    ///
+    /// The counterpart of [`text_of`] for the tests that are about whole
+    /// bodies rather than one line: a delimiter appearing in here was NOT
+    /// consumed by the parser and would reach the card as itself.
+    fn painted(block: &NotesBlock) -> String {
+        match block {
+            NotesBlock::Blank => String::new(),
+            NotesBlock::Heading { spans, .. }
+            | NotesBlock::Bullet { spans, .. }
+            | NotesBlock::Paragraph { spans } => text_of(spans),
+        }
+    }
+
+    /// The release body the Release workflow composes for the release that is
+    /// actually out, character for character.
+    ///
+    /// **Not a fixture written to pass.** It is the output of the "Compose
+    /// the release body" step in `.github/workflows/release.yml`, run against
+    /// this repository's own `CHANGELOG.md` with `APP_VERSION=0.14.0` -- the
+    /// same PowerShell, the same file, the same section. That step is not
+    /// reachable from `cargo test`, so this is the join between the two: the
+    /// workflow's job log prints the body it publishes, and it has to be this.
+    ///
+    /// `concat!` of one-line literals rather than a raw string, because
+    /// `nothing_but_gated_test_modules_lives_below_the_guards_cut` reads
+    /// column-0 lines below the cut and every line of a multi-line literal is
+    /// at column 0.
+    const COMPOSED_BODY_0_14_0: &str = concat!(
+        "## What's new in 0.14.0\n",
+        "\n",
+        "### Keeping an encrypted copy on this PC no longer asks for anything\n",
+        "\n",
+        "Turning that setting on used to stop Deskwarden starting at all: it wanted Windows Hello every launch, and when the prompt did not appear it waited for it forever, with no window and nothing in the log.\n",
+        "\n",
+        "The copy is now protected the same way the key that unlocks your vault already is — kept on this PC, protected by Windows. **No prompt, ever.** A PC without Windows Hello can use the setting now, which it could not before.\n",
+        "\n",
+        "**What that means, plainly:** anyone who can run programs as you on this PC can read the copy, and so can someone who takes this disk and knows your Windows password. That is the same protection your vault key already had, and the same trade other password managers make when you tell them not to lock. When it locks is still yours to choose, under **Lock the vault when you step away**.\n",
+        "\n",
+        "The setting's description said it was protected by a TPM chip. That stopped being true and now says what actually gates the file.\n",
+        "\n",
+        "**Your existing copy is rebuilt once** on first launch after updating, because the old one cannot be opened with the new key. Nothing is lost — it is a cache.\n",
+        "\n",
+        "**[Full changelog](https://github.com/denis-platonov/deskwarden/blob/v0.14.0/CHANGELOG.md)**\n",
+        "\n",
+        "---\n",
+        "\n",
+        "This build is unsigned; the updater checks the installer's SHA-256 against the digest GitHub publishes. [Code-signing policy](https://github.com/denis-platonov/deskwarden/blob/v0.14.0/docs/code-signing-policy.md)\n",
+    );
+
+    /// **The panel paints the release's prose, and paints none of its
+    /// markup.** The whole point of composing the body from the changelog's
+    /// section rather than from its headings is that this is what a user
+    /// reads instead of a link they have to follow.
+    #[test]
+    fn the_composed_release_body_arrives_as_prose_and_not_as_markup() {
+        let blocks = release_notes_blocks(COMPOSED_BODY_0_14_0);
+        let painted: Vec<String> = blocks.iter().map(painted).collect();
+
+        // 1. The shape. A level-2 title, then exactly one level-3 heading --
+        //    the changelog's `### `, which used to be the entire body.
+        assert!(
+            matches!(&blocks[0], NotesBlock::Heading { level: 2, .. }) &&
+                painted[0] == "What's new in 0.14.0",
+            "got {:?}",
+            &blocks[0]
+        );
+        let threes: Vec<&String> = blocks
+            .iter()
+            .zip(&painted)
+            .filter(|(b, _)| matches!(b, NotesBlock::Heading { level: 3, .. }))
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(
+            threes,
+            vec!["Keeping an encrypted copy on this PC no longer asks for anything"],
+            "the changelog's own `### ` heading is what names the change"
+        );
+
+        // 2. THE PROSE IS THERE, AND IT IS ONE BLOCK PER PARAGRAPH.
+        //    This sentence is three separate lines in `CHANGELOG.md`, which
+        //    is hard-wrapped at about 76 columns. `release_notes_blocks`
+        //    makes one block per SOURCE line, so if the workflow published
+        //    the section line for line this assertion fails and the card
+        //    shows a column of stubs re-wrapped at a narrower width.
+        const REJOINED: &str = concat!(
+            "already is — kept on this PC, protected by Windows. No prompt, ever. ",
+            "A PC without Windows Hello can use the setting now"
+        );
+        assert!(
+            painted.iter().any(|t| t.contains(REJOINED)),
+            "the wrapped source lines were not rejoined into a paragraph: {painted:?}"
+        );
+
+        // 3. Its emphasis is styled, not spelled. `**No prompt, ever.**` is
+        //    the sentence the whole release turns on.
+        let strong: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                NotesBlock::Paragraph { spans } => Some(spans),
+                _ => None,
+            })
+            .flatten()
+            .filter(|s| s.style == NotesStyle::Strong)
+            .map(|s| s.text.as_str())
+            .collect();
+        assert!(
+            strong.contains(&"No prompt, ever.") &&
+                strong.contains(&"Lock the vault when you step away"),
+            "got {strong:?}"
+        );
+
+        // 4. NO MARKUP REACHES THE CARD. A body that painted its own
+        //    asterisks, hashes and backticks would be worse than the list of
+        //    headings this replaced.
+        for text in &painted {
+            assert!(
+                !text.contains('*') && !text.contains('#') && !text.contains('`') &&
+                    !text.starts_with('>'),
+                "unconsumed markup would be painted: {text:?}"
+            );
+        }
+
+        // 5. The tail survived. `release_notes_for_display` cuts at
+        //    `MAX_RELEASE_NOTES_CHARS` from the END, which is where the link
+        //    and the signing note are, so the workflow's own budget has to
+        //    keep the whole body under it.
+        assert!(
+            COMPOSED_BODY_0_14_0.chars().count() < MAX_RELEASE_NOTES_CHARS,
+            "the composed body is {} chars and would be cut",
+            COMPOSED_BODY_0_14_0.chars().count()
+        );
+        let last = blocks.last().expect("a non-empty body");
+        let link = match last {
+            NotesBlock::Paragraph { spans } => spans
+                .iter()
+                .find(|s| s.style == NotesStyle::LinkText)
+                .expect("the signing note ends on a link"),
+            other => panic!("expected the signing note last, got {other:?}"),
+        };
+        assert_eq!(link.text, "Code-signing policy");
+        assert_eq!(
+            link.link.as_deref(),
+            Some("https://github.com/denis-platonov/deskwarden/blob/v0.14.0/docs/code-signing-policy.md")
+        );
+        assert!(
+            !painted.concat().contains("[...]"),
+            "the notes were truncated, so the reader sees the cut mark instead of the tail"
+        );
+    }
+
+    /// **Why the workflow strips a `> ` rather than publishing it.**
+    ///
+    /// A positive control on a construct the subset does NOT cover. The
+    /// changelog uses block quotes for release-wide notes (0.9.0 and 0.8.5
+    /// both open on one), and published as written the marker is painted as
+    /// itself down the left of the card. The degraded form -- the same words,
+    /// the marker gone -- is an ordinary paragraph with its emphasis intact,
+    /// which is the whole of what that quote was saying.
+    #[test]
+    fn a_block_quote_paints_its_own_marker_which_is_why_the_workflow_strips_it() {
+        const QUOTED: &str = "> Heads up: this change is **not reversible**";
+        const DEGRADED: &str = "Heads up: this change is **not reversible**";
+
+        let as_written = painted(&release_notes_blocks(QUOTED)[0]);
+        assert!(
+            as_written.starts_with('>'),
+            "control: the subset grew block quotes, so the workflow's strip is now a downgrade \
+             rather than a rescue -- publish the `> ` instead. Painted: {as_written:?}"
+        );
+
+        let blocks = release_notes_blocks(DEGRADED);
+        assert_eq!(blocks.len(), 1, "got {blocks:?}");
+        assert_eq!(painted(&blocks[0]), "Heads up: this change is not reversible");
+        assert!(
+            spans_of(DEGRADED)
+                .iter()
+                .any(|s| s.style == NotesStyle::Strong && s.text == "not reversible"),
+            "the quote's emphasis has to survive the strip"
+        );
+    }
+
+    /// **Why the workflow drops a fence delimiter and keeps what it wrapped.**
+    ///
+    /// The other positive control. Three backticks on a line of their own are
+    /// not a construct the subset knows, so they arrive as characters; the
+    /// command between them is perfectly readable without them.
+    #[test]
+    fn a_code_fence_paints_its_own_backticks_which_is_why_the_workflow_drops_it() {
+        const FENCED: &str = "```powershell\ndeskwarden.exe --reset-tray\n```";
+
+        let as_written: String =
+            release_notes_blocks(FENCED).iter().map(painted).collect::<Vec<_>>().join("\n");
+        assert!(
+            as_written.contains('`') || as_written.contains("powershell"),
+            "control: the subset grew fenced code, so the workflow should publish the fence \
+             rather than drop it. Painted: {as_written:?}"
+        );
+
+        let blocks = release_notes_blocks("deskwarden.exe --reset-tray");
+        assert_eq!(blocks.len(), 1, "got {blocks:?}");
+        assert_eq!(painted(&blocks[0]), "deskwarden.exe --reset-tray");
+    }
+
     #[test]
     fn bold_italic_and_code_become_styles_and_lose_their_delimiters() {
         let spans = spans_of("a **strong** and *soft* and `literal` word");
