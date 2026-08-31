@@ -99,9 +99,64 @@ open.
   is faster and much lighter. The trade is that the key unlocking your vault
   is kept on this PC under DPAPI and does not expire — the setting says so
   before you turn it on.
-- **Signing in uses the CLI either way**, today. Removing that is the next
-  release's headline; see
-  [the design](docs/superpowers/specs/2026-08-28-deskwarden-alone-design.md).
+- **On a self-hosted server, nothing uses the CLI any more.** Signing in,
+  Sends, exporting and the account name were the last things that did, and
+  as of 0.15.0 none of them do.
+
+### Where your vault lives
+
+Deskwarden works with any Bitwarden-compatible server. Three options, and
+the trade-offs are real ones:
+
+- **[Bitwarden's own service](https://bitwarden.com/)** — recommended if you
+  want the least to think about. It is the reference implementation, run by
+  the people who make Bitwarden, with a free tier. Deskwarden needs
+  Bitwarden's command-line program for this option and will offer to install
+  it when you choose one of their servers.
+
+- **[Vaultwarden](https://github.com/dani-garcia/vaultwarden)** — an
+  independent server that speaks the same API, written in Rust and small
+  enough to run on a cheap VPS or a home machine. You host and back it up
+  yourself. **Not tested with Deskwarden**, but nothing here is specific to
+  one server and it should work; if you try it, please open an issue either
+  way.
+
+- **[NodeWarden](https://github.com/shuaiplus/nodewarden)** — another
+  independent server, running on Cloudflare Workers, which can be free at
+  personal scale and needs no machine of your own to maintain. This is what
+  Deskwarden's author uses day to day, so it gets exercised, though it is a
+  third-party project neither written nor maintained here.
+
+Vaultwarden and NodeWarden are unofficial and unaffiliated with Bitwarden,
+Inc., as is Deskwarden. Self-hosting means the backups and the uptime are
+yours; that is the price of the control.
+
+On a self-hosted server Deskwarden can talk to it directly and skip the
+command-line program entirely — faster to start, and about 118 MB of RAM it
+does not use.
+
+### Everywhere else you use your vault
+
+Deskwarden is a Windows desktop app and nothing else. It is deliberately one
+piece of a set, not a replacement for one — the same vault, reached from
+whatever you happen to be using:
+
+| Where | Use |
+| --- | --- |
+| **Windows desktop and native apps** | Deskwarden — this is the gap it fills |
+| **Your browser** | [Bitwarden's extensions](https://bitwarden.com/download/) — Chrome, Firefox, Edge, Safari and the rest |
+| **Android / iOS** | [Bitwarden's mobile apps](https://bitwarden.com/download/), on Google Play and the App Store |
+
+**These all work with a self-hosted server too.** Every official Bitwarden
+client lets you point it at your own server URL before you log in, so
+choosing Vaultwarden or NodeWarden does not cost you the browser extension or
+the phone app.
+
+Deskwarden exists because that set has a hole in it on Windows: browser
+extensions fill web forms, and nothing official fills a **native** Windows
+application. That is what commercial password managers do well and what this
+app is built to match — the vault you already have, reaching the windows a
+browser extension cannot see.
 
 ### Keeping secrets where they belong
 

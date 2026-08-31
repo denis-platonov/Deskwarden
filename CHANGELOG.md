@@ -8,25 +8,67 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
-## Unreleased
+## 0.15.0 - 2026-08-31
 
-### Exporting your vault no longer needs the Bitwarden CLI
+The short version: if your vault lives on your own server, Deskwarden no
+longer needs Bitwarden's command-line program to do anything. It is faster to
+start, and there is one less thing installed on your PC.
 
-If you have turned **Use official bw for crypto** off, **Export vault...**
-used to reach for `bw.exe` anyway — the one row on that menu that still did.
-It does not any more: Deskwarden now writes the archive itself.
+### Your own server needs nothing but Deskwarden
 
-The file is the same file. It is a Bitwarden `encrypted_json` export --
-encrypted under your account's own key, so it imports back into Bitwarden
-with no password to remember and no password to lose -- and every value in it
-is the ciphertext Bitwarden's own server sent, copied across without being
-decrypted on the way. Nothing about your vault exists in the clear at any
-point, which is exactly what was true when the CLI wrote it.
+Deskwarden used to run Bitwarden's command-line program, `bw`, behind the
+scenes — for your passwords, your Sends, your name in the window, signing in
+and exporting. On a self-hosted server it does all of that itself now.
 
-What is in the file is unchanged too: your own items, without the ones in the
-trash, without any that belong to an organisation, and without attachments.
-That is what `bw export` has always put in this format.
+You will notice it as a window that opens straight away instead of pausing
+for a couple of seconds, and as an app that no longer needs a 126 MB
+companion program on disk.
 
+**Using bitwarden.com or bitwarden.eu still needs that program.** Deskwarden
+now offers to install it when you pick one of those servers, instead of
+installing it for everybody at setup time whether they need it or not.
+
+### Share a link, and open one
+
+Creating and revoking a Send works without the companion program. So does
+**opening** one — which matters more than it sounds: Bitwarden changed how
+their servers hand out shared links, and the older program cannot open them
+on an up-to-date server. Deskwarden can.
+
+Sends that hold a file, or that ask the recipient for an emailed code, are
+still not offered. They never were — but now Deskwarden says so plainly
+instead of failing in a way that looked like the link was broken.
+
+### Export your vault
+
+**Export vault...** no longer needs the companion program either. The file is
+the same file: a Bitwarden `encrypted_json` export, locked with your own
+account key, which imports back into Bitwarden.
+
+A plaintext export could previously be reported as an encrypted one. It
+cannot now.
+
+### The window comes back instantly
+
+With **Keep the interface loaded** turned on, closing the vault window now
+hides it rather than shutting it down, so the next click brings it straight
+back. Settings you changed before closing still take effect — including the
+case where a setting could not be switched on, which is still reported to you
+rather than quietly recorded as on.
+
+Minimising behaves exactly as it did.
+
+### Settings show what applies to you
+
+Settings that describe the companion program are no longer shown to people
+who are not using it.
+
+### The sign-in screen knows who you are
+
+On a self-hosted account the sign-in screen used to say you were signed out
+while your vault was open, and offer an email box it then ignored. It reads
+your account now, and the server box opens on your own server's address
+instead of Bitwarden's.
 
 ## 0.14.0 - 2026-08-30
 
