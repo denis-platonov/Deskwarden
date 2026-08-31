@@ -1361,7 +1361,11 @@ mod tests {
         // for the length of two network round trips and a PBKDF2 derivation,
         // which is the reason every other host here has a worker too.
         ("app_window.rs", 7),
-        ("breach.rs", 2),
+        // One: `spawn_check`'s worker, which takes the range request off the
+        // frame thread. It was two while the request-head guard hand-rolled a
+        // `TcpListener` server of its own; that test uses `test_http`'s server
+        // now, so the site is gone and the budget comes down with it.
+        ("breach.rs", 1),
         // One: the worker a `breach_scan` run starts. There are up to
         // `breach_scan::MAX_IN_FLIGHT` of them at a time, from this ONE site
         // in a loop -- the census counts sites, not threads, and the ceiling
