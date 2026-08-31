@@ -310,7 +310,7 @@ logins.
 | **Rust** | Native Win32/COM interop (UI Automation, DPAPI, WinTrust, Job Objects) without an FFI layer on top of a managed runtime, and a single static binary with no runtime to install. |
 | **[`windows`](https://crates.io/crates/windows) crate (raw Win32/WinRT bindings)**, not a higher-level GUI-automation library | The two things that actually need OS-level access — reading whatever window is in the foreground, and typing into an arbitrary native control — don't have a portable abstraction worth building on. Direct bindings also make the Authenticode signature check on the `bw.exe` the app downloads (real `WinVerifyTrust`, not a shelled-out PowerShell call -- and since the installer stopped bootstrapping the CLI, this is the crate's only Authenticode mechanism rather than one of two) and the DPAPI-encrypted session cache possible without another dependency. |
 | **[`eframe`/`egui`](https://github.com/emilk/egui) (immediate-mode GUI)** | A tray app with a handful of small windows (login, an autofill overlay, a picker, the vault browser) doesn't need a retained-mode widget tree or a bundled browser engine — egui compiles into the same static binary and adds single-digit megabytes, not a WebView2 dependency. |
-| **The Bitwarden CLI (`bw`) as the default vault backend**, via its local `bw serve` REST bridge — with a direct one beside it for self-hosted servers | Reimplementing Bitwarden's cryptography is a security liability a community tool should not take on lightly, so for a long time it was not taken on at all. It has been now, for self-hosted servers only and behind a setting that is off by default: `bw serve` is a bundled Node runtime costing ~118 MB of RAM, which is more than the rest of the app put together. The direct path is checked against Bitwarden's own published test vectors, and every write is laid over the JSON the server sent so a field this app cannot decrypt survives an edit untouched. On the default path Deskwarden still only ever talks to `localhost`. |
+| **The Bitwarden CLI (`bw`) as the vault backend for official Bitwarden servers**, via its local `bw serve` REST bridge — with a direct one for self-hosted servers | Reimplementing Bitwarden's cryptography is a security liability a community tool should not take on lightly, so for a long time it was not taken on at all. It has been now, for self-hosted servers only, and since 0.15.0 it is what a new self-hosted account gets without opting in — bitwarden.com and bitwarden.eu still go through the CLI, as does every account created before that release: `bw serve` is a bundled Node runtime costing ~118 MB of RAM, which is more than the rest of the app put together. The direct path is checked against Bitwarden's own published test vectors, and every write is laid over the JSON the server sent so a field this app cannot decrypt survives an edit untouched. On the default path Deskwarden still only ever talks to `localhost`. |
 | **DPAPI** for the cached session token, **Windows Hello** (`KeyCredentialManager`) for optional quick-unlock | Both are already the OS's own answer to "encrypt this for the current Windows user" — no key management of Deskwarden's own to get wrong. |
 
 ## Size
@@ -366,7 +366,7 @@ built for each other.
 Two rows rather than one, because a fresh install is now the app alone.
 The installer no longer fetches the Bitwarden CLI; Deskwarden asks, and then
 downloads and verifies it, at the moment you choose a server that requires
-it. Choose a self-hosted server with the built-in client and the second row
+it. A new self-hosted account uses the built-in client, so the second row
 never happens.
 
 Source: ~188,000 lines of Rust across 103 modules, roughly a third of it
@@ -415,9 +415,12 @@ the installer is built.
 
 ## Privacy
 
-Deskwarden has no servers, no accounts and no analytics. What it reads, what
-it stores, the four network requests it makes and which of them you can turn
-off are set out in [PRIVACY.md](PRIVACY.md).
+Deskwarden has no servers, no accounts, no analytics and no telemetry.
+Nothing is sent to the developer — not usage data, not crash reports,
+nothing — and there is no mechanism in the software to do so, nor any plan
+to add one. What it reads, what it stores, the five network requests it
+makes and which of them you can turn off are set out in
+[PRIVACY.md](PRIVACY.md).
 
 Changes between releases are in [CHANGELOG.md](CHANGELOG.md).
 

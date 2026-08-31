@@ -58,6 +58,23 @@ Both are gone: Deskwarden now verifies Authenticode in one way, in one place.
 Uninstalling still deliberately leaves `bw` and its `PATH` entry behind --
 you may be using it independently of Deskwarden.
 
+### Your own server is now the built-in client's, by default
+
+A new self-hosted account uses Deskwarden's built-in client without you
+turning anything on. Nothing is downloaded and no command-line program is
+involved.
+
+**Accounts you already have are not touched.** An account that exists before
+this update keeps the backend it has today, whatever your settings said, and
+keeps working exactly as it does now. There is no migration and nothing to
+redo.
+
+**The choice is now per account, not per machine.** You can keep a
+bitwarden.com account served by the official CLI and a self-hosted account
+served by the built-in client on the same PC, and switching between them
+does not disturb either. Preferences shows the setting for whichever account
+is active.
+
 ### Your own server needs nothing but Deskwarden
 
 Deskwarden used to run Bitwarden's command-line program, `bw`, behind the

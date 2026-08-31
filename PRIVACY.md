@@ -66,15 +66,29 @@ Deskwarden being broken.
 
 ## What leaves your machine, and to whom
 
-Deskwarden makes network requests to exactly four destinations. Three are
-third parties; one is your own vault.
+Deskwarden makes network requests to exactly five destinations. Four are
+third parties; one is your own vault. The fifth happens at most once, and
+only if you sign in to an official Bitwarden server.
 
-### 1. Your Bitwarden server, via the Bitwarden CLI
+### 1. Your Bitwarden server
 
-Over `localhost` to `bw serve`, which you started. `bw` then talks to
-whichever Bitwarden server you signed in to — theirs, or your own if you
-self-host. Deskwarden never contacts your vault server directly and never
-sees your master password after handing it to `bw`.
+How this happens depends on the account, and the difference is worth stating
+plainly:
+
+- **Through the Bitwarden CLI** — every account on bitwarden.com and
+  bitwarden.eu. Deskwarden talks over `localhost` to `bw serve`, and `bw`
+  talks to the server. On these accounts Deskwarden does not contact your
+  vault server directly and does not see your master password after handing
+  it to `bw`.
+- **Directly** — a self-hosted server using the built-in client.
+  Deskwarden contacts your server itself and derives the keys itself, with
+  no subprocess. Your master password is used here to derive those keys and
+  is wiped from memory afterwards; it goes nowhere except to your own
+  server, in the same authentication request any Bitwarden client makes.
+
+Either way this is *your* server, the one you chose. Nothing about your
+vault reaches the developer, and there is no mechanism in the software for
+it to.
 
 ### 2. Site icons — `icons.bitwarden.net`
 
@@ -143,6 +157,20 @@ Microsoft Store do not perform this check. **There is no Microsoft Store
 build of Deskwarden**, so that sentence described an intention rather than
 the software, and it has been removed. Should one ever ship, this section
 will say what it actually does before it does it.
+
+### 5. The Bitwarden CLI download — `api.github.com` and GitHub's file host
+
+**Only if you sign in to bitwarden.com or bitwarden.eu, and only once.**
+Those servers require Bitwarden's official command-line program. Deskwarden
+tells you so, asks first, and downloads it only if you agree — from
+Bitwarden's own public releases on GitHub. It checks that Bitwarden signed
+the program before installing it, and never runs it to find out.
+
+Like the update check, this reveals to GitHub only what any HTTP request
+reveals: your IP address and the fact that a request was made. It carries
+nothing about you, your vault or your account. A self-hosted server using
+the built-in client never makes this request, and a machine that already has
+the program does not either.
 
 ## What Deskwarden does not do
 
