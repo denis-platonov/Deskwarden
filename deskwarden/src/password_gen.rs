@@ -221,10 +221,10 @@ impl std::fmt::Display for PasswordGenError {
                  was generated",
             ),
             Self::WordlistMissing => f.write_str(
-                "the word list a passphrase is built from was not found beside this application,                  so no passphrase was generated",
+                "the word list a passphrase is built from was not found beside this application, so no passphrase was generated",
             ),
             Self::WordlistUnusable => f.write_str(
-                "the word list a passphrase is built from is not the one this application ships,                  so no passphrase was generated",
+                "the word list a passphrase is built from is not the one this application ships, so no passphrase was generated",
             ),
             Self::WordlistUnreadable => f.write_str(
                 "the word list a passphrase is built from could not be read just now, so no \
