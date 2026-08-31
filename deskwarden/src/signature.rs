@@ -339,12 +339,101 @@ pub fn dn_component(subject_dn: &str, key: &str) -> Vec<String> {
     values
 }
 
+/// Organization (`O=`) values accepted as proof that a `bw.exe` really is
+/// Bitwarden's own CLI.
+///
+/// # Why it lives here and not in `main.rs`
+///
+/// It used to be a private constant in `main.rs`, with exactly one reader:
+/// the startup check that verifies whatever `bw_path::resolve_bw_exe` found.
+/// There are two readers now. `bw_acquire::verify_is_bitwardens` checks a
+/// freshly-downloaded copy **before installing it**, and it must reach the
+/// same verdict as startup will reach on the same file at the next launch.
+/// A second list is how those two come apart, and the direction they come
+/// apart in is the bad one: the app installs a binary that its own startup
+/// then refuses to run, or -- worse -- the reverse.
+///
+/// So the list moved to the module that owns the comparison
+/// ([`is_trusted_organization`]) rather than to either caller. Neither caller
+/// may carry its own; `bw_acquire`'s
+/// `the_trusted_organizations_are_not_duplicated_in_this_module` pins that
+/// for the new one.
+///
+/// It also used to mirror `$BitwardenSignerOrganizations` in
+/// `installer/bootstrap-bw.ps1`, "kept in sync by hand, not shared code".
+/// **That script is gone**, along with the second Authenticode mechanism and
+/// the second hand-maintained DN parser that went with it, so there is no
+/// hand-synchronised copy left anywhere. Pinning the *path* `bw.exe` is
+/// resolved from is not enough on its own: the install tree's `bin`
+/// directory is user-writable, so anything able to plant a file beside
+/// `deskwarden.exe` can just as easily overwrite `bin\bw.exe`. This is the
+/// check that actually matters -- whatever ends up at that path must be
+/// signed by Bitwarden before it is handed the user's master password
+/// (`login_ui::run_bw_with_password`) or session token.
+///
+/// **Entry 1, `"Bitwarden Inc."`, is verified.** Checked 2026-08-10 against
+/// a real, currently-valid Bitwarden-signed `bw.exe`. Measured twice: once
+/// with `Get-AuthenticodeSignature`, and once through
+/// [`verify_authenticode`] itself, so what is recorded here is what
+/// production reads rather than what a cmdlet formats.
+///
+/// ```text
+/// valid      : true
+/// O=         : Bitwarden Inc.       (CN= happens to be identical -- see below)
+/// thumbprint : 80375A0C9630A51ECB7EC79B37A8174C8DACCCED
+/// issuer     : CN=DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1,
+///              O="DigiCert, Inc.", C=US
+/// notAfter   : 2027-07-30T16:59:59Z
+/// ```
+///
+/// That certificate's subject DN is pinned verbatim as
+/// `REAL_BITWARDEN_CLI_SUBJECT_DN` in `main.rs`'s test module, and the tests
+/// there run the *production* comparison -- [`is_trusted_organization`]
+/// against this very constant -- over it, so a well-meant retyping of the
+/// string here fails the suite. Note the expiry: one certificate, on one
+/// machine, that stops existing in 2027 -- and the organization spelling on
+/// its replacement is not knowable today.
+///
+/// **The other four entries remain unverified** -- plausible spellings nobody
+/// here has seen on a real Bitwarden certificate. They are kept rather than
+/// trimmed: `8bit Solutions LLC` is Bitwarden's documented former legal name,
+/// the punctuation variants cover the way DN spelling drifts between
+/// issuances, and each is an *exact whole-`O=`-component* match on a name a
+/// public CA had to validate before issuing -- so the breadth they add is
+/// narrow, while dropping them would turn a legitimate older or
+/// differently-punctuated Bitwarden certificate into a scary dialog, and a
+/// dialog users learn to click through is worse than the entry.
+/// `"Bitwarden"` alone is the weakest of the four and the first that should
+/// go if this list is ever tightened.
+///
+/// Because four of the five entries are *still unverified* -- and the fifth
+/// is verified only against a single certificate that expires in 2027 -- a
+/// mismatch is deliberately **not** treated the same way
+/// `updater::EXPECTED_SIGNER_THUMBPRINT` treats a bad update signature. See
+/// `main::check_bw_signature` for the graded response at startup: an
+/// unsigned or tamper-detected binary is refused outright, but "validly
+/// signed by an organization this unverified list does not happen to name"
+/// asks the user instead of killing a tray app with no console.
+///
+/// **`bw_acquire` does not grade.** A binary it just downloaded and cannot
+/// prove is Bitwarden's is deleted, not queried about -- the startup grading
+/// exists because a file the user already had may predate this list, and a
+/// file this app fetched thirty seconds ago has no such excuse.
+pub const TRUSTED_BW_SIGNER_ORGANIZATIONS: &[&str] = &[
+    "Bitwarden Inc.",
+    "Bitwarden, Inc.",
+    "Bitwarden Inc",
+    "Bitwarden",
+    "8bit Solutions LLC",
+];
+
 /// True if `info` is a validly-chained signature whose subject DN names one
 /// of `trusted_orgs` in its `O=` component -- an exact whole-component match,
-/// never a substring search (see `$BitwardenSignerOrganizations` in
-/// `installer/bootstrap-bw.ps1` for why: an unanchored substring match would
+/// never a substring search. The finding this preserves was first written
+/// down against the installer's own copy of this check (now deleted, see
+/// [`TRUSTED_BW_SIGNER_ORGANIZATIONS`]): an unanchored substring match would
 /// accept any validly-signed binary whose subject merely *contains* one of
-/// these words, from an unrelated but legitimately-issued certificate).
+/// these words, from an unrelated but legitimately-issued certificate.
 pub fn is_trusted_organization(info: &SignatureInfo, trusted_orgs: &[&str]) -> bool {
     if !info.valid {
         return false;

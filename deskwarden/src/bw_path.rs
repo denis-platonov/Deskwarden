@@ -329,7 +329,22 @@ pub fn resolve_bw_exe() -> Option<PathBuf> {
     resolve_bw_exe_with(exe_dir.as_deref(), &path_var)
 }
 
-fn install_bin_candidate(exe_dir: &Path) -> PathBuf {
+/// `<install dir>\bin\bw.exe` -- the one place this app's own copy of the
+/// Bitwarden CLI lives.
+///
+/// **`pub(crate)`, and that is the whole point.** [`resolve_bw_exe`] returns
+/// this path even when no file is there, and `main` hands that answer to
+/// [`remember_verified_bw_exe`] unconditionally -- so by the time
+/// `bw_acquire` runs, the process is already holding a path to a file that
+/// does not exist. Acquisition makes that path correct by putting the file
+/// *under it*, which means it must install to **this function's answer** and
+/// never to a second spelling of it. A literal `exe_dir.join("bin")
+/// .join("bw.exe")` written in `bw_acquire` would agree today and would be
+/// free to stop agreeing, leaving the process trusting one path while the
+/// binary sat at another. `bw_acquire::the_install_destination_is_the_path_
+/// the_resolver_already_recorded` asserts the agreement rather than the
+/// string.
+pub(crate) fn install_bin_candidate(exe_dir: &Path) -> PathBuf {
     exe_dir.join("bin").join("bw.exe")
 }
 

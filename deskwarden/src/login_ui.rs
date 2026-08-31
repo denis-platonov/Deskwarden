@@ -1738,6 +1738,72 @@ pub enum LoginAction {
     /// are not reachable from `bw login` either, so this is not a shortcut
     /// past the password prompt -- it is the only door those accounts have.
     UseApiKey,
+    /// A button in the CLI-setup modal. See
+    /// [`crate::bw_acquire::CliSetupState`].
+    CliModal(crate::bw_acquire::CliModalAction),
+}
+
+/// Draws the CLI-setup modal over the card, and returns the button pressed.
+///
+/// **It replaces the credential zone rather than floating over it.** A true
+/// overlay would leave the master-password field painted, focusable and
+/// typeable underneath -- and the whole reason this modal exists at a
+/// blocking moment is that the credentials must not go anywhere until the
+/// question is answered. Not drawing the fields at all is the same guarantee
+/// without depending on hit-testing.
+///
+/// Pure view: the state is owned by the caller, which also owns the worker.
+fn draw_cli_setup_modal(
+    ui: &mut egui::Ui,
+    state: &crate::bw_acquire::CliSetupState,
+) -> Option<crate::bw_acquire::CliModalAction> {
+    let mut action = None;
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .corner_radius(CornerRadius::same(10))
+        .stroke(Stroke::new(1.0, theme::HAIRLINE))
+        .inner_margin(Margin::same(16))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::bold(state.title(), 15.0).color(theme::INK));
+            ui.add_space(8.0);
+            for line in state.body() {
+                ui.label(RichText::new(line).size(12.0).color(theme::TEXT_MUTED));
+                ui.add_space(6.0);
+            }
+            // The bar. `ProgressBar` with an explicit fraction where one is
+            // known, and egui's own animated indeterminate bar where it is
+            // not -- which happens only while the release listing is being
+            // fetched, a step with no byte count to report.
+            if matches!(state, crate::bw_acquire::CliSetupState::Working { .. }) {
+                ui.add_space(2.0);
+                let bar = match state.progress() {
+                    Some(fraction) => egui::ProgressBar::new(fraction),
+                    None => egui::ProgressBar::new(0.0).animate(true),
+                };
+                ui.add(bar.desired_width(ui.available_width()).desired_height(6.0));
+                ui.add_space(6.0);
+                // A window that is doing network work must keep painting, or
+                // the bar stops moving while the transfer does not.
+                ui.ctx().request_repaint();
+            }
+            let buttons = state.buttons();
+            if !buttons.is_empty() {
+                ui.add_space(6.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Reversed, because a right-to-left layout places the
+                    // first thing added at the RIGHT edge -- and the
+                    // affirmative button belongs there. `buttons()` lists
+                    // them left to right, which is how they read.
+                    for (label, what) in buttons.iter().rev() {
+                        if ui.button(RichText::new(*label).size(12.0)).clicked() {
+                            action = Some(*what);
+                        }
+                    }
+                });
+            }
+        });
+    action
 }
 
 /// Draws the login/unlock window body (design 3h): brand lockup, title
@@ -1807,12 +1873,32 @@ pub fn draw_login_window(
     // meets a master-password prompt on a machine they were already signed
     // in on with nothing to say why.
     first_run: bool,
+    // `Some` while the CLI-setup modal is open. It REPLACES the credential
+    // card, so nothing can be typed or submitted until it is answered -- see
+    // [`draw_cli_setup_modal`].
+    cli_setup: Option<&crate::bw_acquire::CliSetupState>,
 ) -> Option<LoginAction> {
     let mut action = None;
 
     draw_brand_lockup(ui);
 
     ui.add_space(14.0);
+
+    // **The modal takes the card.** Everything below this point -- the title
+    // block, the fields, the Hello panel, Continue, Enter, and the server
+    // dropdown -- is not drawn while it is open.
+    if let Some(state) = cli_setup {
+        ui.label(theme::bold("Sign in to your vault", 19.0).color(theme::INK));
+        ui.label(
+            RichText::new("Works with bitwarden.com and self-hosted servers.")
+                .size(13.0)
+                .color(theme::TEXT_FAINT),
+        );
+        ui.add_space(14.0);
+        let pressed = draw_cli_setup_modal(ui, state);
+        *flow_bottom = ui.min_rect().bottom();
+        return pressed.map(LoginAction::CliModal);
+    }
 
     // 3b/3h language: matches are counted but never named until the vault
     // opens -- unlocking is what this window is for.
@@ -3015,6 +3101,62 @@ pub fn build_login_frame(
     let (auth_tx, auth_rx) = std::sync::mpsc::channel::<Result<String, String>>();
     let mut auth_in_progress = false;
 
+    // **The CLI-setup modal, and the worker behind its second state.**
+    //
+    // `None` means no modal. It is set by the Submit arm below, *before*
+    // `spawn_auth` and before `configure_server_in` -- the first two things
+    // in this window that need `bw.exe` -- and only when the chosen server's
+    // backend is `bw serve` and no `bw.exe` exists.
+    //
+    // `auth_in_progress` is deliberately NOT set while the modal is open: the
+    // credentials have not gone anywhere, so the form must not paint as
+    // though they had.
+    let mut cli_setup: Option<crate::bw_acquire::CliSetupState> = None;
+    // **The other half of `backend_policy::choose`'s question**, read once
+    // here on the main thread before the window exists -- the same idiom, and
+    // the same fallback, as `login_card_details` a thousand lines above.
+    //
+    // Read once rather than per frame because that is what the rest of the
+    // app does with it: `settings.rs` records that this field is "captured at
+    // startup and never re-read", so re-reading it per frame would make this
+    // window the one place in the app where the setting is live, and it would
+    // then disagree with the backend the app has already settled on.
+    //
+    // Defaults to `true` on every failure, and `true` is `BwServe` for every
+    // account whatever its server -- so every way this read can go wrong
+    // lands on "the CLI is required", which is the safe direction: it offers
+    // to install something that turns out to be unnecessary, rather than
+    // skipping something that was.
+    let use_official_bw_crypto = crate::settings::default_path()
+        .map_or_else(crate::settings::Settings::default, |path| {
+            crate::settings::Settings::load(&path)
+        })
+        .use_official_bw_crypto;
+    // Two channels rather than one, because the two messages have different
+    // lifetimes: progress arrives many times a second and is dropped on the
+    // floor if the modal has moved on, while the outcome arrives exactly once
+    // and decides which state the modal enters next.
+    let (setup_stage_tx, setup_stage_rx) =
+        std::sync::mpsc::channel::<crate::bw_acquire::AcquireStage>();
+    let (setup_done_tx, setup_done_rx) = std::sync::mpsc::channel::<
+        Result<crate::bw_acquire::AcquireOutcome, crate::bw_acquire::AcquireRefusal>,
+    >();
+    // Set when the confirmation's OK is pressed, so the very next frame
+    // re-enters the Submit path the user was already on. That re-entry finds
+    // a `bw.exe` at the recorded path, takes no modal, and carries straight
+    // on into `bw config server` and `bw login` -- which is the owner's
+    // "installation, configuration, login, working" in one flow, with the
+    // user pressing Continue exactly once.
+    let mut resume_submit_after_setup = false;
+    // Set from inside the borrow of `cli_setup` above and acted on just
+    // after it, because the arm that needs it has to REPLACE the `Option`
+    // it is currently borrowing mutably.
+    let mut close_setup_and_resume = false;
+    // A Submit synthesised for the frame AFTER the confirmation's OK, so the
+    // sign-in the user already asked for continues without them pressing
+    // Continue a second time. Taken rather than read, so it fires once.
+    let mut action_after_setup: Option<LoginAction> = None;
+
     // **The vault window's placement, read the way the vault window reads
     // it.** Same `Settings::vault_window`, same `monitor_work_areas`, same
     // `clamp_window_geometry` -- by calling `vault_window::initial_placement`
@@ -3193,6 +3335,54 @@ pub fn build_login_frame(
                     }
                 }
 
+                // **The setup worker's news, drained before the frame is
+                // drawn**, so the bar the user sees is this frame's progress
+                // rather than the previous one's.
+                //
+                // Progress is drained to the LAST message rather than applied
+                // one per frame: `copy_reporting` reports per 8 KiB read, so
+                // a slow frame can have hundreds queued, and painting them in
+                // order would put the bar minutes behind the transfer.
+                if let Some(state) = cli_setup.as_mut() {
+                    let mut latest = None;
+                    while let Ok(stage) = setup_stage_rx.try_recv() {
+                        latest = Some(stage);
+                    }
+                    if let Some(stage) = latest {
+                        // Only while WORKING: a stage arriving after the
+                        // outcome must not reopen the progress state over the
+                        // confirmation the user is reading.
+                        if matches!(state, crate::bw_acquire::CliSetupState::Working { .. }) {
+                            *state = crate::bw_acquire::CliSetupState::Working { stage };
+                        }
+                    }
+                    if let Ok(outcome) = setup_done_rx.try_recv() {
+                        match outcome {
+                            Ok(crate::bw_acquire::AcquireOutcome::Installed(cli)) => {
+                                *state = crate::bw_acquire::CliSetupState::Installed(cli);
+                            }
+                            // Already present is not a state the modal can
+                            // reach -- the Submit arm only opens it when the
+                            // file is absent -- but if it ever did there is
+                            // nothing to confirm, so the modal closes and the
+                            // sign-in resumes rather than showing an empty
+                            // congratulation.
+                            Ok(crate::bw_acquire::AcquireOutcome::AlreadyPresent(_)) => {
+                                close_setup_and_resume = true;
+                            }
+                            Err(refusal) => {
+                                log::warn!("Bitwarden CLI setup failed: {refusal:?}");
+                                *state = crate::bw_acquire::CliSetupState::Failed(refusal);
+                            }
+                        }
+                    }
+                }
+                if close_setup_and_resume {
+                    close_setup_and_resume = false;
+                    cli_setup = None;
+                    resume_submit_after_setup = true;
+                }
+
                 let mut flow_bottom = 0.0f32;
                 let action = draw_login_window(
                     ui,
@@ -3204,7 +3394,12 @@ pub fn build_login_frame(
                     &mut flow_bottom,
                     auth_in_progress,
                     first_run,
+                    cli_setup.as_ref(),
                 );
+                // The resumed Submit wins over whatever the frame produced:
+                // the modal has just closed, so the frame cannot have
+                // produced anything but `None`.
+                let action = action_after_setup.take().or(action);
 
                 // Content height + the footer row and the bottom margin the
                 // footer is pinned above. This used to resize the WINDOW from
@@ -3235,6 +3430,54 @@ pub fn build_login_frame(
                             &form.email,
                             &form.password,
                         );
+
+                        // **The CLI gate, and it sits exactly here.**
+                        //
+                        // After the blank-field check, because there is no
+                        // point downloading 37 MB for a submit that cannot go
+                        // anywhere. Before `configure_server_in` below, which
+                        // is the first line in this window that actually
+                        // requires `bw.exe` -- it shells out to
+                        // `bw config server` through `bw_command_in` and hard
+                        // fails without a verified binary. Placing this after
+                        // that call would mean the first thing needing the
+                        // CLI ran before the CLI was there.
+                        //
+                        // **Nothing is downloaded here.** This opens the
+                        // modal at its first state and returns; the user has
+                        // to press OK. That is what makes the disclosure a
+                        // disclosure rather than a retroactive explanation,
+                        // and it is why browsing the server dropdown costs
+                        // nothing.
+                        //
+                        // The server URL handed to the gate is the EFFECTIVE
+                        // one, not `server_choice.config_url()`. For
+                        // `SelfHosted` that method answers `None`, and `None`
+                        // means bitwarden.com to `backend_policy` -- so
+                        // passing it would tell a self-hoster they were
+                        // signing in to bitwarden.com and require the CLI on
+                        // exactly the arm that may not need it.
+                        let effective_server = match form.server_choice {
+                            ServerChoice::SelfHosted => {
+                                let url = form.server_url.trim().to_string();
+                                if url.is_empty() { None } else { Some(url) }
+                            }
+                            choice => choice.config_url().map(str::to_string),
+                        };
+                        let needs_cli = missing.is_none()
+                            && !resume_submit_after_setup
+                            && crate::bw_acquire::this_sign_in_needs_the_cli(
+                                effective_server.as_deref(),
+                                use_official_bw_crypto,
+                            )
+                            && crate::bw_acquire::resolve_present_and_trusted().is_none();
+                        resume_submit_after_setup = false;
+                        if needs_cli {
+                            cli_setup = Some(crate::bw_acquire::CliSetupState::Asking);
+                            form.error = None;
+                            ui.ctx().request_repaint();
+                            return;
+                        }
 
                         // The server must be configured before `bw login` --
                         // it's global CLI config. A bad or missing
@@ -3437,6 +3680,76 @@ pub fn build_login_frame(
                     Some(LoginAction::UseApiKey) => {
                         *api_key_asked_for_closure.borrow_mut() = true;
                     }
+                    // **The modal's three states, driven from one arm.**
+                    Some(LoginAction::CliModal(what)) => match what {
+                        crate::bw_acquire::CliModalAction::Begin => {
+                            // The one place acquisition starts, and it is
+                            // behind a button the user pressed.
+                            cli_setup = Some(crate::bw_acquire::CliSetupState::Working {
+                                stage: crate::bw_acquire::AcquireStage::Resolving,
+                            });
+                            let stage_tx = setup_stage_tx.clone();
+                            let done_tx = setup_done_tx.clone();
+                            // A worker, because every step of this is
+                            // blocking: a DNS lookup, a 37 MB transfer, a
+                            // SHA-256 over it, a zip extraction and a
+                            // `WinVerifyTrust` call. On the frame thread the
+                            // window would freeze for the whole minute the
+                            // modal exists to narrate.
+                            //
+                            // It carries NO credentials. `form.password` is
+                            // untouched by this whole path -- the gate above
+                            // returns before `spawn_auth` -- which is what
+                            // makes an offline refusal a refusal that happens
+                            // before anything of the user's leaves the
+                            // window.
+                            std::thread::spawn(move || {
+                                let env = crate::bw_acquire::BwAcquireEnv::production();
+                                let outcome =
+                                    crate::bw_acquire::acquire_if_needed(&env, &|stage| {
+                                        // A closed receiver means the window
+                                        // is gone; the transfer then finishes
+                                        // into a temp file that the next
+                                        // attempt sweeps.
+                                        let _ = stage_tx.send(stage);
+                                    });
+                                let _ = done_tx.send(outcome);
+                            });
+                        }
+                        crate::bw_acquire::CliModalAction::Cancel => {
+                            // **Back to where they were**, which is the
+                            // server choice -- not an error card. Nothing was
+                            // fetched, because the modal precedes the first
+                            // byte, so the decline costs nothing and leaves
+                            // nothing behind. The form is exactly as they
+                            // left it, password included.
+                            cli_setup = None;
+                        }
+                        crate::bw_acquire::CliModalAction::Close => {
+                            // Success closes the modal and resumes the
+                            // sign-in the user was already attempting; a
+                            // failure closes it and puts the reason on the
+                            // card, where Continue is live again for the
+                            // refusals that are worth retrying.
+                            let installed = matches!(
+                                cli_setup,
+                                Some(crate::bw_acquire::CliSetupState::Installed(_))
+                            );
+                            if let Some(crate::bw_acquire::CliSetupState::Failed(refusal)) =
+                                &cli_setup
+                            {
+                                form.error = Some(refusal.message());
+                            }
+                            cli_setup = None;
+                            resume_submit_after_setup = installed;
+                            if installed {
+                                // Re-enter Submit on the next frame. The
+                                // user pressed Continue once.
+                                action_after_setup = Some(LoginAction::Submit);
+                                ui.ctx().request_repaint();
+                            }
+                        }
+                    },
                     None => {}
                 }
             },
@@ -4987,6 +5300,8 @@ mod first_run_notice_tests {
                 &mut flow_bottom,
                 false,
                 first_run,
+                // No CLI-setup modal: these frames are about the card.
+                None,
             );
         });
         let mut texts = Vec::new();
@@ -5020,6 +5335,168 @@ mod first_run_notice_tests {
     /// painted nothing at all would pass them.
     fn shows_the_hello_panel(texts: &[String]) -> bool {
         texts.iter().any(|t| t.contains("First use"))
+    }
+
+    /// Every string the login window paints with the CLI-setup modal open.
+    fn painted_with_modal(state: &crate::bw_acquire::CliSetupState) -> Vec<String> {
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        let mut flow_bottom = 0.0f32;
+        let output = ctx.run_ui(raw_input(), |ui| {
+            let _ = draw_login_window(
+                ui,
+                BwStatus::Unauthenticated,
+                None,
+                "bitwarden.com",
+                NOT_ENROLLED,
+                &mut form,
+                &mut flow_bottom,
+                false,
+                false,
+                Some(state),
+            );
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    /// **The modal takes the card: the master-password field is not painted
+    /// while it is open.**
+    ///
+    /// This is the property that makes it a modal rather than a notice, and
+    /// it is the one that matters: the credentials must not be typeable or
+    /// submittable until the question is answered. Asserted by the field's
+    /// absence, with a control proving the same harness paints it when the
+    /// modal is closed -- because "a string is absent" is the purest form of
+    /// the vacuous test.
+    #[test]
+    fn the_setup_modal_replaces_the_credential_card() {
+        let with = painted_with_modal(&crate::bw_acquire::CliSetupState::Asking);
+        // Control first: this really is the login window, and it really did
+        // paint the modal.
+        assert!(
+            with.iter().any(|t| t.contains("Bitwarden CLI")),
+            "the modal painted nothing about the CLI; got {with:?}"
+        );
+        assert!(
+            with.iter().any(|t| t.contains("Sign in to your vault")),
+            "control: this is not the login window at all; got {with:?}"
+        );
+
+        for field in ["Master password", "Email"] {
+            assert!(
+                !with.iter().any(|t| t == field),
+                "{field:?} is still painted under the modal, so credentials can be typed \
+                 before the question is answered; got {with:?}"
+            );
+        }
+
+        // **The control that makes the four assertions above mean
+        // something**: with the modal closed, the same harness DOES paint
+        // those fields. Without it, a `draw_login_window` that painted an
+        // empty window would pass every line above.
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        let mut flow_bottom = 0.0f32;
+        let output = ctx.run_ui(raw_input(), |ui| {
+            let _ = draw_login_window(
+                ui,
+                BwStatus::Unauthenticated,
+                None,
+                "bitwarden.com",
+                NOT_ENROLLED,
+                &mut form,
+                &mut flow_bottom,
+                false,
+                false,
+                None,
+            );
+        });
+        let mut without = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut without);
+        }
+        assert!(
+            without.iter().any(|t| t == "Master password"),
+            "control: the card does not paint a master-password label even with no modal, \
+             so its absence above proves nothing; got {without:?}"
+        );
+        // ...and the modal's own words are absent when it is closed, so the
+        // first assertion is reading the parameter rather than always finding
+        // the string.
+        assert!(
+            !without.iter().any(|t| t.contains("requires the official Bitwarden CLI")),
+            "the modal's text is painted with no modal open; got {without:?}"
+        );
+    }
+
+    /// Each state paints its own words and its own buttons, through the real
+    /// window rather than through the state object alone -- which is what
+    /// separates "the state knows what to say" from "the window says it".
+    #[test]
+    fn each_modal_state_paints_its_own_words_and_buttons() {
+        let asking = painted_with_modal(&crate::bw_acquire::CliSetupState::Asking);
+        assert!(asking.iter().any(|t| t == "OK"), "state 1 has no OK; got {asking:?}");
+        assert!(asking.iter().any(|t| t == "Cancel"), "state 1 has no Cancel; got {asking:?}");
+
+        let working = painted_with_modal(&crate::bw_acquire::CliSetupState::Working {
+            stage: crate::bw_acquire::AcquireStage::Downloading {
+                done: 5 * 1024 * 1024,
+                total: Some(37 * 1024 * 1024),
+            },
+        });
+        assert!(
+            working.iter().any(|t| t.contains("Downloading the Bitwarden CLI")),
+            "state 2 does not say what it is doing; got {working:?}"
+        );
+        assert!(
+            working.iter().any(|t| t.contains("of 37.0 MB")),
+            "state 2 does not report how far it has got; got {working:?}"
+        );
+        // No buttons while work is in flight.
+        assert!(!working.iter().any(|t| t == "Cancel"), "state 2 offers a Cancel; {working:?}");
+        assert!(!working.iter().any(|t| t == "OK"), "state 2 offers an OK; {working:?}");
+
+        let installed =
+            painted_with_modal(&crate::bw_acquire::CliSetupState::Installed(
+                crate::bw_acquire::AcquiredCli {
+                    path: std::path::PathBuf::from(r"C:\x\bin\bw.exe"),
+                    version: Some("2026.8.0".to_string()),
+                    bytes: 38_695_474,
+                },
+            ));
+        assert!(
+            installed.iter().any(|t| t.contains("2026.8.0") && t.contains("36.9 MB")),
+            "state 3 does not name the version and size that landed; got {installed:?}"
+        );
+        assert!(installed.iter().any(|t| t == "OK"), "state 3 has no OK; got {installed:?}");
+        assert!(
+            !installed.iter().any(|t| t == "Cancel"),
+            "state 3 offers a Cancel; got {installed:?}"
+        );
+    }
+
+    /// A failure paints the failure-matrix sentence in the same modal, and
+    /// the signature failure says plainly that the file was not run.
+    #[test]
+    fn a_failed_setup_says_which_thing_was_required_and_what_to_do() {
+        let failed = painted_with_modal(&crate::bw_acquire::CliSetupState::Failed(
+            crate::bw_acquire::AcquireRefusal::NotBitwardenSigned { subject_dn: None },
+        ));
+        let joined = failed.join(" ");
+        assert!(joined.contains("Bitwarden CLI"), "{joined:?}");
+        assert!(joined.contains("bitwarden.com"), "{joined:?}");
+        assert!(joined.contains("self-hosted"), "{joined:?}");
+        assert!(joined.contains("did not run it"), "{joined:?}");
+        // Control: a DIFFERENT refusal paints different words, so this is
+        // reading the variant rather than a fixed failure card.
+        let offline = painted_with_modal(&crate::bw_acquire::CliSetupState::Failed(
+            crate::bw_acquire::AcquireRefusal::Offline("x".into()),
+        ));
+        assert_ne!(offline.join(" "), joined);
     }
 
     const ENROLLED: HelloState = HelloState {
@@ -5530,6 +6007,7 @@ mod auth_in_flight_tests {
                         &mut flow_bottom,
                         auth_in_progress,
                         false,
+                        None,
                     );
                 });
             },

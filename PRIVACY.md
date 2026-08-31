@@ -11,8 +11,13 @@ vaults. It is unofficial and unaffiliated with Bitwarden, Inc.
 to the developer — not usage data, not crash reports, not telemetry of any
 kind. There is no mechanism in the software to do so.
 
-Your vault credentials are handled by the Bitwarden CLI (`bw`), which you
-install and sign in to yourself. Deskwarden talks to it locally.
+Your vault credentials are handled by the Bitwarden CLI (`bw`) on accounts
+whose vault it serves -- every account on bitwarden.com and bitwarden.eu.
+Deskwarden talks to it locally. You no longer install it yourself:
+Deskwarden asks first, then downloads it from Bitwarden, checks Bitwarden's
+signature on it, and installs it, at the moment you choose such a server.
+On a self-hosted server with the built-in client there is no CLI and no
+subprocess: this app derives the keys and talks to your server directly.
 
 ## What stays on your machine
 

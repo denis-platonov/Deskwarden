@@ -15,13 +15,9 @@ step that makes sure the Bitwarden CLI (`bw.exe`) is available.
   choco install innosetup
   ```
 
-- That's it — **no other plugins are required.** An earlier draft of
-  `deskwarden.iss` used the Inno Download Plugin (`idp.iss`) for the
-  Bitwarden CLI download step; the shipped version instead shells out to
-  Windows PowerShell (via `bootstrap-bw.ps1`, included alongside the
-  script), which ships on every supported Windows install and can do the
-  GitHub-releases JSON parsing that plugin can't. See the comment on
-  `InstallBwCliIfMissing` in `deskwarden.iss` for the full reasoning.
+- That's it — **no other plugins are required**, and none ever will be for a
+  download step: the script has no `[Code]` section at all. See *What this
+  installer no longer does* below.
 
 - A release build of `deskwarden.exe` at `..\target\release\deskwarden.exe`
   (i.e. build the Rust crate first: `cargo build --release` from
@@ -43,66 +39,68 @@ matching what the release CI workflow expects to find and publish).
 If `AppVersion` isn't passed via `/D`, the script falls back to `0.0.0` so
 it still compiles for a quick local sanity check.
 
-## What the bw-CLI bootstrap step does
+## What this installer no longer does
 
-`InstallBwCliIfMissing` (in `deskwarden.iss`, invoked at `ssPostInstall`)
-extracts and runs `bootstrap-bw.ps1`, which:
+**It no longer installs the Bitwarden CLI.** Until 0.14.0 the script carried a
+`[Code]` section that ran a 370-line `bootstrap-bw.ps1` at `ssPostInstall`: it
+queried `https://api.github.com/repos/bitwarden/clients/releases`, filtered for
+`cli-v*` tags, downloaded the Windows archive, verified its Authenticode
+signature with `Get-AuthenticodeSignature`, extracted `bw.exe` into
+`<InstallDir>in`, and added that directory to the user's `PATH`. A custom
+`TOutputProgressWizardPage` existed to give it visible feedback, and four
+`SuppressibleMsgBox` dialogs reported its failures -- every one of them ending
+by telling the user to go and install a command-line tool by hand.
 
-1. Skips everything if `bw.exe` is already on `PATH` or already present in
-   this install's `bin` folder (e.g. a reinstall/upgrade).
-2. Otherwise, queries `https://api.github.com/repos/bitwarden/clients/releases`
-   and picks the newest release whose tag matches `cli-v*` — `bitwarden/clients`
-   is a monorepo that also publishes desktop/browser/web releases interleaved
-   by date, so GitHub's generic "latest release" for the repo is not
-   reliably the CLI's latest.
-3. Downloads that release's `bw-windows-<version>.zip` asset (the official
-   standalone Windows build — not `bw-oss-windows-*`, which lacks
-   paid-tier vault features) and extracts `bw.exe` from it.
-4. Verifies `bw.exe`'s Authenticode signature via PowerShell's
-   `Get-AuthenticodeSignature` (same mechanism `src/signature.rs` uses for
-   deskwarden's own self-update verification) — checks both that the
-   signature is `Valid` and that the signer certificate's **organization
-   (`O=`) component** exactly matches one of the allowlisted Bitwarden
-   organization names (see `$BitwardenSignerOrganizations` in the script).
-   This is a whole-DN-component comparison, not a substring search over the
-   subject string: an unrelated but legitimately-issued certificate whose
-   subject merely *contains* "Bitwarden" somewhere (`O=Bitwarden Solutions
-   LLC`, `OU=bitwarden-integration`, …) is rejected. Refuses to install
-   otherwise. Not a thumbprint pin — unlike deskwarden's own self-update
-   signer, this is a third party whose certificate may legitimately rotate.
+All of it is deleted. The reasons:
 
-   **Pre-ship check:** the allowlist itself has not yet been confirmed
-   against a real Bitwarden-signed `bw.exe` (no such binary was available on
-   the machine this was written on). Verify it the same way the download URL
-   and asset naming were verified below — see the TODO in the script for the
-   exact command.
-5. Copies the verified `bw.exe` into `<install dir>\bin\bw.exe` and adds
-   `<install dir>\bin` to the current user's `PATH` (`HKCU`, no admin
-   needed) — deskwarden invokes the CLI as a bare `bw` command (see
-   `src/bw_serve.rs`, `src/login_ui.rs`), relying entirely on `PATH`
-   resolution, so this step is required for it to actually find the binary.
+1. **It ran for everybody, before anybody had chosen a server.** The CLI is
+   required only where `bw serve` is the vault. An installer that spends a
+   minute and ~37 MB on it is charging every user for a dependency some of
+   them will never need.
+2. **It was the app's second, divergent Authenticode mechanism.**
+   `src/signature.rs` verifies in-process with `WinVerifyTrust`, because
+   `Get-AuthenticodeSignature` fails wherever `Microsoft.PowerShell.Security`
+   cannot autoload -- a trust gate that cannot answer. The script used the
+   cmdlet, and hand-maintained a second X.500 DN parser
+   (`Get-CertificateDnComponent`) whose own doc admitted it was "kept in sync
+   by hand" with `dn_component`. Two parsers of one grammar, in two
+   languages, held together by a comment.
 
-Verified against Bitwarden's real, current release infrastructure on
-2026-07-28: repo `bitwarden/clients`, latest CLI tag `cli-v2026.7.0`, asset
-`bw-windows-2026.7.0.zip` at
-`https://github.com/bitwarden/clients/releases/download/cli-v2026.7.0/bw-windows-2026.7.0.zip`.
+`src/bw_acquire.rs` does this now, from the sign-in window, at the moment a
+server is chosen that requires it -- asking first, with a modal the user can
+cancel. It creates `<InstallDir>in` and writes the `PATH` entry itself,
+because nothing else does any more.
 
-## Uninstall behavior
+**One finding from the deleted script is still live** and moved with it: the
+monorepo tag filter. `bitwarden/clients` publishes cli, desktop, browser and
+web releases interleaved by date, so GitHub's generic "latest release" for the
+repo is *not* the CLI's latest release; resolving the right one means
+filtering the releases list on a `cli-v` tag prefix. That reasoning now lives
+on `bw_acquire::pick_artefact`, along with a second one the script did not
+have: `bw-oss-windows-<version>.zip` sits beside `bw-windows-<version>.zip`
+and sorts before it, so the asset prefix must be anchored at the front.
 
-Uninstalling deskwarden removes deskwarden's own installed files and the
-`HKCU\...\Run` autostart entry. It deliberately does **not** remove
-`bw.exe` or the `PATH` entry added for it — the user may be using the
-Bitwarden CLI independently of deskwarden, per the distribution design
-spec's Installer section.
+Three tests in `src/main.rs` hold the installer to this --
+`the_installer_says_nothing_about_the_bitwarden_cli`,
+`the_installer_shells_out_to_nothing`, and
+`the_bootstrap_script_is_not_in_the_tree`. They are plain text scans of
+`deskwarden.iss`, so a *mention* in a comment reads exactly like a call; that
+is why this history lives in this file rather than in the script.
+
+**Uninstall still deliberately leaves `bw.exe` and its `PATH` entry behind.**
+The user may be using the Bitwarden CLI independently of Deskwarden. That
+reasoning now lives with the code that writes both, in `bw_acquire`'s module
+docs.
+
 
 ## Testing without Inno Setup installed
 
 `ISCC.exe` was not available in the environment this script was authored
 in (a `choco install innosetup` attempt failed for lack of admin rights).
-The script was reviewed carefully instead, and `bootstrap-bw.ps1` was
-separately validated by parsing it with PowerShell's own script parser
-(`[System.Management.Automation.Language.Parser]::ParseFile`), which
-reported no syntax errors. Actual compilation is deferred to Task 6's
+The script was reviewed carefully instead. That mattered more when there was
+a `[Code]` section to get wrong; there is not any more, so what remains is
+declarative sections a compile either accepts or rejects outright. Actual
+compilation is deferred to Task 6's
 release CI workflow (`.github/workflows/release.yml`), which installs
 Inno Setup via `choco install innosetup -y` on a `windows-latest` runner —
 this will be the first real compile of `deskwarden.iss`.

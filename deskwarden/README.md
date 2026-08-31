@@ -23,8 +23,12 @@ memory-only unless you turn on the encrypted disk copy described under
 ## Requirements
 
 - Windows 10 or 11.
-- The [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw`) installed and on
-  your `PATH`. Check with `bw --version`.
+- Nothing else. Signing in to a Bitwarden server (bitwarden.com or
+  bitwarden.eu) requires the official
+  [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw`), and Deskwarden asks
+  before downloading, verifying and installing it for you at that moment --
+  you do not install it yourself, and it is not fetched until you choose a
+  server that needs it.
 - A Rust toolchain, if you're building from source.
 
 ## Running it

@@ -3,10 +3,9 @@
 ; Per-user Inno Setup installer for deskwarden. No admin rights / UAC prompt
 ; required (PrivilegesRequired=lowest, installs under %LOCALAPPDATA%).
 ;
-; Build-time dependency: Inno Setup 6 (ISCC.exe) only. Unlike an earlier
-; draft of this script, this version does NOT use the Inno Download Plugin
-; (idp.iss) -- see the [Code] section comment on InstallBwCliIfMissing for
-; why. See installer/README.md for full build instructions.
+; Build-time dependency: Inno Setup 6 (ISCC.exe) only. This script has no
+; [Code] section at all: it copies two files, offers the autostart checkbox
+; and finishes. See installer/README.md for full build instructions.
 ;
 ; Build with:
 ;   iscc deskwarden.iss /DAppVersion=0.1.0
@@ -96,12 +95,6 @@ Source: "..\target\release\deskwarden.exe"; DestDir: "{app}"; Flags: ignoreversi
 ; spelling, and `the_installer_ships_the_wordlist_this_module_reads` reads
 ; THIS FILE to hold the two together so the name cannot drift.
 Source: "..\assets\wordlist.txt"; DestDir: "{app}"; Flags: ignoreversion
-; Helper script for the bw-CLI bootstrap step below. `dontcopy` means it's
-; bundled into the installer payload but not installed onto the user's
-; system as an app file; it's pulled out on demand via
-; ExtractTemporaryFile and run once, then left in {tmp} for Windows to
-; clean up.
-Source: "bootstrap-bw.ps1"; DestDir: "{tmp}"; Flags: dontcopy
 
 [Icons]
 Name: "{group}\Deskwarden"; Filename: "{app}\deskwarden.exe"
@@ -163,151 +156,28 @@ Name: "autostart"; Description: "Start Deskwarden automatically when you sign in
 ; must not sit waiting for the user to quit it.
 Filename: "{app}\deskwarden.exe"; Description: "Start Deskwarden"; Flags: postinstall nowait
 
-[Code]
-{ Runs bootstrap-bw.ps1 (see that file for full detail) to ensure bw.exe is
-  available, downloading it from Bitwarden's own GitHub releases and
-  verifying its Authenticode signature first if it's missing.
-
-  This step shells out to PowerShell rather than using the Inno Download
-  Plugin (idp.iss) that an earlier draft of this script referenced. Reasons:
-
-  1. bitwarden/clients (the real, verified repo -- confirmed 2026-07-28
-     against https://api.github.com/repos/bitwarden/clients/releases) is a
-     monorepo publishing releases for multiple products (cli, desktop,
-     browser, web) interleaved by date. GitHub's generic "latest release"
-     for the repo is NOT reliably the CLI's latest release -- resolving the
-     right one requires filtering the releases list by tag prefix
-     ("cli-v*"), which means parsing JSON. Inno's Pascal Script has no JSON
-     support and idpDownloadFile alone can't do this resolution; PowerShell
-     (Invoke-RestMethod) can, in a handful of readable lines.
-  2. This project's own signature-verification code (src/signature.rs)
-     already shells out to PowerShell's Get-AuthenticodeSignature rather
-     than binding WinVerifyTrust directly, specifically to avoid getting
-     security-critical FFI wrong. Doing the same here keeps the bw-CLI
-     bootstrap step's verification logic consistent with that choice
-     instead of introducing a second, different verification mechanism.
-  3. It avoids adding idp.iss as a build-time dependency that Task 6's CI
-     workflow (choco install innosetup only installs Inno Setup itself, not
-     the plugin) would otherwise need an extra step to fetch.
-}
-{ Copying deskwarden.exe itself (the [Files] section) already gets a visible
-  progress page from Inno's own wizard for a normal interactive install --
-  nothing custom is needed for that stage. The two stages below (the
-  compatibility check and the CLI bootstrap) are the ones that used to run
-  with SW_HIDE and zero visible feedback, which is what ProgressPage exists
-  to fix.
-
-  Gated on `not WizardSilent()` throughout: updater.rs's apply_update runs
-  this installer with /VERYSILENT for the app's own self-update relaunch,
-  and that path must stay fully silent (no windows at all) by design -- the
-  same reason the error dialogs below are Suppressible*, not plain, boxes. }
-var
-  ProgressPage: TOutputProgressWizardPage;
-
-procedure InitializeWizard();
-begin
-  if not WizardSilent() then
-    ProgressPage := CreateOutputProgressPage('Setting up Deskwarden',
-      'Please wait while Deskwarden finishes setting up.');
-end;
-
-procedure InstallBwCliIfMissing();
-var
-  ScriptPath: String;
-  PowerShellPath: String;
-  ResultCode: Integer;
-  ExecOk: Boolean;
-begin
-  { Absolute path rather than the bare 'powershell.exe' this used: setup runs
-    out of a user-writable temp directory, and Windows' process-creation
-    search order includes the application directory. Same reasoning as
-    src/signature.rs resolving powershell.exe absolutely.
-    (Note for editors: Pascal brace comments do not nest, so an Inno
-    constant written literally in one of these comments would end it early.) }
-  PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
-
-  if not WizardSilent() then
-  begin
-    ProgressPage.SetText('Checking compatibility...', 'Confirming PowerShell is available');
-    ProgressPage.SetProgress(1, 3);
-    ProgressPage.Show();
-  end;
-
-  { A real check, not a cosmetic delay: without it, a machine missing this
-    (extremely standard, but not guaranteed) component would hit the "could
-    not launch PowerShell" failure path below with no more specific cause. }
-  if not FileExists(PowerShellPath) then
-  begin
-    if not WizardSilent() then ProgressPage.Hide();
-    SuppressibleMsgBox('Deskwarden could not find PowerShell, which it needs to set up the Bitwarden CLI (bw). ' +
-      'Please install it yourself from https://bitwarden.com/help/cli/ and ensure it''s on your PATH.',
-      mbInformation, MB_OK, IDOK);
-    exit;
-  end;
-
-  ExtractTemporaryFile('bootstrap-bw.ps1');
-  ScriptPath := ExpandConstant('{tmp}\bootstrap-bw.ps1');
-
-  if not WizardSilent() then
-  begin
-    ProgressPage.SetText('Installing Bitwarden CLI...',
-      'Downloading and verifying the official CLI if it is not already present -- this can take a minute');
-    ProgressPage.SetProgress(2, 3);
-  end;
-
-  ExecOk := Exec(PowerShellPath,
-    Format('-NoProfile -ExecutionPolicy Bypass -File "%s" -InstallDir "%s"', [
-      ScriptPath, ExpandConstant('{app}')]),
-    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-
-  if not WizardSilent() then
-  begin
-    ProgressPage.SetText('Finishing up...', '');
-    ProgressPage.SetProgress(3, 3);
-  end;
-
-  { SuppressibleMsgBox, not MsgBox, everywhere below. Inno does NOT
-    auto-dismiss plain MsgBox under /SUPPRESSMSGBOXES -- that flag only
-    affects the Suppressible* variants. updater.rs's apply_update runs this
-    installer with `/VERYSILENT /SUPPRESSMSGBOXES` from a process the user
-    never interactively launched, so any of these failure paths (network
-    down, GitHub API shape change, signature check failure) would otherwise
-    put up an invisible modal dialog and block setup indefinitely. The final
-    argument is the answer returned when suppressed; every box here is
-    informational with a single OK button, so IDOK is both the only and the
-    correct answer. Interactively, these still display exactly as before. }
-  if (not ExecOk) then
-  begin
-    if not WizardSilent() then ProgressPage.Hide();
-    SuppressibleMsgBox('Deskwarden could not launch PowerShell to set up the Bitwarden CLI (bw). ' +
-      'Please install it yourself from https://bitwarden.com/help/cli/ and ensure it''s on your PATH.',
-      mbInformation, MB_OK, IDOK);
-    exit;
-  end;
-
-  case ResultCode of
-    0: ; { success: already present, or freshly installed and verified }
-    2: SuppressibleMsgBox('The Bitwarden CLI download did not pass signature verification, so it was not installed. ' +
-        'Please install it yourself from https://bitwarden.com/help/cli/ and ensure it''s on your PATH.',
-        mbError, MB_OK, IDOK);
-  else
-    SuppressibleMsgBox('Deskwarden could not automatically set up the Bitwarden CLI (bw). ' +
-      'Please install it yourself from https://bitwarden.com/help/cli/ and ensure it''s on your PATH.',
-      mbInformation, MB_OK, IDOK);
-  end;
-
-  if not WizardSilent() then ProgressPage.Hide();
-end;
-
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if CurStep = ssPostInstall then
-    InstallBwCliIfMissing();
-end;
-
-{ Deliberately no CurUninstallStepChanged PATH cleanup here: per the design
-  spec's Installer section, uninstalling deskwarden intentionally leaves the
-  bw CLI (and the PATH entry bootstrap-bw.ps1 added for it) in place, since
-  the user may be using bw independently of deskwarden. Only deskwarden's
-  own tracked files and the autostart registry value (uninsdeletevalue,
-  above) are removed. }
+; **No [Code] section, deliberately.**
+;
+; This installer copies an app and finishes. It does not fetch, verify, or
+; make a wizard page out of anybody else's binary, and it starts no external
+; process of any kind.
+;
+; What used to be here -- a wizard page, a helper script, a signature check
+; and four dialogs, all for a dependency that only some accounts need and
+; that ran before the user had chosen a server -- is recorded in
+; installer/README.md under "What this installer no longer does", together
+; with the two findings from it that are still live. The app acquires that
+; dependency itself now, at the moment a server is chosen that requires it:
+; see src/bw_acquire.rs.
+;
+; Three tests in src/main.rs hold this file to it:
+; `the_installer_says_nothing_about_the_bitwarden_cli`,
+; `the_installer_shells_out_to_nothing`, and
+; `the_bootstrap_script_is_not_in_the_tree`. They are text scans, so a
+; MENTION in a comment here reads exactly like a call -- which is why the
+; history lives in the README rather than in this file.
+;
+; **Uninstall still deliberately leaves what it installed behind.** That
+; reasoning is unchanged and has moved to the module that now writes it: see
+; src/bw_acquire.rs's module docs. Only deskwarden's own tracked files and
+; the autostart registry value (uninsdeletevalue, above) are removed.
