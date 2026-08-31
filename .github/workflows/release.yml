@@ -167,20 +167,55 @@ jobs:
       # hand into the shape below. This step makes every future release get
       # that shape without anyone remembering to.
       #
-      # WHERE THE BULLETS COME FROM. `CHANGELOG.md`'s section for the version
-      # being released, whose `### ` headings are already one line per
-      # user-visible change -- that IS the list, written once. Asking a human
-      # to write it a second time into a release body is how the two drift.
+      # WHAT COMES FROM THE CHANGELOG, AND WHY IT IS THE WHOLE SECTION NOW.
+      # Until 0.15.0 this step read ONLY the `### ` headings of the version's
+      # section and published them as a bulleted list, with a link to the file
+      # for anyone who wanted to know what the headings meant. The panel is
+      # where a user finds out what an update does; a list of headlines plus
+      # "go and read a file on the web" is not that. So the section's PROSE
+      # comes too: each `### ` heading followed by the paragraphs, lists and
+      # notes written under it, up to the next `### ` or the next `## `.
       #
-      # WHY THE EXTRACTION IS RELIABLE. It is a two-state scan over lines, not
-      # a Markdown parse: `## <version>` opens the section, the next `## `
-      # closes it, and `### ` lines in between are the bullets. `^##\s` cannot
-      # match a `### ` heading (the third character is `#`, not whitespace),
-      # so the two levels cannot be confused. Nothing about the prose BELOW a
-      # `### ` is read, so a section can contain anything -- blockquotes,
-      # code, lists -- without affecting the result. The version is matched
+      # WHY THE EXTRACTION IS STILL RELIABLE. It is still a two-state scan
+      # over lines, not a Markdown parse: `## <version>` opens the section,
+      # the next `## ` closes it, and everything in between is carried.
+      # `^##\s` cannot match a `### ` heading (the third character is `#`, not
+      # whitespace), so the two levels cannot be confused, and `####` cannot
+      # be mistaken for `###` for the same reason. The version is matched
       # against `$env:APP_VERSION`, which an earlier step has already proved
       # equal to the crate version and to the tag.
+      #
+      # WHY THE LINES ARE REJOINED. `release_notes_blocks` makes ONE BLOCK PER
+      # SOURCE LINE -- deliberately, so a bulleted release body is not flowed
+      # into a wall -- and `CHANGELOG.md` is hard-wrapped at about 76 columns.
+      # Published line for line, a paragraph written for a text file would be
+      # painted as eight stubs, each re-wrapped again by a card that is
+      # narrower than 76 columns and is drawn at two different widths. So a
+      # run of prose lines is joined back into one line and the panel wraps it
+      # to the width it actually has; a blank line, a `### ` heading and a
+      # list marker each end the run. Continuation lines of a wrapped list
+      # item join their item, which is why `- ` is remembered as a prefix.
+      #
+      # WHAT THE PANEL CANNOT RENDER, AND WHAT HAPPENS TO IT. The subset in
+      # `updater.rs` covers headings, paragraphs, `-`/`*`/`+` lists, `**bold**`,
+      # `_italic_`, `` `code` `` and `https` links. It does NOT cover block
+      # quotes or fenced code, and anything it does not cover it paints as the
+      # characters it is -- so a `> ` line published as written arrives in the
+      # panel with a literal `>` down the left margin, and a fence arrives as
+      # three backticks on a line of their own. Neither is taught to the
+      # renderer here: a block quote in this changelog is a release-wide note
+      # (see 0.9.0 and 0.8.5) whose WORDS are the content, and a new block
+      # kind would have to be matched in the drawing code as well. Both are
+      # degraded instead, predictably and in one place: the `> ` marker is
+      # stripped and the quote is published as the paragraph it reads as, and
+      # a fence delimiter line is dropped while the code lines it wrapped are
+      # kept. Nothing is deleted except the two delimiters themselves.
+      #
+      # WHY THERE IS A LENGTH BUDGET. `release_notes_for_display` cuts the
+      # body at 4000 characters, and it cuts from the END -- where the full
+      # changelog link and the signing note are. A section can be far longer
+      # than that (0.10.0 is), so the notes are cut HERE instead, at a blank
+      # line, leaving the tail intact and saying that it cut.
       #
       # WHAT IT DOES WHEN THE SECTION IS MISSING. Warns loudly in the job log
       # and publishes the rest of the body -- the link and the two notes --
@@ -198,10 +233,19 @@ jobs:
         run: |
           $changelog = Join-Path $env:GITHUB_WORKSPACE 'CHANGELOG.md'
           $version = $env:APP_VERSION
-          $bullets = @()
+          # The longest "What's new" block this step will publish. Under
+          # `MAX_RELEASE_NOTES_CHARS` (4000) by enough room for the heading,
+          # the full-changelog link and the signing note below it.
+          $notesBudget = 3200
+          $notes = [System.Collections.Generic.List[string]]::new()
           $found = $false
+          $headings = 0
           if (Test-Path -LiteralPath $changelog) {
             $inSection = $false
+            # The run of wrapped lines being rejoined, and the list marker it
+            # belongs to (empty for a paragraph).
+            $pending = ''
+            $pendingPrefix = ''
             foreach ($line in (Get-Content -LiteralPath $changelog -Encoding utf8)) {
               if ($line -match '^##\s') {
                 if ($inSection) { break }
@@ -211,26 +255,86 @@ jobs:
                 }
                 continue
               }
-              if ($inSection -and $line -match '^###\s+(.+)$') {
-                $bullets += $Matches[1].Trim()
+              if (-not $inSection) { continue }
+
+              # The two degradations, both spelled here and nowhere else.
+              if ($line -match '^\s*```') { continue }
+              $line = $line -replace '^(\s*)>\s?', '$1'
+
+              if ($line -match '^###\s+(.+)$') {
+                if ($pending -ne '') { $notes.Add($pendingPrefix + $pending); $pending = ''; $pendingPrefix = '' }
+                $notes.Add('')
+                $notes.Add('### ' + $Matches[1].Trim())
+                $notes.Add('')
+                $headings++
+                continue
               }
+              if ($line.Trim() -eq '') {
+                if ($pending -ne '') { $notes.Add($pendingPrefix + $pending); $pending = ''; $pendingPrefix = '' }
+                $notes.Add('')
+                continue
+              }
+              if ($line -match '^([ \t]*)([-*+])\s+(.*)$') {
+                if ($pending -ne '') { $notes.Add($pendingPrefix + $pending); $pending = ''; $pendingPrefix = '' }
+                $pendingPrefix = ($Matches[1] -replace "`t", '  ') + $Matches[2] + ' '
+                $pending = $Matches[3].Trim()
+                continue
+              }
+              $pending = ($pending + ' ' + $line.Trim()).Trim()
             }
+            if ($pending -ne '') { $notes.Add($pendingPrefix + $pending) }
           } else {
             Write-Host "::warning::CHANGELOG.md is missing from the checkout."
           }
 
+          # Runs of blank lines collapse to one, and the leading and trailing
+          # ones go: the heading emits its own air above and below, and the
+          # source has blank lines there too.
+          $clean = [System.Collections.Generic.List[string]]::new()
+          foreach ($n in $notes) {
+            if ($n -eq '' -and ($clean.Count -eq 0 -or $clean[$clean.Count - 1] -eq '')) { continue }
+            $clean.Add($n)
+          }
+          while ($clean.Count -gt 0 -and $clean[$clean.Count - 1] -eq '') { $clean.RemoveAt($clean.Count - 1) }
+
+          # The budget, cut at a blank line so it never stops mid-sentence.
+          $joined = ($clean -join "`n")
+          if ($joined.Length -gt $notesBudget) {
+            $length = 0
+            $lastBreak = -1
+            for ($i = 0; $i -lt $clean.Count; $i++) {
+              $length += $clean[$i].Length + 1
+              if ($length -gt $notesBudget) { break }
+              if ($clean[$i] -eq '') { $lastBreak = $i }
+            }
+            if ($lastBreak -lt 0) { $lastBreak = 0 }
+            $kept = [System.Collections.Generic.List[string]]::new()
+            for ($i = 0; $i -lt $lastBreak; $i++) { $kept.Add($clean[$i]) }
+            $clean = $kept
+            while ($clean.Count -gt 0 -and $clean[$clean.Count - 1] -eq '') { $clean.RemoveAt($clean.Count - 1) }
+            $clean.Add('')
+            $clean.Add('_The rest of this release''s notes are in the full changelog below._')
+            Write-Host ("::warning::The $version section is longer than $notesBudget characters, " +
+              "so the release body carries only the part that fits. This is not a failure -- the " +
+              "full changelog link below it is what the rest is for.")
+          }
+
           $parts = @()
-          if ($bullets.Count -gt 0) {
+          if ($clean.Count -gt 0) {
             $parts += "## What's new in $version"
             $parts += ""
-            foreach ($bullet in $bullets) { $parts += "- $bullet" }
+            foreach ($n in $clean) { $parts += $n }
             $parts += ""
           } elseif ($found) {
-            Write-Host ("::warning::CHANGELOG.md has a section for $version but no '### ' " +
-              "headings in it, so this release body has no 'What's new' list.")
+            Write-Host ("::warning::CHANGELOG.md has a section for $version but nothing in it, " +
+              "so this release body has no 'What's new' block.")
           } else {
             Write-Host ("::warning::CHANGELOG.md has no '## $version' section, so this " +
-              "release body has no 'What's new' list. Add one and edit the release body.")
+              "release body has no 'What's new' block. Add one and edit the release body.")
+          }
+          if ($found -and $headings -eq 0) {
+            Write-Host ("::warning::CHANGELOG.md's $version section has no '### ' headings, so " +
+              "the release body is prose with nothing naming what changed.")
           }
 
           # The TAG, never `main`: this link is read by someone installing
