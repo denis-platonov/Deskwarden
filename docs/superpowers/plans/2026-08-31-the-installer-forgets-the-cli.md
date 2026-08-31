@@ -219,8 +219,12 @@ bundled is a defect with a longer half-life than any code.
   Bitwarden CLI, or reinstall Deskwarden (its installer downloads a signed copy
   for you)."* The installer does not. After acquisition this arm should be very
   nearly unreachable — it now means "an official account, at startup, with no
-  CLI and no completed setup" — so the text should say that setup will finish
-  the next time they sign in, and stop naming the installer.
+  CLI and no completed setup". Per the owner's ruling, the replacement **keeps
+  naming the Bitwarden CLI** and stops naming the installer: it says this
+  account's server requires the CLI, that Deskwarden will download and install
+  it at the next sign-in, and that a self-hosted server does not need it. Do
+  not euphemise this into "setup will finish next time"; see the acquisition
+  design's *Nothing here is silent* section.
 - **`README.md:254`**: *"the Authenticode signature check on the bundled
   `bw.exe`"*. Not bundled. The check is unchanged and now happens in one place
   instead of two — which is worth saying, since that table is about tradeoffs.

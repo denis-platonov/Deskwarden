@@ -2,14 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A user installs Deskwarden, opens it, types their email and master
-password, picks `bitwarden.com`, and presses Continue. A line reads "Setting up
-your vault…" over a progress bar for as long as it takes, and then they are
-signed in. They are never told what was set up. A user who picks Self-hosted
-sees none of it, ever. A user who already has a Bitwarden-signed `bw.exe` sees
-none of it either — no request is made. Every way this can fail ends in a
-sentence naming what to do next, and a binary that cannot be proved to be
-Bitwarden's is deleted rather than run.
+**Goal:** A user installs Deskwarden, opens it, and picks `bitwarden.com`. The
+card tells them plainly that bitwarden.com requires the Bitwarden CLI and that
+Deskwarden will download and install it — **before** anything is fetched, while
+they can still choose otherwise. They press Continue; a progress bar says it is
+downloading the Bitwarden CLI from Bitwarden, then that it is checking the
+signature; then they are signed in. A user who picks Self-hosted sees none of
+it, ever. A user who already has a Bitwarden-signed `bw.exe` sees none of it
+either — no notice, no request. Every way this can fail says which thing was
+required, that bitwarden.com cannot be used without it, and that a self-hosted
+server can. A binary that cannot be proved to be Bitwarden's is deleted rather
+than run.
 
 **Architecture:** This implements
 `docs/superpowers/specs/2026-08-31-the-cli-arrives-when-it-is-needed-design.md`.
@@ -22,11 +25,21 @@ and `signature::is_trusted_organization`, and installs to the path
 `bw_path` itself computes. `bw_path.rs`, `signature.rs`, `updater.rs` and
 `backend_policy.rs` gain no behaviour.
 
-The design's governing rule, and every task below follows from it:
+The design's governing rule, from the owner's ruling — *"yes, no silent - we say
+that it is requared period"* — and every task below follows from it:
 
-> The user is told **that** setup is happening and **how far along** it is;
-> never **what** is being set up. The one exception is a failed signature,
-> which is a security event and is named as one.
+> **Nothing here is silent.** The app names the Bitwarden CLI, says it is
+> required for the server the user chose, and says it is downloading and
+> installing it. The requirement is stated **before** the first byte, not as a
+> retroactive explanation. Every failure says plainly that bitwarden.com cannot
+> be used without it and that a self-hosted server can.
+
+This does **not** contradict "users should not know about how it works
+underhood". That rule bans internal machinery the user has no decision to make
+about; this is a third-party program being installed on their computer as a
+hard requirement of a choice they just made. The design's *Nothing here is
+silent* section states the distinction and the test that separates the two —
+**read it before softening any string in this plan.**
 
 And the ordering rule that is not a preference:
 
@@ -182,32 +195,59 @@ already under oath.
         // ...and the remaining three, each named.
     }
 
-    /// **Exactly one variant names machinery.** The rule the design turns on,
-    /// asserted rather than trusted to review.
+    /// **Every refusal names the Bitwarden CLI and the way out.**
+    ///
+    /// The owner's ruling — "yes, no silent - we say that it is requared
+    /// period" — held by the file rather than by review. An earlier draft of
+    /// this test asserted the OPPOSITE (that only the signature failure named
+    /// the CLI, everything else being euphemised to "setup"); it was wrong,
+    /// and it is recorded here so nobody re-derives it from the
+    /// "underhood" rule. See the design's *Nothing here is silent* section
+    /// for why the two rules do not conflict.
     #[test]
-    fn only_the_signature_refusal_names_the_cli() {
-        let naming = [
+    fn every_refusal_names_the_cli_the_server_and_the_alternative() {
+        let all = [
             AcquireRefusal::Offline("x".into()),
             AcquireRefusal::NoArtefact("x".into()),
             AcquireRefusal::DigestMismatch,
             AcquireRefusal::Unverifiable("x".into()),
             AcquireRefusal::CouldNotInstall("x".into()),
+            AcquireRefusal::NotBitwardenSigned { subject_dn: None },
         ];
-        for r in &naming {
-            let m = r.message().to_lowercase();
-            for word in ["bitwarden cli", "bw.exe", "github", "powershell", "download"] {
-                assert!(!m.contains(word), "{m:?} names machinery: {word}");
-            }
-            assert!(r.retryable(), "{m:?} should offer another attempt");
+        for r in &all {
+            let m = r.message();
+            assert!(m.contains("Bitwarden CLI"), "{m:?} does not name what is required");
+            assert!(m.contains("bitwarden.com"), "{m:?} does not name the server that requires it");
+            assert!(m.contains("self-hosted"), "{m:?} does not name the way out");
+            // An empty or one-word message passes a `contains` test against
+            // nothing, so the length floor is part of the assertion.
+            assert!(m.len() > 60, "{m:?} is too short to have said any of that");
         }
-        // Positive control: the one that IS allowed to, does — otherwise the
-        // loop above would pass against a `message()` returning "".
-        let signed = AcquireRefusal::NotBitwardenSigned { subject_dn: None };
-        assert!(signed.message().contains("Bitwarden"));
-        assert!(!signed.retryable(), "a substituted artefact must not be retried in a loop");
-        // And no refusal is empty.
-        for r in naming.iter().chain(std::iter::once(&signed)) {
-            assert!(r.message().len() > 20, "an empty message passes every assertion above");
+
+        // **Positive control for the predicate, not for the messages.** A
+        // euphemism of the kind the ruling forbids must FAIL the same check
+        // the six above pass -- otherwise the loop is asserting nothing.
+        let euphemism = "Something went wrong while setting up. Try again in a moment, please.";
+        assert!(euphemism.len() > 60, "control: the euphemism clears the length floor");
+        assert!(
+            !euphemism.contains("Bitwarden CLI"),
+            "control: the predicate does not distinguish a euphemism from a real message"
+        );
+    }
+
+    /// Retryability is per-variant and the signature failure is the one that
+    /// is not: a retry loop against a substituted artefact is a loop.
+    #[test]
+    fn only_the_signature_refusal_refuses_to_retry() {
+        assert!(!AcquireRefusal::NotBitwardenSigned { subject_dn: None }.retryable());
+        // Control: the others do, so the assertion above is reading the
+        // variant and not a `retryable()` hardcoded to false.
+        for r in [
+            AcquireRefusal::Offline("x".into()),
+            AcquireRefusal::DigestMismatch,
+            AcquireRefusal::CouldNotInstall("x".into()),
+        ] {
+            assert!(r.retryable(), "{:?} should offer another attempt", r.message());
         }
     }
 ```
@@ -521,7 +561,7 @@ pointing at a real file. **`WM_SETTINGCHANGE` and `HWND_BROADCAST` come from the
 
 ---
 
-### Task 5: The window says "Setting up your vault…" and nothing else
+### Task 5: The window says what is required, then says it is fetching it
 
 **Files:** `deskwarden/src/login_ui.rs`, `deskwarden/src/job_object.rs`
 
@@ -540,17 +580,54 @@ pointing at a real file. **`WM_SETTINGCHANGE` and `HWND_BROADCAST` come from the
 - [ ] **Step 1: Write the failing tests**
 
 ```rust
-    /// **Selecting an official server in the dropdown acquires nothing.**
-    /// A user comparing the three options would otherwise trigger two
-    /// 37 MB downloads. Driven through a seam that counts its calls.
+    /// **Selecting an official server states the requirement and downloads
+    /// nothing.** Both halves together, because they are the two ways this
+    /// moment goes wrong: a notice that arrives after the download started is
+    /// not a disclosure, and a disclosure costing 37 MB to read is not one
+    /// either.
     #[test]
-    fn changing_the_dropdown_makes_no_request() { /* form.server_choice = UsCloud; draw; assert calls == 0 */ }
+    fn choosing_an_official_server_states_the_requirement_and_makes_no_request() {
+        let painted = paint_with(ServerChoice::UsCloud, /* bw present */ false);
+        assert!(painted.strings().iter().any(|s| s.contains("requires the Bitwarden CLI")));
+        assert_eq!(painted.seam_calls, 0, "selecting a server must not fetch anything");
+    }
+
+    /// Control for the test above: `SelfHosted` paints no notice, so that
+    /// test is reading the choice rather than always finding the string.
+    #[test]
+    fn choosing_self_hosted_states_no_requirement() {
+        let painted = paint_with(ServerChoice::SelfHosted, false);
+        assert!(!painted.strings().iter().any(|s| s.contains("Bitwarden CLI")));
+    }
+
+    /// And control for the notice itself: a user who already HAS a trusted
+    /// binary is told nothing, because there is no requirement left to state.
+    #[test]
+    fn an_existing_trusted_binary_states_no_requirement() {
+        let painted = paint_with(ServerChoice::UsCloud, /* bw present */ true);
+        assert!(!painted.strings().iter().any(|s| s.contains("Bitwarden CLI")));
+    }
 
     /// **Positive control**: pressing Continue on the same form DOES reach
     /// the seam. Without this, the test above passes against a build where
     /// acquisition is wired to nothing at all.
     #[test]
     fn continue_on_an_official_server_reaches_the_seam() { /* assert calls == 1 */ }
+
+    /// **The requirement is stated before the first byte.** The one property
+    /// the owner's ruling turns on, and it is invisible to every other test
+    /// here: the notice is painted at a frame strictly earlier than the first
+    /// `resolve` call. A build that painted it from inside the worker would
+    /// pass all three tests above and still be a retroactive explanation.
+    #[test]
+    fn the_requirement_is_painted_before_the_resolver_is_ever_called() {
+        let run = drive_frames(ServerChoice::UsCloud, /* submit on frame */ 3);
+        assert!(run.first_notice_frame < run.first_resolve_frame);
+        // Control: both actually happened, or `usize::MAX < usize::MAX` and
+        // two never-set sentinels would satisfy the line above.
+        assert!(run.first_notice_frame < usize::MAX, "the notice was never painted");
+        assert!(run.first_resolve_frame < usize::MAX, "the resolver was never called");
+    }
 
     /// Self-hosted never reaches it, on either value of the toggle that
     /// matters.
@@ -580,13 +657,29 @@ pointing at a real file. **`WM_SETTINGCHANGE` and `HWND_BROADCAST` come from the
 
 - [ ] **Step 2: Make it pass**
 
-Insert between `login_ui.rs:2985` and `:2986`. When
-`this_sign_in_needs_the_cli(target_url, settings.use_official_bw_crypto)` and
-`bw_path::verified_bw_exe()` names no existing trusted file, spawn the
-acquisition worker with an `mpsc` progress channel, set `setup_in_progress`, and
-**return without setting `auth_in_progress`** — the credentials have not gone
-anywhere. On `Ok`, fall through into the existing `configure_server_in` path. On
-`Err`, `form.error = refusal.message()`.
+**Two edits, and the first must land before the second.**
+
+*The notice, in the card.* Where the card draws its subtitle
+(`login_ui.rs:1604`), add one line shown when
+`this_sign_in_needs_the_cli(form.server_choice.config_url(), settings.use_official_bw_crypto)`
+**and** `bw_path::verified_bw_exe()` names no existing trusted file. It is a
+pure function of the form and that one filesystem answer — no worker, no
+channel, nothing spawned — which is what makes it impossible for the notice to
+arrive after the download. It names the chosen server, the Bitwarden CLI, and
+the size.
+
+*The acquisition, at Submit.* Insert between `login_ui.rs:2985` and `:2986`. On
+the same condition, spawn the acquisition worker with an `mpsc` progress
+channel, set `setup_in_progress`, and **return without setting
+`auth_in_progress`** — the credentials have not gone anywhere. The status line
+names each stage as it happens ("Downloading the Bitwarden CLI from Bitwarden…",
+then "Checking it is signed by Bitwarden…"), never a bare spinner. On `Ok`, fall
+through into the existing `configure_server_in` path. On `Err`,
+`form.error = refusal.message()`.
+
+**Do not reuse `form.error`'s styling for the notice.** The notice is not an
+error — it is a statement about the choice the user just made, and painting it
+red would read as a refusal to proceed.
 
 Add `("bw_acquire.rs", 0)`-shaped bookkeeping only if the worker lives there;
 otherwise bump `login_ui.rs`'s entry in `THREAD_SPAWN_SITES` by one with a

@@ -1,8 +1,9 @@
 # The CLI Arrives When It Is Needed
 
-**Nobody is asked to install anything. On the one backend that still needs the
-Bitwarden CLI, Deskwarden fetches it, proves it is Bitwarden's, and installs it
-— at the moment the user chooses that backend, and never before.**
+**Nobody is sent away to install anything by hand. On the one backend that still
+needs the Bitwarden CLI, Deskwarden says plainly that it is required, fetches
+it, proves it is Bitwarden's, and installs it — at the moment the user chooses
+that backend, and never before.**
 
 ## Why
 
@@ -55,10 +56,19 @@ here because it is the kind of ordering that reads as a nicety and is not one.
 
 `login_ui.rs`'s sign-in window already has all three of the moments this needs.
 
-**The dropdown does nothing.** `ServerChoice::{UsCloud, EuCloud, SelfHosted}` is
-a `selectable_value` combo at the bottom of the card (`login_ui.rs:1832`).
-Browsing it must not start a 37 MB download; a user comparing the three options
-would trigger two.
+**The dropdown states the requirement and downloads nothing.**
+`ServerChoice::{UsCloud, EuCloud, SelfHosted}` is a `selectable_value` combo at
+the bottom of the card (`login_ui.rs:1832`). Selecting `UsCloud` or `EuCloud`,
+on a machine with no Bitwarden-signed `bw.exe`, puts a line in the card:
+
+> **bitwarden.com requires the Bitwarden CLI.** Deskwarden will download and
+> install it from Bitwarden when you continue (about 37 MB, once).
+
+Selecting `SelfHosted` removes it. **The notice appears before the download and
+not as an explanation after it** — this is the moment the user still has a
+choice, and it is where the cost of the choice belongs. Browsing the dropdown
+still makes no request; a user comparing three options must not trigger two
+downloads.
 
 **Continue is the moment.** The `Some(LoginAction::Submit)` arm
 (`login_ui.rs:2968`) already computes `server_configured` from `form.server_choice`
@@ -84,43 +94,84 @@ credential zone, paints `theme::disabled_password_field` over a buffer that is
 still there, disables Continue and Enter and the Hello panel, and drives a
 spinner. Acquisition reuses that state rather than inventing a second one.
 
-## Disclosure versus "users should not know how it works underhood"
+## Nothing here is silent, and why that is not a contradiction
 
-These two pressures are real and they do not cancel. The resolution this design
-takes:
+The owner, ruling on exactly this tension:
 
-> **The rule is about machinery, not about consequences.** What the user must
-> not be told is *what* is being fetched. What they must not be denied is *that
-> something is being fetched, how big it is getting, and what to do when it
-> fails.*
+> "yes, no silent - we say that it is requared period"
 
-Concretely, `bw-windows-2026.8.0.zip` is **38,695,474 bytes** (measured, see
-Authentication below). That is somebody's tethered phone. A bare spinner over
-37 MB is not simplicity, it is a cost hidden from the person paying it. So:
+So: **the app names the Bitwarden CLI, says it is required for the server the
+user just chose, and says it is downloading and installing it.** Not a bare
+spinner, not "Setting up…", not a euphemism, and not an explanation offered
+afterwards.
 
-* The status line reads **"Setting up your vault…"** — a determinate bar, not a
-  spinner. `updater::download_and_verify` already reports `(done, total)` per
-  chunk through `on_progress`, and `update_panel::download_fraction` already
-  turns that pair into a fraction; both are reused, neither is rewritten.
-* It happens **once, ever**, and only after the user has chosen an official
-  server and pressed Continue.
-* The words "Bitwarden CLI", "bw.exe", "download", "GitHub" and "PowerShell"
-  appear nowhere in it.
-* Every failure ends in a sentence the user can act on, and no failure ends in a
-  spinner that stops.
+This sits beside the owner's other standing rule —
 
-There is **one deliberate exception**, and it is the signature failure. A binary
-that arrived claiming to be Bitwarden's and could not be shown to be Bitwarden's
-is a security event, and a security event that is described as "something went
-wrong" is a lie of altitude. That message names what happened. This is the
-single place the rule yields, and it yields because the alternative is worse.
+> "users should not know about how it works underhood"
 
-**There is no consent prompt**, and that is a decision rather than an omission.
-A prompt has to say what it is asking about to be answerable, so a prompt is a
-disclosure of machinery by construction. The user's way of declining is the one
-they already have: pick Self-hosted, or close the window. Closing it mid-setup
-cancels it.
+— and a future reader will be tempted to cite that rule to "fix" this
+disclosure away. **They do not conflict, and the distinction is worth stating
+precisely, because getting it wrong in either direction is a real defect.**
 
+The earlier rule bans exposing **internal machinery the user has no decision to
+make about**: which process draws a window, when the disk cache is written,
+whether the vault came from `bw serve` or a direct REST call, that a `bw status`
+spawn failed and fell back. Telling a user any of that hands them a fact they
+cannot act on and a vocabulary they did not ask to learn. That is the leaky
+kind of disclosure, and the Preferences split
+(`2026-08-30-preferences-per-backend-design.md`) exists because of it.
+
+**This is not that.** A third-party program is being downloaded from the
+internet and installed on the user's machine, and it is a hard requirement of
+the server they just selected — not a preference, not an implementation detail,
+and not something Deskwarden gets to decide quietly on their behalf. A user is
+entitled to know what is being put on their computer and why. That is the
+honest kind of disclosure.
+
+The test that separates them, and the one to apply to any future sentence here:
+
+> **Does the user have a decision to make about this fact?** If yes, say it
+> plainly and name the thing. If no, it is machinery and it stays inside.
+
+Choosing `bitwarden.com` over a self-hosted server *is* a decision, the CLI
+requirement *is* a consequence of it, and 38,695,474 bytes (measured — see
+Authentication below) over somebody's tethered connection *is* a cost they are
+about to pay. All three are theirs to know.
+
+### What that means concretely
+
+* **The requirement is stated on selection, before anything is fetched.**
+  Choosing an official server in the dropdown puts the notice in the card while
+  the user can still change their mind. Stating it only once the download is
+  running would make it a retroactive justification rather than a disclosure.
+* **The progress line names what it is doing** — "Downloading the Bitwarden CLI
+  from Bitwarden…" over a determinate bar. `updater::download_and_verify`
+  already reports `(done, total)` per chunk through `on_progress` and
+  `update_panel::download_fraction` already turns that pair into a fraction;
+  both are reused, neither is rewritten. A spinner would hide the size, which
+  is the part that costs the user something.
+* **Verification is named too**, because it is the reassuring half: "Checking
+  it is signed by Bitwarden…". A user watching an unknown binary arrive is
+  owed the fact that it is being checked.
+* **It happens once, ever**, and only on official servers.
+* **Every failure says plainly that this server cannot be used without the
+  CLI.** No vague trouble. See the failure matrix below — every row names the
+  thing.
+
+### Declining
+
+There is still no modal consent prompt, but the reasoning has changed and so has
+the outcome. The notice is the disclosure; the dropdown is the control. A user
+who does not want this **declines by choosing Self-hosted or by closing the
+window**, and both are available with the notice on screen and nothing yet
+downloaded.
+
+What the ruling settles is what they are told when they do, or when the machine
+cannot: **not a vague failure.** A user who is offline, or whose download fails,
+or who closes the window mid-install, is told that `bitwarden.com` cannot be
+used without the Bitwarden CLI, and that a self-hosted server can be used
+without it. That second half is the actionable part, and it is the sentence a
+euphemism would have swallowed.
 ## Authentication — the whole of it
 
 This is the highest-risk thing the app would do, so what follows is what was
@@ -263,22 +314,28 @@ this. It has no settings.
 
 ## Failure, offline, and the user who already has it
 
-Every arm below is a distinct, nameable outcome. None is a spinner that stops.
+Every arm below is a distinct, nameable outcome. None is a spinner that stops,
+and **none is vague**: every failure names the Bitwarden CLI, says
+`bitwarden.com` cannot be used without it, and says a self-hosted server can.
+That last clause is the actionable half and it appears in every failing row.
 
 | Situation | What happens | What the user reads |
 | --- | --- | --- |
-| A Bitwarden-signed `bw.exe` is already resolvable | **Nothing.** No request, no progress bar, no message. Sign-in proceeds exactly as today. | *(silent)* |
-| A `bw.exe` exists, validly signed by someone else (Scoop, Chocolatey) | Acquisition proceeds and installs a Bitwarden-signed copy at `<InstallDir>\bin\bw.exe`, which `resolve_bw_exe` prefers over `PATH`. Next launch, `classify_bw_signature` returns `Trusted` instead of `AskUnrecognizedOrg` — these users stop being asked a question they could not answer. | *(silent)* |
+| A Bitwarden-signed `bw.exe` is already resolvable | **Nothing.** No notice, no request, no progress bar. There is no requirement to state — it is already met. Sign-in proceeds exactly as today. | *(nothing)* |
+| A `bw.exe` exists, validly signed by someone else (Scoop, Chocolatey) | The notice appears and acquisition runs, installing a Bitwarden-signed copy at `<InstallDir>\bin\bw.exe`, which `resolve_bw_exe` prefers over `PATH`. Next launch, `classify_bw_signature` returns `Trusted` instead of `AskUnrecognizedOrg` — these users stop being asked a question they could not answer. | the ordinary notice and progress |
 | A `bw.exe` exists and is invalidly signed or tampered | Unchanged: `BwSignatureVerdict::Refuse` at startup, before this window exists. Acquisition does not paper over it. | existing refusal |
-| Self-hosted server chosen | Acquisition never runs, on any arm, ever. | *(silent)* |
-| No network, DNS failure, connect timeout | Refused **before credentials leave the window**. `form.password` is not wiped, the form stays filled, Continue is live again. | "Deskwarden couldn't finish setting up for bitwarden.com. Check your connection and try again." |
+| Self-hosted server chosen | Acquisition never runs, on any arm, ever, and no notice is shown. | *(nothing)* |
+| Official server selected, nothing pressed yet | The requirement is stated. Nothing is fetched. | "**bitwarden.com requires the Bitwarden CLI.** Deskwarden will download and install it from Bitwarden when you continue (about 37 MB, once)." |
+| No network, DNS failure, connect timeout | Refused **before credentials leave the window**. `form.password` is not wiped, the form stays filled, Continue is live again. | "Deskwarden couldn't download the Bitwarden CLI, which bitwarden.com requires. Check your connection and try again. A self-hosted server can be used without it." |
 | Transfer stalls mid-body | Same, via `http_agent::bounded_stall`'s existing stall timeout. | same as above |
-| No `cli-v*` release, no `bw-windows-*.zip` asset, or no `sha256:` digest on it | Refused, fail-closed. `parse_asset_digest` already returns a required value rather than an `Option`, and that decision carries. | "Deskwarden couldn't finish setting up for bitwarden.com. Try again later." |
-| SHA-256 mismatch | File discarded. Refused. Retry allowed — this is the failure that is usually a bad connection. | "The setup files didn't arrive intact, so Deskwarden stopped. Try again." |
-| **Authenticode invalid, or `O=` not in the trusted list** | File discarded. Refused. **Not retried automatically** — a retry loop against a substituted artefact is a loop. The one message that names machinery. | "Deskwarden downloaded a component for bitwarden.com but could not confirm it came from Bitwarden, so it did not install it. Nothing was run. If this keeps happening, install the Bitwarden CLI yourself from bitwarden.com/help/cli/." |
-| Offline at sign-in, already set up | No acquisition is attempted. The guard is "is there a verified `bw.exe`", not "is there network", so being offline is invisible here. Sign-in fails on its own terms. | existing |
-| Window closed mid-setup | Cancelled. Nothing is left at the install path — the copy is the last step and it did not happen. A stray temp file is swept the way `cleanup_stale_downloads` sweeps installers. | *(none)* |
-| A newer CLI version exists | Nothing. See *Versions* above. | *(silent)* |
+| No `cli-v*` release, no `bw-windows-*.zip` asset, or no `sha256:` digest on it | Refused, fail-closed. `parse_asset_digest` already returns a required value rather than an `Option`, and that decision carries. | "Deskwarden couldn't find the Bitwarden CLI download, which bitwarden.com requires. Try again later, or install it yourself from bitwarden.com/help/cli/. A self-hosted server can be used without it." |
+| SHA-256 mismatch | File discarded. Refused. Retry allowed — this is the failure that is usually a bad connection. | "The Bitwarden CLI download didn't arrive intact, so Deskwarden discarded it. Try again. bitwarden.com requires it; a self-hosted server does not." |
+| **Authenticode invalid, or `O=` not in the trusted list** | File discarded. Refused. **Not retried automatically** — a retry loop against a substituted artefact is a loop. | "Deskwarden downloaded the Bitwarden CLI but could not confirm it came from Bitwarden, so it did not install it and did not run it. bitwarden.com requires the CLI, so you cannot sign in to it until this is resolved. You can install the CLI yourself from bitwarden.com/help/cli/, or use a self-hosted server, which does not need it." |
+| Offline at sign-in, already set up | No acquisition is attempted and no notice is shown. The guard is "is there a verified `bw.exe`", not "is there network". Sign-in fails on its own terms. | existing |
+| Window closed mid-download | Cancelled. Nothing is left at the install path — the copy is the last step and it did not happen. A stray temp file is swept the way `cleanup_stale_downloads` sweeps installers. **Nothing is retried in the background**; the next sign-in states the requirement again from the top. | *(nothing, until next time)* |
+| User declines — picks Self-hosted, or closes with the notice showing | Nothing was fetched, because the notice precedes the download. The decline costs nothing and leaves nothing behind. | the notice they read, and no more |
+| A newer CLI version exists | Nothing. See *Versions* above. | *(nothing)* |
+
 
 ## What happens to existing installs
 
@@ -341,8 +398,24 @@ invisible.
    `backend_policy::choose`, over the same combination table
    `the_whole_decision_table` walks, so the gate cannot become a second decision
    about which backend an account has.
-9. **The dropdown does not acquire.** Selecting `UsCloud` in the combo, with no
-   Submit, performs zero requests through the seam.
+9. **The dropdown states, and does not acquire.** Selecting `UsCloud` in the
+   combo, with no Submit, paints the requirement notice **and** performs zero
+   requests through the seam. Both halves in one test, because they are the two
+   ways this moment goes wrong: a notice that arrives after the download has
+   started is not a disclosure, and a disclosure that costs 37 MB to read is not
+   one either. Control: selecting `SelfHosted` paints no notice, so the test is
+   reading the choice rather than always finding the string.
+10. **Every refusal names the CLI and the way out.** The owner's ruling, held
+    by the file rather than by review: each `AcquireRefusal::message()` contains
+    "Bitwarden CLI", names the server that requires it, and names self-hosting
+    as the alternative — and none is empty or shorter than a sentence, which is
+    what a vacuous version of this test would accept. Control: a deliberately
+    euphemistic string ("Something went wrong. Try again.") must fail the same
+    predicate the real messages pass.
+11. **The requirement is stated before the first byte.** An ordering assertion
+    over the seam: on a fresh official-server sign-in, the notice is painted at
+    a frame strictly earlier than the first `resolve` call. This is the one
+    property the ruling turns on and it is invisible to every other test here.
 
 ## Status
 
