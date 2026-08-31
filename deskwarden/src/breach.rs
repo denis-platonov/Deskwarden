@@ -751,8 +751,8 @@ fn spawn_check(
 mod tests {
     use super::*;
     use crate::login_ui::password_lifetime_tests::{plaintext_reached_the_allocator, PROBE};
-    use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
+    use std::sync::Mutex;
 
     /// A realistic range body: 24 lines, CRLF-terminated as the API sends
     /// them, with the real suffix for the password `"password"` sitting in
@@ -1380,43 +1380,39 @@ mod tests {
     /// this comment -- not discovered afterwards.
     #[test]
     fn the_request_head_carries_nothing_beyond_the_allowlist() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback bind");
-        let port = listener.local_addr().unwrap().port();
-
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            while stream.read(&mut byte).unwrap_or(0) == 1 {
-                head.push(byte[0]);
-                if head.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let _ = stream.write_all(
-                format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{FIXTURE}",
-                    FIXTURE.len()
-                )
-                .as_bytes(),
-            );
-            let _ = stream.flush();
-            // Half-close and then read to EOF before dropping the socket.
-            // Dropping it straight after the write is a `closesocket` while
-            // the client's FIN has not arrived, which Winsock may complete
-            // ABORTIVELY -- an RST discards the response still in the send
-            // buffer and the client reads `os error 10054` instead of the
-            // fixture. That is not hypothetical here: this test failed that
-            // way once in three full `--lib` runs, as `Unavailable` where the
-            // assertion below wants `Breached`. See `test_http::graceful_close`
-            // for the same three-step close and the measurements behind it.
-            let _ = stream.shutdown(std::net::Shutdown::Write);
-            let mut discard = [0u8; 256];
-            while stream.read(&mut discard).unwrap_or(0) > 0 {}
-            String::from_utf8_lossy(&head).into_owned()
-        });
-
+        // **The server is `test_http`'s, and that is the fix for a flake.**
+        // This test used to hand-roll its own `TcpListener`, accept one
+        // connection and close it by hand. That private copy drifted from the
+        // measured one in a way that cost a run in three: its drain loop read
+        // to EOF with **no read timeout**, where `test_http::graceful_close`
+        // sets one before the same three-step close, and a `closesocket` that
+        // Winsock completes abortively sends an RST that discards the response
+        // still in the send buffer -- the client reads `os error 10054` and
+        // `check_prefix` answers `Unavailable` where the assertion below wants
+        // `Breached`. The old comment here described that mechanism and added a
+        // mitigation that was not enough.
+        //
+        // Keeping a second server implementation beside a measured one is what
+        // kept `main.rs` flaky until `mockito` was deleted. So this uses the
+        // one server this crate has, and what the test needs that a matcher
+        // cannot give -- the literal bytes of the head -- is
+        // `test_http::Request::raw_head`, which exists for this guard.
         let (prefix, suffix) = split_hash("password");
+
+        let mut server = crate::test_http::server();
+        let port = server.socket_address().port();
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&captured);
+        let mock = server
+            .mock("GET", format!("/range/{prefix}").as_str())
+            .with_status(200)
+            .with_body_from_request(move |request| {
+                *sink.lock().expect("the head sink") = Some(request.raw_head().to_string());
+                FIXTURE.as_bytes().to_vec()
+            })
+            .expect(1)
+            .create();
+
         let status = check_prefix(
             &BaseUrl::loopback(port),
             &prefix,
@@ -1424,8 +1420,15 @@ mod tests {
             &build_agent(),
         );
         assert_eq!(status, BreachStatus::Breached(PASSWORD_COUNT), "the mock did answer");
+        // The request really did reach the route this test is about, so the
+        // head below is the head of that request and not of some other one.
+        mock.assert();
 
-        let head = server.join().expect("server thread");
+        let head = captured
+            .lock()
+            .expect("the head sink")
+            .clone()
+            .expect("the mock was never asked, so no head was captured");
 
         // Controls first: the head really was captured, really is a request
         // head, and really is complete -- otherwise every assertion below is

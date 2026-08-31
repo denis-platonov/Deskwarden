@@ -258,14 +258,39 @@ pub fn append(path: &Path, record: ScanRecord) -> std::io::Result<ScanHistory> {
 mod tests {
     use super::*;
 
-    /// A scratch path under the OS temp directory. **Never `%APPDATA%`**: no
-    /// test in this crate may touch the real `Deskwarden` config directory,
-    /// and `the_real_config_directory_is_never_resolved_by_a_test` below is
-    /// what keeps that from being a convention.
+    /// A scratch path under the OS temp directory, **guaranteed to name no
+    /// existing file**. **Never `%APPDATA%`**: no test in this crate may touch
+    /// the real `Deskwarden` config directory, and
+    /// `the_real_config_directory_is_never_resolved_by_a_test` below is what
+    /// keeps that from being a convention.
+    ///
+    /// # Why this deletes, and why that is the fix rather than tidiness
+    ///
+    /// The process id is unique among the processes alive at one instant and
+    /// **not across time** -- Windows recycles the range briskly -- while this
+    /// directory was never cleaned, so every run left its files behind for a
+    /// later run to inherit. Measured on the machine this was found on: 2,012
+    /// files here, 255 of them `round-trip-<PID>.json`, each holding exactly
+    /// the one record `a_record_round_trips_through_disk_under_its_own_field_names`
+    /// writes. That test [`append`]s and then asserts the file holds one
+    /// entry, so a run whose pid collided with any of those 255 loaded the
+    /// stale record, appended a second, and failed with two identical entries
+    /// -- roughly once in six full `--lib` runs, and reading exactly like a
+    /// duplicate-write bug in `append`.
+    ///
+    /// The tests that survived it did so by removing the file first, one line
+    /// at a time, in three of the nine. That is a convention every future test
+    /// here has to remember; this is the same guarantee made once, where the
+    /// path is handed out, so a test cannot be written without it. Nothing is
+    /// weakened: a test that wants content on disk writes it on the next line.
     fn temp_path(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("deskwarden-scan-history-tests");
         std::fs::create_dir_all(&dir).unwrap();
-        dir.join(format!("{tag}-{}.json", std::process::id()))
+        let path = dir.join(format!("{tag}-{}.json", std::process::id()));
+        // Not `expect`: an absent file is the state being established, and
+        // `remove_file` reports that as an error.
+        let _ = std::fs::remove_file(&path);
+        path
     }
 
     fn at(millis: i64) -> ScanRecord {

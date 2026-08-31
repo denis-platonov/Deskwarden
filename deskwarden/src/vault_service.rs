@@ -661,6 +661,16 @@ mod tests {
     /// in the name of the counting that was meant to make it work.
     #[test]
     fn a_process_does_not_count_itself_as_somebody_needing_the_vault() {
+        // `reset()` and `attach()` are about ONE process-wide slot table, so a
+        // test that touches it must hold `SERIALISE` for as long as it reads
+        // it. This test and `holding_no_slot_makes_the_two_questions_the_same`
+        // were the only two of the thirteen here that did not, and the hole
+        // was live rather than theoretical: another test's `reset()` landing
+        // between this one's two `attach`es clears the slot it is about to
+        // look for, and the failure surfaces on the line below as "a second
+        // process needing the vault went unnoticed" -- a message that reads
+        // like a counting bug in `anyone_else_attached` and is not one.
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         let mine = attach(&env()).expect("the daemon's own slot");
         assert!(
@@ -685,6 +695,10 @@ mod tests {
     /// With no slot of its own, the filtered question is the plain one.
     #[test]
     fn holding_no_slot_makes_the_two_questions_the_same() {
+        // The second of the two tests that read the shared slot table without
+        // serialising; see the note in
+        // `a_process_does_not_count_itself_as_somebody_needing_the_vault`.
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         assert!(!anyone_else_attached(&env(), None));
         let _theirs = attach(&env()).expect("somebody");

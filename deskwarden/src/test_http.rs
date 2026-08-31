@@ -152,6 +152,9 @@ pub struct Request {
     /// them the way the tests do.
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// The request head exactly as it arrived, terminator included. See
+    /// [`Request::raw_head`] for why the parsed fields above are not enough.
+    head: String,
 }
 
 impl Request {
@@ -200,6 +203,37 @@ impl Request {
     #[must_use]
     pub fn utf8_lossy_body(&self) -> Cow<'_, str> {
         String::from_utf8_lossy(&self.body)
+    }
+
+    /// **The literal bytes of the request head**, request line and header
+    /// lines, CRLFs and the closing blank line included -- what the client put
+    /// on the socket, not this module's reading of it.
+    ///
+    /// # Why the parsed accessors are not enough
+    ///
+    /// The privacy guard in `breach` asserts an **exact allowlist**: the
+    /// request line character-for-character, and every header line matched on
+    /// name *and* value with none extra. The accessors above cannot express
+    /// that, and the gap is not a nicety. [`Request::method`] and
+    /// [`Request::path_and_query`] between them drop the HTTP version, so
+    /// `GET /range/X HTTP/1.0` reads identically to `HTTP/1.1`; the header
+    /// list is lowercased and trimmed, so it cannot see a malformed line at
+    /// all; and *asking* an accessor for a field is asking whether something
+    /// you already named was present, which is the failure mode that guard was
+    /// rewritten to escape -- it cannot enumerate what it did not think of.
+    /// A leak arrives in a header nobody thought to ask about, so the guard
+    /// has to read every byte that left.
+    ///
+    /// # What may safely be read from this
+    ///
+    /// The **head only**. It is the request line and the fields, and this
+    /// module never puts a body in it -- see the note in [`serve_one`] about
+    /// why a response body is wrapped before it is written, which is the same
+    /// concern from the other direction. A test's secret travels in a body,
+    /// so nothing here holds one.
+    #[must_use]
+    pub fn raw_head(&self) -> &str {
+        &self.head
     }
 
     /// The one-line form used in a [`Mock::assert`] failure, so a test that did
@@ -949,10 +983,18 @@ fn graceful_close(stream: &TcpStream) {
 /// what the drop wake and a closed keep-alive connection both look like -- or
 /// on a head this server cannot read.
 fn read_request(reader: &mut BufReader<&TcpStream>) -> Option<Request> {
+    // Every byte of the head is kept alongside the parsed form, for the reason
+    // [`Request::raw_head`] gives: a guard that must enumerate what was sent
+    // cannot work from accessors that only answer what it thought to ask.
+    // Accumulated here rather than re-rendered from the parsed fields, which
+    // would be this module's reading of the request and not the request.
+    let mut head = String::new();
+
     let mut line = String::new();
     if reader.read_line(&mut line).ok()? == 0 {
         return None;
     }
+    head.push_str(&line);
     let mut parts = line.trim_end().split(' ');
     let method = parts.next()?.to_ascii_uppercase();
     let path_and_query = parts.next()?.to_string();
@@ -963,6 +1005,7 @@ fn read_request(reader: &mut BufReader<&TcpStream>) -> Option<Request> {
         if reader.read_line(&mut line).ok()? == 0 {
             return None;
         }
+        head.push_str(&line);
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
             break;
@@ -986,7 +1029,7 @@ fn read_request(reader: &mut BufReader<&TcpStream>) -> Option<Request> {
         body
     };
 
-    Some(Request { method, path_and_query, headers, body })
+    Some(Request { method, path_and_query, headers, body, head })
 }
 
 /// Reassemble a `Transfer-Encoding: chunked` body.
@@ -1502,6 +1545,56 @@ mod tests {
         assert_eq!(response.status_text(), "Created");
         assert_eq!(response.header("content-type"), Some("application/json"));
         assert_eq!(response.into_string().expect("a body"), r#"{"ok":true}"#);
+    }
+
+    /// **[`Request::raw_head`] is the literal bytes, not a re-rendering of the
+    /// parsed request.** `breach`'s privacy allowlist is written against it, so
+    /// an implementation that rebuilt the head from [`Request::method`] and the
+    /// lowercased header list would hand that guard a head *this module*
+    /// invented -- one that agrees with the parse by construction and so could
+    /// never disagree with the wire, which is the whole of what the guard is
+    /// for.
+    ///
+    /// The two assertions past the request line are the two things the parsed
+    /// accessors provably cannot report: the HTTP version, which
+    /// [`Request::method`] and [`Request::path_and_query`] drop between them,
+    /// and the spelling of a field name, which [`Request::header`] lowercases.
+    #[test]
+    fn the_raw_head_is_the_literal_request_line_and_headers() {
+        let mut server = server();
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&captured);
+        let _mock = server
+            .mock("GET", "/head")
+            .with_body_from_request(move |request| {
+                *sink.lock().expect("the head sink") = Some(request.raw_head().to_string());
+                Vec::new()
+            })
+            .create();
+
+        agent()
+            .get(&format!("{}/head", server.url()))
+            .set("X-Spelled-Exactly", "Like-This")
+            .call()
+            .expect("a response");
+
+        let head = captured
+            .lock()
+            .expect("the head sink")
+            .clone()
+            .expect("the mock was never asked, so there is no head to read");
+
+        assert!(
+            head.starts_with("GET /head HTTP/1.1\r\n"),
+            "the request line is not the literal one the client wrote, version included: \
+             {head:?}"
+        );
+        assert!(head.ends_with("\r\n\r\n"), "the head is not terminated: {head:?}");
+        assert!(
+            head.contains("X-Spelled-Exactly: Like-This\r\n"),
+            "the header line did not survive verbatim, so the raw head is a re-rendering: \
+             {head:?}"
+        );
     }
 
     /// A body is read to its end before any matcher sees it, whatever its
