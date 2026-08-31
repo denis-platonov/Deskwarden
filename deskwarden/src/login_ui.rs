@@ -178,6 +178,12 @@ pub fn check_bw_status_details_with_session(session_token: Option<&str>) -> BwSt
 /// What is left is this one, whose argument is the point: `build_login_frame`
 /// asks it about the directory the window it is building was handed, which on
 /// an account switch or an add is not the one the process is on.
+///
+/// **And it asks only on the `bw serve` backend.** This used to be called
+/// unconditionally at the top of `build_login_frame`, which put a `bw status`
+/// spawn on the sign-in path of an account that touches the CLI nowhere else.
+/// [`login_card_details_through`] is the gate; [`LoginCardSource::TheCli`]
+/// says why the spawn survives on this backend by design.
 pub fn check_bw_status_details_in(data_dir: Option<&Path>) -> BwStatusDetails {
     bw_status_stdout_in(data_dir, None)
         .map(|stdout| parse_bw_status_details(&stdout))
@@ -225,6 +231,148 @@ pub fn account_details_for(account: Option<&Account>) -> BwStatusDetails {
         user_email,
         server_url: account.server_url.clone(),
     }
+}
+
+// ---- what the login card knows before the user types anything --------------
+
+/// **Where the login card's opening state comes from, per backend.**
+///
+/// The card has to answer one question before it can draw itself: is this a
+/// SIGN-IN (draw the email box and the server dropdown) or an UNLOCK (draw a
+/// master-password box and nothing else)? Everything else it takes from a
+/// [`BwStatusDetails`] -- the address beside the password label, the host in
+/// the footer, the dropdown's initial value -- is decoration on that one
+/// decision. See [`build_login_frame`], where every read of `status` is
+/// `== BwStatus::Unauthenticated` or its negation: `Locked` and `Unlocked` are
+/// never told apart there, on any of the paths that read it.
+///
+/// Two answers because the question has two honest sources, and they are not
+/// interchangeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginCardSource {
+    /// **The [`Account`] itself**, through [`account_details_for`].
+    ///
+    /// The direct-REST account's sign-in never runs `bw` at all
+    /// ([`authenticate_then_wipe`]'s first arm returns before `run_cli`), the
+    /// address it derives its key from is `account.email` and not the box the
+    /// user typed into ([`DirectRestLogin::email`]), and the `bw config
+    /// server` the card runs on its sign-in arm writes a `data.json` nothing
+    /// on this account ever reads. So `bw status` here was not a slow way to
+    /// get the answer -- it was a spawn asking a CLI that has never seen this
+    /// account, and getting `unauthenticated` back for a vault whose master
+    /// key is on disk and working.
+    TheAccount,
+    /// **`bw status`, in this account's own profile directory**, through
+    /// [`check_bw_status_details_in`].
+    ///
+    /// **The spawn survives here by design.** On this backend `bw` holds the
+    /// login: it is the CLI's own `data.json` that says whether this profile
+    /// is logged in, and that state can change without this app -- a `bw
+    /// logout` in a terminal, a profile directory restored from a backup, a
+    /// session invalidated server-side. The `Account` can see none of it.
+    /// Reading the address off it instead would draw a master-password box,
+    /// run `bw unlock`, and get "You are not logged in" back with no email box
+    /// anywhere on screen to correct it with.
+    TheCli,
+}
+
+/// [`LoginCardSource`] for one account, decided by
+/// [`crate::backend_policy::choose`] and by nothing else.
+///
+/// **Pure, and it takes the same two inputs `choose` does** rather than
+/// re-deriving the backend from `is_self_hosted`, or reading the installed
+/// [`crate::backend_policy::BackendEnv`]. That env is process-global and
+/// describes the ACTIVE account; this window is opened for an account that on
+/// a switch or an add is not the active one -- the same reason
+/// [`profile_dir_for`] exists.
+///
+/// # A fresh install is [`LoginCardSource::TheCli`], by construction
+///
+/// `accounts::prepare_new_account` and `accounts::resolve_startup` both mint
+/// an account with `email: String::new()` **and `server_url: None`**, and
+/// `choose` cannot answer `DirectRest` without a positively self-hosted URL --
+/// `is_self_hosted(None)` is `false` on that function's first line. So an
+/// account that has never signed in cannot reach the arm that would read its
+/// own empty email, whatever the crypto preference says.
+///
+/// That is the whole of the first-run safety here, and it is a property of
+/// `choose` rather than of a guard written beside it.
+/// `a_freshly_minted_account_still_asks_the_cli` pins it against the real
+/// `prepare_new_account` rather than against a hand-built `Account`.
+#[must_use]
+pub fn login_card_source(
+    account: Option<&Account>,
+    use_official_bw_crypto: bool,
+) -> LoginCardSource {
+    match crate::backend_policy::choose(
+        account.and_then(|a| a.server_url.as_deref()),
+        use_official_bw_crypto,
+    ) {
+        crate::backend_policy::VaultBackendChoice::DirectRest => LoginCardSource::TheAccount,
+        crate::backend_policy::VaultBackendChoice::BwServe => LoginCardSource::TheCli,
+    }
+}
+
+/// The one `bw status` [`build_login_frame`] still runs, as a `fn` pointer.
+///
+/// A `fn`-pointer seam struct and not a `cfg(test)` seam, which this crate
+/// bans crate-wide, and not a trait object, because there is exactly one
+/// production value. Same shape as [`SecondFactorSeam`].
+///
+/// **It exists so that a test can see WHICH ARM RAN.** Asserting on the
+/// `BwStatusDetails` that comes back cannot: on a machine with no `bw.exe` --
+/// every CI runner, and a developer's own -- a spawn that really happened
+/// answers [`unknown_status_details`], which is field-for-field what a
+/// nameless account answers through [`account_details_for`]. A test written
+/// against the returned value alone would pass just as well against a version
+/// of this that had removed no spawn at all: a test that passes because it
+/// never reached the thing it names.
+#[derive(Clone, Copy)]
+pub struct LoginCardSeam {
+    /// [`check_bw_status_details_in`] in production.
+    pub ask_the_cli: fn(Option<&Path>) -> BwStatusDetails,
+}
+
+/// The seam as production wires it.
+pub const PRODUCTION_LOGIN_CARD: LoginCardSeam =
+    LoginCardSeam { ask_the_cli: check_bw_status_details_in };
+
+/// **What the login card opens knowing** -- and the decision about whether a
+/// sign-in spawns `bw` at all.
+///
+/// [`login_card_source`] decides; this dispatches. A `match` with no wildcard
+/// arm, so a third backend cannot silently default into spawning a process.
+pub fn login_card_details_through(
+    seam: LoginCardSeam,
+    account: Option<&Account>,
+    profile_dir: Option<&Path>,
+    use_official_bw_crypto: bool,
+) -> BwStatusDetails {
+    match login_card_source(account, use_official_bw_crypto) {
+        LoginCardSource::TheAccount => account_details_for(account),
+        LoginCardSource::TheCli => (seam.ask_the_cli)(profile_dir),
+    }
+}
+
+/// [`login_card_details_through`] on [`PRODUCTION_LOGIN_CARD`], reading the
+/// one setting [`crate::backend_policy::choose`] needs off disk.
+///
+/// The setting is read here rather than taken as a parameter for the same
+/// reason the vault window's placement is read inside [`build_login_frame`]:
+/// this window has six hosts, none of which carries a `Settings`, and
+/// `Settings::load` falls back to its own defaults on every failure -- so this
+/// cannot become a reason the login window does not open.
+///
+/// `use_official_bw_crypto` defaults to `true`, and `true` is
+/// [`LoginCardSource::TheCli`] for every account whatever its server, so every
+/// way this read can go wrong lands on the behaviour this site has always had.
+fn login_card_details(account: Option<&Account>, profile_dir: Option<&Path>) -> BwStatusDetails {
+    let use_official_bw_crypto = crate::settings::default_path()
+        .map_or_else(crate::settings::Settings::default, |path| {
+            crate::settings::Settings::load(&path)
+        })
+        .use_official_bw_crypto;
+    login_card_details_through(PRODUCTION_LOGIN_CARD, account, profile_dir, use_official_bw_crypto)
 }
 
 /// **The identity a SUCCESSFUL sign-in establishes, taken from the form the
@@ -345,10 +493,18 @@ pub fn unknown_status_details() -> BwStatusDetails {
 // None of those callers exist. The email and the server URL are read off the
 // `Account` (`account_details_for`) or off the sign-in that established them
 // (`SignedInIdentity`), neither of which spawns a process, so there is no wait
-// to bound and no deadline to charge `app_window::WORKING_DEADLINE` for. The
-// one `bw status` this file still runs is `check_bw_status_details_in`, in
-// `build_login_frame`, and it is not a label lookup: it decides whether this
-// window asks for a master password or an email AND a master password.
+// to bound and no deadline to charge `app_window::WORKING_DEADLINE` for.
+//
+// The one `bw status` this file still runs is `check_bw_status_details_in`,
+// reached from `build_login_frame` through `login_card_details`, and it is not
+// a label lookup: it decides whether this window asks for a master password or
+// an email AND a master password.
+//
+// **It is no longer unconditional.** That question has a different answer on
+// each backend, and on the direct-REST one the CLI is not what knows it -- it
+// has never seen the account. See `LoginCardSource`, whose two arms are the
+// two honest sources, and `login_card_source`, which is
+// `backend_policy::choose` and nothing else.
 
 /// Runs `bw logout`, for 3h's "Log out" footer action. Already being logged
 /// out counts as success -- the goal state is "no account", however we got
@@ -2779,7 +2935,14 @@ pub fn build_login_frame(
     // process-global. See `profile_dir_for`, which says what that buys and
     // what the alternative cost.
     let profile_dir = profile_dir_for(account);
-    let details = check_bw_status_details_in(profile_dir.as_deref());
+    // **And on a direct-REST account it runs none.** This was an unconditional
+    // `check_bw_status_details_in` -- a `bw status` spawn on every open of
+    // this window, including for the account that otherwise never touches the
+    // CLI at all. See `login_card_details` and `LoginCardSource`: the CLI is
+    // still asked on the `bw serve` backend, where it is the thing that knows
+    // the answer, and is not asked on the backend where it never saw the
+    // account.
+    let details = login_card_details(account.map(|(_, a)| a), profile_dir.as_deref());
 
     // Owned, because the update closure is `'static` and both the Hello
     // re-probes and the enrollment handed to `spawn_auth` need it after this
@@ -4397,8 +4560,23 @@ mod login_entry_point_tests {
         // Permitted = takes the directory it acts on. `run_bw_with_password`
         // is here because it takes `data_dir` as an argument (asserted below);
         // the other three are the `_in` forms.
+        //
+        // `login_card_details` is here because it is the gate that REPLACED
+        // this body's direct `check_bw_status_details_in`, and it takes the
+        // directory it may act on by the same rule the `_in` forms do -- see
+        // its second argument. It is on the allowlist rather than invisible to
+        // the scan because `profile_sensitive_calls` was widened to see it:
+        // a helper that decides which profile a `bw` child reads must be
+        // reviewable here whatever it is called, and this one is called
+        // nothing like `bw_`.
+        //
+        // The layout helpers `login_card_rect` and `login_card_height` are
+        // NOT here, and must not be: the predicate's prefix is
+        // `login_card_details`, narrow enough that a function measuring a
+        // rectangle never reaches this list to be waved through.
         const ALLOWED: &[&str] = &[
             concat!("check_bw_status_details", "_in"),
+            concat!("login_card", "_details"),
             concat!("bw_logout", "_in"),
             concat!("configure_server", "_in"),
             concat!("run_bw_with", "_password"),
@@ -4426,7 +4604,15 @@ mod login_entry_point_tests {
             found.len()
         );
         for required in [
-            concat!("check_bw_status_details", "_in("),
+            // **Was `check_bw_status_details_in(`, and moving it here is the
+            // needle asserting MORE rather than less.** The body no longer
+            // calls the status read directly -- it calls the gate that decides
+            // whether the read happens at all, and hands it the same
+            // directory. Requiring the gate keeps this control doing its job
+            // (the slice really is this window's body); the ABSENCE assertion
+            // that follows is new, and pins something the old spelling could
+            // not: that the direct call cannot come back.
+            concat!("login_card", "_details("),
             concat!("configure_server", "_in("),
             concat!("bw_logout", "_in("),
             concat!("profile_dir", "_for(account)"),
@@ -4437,6 +4623,24 @@ mod login_entry_point_tests {
                  about the wrong text"
             );
         }
+        // **And the direct spawn is not there.** Written into this body it is
+        // unconditional, which is what put a `bw status` on the sign-in path
+        // of an account whose vault is read over REST and which touches the
+        // CLI nowhere else. See `LoginCardSource`.
+        assert!(
+            !window_body().contains(concat!("check_bw_status_details", "_in(")),
+            "the login window calls the CLI status read directly again, bypassing the gate. \
+             That call cannot be conditional where it is written, so every direct-REST \
+             account pays for a process spawn on every open of this window"
+        );
+        // Paired positive control, so the absence above is a fact about this
+        // body rather than about a needle nothing anywhere matches.
+        assert!(
+            SOURCE.contains(concat!("check_bw_status_details", "_in(")),
+            "control: the status read is no longer spelled this way at all, so the assertion \
+             above proves nothing -- and the `bw serve` account, which is every existing \
+             install, may have lost the only thing that knows whether its profile is logged in"
+        );
         assert_eq!(
             profile_sensitive_calls(concat!(
                 "let a = bw_command", "(); let b = active_data_dir", "();\n",
@@ -4469,10 +4673,17 @@ mod login_entry_point_tests {
     /// A **pattern**, not a list of names, and that is the whole point: the
     /// list it replaced named three spellings and missed a fourth that had
     /// been there all along. `bw_*` catches `bw_command`, `bw_logout`,
-    /// `bw_status_stdout` and anything spelled like them; the three
+    /// `bw_status_stdout` and anything spelled like them; the four
     /// remaining prefixes cover the entry points in this file that spawn `bw`
     /// under some other name. A form that does match has to earn its place in
     /// `ALLOWED`.
+    ///
+    /// `login_card_details*` is the fourth, and it was added the day the
+    /// window stopped calling the status read directly: the gate it calls
+    /// instead is named nothing like `bw`, decides the profile a `bw` child
+    /// reads, and would otherwise have been the very blind spot the paragraph
+    /// below warns about -- introduced by the same commit that wrote that
+    /// warning out.
     ///
     /// What it must **not** be read as is "a form that matches none of these
     /// is not a `bw` spawn", which this doc used to say and which is untrue of
@@ -4507,6 +4718,20 @@ mod login_entry_point_tests {
                 || name.starts_with("check_bw")
                 || name.starts_with("run_bw")
                 || name.starts_with("configure_server")
+                // **Widened, and the widening is the point.** The gate that
+                // decides whether this window runs `bw status` at all is
+                // called `login_card_details`, which matches none of the
+                // prefixes above -- exactly the "newly named spawn helper"
+                // this function's own doc warns passes straight through.
+                //
+                // `login_card_details` and not `login_card`, which was tried
+                // and was wrong: this file's LAYOUT helpers are
+                // `login_card_rect` and `login_card_height`, and a `bw`
+                // tripwire that fires on the function measuring a rectangle
+                // is a tripwire nobody will keep. The longer prefix still
+                // catches the seam form, `login_card_details_through`, which
+                // is the one that takes the `fn` pointer that spawns.
+                || name.starts_with("login_card_details")
                 || name == "active_data_dir";
             if sensitive {
                 out.push(name.to_string());
@@ -10775,6 +11000,431 @@ mod login_frame_host_tests {
     }
 }
 
+/// **THE SIGN-IN ASKS NO CLI -- on the backend that never had one.**
+///
+/// `build_login_frame` opened with an unconditional
+/// `check_bw_status_details_in`: a `bw status` spawn on every open of the
+/// login window, including for a direct-REST account, where nothing else in
+/// the sign-in touches `bw` at all. It is gated on
+/// [`crate::backend_policy::choose`] now -- [`login_card_source`] -- and the
+/// two things worth guarding are the two arms.
+///
+/// **The trap this module is built around.** The account arm reads
+/// `Account::email`, and `accounts::prepare_new_account` mints that field
+/// empty. A gate that let a never-signed-in account onto it would be a change
+/// that works perfectly on any machine that has signed in before -- including
+/// the author's -- and misbehaves only on a first install. So the fresh-install
+/// case is tested against the REAL `prepare_new_account`, with a control
+/// asserting the minted account really is empty at that moment, and the
+/// assertion is that it still takes the CLI arm.
+///
+/// **The other half of this pair already existed.**
+/// `a_direct_rest_account_never_spawns_the_cli`, above, pins that SUBMITTING
+/// the form runs no `bw`. That has been true since the direct-REST backend
+/// landed -- and it made the spawn this module removes the odder for it: the
+/// window that ran no CLI to sign you in still ran one to decide what to draw
+/// before you had typed anything. Opening and submitting are now the same
+/// answer on both backends.
+#[cfg(test)]
+mod the_sign_in_asks_no_cli_tests {
+    use super::*;
+    use crate::backend_policy::VaultBackendChoice;
+
+    /// A scratch config directory under `%TEMP%`. **Never** the real one:
+    /// this test calls `remove_dir_all`. Same shape as `accounts.rs`'s own.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "deskwarden-logincard-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("a scratch config directory");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A self-hosted server, so `backend_policy::is_self_hosted` answers
+    /// `true` and the crypto preference is the only remaining input.
+    const SELF_HOSTED: &str = "https://vault.example.eu";
+
+    fn account(email: &str, server: Option<&str>) -> Account {
+        Account {
+            id: AccountId::parse(&"b".repeat(32)).expect("a 32-hex test id"),
+            email: email.to_string(),
+            server_url: server.map(str::to_string),
+        }
+    }
+
+    /// **A value no real `bw status` and no real account can produce**, so a
+    /// test that sees it knows the CLI arm ran and knows it by the value
+    /// rather than by hope.
+    ///
+    /// It has to be distinguishable from [`unknown_status_details`], because
+    /// that is what a REAL spawn answers on a machine with no `bw.exe` -- and
+    /// it is also what `account_details_for` answers for a nameless account.
+    /// The two arms' honest answers for a fresh install are identical, which
+    /// is exactly why the seam exists.
+    fn the_cli_answered() -> BwStatusDetails {
+        BwStatusDetails {
+            status: BwStatus::Locked,
+            user_email: Some("the-cli-was-asked@example.invalid".to_string()),
+            server_url: Some("https://the-cli-was-asked.invalid".to_string()),
+        }
+    }
+
+    /// A seam that answers [`the_cli_answered`] instead of spawning anything.
+    const A_CLI_THAT_ANSWERS: LoginCardSeam =
+        LoginCardSeam { ask_the_cli: |_| the_cli_answered() };
+
+    /// A seam that PANICS if it is reached at all. This is the whole of the
+    /// "no spawn" assertion: production's `ask_the_cli` is
+    /// `check_bw_status_details_in`, which spawns, so a call that reaches this
+    /// pointer in a test is a call that would spawn in production.
+    const A_CLI_THAT_MUST_NOT_BE_ASKED: LoginCardSeam = LoginCardSeam {
+        ask_the_cli: |_| {
+            panic!(
+                "`bw status` was run for an account whose vault this app reads over REST and \
+                 whose sign-in never touches the CLI -- the spawn this change exists to remove"
+            )
+        },
+    };
+
+    /// **THE CHANGE, STATED.** A direct-REST account's login window is built
+    /// without asking the CLI anything, and what it opens knowing is the
+    /// account itself.
+    #[test]
+    fn a_direct_rest_accounts_card_never_reaches_the_cli() {
+        let signed_in = account("who@example.eu", Some(SELF_HOSTED));
+
+        // Control on the fixture BEFORE the assertion that depends on it: this
+        // really is the pair `choose` answers `DirectRest` for. Without it the
+        // no-panic below could be a `bw serve` account routed to the CLI arm
+        // with a seam that happens not to fire -- which it would, loudly, but
+        // for the wrong reason.
+        assert_eq!(
+            crate::backend_policy::choose(Some(SELF_HOSTED), false),
+            VaultBackendChoice::DirectRest,
+            "control: the fixture is not a direct-REST account at all, so nothing below is \
+             about the backend this change is for"
+        );
+
+        let details = login_card_details_through(
+            A_CLI_THAT_MUST_NOT_BE_ASKED,
+            Some(&signed_in),
+            Some(Path::new("some-profile-dir")),
+            false,
+        );
+        assert_eq!(
+            details,
+            account_details_for(Some(&signed_in)),
+            "the direct-REST card no longer opens knowing what the account knows"
+        );
+        assert_eq!(
+            details.user_email.as_deref(),
+            Some("who@example.eu"),
+            "the card cannot name the account it is about to unlock, so it draws an email box \
+             for an address it already has -- and the direct-REST sign-in ignores that box"
+        );
+        assert_ne!(
+            details.status,
+            BwStatus::Unauthenticated,
+            "a signed-in direct-REST account is offered a SIGN-IN form: an email box whose \
+             contents `DirectRestLogin` discards, and a `bw config server` written into a \
+             `data.json` this account never reads"
+        );
+
+        // **The positive control, on the same seam and the same fixture.** The
+        // pointer really does fire -- so the absence of a panic above is the
+        // gate working, not a seam that was never wired to anything.
+        let asked = std::panic::catch_unwind(|| {
+            login_card_details_through(
+                A_CLI_THAT_MUST_NOT_BE_ASKED,
+                Some(&signed_in),
+                Some(Path::new("some-profile-dir")),
+                // The one input changed: the same account with the official
+                // crypto preference on is a `bw serve` account.
+                true,
+            )
+        });
+        assert!(
+            asked.is_err(),
+            "control: the seam's `ask_the_cli` was not reached even on the `bw serve` arm, so \
+             it is not wired to anything and the assertion above proves nothing"
+        );
+    }
+
+    /// **THE TRAP, PINNED AGAINST THE REAL MINT.**
+    ///
+    /// `prepare_new_account` mints `email: String::new()` and
+    /// `server_url: None`. A gate that let that account onto the account arm
+    /// would be invisible on any machine that has ever signed in.
+    ///
+    /// Built from the real function rather than from a hand-written `Account`
+    /// literal on purpose: a literal is this test's opinion of what a fresh
+    /// account looks like, and the defect would be that opinion drifting from
+    /// `accounts.rs`.
+    #[test]
+    fn a_freshly_minted_account_still_asks_the_cli() {
+        let cfg = Scratch::new("fresh");
+        let minted = crate::accounts::prepare_new_account(cfg.path())
+            .expect("a new account must be preparable");
+
+        // The two positive controls that make this test mean anything: the
+        // account really IS empty at this point. Without them every assertion
+        // below passes just as well against an account that has an address --
+        // which is the machine the author is sitting at.
+        assert_eq!(
+            minted.email, "",
+            "control: `prepare_new_account` now mints an account WITH an address, so this test \
+             is no longer about a first install at all"
+        );
+        assert_eq!(
+            minted.server_url, None,
+            "control: `prepare_new_account` now mints an account with a server URL, which is \
+             the input `backend_policy::choose` reads -- the whole first-run argument here \
+             rests on that field being absent"
+        );
+
+        // **Whatever the crypto preference says.** The setting is the other
+        // half of `choose`, and neither value may put a nameless account on
+        // the arm that reads its name.
+        for use_official_bw_crypto in [true, false] {
+            assert_eq!(
+                login_card_source(Some(&minted), use_official_bw_crypto),
+                LoginCardSource::TheCli,
+                "a never-signed-in account was routed to the arm that reads `Account::email`, \
+                 and that field is empty -- on a first install this window would decide what \
+                 to draw from an account that knows nothing, with `use_official_bw_crypto = \
+                 {use_official_bw_crypto}`"
+            );
+
+            // And end to end: the answer is the CLI's, unchanged, byte for
+            // byte -- which is the claim "a fresh install is unaffected"
+            // actually makes.
+            assert_eq!(
+                login_card_details_through(
+                    A_CLI_THAT_ANSWERS,
+                    Some(&minted),
+                    Some(&crate::accounts::data_dir_for(cfg.path(), &minted.id)),
+                    use_official_bw_crypto,
+                ),
+                the_cli_answered(),
+                "a first install's login card no longer opens on what `bw status` said about \
+                 its own profile directory"
+            );
+        }
+
+        // **The control that shows the two arms are distinguishable here at
+        // all.** A nameless account's own answer is `unknown_status_details`,
+        // which is what a FAILED spawn answers too -- so a test that compared
+        // against that would pass on either arm. This is why `the_cli_answered`
+        // is a value neither arm can produce honestly.
+        assert_eq!(
+            account_details_for(Some(&minted)),
+            unknown_status_details(),
+            "control: a minted account's own answer is no longer indistinguishable from a \
+             failed spawn, so the sentinel above is guarding a difference that was already \
+             visible -- re-read what this test is for"
+        );
+        assert_ne!(
+            the_cli_answered(),
+            unknown_status_details(),
+            "control: the sentinel is what an unasked CLI answers, so seeing it proves nothing"
+        );
+    }
+
+    /// [`login_card_source`] over both of [`crate::backend_policy::choose`]'s
+    /// inputs, so the mapping is a table rather than a claim.
+    ///
+    /// The pairing is asserted against `choose` itself in the same loop: this
+    /// function must not become a second, drifting copy of that decision.
+    #[test]
+    fn every_backend_the_policy_can_choose_has_a_card_source() {
+        for (server, official, expected) in [
+            (Some(SELF_HOSTED), false, LoginCardSource::TheAccount),
+            // Opted back into the official crypto: a self-hosted account on
+            // `bw serve`, and the CLI is what knows whether it is logged in.
+            (Some(SELF_HOSTED), true, LoginCardSource::TheCli),
+            // Bitwarden's own cloud is out of the direct-REST backend's scope
+            // whatever the setting says.
+            (Some("https://vault.bitwarden.com"), false, LoginCardSource::TheCli),
+            (Some("https://vault.bitwarden.com"), true, LoginCardSource::TheCli),
+            // No server recorded: a minted account, and `is_self_hosted`
+            // answers `false` for it by its own first line.
+            (None, false, LoginCardSource::TheCli),
+            (None, true, LoginCardSource::TheCli),
+        ] {
+            let a = account("who@example.eu", server);
+            assert_eq!(
+                login_card_source(Some(&a), official),
+                expected,
+                "the card source for server {server:?} with use_official_bw_crypto={official}"
+            );
+            // The pairing, both ways round, so neither table can drift from
+            // the other without failing here.
+            let paired = match crate::backend_policy::choose(server, official) {
+                VaultBackendChoice::DirectRest => LoginCardSource::TheAccount,
+                VaultBackendChoice::BwServe => LoginCardSource::TheCli,
+            };
+            assert_eq!(
+                login_card_source(Some(&a), official),
+                paired,
+                "`login_card_source` no longer agrees with `backend_policy::choose`, which is \
+                 the one function allowed to decide this -- the window would draw one \
+                 backend's form while the sign-in worker ran the other's"
+            );
+        }
+
+        // The table is not all one answer, so the assertions above are
+        // discriminating.
+        assert_eq!(
+            login_card_source(Some(&account("who@example.eu", Some(SELF_HOSTED))), false),
+            LoginCardSource::TheAccount,
+            "control: every row of the table answered `TheCli`, so it distinguishes nothing"
+        );
+
+        // And the no-account app (`StartupAccounts::NoAccountList`): there is
+        // no server URL to read, so `choose` cannot say `DirectRest` and this
+        // is the CLI arm -- the behaviour that host has always had.
+        assert_eq!(login_card_source(None, false), LoginCardSource::TheCli);
+    }
+
+    /// **The window body asks the CLI in no place of its own.**
+    ///
+    /// A source guard because the alternative -- observing it -- needs a live
+    /// eframe event loop. If `build_login_frame` grows a second, direct call,
+    /// every assertion above stays green while the spawn is back.
+    #[test]
+    fn the_window_body_reaches_the_cli_only_through_the_gate() {
+        let source = include_str!("login_ui.rs");
+        let production = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .expect("this file has test modules")
+            .0;
+        let body = production
+            .split_once(concat!("pub fn build_login", "_frame("))
+            .expect("no `build_login_frame` in this file")
+            .1;
+        assert!(
+            body.len() > 5000,
+            "the sliced window body is {} bytes, which is not the window: every assertion over \
+             it would pass against nothing",
+            body.len()
+        );
+
+        // The CALL form, with its paren. `PRODUCTION_LOGIN_CARD` names the
+        // function as an item and spells it WITHOUT one, which is the whole
+        // point: the only remaining way to reach the spawn is through the
+        // seam, and the seam is reached through the gate.
+        let calls = concat!("check_bw_status_details", "_in(");
+        assert_eq!(
+            body.matches(calls).count(),
+            0,
+            "`build_login_frame` runs a `bw status` of its own again. Written there it is \
+             unconditional, so a direct-REST account -- which touches the CLI nowhere else in \
+             its sign-in -- pays for a process on every open of this window, and gets \
+             `unauthenticated` back for a vault whose master key is on disk and working"
+        );
+        // Positive control: the needle is spelled this way somewhere, so
+        // counting zero above is a fact rather than a typo. The one occurrence
+        // in the production half is the DEFINITION, which is above the slice.
+        assert_eq!(
+            production.matches(calls).count(),
+            1,
+            "the only `{calls}` in this file's production half is supposed to be the function's \
+             own definition, which sits above `build_login_frame`. A second one is a caller \
+             this test's slice may not cover"
+        );
+
+        // And the one wiring: the spawn is reachable only as the seam's
+        // production value.
+        let wiring = concat!("ask_the_cli: check_bw_status_details", "_in");
+        assert_eq!(
+            production.matches(wiring).count(),
+            1,
+            "`check_bw_status_details_in` is no longer wired into exactly one seam. If it is \
+             gone entirely, the `bw serve` account can no longer tell a logged-out profile \
+             from a locked one -- and that account is every existing install"
+        );
+        assert!(
+            body.contains(concat!("login_card_", "details(")),
+            "the window body no longer calls the gate at all, so it decides what to draw from \
+             something this test cannot see"
+        );
+    }
+
+    /// **Why collapsing `Locked` into `Unlocked` on the account arm is safe.**
+    ///
+    /// [`account_details_for`] answers `Unlocked` for any named account and
+    /// `Unauthenticated` for a nameless one -- it cannot say `Locked`. That is
+    /// only sound because this window never tells the two apart: every read of
+    /// `status` in the body is `== BwStatus::Unauthenticated` or its negation,
+    /// or the combined `Locked | Unlocked` match arm.
+    ///
+    /// A source guard, and it is the assumption the whole account arm rests
+    /// on. If the card ever grows a `Locked`-only branch -- a different label,
+    /// a skipped field -- the direct-REST account would silently take the
+    /// `Unlocked` side of it forever.
+    #[test]
+    fn the_card_never_tells_a_locked_vault_from_an_unlocked_one() {
+        let source = include_str!("login_ui.rs");
+        let production = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .expect("this file has test modules")
+            .0;
+        let body = production
+            .split_once(concat!("pub fn build_login", "_frame("))
+            .expect("no `build_login_frame` in this file")
+            .1;
+        assert!(body.len() > 5000, "control: the window body is {} bytes", body.len());
+
+        let locked = concat!("BwStatus::", "Locked");
+        let together = concat!("BwStatus::Locked | BwStatus::", "Unlocked");
+        assert_eq!(
+            body.matches(locked).count(),
+            body.matches(together).count(),
+            "`{locked}` is named in `build_login_frame` somewhere other than the combined \
+             `{together}` arm, so this window now behaves differently for a locked vault than \
+             for an unlocked one. `account_details_for` cannot answer `Locked` at all -- it \
+             derives the status from whether the address is known -- so every direct-REST \
+             account would take the unlocked side of that new branch, forever"
+        );
+        // Positive controls: the combined arm really is there and really is
+        // spelled that way, so counting equal is two real numbers matching
+        // rather than two zeroes.
+        assert_eq!(
+            body.matches(together).count(),
+            1,
+            "control: the combined `{together}` arm is gone from the window body, so the \
+             equality above is 0 == 0 and pins nothing"
+        );
+        // The needle is one this file really does spell, ABOVE the slice --
+        // `parse_bw_status` is where a `locked` payload becomes this variant.
+        // So counting one inside the window is a fact about the window rather
+        // than about a string nothing anywhere matches.
+        let above = &production[..production.len() - body.len()];
+        assert!(
+            above.contains(locked),
+            "control: `{locked}` is no longer spelled this way above `build_login_frame`, so \
+             the needle has drifted and both counts above are counting nothing"
+        );
+    }
+}
+
 /// **THE APP LEARNS WHOSE ACCOUNT IT IS ON WITHOUT SPAWNING A PROCESS.**
 ///
 /// This module replaced `status_deadline_tests`, which guarded the bounded
@@ -11216,9 +11866,11 @@ mod identity_without_a_spawn_tests {
         // 12 before this branch. The second factor added four: the two that
         // watch its worker-side boundary and its completion loop, the one over
         // the window's end of the prompt channel, and the one that holds the
-        // retired "run `bw login` in a terminal" message down.
+        // retired "run `bw login` in a terminal" message down. Seventeen now:
+        // `the_sign_in_asks_no_cli_tests` guards the gate that stopped this
+        // window spawning `bw status` for a direct-REST account.
         assert_eq!(
-            modules, 16,
+            modules, 17,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
