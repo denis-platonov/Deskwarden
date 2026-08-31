@@ -378,20 +378,28 @@ pub fn account_label(account: &Account) -> &str {
     }
 }
 
-/// Records what `bw status` has just said about **this account's own profile
-/// directory**, and answers whether it changed anything.
+/// Records what the app has just learned about **this account's identity**,
+/// and answers whether it changed anything.
 ///
 /// The hole this closes: an account minted by [`resolve_startup`] on a first
 /// install carries an empty email, and nothing filled it in afterwards — so
 /// [`account_label`] fell back to the id and every menu naming the account
 /// named a 32-character hash instead. The sign-in that follows the mint is the
-/// moment the address becomes knowable, and `bw status` is the only thing that
-/// knows it.
+/// moment the address becomes knowable, and
+/// [`login_ui::identity_after_sign_in`](crate::login_ui::identity_after_sign_in)
+/// is what knows it: the address is read off the box the user just submitted,
+/// on the `bw serve` backend and on the direct-REST one alike. It used to come
+/// from a `bw status` spawn that followed the sign-in — later than the form,
+/// and on a direct-REST account a question put to a CLI that has never seen
+/// this account at all.
 ///
-/// **`None` means "`bw status` did not say", never "there is nobody".** A CLI
-/// that is logged out, or that could not be spawned at all, answers `null` for
-/// both fields ([`check_bw_status_details_in`](crate::login_ui::check_bw_status_details_in)
-/// returns exactly that on a failed spawn), and letting that erase an address
+/// **`None` means "nothing was learned", never "there is nobody".** An unlock
+/// draws no email box, so it has nothing to offer here; and on the `bw serve`
+/// backend a `bw status` is still run — to decide what the login card opens
+/// knowing, not to name the account
+/// ([`check_bw_status_details_in`](crate::login_ui::check_bw_status_details_in))
+/// — and it answers `null` for both fields when the CLI is logged out or
+/// could not be spawned at all. Letting either of those erase an address
 /// already on disk would put the hash back in the menu for a locked vault.
 ///
 /// A *different* non-empty answer does win, and has to: `bw login` replaces
@@ -455,11 +463,23 @@ pub fn ensure_account_dir(config_dir: &Path, id: &AccountId) -> std::io::Result<
 /// not happened yet.
 ///
 /// The email is empty *by construction*, not by oversight: nobody has signed
-/// in, so there is nothing to record. Whoever completes the sign-in fills it
-/// in by asking the CLI about **this** directory
-/// ([`login_ui::check_bw_status_details_in`](crate::login_ui::check_bw_status_details_in)),
-/// which is the only source that knows. Left empty, the account is a blank row
+/// in, so there is nothing to record. The sign-in that follows fills it in
+/// from the address typed into the login card's own email box
+/// ([`login_ui::identity_after_sign_in`](crate::login_ui::identity_after_sign_in)),
+/// which is the single writer for both backends and knows the answer strictly
+/// before any process could report it. Left empty, the account is a blank row
 /// in the switcher that the user cannot tell from any other.
+///
+/// **The CLI is still asked something on this path, and it is a different
+/// question.** An account minted here has `server_url: None`, and
+/// [`backend_policy::choose`](crate::backend_policy::choose) cannot answer
+/// `DirectRest` without a positively self-hosted URL — so a fresh account's
+/// login card is always the `bw serve` one, which runs `bw status` in this
+/// directory
+/// ([`login_ui::check_bw_status_details_in`](crate::login_ui::check_bw_status_details_in))
+/// to decide what the card opens showing. That spawn reports whether the
+/// CLI's own profile is logged in. It is not what names the account, and on a
+/// direct-REST account it does not run at all.
 ///
 /// The directory is created with `create_dir` rather than `create_dir_all`, so
 /// an id whose directory already exists is an **error** rather than a silent
@@ -812,10 +832,11 @@ impl AccountsState {
         !self.switchable.is_empty()
     }
 
-    /// Fills the active account's email and server URL in from what `bw
-    /// status` reported about the directory this process is pointed at, and
-    /// answers whether anything changed — so the caller writes `settings.json`
-    /// only when there is something new to write.
+    /// Fills the active account's email and server URL in from what the
+    /// sign-in established about it (see [`learn_account_details`], which is
+    /// where the source of that answer is written down), and answers whether
+    /// anything changed — so the caller writes `settings.json` only when
+    /// there is something new to write.
     ///
     /// Applied to [`active`](Self::active) **and** to every entry of
     /// [`all`](Self::all) carrying that id, because those are two copies of one
