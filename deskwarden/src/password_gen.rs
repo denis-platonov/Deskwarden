@@ -177,6 +177,40 @@ pub enum PasswordGenError {
     /// de-duplicated and hashed on every load and anything short of an exact
     /// match arrives here.
     WordlistUnusable,
+    /// The wordlist is **there and was not read** -- the open or the read
+    /// itself failed, so nothing was ever judged.
+    ///
+    /// # Why this is not [`Self::WordlistUnusable`]
+    ///
+    /// Because that variant accuses the file, and this one cannot. Its
+    /// sentence tells the user the list beside the application is not the list
+    /// the application ships, which is a statement about tampering or
+    /// corruption; every word of it is wrong when the truth is that some other
+    /// process had the file open at that instant. The two failures need
+    /// opposite responses -- one is permanent and one clears on its own -- and
+    /// collapsing them told a user with a perfectly good installation that
+    /// their word list had been altered.
+    ///
+    /// **This really happens, and the writer is usually this application.** An
+    /// installer or an updater replacing the list is holding it open while it
+    /// does so; a passphrase asked for in that window gets a sharing
+    /// violation. Measured on Windows, reads racing a copy of the same file
+    /// failed this way about a quarter of the time -- and never once came back
+    /// short, which is the failure [`Self::WordlistUnusable`] exists for.
+    ///
+    /// # The one read failure that is NOT this
+    ///
+    /// [`std::io::ErrorKind::InvalidData`], which is what
+    /// [`std::fs::read_to_string`] returns for bytes that are not UTF-8. That
+    /// is the file's contents being wrong, not the file being busy, and it
+    /// stays [`Self::WordlistUnusable`] -- see [`read_failure`], which is the
+    /// whole of that split.
+    ///
+    /// **Still a refusal, never a fallback.** Transient does not mean
+    /// tolerable: a passphrase drawn from a list this module could not read is
+    /// a passphrase drawn from nothing. The difference this variant makes is
+    /// only in what the user is told, which is that trying again may work.
+    WordlistUnreadable,
 }
 
 impl std::fmt::Display for PasswordGenError {
@@ -191,6 +225,11 @@ impl std::fmt::Display for PasswordGenError {
             ),
             Self::WordlistUnusable => f.write_str(
                 "the word list a passphrase is built from is not the one this application ships,                  so no passphrase was generated",
+            ),
+            Self::WordlistUnreadable => f.write_str(
+                "the word list a passphrase is built from could not be read just now, so no \
+                 passphrase was generated; something else may be using the file, and trying \
+                 again may work",
             ),
         }
     }
@@ -789,12 +828,55 @@ fn draw_index() -> Result<u16, PasswordGenError> {
 /// held a *broken* file is a search whose answer depends on which failure came
 /// first. That is [`crate::brand_mark::find_file`]'s rule, for the same
 /// reason.
+/// A read that failed, told apart from a file that is wrong.
+///
+/// Every one of these used to be [`PasswordGenError::WordlistUnusable`], which
+/// meant a word list momentarily held open by an installer was reported to the
+/// user as one that had been tampered with. The split is one line and it is
+/// this one.
+///
+/// [`std::io::ErrorKind::InvalidData`] is the only kind that stays a verdict
+/// on the contents: it is what [`std::fs::read_to_string`] returns for bytes
+/// that are not UTF-8, and a word list that is not text is not this
+/// application's word list, whatever else is true. Every other kind --
+/// a sharing violation, a denied open, a file that vanished between the
+/// [`std::path::Path::is_file`] test and the read -- is a condition of the
+/// moment rather than of the file.
+///
+/// The default arm is deliberately the transient one. A read failure this
+/// module has not thought of is far more likely to be another busy-file case
+/// than evidence of tampering, and of the two ways to be wrong, telling a user
+/// to try again is the one that does not accuse them.
+fn read_failure(e: &std::io::Error) -> PasswordGenError {
+    match e.kind() {
+        std::io::ErrorKind::InvalidData => PasswordGenError::WordlistUnusable,
+        _ => PasswordGenError::WordlistUnreadable,
+    }
+}
+
 fn load_wordlist() -> Result<Vec<String>, PasswordGenError> {
-    for path in wordlist_paths() {
+    load_wordlist_from(&wordlist_paths())
+}
+
+/// [`load_wordlist`]'s whole body, over paths the caller names.
+///
+/// Split out for one reason: [`wordlist_paths`] is derived from
+/// [`std::env::current_exe`], so a test of this function could otherwise only
+/// reach it by moving the running test binary. That left the read-failure
+/// branch -- the branch this split exists to fix -- with no coverage at all,
+/// which is how it stayed wrong. `a_busy_word_list_is_not_a_wrong_one` now
+/// hands it a locked file, a file of bytes that are not text, and no file, and
+/// requires three different refusals.
+///
+/// Not a seam and not conditional: production calls the same function with the
+/// same body, and [`load_wordlist`] is the one-line caller that supplies the
+/// real paths.
+fn load_wordlist_from(paths: &[PathBuf]) -> Result<Vec<String>, PasswordGenError> {
+    for path in paths {
         if !path.is_file() {
             continue;
         }
-        let text = std::fs::read_to_string(&path).map_err(|_| PasswordGenError::WordlistUnusable)?;
+        let text = std::fs::read_to_string(path).map_err(|e| read_failure(&e))?;
         return verify(&text);
     }
     Err(PasswordGenError::WordlistMissing)
@@ -1373,17 +1455,128 @@ mod tests {
     }
 
     /// A missing file is its own named refusal, not a silent empty list.
+    ///
+    /// This used to assert only that the two refusals were different values,
+    /// with a comment conceding it could not reach the loader. It can now:
+    /// [`load_wordlist_from`] takes its paths, so the missing-file branch is
+    /// exercised rather than described.
     #[test]
     fn an_absent_word_list_is_refused_by_name() {
-        // `verify` is the half a test can reach without moving the running
-        // executable; the missing-file half is `load_wordlist`'s, and what is
-        // asserted here is that the two refusals are DIFFERENT so a user can
-        // be told which one happened.
-        assert_ne!(PasswordGenError::WordlistMissing, PasswordGenError::WordlistUnusable);
+        let dir = scratch_dir();
+        // Both shapes of absent: no candidate at all, and a candidate that is
+        // not there. Neither may be mistaken for a list that failed to verify.
+        for paths in [vec![], vec![dir.join(WORDLIST_FILE)]] {
+            assert_eq!(load_wordlist_from(&paths).unwrap_err(), PasswordGenError::WordlistMissing);
+        }
         assert!(
             PasswordGenError::WordlistMissing.to_string().contains("not found"),
             "the refusal does not say the list is absent"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A unique scratch directory, the `temp_dir()` + nanos pattern the rest
+    /// of the suite uses. Never near the installed word list, which no test
+    /// here may touch.
+    fn scratch_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "deskwarden-wordlist-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// **A word list that is merely busy must not be reported as a wrong one.**
+    ///
+    /// The defect this fixes: every `io::Error` from the read collapsed into
+    /// [`PasswordGenError::WordlistUnusable`], whose sentence tells the user
+    /// the list beside their application is not the one it ships. A sharing
+    /// violation -- the installer or the updater holding the file open while
+    /// it replaces it, which measurement showed happens on about a quarter of
+    /// racing reads -- produced that accusation against a perfectly good
+    /// installation.
+    ///
+    /// # Four outcomes through one function, so the distinction is the claim
+    ///
+    /// A test that only showed the new variant coming back would prove nothing
+    /// about telling the three apart; it would also pass if the loader had
+    /// simply been rewired to return it always. So every case runs through
+    /// [`load_wordlist_from`] and each of the four possible answers is
+    /// required from its own cause:
+    ///
+    /// 1. **Locked** -- opened `FILE_SHARE_NONE`, which is what a file being
+    ///    replaced looks like -- must be [`PasswordGenError::WordlistUnreadable`].
+    /// 2. **Not text** -- bytes that are not UTF-8, the one read failure that
+    ///    really is a verdict on the contents -- must stay
+    ///    [`PasswordGenError::WordlistUnusable`]. This is the control that
+    ///    proves the new variant did not just swallow the old one.
+    /// 3. **Absent** -- must stay [`PasswordGenError::WordlistMissing`].
+    /// 4. **The shipped list** -- must be `Ok`. Without this the other three
+    ///    could all be failing for some reason of the harness rather than the
+    ///    reason each names, which is this repo's named defect class.
+    #[test]
+    fn a_busy_word_list_is_not_a_wrong_one() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = scratch_dir();
+        let shipped = shipped_wordlist_text();
+
+        // 4, first: the harness reads and verifies a real list through the
+        // very function the refusals below are asked of.
+        let good = dir.join(WORDLIST_FILE);
+        std::fs::write(&good, shipped.as_bytes()).unwrap();
+        let words = load_wordlist_from(&[good.clone()])
+            .expect("the shipped list, through the loader under test");
+        assert_eq!(words.len(), WORDLIST_WORDS);
+
+        // 1: the same bytes, unreadable only because something else holds the
+        // file. The content is byte-for-byte the list that just verified, so
+        // any answer about the CONTENT here is provably wrong.
+        let lock = std::fs::OpenOptions::new().write(true).share_mode(0).open(&good).unwrap();
+        let busy = load_wordlist_from(&[good.clone()]).unwrap_err();
+        drop(lock);
+        assert_eq!(
+            busy,
+            PasswordGenError::WordlistUnreadable,
+            "a word list held open by another writer was reported as one that failed to verify"
+        );
+        // And it reads as its own answer once the writer lets go, which is the
+        // whole claim the sentence makes to the user.
+        load_wordlist_from(&[good.clone()]).expect("the same file, after the lock was released");
+
+        // 2: not a busy file, a wrong one. `read_to_string` fails this with
+        // `InvalidData`, and that must not have been swept into the new
+        // variant along with everything else.
+        let not_text = dir.join("not-text.txt");
+        std::fs::write(&not_text, [0xff, 0xfe, 0x41]).unwrap();
+        assert_eq!(
+            load_wordlist_from(&[not_text]).unwrap_err(),
+            PasswordGenError::WordlistUnusable,
+            "a word list whose bytes are not text is a wrong list, not a busy one"
+        );
+
+        // 3: absent stays absent even with a real candidate list on the same
+        // search path behind it.
+        assert_eq!(
+            load_wordlist_from(&[dir.join("absent.txt")]).unwrap_err(),
+            PasswordGenError::WordlistMissing
+        );
+
+        // The three refusals are three values, and the new sentence is the
+        // only one that offers the user the retry.
+        assert_ne!(PasswordGenError::WordlistUnreadable, PasswordGenError::WordlistUnusable);
+        assert_ne!(PasswordGenError::WordlistUnreadable, PasswordGenError::WordlistMissing);
+        let sentence = PasswordGenError::WordlistUnreadable.to_string();
+        assert!(sentence.contains("could not be read"));
+        assert!(sentence.contains("again may work"));
+        assert!(
+            !sentence.contains("is not the one"),
+            "the transient refusal still accuses the file: {sentence}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- the draw ------------------------------------------------------------
@@ -1794,12 +1987,14 @@ mod tests {
         assert_eq!(format!("{:?}", PasswordGenError::Rng), "Rng");
         assert_eq!(format!("{:?}", PasswordGenError::WordlistMissing), "WordlistMissing");
         assert_eq!(format!("{:?}", PasswordGenError::WordlistUnusable), "WordlistUnusable");
+        assert_eq!(format!("{:?}", PasswordGenError::WordlistUnreadable), "WordlistUnreadable");
         // And the compiler's half: if a variant ever gains a field, this stops
         // compiling as written and whoever added it has to come back here.
         let _exhaustive: fn(PasswordGenError) -> u8 = |e| match e {
             PasswordGenError::Rng => 0,
             PasswordGenError::WordlistMissing => 1,
             PasswordGenError::WordlistUnusable => 2,
+            PasswordGenError::WordlistUnreadable => 3,
         };
         // Nor may a message quote anything that was generated. Every message
         // is a fixed English sentence with no interpolation at all, which is
@@ -1810,6 +2005,7 @@ mod tests {
             PasswordGenError::Rng,
             PasswordGenError::WordlistMissing,
             PasswordGenError::WordlistUnusable,
+            PasswordGenError::WordlistUnreadable,
         ] {
             assert!(!error.to_string().is_empty());
             assert_eq!(error.to_string(), error.to_string());
