@@ -2313,10 +2313,16 @@ pub struct VaultSessionOutcome {
 ///
 /// `build_sign_in` and `rebuild_vault` both run on THIS thread. They are
 /// closures rather than parameters because both are lazy on purpose:
-/// `login_ui::build_login_frame` spawns a `bw status` of its own, and a vault
-/// session that pays for one on every open -- when the overwhelmingly common
-/// outcome is an ordinary close -- would be a regression measured in seconds
-/// on every single click.
+/// `login_ui::build_login_frame` can still spawn a `bw status` of its own, and
+/// a vault session that pays for one on every open -- when the overwhelmingly
+/// common outcome is an ordinary close -- would be a regression measured in
+/// seconds on every single click.
+///
+/// **"Can still" and no longer "does".** That spawn is gated on the backend
+/// now (`login_ui::LoginCardSource`): a direct-REST account's card is built
+/// from its own `Account` and reaches no process at all. The laziness is kept
+/// for the `bw serve` account, which is the default and every existing
+/// install, and where the spawn is genuinely what knows the answer.
 pub fn run_from_vault<T, S, B>(
     vault: (
         eframe::NativeOptions,
