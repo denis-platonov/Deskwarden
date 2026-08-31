@@ -109,11 +109,10 @@
 //!    verifies *before* the copy, so a file that fails is never at the
 //!    recorded path at all.
 //!
-//! # Uninstall deliberately leaves both behind
+//! # Uninstall now removes both, and why that reversed
 //!
-//! This paragraph moved here from `installer/deskwarden.iss`, which was
-//! deleted along with the bootstrap. It is still true, and it is truer here,
-//! because this is now the code that writes the two things it is about:
+//! This paragraph moved here from `installer/deskwarden.iss` when the
+//! bootstrap was deleted, and it used to read:
 //!
 //! > Uninstall does not remove `bw.exe` or its `PATH` entry. The user may be
 //! > using `bw` independently of deskwarden -- it is a general-purpose tool
@@ -121,7 +120,25 @@
 //! > working command-line program because an unrelated tray app was
 //! > uninstalled is worse than leaving a 40 MB file behind.
 //!
-//! A decision that survives its code should survive with it.
+//! **That reasoning was written for a file this app did not own, and it no
+//! longer describes the file it guards.** It dates from `bootstrap-bw.ps1`,
+//! when the CLI could plausibly be one the user already had. What this module
+//! installs is not that: [`install_destination`] puts it under
+//! `<InstallDir>\bin`, a directory THIS APP creates inside its own install
+//! location, from a download THIS APP made, on a `PATH` entry THIS APP wrote.
+//! Nobody's independent copy of `bw` lives there. So the sentence protected a
+//! case that cannot arise, at the price of one that does: leaving a 40 MB
+//! binary and a `PATH` entry pointing into the install directory of an app
+//! that has been uninstalled.
+//!
+//! The uninstaller therefore removes `<InstallDir>\bin` and takes that one
+//! `PATH` entry back out, comparing it the same way [`add_to_user_path`]
+//! compared it going in. A `bw` the user installed anywhere else is untouched,
+//! which is the part of the old reasoning that was always the real point.
+//!
+//! **None of that is this module's job, and the test below still says so.**
+//! The running app must never delete the CLI -- the uninstaller is a different
+//! program, run deliberately, at a moment the user asked for exactly this.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -2380,9 +2397,12 @@ mod tests {
         }
     }
 
-    /// **Nothing here deletes a CLI.** Uninstall deliberately leaves `bw.exe`
-    /// and its PATH entry behind -- the user may be using `bw` independently
-    /// of this app -- and that property predates this module and survives it.
+    /// **Nothing here deletes a CLI**, and that is now the whole of what this
+    /// asserts. The UNINSTALLER removes `<InstallDir>\bin` and its PATH entry
+    /// (see the module docs for why that reversed); this module is the
+    /// RUNNING APP, which must never do either. The distinction is the point:
+    /// a deletion the user triggered by uninstalling is not the same act as a
+    /// deletion a tray app performs on its own while they are using it.
     ///
     /// The `discard` calls in this file are all on the SCRATCH directory: a
     /// partial download, a rejected archive, an extracted binary that failed
@@ -2394,8 +2414,9 @@ mod tests {
         let code = code_without_literals(&production_slice());
         assert!(
             !code.contains("remove_dir"),
-            "this module removes a directory; uninstall deliberately leaves <InstallDir>\\bin \
-             and its PATH entry in place"
+            "this module removes a directory. Removing <InstallDir>\\bin is the UNINSTALLER's \
+             job and only its job -- the running app taking a command-line tool away from \
+             somebody who is still using it is a different act entirely"
         );
         // Every `discard` is reachable only with a scratch path. Asserted by
         // the absence of the one composition that would not be: discarding
