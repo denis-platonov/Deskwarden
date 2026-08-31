@@ -145,16 +145,25 @@ pub mod session_store;
 pub mod settings;
 pub mod signature;
 pub mod single_instance;
-/// The one place a `mockito` server is created, and the gate that keeps only
-/// one serving at a time -- the fix for the `os error 10054` resets that used
-/// to scatter across every module with a mock server. Test-only at the
-/// declaration, exactly like [`below_cut`], so nothing in it can ship.
-#[cfg(test)]
+/// The one place in this repository a test HTTP server is stood up -- the
+/// hand-rolled listener that replaced `mockito`, whose 1.7.2 server resets
+/// accepted connections (`os error 10054`). Test-only at the declaration,
+/// exactly like [`below_cut`], so nothing in it can ship.
+///
+/// The `test-support` half of the gate is what `main.rs` reaches it through.
+/// `main.rs` is a different crate and links this library built WITHOUT
+/// `cfg(test)`, so a bare `#[cfg(test)]` here left it with no mock server at
+/// all and it stayed on `mockito` -- and flaked. `Cargo.toml`'s
+/// `[dev-dependencies]` turns the feature on for test targets only; a
+/// `cargo build` resolves no dev-dependencies, so a shipped binary still has
+/// no `test_http` in it.
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_http;
 /// Seeding a [`vault_cache::VaultCache`] for a test with no backend at all --
-/// no `mockito` server, no port, no round-trip. Test-only at the declaration,
-/// exactly like [`below_cut`], so nothing in it can ship.
-#[cfg(test)]
+/// no mock server, no port, no round-trip. Test-only at the declaration,
+/// exactly like [`below_cut`], so nothing in it can ship; gated like
+/// [`test_http`] above, and for the same reason.
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_vault;
 pub mod theme;
 pub mod tray;

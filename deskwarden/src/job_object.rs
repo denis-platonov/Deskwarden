@@ -2301,7 +2301,58 @@ mod tests {
             // implementation -- rather than copied out of the failure
             // message. A pin re-pinned to whatever the file happens to say is
             // not a pin.
-            (13177, 0x06b9_937d_5cbb_db5c_u64),
+            //
+            // **Re-pinned for `main.rs`'s move off `mockito`**, and three
+            // things moved, so all three are named here as this pin requires.
+            //
+            // REMOVED: `mockito = "1"`, from `[dev-dependencies]`. It was down
+            // to one caller -- `main.rs`'s tests -- and its 1.7.2 server
+            // resets accepted connections (`os error 10054`): measured on this
+            // machine, a single `main.rs` test alone in a fresh process at
+            // `--test-threads=1` failed 5 runs out of 15. Nothing in the tree
+            // calls it now and `test_http`'s
+            // `no_module_in_this_crate_builds_a_mockito_server` walks every
+            // file, `main.rs` included, to keep it that way.
+            //
+            // ADDED: `regex = { version = "1", optional = true }`, from
+            // crates.io, in `[dependencies]`. THE SAME CRATE AND VERSION that
+            // was already a dev-dependency and still is; it is named twice
+            // because `test_http` must compile both under `cfg(test)` (where
+            // the dev-dependency supplies it) and under `test-support` (where
+            // this one does). Optional and named by no default feature, so
+            // `cargo build` links neither it nor `test_http`.
+            //
+            // ADDED: `deskwarden = { path = ".", features = ["test-support"] }`
+            // in `[dev-dependencies]` -- THIS CRATE, ON ITSELF. It is the one
+            // path dependency in this manifest and it is why the sentence
+            // "no path or fork dependency" above stops being repeated below.
+            // What that sentence protects against is a REGISTRY name
+            // re-pointed at foreign code; this points the name `deskwarden` at
+            // the directory that name already means, adds no crate to the
+            // tree, and is resolved only for test targets. It is what lets
+            // `main.rs` -- a separate crate, linking this library built
+            // without `cfg(test)` -- see `deskwarden::test_http` at all.
+            //
+            // ADDED: `[features] test-support = ["dep:regex"]`. A feature in
+            // this crate is the subject of
+            // `nothing_in_this_crate_is_compiled_differently_when_it_is_tested`,
+            // which used to assert there were none and now asserts the
+            // stricter thing that rule stood in for: exactly this one feature,
+            // nothing on by default, and every `cfg` naming it in the additive
+            // `any(test, feature = ...)` form that cannot remove production
+            // code.
+            //
+            // NOT changed: no registry name removed except `mockito`, none
+            // re-pointed, no `[patch]`, `[replace]` or
+            // `[workspace.dependencies]` table, no fork, and
+            // `[build-dependencies]` still reads exactly `winresource = "0.1"`.
+            // 13177 -> 14851 bytes: the feature table, the two dependency
+            // entries, and the comments that say why each is there.
+            //
+            // The hash below was recomputed independently -- FNV-1a/64 over
+            // the file with CRLF normalised to LF, in a separate
+            // implementation -- rather than copied out of the failure message.
+            (14851, 0x113b_0e40_555e_2506_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
@@ -5725,25 +5776,161 @@ mod tests {
         // FEATURE. `#[cfg(feature = "prod")]` is invisible to both matchers
         // above, and with a default-on feature that the test profile turns off
         // it divides the two builds exactly as `not(test)` does. It takes a
-        // `Cargo.toml` edit to exploit -- so `Cargo.toml` is where it is
-        // refused. This crate declares no features at all today, so the
-        // cheapest honest rule is that it declares none: adding one becomes a
-        // visible edit here, in the test whose whole subject is build
-        // divergence.
+        // `Cargo.toml` edit to exploit -- so `Cargo.toml` is read here too.
+        //
+        // **THIS USED TO BE "THE CRATE DECLARES NO FEATURES AT ALL",** which
+        // was the cheapest honest rule while that was true. It stopped being
+        // true when `main.rs` moved off `mockito`: `main.rs` is a separate
+        // crate that links this library built WITHOUT `cfg(test)`, so the only
+        // way to hand it `test_http` was a feature its own dev-dependency
+        // turns on. The rule this assertion states now is the one the old one
+        // was standing in for, and it is STRICTER than "no features" was
+        // vacuous: a feature may only ever ADD code that `cfg(test)` already
+        // adds, never remove or replace any.
+        //
+        // Three things enforce that, and the third is the one with teeth:
+        //
+        // 1. The declared feature set is exactly [`TEST_ONLY_FEATURES`]. A
+        //    second feature is a visible edit here, in the test whose whole
+        //    subject is build divergence.
+        // 2. No `default` feature list. A default-on feature that the test
+        //    profile turns off is the exact `not(test)` shape, spelled in
+        //    `Cargo.toml`.
+        // 3. Every `feature = "..."` anywhere in `src/` appears ONLY inside
+        //    the literal attribute [`TEST_ONLY_GATE`] -- `#[cfg(any(test,
+        //    feature = "test-support"))]`. That form cannot subtract: whatever
+        //    it guards is compiled in every test build of this library
+        //    already, so the tested configuration is still a superset of the
+        //    shipped one. A bare `#[cfg(feature = ...)]` on a production item,
+        //    or the same feature named in a `not(`, is a different string and
+        //    fails.
+        //
+        // The manifest needle is split across `concat!` arguments so this
+        // file's own source does not match it. The two SOURCE needles are not,
+        // and do not have to be: they are matched against a [`code_only`]
+        // view, which drops comments and the CONTENTS of every string literal,
+        // so this file's prose about them and the `concat!` fragments that
+        // would spell them are both gone before the scan sees anything. That
+        // is also why the feature NAME is absent from `TEST_ONLY_GATE`: it is
+        // inside a string literal in the real attribute too. Which features
+        // exist at all is assertion 1's job, one screen up; this scan only has
+        // to tell an additive gate from a subtractive one, and the `any(test,`
+        // is what does that.
+        const TEST_ONLY_FEATURES: [&str; 1] = [concat!("test-", "support")];
+        const FEATURES_TABLE: &str = concat!("[fea", "tures]");
+        const FEATURE_CFG: &str = "feature=";
+        const TEST_ONLY_GATE: &str = "#[cfg(any(test,feature=))]";
         let manifest = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"),
         )
         .unwrap();
         assert!(
             manifest.contains("[package]"),
-            "control: the manifest was not read, so the assertion below is vacuous"
+            "control: the manifest was not read, so the assertions below are vacuous"
+        );
+        // 1. exactly the features named above, and no others.
+        let declared: Vec<String> = match manifest.split_once(FEATURES_TABLE) {
+            None => Vec::new(),
+            Some((_, rest)) => rest
+                .lines()
+                .skip(1)
+                .take_while(|line| !line.starts_with('['))
+                .filter_map(|line| line.split_once('=').map(|(name, _)| name.trim().to_string()))
+                .filter(|name| !name.is_empty() && !name.starts_with('#'))
+                .collect(),
+        };
+        assert_eq!(
+            declared,
+            TEST_ONLY_FEATURES.to_vec(),
+            "this crate's declared Cargo features are no longer exactly {TEST_ONLY_FEATURES:?}. \
+             A feature is a third way to compile the shipped binary differently from the tested \
+             library, and neither matcher above can see one. Adding one is allowed only on the \
+             terms below: it must be turned on by a dev-dependency and never by default, and \
+             every `cfg` that names it must be the `any(test, ...)` form that can only ADD \
+             code -- do not simply widen this list"
+        );
+        // 2. nothing is on by default.
+        assert!(
+            !declared.iter().any(|name| name == "default"),
+            "a `default` feature list is a feature the shipped binary has and `cargo test` can \
+             be run without, which is `not(test)` spelled in `Cargo.toml`"
+        );
+        // 3. the only feature `cfg` in this crate is the additive one.
+        // Through `code_only`, for the reason the `cfg!` matcher above gives:
+        // prose is not code, and this module's own comments discuss both of
+        // the strings below at length.
+        let mut feature_gates = Vec::new();
+        for file in &files {
+            let text = code_only(&std::fs::read_to_string(file).unwrap());
+            let named = text.matches(FEATURE_CFG).count();
+            let additive = text.matches(TEST_ONLY_GATE).count();
+            if named != additive {
+                feature_gates.push(format!(
+                    "{}: {named} `{FEATURE_CFG}` but only {additive} are `{TEST_ONLY_GATE}`",
+                    file.display()
+                ));
+            }
+        }
+        assert!(
+            feature_gates.is_empty(),
+            "a Cargo feature is named somewhere other than the additive `{TEST_ONLY_GATE}` \
+             gate, so it can compile the shipped binary differently from the tested \
+             library:\n{}",
+            feature_gates.join("\n")
+        );
+        // CONTROLS ON ALL THREE, so they are not three silences agreeing with
+        // each other. The `assert_eq!` above is its own control -- a parser
+        // that found nothing would report an empty list against a non-empty
+        // one -- and these cover the rest.
+        assert!(
+            files
+                .iter()
+                .any(|file| code_only(&std::fs::read_to_string(file).unwrap())
+                    .contains(TEST_ONLY_GATE)),
+            "control: no file in `src/` contains `{TEST_ONLY_GATE}`, so the scan above counted \
+             nothing on both sides of every comparison and would pass over a bare feature gate"
         );
         assert!(
-            !manifest.contains(concat!("[fea", "tures]")),
-            "this crate now declares Cargo features. A feature is a third way to compile the \
-             shipped binary differently from the tested library, and neither matcher above can \
-             see one. If a feature is genuinely needed, replace this assertion with a check that \
-             none of them gates production code -- do not simply delete it"
+            TEST_ONLY_GATE.contains(FEATURE_CFG),
+            "control: the additive gate does not contain the needle the scan counts against it, \
+             so every file with a feature gate would be reported and none is"
+        );
+        for planted in [
+            // A bare gate on a production item: present when the feature is
+            // on, ABSENT when it is off, which is the whole defect.
+            concat!("#[cfg(", "fea", "ture = \"", "test-", "support", "\")]\nfn f() {}"),
+            // The same division written the other way round.
+            concat!("#[cfg(", "not", "(", "fea", "ture = \"", "test-", "support", "\"))]\nfn f() {}"),
+            // A second feature, and one `all(` rather than `any(` -- so the
+            // item is gone unless it is on.
+            concat!("#[cfg(all(windows, ", "fea", "ture = \"x\"))]\nfn f() {}"),
+        ] {
+            let seen = code_only(planted);
+            assert!(
+                seen.matches(FEATURE_CFG).count() > seen.matches(TEST_ONLY_GATE).count(),
+                "the scan cannot see `{planted}`, so its silence above means nothing"
+            );
+        }
+        // ...and the real attribute, read the way the scan reads it, is the
+        // needle the scan forgives -- which is what makes the three above a
+        // contrast rather than three strings nobody compared to anything.
+        assert_eq!(
+            code_only(concat!(
+                "#[cfg(any(test, ",
+                "fea",
+                "ture = \"",
+                "test-",
+                "support",
+                "\"))]\nmod m {}"
+            )),
+            format!("{TEST_ONLY_GATE}modm{{}}"),
+            "the gate this scan forgives is not the attribute `lib.rs` actually writes"
+        );
+        // ...and the additive form itself is not flagged.
+        assert_eq!(
+            TEST_ONLY_GATE.matches(FEATURE_CFG).count(),
+            TEST_ONLY_GATE.matches(TEST_ONLY_GATE).count(),
+            "the scan flags the one gate this crate is allowed to have"
         );
 
         // Controls: the matcher sees every shape of the thing it bans...

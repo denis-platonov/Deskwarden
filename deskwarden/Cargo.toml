@@ -218,20 +218,49 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 # unwrap of an already-fetched org key is not the repeated-oracle exposure
 # that advisory is about, and `deny.toml` for the recorded decision.
 rsa = "0.9"
+# OPTIONAL, AND OFF IN EVERY BUILD THAT SHIPS. The engine behind
+# `test_http::Matcher::Regex`, which five call sites use. It is named here as
+# well as in `[dev-dependencies]` because `test_http` has to compile in two
+# configurations: the library's own test target, where the dev-dependency
+# supplies it, and the library built for `main.rs`'s test target, where
+# `test-support` does. `cargo build` turns on neither, so `regex` is not
+# linked into the shipped binary.
+regex = { version = "1", optional = true }
+
+[features]
+# The one thing this feature does is un-gate `test_http` and `test_vault` in
+# `lib.rs`, which are otherwise `#[cfg(test)]` and therefore invisible to
+# `main.rs` -- a SEPARATE CRATE that reaches this one through `deskwarden::`
+# and links the library built WITHOUT `cfg(test)`. That invisibility is why
+# `main.rs` was the last `mockito` caller in the tree, and `mockito` 1.7.2
+# resets loopback connections (`os error 10054`); see `src/test_http.rs`.
+#
+# It is NOT a `cfg(test)` seam: no production item changes shape, appears or
+# disappears with it. It only decides whether two test-only modules are
+# compiled, and nothing outside a test target ever turns it on -- the
+# dev-dependency below is the only thing that does.
+test-support = ["dep:regex"]
 
 [dev-dependencies]
-# `mockito` is down to ONE user: `main.rs`'s tests. It is a different crate
-# that reaches this one through `deskwarden::`, so the library's
-# `#[cfg(test)]` `test_http` module is not visible to it at all. Everything in
-# the library moved off it -- see `src/test_http.rs` for the `os error 10054`
-# measurements that made that necessary -- and `test_http`'s
-# `no_module_in_this_crate_builds_a_mockito_server` is what keeps it moved.
-mockito = "1"
-# The engine behind `test_http::Matcher::Regex`, which five call sites use.
-# ALREADY IN THE TREE: `mockito` depends on it, at this version, for exactly
-# the same matcher. Naming it here adds a line and no crate, and it is named
-# rather than reimplemented because a hand-rolled substring match would
-# silently accept the first pattern in this crate that is a real expression.
+# THIS CRATE, ON ITSELF, WITH `test-support` ON. A dev-dependency cycle is
+# explicitly allowed by cargo, and this one adds no code to the tree: the
+# path is this same directory, so the only effect is that the library
+# `main.rs`'s TEST target links is built with the feature above and can see
+# `deskwarden::test_http`. `cargo build` does not resolve dev-dependencies,
+# so a shipped binary still links a library with neither module in it.
+#
+# This is the one path dependency in this manifest, and it is deliberate:
+# `job_object`'s whole-file pin exists because re-pointing a REGISTRY name at
+# a path or a fork runs foreign code. This points a name at the crate that
+# name already means.
+deskwarden = { path = ".", features = ["test-support"] }
+# The same crate as the optional `regex` above, named again here because the
+# library's OWN test target compiles `test_http` under `cfg(test)` with no
+# feature turned on. `mockito` -- which brought `regex` and its three
+# dependencies into the tree in the first place, at this version, for exactly
+# the same matcher -- is GONE from this manifest: `main.rs` was its last user
+# and `test_http::no_module_in_this_crate_builds_a_mockito_server` is what
+# keeps it gone.
 regex = "1"
 
 [build-dependencies]

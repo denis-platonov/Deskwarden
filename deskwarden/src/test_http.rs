@@ -1510,18 +1510,35 @@ mod tests {
     /// `http_agent.rs` has shipped a dead guard of exactly this shape before;
     /// see its note.
     ///
-    /// `main.rs` is the exemption, and it is a limit rather than a preference:
-    /// it is a *different crate* that reaches this one through `deskwarden::`,
-    /// so a `#[cfg(test)]` module of the lib is not visible to it at all. Its
-    /// tests also run in their own process, one at a time against their own
-    /// servers, where the concurrency that provokes the reset is not there.
-    /// It is also the CONTROL: the needle is checked against `main.rs` first,
-    /// so the day `main.rs` stops using `mockito` this test fails and says so,
-    /// rather than passing forever over a needle that no longer matches
-    /// anything.
+    /// **`main.rs` USED TO BE EXEMPT, AND IS NOT ANY MORE.** The exemption was
+    /// a limit -- `main.rs` is a *different crate* that reaches this one
+    /// through `deskwarden::`, so a `#[cfg(test)]` module of the lib was not
+    /// visible to it at all -- and it rested on a claim that was measured
+    /// FALSE: that its tests "run in their own process, one at a time against
+    /// their own servers, where the concurrency that provokes the reset is not
+    /// there". Measured on the machine in this module's docs, a single one of
+    /// those tests, alone in a fresh process at `--test-threads=1` with one
+    /// server and four requests, failed **5 runs out of 15** with the same
+    /// `os error 10054`. `mockito` does not need this crate's concurrency to
+    /// reset a connection; it only needs a request. `lib.rs`'s `test-support`
+    /// feature is what removed the limit, and with it the exemption.
+    ///
+    /// So the walk now covers every file, `main.rs` included, and the control
+    /// moved with it: with nothing in the tree left to match, the needle is
+    /// checked against a string built here instead.
     #[test]
     fn no_module_in_this_crate_builds_a_mockito_server() {
         const NEEDLE: &str = concat!("mockito::Server:", ":new");
+        // THE CONTROL, and it has to be synthetic now: the needle used to be
+        // proved live against `main.rs`, the last file that matched it. A
+        // needle that matches nothing anywhere passes this test forever while
+        // asserting nothing, which is exactly what happened to `http_agent`'s
+        // dead guard; see its note.
+        assert!(
+            format!("let mut server = {}::Server{}new();", "mockito", "::").contains(NEEDLE),
+            "needle {NEEDLE:?} does not match the call it bans, so this test has been passing \
+             over nothing"
+        );
 
         /// Every `.rs` file under `src/`, as (path relative to `src/`,
         /// contents). Walked off disk rather than pulled from a hand-written
@@ -1552,30 +1569,25 @@ mod tests {
 
         let files = crate_source_files();
         assert!(files.len() > 20, "the walk found only {} files; src/ has far more", files.len());
-        let exempt = files
-            .iter()
-            .find(|(path, _)| path == "main.rs")
-            .expect("the walk did not reach main.rs");
         assert!(
-            exempt.1.contains(NEEDLE),
-            "needle {NEEDLE:?} no longer matches `main.rs`, the one crate that is still \
-             allowed to use `mockito`. Either the needle has rotted -- in which case this \
-             test has been passing over nothing -- or `main.rs` has moved off `mockito` too, \
-             in which case delete this test and the `mockito` dev-dependency with it"
+            files.iter().any(|(path, _)| path == "main.rs"),
+            "control: the walk did not reach `main.rs`, the file that used to be exempt here"
         );
 
         let offenders: Vec<&String> = files
             .iter()
-            .filter(|(path, text)| path != "main.rs" && text.contains(NEEDLE))
+            .filter(|(_, text)| text.contains(NEEDLE))
             .map(|(path, _)| path)
             .collect();
 
         assert!(
             offenders.is_empty(),
-            "these library files stand up a `mockito` server: {offenders:?}. `mockito` 1.7.2 \
-             resets connections under concurrent load -- the `os error 10054` this module was \
-             written to remove -- and the `--lib` suite runs its tests in parallel. Call \
-             `test_http::server()` instead"
+            "these files stand up a `mockito` server: {offenders:?}. `mockito` 1.7.2 resets \
+             accepted connections -- the `os error 10054` this module was written to remove, \
+             and it does it to a lone sequential test as readily as to a parallel suite. Call \
+             `test_http::server()` instead. `mockito` is not a dependency of this crate any \
+             more, so such a call does not even compile; this walk is what keeps it from \
+             coming back with the dependency"
         );
     }
 }

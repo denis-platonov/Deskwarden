@@ -12826,7 +12826,7 @@ mod tests {
     /// **The update check is not made when the setting is off**, observed as
     /// a request that never arrives rather than as a branch that was taken.
     ///
-    /// The server is `mockito`'s, on loopback, exactly as `updater`'s own
+    /// The server is `test_http`'s, on loopback, exactly as `updater`'s own
     /// tests use it -- no test here goes near `api.github.com`. What makes
     /// this an observation is `Mock::matched`: it reports whether the
     /// releases endpoint was actually hit, so "no request" is a fact about
@@ -12854,10 +12854,10 @@ mod tests {
         let current = Version::parse("1.0.0").unwrap();
 
         // -- off: nothing reaches the wire ---------------------------------
-        let mut off_server = mockito::Server::new();
+        let mut off_server = deskwarden::test_http::server();
         let off_mock = off_server
             .mock("GET", "/repos/denis-platonov/deskwarden/releases")
-            .match_query(mockito::Matcher::Any)
+            .match_query(deskwarden::test_http::Matcher::Any)
             .with_status(200)
             .with_body(body)
             .create();
@@ -12878,10 +12878,10 @@ mod tests {
         );
 
         // -- on: the SAME request does reach it ----------------------------
-        let mut on_server = mockito::Server::new();
+        let mut on_server = deskwarden::test_http::server();
         let on_mock = on_server
             .mock("GET", "/repos/denis-platonov/deskwarden/releases")
-            .match_query(mockito::Matcher::Any)
+            .match_query(deskwarden::test_http::Matcher::Any)
             .with_status(200)
             .with_body(body)
             .create();
@@ -14920,7 +14920,7 @@ mod tests {
     /// that started that way.
     #[test]
     fn a_startup_repopulation_arms_autofill_and_seeds_the_cache_from_the_same_items() {
-        let mut server = mockito::Server::new();
+        let mut server = deskwarden::test_http::server();
         // `populate_with` still fetches folders; nothing else here talks to
         // the backend.
         server
@@ -14996,7 +14996,7 @@ mod tests {
     /// pass the `lookup` assertion and fail the two below it.
     #[test]
     fn the_cache_first_arm_arms_the_engine_from_the_cache_and_writes_nothing_back() {
-        // **No `mockito` and no fetch.** The bridge is the discard port,
+        // **No mock server and no fetch.** The bridge is the discard port,
         // dead for the life of the process, and `populate_with_vault` asks it
         // for nothing -- so the cache is populated by the same write-back
         // every populate uses, with the network taken out of the fixture. A
@@ -15238,7 +15238,7 @@ mod tests {
     /// an empty cache.
     #[test]
     fn a_folders_failure_after_unlock_leaves_the_match_engine_armed() {
-        let mut server = mockito::Server::new();
+        let mut server = deskwarden::test_http::server();
         let _folders = server
             .mock("GET", "/list/object/folders")
             .with_status(500)
@@ -15278,7 +15278,7 @@ mod tests {
     /// request over.
     #[test]
     fn the_engine_is_armed_from_the_probes_items_even_if_every_later_request_fails() {
-        let mut server = mockito::Server::new();
+        let mut server = deskwarden::test_http::server();
         let _items = server
             .mock("GET", "/list/object/items")
             .with_status(500)
@@ -15316,7 +15316,7 @@ mod tests {
     /// all, which is the case that would otherwise leave stale ones armed.
     #[test]
     fn matches_from_the_pre_lock_account_do_not_survive_the_unlock() {
-        let mut server = mockito::Server::new();
+        let mut server = deskwarden::test_http::server();
         let _folders = server
             .mock("GET", "/list/object/folders")
             .with_status(500)
@@ -15344,7 +15344,7 @@ mod tests {
     /// populate needs only the folders request -- no second `list_items`.
     #[test]
     fn the_cache_is_seeded_from_the_probes_items_without_listing_them_again() {
-        let mut server = mockito::Server::new();
+        let mut server = deskwarden::test_http::server();
         let items = server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -15947,7 +15947,7 @@ mod tests {
     /// then succeeds takes the ordinary `Ready` path.
     #[test]
     fn a_dismissed_spinner_after_unlock_gets_one_free_readiness_retry() {
-        let mut server = mockito::Server::new();
+        let mut server = deskwarden::test_http::server();
         let _folders = server
             .mock("GET", "/list/object/folders")
             .with_status(200)
@@ -16269,7 +16269,7 @@ mod tests {
     /// `bw status` produced. Returns the mock server too, because dropping it
     /// unmounts the mocks the repopulate below will need.
     fn an_app_signed_into_one_account() -> (
-        mockito::ServerGuard,
+        deskwarden::test_http::Server,
         VaultCache,
         MatchEngine,
         Option<login_ui::BwStatusDetails>,
@@ -26495,8 +26495,8 @@ mod tests {
 
     /// A `bw serve` that answers one item carrying an app match, plus the
     /// folders every populate also fetches.
-    fn sync_server() -> mockito::ServerGuard {
-        let mut server = mockito::Server::new();
+    fn sync_server() -> deskwarden::test_http::Server {
+        let mut server = deskwarden::test_http::server();
         server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -26642,13 +26642,17 @@ mod tests {
     /// invisible. The lib's own `vault_bridge::echoing_item_put` is
     /// `#[cfg(test)]`, so it is not reachable from this binary's tests; this
     /// is the same shape, locally.
-    fn echoing_item_put(server: &mut mockito::Server, path: &str) -> mockito::Mock {
+    fn echoing_item_put(server: &mut deskwarden::test_http::Server, path: &str) -> deskwarden::test_http::Mock {
         server
             .mock("PUT", path)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body_from_request(|req| {
-                let sent = req.body().expect("a PUT this app makes always carries a body");
+                // `test_http` reads the body off the socket before a matcher
+                // sees the request, so there is no state in which it is
+                // absent and nothing to unwrap -- see its module doc. An
+                // empty body still fails, one line down, at the parse.
+                let sent = req.body();
                 let mut item: serde_json::Value =
                     serde_json::from_slice(sent).expect("this app's write bodies are JSON");
                 if let Some(map) = item.as_object_mut() {
@@ -26665,7 +26669,7 @@ mod tests {
     fn an_app_match_saved_while_a_sync_was_in_flight_survives_that_sync() {
         const ONE_ITEM_NO_MATCH: &str =
             r#"{"success":true,"data":{"data":[{"id":"1","name":"1","type":1,"fields":[]}]}}"#;
-        let mut server = mockito::Server::new();
+        let mut server = deskwarden::test_http::server();
         server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -26741,7 +26745,7 @@ mod tests {
     fn an_app_match_saved_while_a_syncs_fetch_was_in_flight_survives_that_sync() {
         const ONE_ITEM_NO_MATCH: &str =
             r#"{"success":true,"data":{"data":[{"id":"1","name":"1","type":1,"fields":[]}]}}"#;
-        let mut server = mockito::Server::new();
+        let mut server = deskwarden::test_http::server();
         server
             .mock("GET", "/list/object/items")
             .with_status(200)
@@ -29459,8 +29463,8 @@ mod tests {
         /// `VaultCache::populate_with` is seeded with the probe's items but
         /// fetches folders itself. Nothing else here talks to a backend, and
         /// the fill deliberately reads the cache rather than the bridge.
-        fn a_backend_that_answers_for_folders() -> mockito::ServerGuard {
-            let mut server = mockito::Server::new();
+        fn a_backend_that_answers_for_folders() -> deskwarden::test_http::Server {
+            let mut server = deskwarden::test_http::server();
             server
                 .mock("GET", "/list/object/folders")
                 .with_status(200)

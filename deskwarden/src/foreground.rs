@@ -1506,9 +1506,9 @@ mod tests {
             // snapshot the caller already holds into it. It draws nothing,
             // owns no window, and cannot ship.
             "test_vault",
-            // Test-only at its declaration in `lib.rs`, like `test_vault`: it
-            // hands out a `mockito` server under a gate. A TCP listener on
-            // loopback is not a window and raises nothing.
+            // Test-only at its declaration in `lib.rs`, like `test_vault`: a
+            // hand-rolled mock HTTP server. A TCP listener on loopback is not
+            // a window and raises nothing.
             "test_http",
             "theme",
             "tray",
