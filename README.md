@@ -99,9 +99,11 @@ open.
   is faster and much lighter. The trade is that the key unlocking your vault
   is kept on this PC under DPAPI and does not expire — the setting says so
   before you turn it on.
-- **On a self-hosted server, nothing uses the CLI any more.** Signing in,
-  Sends, exporting and the account name were the last things that did, and
-  as of 0.15.0 none of them do.
+- **Signing in no longer uses the CLI either way.** A direct-REST account
+  authenticates against the server itself. The CLI is required only where
+  `bw serve` is the vault -- every account on bitwarden.com and
+  bitwarden.eu -- and Deskwarden acquires it for you at that point rather
+  than the installer fetching it for everybody in advance.
 
 ### Where your vault lives
 
@@ -306,7 +308,7 @@ logins.
 | Choice | Reasoning |
 | --- | --- |
 | **Rust** | Native Win32/COM interop (UI Automation, DPAPI, WinTrust, Job Objects) without an FFI layer on top of a managed runtime, and a single static binary with no runtime to install. |
-| **[`windows`](https://crates.io/crates/windows) crate (raw Win32/WinRT bindings)**, not a higher-level GUI-automation library | The two things that actually need OS-level access — reading whatever window is in the foreground, and typing into an arbitrary native control — don't have a portable abstraction worth building on. Direct bindings also make the Authenticode signature check on the bundled `bw.exe` (real `WinVerifyTrust`, not a shelled-out PowerShell call) and the DPAPI-encrypted session cache possible without another dependency. |
+| **[`windows`](https://crates.io/crates/windows) crate (raw Win32/WinRT bindings)**, not a higher-level GUI-automation library | The two things that actually need OS-level access — reading whatever window is in the foreground, and typing into an arbitrary native control — don't have a portable abstraction worth building on. Direct bindings also make the Authenticode signature check on the `bw.exe` the app downloads (real `WinVerifyTrust`, not a shelled-out PowerShell call -- and since the installer stopped bootstrapping the CLI, this is the crate's only Authenticode mechanism rather than one of two) and the DPAPI-encrypted session cache possible without another dependency. |
 | **[`eframe`/`egui`](https://github.com/emilk/egui) (immediate-mode GUI)** | A tray app with a handful of small windows (login, an autofill overlay, a picker, the vault browser) doesn't need a retained-mode widget tree or a bundled browser engine — egui compiles into the same static binary and adds single-digit megabytes, not a WebView2 dependency. |
 | **The Bitwarden CLI (`bw`) as the default vault backend**, via its local `bw serve` REST bridge — with a direct one beside it for self-hosted servers | Reimplementing Bitwarden's cryptography is a security liability a community tool should not take on lightly, so for a long time it was not taken on at all. It has been now, for self-hosted servers only and behind a setting that is off by default: `bw serve` is a bundled Node runtime costing ~118 MB of RAM, which is more than the rest of the app put together. The direct path is checked against Bitwarden's own published test vectors, and every write is laid over the JSON the server sent so a field this app cannot decrypt survives an edit untouched. On the default path Deskwarden still only ever talks to `localhost`. |
 | **DPAPI** for the cached session token, **Windows Hello** (`KeyCredentialManager`) for optional quick-unlock | Both are already the OS's own answer to "encrypt this for the current Windows user" — no key management of Deskwarden's own to get wrong. |
@@ -358,7 +360,14 @@ built for each other.
 | | Deskwarden | Bitwarden Desktop |
 | --- | --- | --- |
 | App itself | ~16 MB | 456 MB |
-| Full install (app + bundled `bw` CLI) | ~169 MB | 456 MB |
+| Fresh install (app alone) | ~51 MB | 456 MB |
+| After signing in to an official server (app + `bw` CLI) | ~169 MB | 456 MB |
+
+Two rows rather than one, because a fresh install is now the app alone.
+The installer no longer fetches the Bitwarden CLI; Deskwarden asks, and then
+downloads and verifies it, at the moment you choose a server that requires
+it. Choose a self-hosted server with the built-in client and the second row
+never happens.
 
 Source: ~188,000 lines of Rust across 103 modules, roughly a third of it
 production code and the rest tests.

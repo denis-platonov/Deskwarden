@@ -1022,7 +1022,15 @@ pub fn cleanup_stale_downloads(dir: &Path) -> Result<usize, String> {
 /// thing standing between a file on disk and a process start, so a failure to
 /// READ the file has to be as loud as a failure to MATCH it. Both callers
 /// treat it as a refusal.
-fn file_sha256(path: &Path) -> Result<Sha256Digest, String> {
+/// `pub(crate)` rather than private, for ONE reason: `bw_acquire` hashes the
+/// Bitwarden CLI zip it just downloaded, and it must do it with this function
+/// rather than a second one. A second hasher is a second set of decisions
+/// about I/O errors, chunk sizes and what a partial read means -- and the one
+/// decision that matters here (an unreadable file is an `Err`, never a zero
+/// hash) is exactly the sort that a copy re-derives wrongly. Not `pub`: this
+/// is not part of the crate's surface, only shared between two modules that
+/// verify downloads.
+pub(crate) fn file_sha256(path: &Path) -> Result<Sha256Digest, String> {
     let mut file = std::fs::File::open(path)
         .map_err(|e| format!("could not open {} to hash it: {e}", path.display()))?;
     let mut hasher = Sha256::new();
@@ -1179,7 +1187,12 @@ pub const NO_PROGRESS: &dyn Fn(u64, Option<u64>) = &|_, _| {};
 /// `total` is passed through untouched rather than being reconciled against
 /// what arrived. It is the server's claim; `copied` is the truth, and the
 /// caller is shown both.
-fn copy_reporting(
+/// `pub(crate)` for `bw_acquire`, the second streamed download in this crate.
+/// The contract pinned below -- **the final call always reports the total
+/// number of bytes actually written** -- is what both progress bars depend
+/// on, and it is cheaper to share the function than to pin the contract
+/// twice.
+pub(crate) fn copy_reporting(
     reader: &mut dyn std::io::Read,
     writer: &mut dyn std::io::Write,
     total: Option<u64>,

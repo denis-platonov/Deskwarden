@@ -1393,7 +1393,17 @@ mod tests {
         // (`login_ui::account_details_for`) or off the sign-in that
         // established them (`login_ui::SignedInIdentity`), neither of which
         // spawns anything -- so the threads went with the work.
-        ("login_ui.rs", 7),
+        // Eight. It was seven; the new one is the Bitwarden CLI setup
+        // worker, started from the modal's OK in `build_login_frame`'s
+        // `CliModalAction::Begin` arm. Every step behind that button blocks:
+        // a DNS lookup, a ~37 MB transfer, a SHA-256 over it, a zip
+        // extraction and a `WinVerifyTrust` call. On the frame thread the
+        // window would freeze for the whole minute the modal exists to
+        // narrate, and the determinate bar it paints would never move.
+        //
+        // It carries no credentials -- the gate that opens the modal returns
+        // before `spawn_auth`, so `form.password` is untouched by this path.
+        ("login_ui.rs", 8),
         // Six. It was eleven, and the five that went were every thread this
         // file started to run a `bw status`: the startup prefetch, the vault
         // window's own fetch, the post-lock rebuild's, the UI process's copy
@@ -2353,10 +2363,35 @@ mod tests {
             // 13177 -> 14851 bytes: the feature table, the two dependency
             // entries, and the comments that say why each is there.
             //
+            // ADDED: `zip = { version = "2", default-features = false,
+            // features = ["deflate"] }`, and the comment block that says why
+            // its default features are off. `src/bw_acquire.rs` acquires the
+            // Bitwarden CLI on demand, and Bitwarden distributes that CLI
+            // ONLY as `bw-windows-<version>.zip` -- there is no bare-exe
+            // asset -- so an extractor became unavoidable when the installer
+            // stopped bootstrapping it.
+            //
+            // `default-features = false` is the security-relevant half of
+            // that line: the default set adds bzip2 (a C library), zstd, xz
+            // and encrypted-archive AES, which is four more parsers of
+            // network-supplied bytes plus an FFI dependency, none of them
+            // reachable by a Bitwarden release asset. Transitively this adds
+            // `zip`, `flate2`, `miniz_oxide` (pure Rust, no zlib C) and
+            // `crc32fast`, and nothing else.
+            //
+            // NOT changed: no registry name removed or re-pointed, no
+            // `[patch]`, `[replace]` or `[workspace.dependencies]` table, no
+            // fork, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`.
+            // 14851 -> 16165 bytes: the one dependency line and its rationale.
+            //
             // The hash below was recomputed independently -- FNV-1a/64 over
             // the file with CRLF normalised to LF, in a separate
             // implementation -- rather than copied out of the failure message.
-            (14851, 0x113b_0e40_555e_2506_u64),
+            // That implementation was first checked against the PREVIOUS
+            // pinned pair (14851, 0x113b_0e40_555e_2506) and reproduced it
+            // exactly, so it is measuring the same thing this test measures.
+            (16165, 0xf867_4acb_b714_79ba_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
@@ -2697,7 +2732,16 @@ mod tests {
                 // ship, generate or keep in step with the brand table.
                 "deny.toml",
                 "installer/README.md",
-                "installer/bootstrap-bw.ps1",
+                // NO `installer/bootstrap-bw.ps1`. It was 370 lines of
+                // PowerShell that downloaded the Bitwarden CLI at install
+                // time, parsed X.500 DNs by hand, and checked an Authenticode
+                // signature with `Get-AuthenticodeSignature` -- the crate's
+                // SECOND verification mechanism, kept in step with
+                // `signature.rs` by a comment. The app acquires the CLI
+                // itself now (`bw_acquire.rs`), verifying in-process through
+                // `WinVerifyTrust`, so both the script and the second DN
+                // parser are gone. `main::the_bootstrap_script_is_not_in_the_tree`
+                // asserts its absence from the other side.
                 "installer/deskwarden.iss",
             ],
             "the set of NON-Rust files in this crate changed. rustc does not care what a module \
@@ -7225,6 +7269,15 @@ mod tests {
         "ok",
         "or_else",
         "parent",
+        // The bare `pub`, and it is not a call. `install_bin_candidate`
+        // became `pub(crate) fn` so that `bw_acquire` can install to the path
+        // this module computes rather than to a second spelling of it -- and
+        // this scanner tokenises `pub(crate)` into a bare `pub` plus the rest,
+        // where a plain `pub fn` would have folded into `pubfn...`. Declared
+        // rather than avoided: the alternative was making the function fully
+        // `pub`, which would put an install-path helper on the crate's public
+        // surface to satisfy a spelling census.
+        "pub",
         "pubfnactive_data_dir",
         "pubfnbw_command",
         "pubfnbw_command_in",
@@ -7291,7 +7344,10 @@ mod tests {
             last_production_item: "BlockedByUnknownCliPath => Some(",
             min_code_len: 4400,
             callees: BW_PATH_CALLEES,
-            call_sites: 113,
+            // 113 -> 114: the bare `pub` token that `pub(crate) fn
+            // install_bin_candidate` introduced. See the `"pub"` entry in the
+            // list above for why that visibility, and not `pub fn`.
+            call_sites: 114,
             macros: BW_PATH_MACROS,
             imports: BW_PATH_IMPORTS,
             local_paths: BW_PATH_LOCAL_PATHS,

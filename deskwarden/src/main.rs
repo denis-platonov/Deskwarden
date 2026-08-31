@@ -98,76 +98,23 @@ const GITHUB_API_BASE: &str = "https://api.github.com";
 // never be chosen at a call site -- and the fewer files that name it, the
 // fewer places anyone could be tempted to.
 
-/// Organization (`O=`) values accepted as proof that the resolved `bw.exe`
-/// (see `bw_path::resolve_bw_exe`) really is Bitwarden's own CLI.
+/// Organization (`O=`) values accepted as proof that a `bw.exe` really is
+/// Bitwarden's own CLI.
 ///
-/// Mirrors `$BitwardenSignerOrganizations` in `installer/bootstrap-bw.ps1` --
-/// kept in sync there by hand, not shared code, since one runs at install
-/// time (PowerShell) and this runs at every app startup (Rust). Pinning the
-/// *path* `bw.exe` is resolved from isn't enough on its own: the installer's
-/// `bin` directory is itself inside deskwarden's user-writable install tree,
-/// so anything able to plant a file beside `deskwarden.exe` can just as
-/// easily overwrite `bin\bw.exe`. This is the check that actually matters --
-/// whatever ends up at that path must be signed by Bitwarden before it's
-/// handed the user's master password (`login_ui::run_bw_with_password`) or
-/// session token.
+/// **This is a re-export, not a definition.** The list itself lives in
+/// `signature::TRUSTED_BW_SIGNER_ORGANIZATIONS`, because there are now two
+/// readers of it and they must not be able to disagree: this file's startup
+/// check, which verifies whatever `bw_path::resolve_bw_exe` found, and
+/// `bw_acquire::verify_is_bitwardens`, which verifies a freshly-downloaded
+/// copy before it is installed. A second list is how the two would come
+/// apart -- and the direction they would come apart in is "the app installs
+/// a binary its own startup then refuses to run".
 ///
-/// **Entry 1, `"Bitwarden Inc."`, is verified.** Checked 2026-08-10 against
-/// a real, currently-valid Bitwarden-signed `bw.exe` -- the CLI this
-/// project's own installer downloads. Measured twice: once with
-/// `Get-AuthenticodeSignature`, and once through
-/// `signature::verify_authenticode` itself, so what is recorded here is what
-/// production reads rather than what a cmdlet formats.
-///
-/// ```text
-/// valid      : true
-/// O=         : Bitwarden Inc.       (CN= happens to be identical -- see below)
-/// thumbprint : 80375A0C9630A51ECB7EC79B37A8174C8DACCCED
-/// issuer     : CN=DigiCert Trusted G4 Code Signing RSA4096 SHA384 2021 CA1,
-///              O="DigiCert, Inc.", C=US
-/// notAfter   : 2027-07-30T16:59:59Z
-/// ```
-///
-/// That certificate's subject DN is pinned verbatim as
-/// `REAL_BITWARDEN_CLI_SUBJECT_DN` (in the test module), and the tests below
-/// run the *production* comparison -- `signature::is_trusted_organization`
-/// against this very constant -- over it, so a well-meant retyping of the
-/// string here fails the suite. Note the expiry: one certificate, on one
-/// machine, that stops existing in 2027 -- and the organization spelling on
-/// its replacement is not knowable today.
-///
-/// **The other four entries remain unverified** -- plausible spellings nobody
-/// here has seen on a real Bitwarden certificate. They are kept rather than
-/// trimmed: `8bit Solutions LLC` is Bitwarden's documented former legal name,
-/// the punctuation variants cover the way DN spelling drifts between
-/// issuances, and each is an *exact whole-`O=`-component* match on a name a
-/// public CA had to validate before issuing -- so the breadth they add is
-/// narrow, while dropping them would turn a legitimate older or
-/// differently-punctuated Bitwarden certificate into a scary dialog, and a
-/// dialog users learn to click through is worse than the entry. `"Bitwarden"`
-/// alone is the weakest of the four and the first that should go if this list
-/// is ever tightened.
-///
-/// The matching note on `$BitwardenSignerOrganizations` in
-/// `installer/bootstrap-bw.ps1` records the same finding and must stay in
-/// step with this one.
-///
-/// Because four of the five entries are *still unverified* -- and the fifth
-/// is verified only against a single certificate that expires in 2027 -- a
-/// mismatch is deliberately
-/// **not** treated the same way `EXPECTED_SIGNER_THUMBPRINT` treats a bad
-/// update signature. See `check_bw_signature` below for the graded response
-/// and the reasoning behind it: an unsigned or tamper-detected binary is
-/// still refused outright, but "validly signed by an organization this
-/// unverified list doesn't happen to name" asks the user instead of killing a
-/// tray app with no console and no explanation.
-const TRUSTED_BW_SIGNER_ORGANIZATIONS: &[&str] = &[
-    "Bitwarden Inc.",
-    "Bitwarden, Inc.",
-    "Bitwarden Inc",
-    "Bitwarden",
-    "8bit Solutions LLC",
-];
+/// The doc comment that used to live here -- the 2026-08-10 measurement, why
+/// four of the five entries are unverified, and why a mismatch asks rather
+/// than kills -- moved with the constant. See `signature.rs`.
+use deskwarden::signature::TRUSTED_BW_SIGNER_ORGANIZATIONS;
+
 
 fn main() {
     // **Which of the two processes this is, answered before anything else.**
@@ -466,18 +413,63 @@ fn main() {
     );
     if !bw_exe.exists() {
         if bw_is_this_accounts_vault {
-            fatal_startup_error(&format!(
-                "Deskwarden needs the Bitwarden CLI (bw.exe) and could not find it.\n\nExpected \
-                 it at:\n{}\n\nInstall the Bitwarden CLI, or reinstall Deskwarden (its \
-                 installer downloads a signed copy for you).",
+            // **A missing `bw.exe` is NOT fatal any more, and this is the
+            // line that had to change before the installer could stop
+            // bootstrapping one.**
+            //
+            // It used to end the process here with a fatal startup dialog,
+            // whose text told the user to "reinstall Deskwarden (its
+            // installer downloads a signed copy for you)". Both halves of
+            // that stopped being true on the same day: the installer no
+            // longer fetches the CLI, and `bw_acquire` does it from the
+            // sign-in window instead.
+            //
+            // (This comment deliberately does not SPELL the name of the
+            // function it is describing. The guard over this block scans raw
+            // source, so a mention in a comment reads exactly like a call --
+            // and loosening the guard to tell them apart would cost more
+            // than writing the sentence differently.)
+            //
+            // Left as it was, this arm would have **bricked every fresh
+            // install at first launch**. `backend_policy::choose(None, true)`
+            // is `BwServe` -- a fresh install has no account, so
+            // `startup_server_url` is `None`, and `None` is bitwarden.com by
+            // definition -- so `bw_is_this_accounts_vault` is true for
+            // exactly the user who has never run the app before, and the
+            // advice they would have been given is to reinstall the thing
+            // that just broke them.
+            //
+            // **What the fatal arm protected, and why nothing is lost.** It
+            // stopped the app opening "a window over nothing": a vault window
+            // whose backend cannot start. That is still true and still
+            // undesirable -- but it is now RECOVERABLE, in the one window the
+            // user has to pass through anyway. `login_ui`'s Submit path calls
+            // `bw_acquire::acquire_if_needed`, which downloads, verifies and
+            // installs a Bitwarden-signed copy to exactly the path this
+            // block just resolved, and then carries straight on into
+            // `bw config server` and `bw login`. So the condition is resolved
+            // at the moment a server is chosen, which is the first moment
+            // anybody knows it is needed.
+            //
+            // **The signature control is untouched**, and that is the half a
+            // reader should check first: nothing here weakens verification.
+            // A `bw.exe` that EXISTS is still graded by `check_bw_signature`
+            // below, refusing an unsigned or tampered one outright. What
+            // changed is only the treatment of ABSENCE, which was never a
+            // trust question -- there is nothing to verify -- and which is
+            // now a condition with a remedy instead of a dead end.
+            log::info!(
+                "no bw.exe at {}, and this account's vault is served by bw serve: signing in \
+                 to an official server will download, verify and install one",
                 bw_exe.display()
-            ));
+            );
+        } else {
+            log::info!(
+                "no bw.exe at {}, and this account does not need one: its vault is served by \
+                 talking to the server",
+                bw_exe.display()
+            );
         }
-        log::info!(
-            "no bw.exe at {}, and this account does not need one: its vault is served by \
-             talking to the server",
-            bw_exe.display()
-        );
     } else {
         // **Checked whenever it EXISTS, not only when it is the backend.**
         // This is a supply-chain control, and "we no longer need bw" must
@@ -15810,6 +15802,99 @@ mod tests {
     /// after an install) that nobody exercises while developing. Held by
     /// reading the file, which is what makes it a fact rather than a
     /// convention.
+    /// **The installer names no CLI.**
+    ///
+    /// The owner's rule, held by the file rather than by review: "fix the
+    /// installer - so it doesn't even ask about the bw cli". The installer
+    /// copies an app and finishes; the app acquires the Bitwarden CLI itself
+    /// when a server is chosen that needs it (`bw_acquire`).
+    ///
+    /// **The positive control is not optional decoration.** This test asserts
+    /// that a file does NOT contain some strings, which is exactly the
+    /// assertion that passes when the file could not be read, when the path
+    /// is wrong, and when `include_str!` picked up something empty. So it
+    /// first proves it is looking at the real installer.
+    #[test]
+    fn the_installer_says_nothing_about_the_bitwarden_cli() {
+        let iss = include_str!("../installer/deskwarden.iss");
+
+        // Control, first: this IS the installer, and it still does the things
+        // the installer exists to do.
+        assert!(iss.contains("deskwarden.exe"), "control: this is not the installer");
+        assert!(iss.contains("wordlist.txt"), "control: this is not the installer");
+        assert!(iss.contains("AppMutex"), "control: this is not the installer");
+
+        let lower = iss.to_lowercase();
+        for forbidden in [
+            "bw.exe",
+            "bootstrap-bw",
+            "bitwarden cli",
+            "bitwarden.com/help/cli",
+            r"\bin\bw",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "the installer still names {forbidden}: the user is being told about a \
+                 dependency they have not yet chosen to need, and every failure path that \
+                 mentioned it ended by sending them to install a command-line tool by hand"
+            );
+        }
+    }
+
+    /// **The installer runs no PowerShell, and starts no process at all.**
+    ///
+    /// This is the pin that closes the crate's SECOND Authenticode
+    /// mechanism. `signature.rs` verifies with `WinVerifyTrust`, and
+    /// `signature::verification_needs_no_external_process` pins that it does,
+    /// because `Get-AuthenticodeSignature` fails wherever
+    /// `Microsoft.PowerShell.Security` cannot autoload. The installer used
+    /// the PowerShell one, and hand-maintained a second X.500 DN parser to go
+    /// with it whose own doc admitted it was "kept in sync by hand with
+    /// `dn_component` in `src/signature.rs`". Together these two tests say,
+    /// from both ends: **this crate verifies Authenticode in one way, in one
+    /// place.**
+    #[test]
+    fn the_installer_shells_out_to_nothing() {
+        let iss = include_str!("../installer/deskwarden.iss");
+        assert!(iss.contains("deskwarden.exe"), "control: this is not the installer");
+        let lower = iss.to_lowercase();
+        for forbidden in ["powershell", "exec(", "extracttemporaryfile"] {
+            assert!(!lower.contains(forbidden), "the installer still shells out: {forbidden}");
+        }
+        // Control on the needles: they are spellings that WOULD have matched
+        // the installer as it stood before this change, rather than typos
+        // that can never fire. Asserted against a sample of the deleted
+        // code rather than against the live file, which by construction no
+        // longer contains them.
+        let as_it_was = "  if not Exec('powershell.exe', Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then\r\n  ExtractTemporaryFile('bootstrap-bw.ps1');";
+        let was_lower = as_it_was.to_lowercase();
+        for forbidden in ["powershell", "exec(", "extracttemporaryfile"] {
+            assert!(
+                was_lower.contains(forbidden),
+                "control: needle {forbidden:?} would not have matched the installer this test \
+                 was written to catch, so it can never fire"
+            );
+        }
+    }
+
+    /// The script is gone from the tree, not merely unreferenced.
+    ///
+    /// Control: its sibling still exists, read through the same join, so a
+    /// wrong directory cannot make this pass.
+    #[test]
+    fn the_bootstrap_script_is_not_in_the_tree() {
+        let installer = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("installer");
+        assert!(
+            installer.join("deskwarden.iss").exists(),
+            "control: wrong directory -- {} has no deskwarden.iss",
+            installer.display()
+        );
+        assert!(
+            !installer.join("bootstrap-bw.ps1").exists(),
+            "the bootstrap script is still shipped in the installer payload"
+        );
+    }
+
     #[test]
     fn the_installers_run_entry_passes_the_flag_the_app_reads() {
         let iss = include_str!("../installer/deskwarden.iss");
@@ -19514,18 +19599,40 @@ mod tests {
         );
     }
 
-    /// **A missing `bw.exe` is fatal only when `bw serve` is the vault.**
+    /// **A missing `bw.exe` is not fatal at all any more.**
     ///
-    /// The gate used to be unconditional, and it ran BEFORE `settings.json`
-    /// was read -- so it could not have been conditional even in principle.
-    /// A direct-REST account, which since 0.13.0 does not spawn the CLI even
-    /// to sign in, still could not start the app without it.
+    /// # What this needle used to say, and why it now asserts MORE
     ///
-    /// Ordering is what this pins, because ordering is what was wrong: the
-    /// settings read has to reach the gate, and the fatal arm has to sit
-    /// inside the backend condition rather than beside it.
+    /// This test used to be `a_missing_bw_is_only_fatal_when_bw_serve_is_the_
+    /// vault`, and it pinned an ORDERING: that `settings.json` was read
+    /// before the gate, and that the gate consulted
+    /// `bw_is_this_accounts_vault` before it reached `fatal_startup_error`.
+    /// It had a control asserting the fatal call was still there at all
+    /// ("control: the gate no longer refuses anything, on any backend").
+    ///
+    /// That control has been deliberately inverted, and the inversion is a
+    /// strengthening rather than a loosening. The old test permitted a fatal
+    /// exit on the `bw serve` arm and merely insisted it be conditional. This
+    /// one permits **no fatal exit on the missing-file path at all**, which
+    /// is a strictly smaller set of programs. The reason is that the
+    /// installer no longer bootstraps the CLI, so the `bw serve` arm is now
+    /// reached by every FRESH INSTALL at first launch --
+    /// `backend_policy::choose(None, true)` is `BwServe` -- and a fatal exit
+    /// there bricks the app before the user has chosen anything.
+    ///
+    /// The three things it holds, all of which the old one either permitted
+    /// or did not mention:
+    ///
+    /// 1. `settings.json` is still read before the gate (kept from the old
+    ///    test -- the gate still has to know the backend, to log the right
+    ///    thing and because the arm still exists).
+    /// 2. The gate reaches **no** `fatal_startup_error`, on either arm.
+    /// 3. `check_bw_signature` is still reached for a file that EXISTS. This
+    ///    is the one that matters most: "we no longer refuse a missing bw"
+    ///    must not become "we no longer check the bw we have", and those two
+    ///    are one edit apart in this block.
     #[test]
-    fn a_missing_bw_is_only_fatal_when_bw_serve_is_the_vault() {
+    fn a_missing_bw_is_not_fatal_and_a_present_one_is_still_verified() {
         let whole = include_str!("main.rs");
         let source = whole.split(concat!("#[cfg(", "test)]")).next().expect("a half");
 
@@ -19543,23 +19650,50 @@ mod tests {
         );
 
         let after = &source[gate..];
-        let fatal = after
-            .find(concat!("fatal_startup_", "error"))
-            .expect("control: the gate no longer refuses anything, on any backend");
-        let guard = after
-            .find("bw_is_this_accounts_vault")
-            .expect("the gate does not consult the backend choice at all");
-        assert!(
-            guard < fatal,
-            "the gate reaches `fatal_startup_error` before it consults the backend, so a \
-             direct-REST account still cannot start without a CLI it never uses"
-        );
+        // The gate's own block, up to the signature check that closes it.
+        // Bounded rather than "the rest of the file", or this would be
+        // asserting that `main.rs` contains no fatal exit anywhere, which is
+        // false and would make the test unmaintainable.
+        let signature_check = after
+            .find(concat!("check_bw_", "signature(&bw_exe)"))
+            .expect(
+                "the signature check went with the requirement. `we no longer refuse a missing \
+                 bw` must not become `we no longer check the bw we have`: an account switch can \
+                 make a bw serve account active later in this same process, and this is the \
+                 only place it is verified",
+            );
+        let gate_block = &after[..signature_check];
 
         assert!(
-            after.contains(concat!("check_bw_", "signature(&bw_exe)")),
-            "the signature check went with the requirement. `we no longer need bw` must not \
-             become `we no longer check bw`: an account switch can make a bw serve account \
-             active later in this same process, and this is the only place it is verified"
+            !gate_block.contains(concat!("fatal_startup_", "error")),
+            "a missing bw.exe is fatal again. `backend_policy::choose(None, true)` is \
+             `BwServe`, so this arm is reached by EVERY FRESH INSTALL at first launch now \
+             that the installer no longer bootstraps the CLI -- a fatal exit here bricks the \
+             app before the user has chosen a server, and the message it used to print told \
+             them to reinstall the thing that had just broken them. The condition is resolved \
+             by `bw_acquire` from the sign-in window instead; see the gate's own comment"
+        );
+
+        // Control on the slice, not on the property: the region really is the
+        // gate, and it really does still branch on the backend. Without this,
+        // a mis-located `gate` index would make the assertion above pass by
+        // scanning nothing at all -- which is the exact house defect, and a
+        // test asserting a string is ABSENT is its purest form.
+        assert!(
+            gate_block.contains("bw_is_this_accounts_vault"),
+            "control: this slice is not the gate -- it does not consult the backend choice"
+        );
+        assert!(
+            gate_block.len() > 200,
+            "control: the scanned region is {} bytes, which is too small to be the gate; the \
+             absence assertion above would pass on an empty string",
+            gate_block.len()
+        );
+        // And the control that proves the needle still matches live code
+        // somewhere, so it is not a typo that can never fire.
+        assert!(
+            source.contains(concat!("fatal_startup_", "error")),
+            "control: the needle no longer matches anything in this file at all"
         );
     }
 

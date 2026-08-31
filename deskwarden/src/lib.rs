@@ -49,6 +49,7 @@ pub mod breach_scan;
 /// source text to guard it, and nothing in it can ship.
 #[cfg(test)]
 pub mod debug_leak_guard;
+pub mod bw_acquire;
 pub mod bw_path;
 pub mod bw_serve;
 pub mod card_brand;

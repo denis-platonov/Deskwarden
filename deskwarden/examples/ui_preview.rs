@@ -1121,6 +1121,11 @@ impl Preview {
                     // existing account meets, so the first-run notice is not
                     // part of what this screenshots.
                     false,
+                    // No CLI-setup modal. The preview draws the sign-in
+                    // window's own states; the modal has its own states and
+                    // its own tests, and screenshotting it here would mean
+                    // this example decided which of them was worth seeing.
+                    None,
                 );
                 // Size to content, exactly as run_login_flow does, so the
                 // screenshot shows the window the app would show.

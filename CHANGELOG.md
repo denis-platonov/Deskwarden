@@ -14,6 +14,50 @@ The short version: if your vault lives on your own server, Deskwarden no
 longer needs Bitwarden's command-line program to do anything. It is faster to
 start, and there is one less thing installed on your PC.
 
+### Setup no longer installs the Bitwarden CLI -- Deskwarden asks, then does it
+
+Installing Deskwarden used to spend a wizard page, a minute of your time and
+about 37 MB of your connection downloading the Bitwarden CLI, before you had
+chosen a server that needs it. It does not any more. Setup copies the app and
+finishes.
+
+Instead, the first time you sign in to a Bitwarden server (bitwarden.com or
+bitwarden.eu), Deskwarden tells you plainly that the official Bitwarden CLI is
+required and asks whether to install it:
+
+- **OK** downloads it from Bitwarden, checks that Bitwarden signed it, and
+  installs it -- with a progress bar that names each step, not a spinner. It
+  then tells you the version and size of what landed, and continues the
+  sign-in you were already doing. You press Continue once.
+- **Cancel** goes back to the server choice. Nothing is downloaded, because
+  the question comes before the first byte.
+
+It happens once, ever. A self-hosted server with the built-in client never
+asks and never downloads anything, and a machine that already has a
+Bitwarden-signed `bw.exe` is not asked either.
+
+**What is checked, and what that is worth.** Bitwarden publishes no signature
+file and no checksum file for the CLI; what their documentation calls a
+checksum is GitHub's own per-asset digest, which arrives over the same
+connection as the download. Deskwarden checks it, and it catches a corrupted
+or truncated transfer -- but it proves integrity, not origin. The check that
+proves origin is the Authenticode signature on `bw.exe` itself, issued by a
+certificate authority that had to validate the name *Bitwarden Inc.* That is
+verified before the file is installed, and the file is never executed --
+not even to read its version. A download Deskwarden cannot prove came from
+Bitwarden is deleted, and it is not retried.
+
+If anything goes wrong, the message says which thing was required, that
+bitwarden.com cannot be used without it, and that a self-hosted server can.
+
+This also removes the second copy of a security check the app already had.
+The installer verified signatures with PowerShell and kept its own
+hand-maintained certificate-name parser "in sync by hand" with the app's.
+Both are gone: Deskwarden now verifies Authenticode in one way, in one place.
+
+Uninstalling still deliberately leaves `bw` and its `PATH` entry behind --
+you may be using it independently of Deskwarden.
+
 ### Your own server needs nothing but Deskwarden
 
 Deskwarden used to run Bitwarden's command-line program, `bw`, behind the

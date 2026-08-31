@@ -218,6 +218,28 @@ pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 # unwrap of an already-fetched org key is not the repeated-oracle exposure
 # that advisory is about, and `deny.toml` for the recorded decision.
 rsa = "0.9"
+# Reads `bw.exe` out of the `bw-windows-<version>.zip` Bitwarden publishes
+# (src/bw_acquire.rs). That archive is the ONLY form the CLI is distributed
+# in -- there is no bare-executable asset -- so an extractor is not optional
+# if the app is to acquire the CLI itself.
+#
+# `default-features = false` with only `deflate` is load-bearing, not
+# tidiness. The default feature set pulls in bzip2 (a C library), zstd,
+# lzma/xz, and AES + PBKDF2 decryption for encrypted archives: four more
+# format parsers and an FFI dependency, every one of them pointed at bytes
+# that arrived over the network, and none of them reachable by a Bitwarden
+# release asset, which is plain deflate. The surface this crate is allowed
+# is deliberately the smallest one that can open the file in question.
+#
+# `flate2` (with its pure-Rust `miniz_oxide` backend, no zlib C) is the only
+# meaningful transitive addition; `crc32fast` comes with it.
+#
+# Note what this dependency is NOT trusted for: nothing it returns is
+# executed. The extracted file is Authenticode-verified
+# (`signature::verify_authenticode`) before it is copied to the install path,
+# and it is never run -- not even `bw --version` -- so a malformed archive
+# yields a refusal, not a process.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 # OPTIONAL, AND OFF IN EVERY BUILD THAT SHIPS. The engine behind
 # `test_http::Matcher::Regex`, which five call sites use. It is named here as
 # well as in `[dev-dependencies]` because `test_http` has to compile in two
