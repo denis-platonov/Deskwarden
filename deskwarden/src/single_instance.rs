@@ -808,8 +808,30 @@ mod tests {
 
     // The substituted world. `fn` pointers cannot capture, so the script each
     // test wants is kept in statics and reset by the test that reads it.
-    // Every test below is `#[serial]`-free by construction: each uses its own
-    // pair of counters and no two tests share one.
+    //
+    // The four counters below are process-wide and the runner executes tests
+    // in parallel, so a test that touches ANY of them must hold [`SERIALISE`]
+    // from before its `reset` until after its last read of them. The claim
+    // that used to stand here -- that each test kept its own pair and no two
+    // shared one -- was never true of these four, and the hole was live: one
+    // test's `reset` landing between another's `reset` and its assertions is
+    // how `a_first_instance_that_cannot_be_asked_is_not_waited_for` was seen
+    // to fail on `POLLS == 0` in one full-suite run out of fourteen.
+    //
+    // "Touches" is wider than it looks, and wider than the cut further down
+    // suggests. `forcing_env` wires `sleep: sleeps` for EVERY caller, so each
+    // test on the forced path below writes `SLEEPS` even though it brings its
+    // own ask and poll counters; two of those also pass `asks_and_is_not_heard`
+    // and so write `ASKS`. Those tests assert nothing about the shared four,
+    // but the tests that DO assert about them cannot survive the writes.
+    //
+    // Poison is deliberately ignored, the way `vault_service::tests::SERIALISE`
+    // and `backend_policy::tests::ENV_LOCK` ignore it. A panicking test poisons
+    // this lock, and every later test failing to acquire it would report the
+    // first failure over and over instead of its own -- turning one red test
+    // into a screenful of them, all naming the wrong seam.
+    static SERIALISE: Mutex<()> = Mutex::new(());
+
     static ASKS: AtomicU32 = AtomicU32::new(0);
     static SLEEPS: AtomicU32 = AtomicU32::new(0);
     static POLLS: AtomicU32 = AtomicU32::new(0);
@@ -883,6 +905,7 @@ mod tests {
     /// that always returned `Sole` satisfies "a lone launch starts".
     #[test]
     fn a_lone_launch_asks_nobody_and_starts() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset(1);
         let env = env(asks_and_is_heard, free_after_the_script);
         assert_eq!(resolve(Ok(Acquired::First), &env), Startup::Sole);
@@ -899,6 +922,7 @@ mod tests {
     /// relaunch feel broken.
     #[test]
     fn a_second_launch_asks_the_first_to_go_and_becomes_the_only_one() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset(2);
         let env = env(asks_and_is_heard, free_after_the_script);
         assert_eq!(
@@ -918,6 +942,7 @@ mod tests {
     /// `GaveUp` rather than in a second instance carrying on regardless.
     #[test]
     fn an_outgoing_instance_that_will_not_go_stops_this_one() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset(0);
         let env = env(asks_and_is_heard, never_free);
         assert_eq!(
@@ -958,6 +983,10 @@ mod tests {
     /// symptom would point here.
     #[test]
     fn the_wait_starts_by_letting_go_of_this_process_s_own_handle() {
+        // Asserts only on its own two counters, but `asks_and_is_heard` and
+        // `sleeps` write the shared `ASKS` and `SLEEPS`, so running beside a
+        // test that reads those would break THAT test rather than this one.
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         let env = TakeoverEnv {
             ask_to_quit: asks_and_is_heard,
             let_go: releases_the_handle,
@@ -980,6 +1009,7 @@ mod tests {
     /// refuses -- and refuses without having polled once.
     #[test]
     fn a_first_instance_that_cannot_be_asked_is_not_waited_for() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset(1);
         let env = env(asks_and_is_not_heard, free_after_the_script);
         assert_eq!(
@@ -991,10 +1021,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The forced path. Every test below keeps its OWN statics: the four at the
-    // top of this module are shared by the tests above, and a counter shared
-    // between tests the runner may execute in parallel proves nothing about
-    // either of them.
+    // The forced path. Every test below keeps its OWN ask and poll counters:
+    // the four at the top of this module are shared by the tests above, and a
+    // counter shared between tests the runner may execute in parallel proves
+    // nothing about either of them.
+    //
+    // That is not the same as touching nothing shared. `forcing_env` wires
+    // `sleep: sleeps`, so each of these still writes the shared `SLEEPS`, and
+    // the last two also write the shared `ASKS` through
+    // `asks_and_is_not_heard`. They therefore take [`SERIALISE`] as well --
+    // not to protect their own assertions, which own counters already do, but
+    // to keep their writes out of the middle of a test above that reads them.
     // -----------------------------------------------------------------------
 
     /// **Nobody listening: ended by force, and the launch continues.**
@@ -1009,6 +1046,7 @@ mod tests {
     /// free and could not reach `TookOver` at all.
     #[test]
     fn an_instance_with_nobody_listening_is_ended_by_force_and_the_launch_starts() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         static ASKS: AtomicU32 = AtomicU32::new(0);
         static FORCES: AtomicU32 = AtomicU32::new(0);
         static FORCES_WHEN_ASKED: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -1054,6 +1092,7 @@ mod tests {
     /// when force ran -- the whole graceful bound, not a shortcut to the kill.
     #[test]
     fn an_instance_that_does_not_answer_is_asked_first_and_only_then_forced() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         static ASKS: AtomicU32 = AtomicU32::new(0);
         static FORCES: AtomicU32 = AtomicU32::new(0);
         static POLLS: AtomicU32 = AtomicU32::new(0);
@@ -1105,6 +1144,7 @@ mod tests {
     /// exactly why the two tests above it exist.
     #[test]
     fn a_first_instance_that_stands_down_is_never_forced() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         static FORCES: AtomicU32 = AtomicU32::new(0);
         static POLLS: AtomicU32 = AtomicU32::new(0);
 
@@ -1141,6 +1181,7 @@ mod tests {
     /// that never happened and start a second Deskwarden alongside the first.
     #[test]
     fn a_refused_termination_does_not_become_a_second_deskwarden() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         static POLLS: AtomicU32 = AtomicU32::new(0);
         static FORCES: AtomicU32 = AtomicU32::new(0);
 
@@ -1175,6 +1216,7 @@ mod tests {
     /// exactly `FORCE_TIMEOUT` worth of polling and not one poll more.
     #[test]
     fn an_ended_instance_whose_name_stays_held_stops_this_one() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         static POLLS: AtomicU32 = AtomicU32::new(0);
 
         fn ends_one() -> usize {
@@ -1269,6 +1311,9 @@ mod tests {
     /// call `app_mutex::acquire`'s own docs make about its failure.
     #[test]
     fn a_mutex_that_could_not_be_created_does_not_stop_the_app() {
+        // The one test past the forced-path cut that is not on that path: it
+        // shares the four counters outright, `reset` and asserted `ASKS` both.
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         reset(1);
         let env = env(asks_and_is_heard, free_after_the_script);
         assert_eq!(resolve(Err("access denied".to_string()), &env), Startup::Sole);
