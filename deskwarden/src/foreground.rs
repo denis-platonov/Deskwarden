@@ -1309,7 +1309,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 74] = [
+        const OPENS_NO_WINDOW: [&str; 75] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1513,6 +1513,10 @@ mod tests {
             // hand-rolled mock HTTP server. A TCP listener on loopback is not
             // a window and raises nothing.
             "test_http",
+            // Test-only at its declaration in `lib.rs`, like `test_http`: a
+            // scratch directory under `%TEMP%` and the `Drop` that removes it.
+            // It creates directories, not windows.
+            "test_scratch",
             "theme",
             "tray",
             // The About page's update flow: a state machine, two worker

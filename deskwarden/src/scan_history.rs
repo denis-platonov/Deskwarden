@@ -283,14 +283,26 @@ mod tests {
     /// here has to remember; this is the same guarantee made once, where the
     /// path is handed out, so a test cannot be written without it. Nothing is
     /// weakened: a test that wants content on disk writes it on the next line.
-    fn temp_path(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("deskwarden-scan-history-tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("{tag}-{}.json", std::process::id()));
-        // Not `expect`: an absent file is the state being established, and
-        // `remove_file` reports that as an error.
-        let _ = std::fs::remove_file(&path);
-        path
+    /// **This is the helper whose leftovers caused the failure above**, and it
+    /// is now [`crate::test_scratch::ScratchDir`]'s job. The removal on the way
+    /// in used to be the whole guarantee; the directory itself was one shared
+    /// `deskwarden-scan-history-tests` that nothing ever deleted, and the file
+    /// in it was namespaced by `std::process::id()` alone -- which is what
+    /// Windows recycled.
+    ///
+    /// A guard settles both halves at once. Each call gets a directory of its
+    /// own, named by pid AND a per-process seed AND a counter, so no earlier
+    /// run's file can be sitting at the path this one is about to read; and
+    /// the directory goes when the guard does, so nothing accumulates to be
+    /// recycled into in the first place. The removal on the way in is gone
+    /// because a fresh directory cannot contain a stale file.
+    ///
+    /// The guard is returned WITH the path and the caller must bind it:
+    /// `let (_dir, path) = temp_path("x");`.
+    fn temp_path(tag: &str) -> (crate::test_scratch::ScratchDir, PathBuf) {
+        let dir = crate::test_scratch::ScratchDir::new(&format!("scan-history-{tag}"));
+        let path = dir.join("history.json");
+        (dir, path)
     }
 
     fn at(millis: i64) -> ScanRecord {
@@ -299,7 +311,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_an_empty_history_and_not_an_error() {
-        let path = temp_path("absent");
+        let (_dir, path) = temp_path("absent");
         let _ = std::fs::remove_file(&path);
         let loaded = ScanHistory::load(&path);
         assert_eq!(loaded, ScanHistory::default());
@@ -311,7 +323,7 @@ mod tests {
     /// `Settings::load` treats it.
     #[test]
     fn an_empty_file_is_an_empty_history() {
-        let path = temp_path("empty");
+        let (_dir, path) = temp_path("empty");
         std::fs::write(&path, "").unwrap();
         assert!(ScanHistory::load(&path).entries.is_empty());
         std::fs::write(&path, "   \n\t ").unwrap();
@@ -320,7 +332,7 @@ mod tests {
 
     #[test]
     fn an_unparseable_file_is_an_empty_history_and_does_not_block_the_next_write() {
-        let path = temp_path("garbage");
+        let (_dir, path) = temp_path("garbage");
         std::fs::write(&path, "{ this is not json").unwrap();
         assert!(ScanHistory::load(&path).entries.is_empty());
         // **The difference from `Settings`, asserted rather than described.**
@@ -336,7 +348,7 @@ mod tests {
     /// history away.
     #[test]
     fn an_older_file_without_the_newer_counts_reads_them_as_zero() {
-        let path = temp_path("older");
+        let (_dir, path) = temp_path("older");
         std::fs::write(&path, r#"{"entries":[{"finished_at_unix_millis":1700000000000}]}"#)
             .unwrap();
         let loaded = ScanHistory::load(&path);
@@ -350,14 +362,14 @@ mod tests {
     /// A file from before this feature existed at all: no `entries` key.
     #[test]
     fn a_file_with_no_entries_key_is_an_empty_history() {
-        let path = temp_path("no-entries-key");
+        let (_dir, path) = temp_path("no-entries-key");
         std::fs::write(&path, r#"{"something_else": 3}"#).unwrap();
         assert!(ScanHistory::load(&path).entries.is_empty());
     }
 
     #[test]
     fn a_record_round_trips_through_disk_under_its_own_field_names() {
-        let path = temp_path("round-trip");
+        let (_dir, path) = temp_path("round-trip");
         let written = ScanRecord {
             // Deliberately five DIFFERENT numbers: a writer that assigned one
             // field from another would round-trip identically through any
@@ -384,7 +396,7 @@ mod tests {
 
     #[test]
     fn the_newest_scan_is_first() {
-        let path = temp_path("order");
+        let (_dir, path) = temp_path("order");
         let _ = std::fs::remove_file(&path);
         append(&path, at(1)).unwrap();
         append(&path, at(2)).unwrap();
@@ -401,7 +413,7 @@ mod tests {
 
     #[test]
     fn the_history_is_capped_and_the_oldest_falls_off() {
-        let path = temp_path("cap");
+        let (_dir, path) = temp_path("cap");
         let _ = std::fs::remove_file(&path);
         for i in 0..(MAX_ENTRIES as i64 + 5) {
             append(&path, at(i)).unwrap();
@@ -425,7 +437,7 @@ mod tests {
     /// larger cap -- has to come back under the cap rather than stay over it.
     #[test]
     fn an_over_long_file_is_trimmed_on_the_next_write() {
-        let path = temp_path("over-long");
+        let (_dir, path) = temp_path("over-long");
         let over = ScanHistory {
             entries: (0..(MAX_ENTRIES as i64 * 3)).rev().map(at).collect(),
         };

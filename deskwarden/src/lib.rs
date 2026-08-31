@@ -160,6 +160,14 @@ pub mod single_instance;
 /// no `test_http` in it.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_http;
+/// The one scratch directory every test in this crate writes into, and the
+/// `Drop` guard that removes it -- including when the test panics, which is
+/// the case every hand-rolled tidy-up at the end of a test body missed.
+/// Test-only at the declaration, and gated like [`test_http`] above for
+/// exactly its reason: `main.rs` is a separate crate linking this library
+/// built WITHOUT `cfg(test)`, and it has scratch directories of its own.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_scratch;
 /// Seeding a [`vault_cache::VaultCache`] for a test with no backend at all --
 /// no mock server, no port, no round-trip. Test-only at the declaration,
 /// exactly like [`below_cut`], so nothing in it can ship; gated like

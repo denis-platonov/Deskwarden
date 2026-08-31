@@ -731,15 +731,27 @@ mod tests {
 
     /// A context whose logo policy points at a directory holding exactly
     /// `files`, with the setting `enabled`.
-    fn ctx_with_marks(enabled: bool, files: &[(CardBrand, Vec<u8>)]) -> egui::Context {
+    ///
+    /// **The directory comes back with the context and the caller must bind
+    /// it.** The policy holds a path, not the files, and every mark is read
+    /// off disk at paint time -- so a guard dropped here would delete the
+    /// fixture before the first frame, and every test below would pass or fail
+    /// on an empty directory rather than on the images it wrote.
+    fn ctx_with_marks(
+        enabled: bool,
+        files: &[(CardBrand, Vec<u8>)],
+    ) -> (egui::Context, crate::test_scratch::ScratchDir) {
         let dir = tempdir("card-mark");
         for (brand, bytes) in files {
             let name = crate::brand_mark::file_name(*brand).expect("a brand with a file name");
             std::fs::write(dir.join(name), bytes).expect("the fixture was written");
         }
         let ctx = ctx();
-        install_logo_policy(&ctx, LogoPolicy { enabled, dirs: Arc::new(vec![dir]) });
-        ctx
+        install_logo_policy(
+            &ctx,
+            LogoPolicy { enabled, dirs: Arc::new(vec![dir.to_path_buf()]) },
+        );
+        (ctx, dir)
     }
 
     /// Paints one mark and reports what really reached the screen: the words,
@@ -773,7 +785,7 @@ mod tests {
     /// nothing if the image path never draws an image under any circumstances.
     #[test]
     fn a_valid_file_with_the_setting_on_draws_the_image_and_not_the_word() {
-        let ctx = ctx_with_marks(true, &[(CardBrand::Visa, isolated_png(96, 48, 24))]);
+        let (ctx, _marks) = ctx_with_marks(true, &[(CardBrand::Visa, isolated_png(96, 48, 24))]);
         let (words, images) = painted(&ctx, CardBrand::Visa, MARK_ROW_HEIGHT);
         assert!(
             images.len() == 1,
@@ -793,10 +805,11 @@ mod tests {
     fn the_setting_off_draws_the_word_even_with_a_perfectly_good_file_present() {
         let files = [(CardBrand::Visa, isolated_png(96, 48, 24))];
         // The control: the very same fixture, with the setting on, is a logo.
-        let (_, drawn) = painted(&ctx_with_marks(true, &files), CardBrand::Visa, MARK_ROW_HEIGHT);
+        let (on_ctx, _on_marks) = ctx_with_marks(true, &files);
+        let (_, drawn) = painted(&on_ctx, CardBrand::Visa, MARK_ROW_HEIGHT);
         assert_eq!(drawn.len(), 1, "the premise: this fixture does draw as a logo");
 
-        let ctx = ctx_with_marks(false, &files);
+        let (ctx, _marks) = ctx_with_marks(false, &files);
         let (words, images) = painted(&ctx, CardBrand::Visa, MARK_ROW_HEIGHT);
         assert!(images.is_empty(), "a logo was drawn with the preference off");
         assert_eq!(words, vec![CardBrand::Visa.wordmark().to_string()]);
@@ -807,7 +820,7 @@ mod tests {
     /// "no directory".
     #[test]
     fn a_brand_with_no_file_draws_its_word_while_its_neighbour_draws_a_logo() {
-        let ctx = ctx_with_marks(true, &[(CardBrand::Visa, isolated_png(96, 48, 24))]);
+        let (ctx, _marks) = ctx_with_marks(true, &[(CardBrand::Visa, isolated_png(96, 48, 24))]);
         let (words, images) = painted(&ctx, CardBrand::Mastercard, MARK_ROW_HEIGHT);
         assert!(images.is_empty(), "a logo was drawn for a brand with no file");
         assert_eq!(words, vec![CardBrand::Mastercard.wordmark().to_string()]);
@@ -843,7 +856,7 @@ mod tests {
             ("more pixels than we will decode", oversized_header),
         ];
         for (why, bytes) in refusals {
-            let ctx = ctx_with_marks(true, &[(CardBrand::Jcb, bytes)]);
+            let (ctx, _marks) = ctx_with_marks(true, &[(CardBrand::Jcb, bytes)]);
             let (words, images) = painted(&ctx, CardBrand::Jcb, MARK_ROW_HEIGHT);
             assert!(images.is_empty(), "a mark {why} was drawn anyway");
             assert_eq!(
@@ -864,7 +877,7 @@ mod tests {
         // Deliberately different in every dimension a file can differ in:
         // different pixel sizes, different aspect ratios, and lettering that
         // is 100% of one image and 40% of the other.
-        let ctx = ctx_with_marks(
+        let (ctx, _marks) = ctx_with_marks(
             true,
             &[
                 (CardBrand::Visa, isolated_png(120, 60, 30)),
@@ -923,7 +936,7 @@ mod tests {
     /// galley with a logo in the box.
     #[test]
     fn a_logo_takes_the_line_and_the_box_height_the_word_would_have_had() {
-        let ctx = ctx_with_marks(true, &[(CardBrand::Visa, on_ground_png(240, 80, 32))]);
+        let (ctx, _marks) = ctx_with_marks(true, &[(CardBrand::Visa, on_ground_png(240, 80, 32))]);
         let (word_ink, height) = with_ui_on(&ctx, |ui| {
             let word = word_galley(ui, CardBrand::Visa, MARK_ROW_HEIGHT);
             let (top, bottom) = theme::ink_band_y(&word).expect("the word has ink");
@@ -966,7 +979,7 @@ mod tests {
         });
         // Twenty to one, which no real mark is: the point is that the bound
         // holds without knowing what a user will drop in.
-        let ctx = ctx_with_marks(true, &[(CardBrand::Discover, on_ground_png(1000, 50, 20))]);
+        let (ctx, _marks) = ctx_with_marks(true, &[(CardBrand::Discover, on_ground_png(1000, 50, 20))]);
         let drawn = with_ui_on(&ctx, |ui| mark_width(ui, CardBrand::Discover, MARK_ROW_HEIGHT));
         assert!(
             drawn <= widest,
@@ -993,7 +1006,7 @@ mod tests {
         let watching = ctx();
         install_logo_policy(
             &watching,
-            LogoPolicy { enabled: true, dirs: Arc::new(vec![dir.clone()]) },
+            LogoPolicy { enabled: true, dirs: Arc::new(vec![dir.to_path_buf()]) },
         );
         let name = crate::brand_mark::file_name(CardBrand::Maestro).expect("a name");
 
@@ -1015,7 +1028,7 @@ mod tests {
         // read and rejected is not re-read on a timer forever.
         let refused = tempdir("recheck-refused");
         let second = ctx();
-        install_logo_policy(&second, LogoPolicy { enabled: true, dirs: Arc::new(vec![refused.clone()]) });
+        install_logo_policy(&second, LogoPolicy { enabled: true, dirs: Arc::new(vec![refused.to_path_buf()]) });
         let name = crate::brand_mark::file_name(CardBrand::Jcb).expect("a name");
         std::fs::write(refused.join(&name), b"not a PNG").expect("write");
         let (_, images) = painted(&second, CardBrand::Jcb, MARK_ROW_HEIGHT);

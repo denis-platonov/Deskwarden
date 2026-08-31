@@ -514,7 +514,7 @@ pub(crate) mod tests {
         let dir = tempdir("missing");
         std::fs::create_dir_all(&dir).expect("dir");
         assert!(
-            matches!(load(&[dir], CardBrand::Jcb), MarkLoad::Missing),
+            matches!(load(&[dir.to_path_buf()], CardBrand::Jcb), MarkLoad::Missing),
             "an absent file must be Missing: `Refused` is terminal for the session, and a \
              directory the user is about to drop a file into is not"
         );
@@ -527,7 +527,7 @@ pub(crate) mod tests {
         let name = file_name(CardBrand::Visa).expect("a name");
         std::fs::write(dir.join(&name), vec![0u8; MAX_MARK_BYTES as usize + 1]).expect("write");
         assert!(
-            matches!(load(&[dir], CardBrand::Visa), MarkLoad::Refused(Refusal::TooManyBytes)),
+            matches!(load(&[dir.to_path_buf()], CardBrand::Visa), MarkLoad::Refused(Refusal::TooManyBytes)),
             "a file over the byte bound was not refused on its size"
         );
     }
@@ -558,7 +558,7 @@ pub(crate) mod tests {
         let name = file_name(CardBrand::Maestro).expect("a name");
         std::fs::write(dir.join(&name), b"this is not a PNG, it is a sentence").expect("write");
         assert!(
-            matches!(load(&[dir], CardBrand::Maestro), MarkLoad::Refused(Refusal::Undecodable)),
+            matches!(load(&[dir.to_path_buf()], CardBrand::Maestro), MarkLoad::Refused(Refusal::Undecodable)),
             "a non-PNG was not refused"
         );
     }
@@ -634,13 +634,14 @@ pub(crate) mod tests {
     /// `%APPDATA%\\Deskwarden`**: every test here writes files, and the one
     /// directory this app's real marks would live in is the one no test may
     /// touch.
-    pub(crate) fn tempdir(tag: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("deskwarden-marks-{tag}-{unique}"));
-        std::fs::create_dir_all(&dir).expect("a temp directory");
-        dir
+    /// **Removed when the returned guard drops**, panic included. The card
+    /// art these tests write is why: a run left twenty-six `deskwarden-marks-*`
+    /// directories behind, and the `visa.png`, `mastercard.png` and `jcb.png`
+    /// files inside them were 7,438 of the files found abandoned in `%TEMP%`.
+    ///
+    /// Bind the result -- `let dir = tempdir("x");` -- rather than using it in
+    /// place: the directory lives exactly as long as the binding does.
+    pub(crate) fn tempdir(tag: &str) -> crate::test_scratch::ScratchDir {
+        crate::test_scratch::ScratchDir::new(&format!("marks-{tag}"))
     }
 }

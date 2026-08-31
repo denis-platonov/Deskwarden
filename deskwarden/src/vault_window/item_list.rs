@@ -4795,7 +4795,11 @@ mod row_tile_tests {
     /// directory and never the real one**: these are files this test wrote,
     /// and the Deskwarden folder under `%APPDATA%` is not somewhere a test may
     /// look.
-    fn marks_dir(files: &[(CardBrand, Vec<u8>)]) -> std::path::PathBuf {
+    ///
+    /// The guard comes back rather than the path: the marks are read off disk
+    /// at paint time, so the directory has to outlive the paint, and it is the
+    /// caller's binding that decides when it goes.
+    fn marks_dir(files: &[(CardBrand, Vec<u8>)]) -> crate::test_scratch::ScratchDir {
         let dir = crate::brand_mark::tests::tempdir("item-list");
         for (brand, bytes) in files {
             let name = crate::brand_mark::file_name(*brand).expect("a brand with a file name");
@@ -4844,7 +4848,7 @@ mod row_tile_tests {
             card_branded("Amex card", "Amex"),
             card_branded("JCB card", "JCB"),
         ];
-        let p = paint_with_marks(&items, PANE_WIDTH, dir);
+        let p = paint_with_marks(&items, PANE_WIDTH, dir.to_path_buf());
         let rows: Vec<egui::Rect> = row_tiles(&p).iter().map(|r| r.rect).collect();
         assert_eq!(rows.len(), 4);
 
@@ -4909,7 +4913,7 @@ mod row_tile_tests {
                 let mut item = card_branded(NAME, "Mastercard");
                 item.card.as_mut().unwrap().number =
                     Some(zeroize::Zeroizing::new("5555555555554444".to_string()));
-                let p = paint_with_marks(&[item], width, dir);
+                let p = paint_with_marks(&[item], width, dir.to_path_buf());
                 let row = row_tiles_of_width(&p, width)[0].rect;
                 let title = ink_centre_of(&p, NAME);
                 let Some(logo) = logos_in(&p, row).first().copied() else {
@@ -4952,8 +4956,8 @@ mod row_tile_tests {
             CardBrand::Mastercard,
             crate::brand_mark::tests::on_ground_png(300, 100, 46),
         )]);
-        let with = paint_with_marks(&[marked], PANE_WIDTH, dir.clone());
-        let without = paint_with_marks(&[unmarked], PANE_WIDTH, dir);
+        let with = paint_with_marks(&[marked], PANE_WIDTH, dir.to_path_buf());
+        let without = paint_with_marks(&[unmarked], PANE_WIDTH, dir.to_path_buf());
         let row = row_tiles(&with)[0].rect;
         let logo = logos_in(&with, row);
         assert_eq!(logo.len(), 1, "the premise: this row drew a logo");
@@ -5366,7 +5370,7 @@ mod row_tile_tests {
             ("a word mark", paint_at_width(&[card_branded(NAME, "Mastercard")], None, NARROW)),
             ("a wide logo", {
                 let dir = marks_dir(&[(CardBrand::Mastercard, wide_logo.clone())]);
-                paint_with_marks(&[card_branded(NAME, "Mastercard")], NARROW, dir)
+                paint_with_marks(&[card_branded(NAME, "Mastercard")], NARROW, dir.to_path_buf())
             }),
         ] {
             let tile = one_tile_of_width(&p, NARROW - 2.0 * LIST_PADDING);
@@ -5413,7 +5417,7 @@ mod row_tile_tests {
         // pane. At the REAL pane, where the mark is drawn rather than stood
         // aside, it comes out at 4x the height and no more.
         let dir = marks_dir(&[(CardBrand::Mastercard, wide_logo)]);
-        let real = paint_with_marks(&[card_branded(NAME, "Mastercard")], PANE_WIDTH, dir);
+        let real = paint_with_marks(&[card_branded(NAME, "Mastercard")], PANE_WIDTH, dir.to_path_buf());
         let row = row_tiles(&real)[0].rect;
         let logo = logos_in(&real, row);
         assert_eq!(logo.len(), 1, "the real pane must draw the logo: {logo:?}");

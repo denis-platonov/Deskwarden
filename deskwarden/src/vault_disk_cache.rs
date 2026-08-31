@@ -2098,19 +2098,26 @@ pub(crate) mod tests {
 
     // -- the file on disk --------------------------------------------------
 
-    /// A unique scratch directory. `temp_dir()` + nanos, the pattern the rest
-    /// of the suite uses, and **never** the real config directory: nothing
-    /// here may go near the user's own vault cache.
-    pub(crate) fn temp_dir_for(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "deskwarden-diskcache-test-{name}-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A unique scratch directory, **removed when the returned guard drops**,
+    /// and **never** the real config directory: nothing here may go near the
+    /// user's own vault cache.
+    ///
+    /// This used to be `temp_dir()` + a nanosecond stamp with no cleanup at
+    /// all, and it was the worst leak in the suite by volume: a single `--lib`
+    /// run left 59 `deskwarden-diskcache-test-*` directories behind, and the
+    /// `vault-cache.bin` and `vault-cache-key.bin` files under them were the
+    /// largest share of the 643.7 MB found in the author's `%TEMP%`. The
+    /// nanosecond stamp was never the problem -- it made the names unique
+    /// enough -- so the fix is not another name, it is
+    /// [`crate::test_scratch::ScratchDir`]'s `Drop`.
+    ///
+    /// **Callers must bind the result**, not just use it and drop it in the
+    /// same expression: `let dir = temp_dir_for("x");` keeps the directory
+    /// alive for the test, while `temp_dir_for("x").join("f")` would delete it
+    /// before the `join` was ever used. It derefs to `Path`, so every call
+    /// site that held a `PathBuf` reads exactly as it did.
+    pub(crate) fn temp_dir_for(name: &str) -> crate::test_scratch::ScratchDir {
+        crate::test_scratch::ScratchDir::new(&format!("diskcache-test-{name}"))
     }
 
     /// Writes a file directly, bypassing the key state, so the load-side

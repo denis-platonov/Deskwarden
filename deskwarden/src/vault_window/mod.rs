@@ -19181,16 +19181,14 @@ mod account_details_tests {
     /// (`card-hit`, twice). A counter removes the need for label discipline
     /// rather than asking every future author to remember it; the label
     /// stays only so a leftover directory names the test that made it.
-    fn icon_routing_cache_dir(label: &str) -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "deskwarden-test-icon-routing-{label}-{}-{nth}",
-            std::process::id()
-        ));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).expect("test cache dir");
-        dir
+    ///
+    /// **That counter is now [`crate::test_scratch::ScratchDir`]'s**, which is
+    /// where it belongs: the argument above was never specific to icons, and
+    /// every other scratch directory in this crate wanted it too. The guard
+    /// also removes the directory on the way out, so this fixture no longer
+    /// needs the manual `remove_dir_all` that only ran when nothing panicked.
+    fn icon_routing_cache_dir(label: &str) -> crate::test_scratch::ScratchDir {
+        crate::test_scratch::ScratchDir::new(&format!("test-icon-routing-{label}"))
     }
 
     /// A tiny opaque PNG -- enough for `decode_rgba` to succeed, which is the
@@ -19260,7 +19258,9 @@ mod account_details_tests {
         );
 
         let loaded = icons.textures.contains_key(&item.id);
-        std::fs::remove_dir_all(&dir).ok();
+        // `dir` is a guard: it removes itself here, and equally if
+        // `ensure_icon_loaded` above had panicked, which the manual
+        // `remove_dir_all` that used to be on this line could not.
         (loaded, requested.contains(&item.id))
     }
 
@@ -20878,31 +20878,17 @@ mod export_wiring {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    /// A scratch directory, removed on drop. Same idiom as `vault_export`'s
-    /// own tests -- this crate has no `tempfile` dev-dependency.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "deskwarden-export-wiring-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("a scratch directory under the system temp dir");
-            Self(dir)
-        }
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    /// A scratch directory, removed on drop.
+    ///
+    /// This used to be a newtype of its own, with the same `Drop` and a name
+    /// built from the tag, the pid and the thread id. It is now an alias for
+    /// the crate-wide guard, which does the same thing and one more: its name
+    /// carries a per-process counter, so two of these with the SAME tag are
+    /// two directories. Under the old name they were one, and whichever
+    /// dropped first deleted the other's files -- the failure
+    /// `icon_routing_cache_dir` above has recorded in its own doc, from when
+    /// it had this shape.
+    type TempDir = crate::test_scratch::ScratchDir;
 
     /// Everything before the first `#[cfg(test)]`, split with `concat!` so
     /// this needle is not itself the first occurrence.
@@ -23313,7 +23299,7 @@ mod export_wiring {
             Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
                 "http://127.0.0.1:1",
             ))),
-            crate::fill_stats::FillStats::new(dir.0.join("fill-stats.json")),
+            crate::fill_stats::FillStats::new(dir.join("fill-stats.json")),
             crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
@@ -23321,7 +23307,7 @@ mod export_wiring {
                 server_url: None,
             },
             HARNESS_SESSION.to_string(),
-            dir.0.join("icons"),
+            dir.join("icons"),
             // So the auto-lock countdown cannot end the session underneath
             // the frames below.
             AutoLock::Never,
@@ -23334,7 +23320,7 @@ mod export_wiring {
                 no_send_list,
                 // Under the scratch directory, so no frame reads or writes
                 // the real per-user application data directory.
-                Some(dir.0.join("settings.json")),
+                Some(dir.join("settings.json")),
             ),
         );
 
@@ -23490,14 +23476,14 @@ mod export_wiring {
             Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
                 "http://127.0.0.1:1",
             ))),
-            crate::fill_stats::FillStats::new(dir.0.join("fill-stats.json")),
+            crate::fill_stats::FillStats::new(dir.join("fill-stats.json")),
             crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
                 server_url: None,
             },
             HARNESS_SESSION.to_string(),
-            dir.0.join("icons"),
+            dir.join("icons"),
             AutoLock::Never,
             true,
             Some(harness_accounts()),
@@ -23506,7 +23492,7 @@ mod export_wiring {
                 no_sync,
                 loads_an_empty_vault,
                 no_send_list,
-                Some(dir.0.join("settings.json")),
+                Some(dir.join("settings.json")),
             ),
         );
 
@@ -23670,7 +23656,7 @@ mod export_wiring {
             Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
                 "http://127.0.0.1:1",
             ))),
-            crate::fill_stats::FillStats::new(dir.0.join("fill-stats.json")),
+            crate::fill_stats::FillStats::new(dir.join("fill-stats.json")),
             crate::login_ui::BwStatusDetails {
                 status: crate::login_ui::BwStatus::Unlocked,
                 user_email: Some("harness@example.invalid".to_string()),
@@ -23678,7 +23664,7 @@ mod export_wiring {
                 server_url: None,
             },
             HARNESS_SESSION.to_string(),
-            dir.0.join("icons"),
+            dir.join("icons"),
             // So the auto-lock countdown cannot end the session underneath
             // the clicks.
             AutoLock::Never,
@@ -23694,7 +23680,7 @@ mod export_wiring {
                     no_send_list,
                     // Under the scratch directory, so no frame reads or
                     // writes the real `%APPDATA%\Deskwarden`.
-                    Some(dir.0.join("settings.json")),
+                    Some(dir.join("settings.json")),
                 ),
                 frame_spawn,
             ),
@@ -24261,7 +24247,7 @@ mod export_wiring {
         ];
 
         for (tag, expected, writes_envelope, raw) in cases {
-            let destination = dir.0.join(format!("{tag}.json"));
+            let destination = dir.join(format!("{tag}.json"));
             let bytes = envelope.to_vec();
             let staged = std::sync::Arc::new(std::sync::Mutex::new(raw));
             let runner = {
@@ -24427,26 +24413,12 @@ mod export_wiring {
     }
 
     /// A scratch directory that removes itself.
-    struct ExportTempDir(PathBuf);
-
-    impl ExportTempDir {
-        fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "deskwarden-export-wiring-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("a scratch directory under the system temp dir");
-            Self(dir)
-        }
-    }
-
-    impl Drop for ExportTempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    ///
+    /// A second copy of the newtype above, byte for byte including the
+    /// `deskwarden-export-wiring-` prefix -- so a tag reused across the two
+    /// modules named ONE directory that either one's `Drop` could delete. Both
+    /// are now the crate-wide guard, whose names cannot collide.
+    type ExportTempDir = crate::test_scratch::ScratchDir;
 
     /// **A direct-REST export starts no child process**, and it is observed
     /// at `job_object`'s spawn probe rather than read out of this file's
@@ -24464,7 +24436,7 @@ mod export_wiring {
             r"C:\deskwarden-test\first\bw.exe",
         ));
         let temp = ExportTempDir::new("nochild");
-        let destination = temp.0.join("vault.json");
+        let destination = temp.join("vault.json");
 
         let installed = ExportingDirectRest::signed_out();
         let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
@@ -24500,7 +24472,7 @@ mod export_wiring {
             "a failed export wrote the name the user picked"
         );
         assert!(
-            !temp.0.join("vault.json.dw-partial").exists(),
+            !temp.join("vault.json.dw-partial").exists(),
             "a failed export left its staging file in the user's folder"
         );
 
@@ -24548,7 +24520,7 @@ mod export_wiring {
         let bytes = document.as_bytes().to_vec();
 
         let temp = ExportTempDir::new("realdoc");
-        let destination = temp.0.join("vault.json");
+        let destination = temp.join("vault.json");
         let staged = bytes.clone();
         let report = export_thread::pick_and_export_with(
             {
@@ -24591,7 +24563,7 @@ mod export_wiring {
         // envelope instead -- `encrypted: false`, no key-validation field --
         // must NOT be promoted, or the assertion above would confirm any
         // bytes at all.
-        let plain_destination = temp.0.join("plaintext.json");
+        let plain_destination = temp.join("plaintext.json");
         let plain: Vec<u8> =
             b"{\n  \"encrypted\": false,\n  \"folders\": [],\n  \"items\": []\n}".to_vec();
         let plain_report = export_thread::pick_and_export_with(
@@ -25167,12 +25139,7 @@ mod send_delete_wiring {
         *FRAME_LIST_TX.lock().expect("not poisoned") = None;
         FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let scratch = std::env::temp_dir().join(format!(
-            "deskwarden-send-delete-frame-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+        let scratch = crate::test_scratch::ScratchDir::new("send-delete-frame");
 
         let (_options, mut frame_fn, _handles) = build_frame(
             // A base URL nothing listens on, and never dialled: the only
@@ -25706,12 +25673,7 @@ mod send_delete_wiring {
         *FRAME_LIST_TX.lock().expect("not poisoned") = None;
         let _empty_vault = EmptyVaultFixture::armed();
 
-        let scratch = std::env::temp_dir().join(format!(
-            "deskwarden-empty-vault-frame-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+        let scratch = crate::test_scratch::ScratchDir::new("empty-vault-frame");
 
         let (_options, mut frame_fn, _handles) = build_frame(
             Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
@@ -27061,12 +27023,7 @@ mod send_delete_wiring {
         FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
         FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let scratch = std::env::temp_dir().join(format!(
-            "deskwarden-send-create-frame-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+        let scratch = crate::test_scratch::ScratchDir::new("send-create-frame");
 
         let (_options, mut frame_fn, _handles) = build_frame(
             Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
@@ -27234,12 +27191,7 @@ mod send_delete_wiring {
         FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
         FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let scratch = std::env::temp_dir().join(format!(
-            "deskwarden-close-pane-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+        let scratch = crate::test_scratch::ScratchDir::new("close-pane");
 
         let (_options, mut frame_fn, _handles) = build_frame(
             Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
@@ -27375,12 +27327,7 @@ mod send_delete_wiring {
         FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
         FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
 
-        let scratch = std::env::temp_dir().join(format!(
-            "deskwarden-record-entry-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+        let scratch = crate::test_scratch::ScratchDir::new("record-entry");
 
         let (_options, mut frame_fn, _handles) = build_frame(
             Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
@@ -27499,12 +27446,7 @@ mod send_delete_wiring {
         let _empty_vault =
             matches!(state, ReachableState::EmptyVault).then(EmptyVaultFixture::armed);
 
-        let scratch = std::env::temp_dir().join(format!(
-            "deskwarden-sends-matrix-{state:?}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        std::fs::create_dir_all(&scratch).expect("a writable scratch directory");
+        let scratch = crate::test_scratch::ScratchDir::new(&format!("sends-matrix-{state:?}"));
 
         let (_options, mut frame_fn, _handles) = build_frame(
             Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(

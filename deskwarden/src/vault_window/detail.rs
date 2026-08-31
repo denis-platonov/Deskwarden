@@ -13498,7 +13498,7 @@ mod tests {
             "the control did not draw the word"
         );
 
-        let (texts, grounds, images) = painted_with_logos(&a_full_card(), Some(dir));
+        let (texts, grounds, images) = painted_with_logos(&a_full_card(), Some(dir.to_path_buf()));
         assert_eq!(images.len(), 1, "the logo was not drawn on the read pane");
         assert!(
             grounds.is_empty(),

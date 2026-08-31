@@ -5787,15 +5787,24 @@ mod fill_dispatch_tests {
         LINES.with(|l| l.borrow_mut().take().unwrap_or_default())
     }
 
-    fn scratch_stats(label: &str) -> crate::fill_stats::FillStats {
-        let dir = std::env::temp_dir().join(format!(
-            "deskwarden-fill-dispatch-{label}-{}-{:?}-{:?}",
-            std::process::id(),
-            std::thread::current().id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
-        ));
-        std::fs::create_dir_all(&dir).expect("the stats directory is creatable");
-        crate::fill_stats::FillStats::new(dir.join("stats.json"))
+    /// A `FillStats` over a scratch directory that **removes itself**.
+    ///
+    /// The guard has to be handed back with the stats rather than dropped
+    /// here: dropping it inside this function would delete the directory
+    /// before the `FillStats` had written a byte into it. So the return is a
+    /// pair, and the caller's `let` is what holds the directory open for the
+    /// length of the test.
+    ///
+    /// This family was the second-worst leak in the suite -- 46 directories
+    /// per `--lib` run across nineteen labels, each with a `stats.json` in it.
+    /// Its old name carried the pid, the thread id AND a nanosecond stamp,
+    /// which is three ways of being unique and none of cleaning up; that is
+    /// the trade this replaces.
+    fn scratch_stats(label: &str) -> (crate::test_scratch::ScratchDir, crate::fill_stats::FillStats)
+    {
+        let dir = crate::test_scratch::ScratchDir::new(&format!("fill-dispatch-{label}"));
+        let stats = crate::fill_stats::FillStats::new(dir.join("stats.json"));
+        (dir, stats)
     }
 
     /// Runs one fill and hands back **all three** things it can be judged by:
@@ -5810,11 +5819,19 @@ mod fill_dispatch_tests {
     /// notifier writes to when it happens to be compiled under `cfg(test)`.
     /// That is the whole change: the recorder is the only notifier this fill
     /// has, so there is no configuration in which it opens a window instead.
+    ///
+    /// The scratch directory the `FillStats` writes into comes back as the
+    /// LAST element, and it is last so that it drops last: the stats go
+    /// first, the directory under them only afterwards. Callers that never
+    /// read the stats file still have to bind it -- dropping it on the spot
+    /// would delete the directory out from under a `FillStats` the caller is
+    /// still holding.
     fn fill_reporting(
         item: VaultItem,
         reports: crate::fill_stats::FillOutcome,
         default_result: Result<(), String>,
-    ) -> (Arc<Recorder>, crate::fill_stats::FillStats, Vec<String>) {
+    ) -> (Arc<Recorder>, crate::fill_stats::FillStats, Vec<String>, crate::test_scratch::ScratchDir)
+    {
         // `fill_from_vault` reaches `Injector::fill_sequence`, which contends
         // for a process-global "already typing" flag. See
         // `injector::sequence_test_lock`.
@@ -5825,7 +5842,7 @@ mod fill_dispatch_tests {
             ui: NoUiAutomation,
             fallback: RecordingFiller { rec: rec.clone(), reports, default_result },
         };
-        let stats = scratch_stats("dispatch");
+        let (scratch, stats) = scratch_stats("dispatch");
         let notifier = sequence::RecordingNotifier::default();
         fill_from_vault(
             &cache_with(item),
@@ -5837,17 +5854,26 @@ mod fill_dispatch_tests {
             &notifier,
             &mut ungated(&mut crate::reprompt::Proof::default()),
         );
-        (rec, stats, notifier.take())
+        (rec, stats, notifier.take(), scratch)
     }
 
-    fn fill_recording_stats(item: VaultItem) -> (Arc<Recorder>, crate::fill_stats::FillStats) {
-        let (rec, stats, _) = fill_reporting(item, crate::fill_stats::FillOutcome::Typed, Ok(()));
-        (rec, stats)
+    /// Hands the scratch directory on to the caller with the stats, for the
+    /// same reason [`fill_reporting`] does: a `FillStats` whose directory has
+    /// already been removed reads as an empty count rather than as an error.
+    fn fill_recording_stats(
+        item: VaultItem,
+    ) -> (Arc<Recorder>, crate::fill_stats::FillStats, crate::test_scratch::ScratchDir) {
+        let (rec, stats, _, scratch) =
+            fill_reporting(item, crate::fill_stats::FillOutcome::Typed, Ok(()));
+        (rec, stats, scratch)
     }
 
     /// A fill judged by what it typed **and** what the user was told.
+    ///
+    /// This one really is done with the stats, so it drops the guard here and
+    /// the directory goes with it.
     fn fill_with_notices(item: VaultItem) -> (Arc<Recorder>, Vec<String>) {
-        let (rec, _stats, notices) =
+        let (rec, _stats, notices, _scratch) =
             fill_reporting(item, crate::fill_stats::FillOutcome::Typed, Ok(()));
         (rec, notices)
     }
@@ -5878,15 +5904,15 @@ mod fill_dispatch_tests {
     fn the_outcome_sink_records_only_an_outcome_that_counts() {
         use crate::fill_stats::FillOutcome;
 
-        let typed = scratch_stats("sink-typed");
+        let (_typed_dir, typed) = scratch_stats("sink-typed");
         fill_outcome_sink(&typed, "item-1")(FillOutcome::Typed);
         assert_eq!(typed.count("item-1"), 1, "the harness cannot record at all");
 
-        let partial = scratch_stats("sink-partial");
+        let (_partial_dir, partial) = scratch_stats("sink-partial");
         fill_outcome_sink(&partial, "item-1")(FillOutcome::Partial);
         assert_eq!(partial.count("item-1"), 0, "a half-typed sequence was counted as a fill");
 
-        let untyped = scratch_stats("sink-untyped");
+        let (_untyped_dir, untyped) = scratch_stats("sink-untyped");
         fill_outcome_sink(&untyped, "item-1")(FillOutcome::NotTyped);
         assert_eq!(untyped.count("item-1"), 0, "a fill that typed nothing was counted");
     }
@@ -5899,7 +5925,7 @@ mod fill_dispatch_tests {
     /// blending in.
     #[test]
     fn the_outcome_sink_credits_the_item_it_was_given() {
-        let stats = scratch_stats("sink-id");
+        let (_scratch, stats) = scratch_stats("sink-id");
         fill_outcome_sink(&stats, "item-7")(crate::fill_stats::FillOutcome::Typed);
 
         assert_eq!(stats.count("item-7"), 1, "the item the sink was built for was not credited");
@@ -5912,7 +5938,7 @@ mod fill_dispatch_tests {
     /// it points at.
     #[test]
     fn the_outcome_sink_can_be_moved_onto_another_thread() {
-        let stats = scratch_stats("sink-thread");
+        let (_scratch, stats) = scratch_stats("sink-thread");
         let sink = fill_outcome_sink(&stats, "item-1");
         std::thread::spawn(move || sink(crate::fill_stats::FillOutcome::Typed))
             .join()
@@ -5933,7 +5959,7 @@ mod fill_dispatch_tests {
     /// typing *started*, and nothing counts a fill off it any more.
     #[test]
     fn a_sequence_that_typed_is_recorded_against_the_item() {
-        let (rec, stats) = fill_recording_stats(item_with("{USERNAME}{TAB}{PASSWORD}"));
+        let (rec, stats, _scratch) = fill_recording_stats(item_with("{USERNAME}{TAB}{PASSWORD}"));
         assert_eq!(
             rec.sequences.lock().unwrap().len(),
             1,
@@ -5953,7 +5979,7 @@ mod fill_dispatch_tests {
     /// this run is identical to the test above except the outcome reported.
     #[test]
     fn a_sequence_abandoned_part_way_is_not_recorded_as_a_fill() {
-        let (rec, stats, _notices) = fill_reporting(
+        let (rec, stats, _notices, _scratch) = fill_reporting(
             item_with("{USERNAME}{TAB}{PASSWORD}"),
             crate::fill_stats::FillOutcome::Partial,
             Ok(()),
@@ -5971,7 +5997,7 @@ mod fill_dispatch_tests {
     /// filler that could not restore foreground at all.
     #[test]
     fn a_sequence_that_typed_nothing_is_not_recorded_as_a_fill() {
-        let (rec, stats, _notices) = fill_reporting(
+        let (rec, stats, _notices, _scratch) = fill_reporting(
             item_with("{USERNAME}{TAB}{PASSWORD}"),
             crate::fill_stats::FillOutcome::NotTyped,
             Ok(()),
@@ -5987,7 +6013,7 @@ mod fill_dispatch_tests {
     fn a_refused_sequence_is_not_recorded_as_a_fill() {
         // `{PICKCHARS}` is unimplemented, so `fill_action` refuses at plan
         // time and the filler is never reached.
-        let (rec, stats) = fill_recording_stats(item_with("{USERNAME}{PICKCHARS}"));
+        let (rec, stats, _scratch) = fill_recording_stats(item_with("{USERNAME}{PICKCHARS}"));
         assert!(
             rec.sequences.lock().unwrap().is_empty(),
             "a refused sequence still reached the filler"
@@ -6001,7 +6027,7 @@ mod fill_dispatch_tests {
     /// shared sink must not have quietly changed that.
     #[test]
     fn a_default_fill_is_still_recorded_against_the_item() {
-        let (rec, stats) = fill_recording_stats(item_with(""));
+        let (rec, stats, _scratch) = fill_recording_stats(item_with(""));
         assert_eq!(
             rec.default_fills.lock().unwrap().len(),
             1,
@@ -6015,7 +6041,7 @@ mod fill_dispatch_tests {
     /// regardless -- the shape of the sequence bug, transplanted -- fails here.
     #[test]
     fn a_default_fill_that_failed_is_not_recorded_as_a_fill() {
-        let (rec, stats, _notices) = fill_reporting(
+        let (rec, stats, _notices, _scratch) = fill_reporting(
             item_with(""),
             crate::fill_stats::FillOutcome::Typed,
             Err("target window is not foreground".into()),
@@ -6204,7 +6230,7 @@ mod fill_dispatch_tests {
 
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("choice-totp");
+        let (_scratch, stats) = scratch_stats("choice-totp");
         fill_from_vault_with(
             &cache,
             &injector,
@@ -6245,7 +6271,7 @@ mod fill_dispatch_tests {
 
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("choice-nototp");
+        let (_scratch, stats) = scratch_stats("choice-nototp");
         fill_from_vault_with(
             &cache,
             &injector,
@@ -6317,7 +6343,7 @@ mod fill_dispatch_tests {
 
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("cache-miss-fallback");
+        let (_scratch, stats) = scratch_stats("cache-miss-fallback");
         let lines = captured_logs(|| {
             fill_from_vault_with(
                 &cache,
@@ -6436,7 +6462,7 @@ mod fill_dispatch_tests {
         // 3. The fill, exactly as `main`'s hotkey handler issues it.
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("cache-first-fill");
+        let (_scratch, stats) = scratch_stats("cache-first-fill");
         fill_from_vault_with(
             &restored,
             &injector,
@@ -6505,7 +6531,7 @@ mod fill_dispatch_tests {
 
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("preflight-routing");
+        let (_scratch, stats) = scratch_stats("preflight-routing");
         let notifier = sequence::RecordingNotifier::default();
         fill_from_vault_with(
             &cache,
@@ -6596,7 +6622,7 @@ mod fill_dispatch_tests {
         CONFIRM_SAW_SECRET.store(false, std::sync::atomic::Ordering::SeqCst);
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("preflight-hosting");
+        let (_scratch, stats) = scratch_stats("preflight-hosting");
         fill_from_vault_with(
             &cache_with(item_with("{USERNAME}{TAB}{PASSWORD}")),
             &injector,
@@ -6725,7 +6751,7 @@ mod fill_dispatch_tests {
         let _serialised = crate::injector::sequence_test_lock();
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("choice-default");
+        let (_scratch, stats) = scratch_stats("choice-default");
         // A stored sequence, so `Saved` here would take the OTHER arm: the
         // fixture disagrees with itself between the two choices.
         let item = item_with("{USERNAME}{TAB}{PASSWORD}");
@@ -6805,7 +6831,7 @@ mod fill_dispatch_tests {
             crate::injector::SequenceGuard::acquire().expect("nothing else holds the flag");
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("refused-default");
+        let (_scratch, stats) = scratch_stats("refused-default");
         let notifier = sequence::RecordingNotifier::default();
         fill_from_vault(
             &cache_with(item),
@@ -6928,7 +6954,7 @@ mod fill_dispatch_tests {
         let rec = Arc::new(Recorder::default());
         let injector =
             Injector { ui: NoUiAutomation, fallback: ForegroundLostFiller { rec: rec.clone() } };
-        let stats = scratch_stats("sequence-diagnostic");
+        let (_scratch, stats) = scratch_stats("sequence-diagnostic");
         let notifier = sequence::RecordingNotifier::default();
         fill_from_vault(
             &cache_with(item_with("{USERNAME}{TAB}{PASSWORD}")),
@@ -6986,7 +7012,7 @@ mod fill_dispatch_tests {
     /// state it names.
     #[test]
     fn a_default_fill_that_failed_for_another_reason_opens_no_dialog() {
-        let (rec, stats, notices) = fill_reporting(
+        let (rec, stats, notices, _scratch) = fill_reporting(
             item_with(""),
             crate::fill_stats::FillOutcome::Typed,
             Err("SendInput delivered 0 of 2 events".to_string()),
@@ -7041,7 +7067,7 @@ mod fill_dispatch_tests {
         let cache = cache_with(item);
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("default-lifetime");
+        let (_scratch, stats) = scratch_stats("default-lifetime");
 
         let notifier = sequence::RecordingNotifier::default();
         let leaked = plaintext_reached_the_allocator(|| {
@@ -7139,7 +7165,7 @@ mod fill_dispatch_tests {
         let _serialised = crate::injector::sequence_test_lock();
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("reprompt-routing");
+        let (_scratch, stats) = scratch_stats("reprompt-routing");
         let notifier = sequence::RecordingNotifier::default();
         let mut proof = crate::reprompt::Proof::default();
         fill_from_vault_with(
@@ -7269,7 +7295,7 @@ mod fill_dispatch_tests {
         let _serialised = crate::injector::sequence_test_lock();
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("reprompt-window");
+        let (_scratch, stats) = scratch_stats("reprompt-window");
         let notifier = sequence::RecordingNotifier::default();
         let cache = cache_with(a_protected(item_with("")));
         let mut proof = crate::reprompt::Proof::default();
@@ -7377,7 +7403,7 @@ mod fill_dispatch_tests {
         let id = crate::accounts::AccountId::parse(&"c".repeat(32)).expect("a 32-char hex id");
         let rec = Arc::new(Recorder::default());
         let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let stats = scratch_stats("reprompt-account");
+        let (_scratch, stats) = scratch_stats("reprompt-account");
         let mut proof = crate::reprompt::Proof::default();
         let mut reprompt = Reprompt::with_gate_for(&mut proof, record);
         reprompt.account = Some(id.clone());

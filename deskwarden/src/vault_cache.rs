@@ -5342,7 +5342,13 @@ mod tests {
     /// A cache over its own scratch directory, with the Hello step already
     /// satisfied by the substituted key -- which is the state a real session
     /// is in after the startup load or after the toggle was switched on.
-    fn cache_with_disk(name: &str, enabled: bool) -> (VaultCache, std::path::PathBuf) {
+    /// The directory comes back as the guard rather than a bare `PathBuf` so
+    /// the caller's binding is what keeps it alive, and dropping that binding
+    /// -- normally or by an assertion unwinding past it -- is what removes it.
+    fn cache_with_disk(
+        name: &str,
+        enabled: bool,
+    ) -> (VaultCache, crate::test_scratch::ScratchDir) {
         let dir = temp_dir_for(name);
         let disk = cache_with_key(&dir);
         let cache = VaultCache::with_disk_cache(

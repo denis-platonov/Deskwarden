@@ -14306,13 +14306,7 @@ mod tests {
     /// `Child`, and any `Child` proves it.
     #[test]
     fn a_child_that_arrives_after_the_deadline_gave_up_is_stopped_not_orphaned() {
-        let dir = std::env::temp_dir().join(format!(
-            "deskwarden-abandoned-worker-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let dir = deskwarden::test_scratch::ScratchDir::new("abandoned-worker");
         let park = EstatePark::holding(SessionEstate {
             cache: Arc::new(VaultCache::new(VaultBridge::new(
                 "http://127.0.0.1:1".to_string(),
@@ -18942,15 +18936,13 @@ mod tests {
         /// A scratch directory for the estate's session store. Never read or
         /// written by these tests: `SessionStore` is a path until something
         /// asks it to load or save, and nothing here does.
-        fn scratch(tag: &str) -> std::path::PathBuf {
-            let dir = std::env::temp_dir().join(format!(
-                "deskwarden-parked-estate-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).expect("a scratch directory");
-            dir
+        ///
+        /// **Removed when the returned guard drops**, panic included -- which
+        /// matters more here than in most places: three of the tests below
+        /// drive a worker that is *supposed* to panic, and the removal this
+        /// helper used to leave to the end of a test body never ran for them.
+        fn scratch(tag: &str) -> deskwarden::test_scratch::ScratchDir {
+            deskwarden::test_scratch::ScratchDir::new(&format!("parked-estate-{tag}"))
         }
 
         /// An estate holding none of what the worker will write.
@@ -21215,7 +21207,11 @@ mod tests {
         /// backend would be refused rather than served, and nothing in this
         /// module starts a `bw serve`.
         struct Bench {
-            dir: PathBuf,
+            /// The scratch directory AND the thing that removes it. `Bench`
+            /// used to carry a bare `PathBuf` plus a hand-written `impl Drop`
+            /// that did nothing else; holding the guard is the same behaviour
+            /// with the removal no longer restatable incorrectly.
+            dir: deskwarden::test_scratch::ScratchDir,
             settings_path: PathBuf,
             fill_stats: fill_stats::FillStats,
             job: Arc<Option<job_object::KillOnCloseJob>>,
@@ -21228,13 +21224,7 @@ mod tests {
 
         impl Bench {
             fn new(tag: &str) -> Self {
-                let dir = std::env::temp_dir().join(format!(
-                    "deskwarden-vault-loop-{tag}-{}-{:?}",
-                    std::process::id(),
-                    std::thread::current().id()
-                ));
-                let _ = std::fs::remove_dir_all(&dir);
-                std::fs::create_dir_all(&dir).expect("a scratch directory");
+                let dir = deskwarden::test_scratch::ScratchDir::new(&format!("vault-loop-{tag}"));
                 let (backend_op_tx, _backend_op_rx) = mpsc::channel();
                 Self {
                     settings_path: dir.join("settings.json"),
@@ -21302,12 +21292,6 @@ mod tests {
             /// loop has not written it at all.
             fn settings_bytes(&self) -> Option<Vec<u8>> {
                 std::fs::read(&self.settings_path).ok()
-            }
-        }
-
-        impl Drop for Bench {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.dir);
             }
         }
 
@@ -24201,7 +24185,10 @@ mod tests {
     /// **Every path any switch test touches is under one of these.** Nothing
     /// here may reach the real `%APPDATA%` profile or the user's real config
     /// directory: these tests delete a `session.bin` by design.
-    struct ScratchConfig(std::path::PathBuf);
+    /// Wraps the crate-wide guard rather than a bare path, so the removal
+    /// comes with the directory instead of from a `Drop` written out again
+    /// beside it.
+    struct ScratchConfig(deskwarden::test_scratch::ScratchDir);
 
     impl ScratchConfig {
         fn new(tag: &str) -> Self {
@@ -24212,13 +24199,7 @@ mod tests {
         /// is the assertion: an add starts from one account and must end with
         /// either one or two, never one and a half.
         fn with_accounts(tag: &str, ids: &[&str]) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "deskwarden-switch-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
+            let dir = deskwarden::test_scratch::ScratchDir::new(&format!("switch-{tag}"));
             for id in ids {
                 let account_dir =
                     accounts::data_dir_for(&dir, &deskwarden::accounts::AccountId::parse(id).unwrap());
@@ -24230,12 +24211,6 @@ mod tests {
 
         fn path(&self) -> &Path {
             &self.0
-        }
-    }
-
-    impl Drop for ScratchConfig {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -28271,14 +28246,23 @@ mod tests {
 
         /// A `FillStats` on its own throwaway file -- never the real one under
         /// `%APPDATA%`, which a successful fill would write to.
-        fn scratch_fill_stats() -> (fill_stats::FillStats, std::path::PathBuf) {
-            let path = std::env::temp_dir().join(format!(
-                "deskwarden-test-fill-stats-{}-{:?}.json",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_file(&path);
-            (fill_stats::FillStats::new(path.clone()), path)
+        ///
+        /// The second element used to be the file's path and is now the
+        /// scratch directory holding it -- **a guard, which every caller must
+        /// keep bound for as long as it uses the stats**. Every one of them
+        /// already binds and ignores that slot, so the change is the type
+        /// rather than the call sites.
+        ///
+        /// The old shape wrote `deskwarden-test-fill-stats-<pid>-<thread>.json`
+        /// straight into `%TEMP%` and removed it only on the way IN, on the
+        /// next run, so the last run's file was always still sitting there.
+        /// 7,375 abandoned `stats.json` files were counted across this crate's
+        /// scratch families.
+        fn scratch_fill_stats(
+        ) -> (fill_stats::FillStats, deskwarden::test_scratch::ScratchDir) {
+            let dir = deskwarden::test_scratch::ScratchDir::new("test-fill-stats");
+            let stats = fill_stats::FillStats::new(dir.join("stats.json"));
+            (stats, dir)
         }
 
         fn engine_with(entries: &[(&str, AppMatch)]) -> MatchEngine {
@@ -29703,14 +29687,14 @@ mod tests {
         /// A `SessionStore` on its own throwaway file, for
         /// `scratch_fill_stats`'s reason: the real one lives beside the user's
         /// account and a successful unlock writes to it.
-        fn scratch_session_store() -> (session_store::SessionStore, std::path::PathBuf) {
-            let path = std::env::temp_dir().join(format!(
-                "deskwarden-test-session-{}-{:?}.bin",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_file(&path);
-            (session_store::SessionStore::new(path.clone()), path)
+        /// The second element is the scratch directory guard, for
+        /// [`scratch_fill_stats`]'s reason and on the same terms: bind it for
+        /// as long as the store is used.
+        fn scratch_session_store(
+        ) -> (session_store::SessionStore, deskwarden::test_scratch::ScratchDir) {
+            let dir = deskwarden::test_scratch::ScratchDir::new("test-session");
+            let store = session_store::SessionStore::new(dir.join("session.bin"));
+            (store, dir)
         }
 
         /// The 3b stub that clicks *Unlock*. It answers through
@@ -31884,16 +31868,15 @@ mod vault_backend_choice_tests {
     /// account directory already made -- the layout
     /// `accounts::ensure_account_dir` produces, since `UserKeyStore` requires
     /// its parent to exist and must never be the thing that creates one.
-    fn scratch_config(label: &str) -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "deskwarden-test-backend-{}-{}-{}",
-            label,
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).expect("a temp config directory");
-        dir
+    ///
+    /// **Removed when the returned guard drops**, panic included. This is
+    /// `deskwarden::test_scratch`, which `main.rs` can see for the same reason
+    /// it can see `deskwarden::test_http`: the `test-support` feature, turned
+    /// on by the dev-dependency this crate has on itself. This is a separate
+    /// crate linking the library built WITHOUT `cfg(test)`, so a `cfg(test)`
+    /// module would be invisible here.
+    fn scratch_config(label: &str) -> deskwarden::test_scratch::ScratchDir {
+        deskwarden::test_scratch::ScratchDir::new(&format!("test-backend-{label}"))
     }
 
     /// An account on `server_url`, served by the official CLI.
@@ -32492,19 +32475,15 @@ mod the_live_settings_channel {
 mod the_one_settings_write_back {
     use super::*;
 
-    /// A scratch directory of this test's own, in the same idiom every other
-    /// filesystem test in this file uses -- `%TEMP%`, never
-    /// `%APPDATA%\Deskwarden`, and keyed by pid and thread so a parallel run
-    /// cannot collide.
-    fn scratch(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "deskwarden-one-write-back-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        dir
+    /// A scratch directory of this test's own -- `%TEMP%`, never
+    /// `%APPDATA%\Deskwarden` -- **removed when the returned guard drops**.
+    ///
+    /// "The same idiom every other filesystem test in this file uses" is what
+    /// this doc said, and it was true: the idiom was copied into six helpers,
+    /// each keyed slightly differently and none of them deleting anything.
+    /// The idiom is now one type.
+    fn scratch(tag: &str) -> deskwarden::test_scratch::ScratchDir {
+        deskwarden::test_scratch::ScratchDir::new(&format!("one-write-back-{tag}"))
     }
 
     /// A cache whose disk half is real and lives in `dir`.
