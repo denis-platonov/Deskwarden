@@ -330,9 +330,9 @@ fn cli_rows_are_shown(server: Option<&str>, use_official_bw_crypto: bool) -> boo
 ///
 /// `None` is bitwarden.com **by definition** and not "not known yet" --
 /// [`crate::backend_policy::is_self_hosted`] says so in as many words -- so
-/// the `Checking` and `SignedOut` arms landing here is the safe direction and
-/// not an oversight: unknown counts as official, and the `bw` rows are the
-/// ones a user already had.
+/// the `SignedOut` and nothing-published arms landing here is the safe
+/// direction and not an oversight: unknown counts as official, and the `bw`
+/// rows are the ones a user already had.
 ///
 /// One reader for the two call sites in [`draw_backend_card`], so a mid-frame
 /// status arrival cannot give the switch and the row below it different
@@ -716,18 +716,15 @@ const FILL_HOTKEY_UNAVAILABLE_LABEL: &str = "Fill the focused app — shortcut n
 /// empty right-hand column reads as a field that failed to load.
 const ACCOUNT_STATUS: &str = "Open the vault window to see the signed-in account.";
 
-/// The row's label, and the three things it can say about a known account.
-const ACCOUNT_LABEL: &str = "Bitwarden account";
-/// While the lookup is in flight.
+/// The row's label, and the two things it can say about a known account.
 ///
-/// **Deliberately not the same words as [`ACCOUNT_SIGNED_OUT`].** The answer
-/// took 2.8 seconds to arrive on the machine this was reported from, so the
-/// waiting state is one a user will really see -- and "we have not asked yet"
-/// and "nobody is signed in" are opposite facts. A row that showed the same
-/// thing for both would make the page assert the second one for three seconds
-/// every time it is opened.
-const ACCOUNT_CHECKING: &str = "Checking...";
-const ACCOUNT_CHECKING_NOTE: &str = "Asking which account is signed in.";
+/// **There used to be a third, "Checking...", and there is no longer a moment
+/// it could be shown.** It covered the 2.8 seconds a startup `bw status`
+/// spawn took to answer, during which the row had to say something other than
+/// "Not signed in" -- the two being opposite claims rather than shades of one.
+/// That spawn is gone: the address is read off the `Account`, or off the
+/// sign-in that established it, and both answer on the frame they are asked.
+const ACCOUNT_LABEL: &str = "Bitwarden account";
 const ACCOUNT_SIGNED_OUT: &str = "Not signed in";
 /// **One sentence for two situations, because this build cannot tell them
 /// apart.** `login_ui::unknown_status_details` returns the same value for a
@@ -761,30 +758,25 @@ const ACCOUNT_SERVER_PREFIX: &str = "Signed in at ";
 /// never copied, and never sent. The alternative -- a row that says an
 /// account is linked without saying which -- is the state the user reported
 /// as "empty but we know it for sure".
+///
+/// # Two variants, and there is deliberately no third for "not yet"
+///
+/// There was one, `Checking`, and it is deleted. It existed for a single
+/// publisher: `main` spawned a `bw status` at startup to learn the account's
+/// address, that spawn took 2.8 seconds on the machine this row was reported
+/// from, and a Preferences window opened during it had to say something other
+/// than "Not signed in". The spawn is gone; the address is read off the
+/// `Account`, or off the sign-in that established it, and both answer on the
+/// frame they are asked. `None` -- nothing published yet -- is the only
+/// before-state left, and it has its own honest sentence in
+/// [`ACCOUNT_STATUS`]. Re-adding an in-flight variant would need a real
+/// in-flight moment to go with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AccountStatus {
-    /// A lookup is in flight and has not answered yet.
-    ///
-    /// **Nothing in production publishes this any more.** It existed for one
-    /// caller: `main` spawned a `bw status` at startup to learn the account's
-    /// address, that spawn took 2.8 seconds on the machine this row was
-    /// reported from, and a Preferences window opened during it had to say
-    /// something other than "Not signed in" -- the two being opposite claims,
-    /// not shades of the same one. There is no lookup: the address is read off
-    /// the `Account` or off the sign-in that established it, both of which
-    /// answer on the frame they are asked, so the row goes straight from
-    /// nothing published to the final answer.
-    ///
-    /// Kept because it is what this page should say if anything ever is in
-    /// flight again, and because deleting a variant with its own wording,
-    /// its own arm and its own paint tests is a `prefs_ui` change rather than
-    /// part of removing the spawns.
-    Checking,
-    /// The CLI reported a signed-in account. `email` is `None` when it
-    /// reported one without an address; `server` is `None` for Bitwarden's
-    /// own cloud, which is the CLI's default.
+    /// A signed-in account. `email` is `None` when the address was not
+    /// reported; `server` is `None` for Bitwarden's own cloud.
     SignedIn { email: Option<String>, server: Option<String> },
-    /// The CLI reported nobody signed in -- or could not be asked. See
+    /// Nobody is signed in -- or the vault could not be asked. See
     /// [`ACCOUNT_SIGNED_OUT_NOTE`].
     SignedOut,
 }
@@ -1207,10 +1199,13 @@ pub struct PrefsState {
     /// read every frame** rather than a value captured when the window
     /// opened.
     ///
-    /// Both halves matter. Every frame, because the answer arrives late --
-    /// 2.8 seconds after the window on the machine this was reported from --
-    /// so a value snapshotted in `new` would show "Checking..." for the whole
-    /// life of a window opened during the lookup. A seam, because the default
+    /// Both halves matter. Every frame, because the answer can CHANGE while
+    /// this window is open -- an account switch, a sign-out, a sign-in in the
+    /// vault window all republish it -- so a value snapshotted in `new` would
+    /// leave the row naming the account the user just left, for the whole
+    /// life of the window and with no way to correct it. (It used to be worse
+    /// still: the first answer arrived 2.8 seconds after the window, from a
+    /// `bw status` spawn that no longer exists.) A seam, because the default
     /// reads a process-wide published value, and a test that drove that
     /// global would leave the next test's page describing an account nobody
     /// set: the tests and `examples/ui_preview` install their own `fn` and
@@ -1350,20 +1345,19 @@ fn load_scan_history() -> crate::scan_history::ScanHistory {
 /// This is where it deliberately differs from `install_env`, which was
 /// flagged as the decision most worth overruling. An update environment is
 /// fixed at startup; an ACCOUNT is not. This app switches accounts
-/// (`accounts.rs`), signs out, and learns the address several seconds after
-/// launch. A `OnceLock` would pin whichever answer landed first -- most often
-/// `Checking` -- and the row would then be wrong for the rest of the session
-/// with no way to correct it. So the value is republished whenever it
-/// changes, and the last publisher wins.
+/// (`accounts.rs`) and signs out. A `OnceLock` would pin whichever answer
+/// landed first -- the account the app started on -- and the row would then
+/// be wrong for the rest of the session with no way to correct it. So the
+/// value is republished whenever it changes, and the last publisher wins.
 static PUBLISHED_ACCOUNT: std::sync::RwLock<Option<AccountStatus>> =
     std::sync::RwLock::new(None);
 
 /// Publishes what the app now knows about the signed-in account.
 ///
-/// Called by the shells at the moments the answer changes: when the startup
-/// lookup is spawned, when it lands, and when a vault window receives details
-/// of its own. Cheap and idempotent -- publishing the same value again is a
-/// write of a value that was already there.
+/// Called by the shells at the moments the answer changes: when `main`
+/// settles the account it launched on, and when a vault window receives
+/// details of its own. Cheap and idempotent -- publishing the same value
+/// again is a write of a value that was already there.
 ///
 /// A poisoned lock is ignored rather than propagated: this is a decorative
 /// row on an About page, and panicking a caller mid-startup over it would be
@@ -4083,13 +4077,10 @@ fn account_row(ui: &mut Ui, status: Option<AccountStatus>) {
 /// What the account row says, as a pure function of what is known.
 ///
 /// Split out so every state's wording is testable without a window, and so
-/// the four cases are visible in one place rather than spread through a draw.
+/// the three cases are visible in one place rather than spread through a draw.
 fn account_row_text(status: Option<&AccountStatus>) -> (String, Option<String>) {
     match status {
         None => (ACCOUNT_STATUS.to_string(), None),
-        Some(AccountStatus::Checking) => {
-            (ACCOUNT_CHECKING_NOTE.to_string(), Some(ACCOUNT_CHECKING.to_string()))
-        }
         Some(AccountStatus::SignedOut) => {
             (ACCOUNT_SIGNED_OUT_NOTE.to_string(), Some(ACCOUNT_SIGNED_OUT.to_string()))
         }
@@ -9848,9 +9839,10 @@ mod tests {
     }
 
     /// The server reader, including the two states that are not a signed-in
-    /// account. `Checking` is the one that matters: it lasted 2.8 seconds on
-    /// the machine this page's account row was reported from, and it must read
-    /// as "unknown", which `is_self_hosted` already treats as official.
+    /// account. Both must read as "unknown", which `is_self_hosted` already
+    /// treats as official: `SignedOut` because there is no vault to name a
+    /// server for, and nothing-published because the row is drawn before any
+    /// shell has spoken -- `examples/ui_preview` never publishes at all.
     #[test]
     fn the_page_reads_the_server_off_the_status_and_nothing_else() {
         assert_eq!(
@@ -9866,7 +9858,6 @@ mod tests {
             account_server(&Some(AccountStatus::SignedIn { email: None, server: None })),
             None
         );
-        assert_eq!(account_server(&Some(AccountStatus::Checking)), None);
         assert_eq!(account_server(&Some(AccountStatus::SignedOut)), None);
         assert_eq!(account_server(&None), None);
     }
@@ -10315,36 +10306,51 @@ mod tests {
         );
     }
 
-    /// **Waiting and signed-out must not look alike.**
+    /// **Not-asked and signed-out must not look alike.**
     ///
-    /// The lookup landed 2.8 seconds after the window on the machine this was
-    /// reported from, so the waiting state is one users really see -- and
-    /// "we have not asked yet" and "nobody is signed in" are opposite claims.
+    /// This replaces `checking_and_signed_out_say_different_things`, which
+    /// drove the deleted `AccountStatus::Checking`. The claim it was written
+    /// for outlives that variant: "nobody has told this page anything" and
+    /// "nobody is signed in" are opposite facts, and a page that showed the
+    /// same words for both would assert the second one for every window that
+    /// draws About without a shell behind it -- `examples/ui_preview`, and
+    /// any future entry point.
     #[test]
-    fn checking_and_signed_out_say_different_things() {
-        let checking = paint_about_account(|| Some(AccountStatus::Checking));
+    fn nothing_published_and_signed_out_say_different_things() {
+        let unpublished = paint_about_account(|| None);
         let signed_out = paint_about_account(|| Some(AccountStatus::SignedOut));
 
-        assert!(checking.contains(ACCOUNT_CHECKING), "got {:?}", checking.strings());
+        assert!(unpublished.contains(ACCOUNT_STATUS), "got {:?}", unpublished.strings());
         assert!(signed_out.contains(ACCOUNT_SIGNED_OUT), "got {:?}", signed_out.strings());
         assert!(
-            !checking.contains(ACCOUNT_SIGNED_OUT),
-            "a page that has not asked yet must not assert that nobody is signed in: {:?}",
-            checking.strings()
+            !unpublished.contains(ACCOUNT_SIGNED_OUT),
+            "a page nobody has published to must not assert that nobody is signed in: {:?}",
+            unpublished.strings()
+        );
+        // The control in the other direction: the signed-out page really has
+        // stopped saying the not-asked sentence, so the two assertions above
+        // are two different paints rather than one string that never appears.
+        assert!(
+            !signed_out.contains(ACCOUNT_STATUS),
+            "the signed-out row still points at the vault window for an answer it has: {:?}",
+            signed_out.strings()
         );
     }
 
-    /// **About's account row named the Bitwarden CLI three times,
-    /// unconditionally, on a page a built-in-client user reads too.**
+    /// **About's account row named the Bitwarden CLI, unconditionally, on a
+    /// page a built-in-client user reads too.**
     ///
     /// Not ghosted and not hedged: it asserted a program was asked. These are
-    /// the three sentences, and the fix is to name what the app did rather
-    /// than what it did it with -- which is the altitude the whole split is
-    /// about. On the built-in client the status comes from `rest::api` and no
-    /// CLI is running at all.
+    /// the sentences, and the fix is to name what the app did rather than
+    /// what it did it with -- which is the altitude the whole split is about.
+    /// On the built-in client the status comes from `rest::api` and no CLI is
+    /// running at all.
+    ///
+    /// It covered a third note, `ACCOUNT_CHECKING_NOTE`, until the state it
+    /// belonged to stopped being reachable and was deleted with it.
     #[test]
     fn the_account_row_says_what_happened_and_not_which_program_did_it() {
-        for note in [ACCOUNT_CHECKING_NOTE, ACCOUNT_NO_EMAIL_NOTE, ACCOUNT_SIGNED_OUT_NOTE] {
+        for note in [ACCOUNT_STATUS, ACCOUNT_NO_EMAIL_NOTE, ACCOUNT_SIGNED_OUT_NOTE] {
             assert!(
                 !note.contains("Bitwarden CLI"),
                 "{note:?} names a program that is not running on the built-in client"
@@ -10355,9 +10361,12 @@ mod tests {
             // written for.
             assert!(note.len() > 20, "{note:?} was emptied rather than reworded");
         }
-        // And they are still three different sentences -- "we have not asked
-        // yet" and "nobody is signed in" are opposite facts.
-        assert_ne!(ACCOUNT_CHECKING_NOTE, ACCOUNT_SIGNED_OUT_NOTE);
+        // And they are still three different sentences -- "nobody has told
+        // this page anything", "nobody is signed in" and "signed in, address
+        // not reported" are three different facts, and a row that said the
+        // same thing for any two of them would assert one of them falsely.
+        assert_ne!(ACCOUNT_STATUS, ACCOUNT_SIGNED_OUT_NOTE);
+        assert_ne!(ACCOUNT_STATUS, ACCOUNT_NO_EMAIL_NOTE);
         assert_ne!(ACCOUNT_NO_EMAIL_NOTE, ACCOUNT_SIGNED_OUT_NOTE);
     }
 
@@ -10366,11 +10375,25 @@ mod tests {
     /// The property the old constant existed for and the one this change had
     /// to keep: an empty right-hand column reads as a field that failed to
     /// load, on the page someone opens to check whether their app is working.
+    ///
+    /// "In any state" is enforced rather than asserted: the `match` below has
+    /// no wildcard arm, so a variant added to [`AccountStatus`] and left out
+    /// of `states` stops this file compiling. It is written that way because
+    /// the list previously carried `Checking`, and a hand-maintained list is
+    /// exactly what a deleted or added variant leaves quietly wrong.
     #[test]
     fn the_account_row_always_says_something() {
+        // The exhaustiveness control. It paints nothing; it fails to build if
+        // `AccountStatus` grows an arm the list below does not carry.
+        fn every_variant_is_in_the_list_below(status: &AccountStatus) {
+            match status {
+                AccountStatus::SignedOut | AccountStatus::SignedIn { .. } => {}
+            }
+        }
+        every_variant_is_in_the_list_below(&AccountStatus::SignedOut);
+
         let states = [
             None,
-            Some(AccountStatus::Checking),
             Some(AccountStatus::SignedOut),
             Some(AccountStatus::SignedIn { email: None, server: None }),
             Some(AccountStatus::SignedIn {
