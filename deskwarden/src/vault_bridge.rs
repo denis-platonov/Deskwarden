@@ -5353,11 +5353,43 @@ mod tests {
     /// call would have claimed.** Arming the watch across the entire call
     /// reports a leak, and the third reading below attributes it: a bare
     /// `ureq` GET of the same body, with no serde, no `Envelope` and no code
-    /// from this file touching the bytes, leaks too. The plaintext is
+    /// from this file touching the bytes, leaks too in all but about one run
+    /// in six -- see the paragraph below, which is what that "all but" costs.
+    /// The plaintext is
     /// released by `ureq`'s own body reading, upstream of anything
     /// [`VaultBridge::generate`] allocates. That is not fixable here -- it is
     /// the caveat `generate`'s own doc already states about `into_json`'s
     /// buffer -- so it is recorded rather than asserted away.
+    ///
+    /// **The transport's leak is USUAL, NOT GUARANTEED, and reading 3 no
+    /// longer asserts it.** It used to, and that assertion failed about one
+    /// run in six. The reason is not a security regression and it was
+    /// measured rather than argued. Separating fresh-from-pooled connection
+    /// against raw-read-from-`generate`, six readings each, gives 24/24
+    /// leaked unloaded and 24/24 leaked again under full-suite load, pooled
+    /// raw reads included -- a pooling asymmetry was the hypothesis and it is
+    /// disproven. What does move the reading is segmentation: splitting the
+    /// mock's response into two writes makes reading 3 read clean **every**
+    /// time, because this probe scans each freed block for the needle
+    /// CONTIGUOUS and a needle straddling two buffers is in neither. So
+    /// whether the transport's body buffer is freed, in one piece, inside the
+    /// armed window is an allocator-and-segmentation incidental. Reading 3
+    /// asserted the PRESENCE of that incidental, which is a race by
+    /// construction, and no amount of it being true 24 times in a row makes
+    /// it a property.
+    ///
+    /// What reading 3 asserts now is the half that is deterministic: that the
+    /// raw read really did bring the plaintext back over the bridge's own
+    /// agent, so it covers the same stretch reading 2 does and is not a
+    /// window about nothing. Whether that stretch leaked is **recorded** and
+    /// printed, and libtest shows the print exactly when another reading in
+    /// this test fails -- which is when a reader needs to know whether the
+    /// transport was leaking in that run. Making reading 3 deterministic in
+    /// the other direction was considered and not taken: it would need a
+    /// probe that finds the needle across block boundaries, and that probe is
+    /// [`plaintext_reached_the_allocator`] itself, shared with some twenty
+    /// other tests whose claims are all stated in terms of the contiguous
+    /// scan. Widening it here would have changed what all of them mean.
     ///
     /// **Serde's intermediate is a different question and this test does NOT
     /// answer it.** By reading the code it is safe: the final line of
@@ -5373,9 +5405,10 @@ mod tests {
     /// stops releasing the body would make that window readable.
     ///
     /// **What this covers.** Three things, and it is the combination that is
-    /// the claim: the probe sees a bare `String` (control); the transport
-    /// leaks and it is the transport's doing and not this file's (recorded
-    /// and attributed); and the value `generate` hands back, from the moment
+    /// the claim: the probe sees a bare `String` (control); the call leaks,
+    /// and a raw read over the same agent that carries the same plaintext is
+    /// there to attribute it (asserted that it carries; its leak recorded,
+    /// not asserted); and the value `generate` hands back, from the moment
     /// the call returns to the moment it is dropped, does **not** go back to
     /// the allocator in the clear.
     ///
@@ -5445,14 +5478,26 @@ mod tests {
             "the whole call now reads clean. That is better than what was measured when this \
              test was written, not a failure -- find out what changed, and if the transport no \
              longer releases the body in the clear, widen reading 4 below to cover the call \
-             itself and delete reading 3"
+             itself and reduce reading 3 to the raw read it now asserts"
         );
 
-        // 3. ATTRIBUTION. The same body over the same client with no serde,
-        //    no `Envelope` and nothing this file wrote touching the bytes,
-        //    leaks as well -- so reading 2 is `ureq`'s body reading and not
-        //    something `generate` does. This is what stops reading 2 from
-        //    being read as an indictment of the bridge.
+        // 3. ATTRIBUTION, OBSERVED RATHER THAN ASSERTED. The same body over
+        //    the same client with no serde, no `Envelope` and nothing this
+        //    file wrote touching the bytes. Usually it leaks as well, and
+        //    that is what stops reading 2 from being read as an indictment of
+        //    the bridge: reading 2 is `ureq`'s body reading and not something
+        //    `generate` does.
+        //
+        //    "Usually" is the whole of why this is no longer an assertion.
+        //    Whether the transport's buffer is freed, in one piece, inside
+        //    this window is an allocator-and-segmentation incidental -- see
+        //    this test's doc, which names the measurements -- and asserting
+        //    the presence of an incidental failed about one run in six. So
+        //    the leak is RECORDED, and printed below where libtest will show
+        //    it only if something else in this test fails; what is asserted
+        //    is the deterministic half, that this window really did carry the
+        //    plaintext and is therefore about the same stretch reading 2
+        //    covers.
         //
         //    It goes through the bridge's OWN agent, not a fresh one. Building
         //    a bare `ureq` agent here would be an untimed client in this file,
@@ -5460,8 +5505,13 @@ mod tests {
         //    also attribute reading 2's leak to a client that is not the one
         //    reading 2 used.
         let raw_url = format!("{}/generate", server.url());
+        // The sink outlives the window on purpose: what is measured in here is
+        // the transport's OWN buffers, and the needle has to be readable
+        // afterwards to prove they carried it. It is `Zeroizing`, so it was
+        // never a thing this window could have caught anyway, and it is
+        // dropped at the end of the test with nothing armed.
+        let mut sink = Zeroizing::new(Vec::with_capacity(8192));
         let transport_alone = plaintext_reached_the_allocator(|| {
-            let mut sink = Zeroizing::new(Vec::with_capacity(8192));
             std::io::copy(
                 &mut std::io::Read::take(
                     bridge
@@ -5476,10 +5526,20 @@ mod tests {
             )
             .expect("the body was read");
         });
+        // Non-vacuity, and it is deterministic: the raw read brought the
+        // needle back. Without this the recording below could be a serene
+        // `false` about a 404, an empty body, or a `take` that stopped short.
+        // Read outside the window -- a search inside it is harmless but a
+        // failing `assert!` inside it would allocate its own copy.
         assert!(
-            transport_alone,
-            "the transport on its own reads clean, so reading 2's leak is NOT the transport's \
-             and something between the socket and the `Zeroizing` is releasing the plaintext"
+            sink.windows(PROBE.len()).any(|w| w == PROBE.as_bytes()),
+            "the raw read over the bridge's own agent did not bring back the needle, so this \
+             reading covers a different stretch from reading 2 and attributes nothing"
+        );
+        eprintln!(
+            "reading 3, attribution (recorded, not asserted): the transport on its own {} the \
+             plaintext to the allocator in this run",
+            if transport_alone { "DID release" } else { "did NOT release" }
         );
 
         // 4. THE CLAIM. The value `generate` handed back, dropped inside its
@@ -5503,7 +5563,10 @@ mod tests {
             !on_drop,
             "the password `generate` returned went back to the allocator in the clear when it \
              was dropped -- it is not wiping itself, so every caller that takes a copy leaves \
-             the plaintext on the heap"
+             the plaintext on the heap. For what it is worth here: the transport on its own {} \
+             the plaintext in this run, but reading 3's buffers were all freed before this \
+             window opened, so the needle this window saw is the returned value's own",
+            if transport_alone { "DID release" } else { "did NOT release" }
         );
 
         _m.assert();
