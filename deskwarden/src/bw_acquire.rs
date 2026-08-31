@@ -1319,6 +1319,82 @@ mod tests {
         assert!(this_sign_in_needs_the_cli(Some("https://vault.example.com"), true));
     }
 
+    /// **What the sign-in window actually asks, composed the way it composes
+    /// it**, rather than the gate alone.
+    ///
+    /// The gate takes a `bool`, and the tests above pin it against `choose`
+    /// for every value of that bool. Neither says where the bool comes from --
+    /// and that is the half the acquisition modal now turns on, because a
+    /// *new* account has no server yet and so no property of its record can
+    /// answer the question. `login_ui` passes
+    /// `accounts::official_cli_after_sign_in(account, typed_server)`, so this
+    /// walks the same composition over the cases that differ.
+    ///
+    /// Each row is a `(what the user is doing, does the CLI get downloaded)`
+    /// pair, and the three rows are three different reasons for the answer.
+    #[test]
+    fn the_acquisition_modal_fires_for_official_servers_and_not_for_new_self_hosted_ones() {
+        use crate::accounts::{Account, AccountId, official_cli_after_sign_in};
+
+        let id = || AccountId::parse(&"a".repeat(32)).expect("a 32-hex test id");
+        // What `prepare_new_account` produces: no address, no server.
+        let mint = Account {
+            id: id(),
+            email: String::new(),
+            server_url: None,
+            use_official_bw_crypto: true,
+        };
+        // A self-hoster who has been on `bw serve` all along.
+        let established_on_the_cli = Account {
+            id: id(),
+            email: "me@example.com".to_string(),
+            server_url: Some("https://vault.example.com".to_string()),
+            use_official_bw_crypto: true,
+        };
+
+        let needs_cli = |account: Option<&Account>, typed: Option<&str>| {
+            this_sign_in_needs_the_cli(typed, official_cli_after_sign_in(account, typed))
+        };
+
+        // **A new account signing in to a self-hosted server: no download.**
+        // This is the row the whole change exists for.
+        assert!(
+            !needs_cli(Some(&mint), Some("https://vault.example.com")),
+            "a new self-hosted account was asked to download the Bitwarden CLI, which is the \
+             download the built-in client exists to avoid"
+        );
+
+        // **A new account signing in to bitwarden.com: the modal fires.**
+        // `None` is what the form leaves for the official cloud, and the
+        // explicit cloud URL is what it leaves when the user types one.
+        assert!(
+            needs_cli(Some(&mint), None),
+            "a new bitwarden.com account no longer acquires the CLI, so official servers get \
+             a backend this app does not implement for them"
+        );
+        assert!(
+            needs_cli(Some(&mint), Some("https://vault.bitwarden.com")),
+            "a new account against an official Bitwarden host no longer acquires the CLI"
+        );
+
+        // **An established self-hosted account on `bw serve` still needs it.**
+        // Its vault is held by the CLI; answering "no" here would be the
+        // upgrade regression showing up as a missing binary instead.
+        assert!(
+            needs_cli(Some(&established_on_the_cli), Some("https://vault.example.com")),
+            "an existing self-hosted account served by `bw serve` was refused the CLI its \
+             vault is actually held by"
+        );
+
+        // And the typed address does NOT override an established account:
+        // same record, official URL typed, still the record's answer.
+        assert!(
+            needs_cli(Some(&established_on_the_cli), None),
+            "an established account's backend followed the typed server rather than its own \
+             record"
+        );
+    }
+
     /// `production()` holds the real functions.
     ///
     /// Copied in shape from

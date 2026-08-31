@@ -127,6 +127,48 @@ pub struct Account {
     pub email: String,
     /// A self-hosted server URL, or `None` for bitwarden.com.
     pub server_url: Option<String>,
+    /// Whether this account's vault goes through the official `bw` CLI rather
+    /// than through this crate's built-in client.
+    ///
+    /// **Per account, and that is the feature rather than an implementation
+    /// detail.** The owner's case is "two profiles on the same machine --
+    /// official via CLI and not", which a single value in [`crate::settings`]
+    /// cannot express at all: one machine, two accounts, two backends.
+    /// [`crate::backend_policy::choose`] takes this and
+    /// [`Self::server_url`] and answers for *one* account, and every caller
+    /// spends it against the account it is actually serving.
+    ///
+    /// **`true` for any record already on disk, and that is what makes the
+    /// upgrade safe.** This struct has no container `#[serde(default)]` --
+    /// unlike [`crate::settings::Settings`], which does -- so a missing key
+    /// is answered by this field's own `default` and by nothing else. An
+    /// `Account` in a `settings.json` was written before this field existed,
+    /// therefore it is an account that has been served by `bw serve` all
+    /// along, therefore `true` is not a guess about it but a description of
+    /// it. No migration runs and no existing account changes backend.
+    ///
+    /// That is precisely the reasoning a default on
+    /// [`crate::settings::Settings`] could **not** support: a `Settings` with
+    /// no key is indistinguishable from a fresh install, so a `false` there
+    /// would silently move an existing self-hoster off the backend that holds
+    /// their vault. Here the record's existence *is* the evidence.
+    ///
+    /// Set explicitly at every mint site ([`prepare_new_account`],
+    /// [`resolve_startup`]'s first-run arm, and the API-key path) from the
+    /// server the account is being created against, so a *new* account never
+    /// relies on this default.
+    #[serde(default = "served_by_the_official_cli_by_default")]
+    pub use_official_bw_crypto: bool,
+}
+
+/// `true`, for [`Account::use_official_bw_crypto`]'s `serde(default)`.
+///
+/// Named for what it means rather than for what it returns: a free
+/// `default_true` would read as a serde idiom, and the thing worth saying at
+/// the call site is *which* backend an account with no stored answer gets.
+/// See that field for why the answer is `true` and why it is safe.
+fn served_by_the_official_cli_by_default() -> bool {
+    true
 }
 
 /// One switchable account, as an [`AccountsState`], for the windows' tests.
@@ -145,6 +187,7 @@ pub(crate) fn one_available_account(email: &str) -> AccountsState {
         id: AccountId::generate(),
         email: email.to_string(),
         server_url: None,
+        use_official_bw_crypto: true,
     };
     let active = account.id.clone();
     AccountsState::new(
@@ -405,11 +448,86 @@ pub fn account_label(account: &Account) -> &str {
 /// A *different* non-empty answer does win, and has to: `bw login` replaces
 /// whatever profile it is pointed at, so a directory can genuinely change
 /// hands. A stale email is a menu row naming the wrong person.
+/// Whether `account` is a mint that no sign-in has completed yet.
+///
+/// A blank address *and* no server: that is what [`prepare_new_account`] and
+/// [`resolve_startup`]'s first-run arm produce, and nothing else in this app
+/// writes a record in that state. Both halves are required -- an account with
+/// an address has signed in, and an account with a server has been pointed at
+/// one -- because this predicate gates the one write that is allowed to
+/// choose an account's backend, and widening it would let that write reach an
+/// established account.
+fn is_a_fresh_mint(account: &Account) -> bool {
+    account.email.is_empty() && account.server_url.is_none()
+}
+
+/// Which backend an account will be on once a sign-in against `server_url`
+/// completes -- asked *before* the sign-in, by the window that has to decide
+/// whether this sign-in needs the `bw` CLI downloaded first.
+///
+/// **One rule, two callers, and the second one exists because the first is
+/// too late.** [`learn_account_details`] writes this value, but it runs
+/// *after* a successful sign-in -- and the CLI has to be on disk *before* the
+/// sign-in, because on the `bw serve` backend the CLI is what performs it. So
+/// the sign-in window asks the same question in advance, and asks it through
+/// this function rather than through a second copy of the reasoning:
+/// `crate::bw_acquire::this_sign_in_needs_the_cli` spends the answer, and a
+/// `debug_assert` in `learn_account_details` holds the two to the same
+/// answer.
+///
+/// **The typed server, not the stored one, and that is the whole point for a
+/// new account.** A mint carries `server_url: None` and the `true`
+/// placeholder right up until the sign-in it is waiting for, so asking the
+/// *record* would say "official, fetch the CLI" for every new account
+/// including a self-hosted one -- which is the download the built-in client
+/// exists to avoid. `server_url` here is the address in the form the user is
+/// about to submit.
+///
+/// **An established account answers from its record**, and the typed address
+/// is ignored: it has a backend already serving it, and `learn_account_details`
+/// will not move it either.
+#[must_use]
+pub fn official_cli_after_sign_in(account: Option<&Account>, server_url: Option<&str>) -> bool {
+    match account {
+        Some(account) if !is_a_fresh_mint(account) => account.use_official_bw_crypto,
+        // `None` is a host with no account record at all, which is a sign-in
+        // that is about to mint one; it takes the same answer as a mint.
+        _ => !crate::backend_policy::is_self_hosted(server_url),
+    }
+}
+
 pub fn learn_account_details(
     account: &mut Account,
     email: Option<&str>,
     server_url: Option<&str>,
 ) -> bool {
+    // **The one moment an account's backend is decided, and it is decided
+    // once.**
+    //
+    // A blank record -- no address and no server -- is a mint from
+    // [`prepare_new_account`] or [`resolve_startup`]'s first-run arm that no
+    // sign-in has completed yet. This call is that sign-in, so it is the
+    // first and only moment at which the server this account exists to talk
+    // to is known, which is exactly what
+    // [`crate::backend_policy::choose`] needs and what
+    // [`Account::use_official_bw_crypto`] must therefore hold.
+    //
+    // **Read before anything below writes**, because both halves of the test
+    // are fields this function is about to fill in.
+    //
+    // Guarding on "was blank" rather than deriving unconditionally is the
+    // whole safety argument, and it is the same one the field's `serde`
+    // default rests on: an account that already carries an address or a
+    // server has been signed in before, therefore it has a backend already
+    // serving it, therefore this function must not re-open the question. `bw
+    // login` can genuinely move a directory to a different server -- see the
+    // note above about a stale email -- and on an established account that
+    // moves the address without moving the vault off the backend that holds
+    // it. `settle_the_vault_backend` handles a server that has moved to a
+    // cloud host on its own, by clearing the stored key and returning to
+    // `bw serve`; it does not need this function to rewrite the preference to
+    // get there.
+    let completing_a_fresh_mint = is_a_fresh_mint(account);
     let mut changed = false;
     if let Some(email) = email.filter(|e| !e.is_empty()) {
         if account.email != email {
@@ -420,6 +538,32 @@ pub fn learn_account_details(
     if let Some(server_url) = server_url.filter(|s| !s.is_empty()) {
         if account.server_url.as_deref() != Some(server_url) {
             account.server_url = Some(server_url.to_string());
+            changed = true;
+        }
+    }
+    if completing_a_fresh_mint {
+        // The same function the sign-in window's CLI gate asks, so the modal
+        // that window decides to show and the backend this write settles on
+        // are one answer and not two. See `official_cli_after_sign_in`.
+        // `!is_self_hosted` rather than `choose`: this is the *input* that
+        // function takes, and computing it from the function it feeds would
+        // be circular. A positively self-hosted server gets the built-in
+        // client; bitwarden.com, and any address whose host cannot be read,
+        // gets the official CLI -- the same "unknown counts as official"
+        // direction `is_self_hosted` documents, reached rather than repeated.
+        //
+        // A sign-in to bitwarden.com leaves `server_url` as `None` and lands
+        // here with `true`, which is both the value the mint already carried
+        // and the right one; the assignment is unconditional so that the two
+        // arms cannot drift apart.
+        let official = !crate::backend_policy::is_self_hosted(account.server_url.as_deref());
+        debug_assert_eq!(
+            official,
+            official_cli_after_sign_in(None, account.server_url.as_deref()),
+            "the sign-in gate and this write must agree about the backend a new account gets"
+        );
+        if account.use_official_bw_crypto != official {
+            account.use_official_bw_crypto = official;
             changed = true;
         }
     }
@@ -500,6 +644,16 @@ pub fn prepare_new_account(config_dir: &Path) -> Result<Account, String> {
         id,
         email: String::new(),
         server_url: None,
+        // Nothing has been signed in against this directory yet, so the
+        // server -- the only thing that can answer this -- is not known.
+        // `true` is the value that means "no decision has been taken": it is
+        // what every account on this machine had before the field existed, so
+        // a mint abandoned between here and the sign-in leaves a record that
+        // reads exactly like an old one rather than like an opt-in nobody
+        // made. `learn_account_details` derives the real answer from the
+        // server the sign-in is actually against, and it is the only writer
+        // that ever moves this field for a new account.
+        use_official_bw_crypto: true,
     })
 }
 
@@ -655,6 +809,10 @@ pub fn resolve_startup(
             // completes a sign-in against this directory.
             email: String::new(),
             server_url: None,
+            // Not known yet either, and for the same reason -- the server is
+            // learned from the sign-in this mint has not had. See
+            // `prepare_new_account` for why the placeholder is `true`.
+            use_official_bw_crypto: true,
         });
         needs_persist = true;
         first_run = true;
@@ -856,6 +1014,34 @@ impl AccountsState {
         changed
     }
 
+    /// Records that the user has chosen a backend for the active account,
+    /// answering whether anything moved.
+    ///
+    /// **The one writer that may change an established account's backend**,
+    /// and it is deliberately not [`learn_account_details`]: that function
+    /// derives the value from a server and refuses to touch an account that
+    /// has signed in before, precisely so a re-sign-in cannot move a vault
+    /// off the backend holding it. This is the other direction -- the user in
+    /// Preferences, saying so on purpose -- so it takes the value rather than
+    /// deriving one, and it applies to an established account by design.
+    ///
+    /// Written to [`active`](Self::active) **and** to every entry of
+    /// [`all`](Self::all) carrying that id, for the reason
+    /// [`learn_active_details`](Self::learn_active_details) gives: those are
+    /// two copies of one account and `all()` is what gets persisted. A
+    /// caller that updated only `active` would show the change for this
+    /// session and lose it on the next launch.
+    pub fn set_active_backend_preference(&mut self, use_official_bw_crypto: bool) -> bool {
+        let mut changed = self.active.use_official_bw_crypto != use_official_bw_crypto;
+        self.active.use_official_bw_crypto = use_official_bw_crypto;
+        let id = self.active.id.clone();
+        for account in self.accounts.iter_mut().filter(|a| a.id == id) {
+            changed |= account.use_official_bw_crypto != use_official_bw_crypto;
+            account.use_official_bw_crypto = use_official_bw_crypto;
+        }
+        changed
+    }
+
     /// Records the account this process has just moved onto, appending it to
     /// the list if it is not there yet.
     ///
@@ -955,6 +1141,7 @@ mod tests {
             id: id(raw),
             email: "me@example.com".to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         }
     }
 
@@ -1106,12 +1293,14 @@ mod tests {
             id: id(A),
             email: "me@example.com".to_string(),
             server_url: Some("https://vault.example.com".to_string()),
+            use_official_bw_crypto: false,
         };
         assert_eq!(
             serde_json::to_string(&stored).unwrap(),
             format!(
                 "{{\"id\":\"{A}\",\"email\":\"me@example.com\",\
-                 \"server_url\":\"https://vault.example.com\"}}"
+                 \"server_url\":\"https://vault.example.com\",\
+                 \"use_official_bw_crypto\":false}}"
             )
         );
         assert_eq!(
@@ -1121,7 +1310,27 @@ mod tests {
         // A self-hosted URL is optional, not absent-meaning-empty.
         assert_eq!(
             serde_json::to_string(&account(A)).unwrap(),
-            format!("{{\"id\":\"{A}\",\"email\":\"me@example.com\",\"server_url\":null}}")
+            format!(
+                "{{\"id\":\"{A}\",\"email\":\"me@example.com\",\"server_url\":null,\
+                 \"use_official_bw_crypto\":true}}"
+            )
+        );
+        // **A record written before the backend became a per-account choice.**
+        // The key is absent, and it must read as `true` -- the official CLI,
+        // which is what every account on this machine was served by before the
+        // field existed. `Account` deliberately carries no container
+        // `#[serde(default)]`, so this is that one field's own default and
+        // nothing else; see `Account::use_official_bw_crypto` for why the
+        // existence of the record is what makes `true` a description rather
+        // than a guess.
+        let older = serde_json::from_str::<Account>(&format!(
+            "{{\"id\":\"{A}\",\"email\":\"me@example.com\",\
+             \"server_url\":\"https://vault.example.com\"}}"
+        ))
+        .expect("a record written before the field existed must still load");
+        assert!(
+            older.use_official_bw_crypto,
+            "an account stored before this field existed must stay on the official CLI"
         );
         // And a stored account carrying an escaping id is rejected as a whole,
         // not silently loaded with a dangerous directory name.
@@ -1129,6 +1338,249 @@ mod tests {
             r#"{"id":"../..","email":"me@example.com","server_url":null}"#
         )
         .is_err());
+    }
+
+    // ---- the backend an account gets, and when it is decided --------------
+
+    /// **The upgrade regression, and it is the one that would cost a user
+    /// their vault.**
+    ///
+    /// An existing self-hosted account is a record in a `settings.json`
+    /// written before this field existed: it has a server, it has an address,
+    /// and it has no `use_official_bw_crypto` key. That user's vault is held
+    /// by `bw serve`, and their machine may have no `userkey.bin` at all --
+    /// the direct path has never run for them. If the upgrade moved them to
+    /// the built-in client, their next launch would drop the cached `bw`
+    /// session and ask for the master password against a backend that has
+    /// never held their vault.
+    ///
+    /// So this walks the whole way from the bytes on disk to the backend:
+    /// parse the record as it really is on disk, and spend it on the same
+    /// `choose` that `settle_the_vault_backend` spends. Asserting the field
+    /// alone would be the vacuous version -- it would pass while `choose`
+    /// answered anything at all.
+    #[test]
+    fn an_existing_self_hosted_account_stays_on_bw_serve_across_the_upgrade() {
+        use crate::backend_policy::{VaultBackendChoice, choose, is_self_hosted};
+
+        // Byte for byte what a pre-0.9.0 `settings.json` holds for one
+        // account: no `use_official_bw_crypto` key anywhere in it.
+        let on_disk = format!(
+            "{{\"id\":\"{A}\",\"email\":\"me@example.com\",\
+             \"server_url\":\"https://vault.example.com\"}}"
+        );
+        assert!(
+            !on_disk.contains("use_official_bw_crypto"),
+            "control: this fixture is supposed to be a record with the key ABSENT, and it \
+             carries one -- the test would prove nothing about an upgrading user"
+        );
+        let existing: Account =
+            serde_json::from_str(&on_disk).expect("a record written by an older build must load");
+
+        // The control for the other half of `choose`: this really is the
+        // self-hosted case, so a `BwServe` answer below can only come from the
+        // preference and not from the server test falling through.
+        assert!(
+            is_self_hosted(existing.server_url.as_deref()),
+            "control: the fixture is not self-hosted, so this test is not about the \
+             account it claims to be about"
+        );
+
+        assert_eq!(
+            choose(existing.server_url.as_deref(), existing.use_official_bw_crypto),
+            VaultBackendChoice::BwServe,
+            "an existing self-hosted account was moved off `bw serve` by the upgrade. Its \
+             vault is held by the CLI and it may have no stored vault key at all, so this \
+             user's next launch asks for a master password against a backend that has \
+             never held their vault."
+        );
+    }
+
+    /// The other direction, and the reason the test above is not simply
+    /// "everything is `BwServe`": a NEW self-hosted account gets the built-in
+    /// client, from the same `choose`.
+    ///
+    /// The account is built the way production builds one -- a mint, then the
+    /// sign-in that teaches it its server -- rather than by setting the field
+    /// directly, so this fails if `learn_account_details` stops deriving.
+    #[test]
+    fn a_new_self_hosted_account_gets_the_built_in_client() {
+        use crate::backend_policy::{VaultBackendChoice, choose};
+
+        let mut minted = Account {
+            id: id(A),
+            email: String::new(),
+            server_url: None,
+            use_official_bw_crypto: true,
+        };
+        assert_eq!(
+            choose(minted.server_url.as_deref(), minted.use_official_bw_crypto),
+            VaultBackendChoice::BwServe,
+            "control: a mint that has not signed in yet is on `bw serve`, so the change \
+             below is the sign-in's doing and not the fixture's"
+        );
+
+        assert!(
+            learn_account_details(
+                &mut minted,
+                Some("me@example.com"),
+                Some("https://vault.example.com"),
+            ),
+            "the sign-in taught the account nothing"
+        );
+
+        assert!(
+            !minted.use_official_bw_crypto,
+            "a new self-hosted account was left on the official CLI"
+        );
+        assert_eq!(
+            choose(minted.server_url.as_deref(), minted.use_official_bw_crypto),
+            VaultBackendChoice::DirectRest,
+            "a new self-hosted account did not get the built-in client"
+        );
+    }
+
+    /// A new account on bitwarden.com gets `bw serve`, which is what keeps the
+    /// CLI acquisition modal firing for the servers that need it.
+    ///
+    /// `server_url` stays `None` for the official cloud -- that is what `None`
+    /// means here -- so this also pins that the derivation reads "no server"
+    /// as official rather than as unknown-and-therefore-direct.
+    #[test]
+    fn a_new_bitwarden_com_account_stays_on_the_official_cli() {
+        use crate::backend_policy::{VaultBackendChoice, choose};
+
+        let mut minted = Account {
+            id: id(A),
+            email: String::new(),
+            server_url: None,
+            use_official_bw_crypto: true,
+        };
+        learn_account_details(&mut minted, Some("me@example.com"), None);
+
+        assert!(minted.use_official_bw_crypto, "a bitwarden.com account left the official CLI");
+        assert_eq!(
+            choose(minted.server_url.as_deref(), minted.use_official_bw_crypto),
+            VaultBackendChoice::BwServe
+        );
+    }
+
+    /// **A re-sign-in must not re-open the question on an established
+    /// account**, which is the guard that keeps the upgrade test above true
+    /// for anything the user does after the upgrade.
+    ///
+    /// Both directions, because the damage runs both ways: a self-hoster on
+    /// `bw serve` must not be moved to the built-in client by signing in
+    /// again, and one who has chosen the built-in client must not be dragged
+    /// back onto the CLI.
+    #[test]
+    fn signing_in_again_does_not_move_an_established_account_between_backends() {
+        let mut on_the_cli = Account {
+            id: id(A),
+            email: "me@example.com".to_string(),
+            server_url: Some("https://vault.example.com".to_string()),
+            use_official_bw_crypto: true,
+        };
+        learn_account_details(
+            &mut on_the_cli,
+            Some("me@example.com"),
+            Some("https://vault.example.com"),
+        );
+        assert!(
+            on_the_cli.use_official_bw_crypto,
+            "signing in again moved an established self-hosted account off `bw serve`, which \
+             is the upgrade regression arriving one launch late"
+        );
+
+        let mut on_the_built_in_client =
+            Account { use_official_bw_crypto: false, ..on_the_cli.clone() };
+        learn_account_details(
+            &mut on_the_built_in_client,
+            Some("me@example.com"),
+            Some("https://vault.example.com"),
+        );
+        assert!(
+            !on_the_built_in_client.use_official_bw_crypto,
+            "signing in again dragged an account back onto the official CLI"
+        );
+    }
+
+    /// **The owner's case: two accounts, one machine, one backend each.**
+    ///
+    /// Nothing in the suite covered this before, because it could not be
+    /// expressed -- the preference was one value per `settings.json`. It is
+    /// spent through `choose` for each account rather than by reading the two
+    /// fields back, so it fails if the decision ever stops being per-account.
+    #[test]
+    fn two_accounts_on_one_machine_keep_their_own_backends() {
+        use crate::backend_policy::{VaultBackendChoice, choose};
+
+        let official = Account {
+            id: id(A),
+            email: "me@example.com".to_string(),
+            server_url: None,
+            use_official_bw_crypto: true,
+        };
+        let self_hosted = Account {
+            id: id(B),
+            email: "me@example.com".to_string(),
+            server_url: Some("https://vault.example.com".to_string()),
+            use_official_bw_crypto: false,
+        };
+
+        let mut state = AccountsState::new(
+            crate::bw_path::MultiAccountAvailability::Available,
+            vec![official.clone(), self_hosted.clone()],
+            official.id.clone(),
+        )
+        .expect("two accounts is a valid state");
+
+        let backend_of = |a: &Account| choose(a.server_url.as_deref(), a.use_official_bw_crypto);
+
+        assert_eq!(backend_of(state.active()), VaultBackendChoice::BwServe);
+        // The switch, through `adopt` -- the one mutation every switch goes
+        // through, and the same one `main`'s `switch_to_account` performs.
+        state.adopt(self_hosted.clone());
+        assert_eq!(
+            backend_of(state.active()),
+            VaultBackendChoice::DirectRest,
+            "after switching to the self-hosted account the app is still on `bw serve`, so \
+             the backend is not following the account"
+        );
+        // And back, so the two answers above are telling the accounts apart
+        // rather than reporting one constant twice.
+        state.adopt(official.clone());
+        assert_eq!(backend_of(state.active()), VaultBackendChoice::BwServe);
+    }
+
+    /// Preferences writes the backend choice into the account, and into every
+    /// copy of it that gets persisted.
+    #[test]
+    fn choosing_a_backend_in_preferences_writes_it_to_the_active_account() {
+        let mut state = AccountsState::new(
+            crate::bw_path::MultiAccountAvailability::Available,
+            vec![account(A), account(B)],
+            id(A),
+        )
+        .expect("two accounts is a valid state");
+        assert!(state.active().use_official_bw_crypto, "control: the fixture starts on the CLI");
+
+        assert!(state.set_active_backend_preference(false), "the write reported no change");
+        assert!(!state.active().use_official_bw_crypto);
+        assert!(
+            !account_for(state.all(), &id(A)).expect("the account is in the list").use_official_bw_crypto,
+            "the choice reached `active` but not the list that gets persisted, so it is lost \
+             on the next launch"
+        );
+        assert!(
+            account_for(state.all(), &id(B)).expect("the other account").use_official_bw_crypto,
+            "choosing a backend for one account changed the other one's"
+        );
+        assert!(
+            !state.set_active_backend_preference(false),
+            "writing the same value again reported a change, so every visit to Preferences \
+             rewrites settings.json"
+        );
     }
 
     // ---------------------------------------------------------------- 2.2
@@ -1551,7 +2003,7 @@ mod tests {
             // as "signed out" with the real vault untouched a few directories
             // away.
             for availability in [
-                MultiAccountAvailability::Available,
+                crate::bw_path::MultiAccountAvailability::Available,
                 MultiAccountAvailability::BlockedByUnknownCliPath,
                 trap(),
             ] {
@@ -1585,7 +2037,7 @@ mod tests {
             // A hand-edited `settings.json` again. Two entries with one id are
             // two menu items that switch to the same data directory.
             let s = state(
-                MultiAccountAvailability::Available,
+                crate::bw_path::MultiAccountAvailability::Available,
                 vec![a(), b(), b(), a()],
                 &a().id,
             );
@@ -1737,9 +2189,10 @@ mod tests {
                 id: id(A),
                 email: String::new(),
                 server_url: None,
+                use_official_bw_crypto: true,
             };
             let mut s = state(
-                MultiAccountAvailability::Available,
+                crate::bw_path::MultiAccountAvailability::Available,
                 vec![blank.clone(), b()],
                 &blank.id,
             );
@@ -1819,9 +2272,10 @@ mod tests {
                 id: id(A),
                 email: String::new(),
                 server_url: None,
+                use_official_bw_crypto: true,
             };
             let mut s = state(
-                MultiAccountAvailability::Available,
+                crate::bw_path::MultiAccountAvailability::Available,
                 vec![blank.clone(), b(), blank.clone()],
                 &blank.id,
             );
@@ -2293,6 +2747,7 @@ mod tests {
                 id: id(B),
                 email: "new@example.com".to_string(),
                 server_url: Some("https://vault.example.com".to_string()),
+                use_official_bw_crypto: true,
             };
             s.adopt(added.clone());
 
@@ -2321,7 +2776,7 @@ mod tests {
             // on one directory.
             let (a, b) = (account(A), account(B));
             let mut s = state(
-                MultiAccountAvailability::Available,
+                crate::bw_path::MultiAccountAvailability::Available,
                 vec![a.clone(), b.clone()],
                 &a.id,
             );

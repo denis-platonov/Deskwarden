@@ -17355,6 +17355,7 @@ mod account_switcher_tests {
             id: AccountId::parse(id).expect("a 32-char lowercase hex id"),
             email: email.to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         }
     }
 
@@ -18260,6 +18261,7 @@ mod titlebar_switcher_placement_tests {
             id: AccountId::parse(id).expect("a 32-char lowercase hex id"),
             email: email.to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         }
     }
 

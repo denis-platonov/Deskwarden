@@ -370,12 +370,18 @@ fn main() {
     // because reading it directly bypasses all three. `None` for the minting
     // argument, so this asks a question and changes nothing -- the real
     // resolve, the one allowed to mint, still happens below.
-    let startup_server_url = match accounts::resolve_startup(
+    // **The account rather than its URL**, because the backend preference is
+    // a field of the same record since it stopped being one setting per
+    // machine. Taking the whole account here is what lets the gate below ask
+    // `choose` the same question `settle_the_vault_backend` asks it, off the
+    // same two fields, instead of pairing this account's server with some
+    // other account's preference.
+    let startup_account = match accounts::resolve_startup(
         &settings.accounts,
         settings.active_account.as_ref(),
         None,
     ) {
-        accounts::StartupAccounts::Ready { active, .. } => active.server_url.clone(),
+        accounts::StartupAccounts::Ready { active, .. } => Some(active.clone()),
         _ => None,
     };
 
@@ -408,7 +414,10 @@ fn main() {
     // rest of the app decides this with -- so this cannot disagree with
     // the backend that is actually built later.
     let bw_is_this_accounts_vault = matches!(
-        backend_policy::choose(startup_server_url.as_deref(), settings.use_official_bw_crypto),
+        backend_policy::choose(
+            startup_account.as_ref().and_then(|a| a.server_url.as_deref()),
+            startup_account.as_ref().is_none_or(|a| a.use_official_bw_crypto),
+        ),
         backend_policy::VaultBackendChoice::BwServe
     );
     if !bw_exe.exists() {
@@ -819,12 +828,8 @@ fn main() {
     // be invisible to that rule, and this environment is one the rule is
     // exactly right about: `login_ui`'s sign-in worker reads it, and the
     // startup window is a sign-in window.
-    let backend_env = settle_the_vault_backend(
-        config_dir.as_path(),
-        active_account.as_ref(),
-        settings.use_official_bw_crypto,
-        &vault_slot,
-    );
+    let backend_env =
+        settle_the_vault_backend(config_dir.as_path(), active_account.as_ref(), &vault_slot);
     let backend_choice = backend_policy::install_env(backend_env)
         .then(|| backend_policy::selected())
         .unwrap_or_else(|| {
@@ -842,7 +847,6 @@ fn main() {
     // `BackendSettlement`.
     publish_backend_settlement(BackendSettlement {
         config_dir: config_dir.clone(),
-        use_official_bw_crypto: settings.use_official_bw_crypto,
         slot: Arc::clone(&vault_slot),
     });
 
@@ -2424,7 +2428,13 @@ fn main() {
         // order would apply the same edit twice, which is harmless but
         // would log the disk-cache change twice.
         if let Some(edited) = ui_windows.take_edited_settings(&config_dir) {
-            apply_edited_settings(&estate.cache, &mut estate.settings, &settings_path, edited);
+            apply_edited_settings(
+                &estate.cache,
+                &mut estate.settings,
+                &settings_path,
+                edited,
+                estate.accounts.as_mut(),
+            );
         }
         if let Some(result) = ui_windows.poll_the_vault_window(&config_dir) {
             estate = open_vault_window(
@@ -2626,7 +2636,19 @@ fn main() {
                 // a bit further down only runs once this returns, so a
                 // changed `keep_backend_running` takes effect on the very
                 // next iteration rather than waiting for the next launch.
-                let edited = prefs_ui::run(estate.settings.clone());
+                // **Seeded from the account, because that is where the value
+                // lives.** The page still reads and writes one `Settings`
+                // field -- it is the shape all three shells pass -- but the
+                // copy in `estate.settings` is not the authority and may be
+                // stale for this field the moment an account switch happens.
+                // `apply_edited_settings` takes the answer back out.
+                let edited = prefs_ui::run(settings::Settings {
+                    use_official_bw_crypto: estate
+                        .accounts
+                        .as_ref()
+                        .is_none_or(|a| a.active().use_official_bw_crypto),
+                    ..estate.settings.clone()
+                });
                 // **The first of the three shells for the same page**, and
                 // the write-back is one function so that the other two cannot
                 // drift from it -- see `apply_edited_settings`, which carries
@@ -2638,6 +2660,7 @@ fn main() {
                     &mut estate.settings,
                     &settings_path,
                     edited,
+                    estate.accounts.as_mut(),
                 );
                 // The vault window is not the only blocking one, and this is
                 // the other one the TRAY can open: repeat clicks on
@@ -7409,7 +7432,13 @@ fn run_vault_loop(
         // One line, one read of the field, and no jump -- see
         // `nothing_outside_the_two_branch_bodies_may_jump`, which counts both.
         if let Some(edited) = result.edited_settings.clone() {
-            apply_edited_settings(&est.cache, &mut est.settings, deps.settings_path, edited);
+            apply_edited_settings(
+                &est.cache,
+                &mut est.settings,
+                deps.settings_path,
+                edited,
+                est.accounts.as_mut(),
+            );
         }
 
         // **The three things the titlebar's account menu can ask for, ranked
@@ -8497,10 +8526,23 @@ fn add_account(
              the account list with no address on it"
         );
     }
+    // **The third mint site, and the one that does not go through
+    // `learn_account_details`.** This path builds the finished record in one
+    // go rather than filling in a blank one, so the derivation that function
+    // performs has to happen here too -- through the same
+    // `official_cli_after_sign_in`, not a second copy of the rule, so that
+    // this account lands on the backend the sign-in window's CLI gate already
+    // decided it would. `prepared` is a fresh mint from
+    // `prepare_new_account`, so the answer comes from the server this sign-in
+    // was actually against: self-hosted gets the built-in client, and
+    // bitwarden.com gets `bw serve`.
+    let use_official_bw_crypto =
+        accounts::official_cli_after_sign_in(Some(&prepared), details.server_url.as_deref());
     let added = Account {
         id: prepared.id.clone(),
         email: details.user_email.unwrap_or_default(),
         server_url: details.server_url,
+        use_official_bw_crypto,
     };
 
     // Into the new account's own file, before the switch, because the switch's
@@ -10442,7 +10484,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     let cache = Arc::new(
         match backend_policy::choose(
             active_account.as_ref().and_then(|a| a.server_url.as_deref()),
-            settings.use_official_bw_crypto,
+            active_account.as_ref().is_none_or(|a| a.use_official_bw_crypto),
         ) {
             backend_policy::VaultBackendChoice::DirectRest => {
                 // Both halves or neither: the stored key, and the server it
@@ -11295,12 +11337,36 @@ fn apply_disk_cache_change(cache: &VaultCache, before: bool, after: bool) -> boo
 /// was told at startup -- and inside the `edited != *settings` guard on
 /// purpose: a visit to Preferences that changed nothing has nothing to
 /// install.
+/// **The backend preference travels in the `Settings` blob but does not live
+/// there**, and this is the function that puts it back where it does.
+///
+/// `prefs_ui::run` is handed a `Settings` and returns an edited one; that
+/// struct is the page's whole input and output, in this shell and in the two
+/// child-process ones. The backend preference is a field of
+/// [`accounts::Account`] now, so it is *seeded into* that blob before the
+/// window opens (see the Preferences arm of the tray loop) and *taken out of*
+/// it here, into the active account, which is the only copy anything reads.
+///
+/// Persisted through `persist_accounts` rather than `persist_preferences`,
+/// because those two own disjoint halves of `settings.json` and this value
+/// has changed sides. Writing it from `persist_preferences` would put a
+/// second copy in the file for the next launch to disagree with.
 fn apply_edited_settings(
     cache: &VaultCache,
     settings: &mut settings::Settings,
     settings_path: &Path,
     edited: settings::Settings,
+    accounts: Option<&mut accounts::AccountsState>,
 ) {
+    if let Some(accounts) = accounts {
+        if accounts.set_active_backend_preference(edited.use_official_bw_crypto) {
+            if let Err(e) =
+                settings::Settings::persist_accounts(settings_path, accounts.all(), Some(&accounts.active().id))
+            {
+                log::warn!("could not save the backend choice for this account: {e}");
+            }
+        }
+    }
     if edited == *settings {
         return;
     }
@@ -11540,14 +11606,28 @@ fn device_id_for(id: &accounts::AccountId) -> String {
 fn settle_the_vault_backend(
     config_dir: &Path,
     account: Option<&accounts::Account>,
-    use_official_bw_crypto: bool,
     slot: &vault_backend::SharedLateBoundBackend,
 ) -> backend_policy::BackendEnv {
     use backend_policy::VaultBackendChoice;
 
+    // **Both halves come off the account, and that is why the parameter that
+    // used to carry the second one is gone.**
+    //
+    // `choose` is a function of a server and a preference. When the
+    // preference lived in `settings.json` there was exactly one of it per
+    // machine, so it had to be threaded in from `main` -- and threading it
+    // meant every call site got its own chance to pass a different value than
+    // the account in its other hand. Now both values are fields of one
+    // record, so the two cannot disagree and there is nothing to thread: an
+    // account switch re-settles by handing this function the *other* account,
+    // and the answer moves with it.
+    //
+    // That is also the owner's case -- two accounts on one machine, one on
+    // the CLI and one on the built-in client -- expressed in the signature
+    // rather than in a comment.
     let choice = backend_policy::choose(
         account.and_then(|a| a.server_url.as_deref()),
-        use_official_bw_crypto,
+        account.is_none_or(|a| a.use_official_bw_crypto),
     );
 
     // Both arms of the `DirectRest` decision need an account with a server
@@ -11757,14 +11837,20 @@ fn install_backend_env(
 /// is the same shape `backend_policy`'s own environment takes and for the same
 /// reason.
 ///
-/// **`use_official_bw_crypto` is captured at startup and never re-read**, and
-/// that is Task C's rule expressed in the type rather than in a comment: the
-/// setting takes effect on the next launch, Preferences says so in the row
-/// itself, and a switch mid-session honours the value this process started
-/// with.
+/// **The backend preference is no longer among those facts, because it is not
+/// a fact about the process.** It used to be a field here, captured at startup
+/// and never re-read, with a note saying that was the rule expressed in the
+/// type: one value per machine, so a switch mid-session had to honour the one
+/// this process started with.
+///
+/// It now lives on [`accounts::Account`], which is the record a switch is
+/// switching *to* -- so [`resettle_vault_backend_for`] reads it off the
+/// account it is handed and gets the right answer for that account without
+/// this struct carrying anything. A machine with a `bw serve` account and a
+/// built-in-client account switches between them and each keeps its own
+/// backend, which the captured-at-startup shape could not express.
 struct BackendSettlement {
     config_dir: std::path::PathBuf,
-    use_official_bw_crypto: bool,
     slot: vault_backend::SharedLateBoundBackend,
 }
 
@@ -11803,12 +11889,7 @@ fn resettle_vault_backend_for(account: &Account) {
     let Some(settlement) = SETTLEMENT.get() else {
         return;
     };
-    let env = settle_the_vault_backend(
-        &settlement.config_dir,
-        Some(account),
-        settlement.use_official_bw_crypto,
-        &settlement.slot,
-    );
+    let env = settle_the_vault_backend(&settlement.config_dir, Some(account), &settlement.slot);
     let choice = install_backend_env(env, &settlement.slot);
     log::info!("after the switch, {}'s vault is served by {choice:?}", account.email);
 }
@@ -16716,6 +16797,7 @@ mod tests {
                 id: accounts::AccountId::parse(&id.repeat(32)).expect("a 32-hex test id"),
                 email: email.to_string(),
                 server_url: Some("https://vault.example.eu".to_string()),
+                use_official_bw_crypto: true,
             }
         }
 
@@ -22196,6 +22278,7 @@ mod tests {
                     .expect("a 32-character hex id should parse"),
                 email: "first@example.com".to_string(),
                 server_url: None,
+                use_official_bw_crypto: true,
             }
         }
 
@@ -22208,6 +22291,7 @@ mod tests {
                 id: target(),
                 email: "second@example.com".to_string(),
                 server_url: None,
+                use_official_bw_crypto: true,
             }
         }
 
@@ -22218,6 +22302,7 @@ mod tests {
                     .expect("a 32-character hex id should parse"),
                 email: "minted@example.com".to_string(),
                 server_url: None,
+                use_official_bw_crypto: true,
             }
         }
 
@@ -24105,6 +24190,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id:?} should be a valid account id")),
             email: email.to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         }
     }
 
@@ -27362,11 +27448,13 @@ mod tests {
             id: accounts::AccountId::parse(&"a".repeat(32)).unwrap(),
             email: String::new(),
             server_url: None,
+            use_official_bw_crypto: true,
         };
         let other = Account {
             id: accounts::AccountId::parse(&"b".repeat(32)).unwrap(),
             email: "someone@example.com".to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         };
 
         assert!(
@@ -27403,11 +27491,13 @@ mod tests {
             id: accounts::AccountId::parse(&"a".repeat(32)).unwrap(),
             email: "ana@example.com".to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         };
         let b = Account {
             id: accounts::AccountId::parse(&"b".repeat(32)).unwrap(),
             email: "ben@example.com".to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         };
 
         // The layout is not re-spelled here: it is asserted to be the SAME
@@ -27436,11 +27526,13 @@ mod tests {
             id: accounts::AccountId::parse(&"a".repeat(32)).unwrap(),
             email: "ana@example.com".to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         };
         let b = Account {
             id: accounts::AccountId::parse(&"b".repeat(32)).unwrap(),
             email: "ben@example.com".to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         };
         // Same address, different server: still two different files.
         let self_hosted = Account {
@@ -31804,12 +31896,25 @@ mod vault_backend_choice_tests {
         dir
     }
 
+    /// An account on `server_url`, served by the official CLI.
+    ///
+    /// The backend preference is a field of the account now rather than a
+    /// parameter of `settle_the_vault_backend`, so the fixtures carry it: this
+    /// one is every account that has not chosen otherwise, and
+    /// [`account_on_the_built_in_client`] is the other.
     fn account_on(server_url: Option<&str>) -> Account {
         Account {
             id: accounts::AccountId::generate(),
             email: "someone@example.com".to_string(),
             server_url: server_url.map(str::to_string),
+            use_official_bw_crypto: true,
         }
+    }
+
+    /// An account on `server_url` that has been switched to the built-in
+    /// client -- the direct-REST arm's fixture.
+    fn account_on_the_built_in_client(server_url: Option<&str>) -> Account {
+        Account { use_official_bw_crypto: false, ..account_on(server_url) }
     }
 
     fn empty_slot() -> vault_backend::SharedLateBoundBackend {
@@ -31830,7 +31935,6 @@ mod vault_backend_choice_tests {
         let env = settle_the_vault_backend(
             &config,
             Some(&account_on(Some("https://vault.example.com"))),
-            settings::Settings::default().use_official_bw_crypto,
             &slot,
         );
         assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
@@ -31847,7 +31951,7 @@ mod vault_backend_choice_tests {
         let _guard = hold_the_settle_lock();
         let config = scratch_config("no-account");
         let slot = empty_slot();
-        let env = settle_the_vault_backend(&config, None, false, &slot);
+        let env = settle_the_vault_backend(&config, None, &slot);
         assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
         assert!(slot.is_filled());
     }
@@ -31859,13 +31963,13 @@ mod vault_backend_choice_tests {
         let _guard = hold_the_settle_lock();
         let config = scratch_config("official");
         let slot = empty_slot();
-        let env = settle_the_vault_backend(&config, Some(&account_on(None)), false, &slot);
+        let env =
+            settle_the_vault_backend(&config, Some(&account_on_the_built_in_client(None)), &slot);
         assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
         assert!(slot.is_filled());
         let env = settle_the_vault_backend(
             &config,
-            Some(&account_on(Some("https://vault.bitwarden.com"))),
-            false,
+            Some(&account_on_the_built_in_client(Some("https://vault.bitwarden.com"))),
             &slot,
         );
         assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
@@ -31895,9 +31999,10 @@ mod vault_backend_choice_tests {
         let slot = empty_slot();
 
         // **Way one: the user turns `use_official_bw_crypto` back on.**
+        // `account` carries `true`, which is that account after the switch.
         std::fs::write(&key_path, b"a stand-in for a wrapped master key").expect("the key file");
         assert!(key_path.exists(), "control: there really is a key on disk to be left behind");
-        let env = settle_the_vault_backend(&config, Some(&account), true, &slot);
+        let env = settle_the_vault_backend(&config, Some(&account), &slot);
         assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
         assert!(
             !key_path.exists(),
@@ -31910,11 +32015,15 @@ mod vault_backend_choice_tests {
         // host**, which takes the same arm for a different reason and had the
         // same gap.
         std::fs::write(&key_path, b"a stand-in for a wrapped master key").expect("the key file");
+        // On the built-in client, so that the ONLY reason this settles back on
+        // `bw serve` is the server having moved to a cloud host -- which is
+        // the thing this half of the test is about.
         let moved = Account {
             server_url: Some("https://vault.bitwarden.com".to_string()),
+            use_official_bw_crypto: false,
             ..account.clone()
         };
-        let env = settle_the_vault_backend(&config, Some(&moved), false, &slot);
+        let env = settle_the_vault_backend(&config, Some(&moved), &slot);
         assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
         assert!(
             !key_path.exists(),
@@ -31935,7 +32044,7 @@ mod vault_backend_choice_tests {
     fn settling_on_direct_rest_leaves_the_stored_key_alone() {
         let _guard = hold_the_settle_lock();
         let config = scratch_config("key-kept");
-        let account = account_on(Some("https://vault.example.com"));
+        let account = account_on_the_built_in_client(Some("https://vault.example.com"));
         accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
         let key_path = accounts::user_key_path_for(&config, &account.id);
         // Not a record `UserKeyStore::parse` accepts, so the load below
@@ -31946,7 +32055,7 @@ mod vault_backend_choice_tests {
         std::fs::write(&key_path, b"not a record this parses").expect("the key file");
         let slot = empty_slot();
 
-        let env = settle_the_vault_backend(&config, Some(&account), false, &slot);
+        let env = settle_the_vault_backend(&config, Some(&account), &slot);
         assert_eq!(
             install_backend_env(env, &slot),
             backend_policy::VaultBackendChoice::DirectRest,
@@ -31973,11 +32082,11 @@ mod vault_backend_choice_tests {
     fn direct_rest_with_no_stored_key_leaves_the_slot_empty_and_arms_the_sign_in() {
         let _guard = hold_the_settle_lock();
         let config = scratch_config("no-key");
-        let account = account_on(Some("https://vault.example.com"));
+        let account = account_on_the_built_in_client(Some("https://vault.example.com"));
         accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
         let slot = empty_slot();
 
-        let env = settle_the_vault_backend(&config, Some(&account), false, &slot);
+        let env = settle_the_vault_backend(&config, Some(&account), &slot);
         assert_eq!(
             install_backend_env(env, &slot),
             backend_policy::VaultBackendChoice::DirectRest
@@ -32012,11 +32121,11 @@ mod vault_backend_choice_tests {
     fn settling_back_onto_bw_serve_uninstalls_the_direct_rest_login() {
         let _guard = hold_the_settle_lock();
         let config = scratch_config("switch-back");
-        let direct = account_on(Some("https://vault.example.com"));
+        let direct = account_on_the_built_in_client(Some("https://vault.example.com"));
         accounts::ensure_account_dir(&config, &direct.id).expect("the account directory");
         let slot = empty_slot();
 
-        let env = settle_the_vault_backend(&config, Some(&direct), false, &slot);
+        let env = settle_the_vault_backend(&config, Some(&direct), &slot);
         assert_eq!(
             install_backend_env(env, &slot),
             backend_policy::VaultBackendChoice::DirectRest
@@ -32026,8 +32135,8 @@ mod vault_backend_choice_tests {
             "control: the environment this test is about was never installed"
         );
 
-        let official = account_on(None);
-        let env = settle_the_vault_backend(&config, Some(&official), false, &slot);
+        let official = account_on_the_built_in_client(None);
+        let env = settle_the_vault_backend(&config, Some(&official), &slot);
         assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
         assert!(
             backend_policy::direct_rest_login().is_none(),
@@ -32452,7 +32561,7 @@ mod the_one_settings_write_back {
             ..settings::Settings::default()
         };
         let turn_it_on = settings::Settings { cache_vault_to_disk: true, ..settings.clone() };
-        apply_edited_settings(&cache, &mut settings, &settings_path, turn_it_on);
+        apply_edited_settings(&cache, &mut settings, &settings_path, turn_it_on, None);
         assert!(
             settings.cache_vault_to_disk,
             "the edit did not reach the estate, so `apply_disk_cache_change` refused it"
@@ -32480,7 +32589,7 @@ mod the_one_settings_write_back {
         assert!(file.exists(), "control: the planted copy was not written");
 
         let turn_it_off = settings::Settings { cache_vault_to_disk: false, ..settings.clone() };
-        apply_edited_settings(&cache, &mut settings, &settings_path, turn_it_off);
+        apply_edited_settings(&cache, &mut settings, &settings_path, turn_it_off, None);
         assert!(!settings.cache_vault_to_disk);
         assert!(
             !file.exists(),
@@ -32500,7 +32609,7 @@ mod the_one_settings_write_back {
         let mut settings = settings::Settings::default();
 
         let unchanged = settings.clone();
-        apply_edited_settings(&cache, &mut settings, &settings_path, unchanged);
+        apply_edited_settings(&cache, &mut settings, &settings_path, unchanged, None);
         assert!(
             !settings_path.exists(),
             "a visit to the gear that changed nothing still wrote settings.json"
@@ -32510,7 +32619,7 @@ mod the_one_settings_write_back {
         // assertion above is not passing because nothing works.
         let a_real_change =
             settings::Settings { check_breaches: !settings.check_breaches, ..settings.clone() };
-        apply_edited_settings(&cache, &mut settings, &settings_path, a_real_change);
+        apply_edited_settings(&cache, &mut settings, &settings_path, a_real_change, None);
         assert!(settings_path.exists(), "control: a real change did not write either");
         let _ = std::fs::remove_dir_all(&dir);
     }

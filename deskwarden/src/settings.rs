@@ -1136,18 +1136,30 @@ pub struct Settings {
     /// Whether the app trusts `bw`'s own crypto implementation rather than
     /// this crate's, for the operations where both exist.
     ///
-    /// **`true` (the default), and what an older `settings.json` without this
-    /// field parses as** -- today's behaviour, unconditionally.
+    /// # **This field is a passenger. The answer lives on the account.**
     ///
-    /// **Live, and it is the field with the most behind it.**
-    /// [`crate::backend_policy::choose`] is where this field and an account's
-    /// server URL become a backend, and that rule -- self-hosted *and* this
-    /// setting off, or else `bw serve`; unknown counts as official -- is
-    /// stated and table-tested there rather than at any call site. `main`'s
-    /// `settle_the_vault_backend` acts on the answer: it fills the vault slot
-    /// with a [`crate::rest::backend::RestBackend`] or with the `bw serve`
-    /// bridge, and `try_start_backend` refuses to spawn `bw serve` at all on
-    /// the direct-REST arm.
+    /// [`crate::accounts::Account::use_official_bw_crypto`] is the value
+    /// [`crate::backend_policy::choose`] is actually spent against, the value
+    /// `settle_the_vault_backend` acts on, and the only one written to disk
+    /// -- by `Self::persist_accounts`, with the rest of the account record.
+    /// It moved there because the owner's case is two accounts on one machine
+    /// with different backends, which one field per `settings.json` cannot
+    /// express.
+    ///
+    /// What is left here is transport. `prefs_ui::run` takes a `Settings` and
+    /// returns an edited one -- that struct is the preferences page's whole
+    /// input and output, in all three of its shells -- so `main` seeds this
+    /// field from the active account on the way in and writes it back to the
+    /// active account on the way out (`apply_edited_settings`). Between those
+    /// two points it is the user's answer in flight and nothing else.
+    ///
+    /// **It is deliberately not written to `settings.json`.**
+    /// `Self::persist_preferences` binds it as `_` and says why: a copy in
+    /// this file would be a second answer for the next launch to disagree
+    /// with. It is still *serialized* -- this struct has no
+    /// `skip_serializing_if` anywhere -- so an old file's key is read back
+    /// into a field nothing consults, which is harmless and is the reason
+    /// this doc exists rather than the field being deleted outright.
     ///
     /// **Turning it back ON deletes the stored vault key.** The key
     /// [`crate::user_key_store`] writes does not expire and cannot be
@@ -1155,10 +1167,9 @@ pub struct Settings {
     /// what removes it -- see `settle_the_vault_backend` and
     /// `settling_off_direct_rest_deletes_the_stored_vault_key`.
     ///
-    /// **Captured at startup and never re-read**, so the change takes effect
-    /// on the next launch; Preferences draws the row (see
-    /// `prefs_ui::official_crypto_description`), says so in the row itself,
-    /// and ghosts it with an explanation on an account that is not
+    /// The change takes effect on the next launch; Preferences draws the row
+    /// (see `prefs_ui::official_crypto_description`), says so in the row
+    /// itself, and ghosts it with an explanation on an account that is not
     /// self-hosted.
     pub use_official_bw_crypto: bool,
     /// Whether `deskwarden.exe --service` may serve the vault on loopback.
@@ -1416,7 +1427,17 @@ impl Settings {
             clear_clipboard_seconds,
             cache_vault_to_disk,
             read_through_cache,
-            use_official_bw_crypto,
+            // **Not this writer's any more, and not any writer's in this
+            // file.** It moved to `accounts::Account`, where there is one per
+            // account rather than one per machine, and it is persisted by
+            // `Self::persist_accounts` along with the rest of that record.
+            // The field is still on this struct because it is how the
+            // preferences page is handed its value and how the edited value
+            // comes back -- see `main`'s `apply_edited_settings` -- but the
+            // copy that reaches this file is a passenger, and writing it here
+            // would put a second answer in `settings.json` for the next
+            // launch to disagree with.
+            use_official_bw_crypto: _,
             service_enabled,
             // Owned by the overlay, not by the preferences window: it is
             // written by `Self::persist_never_save_for_app` from inside the 3c
@@ -1450,7 +1471,6 @@ impl Settings {
         on_disk.clear_clipboard_seconds = *clear_clipboard_seconds;
         on_disk.cache_vault_to_disk = *cache_vault_to_disk;
         on_disk.read_through_cache = *read_through_cache;
-        on_disk.use_official_bw_crypto = *use_official_bw_crypto;
         on_disk.service_enabled = *service_enabled;
         on_disk.save(path)
     }
@@ -3108,6 +3128,7 @@ mod tests {
             id: id.clone(),
             email: "someone@example.com".to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         }
     }
 
@@ -3281,11 +3302,13 @@ mod tests {
                     id: a.clone(),
                     email: "work@example.com".into(),
                     server_url: Some("https://vault.example.com".into()),
+                    use_official_bw_crypto: true,
                 },
                 Account {
                     id: id_of('a'),
                     email: "me@example.com".into(),
                     server_url: None,
+                    use_official_bw_crypto: true,
                 },
             ],
             active_account: Some(a.clone()),
@@ -3319,11 +3342,13 @@ mod tests {
                 id: a.clone(),
                 email: "work@example.com".into(),
                 server_url: Some("https://vault.example.com".into()),
+                use_official_bw_crypto: true,
             },
             Account {
                 id: id_of('a'),
                 email: "me@example.com".into(),
                 server_url: None,
+                use_official_bw_crypto: true,
             },
         ];
         Settings::persist_accounts(&path, &accounts, Some(&a)).unwrap();

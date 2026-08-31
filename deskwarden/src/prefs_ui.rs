@@ -204,17 +204,17 @@ const BACKEND_DESCRIPTION: &str =
 /// # Which way round it is, said once and never restated
 ///
 /// **On means `bw`.** The field behind this row is
-/// `Settings::use_official_bw_crypto`, it defaults to `true`, and `true` is
-/// the official CLI -- so the pill is on when this app is doing what it has
-/// always done, and off is the opt-in to the built-in client. The label reads
+/// `accounts::Account::use_official_bw_crypto`, and `true` is the official
+/// CLI -- so the pill is on when this app is doing what `bw serve` has always
+/// done, and off is the built-in client. The label reads
 /// that way on purpose ("use official bw" is true when the pill is on) and
 /// [`official_crypto_description`] opens by naming both states rather than
 /// leaving the reader to infer the second from the first.
 ///
 /// That is worth this much prose because the inversion is invisible: a row
 /// wired to `!use_official_bw_crypto` paints, clicks and persists perfectly,
-/// and the only symptom is that a fresh install of the default configuration
-/// shows the pill off, or that a user who thinks they have turned `bw` on has
+/// and the only symptom is that an account shows the pill off while `bw` is
+/// serving it, or that a user who thinks they have turned `bw` on has
 /// turned it off. `the_backend_row_is_on_when_bw_is_the_backend` pins it
 /// against [`crate::backend_policy::choose`] rather than against the field,
 /// so an inversion anywhere between the pill and the decision fails.
@@ -251,7 +251,7 @@ const OFFICIAL_CRYPTO_LABEL: &str = "Use the official Bitwarden CLI";
 ///    reason: a ghosted control with no explanation reads as a bug.
 fn official_crypto_description(self_hosted: bool) -> &'static str {
     if self_hosted {
-        "On (the default), Deskwarden's vault goes through the official Bitwarden CLI — the \
+        "On, this account's vault goes through the official Bitwarden CLI — the \
          `bw` program — which holds your keys in a background process of its own.\n\n\
          Off is much lighter and faster — Deskwarden's built-in client talks to your server \
          itself, so no background process keeps running, and signing in no longer uses the \
@@ -9686,7 +9686,16 @@ mod tests {
         // whose pill is right and whose sentence is backwards is the same
         // defect delivered in prose.
         let copy = official_crypto_description(true);
-        let on = copy.find("On (the default)").expect("the copy no longer names the on state");
+        // The needle grew rather than shrank when the parenthetical went. It
+        // used to be "On (the default)", and "the default" stopped being true
+        // of this row: the backend is a property of the account now, derived
+        // from its server when it is first signed in, so a self-hosted account
+        // defaults to the built-in client and this row's ON is not what it
+        // opens on. What replaces it asserts the same position AND that the
+        // sentence is scoped to one account, which is the fact that changed.
+        let on = copy
+            .find("On, this account's vault")
+            .expect("the copy no longer names the on state, scoped to the account");
         let off = copy.find("Off is much lighter").expect("the copy no longer names the off state");
         assert!(on < off, "the copy describes the off state first, under a label that reads on");
         assert!(

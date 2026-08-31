@@ -665,6 +665,7 @@ mod tests {
             id: id(raw),
             email: email.to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         }
     }
 

@@ -354,24 +354,21 @@ pub fn login_card_details_through(
     }
 }
 
-/// [`login_card_details_through`] on [`PRODUCTION_LOGIN_CARD`], reading the
-/// one setting [`crate::backend_policy::choose`] needs off disk.
+/// [`login_card_details_through`] on [`PRODUCTION_LOGIN_CARD`], taking the one
+/// value [`crate::backend_policy::choose`] needs off the account.
 ///
-/// The setting is read here rather than taken as a parameter for the same
-/// reason the vault window's placement is read inside [`build_login_frame`]:
-/// this window has six hosts, none of which carries a `Settings`, and
-/// `Settings::load` falls back to its own defaults on every failure -- so this
-/// cannot become a reason the login window does not open.
+/// **This used to load `settings.json` from disk**, with a note explaining
+/// that none of this window's six hosts carries a `Settings` and that a failed
+/// read falling back to `true` was safe. Both halves of that stopped being
+/// true at once: the value is a field of [`Account`] now, this function is
+/// already handed the account, and there is no read left to fail. A file that
+/// is no longer opened cannot be the reason a login window does not open.
 ///
-/// `use_official_bw_crypto` defaults to `true`, and `true` is
-/// [`LoginCardSource::TheCli`] for every account whatever its server, so every
-/// way this read can go wrong lands on the behaviour this site has always had.
+/// `None` -- a host with no account -- answers `true`, which is
+/// [`LoginCardSource::TheCli`] whatever the server, the same behaviour this
+/// site has always had when it could not tell.
 fn login_card_details(account: Option<&Account>, profile_dir: Option<&Path>) -> BwStatusDetails {
-    let use_official_bw_crypto = crate::settings::default_path()
-        .map_or_else(crate::settings::Settings::default, |path| {
-            crate::settings::Settings::load(&path)
-        })
-        .use_official_bw_crypto;
+    let use_official_bw_crypto = account.is_none_or(|a| a.use_official_bw_crypto);
     login_card_details_through(PRODUCTION_LOGIN_CARD, account, profile_dir, use_official_bw_crypto)
 }
 
@@ -3112,26 +3109,27 @@ pub fn build_login_frame(
     // credentials have not gone anywhere, so the form must not paint as
     // though they had.
     let mut cli_setup: Option<crate::bw_acquire::CliSetupState> = None;
-    // **The other half of `backend_policy::choose`'s question**, read once
-    // here on the main thread before the window exists -- the same idiom, and
-    // the same fallback, as `login_card_details` a thousand lines above.
+    // **The account, so the gate below can ask about the server the user is
+    // typing rather than the one this record was minted with.**
     //
-    // Read once rather than per frame because that is what the rest of the
-    // app does with it: `settings.rs` records that this field is "captured at
-    // startup and never re-read", so re-reading it per frame would make this
-    // window the one place in the app where the setting is live, and it would
-    // then disagree with the backend the app has already settled on.
+    // This used to be a `bool` read out of `settings.json` here, once, before
+    // the window existed. Two things made that wrong at the same time. The
+    // value moved onto [`Account`], so there is no file to read; and -- the
+    // half that actually mattered -- a *new* account has not got a server yet,
+    // so no property of the record can answer whether this sign-in needs the
+    // CLI. A mint carries `server_url: None` and the `true` placeholder, and
+    // `true` is `BwServe`, so a precomputed answer would have demanded a 37 MB
+    // download from every new self-hosted account -- exactly the one the
+    // built-in client exists to spare them.
     //
-    // Defaults to `true` on every failure, and `true` is `BwServe` for every
-    // account whatever its server -- so every way this read can go wrong
-    // lands on "the CLI is required", which is the safe direction: it offers
-    // to install something that turns out to be unnecessary, rather than
-    // skipping something that was.
-    let use_official_bw_crypto = crate::settings::default_path()
-        .map_or_else(crate::settings::Settings::default, |path| {
-            crate::settings::Settings::load(&path)
-        })
-        .use_official_bw_crypto;
+    // So nothing is precomputed. The gate calls
+    // `accounts::official_cli_after_sign_in` with the address in the form,
+    // which is the same function `accounts::learn_account_details` uses to
+    // write the field a moment later, so the modal and the backend that
+    // follows it cannot disagree. An established account ignores the typed
+    // address and answers from its record, which is what keeps a self-hoster
+    // already on `bw serve` on `bw serve`.
+    let signin_account: Option<crate::accounts::Account> = account.map(|(_, a)| a.clone());
     // Two channels rather than one, because the two messages have different
     // lifetimes: progress arrives many times a second and is dropped on the
     // floor if the modal has moved on, while the outcome arrives exactly once
@@ -3468,7 +3466,10 @@ pub fn build_login_frame(
                             && !resume_submit_after_setup
                             && crate::bw_acquire::this_sign_in_needs_the_cli(
                                 effective_server.as_deref(),
-                                use_official_bw_crypto,
+                                crate::accounts::official_cli_after_sign_in(
+                                    signin_account.as_ref(),
+                                    effective_server.as_deref(),
+                                ),
                             )
                             && crate::bw_acquire::resolve_present_and_trusted().is_none();
                         resume_submit_after_setup = false;
@@ -4842,6 +4843,7 @@ mod login_entry_point_tests {
             id: AccountId::parse("0123456789abcdef0123456789abcdef").expect("a valid id"),
             email: "a@example.com".to_string(),
             server_url: None,
+            use_official_bw_crypto: true,
         };
         assert_eq!(
             profile_dir_for(Some((cfg, &account))),
@@ -11544,6 +11546,7 @@ mod the_sign_in_asks_no_cli_tests {
             id: AccountId::parse(&"b".repeat(32)).expect("a 32-hex test id"),
             email: email.to_string(),
             server_url: server.map(str::to_string),
+            use_official_bw_crypto: true,
         }
     }
 
@@ -11956,6 +11959,7 @@ mod identity_without_a_spawn_tests {
             id: AccountId::parse(&"a".repeat(32)).expect("a 32-hex test id"),
             email: email.to_string(),
             server_url: server.map(str::to_string),
+            use_official_bw_crypto: true,
         }
     }
 
