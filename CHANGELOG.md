@@ -8,6 +8,41 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## 0.15.1 - 2026-08-31
+
+### Deskwarden starts even when the Bitwarden CLI has gone missing
+
+If you use bitwarden.com or bitwarden.eu and the CLI disappeared — your
+antivirus quarantined it, a cleanup removed it, or an update went wrong —
+Deskwarden refused to start at all. A message box said it could not start
+its backend, and that was the end of it: no window, no way to sign out, no
+way in.
+
+It now offers to reinstall the CLI, in the same way it does when you first
+choose a Bitwarden server — downloading it from Bitwarden and checking
+Bitwarden signed it. If you decline, or it cannot be fetched, **the app
+still opens** and says what is unavailable, instead of closing.
+
+Autofill keeps working from your encrypted local copy while the backend is
+unavailable, if you have that copy switched on.
+
+### Uninstalling can take your data with it, if you want
+
+The uninstaller now offers a checkbox: **Also delete all data and
+settings**. It is off unless you tick it, so uninstalling for a reinstall or
+a version change leaves your vault alone.
+
+Leave it clear and your settings, signed-in accounts, the encrypted copy of
+your vault and the key that unlocks it stay on this computer under
+`%APPDATA%\Deskwarden`. The uninstaller says so on screen rather than
+leaving you to wonder. Tick it and that folder goes, key included.
+
+Either way, uninstalling now removes the rest of what Deskwarden put on your
+PC: the Bitwarden CLI it installed for you, the folder it installed it in,
+the entry it added to your PATH, the start-with-Windows entry, and its
+cached site icons. A `bw` you installed somewhere else yourself is left
+alone.
+
 ## 0.15.0 - 2026-08-31
 
 The short version: if your vault lives on your own server, Deskwarden no
