@@ -717,6 +717,35 @@ pub fn generate_passphrase(
     recipe: &PassphraseRecipe,
 ) -> Result<Zeroizing<String>, PasswordGenError> {
     let words = load_wordlist()?;
+    generate_passphrase_from(&words, recipe)
+}
+
+/// [`generate_passphrase`]'s draw, over a list the caller already holds.
+///
+/// # This is not a cache and it is not a seam
+///
+/// The list still lives exactly as long as [`generate_passphrase`]'s call:
+/// that function loads it, hands it here by reference, and drops it on return.
+/// Nothing is retained between calls and nothing is conditional on `cfg`.
+/// Production takes the same path it always did, one line longer.
+///
+/// # Why the split exists
+///
+/// `every_word_position_draws_from_the_whole_list` draws sixty thousand words
+/// to measure the distribution. Through [`generate_passphrase`] that also
+/// meant fifteen thousand reads of the installed file, which is not what the
+/// test is measuring and is a minute and a half of wall clock spent racing
+/// anything that writes there -- `build.rs` copies the list beside the test
+/// binary and cargo does not lock against a running test. A single sharing
+/// violation in that window is a [`PasswordGenError::WordlistUnreadable`] and
+/// a failed test that has nothing to say about the draw. The test now loads
+/// once and calls this fifteen thousand times, so it exercises the same
+/// indices, the same clamping and the same separator logic with the file read
+/// out of the loop.
+fn generate_passphrase_from(
+    words: &[String],
+    recipe: &PassphraseRecipe,
+) -> Result<Zeroizing<String>, PasswordGenError> {
     let count = recipe.words.clamp(MIN_WORDS, MAX_WORDS) as usize;
     let separator = separator_of(recipe);
 
@@ -1598,6 +1627,19 @@ mod tests {
     /// standard deviations, so a false failure is well under one in a million
     /// across all sixteen buckets.
     ///
+    /// # The list is read once, and that is the point
+    ///
+    /// The draw is what is being measured, not the loader, so this calls
+    /// [`generate_passphrase_from`] against one list read once rather than
+    /// [`generate_passphrase`] fifteen thousand times. It is the same
+    /// [`draw_index`], the same clamp and the same separator logic -- only the
+    /// file read is out of the loop. Doing that read fifteen thousand times
+    /// took over a minute and a half and left a window that long for
+    /// `build.rs` to replace the file mid-run, which is the one failure this
+    /// test ever had. The loader keeps its own coverage in
+    /// `a_busy_word_list_is_not_a_wrong_one`, which drives it through all four
+    /// of its outcomes.
+    ///
     /// It also asserts the coarser thing directly: the lowest and highest
     /// indices in the whole sample must sit inside the first and last buckets,
     /// which no truncated selection can manage.
@@ -1637,7 +1679,8 @@ mod tests {
         let mut lowest = usize::MAX;
         let mut highest = 0usize;
         for _ in 0..ROUNDS {
-            let phrase = generate_passphrase(&recipe).expect("the shipped list and the CSPRNG");
+            let phrase =
+                generate_passphrase_from(&list, &recipe).expect("the shipped list and the CSPRNG");
             let parts: Vec<&str> = phrase.split('-').collect();
             assert_eq!(parts.len(), WORDS, "a {WORDS}-word passphrase came back as `{}`", &*phrase);
             for part in parts {
