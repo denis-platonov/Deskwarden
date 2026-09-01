@@ -413,6 +413,23 @@ cargo build --release
 See [`deskwarden/installer/README.md`](deskwarden/installer/README.md) for how
 the installer is built.
 
+### Two things that will surprise you
+
+**Do not run `cargo fmt`.** Many tests in this crate are *source pins*: they
+read the source text and assert on it, to hold properties a type system
+cannot — that a particular function has exactly one call site, that a
+module starts no processes, that a piece of user-facing copy does not promise
+something the code stopped doing. `rustfmt` would rewrite about 5,200 spans
+across `src/`, breaking dozens of those pins at once and burying any real
+change in the churn. Formatting is deliberately not a gate here; match the
+style of the code around you instead.
+
+**Source files are CRLF, and the pins compare raw bytes.** An editor or
+script that writes LF will redden pins with failures that look like logic
+errors — this has cost real debugging time more than once. If a batch of
+unrelated pins goes red after a scripted edit, check the line endings before
+you check the logic.
+
 ## Privacy
 
 Deskwarden has no servers, no accounts, no analytics and no telemetry.
