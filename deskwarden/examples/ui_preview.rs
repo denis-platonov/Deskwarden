@@ -134,6 +134,18 @@ enum Surface {
     /// The login window with no account yet -- server dropdown and the Hello
     /// opt-in, self-hosted, which is the tallest state it has.
     LoginSignin,
+    /// **The login window with the CLI-setup modal open**, at its first
+    /// state ([`deskwarden::bw_acquire::CliSetupState::Asking`]).
+    ///
+    /// A surface of its own because the modal REPLACES the credential card:
+    /// nothing of it is on `login_signin`, and the two shots share no widget
+    /// below the subtitle. It shipped in 0.15.2 painting a heading, three
+    /// body lines and two buttons -- and rendering as an empty panel with
+    /// only the buttons on it, which every test in the suite agreed was
+    /// correct because they all asserted on `title()` and `body()`, the two
+    /// functions that were never the problem. This is the shot that shows
+    /// the panel itself.
+    LoginCliSetup,
     /// The vault window's read pane for an ordinary login.
     LoginDetail,
     /// The read pane for a **card**: brand mark, masked number, and the
@@ -456,6 +468,7 @@ fn pane_frame() -> egui::Frame {
 const ALL: &[Surface] = &[
     Surface::LoginUnlock,
     Surface::LoginSignin,
+    Surface::LoginCliSetup,
     Surface::LoginDetail,
     Surface::CardDetail,
     Surface::CardDetailRevealed,
@@ -509,6 +522,7 @@ impl Surface {
         match self {
             Surface::LoginUnlock => "login_unlock",
             Surface::LoginSignin => "login_signin",
+            Surface::LoginCliSetup => "login_cli_setup",
             Surface::LoginDetail => "detail_login",
             Surface::CardDetail => "detail_card",
             Surface::CardDetailRevealed => "detail_card_revealed",
@@ -580,9 +594,10 @@ impl Surface {
     /// a screenshot of a layout nobody ships is worse than no screenshot.
     fn size(self) -> egui::Vec2 {
         match self {
-            Surface::LoginUnlock | Surface::LoginSignin | Surface::LoginUnlockBusy => {
-                egui::vec2(470.0, 588.0)
-            }
+            Surface::LoginUnlock
+            | Surface::LoginSignin
+            | Surface::LoginCliSetup
+            | Surface::LoginUnlockBusy => egui::vec2(470.0, 588.0),
             // Wide enough for the design's own 260px track with room
             // either side, and tall enough for six of them stacked with
             // their labels.
@@ -684,7 +699,10 @@ impl Surface {
     fn is_login_window(self) -> bool {
         matches!(
             self,
-            Surface::LoginUnlock | Surface::LoginSignin | Surface::LoginUnlockBusy
+            Surface::LoginUnlock
+                | Surface::LoginSignin
+                | Surface::LoginCliSetup
+                | Surface::LoginUnlockBusy
         )
     }
 }
@@ -694,7 +712,8 @@ fn main() -> eframe::Result {
     let all = arg("--all");
     let screenshot = all || arg("--screenshot");
     let signin = arg("--signin");
-    let login = signin || arg("--login");
+    let cli_setup = arg("--cli-setup");
+    let login = signin || cli_setup || arg("--login");
     let list = arg("--list");
     let rail = arg("--rail");
     let health = arg("--health");
@@ -703,6 +722,8 @@ fn main() -> eframe::Result {
     // name, exactly as this example has always behaved.
     let queue: Vec<Surface> = if all {
         ALL.to_vec()
+    } else if cli_setup {
+        vec![Surface::LoginCliSetup]
     } else if signin {
         vec![Surface::LoginSignin]
     } else if login {
@@ -740,6 +761,8 @@ fn main() -> eframe::Result {
     // it. See `target_dir` for the fallback that keeps CI's path unchanged.
     let out: PathBuf = if all {
         target_dir().join("ui_preview")
+    } else if cli_setup {
+        target_dir().join("ui_preview_cli_setup.png")
     } else if signin {
         target_dir().join("ui_preview_signin.png")
     } else if login {
@@ -938,10 +961,17 @@ impl eframe::App for Preview {
         self.frames += 1;
 
         match self.current() {
-            Surface::LoginUnlock => self.draw_login(root, &ctx, false, false),
-            Surface::LoginUnlockBusy => self.draw_login(root, &ctx, false, true),
+            Surface::LoginUnlock => self.draw_login(root, &ctx, false, false, None),
+            Surface::LoginUnlockBusy => self.draw_login(root, &ctx, false, true, None),
             Surface::ProgressBarCycle => draw_progress_bar_cycle(root),
-            Surface::LoginSignin => self.draw_login(root, &ctx, true, false),
+            Surface::LoginSignin => self.draw_login(root, &ctx, true, false, None),
+            Surface::LoginCliSetup => self.draw_login(
+                root,
+                &ctx,
+                true,
+                false,
+                Some(&deskwarden::bw_acquire::CliSetupState::Asking),
+            ),
             Surface::LoginDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Login)),
             Surface::CardDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Card)),
             Surface::CardDetailRevealed => {
@@ -1070,6 +1100,12 @@ impl Preview {
         ctx: &egui::Context,
         signin: bool,
         auth_in_progress: bool,
+        // `Some` draws the CLI-setup modal in place of the credential card,
+        // exactly as `run_login_flow` does. It used to be hardcoded `None`
+        // here, with a comment saying the modal "has its own tests" -- and
+        // it did, all of them on `title()` and `body()`, none of them on the
+        // panel that failed to paint either one.
+        cli_setup: Option<&deskwarden::bw_acquire::CliSetupState>,
     ) {
         // The exact chrome the shipped window draws.
         if login_ui::draw_window_chrome(root, "Log in to Deskwarden")
@@ -1121,11 +1157,7 @@ impl Preview {
                     // existing account meets, so the first-run notice is not
                     // part of what this screenshots.
                     false,
-                    // No CLI-setup modal. The preview draws the sign-in
-                    // window's own states; the modal has its own states and
-                    // its own tests, and screenshotting it here would mean
-                    // this example decided which of them was worth seeing.
-                    None,
+                    cli_setup,
                 );
                 // Size to content, exactly as run_login_flow does, so the
                 // screenshot shows the window the app would show.
