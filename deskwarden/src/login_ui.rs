@@ -2869,7 +2869,15 @@ pub fn complete_second_factor<C>(
 /// is immediate and obvious rather than a puzzling rejection.
 pub const DIRECT_REST_SESSION: &str = "direct-rest";
 
-fn authenticate_then_wipe(
+/// **`pub` so that a test outside this crate can count what it spawns.**
+///
+/// `main.rs` links the library as a separate crate, so its
+/// `a_self_hosted_sign_in_on_a_fresh_install_spawns_no_cli` -- the one test
+/// that asks what a sign-in *runs* rather than which backend it *chose* --
+/// can only reach this function if it is public. It is handed a `run_cli`
+/// that counts calls instead of spawning, which is the only way to assert
+/// "zero subprocesses" over the real decision.
+pub fn authenticate_then_wipe(
     password: String,
     run_cli: impl FnOnce(&str) -> Result<String, String>,
     enroll: impl FnOnce(&str),
@@ -2983,6 +2991,75 @@ fn authenticate_then_wipe(
     token
 }
 
+/// **The direct-REST login for the sign-in the user is submitting right now,
+/// decided from the server they typed rather than from the one this process
+/// started with.**
+///
+/// # The defect this exists for
+///
+/// `backend_policy::direct_rest_login` answers about the **installed**
+/// environment, and that environment is settled once, in `main`, before any
+/// window exists. On a fresh install there is no account yet -- the mint
+/// carries `server_url: None` -- and `is_self_hosted(None)` is `false` by
+/// definition, so `choose` answers `BwServe`, so the environment holds no
+/// login, so [`authenticate_then_wipe`] takes its CLI arm and runs
+/// `bw login` **whatever the user typed into the server box**. With no
+/// `bw.exe` on disk that spawn is the bare
+/// `The system cannot find the file specified. (os error 2)` under the form,
+/// and with one it is a 37 MB download and a `bw serve` the built-in client
+/// exists to avoid.
+///
+/// The CLI-acquisition gate (`bw_acquire::this_sign_in_needs_the_cli`) had
+/// already been taught to read the typed server, so the modal fired
+/// correctly while the authentication behind it went the other way. That
+/// asymmetry is why two releases fixed symptoms of this: each guarded one
+/// spawn on a path whose *decision* was still the startup one.
+///
+/// # The shape
+///
+/// A sign-in that establishes a server is the same kind of moment as an
+/// account switch, so it is handled the same way: the whole [`BackendEnv`]
+/// is rebuilt, through `backend_policy::resettle_for`, for the account this
+/// sign-in is about to produce. `choice`, `direct` and `credentials` are
+/// therefore built together out of one account by one function, exactly as
+/// they are at startup and on a switch -- nothing here patches a field of an
+/// installed environment, and `install_env`'s pairing is untouched.
+///
+/// [`BackendEnv`]: crate::backend_policy::BackendEnv
+///
+/// **The account handed to the re-settle is the one
+/// `accounts::learn_account_details` will write a moment later**, produced by
+/// calling that very function rather than by a second copy of its rule. So
+/// the backend this sign-in runs on and the backend the record ends up
+/// naming cannot disagree -- and an *established* account is left alone by
+/// it, which is what keeps a self-hoster already on `bw serve` on `bw serve`.
+///
+/// `account` is `None` only on a host with no account record at all
+/// (`StartupAccounts::NoAccountList`); there is nothing to re-settle around,
+/// so the installed answer stands, which is the behaviour that host has
+/// always had.
+pub fn direct_login_for_this_sign_in(
+    account: Option<&Account>,
+    typed_email: &str,
+    typed_server: Option<&str>,
+) -> Option<DirectRestLogin> {
+    if let Some(account) = account {
+        let mut establishing = account.clone();
+        crate::accounts::learn_account_details(
+            &mut establishing,
+            Some(typed_email.trim()),
+            typed_server,
+        );
+        if !crate::backend_policy::resettle_for(&establishing) {
+            log::debug!(
+                "no backend re-settle is installed in this process, so this sign-in runs on \
+                 the environment startup settled"
+            );
+        }
+    }
+    crate::backend_policy::direct_rest_login()
+}
+
 fn spawn_auth(
     tx: std::sync::mpsc::Sender<Result<String, String>>,
     args: Vec<String>,
@@ -3002,18 +3079,24 @@ fn spawn_auth(
     // signing in there -- which is what it meant everywhere before the stage
     // existed.
     second_factor: Option<std::sync::Arc<dyn SecondFactorPrompt + Send + Sync>>,
-) {
-    // Read here rather than passed in, so that all four of this window's hosts
-    // get it without carrying it. `None` -- nothing installed, or this account
-    // is on `bw serve` -- is byte-for-byte the behaviour this function has
-    // always had.
+    // **Which backend this particular submit is for**, and the reason it is a
+    // parameter now.
     //
-    // The prompt IS passed in, because it is the one part of this that differs
-    // per host: `backend_policy` installs what the process can reach, and only
-    // the caller knows whether there is a card to draw a code box on.
-    let direct = crate::backend_policy::direct_rest_login().map(|direct| {
-        crate::login_ui::DirectRestLogin { prompt: second_factor, ..direct }
-    });
+    // It used to be read here, out of `backend_policy::direct_rest_login`, so
+    // that all four of this window's hosts got it without carrying it. That
+    // read is the whole of the shipped bug: the installed environment is the
+    // one *startup* settled, and a sign-in that is establishing a server has
+    // an answer startup could not have had. See
+    // [`direct_login_for_this_sign_in`], which the Submit arm calls with the
+    // address in the form; the unlock arms, which establish no server, pass
+    // `backend_policy::direct_rest_login()` and are byte-for-byte unchanged.
+    direct: Option<DirectRestLogin>,
+) {
+    // The prompt is applied here, because it is the one part of this that
+    // differs per host: `backend_policy` installs what the process can reach,
+    // and only the caller knows whether there is a card to draw a code box on.
+    let direct = direct
+        .map(|direct| crate::login_ui::DirectRestLogin { prompt: second_factor, ..direct });
     std::thread::spawn(move || {
         let token = authenticate_then_wipe(
             password,
@@ -3667,6 +3750,22 @@ pub fn build_login_frame(
                             // both arms; the mask therefore covers a real
                             // buffer for exactly as long as the attempt runs,
                             // and not one frame longer.
+                            // **The backend decision for THIS sign-in**, made
+                            // from the address in the form, on the last line
+                            // before the worker starts. On an unlock
+                            // (`Locked`/`Unlocked`) there is no server box and
+                            // nothing is being established, so the installed
+                            // environment is already the right answer and is
+                            // read unchanged.
+                            let direct = if status == BwStatus::Unauthenticated {
+                                direct_login_for_this_sign_in(
+                                    signin_account.as_ref(),
+                                    &form.email,
+                                    configured_server.as_deref(),
+                                )
+                            } else {
+                                crate::backend_policy::direct_rest_login()
+                            };
                             spawn_auth(
                                 auth_tx.clone(),
                                 args,
@@ -3674,6 +3773,7 @@ pub fn build_login_frame(
                                 enroll_hello,
                                 profile_dir.clone(),
                                 second_factor.clone(),
+                                direct,
                             );
                             form.error = None;
                             auth_in_progress = true;
@@ -3711,6 +3811,11 @@ pub fn build_login_frame(
                                     None,
                                     profile_dir.clone(),
                                     second_factor.clone(),
+                                    // A quick unlock establishes no server:
+                                    // this account already has one, and the
+                                    // installed environment was settled around
+                                    // it.
+                                    crate::backend_policy::direct_rest_login(),
                                 );
                                 form.error = None;
                                 auth_in_progress = true;

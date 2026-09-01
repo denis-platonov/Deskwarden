@@ -849,6 +849,19 @@ fn main() {
         config_dir: config_dir.clone(),
         slot: Arc::clone(&vault_slot),
     });
+    // **And what a SIGN-IN re-runs it with.** A sign-in that establishes a
+    // server is the same kind of moment as an account switch: the account the
+    // environment was settled around is not the account the process is about
+    // to be serving. `login_ui::direct_login_for_this_sign_in` asks for this
+    // on the Submit that carries a typed server, which is the only way a
+    // fresh install can reach the built-in client at all -- its mint has no
+    // server URL, so the settlement above could only answer `BwServe`.
+    //
+    // The same function the switch uses, through the same
+    // `settle_the_vault_backend`, so there is one builder of a `BackendEnv`
+    // in this app and `install_env`'s choice/direct/credentials pairing has
+    // one place to hold.
+    backend_policy::install_resettle(REAL_BACKEND_REPOINT);
 
     // **A cached `bw` session is not enough on a direct-REST account.**
     //
@@ -32668,6 +32681,196 @@ mod vault_backend_choice_tests {
         assert!(slot.is_filled(), "the switch left the incoming account with no backend");
 
         backend_policy::uninstall_env();
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// A mint: no address, no server, and the placeholder preference.
+    ///
+    /// `accounts::is_a_fresh_mint` is what reads this shape, and it is the
+    /// shape `resolve_startup` produces on a machine with no accounts at all
+    /// -- the fresh install the two tests below are about.
+    fn a_fresh_mint() -> Account {
+        Account {
+            id: accounts::AccountId::generate(),
+            email: String::new(),
+            server_url: None,
+            use_official_bw_crypto: true,
+        }
+    }
+
+    /// What the production re-settle reads out of `SETTLEMENT`, held here
+    /// instead.
+    ///
+    /// `resettle_vault_backend_for` is a no-op in any process that never
+    /// published a settlement, and a test may not publish one -- `SETTLEMENT`
+    /// is a `OnceLock` whose value the first test to run would decide for
+    /// every later one. So these two tests install their own re-settle
+    /// through the same `backend_policy` seam `main` installs the production
+    /// one through, and it calls the same `settle_the_vault_backend` and the
+    /// same `install_backend_env`. **Nothing about the decision is
+    /// reimplemented here**; only the config directory and the slot, which
+    /// are facts about the process and not about the backend, are supplied.
+    static TEST_SETTLEMENT: std::sync::Mutex<
+        Option<(std::path::PathBuf, vault_backend::SharedLateBoundBackend)>,
+    > = std::sync::Mutex::new(None);
+
+    fn resettle_through_the_test_settlement(account: &Account) {
+        let held = TEST_SETTLEMENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (config, slot) = held.as_ref().expect("no test settlement was published");
+        let env = settle_the_vault_backend(config, Some(account), slot);
+        let _ = install_backend_env(env, slot);
+    }
+
+    /// A second-factor seam whose first grant refuses, so the direct-REST arm
+    /// makes no network call.
+    ///
+    /// The arm still runs to completion and still returns without touching
+    /// `run_cli`, which is the whole of what is being measured. A grant that
+    /// *succeeded* would need an `Authenticated`, which `rest::api` has no
+    /// constructor for outside its own module -- deliberately, and not worth
+    /// widening for a test whose subject is a subprocess count.
+    fn a_grant_that_refuses() -> login_ui::SecondFactorSeam {
+        fn refuse(
+            _server: &str,
+            _email: &str,
+            _device: &str,
+            _password: &[u8],
+        ) -> Result<deskwarden::rest::api::LoginOutcome, String> {
+            Err("the probe's grant refuses by construction".to_string())
+        }
+        login_ui::SecondFactorSeam { start: refuse, ..login_ui::PRODUCTION_SECOND_FACTOR }
+    }
+
+    /// Runs the real sign-in worker body over the real backend decision, and
+    /// answers how many times it reached for a subprocess.
+    ///
+    /// This is the shape every test written for this feature so far was
+    /// missing. They asked which backend was *chosen* -- and the choice was
+    /// right in the gate that draws the CLI modal while being wrong in the
+    /// authentication behind it, so a suite of 4,349 of them was green
+    /// through three broken releases. This asks what was *spawned*.
+    fn spawns_during_a_sign_in(
+        account: &Account,
+        typed_email: &str,
+        typed_server: Option<&str>,
+    ) -> (usize, bool) {
+        let direct = login_ui::direct_login_for_this_sign_in(
+            Some(account),
+            typed_email,
+            typed_server,
+        )
+        .map(|direct| login_ui::DirectRestLogin {
+            second_factor: a_grant_that_refuses(),
+            ..direct
+        });
+        let took_the_direct_arm = direct.is_some();
+        let spawns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&spawns);
+        let _ = login_ui::authenticate_then_wipe(
+            "correct horse battery staple".to_string(),
+            move |_password| {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok("a-session-token".to_string())
+            },
+            |_password| {},
+            direct,
+        );
+        (spawns.load(std::sync::atomic::Ordering::Relaxed), took_the_direct_arm)
+    }
+
+    /// **The owner's bug, as a subprocess count.**
+    ///
+    /// A fresh install: one minted account with no address and no server, a
+    /// self-hosted URL typed into the form, and the built-in client that URL
+    /// implies. Nothing on this path may run `bw.exe` -- the machine in the
+    /// report had none, and the sign-in ended in a bare
+    /// `The system cannot find the file specified. (os error 2)` under the
+    /// form.
+    ///
+    /// It failed before the fix because the sign-in worker read
+    /// `backend_policy::direct_rest_login`, which answers about the
+    /// environment *startup* settled -- and startup had no account with a
+    /// server, so it could only answer `BwServe`.
+    #[test]
+    fn a_self_hosted_sign_in_on_a_fresh_install_spawns_no_cli() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("fresh-self-hosted");
+        let mint = a_fresh_mint();
+        accounts::ensure_account_dir(&config, &mint.id).expect("the account directory");
+        let slot = empty_slot();
+        *TEST_SETTLEMENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((config.to_path_buf(), Arc::clone(&slot)));
+        backend_policy::install_resettle(resettle_through_the_test_settlement);
+
+        // Control, and it is the one that would have hidden the bug: the
+        // environment this process starts the sign-in with is the one a fresh
+        // install really has, and it holds no direct-REST login at all.
+        let env = settle_the_vault_backend(&config, Some(&mint), &slot);
+        assert_eq!(install_backend_env(env, &slot), backend_policy::VaultBackendChoice::BwServe);
+        assert!(
+            backend_policy::direct_rest_login().is_none(),
+            "control: a fresh mint settled onto something other than `bw serve`, so this test \
+             is not starting from the state the report describes"
+        );
+
+        let (spawns, direct) =
+            spawns_during_a_sign_in(&mint, "owner@nw37.powerapps.net", Some("https://nw37.powerapps.net"));
+
+        assert_eq!(
+            spawns, 0,
+            "a self-hosted sign-in on the built-in client reached for `bw.exe` {spawns} \
+             time(s). On the owner's machine there is no `bw.exe`, so that spawn is the bare \
+             `The system cannot find the file specified. (os error 2)` under the form"
+        );
+        assert!(
+            direct,
+            "control: the sign-in spawned nothing AND took no direct-REST arm, so it did not \
+             authenticate at all and the count above is measuring nothing"
+        );
+
+        backend_policy::uninstall_resettle();
+        backend_policy::uninstall_env();
+        *TEST_SETTLEMENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// **The positive control, in the same shape.** The same fresh mint and
+    /// the same worker, signing in to bitwarden.com, DOES run the CLI --
+    /// exactly once, and that is the path every existing install is on.
+    ///
+    /// Without this, the assertion above is satisfied by a counter that can
+    /// never be incremented.
+    #[test]
+    fn a_bitwarden_com_sign_in_on_a_fresh_install_still_runs_the_cli() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("fresh-official");
+        let mint = a_fresh_mint();
+        accounts::ensure_account_dir(&config, &mint.id).expect("the account directory");
+        let slot = empty_slot();
+        *TEST_SETTLEMENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((config.to_path_buf(), Arc::clone(&slot)));
+        backend_policy::install_resettle(resettle_through_the_test_settlement);
+
+        let (spawns, direct) = spawns_during_a_sign_in(
+            &mint,
+            "owner@example.com",
+            Some("https://vault.bitwarden.com"),
+        );
+
+        assert!(!direct, "a bitwarden.com sign-in was handed a direct-REST login");
+        assert_eq!(
+            spawns, 1,
+            "the official-cloud sign-in ran the CLI {spawns} time(s) instead of once, so the \
+             re-settle has broken the path every existing install is on"
+        );
+        assert!(
+            backend_policy::direct_rest_login().is_none(),
+            "the re-settle left a direct-REST login installed for a bitwarden.com account"
+        );
+
+        backend_policy::uninstall_resettle();
+        backend_policy::uninstall_env();
+        *TEST_SETTLEMENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         let _ = std::fs::remove_dir_all(&config);
     }
 

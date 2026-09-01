@@ -337,6 +337,67 @@ pub fn uninstall_env() {
     }
 }
 
+/// How a caller asks for the whole [`BackendEnv`] to be rebuilt for one
+/// account.
+///
+/// A plain `fn` pointer, and the crate's usual seam idiom rather than a
+/// `cfg(test)` switch: the one production implementation is `main`'s
+/// `resettle_vault_backend_for`, which needs two process-lifetime facts
+/// (`main`'s config directory and its vault slot) that no library module can
+/// see. Naming the *shape* here is what lets `login_ui` ask for a re-settle
+/// without knowing any of that.
+pub type BackendResettle = fn(&crate::accounts::Account);
+
+/// The installed re-settle, or `None` in every process where `main` did not
+/// publish one -- every test that does not install its own, and
+/// `examples/ui_preview`.
+static RESETTLE: std::sync::RwLock<Option<BackendResettle>> = std::sync::RwLock::new(None);
+
+/// Publishes the re-settle. Called once, from `main`, beside the settlement
+/// the production implementation reads.
+pub fn install_resettle(resettle: BackendResettle) {
+    match RESETTLE.write() {
+        Ok(mut slot) => *slot = Some(resettle),
+        Err(poisoned) => *poisoned.into_inner() = Some(resettle),
+    }
+}
+
+/// Removes it, for the tests that install one. Same obligation as
+/// [`uninstall_env`], and for the same reason: this is process-wide state in
+/// a suite that runs in parallel.
+pub fn uninstall_resettle() {
+    match RESETTLE.write() {
+        Ok(mut slot) => *slot = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
+}
+
+/// **Rebuilds this process's [`BackendEnv`] around `account`.**
+///
+/// Answers `false`, having done nothing, in a process with no re-settle
+/// installed -- which leaves that process on whatever was installed before,
+/// the same direction every other default in this module takes.
+///
+/// The point of routing this through the seam rather than letting a caller
+/// assemble a [`BackendEnv`] of its own is the pairing [`install_env`]
+/// enforces: `choice`, [`BackendEnv::direct`] and [`BackendEnv::credentials`]
+/// are built together by one function, out of one account, or not at all. A
+/// caller that could patch one field of the installed environment would be
+/// exactly the relaxation [`direct_rest_login`]'s gate exists to catch.
+pub fn resettle_for(account: &crate::accounts::Account) -> bool {
+    let resettle = match RESETTLE.read() {
+        Ok(slot) => *slot,
+        Err(poisoned) => *poisoned.into_inner(),
+    };
+    match resettle {
+        Some(resettle) => {
+            resettle(account);
+            true
+        }
+        None => false,
+    }
+}
+
 fn with_env<T>(f: impl FnOnce(Option<&BackendEnv>) -> T) -> T {
     match ENV.read() {
         Ok(slot) => f(slot.as_ref()),
