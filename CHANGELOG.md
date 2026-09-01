@@ -8,6 +8,23 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## 0.15.2 - 2026-09-01
+
+### Settings for one account no longer change another
+
+If you have more than one account — say one on bitwarden.com and one on
+your own server — opening **Settings** from the vault window could quietly
+move the account you were using onto the other one's backend. It did not
+need you to change anything: opening the panel and closing it was enough.
+
+The panel was reading that one setting from a file shared by the whole
+computer, left over from before the setting became per-account. It now reads
+it from the account you are actually using, which is what the tray menu
+already did.
+
+If this happened to you, the fix is to set the option the way you want once,
+under **Settings—Vault**. It will stay put now.
+
 ## 0.15.1 - 2026-08-31
 
 ### Deskwarden starts even when the Bitwarden CLI has gone missing
