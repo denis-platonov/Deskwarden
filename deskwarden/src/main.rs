@@ -1391,8 +1391,13 @@ fn main() {
     // so it is the one that cannot be gated inside `try_start_backend` like
     // the other eleven: it would have to turn a `NotSelected` into a `Child`
     // it does not have. It is gated here instead, on the same answer.
+    // `and_then`, not `then`: `start_backend` now answers `Option<Child>`, so
+    // "the gate said no" and "the CLI is gone and the user declined to put it
+    // back" flatten to the same `None` -- which is correct, because what both
+    // mean to everything below is "there is no `bw serve` child here".
     bw_serve_child = (!cache_first && backend_policy::bw_serve_is_selected())
-        .then(|| start_backend(&session_token, job_ref(&job)));
+        .then(|| start_backend(&session_token, job_ref(&job)))
+        .flatten();
     // Assigned before either arm rather than by both: the tray arm opens no
     // window, so it has no vault session to report, and the visible arm
     // overwrites this with whatever its window came home holding.
@@ -1442,7 +1447,12 @@ fn main() {
     //    an app that is serving autofill from a perfectly good local copy,
     //    because a background process failed to start, would throw away the
     //    only thing this launch had.
-    *startup_entries.borrow_mut() = match_entries(&cache.items());
+    // Through `arm_autofill_from_the_local_copy` rather than spelled out
+    // here: a second launch shape now needs the same unpaired arming (the one
+    // whose `bw.exe` is gone), and the exemption from
+    // `arm_autofill_and_seed_cache` has to have exactly one spelling or it
+    // stops being an exemption and becomes a habit.
+    arm_autofill_from_the_local_copy(&startup_entries, &cache);
     log::info!(
         "cache-first launch: {} item(s) restored from the encrypted disk cache armed the \
          match engine directly, so the tray, the fill hotkey and autofill come up now; \
@@ -1875,25 +1885,78 @@ fn main() {
 
     match outcome.prepared {
         Some(work) => {
-            // Fatal exactly where it was before this change -- `start_backend`
-            // used to end the process itself -- and now on the main thread,
-            // where the message box it puts up is in front of the user.
+            // **The third arm, and the one the owner's report came through.**
+            //
+            // The worker cannot offer anything: it runs while an eframe
+            // window owns the main thread, so a modal raised there opens
+            // behind a window the user cannot reach. That is why `produce`
+            // calls `try_start_backend` and carries the failure home as a
+            // string. This is where it lands, on the thread that can show a
+            // dialog -- and where the failure used to be fatal, unconditionally,
+            // with a sentence naming `bw_path::resolve_bw_exe` and an OK
+            // button that ended the process.
+            //
+            // The classification is made HERE rather than carried in the
+            // string, and that is deliberate: `the_cli_is_missing` asks the
+            // disk, now, on this thread. A flag set by the worker would be a
+            // belief formed seconds ago about a file the user may have put
+            // back in the meantime -- and on this path they have had a whole
+            // window's worth of time to do exactly that.
+            //
+            // **`without_a_vault` is what stops the recovery below running
+            // on a decline.** `recover_from_failed_vault_wait` opens with a
+            // master-password prompt; asking for it, over a backend the user
+            // has just been told cannot start and has just declined to
+            // repair, would be the app arguing with an answer it already
+            // got. On that arm the vault stays empty and the tray comes up
+            // over it.
+            let mut without_a_vault = false;
             if let Err(e) = work.child {
-                fatal_startup_error(&format!(
-                    "Deskwarden could not start its Bitwarden backend.\n\n{e}"
-                ));
+                match the_cli_is_missing() {
+                    Some(missing) => {
+                        without_a_vault = !the_startup_windows_backend_lost_its_cli(
+                            &missing,
+                            &e,
+                            &session_token,
+                            &job,
+                            &mut bw_serve_child,
+                        );
+                    }
+                    None => fatal_startup_error(&format!(
+                        "Deskwarden could not start its Bitwarden backend.\n\n{e}"
+                    )),
+                }
             }
-            if bw_serve_child.is_none() {
+            if !without_a_vault && bw_serve_child.is_none() {
                 log::error!(
                     "the startup worker reported that `bw serve` started but the estate came \
                      home with no handle for it; the backend cannot be stopped or restarted \
                      from here"
                 );
             }
+            if without_a_vault {
+                // **NOT `arm_autofill_and_seed_cache`, and the difference is
+                // the user's offline copy.** That helper writes at
+                // `Source::Backend`, which re-persists the encrypted disk
+                // cache and stamps `written_at` to now. Handing it the empty
+                // `Vec` this launch actually has would OVERWRITE a perfectly
+                // good local vault with nothing -- destroying, in the name of
+                // recovering from a missing CLI, the one copy of the vault
+                // that is still readable without it.
+                //
+                // So this arms the engine FROM the cache and writes nothing
+                // back, which is the cache-first arm's shape and is exactly
+                // right for the same reason: nothing was fetched, so there is
+                // no second half owing. If `load_from_disk` adopted a copy,
+                // this launch comes up degraded but genuinely useful --
+                // autofill works off the snapshot. If it did not, the entries
+                // are empty and the hotkey says so.
+                arm_autofill_from_the_local_copy(&startup_entries, &cache);
+            }
             // `build_vault` above already armed `startup_entries` and filled the
             // cache on the happy path; this arm is the one where the readiness
             // probe failed, and it is the SAME recovery startup has always run.
-            if let Err(e) = work.items {
+            if let (false, Err(e)) = (without_a_vault, work.items) {
                 let items = recover_from_failed_vault_wait(
                     &e,
                     &vault,
@@ -11107,7 +11170,7 @@ fn recover_from_failed_vault_wait(
     // The longer grace: we just killed our own `bw serve`, and the user just
     // retyped their master password. Give the socket real time to come free
     // rather than aborting on them.
-    *bw_serve_child = match try_start_backend(
+    *bw_serve_child = match start_backend_recovering_a_missing_cli(
         session_token.as_str(),
         job_ref(job),
         bw_serve::PORT_RELEASE_GRACE_RESTART,
@@ -11122,6 +11185,18 @@ fn recover_from_failed_vault_wait(
         BackendStart::NotSelected => None,
         BackendStart::Failed(e) => {
             log::error!("{e}");
+            // **The second fatal arm, and it is now conditional for the same
+            // reason the first one is.** A missing CLI has been offered a
+            // reinstall by the call above and is still missing. Ending the
+            // launch here would be the same brick, reached one sign-in later:
+            // the user has just retyped their master password and would be
+            // answered with a dialog whose OK button kills the app.
+            //
+            // The early return is what stops the vault wait below running --
+            // there is nothing to wait for, and that wait is the ~30 s
+            // readiness deadline spent on a port nothing is listening on.
+            // An empty vault is the honest answer, and the tray comes up
+            // over it.
             fatal_startup_error(&format!(
                 "Deskwarden could not start its Bitwarden backend after you signed \
                  in.\n\n{e}\n\nFull details are in:\n{}",
@@ -11904,8 +11979,35 @@ enum BackendStartError {
     PortHeld(Duration),
     /// No verified `bw.exe` is on record, so there is nothing safe to spawn.
     NoVerifiedCli(String),
+    /// **The verified `bw.exe` is on record and is not on disk.**
+    ///
+    /// Split out of [`Self::Spawn`], which is where it used to arrive, as
+    /// `The system cannot find the file specified. (os error 2)` wrapped in
+    /// a sentence about a verified path. That sentence was true and useless:
+    /// re-reading it is not a remedy, and it was printed by a dialog whose
+    /// OK button ended the process.
+    ///
+    /// This is the one backend failure with a REMEDY the app can offer, and
+    /// it is the reason the enum is graded rather than a string. See
+    /// [`the_cli_is_missing`] for the check, and
+    /// [`recover_a_missing_cli_with`] for what is offered.
+    CliMissing(std::path::PathBuf),
     /// The `bw` process could not be spawned at all.
     Spawn(std::io::Error),
+}
+
+impl BackendStartError {
+    /// **Whether re-downloading the CLI could fix this**, which is the
+    /// question every fatal arm now asks before it decides to be fatal.
+    ///
+    /// Exactly one variant answers `true`. A [`Self::PortHeld`] frees itself,
+    /// a [`Self::Spawn`] on a file that IS there is a permission, corruption
+    /// or environment problem, and a [`Self::NoVerifiedCli`] means startup
+    /// never recorded a path at all -- so there is nowhere to install to and
+    /// nothing an install would make reachable.
+    fn a_missing_cli_could_be_reinstalled(&self) -> bool {
+        matches!(self, Self::CliMissing(_))
+    }
 }
 
 /// **What one attempt to bring `bw serve` up actually produced**, and the
@@ -11955,11 +12057,295 @@ impl std::fmt::Display for BackendStartError {
                 bw_serve::BW_SERVE_PORT
             ),
             Self::NoVerifiedCli(e) => write!(f, "cannot start `bw serve`: {e}"),
+            Self::CliMissing(path) => write!(
+                f,
+                "the Bitwarden CLI is not at {}, where this launch verified it. Your vault is \
+                 served by that program, so Deskwarden cannot read the vault until it is back.",
+                path.display()
+            ),
             Self::Spawn(e) => write!(
                 f,
                 "failed to spawn `bw serve` from the verified Bitwarden CLI path (see \
                  bw_path::resolve_bw_exe for where that path comes from): {e}"
             ),
+        }
+    }
+}
+
+/// **`Some(path)` when this process verified a `bw.exe` and that file is not
+/// there any more.**
+///
+/// The one place the crate spells "the CLI has gone", so that the check, the
+/// error variant it produces and the recovery it unlocks cannot drift apart.
+///
+/// **Asked of the RECORDED path, not re-resolved.** `bw_path::verified_bw_exe`
+/// is the `OnceLock` startup set after `check_bw_signature` graded it, and it
+/// is the only path anything in this process will ever spawn. Re-resolving
+/// here could answer with some other `bw.exe` that appeared on `PATH` since,
+/// which is precisely the substitution `remember_verified_bw_exe` exists to
+/// make impossible.
+///
+/// `None` when the file is there, and `None` when there is no recorded path
+/// at all -- the second is [`BackendStartError::NoVerifiedCli`]'s case, not
+/// this one, and it has no remedy an install could reach.
+fn the_cli_is_missing() -> Option<std::path::PathBuf> {
+    let recorded = bw_path::verified_bw_exe()?;
+    (!recorded.exists()).then(|| recorded.to_path_buf())
+}
+
+/// What the offer to reinstall a vanished CLI settled.
+///
+/// Three arms and no `Result`, for [`BackendStart`]'s reason: "the user said
+/// no" is not a failure, and an `Err` catch-all is how a decline gets treated
+/// as one. Only [`Self::Acquired`] may lead to a retry, and **no arm of this
+/// enum ends the process** -- that is the whole of this branch, expressed as a
+/// type.
+#[derive(Debug)]
+enum MissingCliRecovery {
+    /// A Bitwarden-signed `bw.exe` is now at the recorded path. The backend
+    /// start that failed may be attempted again exactly as if it had never
+    /// been away.
+    Acquired,
+    /// The user pressed Cancel on the ask. Nothing was fetched -- the ask
+    /// precedes the first byte -- so nothing was left behind.
+    Declined,
+    /// They said yes and it did not work. Carries the refusal so the sentence
+    /// the user reads is [`deskwarden::bw_acquire::AcquireRefusal::message`]'s
+    /// and not a second wording of the same failure.
+    Refused(deskwarden::bw_acquire::AcquireRefusal),
+}
+
+/// The `fn`-pointer seam for [`recover_a_missing_cli_with`], the same shape
+/// and the same discipline as `bw_acquire::BwAcquireEnv`.
+///
+/// A seam rather than `cfg(test)` branches, because what has to be driven by a
+/// test here is a **dialog and a 37 MB download**, and neither can run in a
+/// test process. What must be provable is the ROUTING: that a decline leads
+/// nowhere near an exit, that a refusal leads nowhere near an exit, and that a
+/// success is followed by another attempt to start the backend.
+struct MissingCliEnv {
+    /// The ask, as a modal. `true` for OK, `false` for Cancel. Production is
+    /// [`ask_to_reinstall_the_cli`].
+    ask: fn(&str, &str) -> bool,
+    /// The whole download-verify-install path, reused rather than
+    /// reimplemented: production is [`acquire_the_cli`], which is
+    /// `bw_acquire::acquire_if_needed` over `BwAcquireEnv::production` --
+    /// the same six functions, the same digest check, the same
+    /// `verify_is_bitwardens` gate and the same install destination the
+    /// sign-in window's modal drives.
+    acquire: fn() -> Result<
+        deskwarden::bw_acquire::AcquireOutcome,
+        deskwarden::bw_acquire::AcquireRefusal,
+    >,
+    /// The outcome, as a modal. Production is [`tell_about_the_cli`].
+    tell: fn(&str, &str),
+}
+
+impl MissingCliEnv {
+    /// The real world.
+    fn production() -> Self {
+        Self { ask: ask_to_reinstall_the_cli, acquire: acquire_the_cli, tell: tell_about_the_cli }
+    }
+}
+
+/// The ask, defaulted to No like every other consequential prompt in this
+/// file: this one costs the user a 37 MB transfer, so a stray Return must not
+/// be what starts it.
+fn ask_to_reinstall_the_cli(title: &str, body: &str) -> bool {
+    message_box(title, body, MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2) == IDYES
+}
+
+/// The outcome, said once.
+fn tell_about_the_cli(title: &str, body: &str) {
+    message_box(title, body, MB_ICONWARNING | MB_OK);
+}
+
+/// The acquisition itself, named rather than written inline in
+/// [`MissingCliEnv::production`], so that the seam holds a real function with
+/// an address and not a closure.
+///
+/// **Synchronous, and on whichever thread called it -- which is always the
+/// main thread.** The sign-in card runs this on a worker because an eframe
+/// window owns the frame thread there and would freeze mid-paint. Every
+/// caller here has no window: the startup card has closed and the tray does
+/// not exist yet, so there is nothing to keep painting and nothing a worker
+/// would buy except a second place for the handle to go missing. The stages
+/// go to the log for the same reason.
+fn acquire_the_cli() -> Result<
+    deskwarden::bw_acquire::AcquireOutcome,
+    deskwarden::bw_acquire::AcquireRefusal,
+> {
+    let env = deskwarden::bw_acquire::BwAcquireEnv::production();
+    deskwarden::bw_acquire::acquire_if_needed(&env, &|stage| {
+        log::info!("reinstalling the Bitwarden CLI: {}", stage.label());
+    })
+}
+
+/// **Offers to put a vanished `bw.exe` back, and never ends the process on
+/// any arm.**
+///
+/// The gap this closes: `bw_acquire` is reached only from the sign-in card's
+/// Submit path, gated on the server the user is typing. An account that is
+/// ALREADY signed in never sees a sign-in form, so before this existed there
+/// was no route at all from "my CLI is gone" back to a working app -- the
+/// user could not even open the window to sign out. Every route in was a
+/// message box that ended the launch.
+///
+/// The modal is `bw_acquire`'s own: [`deskwarden::bw_acquire::CliSetupState`]
+/// supplies the title and the body on all three states, so the two entry
+/// points cannot come to describe the same download differently.
+fn recover_a_missing_cli_with(env: &MissingCliEnv, missing: &std::path::Path) -> MissingCliRecovery {
+    use deskwarden::bw_acquire::{AcquireOutcome, CliSetupState};
+    log::warn!(
+        "the verified Bitwarden CLI is gone from {}; offering to reinstall it rather than \
+         refusing to start",
+        missing.display()
+    );
+    let ask = CliSetupState::AskingToRecover;
+    if !(env.ask)(ask.title(), &ask.body().join("\n\n")) {
+        log::info!("the reinstall was declined; this launch continues without a vault backend");
+        return MissingCliRecovery::Declined;
+    }
+    match (env.acquire)() {
+        Ok(outcome) => {
+            // `AlreadyPresent` is reachable, and it is good news rather than a
+            // contradiction: the user can put the file back by hand while the
+            // ask is on screen, and `acquire_if_needed` asks the disk again
+            // before it fetches anything.
+            let done = match &outcome {
+                AcquireOutcome::AlreadyPresent(path) => {
+                    log::info!("the CLI was back at {} before anything was fetched", path.display());
+                    CliSetupState::Installed(deskwarden::bw_acquire::AcquiredCli {
+                        version: None,
+                        path: path.clone(),
+                        bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+                    })
+                }
+                AcquireOutcome::Installed(cli) => {
+                    log::info!("the Bitwarden CLI was reinstalled at {}", cli.path.display());
+                    CliSetupState::Installed(cli.clone())
+                }
+            };
+            (env.tell)(done.title(), &done.body().join("\n\n"));
+            MissingCliRecovery::Acquired
+        }
+        Err(refusal) => {
+            log::error!("the Bitwarden CLI could not be reinstalled: {refusal:?}");
+            let failed = CliSetupState::Failed(refusal.clone());
+            (env.tell)(failed.title(), &failed.body().join("\n\n"));
+            MissingCliRecovery::Refused(refusal)
+        }
+    }
+}
+
+/// [`try_start_backend`], plus the one recovery a backend failure has.
+///
+/// **The single place the three pre-tray callers meet**, so that "a missing
+/// CLI is offered a reinstall, and then the start is attempted again" is one
+/// statement rather than three copies of it that can fall out of step. A
+/// caller that reaches for `try_start_backend` directly still works and is
+/// still correct -- it simply gets no offer -- which is what
+/// `StartupWork::produce` wants: it runs on a worker thread, where a message
+/// box would open BEHIND the eframe window that owns the screen.
+///
+/// **Exactly one retry.** `acquire_if_needed` either installed a verified
+/// binary at the recorded path or it did not; if the start fails again with
+/// the file present, that is a different failure and looping on it would be a
+/// loop with no exit condition the user can influence.
+fn start_backend_recovering_a_missing_cli(
+    session_token: &str,
+    job: Option<&job_object::KillOnCloseJob>,
+    port_grace: Duration,
+) -> BackendStart {
+    let first = try_start_backend(session_token, job, port_grace);
+    let BackendStart::Failed(e) = &first else {
+        return first;
+    };
+    let BackendStartError::CliMissing(missing) = e else {
+        return first;
+    };
+    let missing = missing.clone();
+    match recover_a_missing_cli_with(&MissingCliEnv::production(), &missing) {
+        MissingCliRecovery::Acquired => {
+            try_start_backend(session_token, job, port_grace)
+        }
+        // Both of these hand the ORIGINAL failure back rather than inventing
+        // a second one. The caller's job from here is to survive it, and what
+        // it has to survive is unchanged: this account's vault is served by a
+        // program that is not on the disk.
+        MissingCliRecovery::Declined => first,
+        MissingCliRecovery::Refused(refusal) => {
+            // The retryability is `bw_acquire`'s own grading and is worth
+            // recording, because it is the difference between "this will
+            // probably work on the next launch" and "this will not, and the
+            // user has to install the CLI themselves": a download that could
+            // not be confirmed as Bitwarden's is a statement about the
+            // artefact, not about the network.
+            log::warn!(
+                "the reinstall failed and another attempt {} help",
+                if refusal.retryable() { "may" } else { "will not" }
+            );
+            first
+        }
+    }
+}
+
+/// **The startup window's worker came home saying the backend did not start,
+/// and the CLI is not on the disk.** Offers to put it back and, if that
+/// works, starts the backend the worker could not.
+///
+/// `true` when there is a vault to carry on with -- the CLI was reinstalled
+/// and `bw serve` came up. `false` means this launch has no vault backend and
+/// must not go looking for one: the caller uses that to skip
+/// [`recover_from_failed_vault_wait`], whose first act is a master-password
+/// prompt the user has no reason to answer.
+///
+/// **Never ends the process, on any arm**, which is the property the whole
+/// branch exists for and the one
+/// `a_missing_cli_does_not_end_the_startup_window_launch` holds.
+fn the_startup_windows_backend_lost_its_cli(
+    missing: &std::path::Path,
+    reported: &str,
+    session_token: &str,
+    job: &Arc<Option<job_object::KillOnCloseJob>>,
+    bw_serve_child: &mut Option<Child>,
+) -> bool {
+    log::error!("the startup worker could not start the backend: {reported}");
+    if !matches!(
+        recover_a_missing_cli_with(&MissingCliEnv::production(), missing),
+        MissingCliRecovery::Acquired
+    ) {
+        stand_down_without_a_backend(&BackendStartError::CliMissing(missing.to_path_buf()));
+        return false;
+    }
+    // The retry runs HERE rather than through
+    // `start_backend_recovering_a_missing_cli`: that wrapper's job is to make
+    // the offer, and the offer has just been made and accepted. Going back
+    // through it would put a second ask in front of a user who has already
+    // said yes, on the one arm where the install did land but the spawn still
+    // failed.
+    match try_start_backend(session_token, job_ref(job), bw_serve::PORT_RELEASE_GRACE) {
+        BackendStart::Started(child) => {
+            log::info!("the reinstalled Bitwarden CLI started `bw serve`; this launch has a vault");
+            *bw_serve_child = Some(child);
+            true
+        }
+        // The account is a `bw serve` account -- that is how this path was
+        // reached -- so this is the gate contradicting itself rather than a
+        // direct-REST launch. Survived rather than asserted on: the app has
+        // a tray to come up on either way.
+        BackendStart::NotSelected => {
+            log::error!(
+                "the backend policy answered `NotSelected` for an account whose vault the \
+                 startup worker had just tried to serve with `bw serve`"
+            );
+            stand_down_without_a_backend(&BackendStartError::CliMissing(missing.to_path_buf()));
+            false
+        }
+        BackendStart::Failed(e) => {
+            log::error!("the reinstalled Bitwarden CLI still would not start `bw serve`: {e}");
+            stand_down_without_a_backend(&e);
+            false
         }
     }
 }
@@ -12002,6 +12388,21 @@ fn try_start_backend(
     // this backend does not read up to date.
     if !backend_policy::bw_serve_is_selected() {
         return BackendStart::NotSelected;
+    }
+    // **ASKED HERE, above the port wait and above `bw sync`, for the same
+    // reason the policy gate is.** Without this the absence was discovered at
+    // the very bottom of this function, as an `os error 2` from
+    // `CreateProcess` -- after up to thirty seconds waiting for a port nothing
+    // was ever going to bind and after a `bw sync` that spawns the very
+    // binary that is not there. The failure was already certain at this line.
+    //
+    // It is also the line that makes the absence NAMEABLE. Every caller above
+    // this one used to receive one `Spawn(io::Error)` covering "the file is
+    // gone", "the file is not executable" and "the file is corrupt"; only the
+    // first of those has a remedy, and offering a 37 MB download for the
+    // other two would be a fix aimed at the wrong thing.
+    if let Some(missing) = the_cli_is_missing() {
+        return BackendStart::Failed(BackendStartError::CliMissing(missing));
     }
     if !bw_serve::wait_for_port_free(bw_serve::BW_SERVE_PORT, port_grace) {
         return BackendStart::Failed(BackendStartError::PortHeld(port_grace));
@@ -12115,6 +12516,32 @@ fn seed_cache_at_startup(
 /// `items` is moved on into the cache rather than cloned: `match_entries`
 /// borrows, so the whole vault is walked once for the entries and then becomes
 /// the cache's own storage. See [`seed_cache_at_startup`] on why that matters.
+/// **Arms the match engine from the cache the launch ALREADY has, and writes
+/// nothing back to it.**
+///
+/// The unpaired sibling of [`arm_autofill_and_seed_cache`], and the one shape
+/// that is allowed to be unpaired: there is no second half owing because
+/// nothing was fetched. The cache is the SOURCE here, not the destination.
+///
+/// **A function, and used by both of its callers, precisely so the exemption
+/// has one spelling.** It was one inline `match_entries(&cache.items())` in
+/// the cache-first arm until a second site needed the same thing -- the
+/// launch whose CLI is missing and was not put back -- and two hand-written
+/// copies of an exemption is how the exemption stops being one.
+///
+/// Calling [`arm_autofill_and_seed_cache`] at either site instead would be a
+/// live defect rather than a redundancy: that helper writes at
+/// `Source::Backend`, which clears `loaded_from_disk_at` and re-persists the
+/// file. On the missing-CLI arm the items available are an empty `Vec`, so it
+/// would replace the user's encrypted offline copy with an empty one at the
+/// exact moment that copy is the only vault they have.
+fn arm_autofill_from_the_local_copy(
+    entries: &RefCell<Vec<(String, AppMatch)>>,
+    cache: &VaultCache,
+) {
+    *entries.borrow_mut() = match_entries(&cache.items());
+}
+
 fn arm_autofill_and_seed_cache(
     entries: &RefCell<Vec<(String, AppMatch)>>,
     cache: &VaultCache,
@@ -12299,8 +12726,14 @@ fn the_details_this_window_opens_with(
 /// **Never called on a direct-REST account**, and the guard is in `main`
 /// rather than in here.
 ///
-/// This function's whole purpose is that a backend it cannot start ends the
-/// launch, so it has no arm for "there was nothing to start" and must not
+/// **It answers `Option<Child>` now, and the `None` is exactly one
+/// condition**: the CLI this account's vault is served by is not on the disk,
+/// the offer to reinstall it was declined or failed, and the launch carries
+/// on without a vault rather than ending. Nothing else in this body returns
+/// `None`. See [`stand_down_without_a_backend`].
+///
+/// This function's remaining purpose is that a backend it cannot start ends
+/// the launch, so it has no arm for "there was nothing to start" and must not
 /// grow one: an arm here would have to answer with a `Child` it does not
 /// have. `main`'s one call site is gated on
 /// [`backend_policy::bw_serve_is_selected`] instead, so
@@ -12315,9 +12748,13 @@ fn the_details_this_window_opens_with(
 /// on a backend that was never going to start, which is C1.
 /// `the_only_fatal_backend_start_is_start_backends` now holds the real rule:
 /// those two, no third, and no `NotSelected` arm anywhere.
-fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) -> Child {
-    match try_start_backend(session_token, job, bw_serve::PORT_RELEASE_GRACE) {
-        BackendStart::Started(child) => child,
+fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) -> Option<Child> {
+    match start_backend_recovering_a_missing_cli(
+        session_token,
+        job,
+        bw_serve::PORT_RELEASE_GRACE,
+    ) {
+        BackendStart::Started(child) => Some(child),
         // The gate at the one call site is what makes this unreachable, and
         // this arm is deliberately NOT a `fatal_startup_error`: "there was
         // nothing to start" is never something to tell a user about, and
@@ -12328,13 +12765,59 @@ fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) 
         BackendStart::NotSelected => unreachable!(
             "`start_backend` was called on an account whose vault is served directly over              REST. `fn main`'s call site is gated on `backend_policy::bw_serve_is_selected()`              precisely so this cannot happen; the gate has been removed or bypassed"
         ),
+        // **The one arm that is no longer unconditionally fatal**, and the
+        // condition is the whole of this branch.
+        //
+        // A missing CLI has just been offered a reinstall by
+        // `start_backend_recovering_a_missing_cli` and is still missing, which
+        // means the user declined it or it failed. Ending the launch there
+        // would take away the only thing they have left: the tray, from which
+        // they can sign out, switch to a direct-REST account, or open
+        // preferences. The vault is genuinely unavailable and the app says
+        // so -- `stand_down_without_a_backend` -- and then it RUNS.
+        //
+        // Every other failure keeps the exit it had. A held port, an
+        // unrecordable CLI path or a spawn that failed with the file present
+        // are not conditions a launch can serve a vault through, and none of
+        // them is improved by a download.
         BackendStart::Failed(e) => {
             log::error!("{e}");
+            if e.a_missing_cli_could_be_reinstalled() {
+                stand_down_without_a_backend(&e);
+                return None;
+            }
             fatal_startup_error(&format!(
                 "Deskwarden could not start its Bitwarden backend.\n\n{e}"
             ));
         }
     }
+}
+
+/// **Says the vault is unavailable and lets the launch carry on**, which is
+/// the answer a missing CLI gets now that it has one.
+///
+/// The sibling of [`fatal_startup_error`] and of
+/// [`give_up_after_the_window_explained`], and the difference from both is
+/// that this one RETURNS. The user has been offered the remedy and has
+/// declined it or watched it fail; what they are owed at this point is a
+/// statement of what does not work and how to fix it, not the end of the
+/// process.
+///
+/// The message names the three things the tray still does, because "the app
+/// is running but its window is empty" is otherwise indistinguishable from
+/// the app being broken.
+fn stand_down_without_a_backend(e: &BackendStartError) {
+    log::warn!("continuing without a vault backend: {e}");
+    message_box(
+        "Deskwarden started without your vault",
+        &format!(
+            "{e}\n\nDeskwarden is running and its tray icon is available, but your vault is \
+             empty and autofill has nothing to fill from until the Bitwarden CLI is back.\n\n\
+             The tray icon can still sign you out, switch accounts and open preferences. \
+             Restarting Deskwarden will offer to reinstall the CLI again."
+        ),
+        MB_ICONWARNING | MB_OK,
+    );
 }
 
 #[cfg(test)]
@@ -14645,11 +15128,26 @@ mod tests {
             "control: the single-window region must still hold exactly the two recoveries this \
              guard was written for -- the `Some` arm's failed `work.items` and the deadline arm"
         );
+        // **Three, and the third is the missing-CLI recovery.**
+        //
+        // It was two until `the_startup_windows_backend_lost_its_cli`
+        // arrived, and that site is exposed to the identical substitution
+        // this guard exists to catch: it starts `bw serve` from a CLI it has
+        // just reinstalled, and writing that `Child` into a `&mut None`
+        // instead of the claimed binding would leave the process running with
+        // nothing in this launch able to stop it -- an orphan on
+        // `BW_SERVE_PORT` produced by the very recovery that exists to get
+        // the user working again.
+        //
+        // So the number went UP and the rule got stricter: every hand-off of
+        // a startup child in this region, not merely the two recoveries, has
+        // to name the claimed binding.
         assert_eq!(
             region.matches(claimed).count(),
-            2,
-            "the claimed child must be handed to both recoveries; a count of one means one arm \
-             was switched to something else and stops nothing"
+            3,
+            "the claimed child must be handed to both recoveries AND to the missing-CLI \
+             recovery; a lower count means one arm was switched to something else and stops \
+             nothing"
         );
 
         let mut checked = 0;
@@ -15256,41 +15754,65 @@ mod tests {
              definition and the single call inside `arm_autofill_and_seed_cache`. A third is a \
              second, unpaired seeding path"
         );
-        // **ONE, and it used to be zero.** See this test's doc for the whole
-        // of the reasoning; the short form is that zero was the right number
-        // while every site that armed the engine had also just obtained items
-        // to seed the cache with, and one is the right number now that
-        // exactly one site arms the engine from a cache it did not fill.
-        // Exact either way: a SECOND by-hand `match_entries` in startup is a
-        // site that obtained items and wrote one half, which is M6.
+        // **BACK TO ZERO, and that is a strengthening rather than a
+        // relaxation.**
+        //
+        // It was zero while every site went through
+        // `arm_autofill_and_seed_cache`; it went to one when the cache-first
+        // arm arrived and armed the engine from the cache by hand; it is zero
+        // again now that a SECOND launch shape needs the same unpaired arming
+        // -- the one whose `bw.exe` is gone and was not put back -- and both
+        // go through `arm_autofill_from_the_local_copy`.
+        //
+        // Zero is the stronger number because it admits no by-hand spelling
+        // at all. While one was allowed, the second site could have been
+        // written inline and this guard could only have counted it, not
+        // judged it; with the exemption behind a named function, a site that
+        // arms the engine by hand in startup fails here whatever it reads.
         let by_hand = main_body.matches(concat!("match_", "entries(")).count();
         assert_eq!(
-            by_hand, 1,
-            "startup builds match entries by hand {by_hand} time(s), not the one it should. \
-             Zero means the cache-first arm stopped arming autofill at all -- a login \
-             autostart that comes up off the disk copy would then have a tray, a hotkey and \
-             a dead match engine for the whole session. Two or more means a repopulation \
-             site went back to building entries by hand beside a cache seed, which is the \
-             two-halves-drifting-apart shape this guard is about"
+            by_hand, 0,
+            "startup builds match entries by hand {by_hand} time(s). Both unpaired sites -- \
+             the cache-first arm and the launch that has no vault backend -- must go through \
+             `arm_autofill_from_the_local_copy`, which is where the exemption from pairing is \
+             argued and where it is held to reading the cache. A by-hand spelling beside a \
+             cache seed is the two-halves-drifting-apart shape this guard is about"
         );
-        // **And that one reads the CACHE.** The count alone would be
-        // satisfied by a cache-first arm that armed the engine from a fresh
-        // `list_items` -- which would be a seventh site that obtained items
-        // and wrote only the engine, M6 respelt in the one place this guard
-        // just made room for. The exception is safe *because* its source is
-        // the snapshot `load_from_disk` already adopted, so that is what is
-        // pinned, not merely the fact that it is unpaired.
+        // **The exemption itself: exactly two callers, and its body reads the
+        // CACHE.** This replaces the old `match_entries(&cache.items())`
+        // count and holds strictly more. The count alone would be satisfied
+        // by a helper that armed the engine from a fresh `list_items` --
+        // which would be a site that obtained items and wrote only the
+        // engine, M6 respelt in the one place this guard makes room for -- so
+        // the source is pinned too, and now in the one body rather than at
+        // each call site.
         assert_eq!(
-            main_body
-                .matches(concat!("match_", "entries(&cache.items())"))
-                .count(),
-            1,
-            "the one by-hand `match_entries` in startup no longer reads `cache.items()`. \
-             The cache-first arm is exempted from pairing on exactly one ground: it seeds \
-             the engine FROM the cache rather than beside it, so there is no second half \
-             owing. Seeded from a fetch instead, it becomes a site that obtained items and \
-             armed only autofill -- and the vault window would then paint whatever the disk \
-             copy held while the engine matched something else"
+            main_body.matches(concat!("arm_autofill_from_the_", "local_copy(")).count(),
+            2,
+            "startup no longer has exactly the two unpaired arming sites this guard knows \
+             about: the cache-first arm, and the launch whose vault backend could not be \
+             started because the Bitwarden CLI is gone. Zero means one of them stopped arming \
+             autofill at all -- a tray, a hotkey and a dead match engine for the whole \
+             session. Three or more means a new launch shape adopted the exemption without \
+             anyone deciding it had earned it"
+        );
+        assert!(
+            body_of(&code, concat!("fn arm_autofill_from_the_", "local_copy("))
+                .contains(concat!("match_", "entries(&cache.items())")),
+            "`arm_autofill_from_the_local_copy` no longer arms the engine from the cache. \
+             The two sites are exempted from pairing on exactly one ground: they seed the \
+             engine FROM the cache rather than beside it, so there is no second half owing. \
+             Seeded from a fetch instead, they become sites that obtained items and armed \
+             only autofill -- and the vault window would then paint whatever the disk copy \
+             held while the engine matched something else"
+        );
+        assert!(
+            !body_of(&code, concat!("fn arm_autofill_from_the_", "local_copy("))
+                .contains(concat!("seed_cache_at_", "startup(")),
+            "`arm_autofill_from_the_local_copy` writes the cache. It must not: the \
+             missing-CLI site reaches it with an EMPTY vault, and a write at \
+             `Source::Backend` would replace the user's encrypted offline copy with nothing \
+             at the exact moment that copy is the only vault they have left"
         );
     }
 
@@ -31290,7 +31812,13 @@ mod startup_shape_tests {
         //    still reach the LAST production item in the file. If the marker
         //    were matched earlier than the real test modules, this anchor
         //    would fall below the cut instead of just above it.
-        const LAST_PRODUCTION_ITEM: &str = concat!("fn start_backend(session_token: &str, job: Option<&job_object::KillOnClose", "Job>) -> Child {");
+        // Repointed, exactly as this control's own failure message says to:
+        // `start_backend` is no longer the last item in the production half
+        // -- `stand_down_without_a_backend`, the answer a missing CLI gets
+        // instead of `fatal_startup_error`, is declared immediately below it.
+        // Its signature is the anchor for the same reason the old one was:
+        // one occurrence, on one line, in a declaration.
+        const LAST_PRODUCTION_ITEM: &str = concat!("fn stand_down_without_a_backend(e: &BackendStart", "Error) {");
         assert_eq!(
             source.matches(LAST_PRODUCTION_ITEM).count(),
             1,
@@ -31396,8 +31924,15 @@ mod startup_shape_tests {
             // Raised deliberately, and it asserts MORE than six did: two
             // further modules must now be clean, gated, column-0 blocks that
             // this walk really reaches.
+            //
+            // **Nine since a missing CLI stopped being fatal**, which added
+            // `a_missing_cli_is_never_fatal` -- the recovery driven over its
+            // seam, and the rule that no backend failure ends the process
+            // without first asking whether the binary is merely absent.
+            // Raised for the same reason as before: one further module must
+            // now be a clean, gated, column-0 block that this walk reaches.
             modules,
-            8,
+            9,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -32601,5 +33136,515 @@ mod the_one_settings_write_back {
         apply_edited_settings(&cache, &mut settings, &settings_path, a_real_change, None);
         assert!(settings_path.exists(), "control: a real change did not write either");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// **THE DELIVERABLE: a missing `bw.exe` must never end the process.**
+///
+/// The owner met this on their own machine. An account already signed in to
+/// bitwarden.com keeps `use_official_bw_crypto: true`, so
+/// `backend_policy::choose` answers `BwServe` and startup tries to spawn
+/// `bw serve`; with the binary gone, `CreateProcess` returned `os error 2`,
+/// `fatal_startup_error` put a "Deskwarden cannot start" box on the screen
+/// and the process exited. There was no route back: `bw_acquire` fires only
+/// from the sign-in card's Submit, gated on the server being typed, and an
+/// account that is already signed in never reaches a sign-in form. The user
+/// could not open the window to sign out.
+///
+/// Two halves, because neither is sufficient alone:
+///
+/// 1. **The recovery itself, driven.** `recover_a_missing_cli_with` is run
+///    over a substitute seam on every arm a user can reach -- declined, and
+///    accepted-then-refused. A test that RETURNS is a body that did not call
+///    `fatal_startup_error`, because that function's return type is `!` and
+///    its second statement kills the test process. Every one of these carries
+///    a positive control asserting the seam was actually entered, so a
+///    version that returned before doing anything could not pass by never
+///    reaching the thing it names.
+///
+/// 2. **The arms, read.** The three places a backend failure becomes fatal
+///    are in `fn main`'s startup sequence and in `recover_from_failed_vault_
+///    wait`, none of which a test can run: they open windows, spawn
+///    processes and end the process. What can be checked is that no one of
+///    them reaches `fatal_startup_error` without first asking whether the
+///    failure is a missing CLI -- with fixtures proving the rule can tell a
+///    guarded arm from an unguarded one.
+#[cfg(test)]
+mod a_missing_cli_is_never_fatal {
+    use super::*;
+    use deskwarden::bw_acquire::{AcquireOutcome, AcquireRefusal};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// The substitute seam's observations. Process-global because a `fn`
+    /// pointer cannot capture -- which is the whole reason the seam is `fn`
+    /// pointers and not `impl Fn` (see `MissingCliEnv`) -- so every test here
+    /// takes [`SEAM`] first and resets them.
+    static ASKED: AtomicUsize = AtomicUsize::new(0);
+    static ACQUIRED: AtomicUsize = AtomicUsize::new(0);
+    static TOLD: AtomicUsize = AtomicUsize::new(0);
+    static SEAM: Mutex<()> = Mutex::new(());
+
+    /// Takes the seam and zeroes the counters. Poisoning is unwrapped past
+    /// deliberately: a panic in one test here must not turn every other one
+    /// into a second failure about a lock.
+    fn seam() -> std::sync::MutexGuard<'static, ()> {
+        let guard = SEAM.lock().unwrap_or_else(|e| e.into_inner());
+        for counter in [&ASKED, &ACQUIRED, &TOLD] {
+            counter.store(0, Ordering::SeqCst);
+        }
+        guard
+    }
+
+    fn ask_and_say_no(_title: &str, _body: &str) -> bool {
+        ASKED.fetch_add(1, Ordering::SeqCst);
+        false
+    }
+
+    fn ask_and_say_yes(_title: &str, _body: &str) -> bool {
+        ASKED.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    fn acquire_refuses() -> Result<AcquireOutcome, AcquireRefusal> {
+        ACQUIRED.fetch_add(1, Ordering::SeqCst);
+        Err(AcquireRefusal::Offline("no network in a test".into()))
+    }
+
+    /// The refusal that is NOT retryable, so both sides of
+    /// `AcquireRefusal::retryable` are exercised through this module.
+    fn acquire_is_not_bitwardens() -> Result<AcquireOutcome, AcquireRefusal> {
+        ACQUIRED.fetch_add(1, Ordering::SeqCst);
+        Err(AcquireRefusal::NotBitwardenSigned { subject_dn: None })
+    }
+
+    fn acquire_succeeds() -> Result<AcquireOutcome, AcquireRefusal> {
+        ACQUIRED.fetch_add(1, Ordering::SeqCst);
+        Ok(AcquireOutcome::AlreadyPresent(std::path::PathBuf::from(r"C:\nowhere\bw.exe")))
+    }
+
+    fn acquire_must_not_run() -> Result<AcquireOutcome, AcquireRefusal> {
+        ACQUIRED.fetch_add(1, Ordering::SeqCst);
+        panic!(
+            "the download ran after the user pressed Cancel. The ask precedes the first byte \
+             precisely so a decline costs nothing and leaves nothing behind"
+        );
+    }
+
+    fn tell(_title: &str, _body: &str) {
+        TOLD.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn missing() -> std::path::PathBuf {
+        std::path::PathBuf::from(r"C:\nowhere\bw.exe")
+    }
+
+    /// **A decline returns. It does not exit, and it fetches nothing.**
+    ///
+    /// If `recover_a_missing_cli_with` reached `fatal_startup_error` on this
+    /// arm the test binary would die here rather than fail, which is the
+    /// strongest form this assertion has: there is no way to satisfy it
+    /// except by returning.
+    #[test]
+    fn declining_the_reinstall_returns_instead_of_ending_the_process() {
+        let _seam = seam();
+        let env = MissingCliEnv {
+            ask: ask_and_say_no,
+            acquire: acquire_must_not_run,
+            tell,
+        };
+
+        let outcome = recover_a_missing_cli_with(&env, &missing());
+
+        assert!(
+            matches!(outcome, MissingCliRecovery::Declined),
+            "a Cancel on the ask answered {outcome:?} rather than `Declined`"
+        );
+        // Positive control: the body really did reach the ask. Without this,
+        // a `recover_a_missing_cli_with` that returned `Declined` on its
+        // first line -- never offering anything -- would pass the assertion
+        // above while removing the entire feature.
+        assert_eq!(
+            ASKED.load(Ordering::SeqCst),
+            1,
+            "the user was never asked, so this test proves only that a function returns"
+        );
+        assert_eq!(
+            TOLD.load(Ordering::SeqCst),
+            0,
+            "a decline put a second dialog up. Cancel is an answer, not a failure: nothing \
+             was fetched and there is nothing to report"
+        );
+    }
+
+    /// **A refused download returns too**, on both gradings of refusal.
+    ///
+    /// `acquire_must_not_run`'s panic covers the decline arm; this covers the
+    /// arm where the user said yes and the network, the artefact or the
+    /// signature said no. The old code reached this state only as an
+    /// `os error 2` inside a fatal dialog.
+    #[test]
+    fn a_failed_reinstall_returns_instead_of_ending_the_process() {
+        for (what, acquire) in [
+            ("a retryable refusal", acquire_refuses as fn() -> _),
+            ("a refusal that will never retry", acquire_is_not_bitwardens as fn() -> _),
+        ] {
+            let _seam = seam();
+            let env = MissingCliEnv { ask: ask_and_say_yes, acquire, tell };
+
+            let outcome = recover_a_missing_cli_with(&env, &missing());
+
+            assert!(
+                matches!(outcome, MissingCliRecovery::Refused(_)),
+                "{what} answered {outcome:?} rather than `Refused`"
+            );
+            assert_eq!(
+                ACQUIRED.load(Ordering::SeqCst),
+                1,
+                "{what}: the acquisition never ran, so this test reached nothing it names"
+            );
+            assert_eq!(
+                TOLD.load(Ordering::SeqCst),
+                1,
+                "{what}: the user pressed OK, waited, and was told nothing about what \
+                 happened"
+            );
+        }
+    }
+
+    /// **And a success says so and reports `Acquired`**, which is the arm the
+    /// retry hangs off: `start_backend_recovering_a_missing_cli` attempts the
+    /// start again on this value and only on this value.
+    #[test]
+    fn a_successful_reinstall_is_the_one_arm_that_earns_a_retry() {
+        let _seam = seam();
+        let env = MissingCliEnv { ask: ask_and_say_yes, acquire: acquire_succeeds, tell };
+
+        let outcome = recover_a_missing_cli_with(&env, &missing());
+
+        assert!(
+            matches!(outcome, MissingCliRecovery::Acquired),
+            "a successful install answered {outcome:?}"
+        );
+        assert_eq!(
+            TOLD.load(Ordering::SeqCst),
+            1,
+            "the install was not confirmed. The owner's own requirement on this modal is \
+             that what landed is named rather than auto-dismissed"
+        );
+    }
+
+    /// **The ask the user actually reads is the recovery wording, not the
+    /// sign-in wording.**
+    ///
+    /// The two differ in one load-bearing way: the sign-in ask offers "go
+    /// back and choose a different server", which is a real way out at the
+    /// moment a server is being typed and is not one here -- this user has no
+    /// form in front of them. Telling somebody to press a control that is not
+    /// on their screen is the shape of advice this whole branch exists to
+    /// stop giving.
+    #[test]
+    fn the_ask_names_a_way_out_this_user_actually_has() {
+        use deskwarden::bw_acquire::CliSetupState;
+        let body = CliSetupState::AskingToRecover.body().join(" ");
+
+        assert!(
+            body.contains("sign out") || body.contains("switch accounts"),
+            "the recovery ask does not tell the user the app will still open and what they \
+             can do in it, which is the whole difference from refusing to start: {body:?}"
+        );
+        assert!(
+            !body.contains("choose a different server"),
+            "the recovery ask offers the sign-in card's way out -- a server choice -- to a \
+             user who is already signed in and has no form on screen: {body:?}"
+        );
+        // Control on the needle: the sign-in ask really does say it, so the
+        // absence above is a difference between the two states rather than a
+        // phrase that appears in neither.
+        assert!(
+            CliSetupState::Asking.body().join(" ").contains("choose a different server"),
+            "control: the sign-in ask no longer offers the server choice either, so the \
+             assertion above distinguishes nothing"
+        );
+        // And that both states share the disclosure the download costs.
+        for state in [CliSetupState::Asking, CliSetupState::AskingToRecover] {
+            assert!(
+                state.body().join(" ").contains("37 MB"),
+                "{:?} asks the user to accept a download without saying what it costs",
+                state.title()
+            );
+        }
+    }
+
+    /// **Both asks lead to the same install path**, which is the half that
+    /// must not be reimplemented: the digest check, the
+    /// `verify_is_bitwardens` gate and the install destination are
+    /// `bw_acquire`'s, and a second downloader written for this recovery
+    /// would be a second chance to get verification wrong.
+    #[test]
+    fn the_recovery_reuses_the_sign_ins_download_and_verify_path() {
+        let source = main_source();
+        let body = fn_body(&source, concat!("fn acquire_the_", "cli()"));
+        assert!(
+            body.contains(concat!("bw_acquire::acquire_if_", "needed(")),
+            "the missing-CLI recovery no longer goes through `bw_acquire::acquire_if_needed`, \
+             which is the only function in this crate that verifies a downloaded `bw.exe` \
+             before installing it: {body:?}"
+        );
+        assert!(
+            body.contains(concat!("BwAcquireEnv::produc", "tion()")),
+            "the recovery hands `acquire_if_needed` something other than the production seam, \
+             so the six real functions -- including `verify_is_bitwardens` -- may not be the \
+             ones that run: {body:?}"
+        );
+    }
+
+    /// **THE RULE: no backend failure ends the process without first asking
+    /// whether it is a missing CLI.**
+    ///
+    /// The two remaining fatal arms are allowed to be fatal -- both are
+    /// pre-tray, and `the_only_fatal_backend_start_is_start_backends` holds
+    /// that there is no third. What they are not allowed to be is
+    /// unconditional, which is exactly what they were.
+    #[test]
+    fn every_fatal_backend_arm_asks_whether_the_cli_is_merely_missing() {
+        let source = main_source();
+        let fatal = concat!("fatal_startup_er", "ror(");
+        let guard = concat!("a_missing_cli_could_be_re", "installed()");
+        let failed_arm = concat!("BackendStart::Fail", "ed(e) =>");
+
+        let mut guarded = 0;
+        for (at, _) in source.match_indices(failed_arm) {
+            let body = fatal_arm_body(&source, at);
+            if !body.contains(fatal) {
+                continue;
+            }
+            assert!(
+                body.contains(guard),
+                "a `BackendStart::Failed` arm ends the process without asking whether the \
+                 Bitwarden CLI is merely missing. That is the owner's own bricked launch: \
+                 the binary is gone, the account's vault is served by it, and the app puts \
+                 up a box whose OK button is the end of the process -- with no route to \
+                 sign out, switch accounts or reach preferences. Offer the reinstall and \
+                 stand down; see `stand_down_without_a_backend`. The arm: {body:?}"
+            );
+            assert!(
+                body.find(guard) < body.find(fatal),
+                "the missing-CLI question is asked AFTER the fatal exit in this arm, so it \
+                 is never asked at all: {body:?}"
+            );
+            guarded += 1;
+        }
+        assert_eq!(
+            guarded, 2,
+            "there are {guarded} fatal `BackendStart::Failed` arms in this file, not the two \
+             this rule was written over -- `start_backend` and \
+             `recover_from_failed_vault_wait`. A new one arrived with nothing to red it, or \
+             the needle stopped matching and this test now checks nothing"
+        );
+    }
+
+    /// **The startup window's arm too**, which is the one the owner's message
+    /// box actually came from and which is not spelled as a
+    /// `BackendStart::Failed` arm at all -- the worker carries its failure
+    /// home as a `String`, so the rule above cannot see it.
+    #[test]
+    fn the_startup_windows_backend_failure_asks_the_same_question() {
+        let source = main_source();
+        const ARM: &str = concat!("if let Err(e) = work.", "child {");
+        let at = source
+            .find(ARM)
+            .expect("control: the startup window no longer reads its worker's backend result");
+        let body = &source[at..at + 900.min(source.len() - at)];
+        assert!(
+            body.contains(concat!("the_cli_is_", "missing()")),
+            "the startup window's backend failure is fatal without asking whether the CLI is \
+             merely missing. This is the exact arm the owner's report came through: {body:?}"
+        );
+        assert!(
+            body.find(concat!("the_cli_is_", "missing()")) < body.find(concat!("fatal_startup_er", "ror(")),
+            "the question is asked after the exit, so it is never asked: {body:?}"
+        );
+    }
+
+    /// **Control for the two rules above: they can tell a guarded arm from an
+    /// unguarded one.**
+    ///
+    /// Without this, a needle that matched nothing -- a rename, a reflow, a
+    /// `concat!` split in the wrong place -- would make both of them pass by
+    /// scanning arms that do not exist. This is the house defect in its
+    /// purest form and these rules are its purest shape: assertions about
+    /// text that is absent.
+    #[test]
+    fn the_fatal_arm_rule_can_tell_guarded_from_unguarded() {
+        let fatal = concat!("fatal_startup_er", "ror(");
+        let guard = concat!("a_missing_cli_could_be_re", "installed()");
+        let arm = concat!("BackendStart::Fail", "ed(e) =>");
+
+        let unguarded = format!("{arm} {{ log(); {fatal}\"x\"); }}");
+        let guarded = format!("{arm} {{ if e.{guard} {{ return; }} {fatal}\"x\"); }}");
+        let backwards = format!("{arm} {{ {fatal}\"x\"); if e.{guard} {{ }} }}");
+
+        let at = |text: &str| text.find(arm).expect("the fixture names the arm");
+        assert!(
+            !fatal_arm_body(&unguarded, at(&unguarded)).contains(guard),
+            "control: the rule cannot see an UNGUARDED fatal arm, which is the only thing it \
+             exists to catch"
+        );
+        assert!(
+            fatal_arm_body(&guarded, at(&guarded)).contains(guard),
+            "control: the rule calls a correctly guarded arm unguarded"
+        );
+        let backwards_body = fatal_arm_body(&backwards, at(&backwards));
+        assert!(
+            backwards_body.contains(guard) && backwards_body.find(guard) > backwards_body.find(fatal),
+            "control: the rule cannot see a guard placed BELOW the exit, which passes a \
+             `contains` and is never reached"
+        );
+        // And that the slice stops at the next arm rather than running into
+        // it, which is what made an earlier version of this shape report
+        // every arm in the file as fatal.
+        let two = format!(
+            "{arm} {{ log(); }} {} {{ {fatal}\"x\"); }}",
+            concat!("BackendStart::NotSelec", "ted =>")
+        );
+        assert!(
+            !fatal_arm_body(&two, at(&two)).contains(fatal),
+            "control: the arm window ran past its own arm into the next one"
+        );
+    }
+
+    /// **The classifier answers `true` for exactly one variant.**
+    ///
+    /// A download is a remedy for absence and for nothing else. If it
+    /// answered `true` for a spawn failure on a file that IS present, the
+    /// recovery would offer 37 MB against a permissions problem and then
+    /// stand the app down with the vault still unreachable and no
+    /// explanation of why.
+    #[test]
+    fn only_absence_is_worth_a_download() {
+        assert!(
+            BackendStartError::CliMissing(missing()).a_missing_cli_could_be_reinstalled(),
+            "the one failure a reinstall fixes is not graded as one"
+        );
+        for other in [
+            BackendStartError::PortHeld(Duration::from_secs(1)),
+            BackendStartError::NoVerifiedCli("no path was recorded".into()),
+            BackendStartError::Spawn(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        ] {
+            assert!(
+                !other.a_missing_cli_could_be_reinstalled(),
+                "{other} is graded as fixable by a download. It is not: re-fetching the CLI \
+                 does not free a held port, does not conjure a recorded path, and does not \
+                 change the permissions on a file that is already there"
+            );
+        }
+    }
+
+    /// **The absent-CLI message says something the generic one did not**:
+    /// which file, and what it means for the vault. The sentence the owner
+    /// read named `bw_path::resolve_bw_exe` -- a function -- and
+    /// `os error 2`.
+    #[test]
+    fn the_absent_cli_failure_names_the_file_and_the_consequence() {
+        let said = BackendStartError::CliMissing(missing()).to_string();
+        assert!(
+            said.contains(r"C:\nowhere\bw.exe"),
+            "the failure does not name the file that is missing: {said:?}"
+        );
+        assert!(
+            said.contains("vault"),
+            "the failure does not say what the missing file costs the user: {said:?}"
+        );
+        assert!(
+            !said.contains("resolve_bw_exe"),
+            "the message still points the user at a Rust function: {said:?}"
+        );
+        // Control: the spawn failure -- a genuinely different diagnosis --
+        // still reads differently, so the two are not one sentence with a
+        // changed path.
+        let spawn = BackendStartError::Spawn(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        ))
+        .to_string();
+        assert_ne!(said, spawn, "control: absence and a failed spawn say the same thing");
+    }
+
+    /// **The absence is discovered BEFORE the port wait and the sync**, not
+    /// at the bottom of `try_start_backend` as an `os error 2`.
+    ///
+    /// Ordering, not presence: the failure is already certain at that line,
+    /// and below it the launch spends up to thirty seconds waiting for a port
+    /// nothing will bind and then runs a `bw sync` that spawns the very
+    /// binary that is not there.
+    #[test]
+    fn the_missing_cli_is_found_before_anything_is_waited_on() {
+        let source = main_source();
+        let body = fn_body(&source, concat!("fn try_start_back", "end("));
+        let found = body
+            .find(concat!("the_cli_is_", "missing()"))
+            .expect("`try_start_backend` no longer asks whether the CLI is on the disk at all");
+        for (what, needle) in [
+            ("the port wait", concat!("wait_for_port_", "free(")),
+            ("the vault sync", concat!("run_bw_", "sync(")),
+            ("the spawn", concat!("spawn_in_", "job(")),
+        ] {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("control: `try_start_backend` no longer reaches {what}"));
+            assert!(
+                found < at,
+                "the CLI's absence is discovered after {what}, which is time and a subprocess \
+                 spent on a failure that was certain before either"
+            );
+        }
+    }
+
+    /// This file, production half only -- the same cut every other source
+    /// guard here uses, so a needle cannot be satisfied by a test that
+    /// mentions it.
+    /// **Cut at this file's own test-module marker, not at the first
+    /// `#[cfg(test)]`** -- and the marker is spelled in two pieces below for
+    /// the reason every needle here is: an unbroken copy of it in this
+    /// comment would BE a second occurrence, and the cut would move up to
+    /// here.
+    ///
+    /// That is the same correction `bw_serve_gate::main_code` records: this
+    /// file's
+    /// first `#[cfg(test)]` sits four thousand lines ABOVE
+    /// `try_start_backend`, so cutting there would hide the very function
+    /// three of the rules here are about and every one of them would pass by
+    /// reading nothing.
+    fn main_source() -> &'static str {
+        include_str!("main.rs")
+            .split(concat!("mod te", "sts {"))
+            .next()
+            .expect("splitting always yields a first part")
+    }
+
+    /// One `fn`'s body, from its declaration to the next top-level `\n}`.
+    fn fn_body<'a>(source: &'a str, decl: &str) -> &'a str {
+        let at = source
+            .find(decl)
+            .unwrap_or_else(|| panic!("control: {decl:?} is not in the production half"));
+        let rest = &source[at..];
+        let end = rest
+            .find("\n}")
+            .unwrap_or_else(|| panic!("control: {decl:?} is never closed at column zero"));
+        &rest[..end]
+    }
+
+    /// One match arm's body: from its pattern to whichever comes first, the
+    /// NEXT `BackendStart::` arm or 2500 bytes. The same shape, and the same
+    /// reasoning, as `startup_shape_tests::arm_body` -- a fixed window runs
+    /// out of one arm and into the next, which makes every arm below a fatal
+    /// one look fatal.
+    fn fatal_arm_body(source: &str, at: usize) -> &str {
+        let ceiling = (at + 2_500).min(source.len());
+        let from = at + concat!("BackendStart", "::").len();
+        let end = source[from..ceiling]
+            .find(concat!("BackendStart", "::"))
+            .map_or(ceiling, |next| from + next);
+        &source[at..end]
     }
 }

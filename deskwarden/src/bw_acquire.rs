@@ -467,6 +467,24 @@ impl AcquireStage {
 pub enum CliSetupState {
     /// **State 1.** The ask. Nothing has been fetched.
     Asking,
+    /// **State 1, reached from the other direction.** The same ask, worded
+    /// for the user who is ALREADY SIGNED IN and whose `bw.exe` has gone --
+    /// quarantined by antivirus, cleaned out of `%LOCALAPPDATA%`, lost to a
+    /// failed CLI self-update, or missing from a restored machine image.
+    ///
+    /// **A separate variant rather than a parameter on [`Self::Asking`],
+    /// because the two differ only in what they must NOT say.** The sign-in
+    /// ask offers "go back and choose a different server", which is a real
+    /// way out at the moment a server is being typed. It is not one here:
+    /// the server was chosen on a previous launch and this user has no form
+    /// in front of them. Offering it would be telling somebody to press a
+    /// control that is not on their screen.
+    ///
+    /// Everything below this state is shared with [`Self::Asking`] --
+    /// [`acquire_if_needed`], the six-function seam, the verification gate,
+    /// the install path -- which is the whole reason this is a state of this
+    /// modal rather than a second dialog with its own downloader.
+    AskingToRecover,
     /// **State 2.** Downloading, then verifying, then installing -- with a
     /// determinate bar, not a spinner.
     Working { stage: AcquireStage },
@@ -495,6 +513,7 @@ impl CliSetupState {
     pub fn title(&self) -> &'static str {
         match self {
             Self::Asking => "The Bitwarden CLI is required",
+            Self::AskingToRecover => "The Bitwarden CLI is missing",
             Self::Working { .. } => "Installing the Bitwarden CLI",
             Self::Installed(_) => "The Bitwarden CLI is installed",
             Self::Failed(_) => "The Bitwarden CLI was not installed",
@@ -517,6 +536,19 @@ impl CliSetupState {
                     .to_string(),
                 "Press OK to continue, or Cancel to go back and choose a different server. \
                  A self-hosted server can be used without it."
+                    .to_string(),
+            ],
+            Self::AskingToRecover => vec![
+                "Your vault is served by the official Bitwarden CLI, and it is no longer on \
+                 this computer. Antivirus software, a cleanup tool, or a failed CLI update \
+                 can remove it."
+                    .to_string(),
+                "Deskwarden will download it from Bitwarden, check that Bitwarden signed \
+                 it, and install it. It is about 37 MB, and this happens once."
+                    .to_string(),
+                "Press OK to reinstall it now, or Cancel to start without your vault. \
+                 Deskwarden will still open, and you can sign out or switch accounts from \
+                 the tray."
                     .to_string(),
             ],
             Self::Working { stage } => {
@@ -567,7 +599,7 @@ impl CliSetupState {
     #[must_use]
     pub fn buttons(&self) -> Vec<(&'static str, CliModalAction)> {
         match self {
-            Self::Asking => {
+            Self::Asking | Self::AskingToRecover => {
                 vec![("Cancel", CliModalAction::Cancel), ("OK", CliModalAction::Begin)]
             }
             // **No Cancel during state 2.** Not offered rather than offered
