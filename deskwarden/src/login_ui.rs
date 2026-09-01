@@ -441,6 +441,9 @@ pub fn identity_after_sign_in(
     typed: &str,
     known: Option<&str>,
     server_url: Option<&str>,
+    // What the backend-choice modal answered this sign-in, carried through
+    // unchanged. See [`SignedInIdentity::use_official_bw_crypto`].
+    use_official_bw_crypto: Option<bool>,
 ) -> SignedInIdentity {
     let typed = typed.trim();
     SignedInIdentity {
@@ -451,6 +454,7 @@ pub fn identity_after_sign_in(
             Some(typed.to_string())
         },
         server_url: server_url.map(str::to_string).filter(|s| !s.trim().is_empty()),
+        use_official_bw_crypto,
     }
 }
 
@@ -470,6 +474,22 @@ pub struct SignedInIdentity {
     pub account: Option<AccountId>,
     pub user_email: Option<String>,
     pub server_url: Option<String>,
+    /// **What the user answered in the backend-choice modal**, or `None` when
+    /// they were never asked -- which is every sign-in except a fresh mint on
+    /// a self-hosted server.
+    ///
+    /// It travels here rather than being re-derived by the consumer because
+    /// it CANNOT be re-derived: `accounts::official_cli_after_sign_in` would
+    /// answer "built-in client" for exactly the account that just chose the
+    /// official CLI, and `main`'s added-account path builds its `Account`
+    /// record from that function. So the one place the answer exists is the
+    /// window it was given in, and this is the value that window already
+    /// carries its other two established facts out in.
+    ///
+    /// Deliberately NOT in [`Self::as_details`]: `BwStatusDetails` is what a
+    /// `bw status` answer is shaped like, and a `bw status` has no opinion
+    /// about this.
+    pub use_official_bw_crypto: Option<bool>,
 }
 
 impl SignedInIdentity {
@@ -3042,6 +3062,15 @@ pub fn direct_login_for_this_sign_in(
     account: Option<&Account>,
     typed_email: &str,
     typed_server: Option<&str>,
+    // **The choice modal's answer, and the reason it has to reach here.**
+    // This function re-settles the backend the sign-in itself runs on. If the
+    // user picked the official CLI for a self-hosted account and this were
+    // not passed, `learn_account_details` would derive "built-in client",
+    // the environment would re-settle to `RestBackend`, and the sign-in would
+    // run on the backend the user had just declined -- against an account
+    // whose record `main` then writes as `bw serve`. The two would disagree
+    // about the same account in the same second.
+    chosen_this_sign_in: Option<bool>,
 ) -> Option<DirectRestLogin> {
     if let Some(account) = account {
         let mut establishing = account.clone();
@@ -3049,6 +3078,7 @@ pub fn direct_login_for_this_sign_in(
             &mut establishing,
             Some(typed_email.trim()),
             typed_server,
+            chosen_this_sign_in,
         );
         if !crate::backend_policy::resettle_for(&establishing) {
             log::debug!(
@@ -3277,6 +3307,33 @@ pub fn build_login_frame(
     // address and answers from its record, which is what keeps a self-hoster
     // already on `bw serve` on `bw serve`.
     let signin_account: Option<crate::accounts::Account> = account.map(|(_, a)| a.clone());
+    // **What the user answered in the choice modal, for this window's life.**
+    //
+    // `None` until they answer, and `None` forever on every sign-in that is
+    // not a fresh mint against a self-hosted server -- the only case the
+    // modal opens for. Once set it is spent in three places, all of which
+    // would otherwise re-derive the answer and get the opposite one for the
+    // user who chose the official CLI: the CLI gate below, the backend
+    // re-settle in `direct_login_for_this_sign_in`, and the
+    // `SignedInIdentity` this window publishes for `main` to write.
+    //
+    // Held here rather than on `LoginForm` because it is not a field of the
+    // form: the form is what the user typed and can retype, and this is an
+    // answer the modal collected. It survives a failed sign-in and a
+    // corrected password, which is right -- the server did not change, so
+    // the question does not get asked again.
+    let mut chosen_backend: Option<bool> = None;
+    // Set by the choice modal's arms that have nothing to wait for: the
+    // built-in client, which downloads nothing, and the official CLI on a
+    // machine that already has it. Both close the modal and re-enter Submit
+    // on the next frame, the same way the acquisition's confirmation does --
+    // so the user presses Continue exactly once whichever they pick.
+    //
+    // Separate from `close_setup_and_resume` above, which the WORKER's
+    // "already present" outcome sets: that one is read inside the borrow of
+    // `cli_setup` taken to drain the worker's channels, and this one is set
+    // from the action match below, which runs after that borrow has ended.
+    let mut close_choice_and_resume = false;
     // Two channels rather than one, because the two messages have different
     // lifetimes: progress arrives many times a second and is dropped on the
     // floor if the modal has moved on, while the outcome arrives exactly once
@@ -3460,6 +3517,15 @@ pub fn build_login_frame(
                             &form.email,
                             account_email.as_deref(),
                             configured_server.as_deref(),
+                            // **And the answer the choice modal collected**,
+                            // which is the only copy of it that leaves this
+                            // window. `main` builds the new account's record
+                            // from `official_cli_after_sign_in`, and that
+                            // function cannot re-derive this one: it would
+                            // answer "built-in client" for precisely the
+                            // self-hoster who just pressed "Use the
+                            // Bitwarden CLI".
+                            chosen_backend,
                         ));
                         *token_for_closure.borrow_mut() = Some(session_token);
                         // The token is recorded either way; what differs is
@@ -3620,11 +3686,75 @@ pub fn build_login_frame(
                         // `RestBackend`. Bound once and read twice so the
                         // modal and the config call cannot disagree about
                         // which backend this sign-in is for.
+                        // **The CHOICE, and it comes before everything
+                        // else.**
+                        //
+                        // A self-hosted server is the one case where both
+                        // clients open the vault, so which one runs is the
+                        // user's to decide -- and until this modal existed
+                        // the app decided it silently and the owner met an
+                        // account already running `bw` that nobody had asked
+                        // them about. It is put BEFORE the gate below
+                        // because the gate's answer depends on it: the same
+                        // form, answered the other way, needs a 37 MB
+                        // download.
+                        //
+                        // **Every self-hosted sign-in, established account
+                        // included.** The owner's rule: "always either notify
+                        // (if bw.com) or prompt which one to use
+                        // (self-hosted) when login". An account that has
+                        // answered before is not skipped -- it is
+                        // PRESELECTED, by `in_use` below, so pressing through
+                        // is one keystroke and lands where it already was.
+                        //
+                        // The other three conditions exclude sign-ins that
+                        // are not sign-ins. `missing.is_none()` and
+                        // `!resume_submit_after_setup` are the CLI gate's own
+                        // circumstances, shared so the two cannot disagree
+                        // about whether this Submit is a real one; the second
+                        // also stops the modal reopening over the sign-in it
+                        // just released. `chosen_backend.is_none()` makes it
+                        // once per WINDOW rather than once per Continue --
+                        // "when login", not "per attempt", so a mistyped
+                        // password is not re-litigated as a backend
+                        // question.
+                        //
+                        // There is deliberately no "don't ask again": the
+                        // silent default is the defect this replaces, and a
+                        // checkbox would restore it one click later.
+                        let should_ask_which_client = missing.is_none()
+                            && !resume_submit_after_setup
+                            && chosen_backend.is_none()
+                            && crate::backend_policy::is_self_hosted(effective_server.as_deref());
+                        if should_ask_which_client {
+                            cli_setup = Some(crate::bw_acquire::CliSetupState::Choosing {
+                                // **The one rule, asked with `None`**, which
+                                // is what makes this a preselection of the
+                                // answer that would otherwise be taken
+                                // silently rather than a fourth opinion about
+                                // backends. An established account answers
+                                // from its record; a mint answers from the
+                                // derivation, which on a self-hosted address
+                                // is the built-in client.
+                                in_use: crate::accounts::official_cli_after_sign_in(
+                                    signin_account.as_ref(),
+                                    effective_server.as_deref(),
+                                    None,
+                                ),
+                                established: signin_account
+                                    .as_ref()
+                                    .is_some_and(|a| !crate::accounts::is_a_fresh_mint(a)),
+                            });
+                            form.error = None;
+                            ui.ctx().request_repaint();
+                            return;
+                        }
                         let cli_is_the_backend = crate::bw_acquire::this_sign_in_needs_the_cli(
                             effective_server.as_deref(),
                             crate::accounts::official_cli_after_sign_in(
                                 signin_account.as_ref(),
                                 effective_server.as_deref(),
+                                chosen_backend,
                             ),
                         );
                         let needs_cli = missing.is_none()
@@ -3762,6 +3892,7 @@ pub fn build_login_frame(
                                     signin_account.as_ref(),
                                     &form.email,
                                     configured_server.as_deref(),
+                                    chosen_backend,
                                 )
                             } else {
                                 crate::backend_policy::direct_rest_login()
@@ -3888,7 +4019,50 @@ pub fn build_login_frame(
                     }
                     // **The modal's three states, driven from one arm.**
                     Some(LoginAction::CliModal(what)) => match what {
-                        crate::bw_acquire::CliModalAction::Begin => {
+                        // **The built-in client: nothing is fetched and
+                        // nothing is spawned.**
+                        //
+                        // The answer is recorded and the sign-in the user was
+                        // already attempting resumes on the next frame. There
+                        // is deliberately no confirmation state to read --
+                        // nothing happened that needs confirming, and a modal
+                        // that made the user press OK to acknowledge that no
+                        // download had occurred would be an interruption
+                        // charging for itself.
+                        crate::bw_acquire::CliModalAction::UseBuiltIn => {
+                            chosen_backend = Some(false);
+                            close_choice_and_resume = true;
+                        }
+                        // **The official CLI, and the SAME arm as `Begin`.**
+                        //
+                        // Not "the same code as": the same arm, so there is
+                        // one `thread::spawn` in this file for CLI
+                        // acquisition and `job_object::THREAD_SPAWN_SITES`
+                        // does not move. A second copy of this block would
+                        // also be a second place the verification gate could
+                        // be left out of.
+                        //
+                        // `resolve_present_and_trusted` is re-asked because
+                        // this arm can be reached with the binary already
+                        // installed -- a second account on the same machine,
+                        // or a self-hoster who has used the CLI before -- and
+                        // that user is owed a sign-in, not a re-download. The
+                        // `Begin` arm cannot be reached that way (its gate
+                        // requires the file to be absent), so the check is
+                        // pure cost there and correctness here.
+                        crate::bw_acquire::CliModalAction::Begin
+                        | crate::bw_acquire::CliModalAction::UseOfficialCli
+                            if what == crate::bw_acquire::CliModalAction::UseOfficialCli
+                                && crate::bw_acquire::resolve_present_and_trusted().is_some() =>
+                        {
+                            chosen_backend = Some(true);
+                            close_choice_and_resume = true;
+                        }
+                        crate::bw_acquire::CliModalAction::Begin
+                        | crate::bw_acquire::CliModalAction::UseOfficialCli => {
+                            if what == crate::bw_acquire::CliModalAction::UseOfficialCli {
+                                chosen_backend = Some(true);
+                            }
                             // The one place acquisition starts, and it is
                             // behind a button the user pressed.
                             cli_setup = Some(crate::bw_acquire::CliSetupState::Working {
@@ -3957,6 +4131,21 @@ pub fn build_login_frame(
                         }
                     },
                     None => {}
+                }
+                // **The choice is answered, so the sign-in carries on.**
+                //
+                // After the match rather than inside its arms, for the same
+                // reason `close_setup_and_resume` is: the arms above run
+                // while `cli_setup` is being matched on, and this replaces
+                // it. Synthesising the Submit here also means the built-in
+                // path and the CLI path leave the modal by the same three
+                // lines -- there is one way out of this modal into a
+                // sign-in, not two.
+                if close_choice_and_resume {
+                    close_choice_and_resume = false;
+                    cli_setup = None;
+                    action_after_setup = Some(LoginAction::Submit);
+                    ui.ctx().request_repaint();
                 }
             },
         );
@@ -4060,7 +4249,16 @@ pub fn run_login_flow_for(
                 "the login window produced a session token without an identity; the account \
                  will keep whatever address it already had"
             );
-            SignedInIdentity { account: None, user_email: None, server_url: None }
+            SignedInIdentity {
+                account: None,
+                user_email: None,
+                server_url: None,
+                // Nothing was answered, because this identity was not
+                // produced by an answer -- it stands in for one that went
+                // missing. `None` leaves the derivation in charge, which is
+                // where an unasked sign-in has always left it.
+                use_official_bw_crypto: None,
+            }
         }),
         token,
     })
@@ -12563,6 +12761,7 @@ mod identity_without_a_spawn_tests {
             "  typed@example.eu  ",
             None,
             Some("https://vault.example.eu"),
+            None,
         );
         assert_eq!(
             learned.user_email.as_deref(),
@@ -12602,6 +12801,7 @@ mod identity_without_a_spawn_tests {
             "",
             Some("known@example.eu"),
             Some("https://vault.example.eu"),
+            None,
         );
         assert_eq!(
             learned.user_email.as_deref(),
@@ -12613,7 +12813,7 @@ mod identity_without_a_spawn_tests {
         // assertion above is the fallback firing rather than `typed` being
         // ignored outright.
         assert_eq!(
-            identity_after_sign_in(None, "typed@example.eu", Some("known@example.eu"), None)
+            identity_after_sign_in(None, "typed@example.eu", Some("known@example.eu"), None, None)
                 .user_email
                 .as_deref(),
             Some("typed@example.eu"),
@@ -12628,7 +12828,7 @@ mod identity_without_a_spawn_tests {
     /// icons from nowhere.
     #[test]
     fn whitespace_is_not_an_address_and_not_a_server() {
-        let learned = identity_after_sign_in(None, "   ", Some("  "), Some("  "));
+        let learned = identity_after_sign_in(None, "   ", Some("  "), Some("  "), None);
         assert_eq!(learned.user_email, None);
         assert_eq!(learned.server_url, None);
         assert_eq!(
@@ -12658,6 +12858,7 @@ mod identity_without_a_spawn_tests {
             account: None,
             user_email: Some("who@example.eu".to_string()),
             server_url: None,
+            use_official_bw_crypto: None,
         }
         .as_details();
         assert_eq!(
@@ -13696,6 +13897,96 @@ mod cli_setup_modal_layout_tests {
             walk(shape, &mut painted);
         }
         (login_card_height(flow_bottom, content_top), painted)
+    }
+
+    /// **Every shape the CHOICE modal has**, which is four: two clients in
+    /// use, times told-and-not-told that a client is in use.
+    ///
+    /// All four, not a representative one, because the four differ in
+    /// exactly the two dimensions that decide whether this modal fits: the
+    /// `established` arm adds a sentence to the longest paragraph in the
+    /// body, and `in_use` swaps the button labels, whose widths differ by
+    /// several characters. A single case would leave three untested layouts
+    /// of a modal whose sibling shipped blank.
+    fn every_choosing_state() -> Vec<crate::bw_acquire::CliSetupState> {
+        let mut states = Vec::new();
+        for in_use in [false, true] {
+            for established in [false, true] {
+                states.push(crate::bw_acquire::CliSetupState::Choosing { in_use, established });
+            }
+        }
+        states
+    }
+
+    /// The choice modal settles and paints, held to the same two assertions
+    /// as its sibling and by the same means -- `one_frame`, which is
+    /// `run_login_flow`'s real loop.
+    ///
+    /// **It is the state most likely to overflow**, which is why it gets its
+    /// own test rather than a mention: four paragraphs to the requirement
+    /// modal's three, one of them the longest string this window paints, and
+    /// two buttons whose labels are sentences rather than "OK" and "Cancel".
+    /// If any card in this app is going to be too tall for the window, it is
+    /// this one.
+    #[test]
+    fn the_choice_modal_settles_and_paints_inside_the_window() {
+        let ctx = styled_context();
+        let window = egui::Rect::from_min_size(Pos2::ZERO, WINDOW);
+        for state in every_choosing_state() {
+            let mut card_height = LOGIN_CARD_INITIAL_HEIGHT;
+            let mut painted = Vec::new();
+            let mut seen = Vec::new();
+            // The sibling's two hundred, for the sibling's reason: the
+            // runaway was 32px a frame, which a short loop cannot tell from
+            // a settled layout.
+            for _ in 0..200 {
+                let (height, shapes) = one_frame(&ctx, &state, card_height);
+                card_height = height;
+                painted = shapes;
+                seen.push(height);
+            }
+            let settled = *seen.last().expect("two hundred frames were run");
+            assert!(
+                (settled - seen[seen.len() - 2]).abs() <= 0.5,
+                "{state:?}: the card height is still moving after 200 frames \
+                 ({:?}...)",
+                &seen[..4]
+            );
+            assert!(
+                settled < WINDOW.y,
+                "{state:?}: the modal's card wants {settled}px in a {}px window, so it \
+                 cannot be centred in it and still be visible. This state's body is the \
+                 longest this window paints",
+                WINDOW.y
+            );
+            let find = |needle: &str| -> egui::Rect {
+                let (_, rect) = painted
+                    .iter()
+                    .find(|(text, _)| text == needle)
+                    .unwrap_or_else(|| {
+                        let all: Vec<&str> = painted.iter().map(|(t, _)| t.as_str()).collect();
+                        panic!("{state:?} never painted {needle:?}. Painted: {all:?}")
+                    });
+                *rect
+            };
+            for needle in std::iter::once(state.title().to_string()).chain(state.body()) {
+                let rect = find(&needle);
+                assert!(
+                    window.contains_rect(rect),
+                    "{state:?} painted {needle:?} at {rect:?}, outside the {window:?} the \
+                     user can see -- the 0.15.2 failure, in the modal that replaced it"
+                );
+            }
+            // Both answers, and their presence is the positive control: a
+            // blank panel WITH its buttons is the exact shape the bug had.
+            for (label, _) in state.buttons() {
+                let rect = find(label);
+                assert!(
+                    window.contains_rect(rect),
+                    "{state:?} painted its {label:?} button at {rect:?}, outside {window:?}"
+                );
+            }
+        }
     }
 
     /// **The card height settles.** The bug, stated as the thing it did.
