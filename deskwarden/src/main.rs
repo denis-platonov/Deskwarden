@@ -33141,6 +33141,139 @@ mod the_one_settings_write_back {
         assert!(settings_path.exists(), "control: a real change did not write either");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// **The vault window's gear must not move the active account's backend.**
+    ///
+    /// The defect this pins was live in 0.15.1. `use_official_bw_crypto` moved
+    /// from `Settings` to `accounts::Account` in 0.15.0 so that two accounts
+    /// on one machine could use two backends, but the key stayed in
+    /// `settings.json`: `Settings::load` still fills it, and
+    /// `persist_preferences` re-serialises whatever it read, so a value
+    /// written before 0.15.0 is pinned in that file forever. The vault
+    /// window's gear seeded its modal from that file, and
+    /// `apply_edited_settings` writes the seed back into the ACTIVE ACCOUNT
+    /// -- so a user with one `bw serve` account and one built-in-client
+    /// account could move the second onto the first's backend by opening the
+    /// modal and closing it again, changing nothing.
+    ///
+    /// **Driven all the way through, not merely read.** Asserting the seed
+    /// value alone would pass against a fix that never reached the account;
+    /// the bug is the write-back. So this runs the real
+    /// `vault_window::prefs_seed`, does to it exactly what closing the modal
+    /// does (`*edited_settings_for_closure.borrow_mut() = Some(state.settings
+    /// .clone())` -- the seed comes straight back out when nothing is
+    /// changed), and hands that to the one write-back.
+    ///
+    /// **One seed site covers both vault-window shells.** The gear's arm
+    /// lives in `build_frame_with_search`'s closure, which the daemon's
+    /// in-process host (`RealVaultOps`) and the split-out UI process
+    /// (`vault_window::run`) both reach, each handing in its own
+    /// `AccountsState`.
+    #[test]
+    fn the_vault_windows_gear_leaves_the_active_accounts_backend_alone() {
+        let dir = scratch("gear-seed");
+        let settings_path = dir.join("settings.json");
+        let cache = cache_over(&dir);
+
+        // An upgraded `settings.json`: the machine-wide key is still in it,
+        // saying `true`, because that is what this user answered before the
+        // field moved.
+        std::fs::write(
+            &settings_path,
+            br#"{"use_official_bw_crypto": true, "check_breaches": false}"#,
+        )
+        .expect("the scratch settings file should be writable");
+        assert!(
+            settings::Settings::load(&settings_path).use_official_bw_crypto,
+            "control: the stale machine-wide key did not survive the load, so this test would \
+             pass without the fix"
+        );
+
+        let on_the_cli = Account {
+            id: accounts::AccountId::parse("0123456789abcdef0123456789abcdef")
+                .expect("a valid id"),
+            email: "cli@example.invalid".to_string(),
+            server_url: None,
+            use_official_bw_crypto: true,
+        };
+        let on_the_built_in_client = Account {
+            id: accounts::AccountId::parse("fedcba9876543210fedcba9876543210")
+                .expect("a valid id"),
+            email: "self-hosted@example.invalid".to_string(),
+            server_url: Some("https://vault.example.invalid".to_string()),
+            use_official_bw_crypto: false,
+        };
+        let self_hosted_id = on_the_built_in_client.id.clone();
+        let mut accounts = accounts::AccountsState::new(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![on_the_cli, on_the_built_in_client],
+            self_hosted_id.clone(),
+        )
+        .expect("two accounts is a valid state");
+        assert!(
+            !accounts.active().use_official_bw_crypto,
+            "control: the window is not on the built-in-client account"
+        );
+
+        // The gear is clicked for the first time in this window, so nothing
+        // is in flight and the seed comes from outside.
+        let seed = deskwarden::vault_window::prefs_seed(
+            None,
+            Some(&settings_path),
+            Some(&accounts),
+        );
+        // The user changes nothing and closes the modal: `prefs_ui` hands the
+        // settings back exactly as it was given them.
+        let edited = seed.clone();
+
+        let mut settings = settings::Settings::load(&settings_path);
+        apply_edited_settings(&cache, &mut settings, &settings_path, edited, Some(&mut accounts));
+
+        assert!(
+            !accounts.active().use_official_bw_crypto,
+            "opening the vault window's gear and closing it moved this account onto `bw serve` \
+             -- the gear seeded the backend row from `settings.json`'s stale machine-wide key \
+             instead of from the account, and `apply_edited_settings` wrote it back"
+        );
+        let stored = accounts
+            .all()
+            .iter()
+            .find(|a| a.id == self_hosted_id)
+            .expect("the active account is in the persisted list");
+        assert!(
+            !stored.use_official_bw_crypto,
+            "the account list that gets persisted was moved onto `bw serve`, so the change \
+             survives the next launch"
+        );
+        assert!(
+            accounts
+                .all()
+                .iter()
+                .any(|a| a.id != self_hosted_id && a.use_official_bw_crypto),
+            "control: the OTHER account is no longer on the CLI, so the assertions above are \
+             reading a state where nothing is on `bw serve` at all"
+        );
+
+        // **Positive control: the row still works.** A user who actually
+        // turns the backend off in the modal must reach the account, or the
+        // assertions above would pass against a gear wired to nothing.
+        let turned_off =
+            settings::Settings { use_official_bw_crypto: true, ..settings.clone() };
+        apply_edited_settings(
+            &cache,
+            &mut settings,
+            &settings_path,
+            turned_off,
+            Some(&mut accounts),
+        );
+        assert!(
+            accounts.active().use_official_bw_crypto,
+            "control: a deliberate change in the modal did not reach the account either, so \
+             this test proves nothing about the seed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// **THE DELIVERABLE: a missing `bw.exe` must never end the process.**

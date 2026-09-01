@@ -2000,15 +2000,11 @@ pub fn build_frame_with_search(
                     // `edited_settings`. A re-click that re-read `settings.json`
                     // would show values the user has already changed away from,
                     // because nothing is written until this window closes.
-                    let seed = edited_settings_for_closure
-                        .borrow()
-                        .clone()
-                        .or_else(|| {
-                            settings_path_for_prefs
-                                .as_deref()
-                                .map(crate::settings::Settings::load)
-                        })
-                        .unwrap_or_default();
+                    let seed = prefs_seed(
+                        edited_settings_for_closure.borrow().clone(),
+                        settings_path_for_prefs.as_deref(),
+                        accounts.as_ref(),
+                    );
                     prefs = Some(crate::prefs_ui::PrefsState::with_scan_history(seed));
                 }
                 // **The avatar, the chevron beside it, and the menu they open
@@ -5539,6 +5535,55 @@ pub fn run(
         crate::clipboard::clear_if_still_ours_for(trigger);
     }
     result
+}
+
+/// What the gear's Preferences modal opens holding.
+///
+/// Extracted from the click arm because that arm is a closure inside `run`
+/// and no harness in this crate can press it -- see
+/// `settings_gear_placement_tests`, which could only ever guard the gear by
+/// reading source text. The DECISION the arm makes is not a drawing decision,
+/// so it lives out here where it can be driven, and driven all the way
+/// through `main`'s `apply_edited_settings` into the stored account.
+///
+/// **Two sources, and the split is the whole point.**
+///
+/// `in_flight` -- whatever the modal was last left holding -- wins outright
+/// when it is `Some`. The gear can be clicked again later in the same window
+/// and nothing has been written to disk yet at that point, so re-reading any
+/// other source would show the user the values they have already changed
+/// away from. That includes this function's account read: a user who toggled
+/// the backend row a moment ago must see their own answer, not the account's
+/// old one.
+///
+/// Otherwise: every field from `settings.json`, EXCEPT
+/// [`crate::settings::Settings::use_official_bw_crypto`], which comes from
+/// the ACTIVE ACCOUNT. That field moved to [`crate::accounts::Account`] and
+/// the copy in `settings.json` is a passenger an upgraded file still carries
+/// -- `Settings::load` fills it, `persist_preferences` binds it as `_` but
+/// re-serialises whatever it read, so an old machine-wide answer sits in that
+/// file forever. Seeding from there and handing the result to
+/// `apply_edited_settings` writes that stale answer into the active account,
+/// which is exactly the cross-account bleed the per-account move existed to
+/// remove: two accounts, one on `bw serve` and one on the built-in client,
+/// and merely opening and closing this modal moves one of them.
+///
+/// The tray's Preferences arm has always done this (`main.rs`, the
+/// `tray.preferences_id` arm); this is the same read, for the two shells that
+/// reach the page through this window instead.
+pub fn prefs_seed(
+    in_flight: Option<crate::settings::Settings>,
+    settings_path: Option<&std::path::Path>,
+    accounts: Option<&crate::accounts::AccountsState>,
+) -> crate::settings::Settings {
+    if let Some(in_flight) = in_flight {
+        return in_flight;
+    }
+    let on_disk = settings_path.map(crate::settings::Settings::load).unwrap_or_default();
+    crate::settings::Settings {
+        use_official_bw_crypto: accounts.is_none_or(|a| a.active().use_official_bw_crypto),
+        ..on_disk
+    }
 }
 
 /// Whether this detail action would put one of the item's secrets somewhere
@@ -16868,6 +16913,171 @@ mod settings_gear_placement_tests {
         }
         panic!("unbalanced braces after the gear's click -- this guard slices the block it opens")
     }
+
+    /// **The gear's seed is asked for by name, and the account is one of the
+    /// things it is asked with.**
+    ///
+    /// The decision itself is behaviourally tested -- here in
+    /// `the_gears_seed`, and end to end through `apply_edited_settings` in
+    /// `main.rs`'s `the_vault_windows_gear_leaves_the_active_accounts_backend_
+    /// alone`. What no test outside this file can reach is the WIRING: that
+    /// the undrivable click arm calls that function rather than reading
+    /// `settings.json` itself again. Inlining the old two-source `or_else`
+    /// back into this arm would leave every behavioural test above green and
+    /// ship the defect.
+    #[test]
+    fn the_gear_seeds_its_modal_from_the_account_as_well_as_the_file() {
+        let body = gear_click_body();
+        let asks = concat!("prefs_", "seed(");
+        let with_accounts = concat!("accounts.as_", "ref(),");
+        let reads_the_file_itself = concat!("settings::Settings::", "load");
+
+        assert!(
+            body.contains(asks),
+            "the gear's click does not go through the one seed function: {body:?}"
+        );
+        assert!(
+            body.contains(with_accounts),
+            "the gear's click computes its seed without handing in the accounts, so the \
+             backend row is seeded machine-wide again and closing the modal moves this \
+             account onto the other one's backend: {body:?}"
+        );
+        assert!(
+            !body.contains(reads_the_file_itself),
+            "the gear's click reads `settings.json` directly again, which is the seed the \
+             per-account backend move exists to stop: {body:?}"
+        );
+    }
+}
+
+/// [`prefs_seed`]: where each field of the preferences page's input comes
+/// from.
+///
+/// The end-to-end guard is `main.rs`'s
+/// `the_vault_windows_gear_leaves_the_active_accounts_backend_alone`, which
+/// follows this function's answer through `apply_edited_settings` into the
+/// stored account -- the write-back is the defect, not the paint. These are
+/// the unit-level companions: which source each half comes from, and that the
+/// in-flight copy still outranks both.
+#[cfg(test)]
+mod the_gears_seed {
+    use super::*;
+    use crate::accounts::{Account, AccountId, AccountsState};
+
+    fn account(hex: &str, official: bool) -> Account {
+        Account {
+            id: AccountId::parse(hex).expect("a valid id"),
+            email: format!("{hex}@example.invalid"),
+            server_url: if official { None } else { Some("https://vault.example.invalid".into()) },
+            use_official_bw_crypto: official,
+        }
+    }
+
+    const CLI: &str = "0123456789abcdef0123456789abcdef";
+    const BUILT_IN: &str = "fedcba9876543210fedcba9876543210";
+
+    /// Two accounts, active on the built-in-client one.
+    fn two_accounts(active: &str) -> AccountsState {
+        AccountsState::from_blocked_reason(
+            vec![account(CLI, true), account(BUILT_IN, false)],
+            AccountId::parse(active).expect("a valid id"),
+            None,
+        )
+        .expect("two accounts is a valid state")
+    }
+
+    /// A `settings.json` an upgrade left the old machine-wide key in, plus one
+    /// ordinary preference set away from its default so the "everything else
+    /// still comes from the file" half has something to see.
+    fn upgraded_file(dir: &std::path::Path) -> std::path::PathBuf {
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            br#"{"use_official_bw_crypto": true, "check_breaches": false, "auto_lock_minutes": 7}"#,
+        )
+        .expect("the scratch settings file should be writable");
+        path
+    }
+
+    #[test]
+    fn the_backend_row_comes_from_the_account_and_everything_else_from_the_file() {
+        let dir = crate::test_scratch::ScratchDir::new("gear-seed-sources");
+        let path = upgraded_file(&dir);
+        let accounts = two_accounts(BUILT_IN);
+
+        // Control: the file really does still say the opposite, so the
+        // assertion below is telling the two sources apart.
+        assert!(
+            crate::settings::Settings::load(&path).use_official_bw_crypto,
+            "control: the stale key did not survive the load"
+        );
+
+        let seed = prefs_seed(None, Some(&path), Some(&accounts));
+        assert!(
+            !seed.use_official_bw_crypto,
+            "the modal opened saying this account is on `bw serve`; it is not, and closing the \
+             modal would write that answer into the account"
+        );
+        assert!(
+            !seed.check_breaches && seed.auto_lock_minutes == 7,
+            "the other preferences stopped coming from `settings.json`: {:?} {:?}",
+            seed.check_breaches,
+            seed.auto_lock_minutes
+        );
+
+        // The same file, the OTHER account active: the seed follows the
+        // account rather than reporting one constant twice.
+        let seed = prefs_seed(None, Some(&path), Some(&two_accounts(CLI)));
+        assert!(
+            seed.use_official_bw_crypto,
+            "control: the seed says `bw serve` for neither account, so the answer above is not \
+             being read from the account at all"
+        );
+    }
+
+    /// **A second click on the gear shows the user their own answer.**
+    ///
+    /// The in-flight copy is the modal's last state and nothing has been
+    /// written anywhere yet, so it outranks both other sources -- including
+    /// the account. A user who has just turned the backend row off and
+    /// reopened the modal must not find it back on.
+    #[test]
+    fn what_the_modal_was_left_holding_outranks_both_other_sources() {
+        let dir = crate::test_scratch::ScratchDir::new("gear-seed-in-flight");
+        let path = upgraded_file(&dir);
+        let accounts = two_accounts(CLI);
+
+        let in_flight = crate::settings::Settings {
+            use_official_bw_crypto: false,
+            check_breaches: true,
+            ..crate::settings::Settings::default()
+        };
+        let seed = prefs_seed(Some(in_flight.clone()), Some(&path), Some(&accounts));
+        assert_eq!(
+            seed, in_flight,
+            "the second open re-read the account or the file and threw away the change the \
+             user made a moment ago and can still see on screen"
+        );
+        // Control: with nothing in flight the same call answers differently,
+        // so the equality above is not passing against a function that
+        // ignores its other two arguments.
+        assert_ne!(
+            prefs_seed(None, Some(&path), Some(&accounts)),
+            in_flight,
+            "control: the seed is the same with and without an in-flight copy"
+        );
+    }
+
+    /// An app with no account list (`StartupAccounts::NoAccountList`) has no
+    /// account to ask, and `true` is the same answer `backend_policy::choose`
+    /// is given everywhere else in that state.
+    #[test]
+    fn no_account_list_seeds_the_official_backend() {
+        let dir = crate::test_scratch::ScratchDir::new("gear-seed-no-accounts");
+        let path = upgraded_file(&dir);
+        assert!(prefs_seed(None, Some(&path), None).use_official_bw_crypto);
+        assert!(prefs_seed(None, None, None).use_official_bw_crypto);
+    }
 }
 
 /// That "auto-lock is off" really is off, in the one place it has to be.
@@ -20814,9 +21024,13 @@ mod preferences_modal_wiring_tests {
             // `mod hide_delivery_tests` -- that a delivery's answer is
             // believed, that nothing outstanding is not a refusal, and that
             // the modal's live `keep_ui_loaded` beats the startup value.
+            // 62 as of the gear's seed moving to the active account, which
+            // added `mod the_gears_seed` -- which source each half of the
+            // preferences page's input comes from, and that the modal's
+            // in-flight copy still outranks both.
             // Raised deliberately: one more module must now be a clean,
             // column-0, gated block that the walk really reaches.
-            modules, 61,
+            modules, 62,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
