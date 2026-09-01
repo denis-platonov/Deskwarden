@@ -6127,6 +6127,34 @@ const UI_COULD_NOT_START: i32 = 64;
 /// [`UI_COULD_NOT_START`] is.
 const UI_LAUNCH_REFUSED: i32 = 65;
 
+/// **How a window that could not open reaches the user.**
+///
+/// The `fn`-pointer seam, for the reason every other one in this crate exists:
+/// [`ui_vault_outcome`] is the decision, `message_box` is a Win32 call, and no
+/// test in this crate may make one. Without this the only thing under oath
+/// about a failed launch would be that the daemon logged something -- which is
+/// exactly the state that shipped, and exactly what "the main UI does not
+/// open, no error, nothing" is from the outside.
+///
+/// Not [`fatal_startup_error`]: the daemon is fine, the tray is fine, and one
+/// window did not open. That is a message box and a running app, not an exit.
+struct UiFailureEnv {
+    /// Puts one sentence in front of the user, synchronously.
+    report: fn(&str),
+}
+
+impl UiFailureEnv {
+    /// The real one: a plain warning box, titled like every other one this app
+    /// raises.
+    fn production() -> Self {
+        Self {
+            report: |text| {
+                message_box("Deskwarden", text, MB_ICONWARNING | MB_OK);
+            },
+        }
+    }
+}
+
 /// The largest exit code the result bitfield can produce, and therefore the
 /// top of the range the daemon is willing to read as an outcome.
 const UI_RESULT_CODE_CEILING: i32 = deskwarden::ui_process::UiVaultResult::EXIT_LOCKED
@@ -6592,7 +6620,7 @@ fn what_the_vault_ui_process_reported(
     deskwarden::ui_process::forget_edited_settings(
         &deskwarden::ui_process::edited_settings_path(config_dir, pid),
     );
-    let crossing = ui_vault_outcome(pid, code, from_file);
+    let crossing = ui_vault_outcome(pid, code, from_file, &UiFailureEnv::production());
     log::info!("UI process {pid} came home with {crossing:?}");
 
     vault_window::VaultWindowResult {
@@ -6629,13 +6657,34 @@ fn ui_vault_outcome(
     pid: u32,
     code: Option<i32>,
     from_file: Option<deskwarden::ui_process::UiVaultResult>,
+    ui_failure: &UiFailureEnv,
 ) -> deskwarden::ui_process::UiVaultResult {
     let from_exit_code = match code {
         Some(code) if (0..=UI_RESULT_CODE_CEILING).contains(&code) => {
             deskwarden::ui_process::UiVaultResult::from_exit_code(code)
         }
+        // **The window did not open, and the user is told so.** One of the
+        // named causes, so the sentence names what is missing and what to do
+        // about it rather than "something went wrong".
+        Some(code) if deskwarden::ui_process::UiStartFailure::from_exit_code(code).is_some() => {
+            let failure = deskwarden::ui_process::UiStartFailure::from_exit_code(code)
+                .expect("the guard above matched");
+            log::warn!("UI process {pid} could not open its window: {}", failure.log_line());
+            (ui_failure.report)(failure.message());
+            deskwarden::ui_process::UiVaultResult::default()
+        }
+        // The generic code, still reachable: a child that refused before it
+        // could name a cause. It is still not allowed to be silent -- an
+        // unexplained empty window is the defect, and a vague sentence beats
+        // no sentence -- so it says the one true thing it knows and points at
+        // the log.
         Some(UI_COULD_NOT_START) => {
             log::warn!("UI process {pid} could not open its window; see its lines above");
+            (ui_failure.report)(
+                "Deskwarden could not open the vault window. Nothing was changed. The reason \
+                 was written to Deskwarden's log file; try again, and if it keeps happening, \
+                 sign in again from the tray icon.",
+            );
             deskwarden::ui_process::UiVaultResult::default()
         }
         Some(code) => {
@@ -6654,6 +6703,46 @@ fn ui_vault_outcome(
         }
     };
     deskwarden::ui_process::UiVaultResult::union(from_file, from_exit_code)
+}
+
+/// **Whether spawning a UI process for this account would produce a window.**
+///
+/// Asked by the daemon *before* the spawn, and answered off the same two facts
+/// the child would read a moment later: `backend_policy::choose` over the
+/// account, and -- on the direct-REST arm only -- whether `userkey.bin` and a
+/// server URL exist. `deskwarden::ui_process::direct_rest_start_failure` is
+/// the shared decision, so the two processes cannot come to different answers.
+///
+/// `None` on the `bw serve` arm and on no-account-at-all, which is what
+/// `choose` answers for an account with no server: those windows open, and
+/// have always opened, without a stored key.
+///
+/// This is deliberately a **read**, not a probe: it does not talk to the
+/// server and it does not decrypt anything. The question is only whether the
+/// child has the two inputs it refuses without; whether the key still works is
+/// `settle_the_vault_backend`'s probe, and it belongs to the daemon.
+fn why_a_ui_process_could_not_read_this_vault(
+    config_dir: &Path,
+    account: Option<&Account>,
+) -> Option<deskwarden::ui_process::UiStartFailure> {
+    match backend_policy::choose(
+        account.and_then(|a| a.server_url.as_deref()),
+        account.is_none_or(|a| a.use_official_bw_crypto),
+    ) {
+        backend_policy::VaultBackendChoice::BwServe => None,
+        backend_policy::VaultBackendChoice::DirectRest => {
+            let account = account?;
+            deskwarden::ui_process::direct_rest_start_failure(
+                user_key_store::UserKeyStore::new(accounts::user_key_path_for(
+                    config_dir,
+                    &account.id,
+                ))
+                .load()
+                .is_some(),
+                account.server_url.is_some(),
+            )
+        }
+    }
 }
 
 /// `CREATE_BREAKAWAY_FROM_JOB`, from `windows::Win32::System::Threading`.
@@ -6691,7 +6780,32 @@ impl VaultOps for RealVaultOps<'_> {
         // surface and nothing else. So that one route keeps the in-process
         // window, and pays the driver for it -- and blocks, exactly as it did
         // before, which is the one door this change does not open.
-        if self.initial_search.is_none() {
+        //
+        // **And it is where a doomed spawn is not made.** A UI process cannot
+        // ask for a master password -- signing in belongs to the daemon -- so
+        // on an account served by the built-in client with no `userkey.bin`
+        // the child's only possible act is to exit, which is the shipped
+        // defect: a tray click that produced nothing. The daemon can answer
+        // the same question here, without spawning anything, and when the
+        // answer is "it could not read the vault" it opens the window
+        // **itself**, where the sign-in card can derive the key and finish the
+        // switch the user asked for in Preferences. That is the whole of why
+        // the switch is allowed rather than refused at the preference row:
+        // the stored key does not exist until a direct-REST sign-in has
+        // happened, so a Preferences refusal would make the setting
+        // unreachable forever.
+        let child_cannot_read_the_vault = why_a_ui_process_could_not_read_this_vault(
+            deps.config_dir,
+            est.active_account.as_ref(),
+        );
+        if let Some(failure) = child_cannot_read_the_vault {
+            log::warn!(
+                "not spawning a ui process for the vault window: {}. Opening it inside the \
+                 daemon instead, which is the only host that can sign in",
+                failure.log_line()
+            );
+        }
+        if self.initial_search.is_none() && child_cannot_read_the_vault.is_none() {
             if self.ui.ask_for_the_vault_window() {
                 return (est, None);
             }
@@ -10435,13 +10549,17 @@ fn service_keys_path(config_dir: &std::path::Path) -> std::path::PathBuf {
 
 
 fn run_as_a_ui_process(surface: Surface) -> i32 {
+    // **Every refusal below names itself on the way out.** See
+    // `deskwarden::ui_process::UiStartFailure`: the daemon reads the code back
+    // and puts the matching sentence on the screen, because one code for five
+    // causes was one message the daemon could not write.
     let Some(project_dirs) = directories::ProjectDirs::from("dev", "Deskwarden", "Deskwarden")
     else {
-        return UI_COULD_NOT_START;
+        return deskwarden::ui_process::UiStartFailure::NoConfigDirectory.exit_code();
     };
     let config_dir = project_dirs.config_dir().to_path_buf();
     if std::fs::create_dir_all(&config_dir).is_err() {
-        return UI_COULD_NOT_START;
+        return deskwarden::ui_process::UiStartFailure::NoConfigDirectory.exit_code();
     }
     let icon_cache_dir = project_dirs.cache_dir().join("icons");
     deskwarden::app::set_icon_cache_dir(icon_cache_dir.clone());
@@ -10467,11 +10585,11 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // session token.
     let Some(bw_exe) = deskwarden::bw_path::resolve_bw_exe() else {
         log::error!("a ui process could not resolve bw.exe; it will not open a window");
-        return UI_COULD_NOT_START;
+        return deskwarden::ui_process::UiStartFailure::NoBwExe.exit_code();
     };
     if !bw_exe.exists() {
         log::error!("a ui process found no bw.exe at {}", bw_exe.display());
-        return UI_COULD_NOT_START;
+        return deskwarden::ui_process::UiStartFailure::NoBwExe.exit_code();
     }
     check_bw_signature(&bw_exe);
     deskwarden::bw_path::remember_verified_bw_exe(bw_exe);
@@ -10523,7 +10641,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
             "a ui process found no session token; signing in belongs to the daemon, so this \
              window will not open"
         );
-        return UI_COULD_NOT_START;
+        return deskwarden::ui_process::UiStartFailure::NoSessionToken.exit_code();
     };
 
     // **Which backend this window reads through, asked rather than assumed.**
@@ -10574,15 +10692,26 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                         accounts::user_key_path_for(&config_dir, &a.id),
                     )
                     .load()
-                    .zip(a.server_url.clone())
                 });
-                let Some((authenticated, server_url)) = stored else {
+                let server_url = active_account.as_ref().and_then(|a| a.server_url.clone());
+                // **Which half is missing, not merely that one is.** The two
+                // have different remedies and the daemon puts one of them on
+                // the screen, so the answer has to survive the exit -- see
+                // `deskwarden::ui_process::direct_rest_start_failure`, which
+                // the daemon also asks BEFORE spawning, so that this refusal
+                // is the race and not the ordinary case.
+                let asked = deskwarden::ui_process::direct_rest_start_failure(
+                    stored.is_some(),
+                    server_url.is_some(),
+                );
+                let Some((authenticated, server_url)) = stored.zip(server_url) else {
+                    let failure =
+                        asked.unwrap_or(deskwarden::ui_process::UiStartFailure::NoStoredVaultKey);
                     log::error!(
-                        "this account is served directly over REST, but this window has no \
-                         stored vault key and server to read it with; sign in with Deskwarden \
-                         once so the key is saved"
+                        "this window cannot read the vault directly over REST: {}",
+                        failure.log_line()
                     );
-                    return UI_COULD_NOT_START;
+                    return failure.exit_code();
                 };
                 log::info!("this window reads the vault directly over REST at {server_url}");
                 VaultCache::with_disk_cache(
@@ -16397,7 +16526,8 @@ mod tests {
     /// because a child process could not find `bw.exe`.
     #[test]
     fn the_could_not_start_codes_cannot_be_mistaken_for_an_outcome() {
-        for code in [UI_COULD_NOT_START, UI_LAUNCH_REFUSED] {
+        let named = deskwarden::ui_process::UiStartFailure::ALL.map(|f| f.exit_code());
+        for code in [UI_COULD_NOT_START, UI_LAUNCH_REFUSED].into_iter().chain(named) {
             assert!(
                 code > UI_RESULT_CODE_CEILING,
                 "exit {code} is inside the result bitfield's range, so a UI process that \
@@ -16405,6 +16535,30 @@ mod tests {
             );
         }
         assert_ne!(UI_COULD_NOT_START, UI_LAUNCH_REFUSED);
+        // The named causes are distinct from each other and from the two
+        // above, and each one reads back as itself. A collision would put the
+        // wrong remedy on the screen, which is worse than the silence it
+        // replaced.
+        let mut all = named.to_vec();
+        all.push(UI_COULD_NOT_START);
+        all.push(UI_LAUNCH_REFUSED);
+        let mut unique = all.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), all.len(), "two exit codes collide: {all:?}");
+        for failure in deskwarden::ui_process::UiStartFailure::ALL {
+            assert_eq!(
+                deskwarden::ui_process::UiStartFailure::from_exit_code(failure.exit_code()),
+                Some(failure)
+            );
+        }
+        for code in [0, UI_RESULT_CODE_CEILING, UI_COULD_NOT_START, UI_LAUNCH_REFUSED, 101] {
+            assert_eq!(
+                deskwarden::ui_process::UiStartFailure::from_exit_code(code),
+                None,
+                "exit {code} is read as a named startup failure"
+            );
+        }
     }
 
     /// **The app and the installer must agree on the spelling**, and nothing
@@ -21361,9 +21515,39 @@ mod tests {
         /// A pid, for the log lines. Nothing decides on it.
         const PID: u32 = 4242;
 
+        /// **What the daemon put in front of the user**, recorded instead of
+        /// shown. A `static` because [`UiFailureEnv::report`] is an `fn`
+        /// pointer and an `fn` pointer captures nothing; every test that reads
+        /// it holds [`SPEAKING`] for the whole of its body.
+        static WHAT_THE_USER_SAW: std::sync::Mutex<Vec<String>> =
+            std::sync::Mutex::new(Vec::new());
+
+        /// The lock over that static. See this file's other module locks.
+        static SPEAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        /// The seam for the tests that are not about the screen.
+        fn silent() -> UiFailureEnv {
+            UiFailureEnv { report: |_| {} }
+        }
+
+        /// The seam for the tests that are. Clears first, so a test reads only
+        /// its own run.
+        fn watched() -> UiFailureEnv {
+            WHAT_THE_USER_SAW.lock().expect("the recorder").clear();
+            UiFailureEnv {
+                report: |text| {
+                    WHAT_THE_USER_SAW.lock().expect("the recorder").push(text.to_string());
+                },
+            }
+        }
+
+        fn what_the_user_saw() -> Vec<String> {
+            WHAT_THE_USER_SAW.lock().expect("the recorder").clone()
+        }
+
         #[test]
         fn a_lock_survives_a_lost_result_file() {
-            let out = ui_vault_outcome(PID, Some(UiVaultResult::EXIT_LOCKED), None);
+            let out = ui_vault_outcome(PID, Some(UiVaultResult::EXIT_LOCKED), None, &silent());
             assert!(
                 out.locked,
                 "the exit code is the carrier that survives a full disk or a child killed \
@@ -21374,7 +21558,7 @@ mod tests {
         #[test]
         fn a_lock_survives_a_lost_exit_status() {
             let file = UiVaultResult { locked: true, ..Default::default() };
-            let out = ui_vault_outcome(PID, None, Some(file));
+            let out = ui_vault_outcome(PID, None, Some(file), &silent());
             assert!(
                 out.locked,
                 "a child Windows gave no status for still wrote its answer, and the answer \
@@ -21390,7 +21574,7 @@ mod tests {
                 edited_settings: Some(deskwarden::settings::Settings::default()),
                 ..Default::default()
             };
-            let out = ui_vault_outcome(PID, Some(0), Some(file));
+            let out = ui_vault_outcome(PID, Some(0), Some(file), &silent());
             assert_eq!(out.switch_to, Some(account));
             assert!(out.edited_settings.is_some());
         }
@@ -21401,7 +21585,7 @@ mod tests {
             // `locked | needs_reauth | add_account`, which tears the backend
             // down, demands the master password and opens the add-account
             // flow -- all because a window crashed.
-            let out = ui_vault_outcome(PID, Some(101), None);
+            let out = ui_vault_outcome(PID, Some(101), None, &silent());
             assert_eq!(
                 out,
                 UiVaultResult::default(),
@@ -21410,14 +21594,121 @@ mod tests {
             // Control on the boundary: the value one below the ceiling IS
             // read, so the refusal above is about the range and not about a
             // function that reads nothing.
-            let inside = ui_vault_outcome(PID, Some(UI_RESULT_CODE_CEILING), None);
+            let inside = ui_vault_outcome(PID, Some(UI_RESULT_CODE_CEILING), None, &silent());
             assert!(inside.locked && inside.remove_account);
+        }
+
+        /// **The bug the owner reported: a click that did nothing.**
+        ///
+        /// The vault window's process exited because this account is served by
+        /// the built-in client and has no stored vault key -- the state the
+        /// backend switch leaves an account in -- and the daemon's entire
+        /// reaction was a `log::warn!`. Nothing reached the screen, so the
+        /// only symptom available to the user was absence.
+        ///
+        /// This test fails on `main` twice over: the code is not one `main`
+        /// recognises, and no seam existed to observe what was said. It
+        /// asserts what the user SEES, not what the daemon chose.
+        #[test]
+        fn a_window_that_could_not_open_for_want_of_a_stored_key_says_so_on_the_screen() {
+            let _speaking = SPEAKING.lock().unwrap_or_else(|e| e.into_inner());
+            let out = ui_vault_outcome(
+                PID,
+                Some(deskwarden::ui_process::UiStartFailure::NoStoredVaultKey.exit_code()),
+                None,
+                &watched(),
+            );
+            let seen = what_the_user_saw();
+            assert_eq!(
+                seen.len(),
+                1,
+                "the vault window did not open and the user was told {} times -- a silent \
+                 failure is indistinguishable from a click that missed the tray",
+                seen.len()
+            );
+            let said = &seen[0];
+            // Named cause, named remedy. Not "something went wrong": the two
+            // built-in-client failures have different answers, and a generic
+            // sentence would send the user looking in the wrong place.
+            assert!(
+                said.contains("built-in client"),
+                "the message does not name the setting that caused this: {said}"
+            );
+            assert!(
+                said.contains("no vault key is stored"),
+                "the message does not name what is missing: {said}"
+            );
+            assert!(
+                said.contains("Sign in through Deskwarden once")
+                    && said.contains("turn the built-in client off in Preferences"),
+                "the message does not name either of the two things the user can do: {said}"
+            );
+            assert!(
+                !said.contains("secure"),
+                "house copy rule: name what happened, never the word: {said}"
+            );
+            assert_eq!(
+                out,
+                UiVaultResult::default(),
+                "a child that never drew a frame must still not drive the daemon"
+            );
+        }
+
+        /// **The positive control for the sentence above**, and the guard on
+        /// the seam itself: an ordinary close says nothing. Without this, the
+        /// test above would pass against a daemon that put a box up after
+        /// every window.
+        #[test]
+        fn a_window_that_opened_and_closed_says_nothing_at_all() {
+            let _speaking = SPEAKING.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = ui_vault_outcome(PID, Some(UiVaultResult::EXIT_LOCKED), None, &watched());
+            assert!(
+                what_the_user_saw().is_empty(),
+                "a window that locked and closed normally raised a failure box"
+            );
+        }
+
+        /// **Each cause gets its own sentence**, which is the whole reason the
+        /// exit code was widened. Two failures that read identically would
+        /// leave the daemon unable to tell the user which of two very
+        /// different remedies applies.
+        #[test]
+        fn the_five_ways_a_window_can_fail_to_open_read_differently() {
+            let _speaking = SPEAKING.lock().unwrap_or_else(|e| e.into_inner());
+            let mut said = Vec::new();
+            for failure in deskwarden::ui_process::UiStartFailure::ALL {
+                let _ = ui_vault_outcome(PID, Some(failure.exit_code()), None, &watched());
+                let seen = what_the_user_saw();
+                assert_eq!(seen.len(), 1, "{failure:?} put nothing on the screen");
+                said.push(seen[0].clone());
+            }
+            let mut unique = said.clone();
+            unique.sort();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                said.len(),
+                "two causes share a sentence, so the user cannot tell which remedy is theirs"
+            );
+        }
+
+        /// The generic code is still not allowed to be silent.
+        #[test]
+        fn the_unnamed_startup_failure_still_reaches_the_user() {
+            let _speaking = SPEAKING.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = ui_vault_outcome(PID, Some(UI_COULD_NOT_START), None, &watched());
+            assert_eq!(
+                what_the_user_saw().len(),
+                1,
+                "the catch-all startup failure went back to being silent"
+            );
         }
 
         #[test]
         fn a_ui_that_could_not_start_reports_nothing_rather_than_a_lock_and_a_reauth() {
+            let _speaking = SPEAKING.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(
-                ui_vault_outcome(PID, Some(UI_COULD_NOT_START), None),
+                ui_vault_outcome(PID, Some(UI_COULD_NOT_START), None, &silent()),
                 UiVaultResult::default(),
                 "the startup-failure code sits outside the bitfield precisely so it cannot be \
                  read as an outcome"
@@ -21431,7 +21722,7 @@ mod tests {
 
         #[test]
         fn a_window_that_asked_for_nothing_leaves_the_daemon_alone() {
-            assert_eq!(ui_vault_outcome(PID, Some(0), None), UiVaultResult::default());
+            assert_eq!(ui_vault_outcome(PID, Some(0), None, &silent()), UiVaultResult::default());
         }
     }
 
@@ -32476,6 +32767,106 @@ mod vault_backend_choice_tests {
         assert!(slot.is_filled(), "the launch would have met an empty slot");
         assert!(backend_policy::bw_serve_is_selected());
         assert!(backend_policy::direct_rest_login().is_none());
+    }
+
+    /// **The shipped bug, at the moment it is made: switching the backend must
+    /// not strand the account with a window that never opens.**
+    ///
+    /// An account switched to the built-in client with no `userkey.bin` --
+    /// which is every account that made this switch, since the file is written
+    /// only by a sign-in already taken on the direct-REST path, and also every
+    /// account whose sign-in carried no refresh token (`UserKeyStore::save`
+    /// answers `Ok(false)` there, so the DAEMON reads the vault happily off an
+    /// in-memory key while nothing is on disk for a child to find).
+    ///
+    /// The UI process for such an account can do exactly one thing: exit. So
+    /// the daemon must not spawn one -- it asks this question first and keeps
+    /// the window in the process that can sign in.
+    ///
+    /// Fails on `main`, where nothing asks: the daemon spawned, the child
+    /// exited `UI_COULD_NOT_START`, and the user saw a click that did nothing.
+    #[test]
+    fn a_built_in_client_account_with_no_stored_key_is_not_given_a_ui_process() {
+        let config = scratch_config("no-stored-key");
+        let account = account_on_the_built_in_client(Some("https://vault.example.com"));
+        accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
+        assert_eq!(
+            why_a_ui_process_could_not_read_this_vault(&config, Some(&account)),
+            Some(deskwarden::ui_process::UiStartFailure::NoStoredVaultKey),
+            "the daemon would have spawned a UI process that can only exit, and its exit is \
+             what the owner saw as `the main UI does not open`"
+        );
+    }
+
+    /// **The positive control, and it is a real key.** Same account, same
+    /// directory, one file written through the very store the daemon reads --
+    /// so this is not "the function answers None for anything", it is the file
+    /// being found. The window opens in its own process again.
+    #[test]
+    fn the_same_account_with_a_stored_key_gets_its_ui_process() {
+        let config = scratch_config("stored-key");
+        let account = account_on_the_built_in_client(Some("https://vault.example.com"));
+        accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
+        let store = user_key_store::UserKeyStore::new(accounts::user_key_path_for(
+            &config,
+            &account.id,
+        ));
+        assert!(store.store_a_fixture_key().expect("the fixture key was written"));
+        assert!(
+            store.load().is_some(),
+            "control: the fixture key does not load, so the assertion below would pass for a \
+             file that is not there"
+        );
+        assert_eq!(
+            why_a_ui_process_could_not_read_this_vault(&config, Some(&account)),
+            None,
+            "an account the built-in client CAN serve was refused a window of its own"
+        );
+        store.clear().expect("clear");
+    }
+
+    /// The other half of the same account record. A built-in-client account
+    /// with no server has nothing to read the vault from, and it is a
+    /// different sentence to the user -- so it must be a different answer
+    /// here.
+    ///
+    /// `choose` cannot answer `DirectRest` without a self-hosted URL, so this
+    /// state is only reachable through `direct_rest_start_failure` itself;
+    /// asserted there, in `ui_process`, rather than faked into an `Account`
+    /// this app cannot build.
+    #[test]
+    fn the_two_built_in_client_failures_are_two_different_answers() {
+        assert_eq!(
+            deskwarden::ui_process::direct_rest_start_failure(false, true),
+            Some(deskwarden::ui_process::UiStartFailure::NoStoredVaultKey)
+        );
+        assert_eq!(
+            deskwarden::ui_process::direct_rest_start_failure(true, false),
+            Some(deskwarden::ui_process::UiStartFailure::NoServerUrl)
+        );
+        assert_eq!(deskwarden::ui_process::direct_rest_start_failure(true, true), None);
+    }
+
+    /// **The `bw serve` account is untouched**, which is the whole install
+    /// base on the shipped default. Nothing about a stored key gates a window
+    /// there, and a guard that ghosted those windows would be a far worse bug
+    /// than the one it fixes.
+    #[test]
+    fn a_bw_serve_account_is_never_asked_about_a_stored_key() {
+        let config = scratch_config("bw-serve-window");
+        for account in [
+            account_on(Some("https://vault.example.com")),
+            account_on(None),
+            account_on_the_built_in_client(None),
+        ] {
+            assert_eq!(
+                why_a_ui_process_could_not_read_this_vault(&config, Some(&account)),
+                None,
+                "a `bw serve` account was refused its own UI process over a file it has never \
+                 needed"
+            );
+        }
+        assert_eq!(why_a_ui_process_could_not_read_this_vault(&config, None), None);
     }
 
     /// An account with no account list at all -- `StartupAccounts::

@@ -8,6 +8,33 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## Unreleased
+
+### The vault window says why it did not open
+
+Opening the vault could do nothing at all — no window, no error, no dialog.
+The window runs in its own process, and when that process could not read the
+vault it exited quietly; the only trace was a line in the log file. Five
+different failures shared one exit code, so even the log could not always say
+which.
+
+Each cause now carries its own code home, and Deskwarden puts it on the screen
+with the one thing you can do about it: a missing vault key, a missing server
+address, a missing sign-in, a missing Bitwarden CLI, or an unreadable settings
+folder.
+
+### Switching to the built-in client no longer strands the account
+
+The built-in client reads your vault with a master key kept on this PC, and
+that key is written only by a sign-in taken through Deskwarden. An account that
+switched to the built-in client — or whose sign-in did not leave a key behind —
+had nothing for the vault window's process to read, and that process cannot ask
+for a master password.
+
+Deskwarden now checks before it opens the window, and when there is no stored
+key it keeps the window in the process that *can* sign you in, so signing in
+stores the key and finishes the switch.
+
 ## 0.15.4 - 2026-09-01
 
 ### Signing in to your own server really does not need the Bitwarden CLI

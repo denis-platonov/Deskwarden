@@ -311,6 +311,166 @@ pub enum DaemonExit {
     Restart,
 }
 
+/// **Why a UI process could not open its window at all**, widened from one
+/// number into a value the daemon can act on.
+///
+/// `main.rs`'s `UI_COULD_NOT_START` is a single exit code standing in for
+/// five unrelated failures, and the daemon's whole reaction to it was one
+/// `log::warn!`. To the user that is a tray click that did nothing --
+/// reported, on a shipped build, as "the main UI does not open". A window
+/// that cannot open has to say so, and it has to say WHICH thing is missing,
+/// because the five have five different remedies: one is a re-install, one is
+/// a sign-in, and one is a preference to turn back off.
+///
+/// So the child names the cause on the way out and the daemon reads it back.
+/// The codes start at [`Self::FIRST_EXIT_CODE`] and run upwards, **above**
+/// `UI_COULD_NOT_START` (64) and `UI_LAUNCH_REFUSED` (65) and far above the
+/// 0-15 the [`UiVaultResult`] bitfield uses, for the reason those two are
+/// where they are: exit 3 read as a result is `locked | needs_reauth`, and a
+/// child that never drew a frame must not be able to tear `bw serve` down.
+/// `main`'s `the_could_not_start_codes_cannot_be_mistaken_for_an_outcome`
+/// walks [`Self::ALL`] and holds that.
+///
+/// The existing codes are untouched. `UI_COULD_NOT_START` stays 64 and stays
+/// meaningful: it is what a child exits with when it has no more specific
+/// answer, and the daemon still handles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiStartFailure {
+    /// No per-user config directory, or it could not be created. Nothing
+    /// about this account was ever read.
+    NoConfigDirectory,
+    /// `bw.exe` could not be resolved, or is not where it was resolved to.
+    NoBwExe,
+    /// No saved session for this account. Signing in belongs to the daemon,
+    /// so the child cannot fix this itself.
+    NoSessionToken,
+    /// **The one the backend switch produces.** This account is served by the
+    /// built-in client, which reads the vault with a master key kept in
+    /// `userkey.bin` -- and there is no such file. See
+    /// [`direct_rest_start_failure`].
+    NoStoredVaultKey,
+    /// Served by the built-in client, but no server address is recorded, so
+    /// there is nothing to read the vault from.
+    NoServerUrl,
+}
+
+impl UiStartFailure {
+    /// Every variant, in code order. Public so the daemon's range guard can
+    /// walk them rather than trusting a hand-written list that a sixth
+    /// variant would silently fall out of.
+    pub const ALL: [Self; 5] = [
+        Self::NoConfigDirectory,
+        Self::NoBwExe,
+        Self::NoSessionToken,
+        Self::NoStoredVaultKey,
+        Self::NoServerUrl,
+    ];
+
+    /// 66. One past `UI_LAUNCH_REFUSED`, which is one past
+    /// `UI_COULD_NOT_START`.
+    pub const FIRST_EXIT_CODE: i32 = 66;
+
+    /// What the child exits with.
+    #[must_use]
+    pub fn exit_code(self) -> i32 {
+        let at = Self::ALL.iter().position(|f| *f == self).unwrap_or(0);
+        Self::FIRST_EXIT_CODE + at as i32
+    }
+
+    /// The inverse, and `None` for every code that is not one of these --
+    /// including 64, 65, a panic's 101, and the whole result bitfield.
+    #[must_use]
+    pub fn from_exit_code(code: i32) -> Option<Self> {
+        let at = usize::try_from(code - Self::FIRST_EXIT_CODE).ok()?;
+        Self::ALL.get(at).copied()
+    }
+
+    /// **What goes on the screen.** Not a log line and not "something went
+    /// wrong": it names what is missing and the one thing the user can do
+    /// about it, which is the same rule `prefs_ui` holds its copy to.
+    ///
+    /// The two built-in-client sentences end with the preference that caused
+    /// them, because that is the change the user made and the change they can
+    /// undo.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::NoConfigDirectory => {
+                "Deskwarden could not open the vault window: it could not read or create its \
+                 settings folder. Check that your user profile folder is available, then try \
+                 again."
+            }
+            Self::NoBwExe => {
+                "Deskwarden could not open the vault window: it could not find the Bitwarden \
+                 CLI (bw.exe) that the window needs. Install Deskwarden again to put it back."
+            }
+            Self::NoSessionToken => {
+                "Deskwarden could not open the vault window: there is no saved session for \
+                 this account. Sign in again from the Deskwarden tray icon."
+            }
+            Self::NoStoredVaultKey => {
+                "Deskwarden could not open the vault window. This account is set to use \
+                 Deskwarden's built-in client, but no vault key is stored on this PC for it, \
+                 and the window has no way to ask for your master password. Sign in through \
+                 Deskwarden once to store one, or turn the built-in client off in Preferences."
+            }
+            Self::NoServerUrl => {
+                "Deskwarden could not open the vault window. This account is set to use \
+                 Deskwarden's built-in client, but no server address is recorded for it, so \
+                 there is nothing to read the vault from. Sign in through Deskwarden again \
+                 with your server address, or turn the built-in client off in Preferences."
+            }
+        }
+    }
+
+    /// The same fact for the log file, in one clause.
+    #[must_use]
+    pub fn log_line(self) -> &'static str {
+        match self {
+            Self::NoConfigDirectory => "there is no readable config directory",
+            Self::NoBwExe => "bw.exe could not be resolved",
+            Self::NoSessionToken => "there is no saved session token",
+            Self::NoStoredVaultKey => {
+                "this account is served by the built-in client and no vault key is stored for it"
+            }
+            Self::NoServerUrl => {
+                "this account is served by the built-in client and has no server URL"
+            }
+        }
+    }
+}
+
+/// **Whether a direct-REST account can be read by a process that cannot ask
+/// for a master password**, which is every UI process.
+///
+/// One pure function with two callers that must never disagree: the UI child,
+/// which uses it to pick the exit code it dies with, and the daemon, which
+/// uses it BEFORE spawning to find out that the child would die -- and opens
+/// the window itself instead, where the sign-in card can derive the key and
+/// finish the switch the user asked for.
+///
+/// The key is reported before the server URL because it is the half the
+/// backend switch actually strands: `userkey.bin` is written only by a
+/// sign-in taken on the direct-REST path, so an account that reached this
+/// setting from `bw serve` has never had one, and an account whose daemon
+/// login carried no refresh token has one in memory and none on disk (see
+/// `user_key_store::UserKeyStore::save`, which answers `Ok(false)` there).
+/// That second case is the shipped defect: the DAEMON reads the vault fine
+/// and the CHILD cannot, which is why the failure looked like nothing at all.
+#[must_use]
+pub fn direct_rest_start_failure(
+    a_vault_key_is_stored: bool,
+    a_server_url_is_recorded: bool,
+) -> Option<UiStartFailure> {
+    if !a_vault_key_is_stored {
+        return Some(UiStartFailure::NoStoredVaultKey);
+    }
+    if !a_server_url_is_recorded {
+        return Some(UiStartFailure::NoServerUrl);
+    }
+    None
+}
+
 /// **The vault window's six daemon-actionable outcomes**, as they cross the
 /// process boundary.
 ///

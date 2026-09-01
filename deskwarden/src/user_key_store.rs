@@ -212,6 +212,35 @@ impl UserKeyStore {
             other => other,
         }
     }
+
+    /// **Writes a record that [`load`](Self::load) really reads back**, for
+    /// the tests in `main.rs` that need "this account HAS a stored key" as a
+    /// positive control.
+    ///
+    /// [`Authenticated`]'s two constructors are `pub(crate)`, and `main.rs` is
+    /// a separate crate linking this library, so a test over there cannot
+    /// build one. It could write junk bytes -- and a junk file loads as
+    /// `None`, which makes the control test agree with the failing one for the
+    /// wrong reason. That is this crate's own named defect class: a test that
+    /// passes because it never reached the thing it names.
+    ///
+    /// Gated on `test-support` rather than `cfg(test)` for the reason
+    /// [`crate::test_scratch`] is: a `cfg(test)` item is invisible to the
+    /// binary that links this library.
+    ///
+    /// The key bytes are a constant pattern and the refresh token is a fixed
+    /// string. Nothing here is a credential for anything.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn store_a_fixture_key(&self) -> std::io::Result<bool> {
+        self.save(&Authenticated {
+            session: crate::rest::api::Session::from_refresh_token(Zeroizing::new(
+                "a-fixture-refresh-token".to_string(),
+            )),
+            master_key: crate::rest::crypto::MasterKey::from_bytes(
+                [0xA5; crate::rest::crypto::MASTER_KEY_LEN],
+            ),
+        })
+    }
 }
 
 /// The record, back into an [`Authenticated`]. `None` for anything that is
