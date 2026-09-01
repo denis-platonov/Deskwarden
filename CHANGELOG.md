@@ -8,6 +8,32 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## 0.15.3 - 2026-09-01
+
+### Signing in to your own server no longer asks for the Bitwarden CLI
+
+Typing a self-hosted address and pressing Continue failed with an error
+about `bw config server` if you did not have Bitwarden's command-line
+program installed — on the one path that is not supposed to need it. The
+sign-in now only configures that program when it is the one serving your
+vault.
+
+Your server address is still recorded either way, so the account knows where
+it lives.
+
+### The "Bitwarden CLI is required" box shows its text
+
+Signing in to bitwarden.com opened a box that was empty apart from **Cancel**
+and **OK** — no heading, no explanation of what you were agreeing to. The
+words were being drawn off the top of the window. They are on screen now.
+
+### The fill shortcut is in the tray menu
+
+The keyboard shortcut for filling is shown next to **Add app...**, so it is
+there when you need it rather than remembered from Preferences. It is a
+label, not a button: filling goes to whichever window is in front, and
+opening the tray menu would make the tray that window.
+
 ## 0.15.2 - 2026-09-01
 
 ### Settings for one account no longer change another

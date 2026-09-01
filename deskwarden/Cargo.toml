@@ -1,6 +1,6 @@
 [package]
 name = "deskwarden"
-version = "0.15.2"
+version = "0.15.3"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 # NOT published to crates.io: this is a Windows application distributed as an
