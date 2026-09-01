@@ -837,8 +837,15 @@ mod tests {
             // (`apply_edited_settings`, driven directly over a real disk
             // cache). Raised deliberately, and it asserts MORE than six did:
             // two further modules must now be clean, gated, column-0 blocks.
-            (8, 8, 0),
-            "below `main.rs`'s cut there are no longer exactly eight opened-and-closed test \
+            //
+            // **NINE since a missing `bw.exe` stopped ending the launch.**
+            // `a_missing_cli_is_never_fatal` holds the recovery driven over
+            // its `fn`-pointer seam, and the rule that no backend failure
+            // reaches `fatal_startup_error` without first asking whether the
+            // binary is merely absent. Raised for the same reason again: one
+            // further module must now be a clean, gated, column-0 block.
+            (9, 9, 0),
+            "below `main.rs`'s cut there are no longer exactly nine opened-and-closed test \
              modules: {modules} opened, {closes} closed, ending at depth {depth}. THIS IS A \
              REAL, NON-ENVIRONMENTAL FAILURE -- this test does no I/O and is not among the \
              mockito-port-collision failures documented for this machine. Do not step over \

@@ -11197,6 +11197,10 @@ fn recover_from_failed_vault_wait(
             // readiness deadline spent on a port nothing is listening on.
             // An empty vault is the honest answer, and the tray comes up
             // over it.
+            if e.a_missing_cli_could_be_reinstalled() {
+                stand_down_without_a_backend(&e);
+                return Vec::new();
+            }
             fatal_startup_error(&format!(
                 "Deskwarden could not start its Bitwarden backend after you signed \
                  in.\n\n{e}\n\nFull details are in:\n{}",
