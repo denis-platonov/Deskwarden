@@ -268,18 +268,26 @@ fn parse(plain: &[u8]) -> Option<Authenticated> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A temp path, never `%APPDATA%\Deskwarden` and never a real account
     /// directory -- the same rule `session_store`'s and `favicon`'s tests
     /// follow. The counter keeps two tests in one process off one path.
-    fn temp_path() -> PathBuf {
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        std::env::temp_dir().join(format!(
-            "deskwarden-test-userkey-{}-{}.bin",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
+    ///
+    /// **The directory is removed when the returned guard drops**, panic
+    /// included, so bind it: `let (_dir, path) = temp_path();`.
+    ///
+    /// The old shape wrote `deskwarden-test-userkey-<pid>-<n>.bin` loose in
+    /// `%TEMP%` and removed it only on the paths that reached a `clear()`.
+    /// Most tests here do; the ones asserting that NOTHING was written never
+    /// had a file to clear, and the ones whose assertion fires first never get
+    /// that far -- which is why two of these were still on disk when this was
+    /// measured. The counter was also the only thing separating two runs that
+    /// drew the same recycled pid, and it restarts at zero: `scan_history`'s
+    /// failure exactly.
+    fn temp_path() -> (crate::test_scratch::ScratchDir, PathBuf) {
+        let dir = crate::test_scratch::ScratchDir::new("test-userkey");
+        let path = dir.join("userkey.bin");
+        (dir, path)
     }
 
     /// A login-shaped value with no server and no network behind it. The key
@@ -294,7 +302,7 @@ mod tests {
 
     #[test]
     fn round_trips_a_key_and_a_refresh_token_through_dpapi_and_disk() {
-        let path = temp_path();
+        let (_dir, path) = temp_path();
         let store = UserKeyStore::new(path.clone());
 
         assert!(store.save(&fixture("the-refresh-token")).expect("save"));
@@ -313,7 +321,7 @@ mod tests {
     /// and wait for a 401 to find out what it already knows.
     #[test]
     fn a_revived_session_asks_to_be_refreshed_before_its_first_request() {
-        let path = temp_path();
+        let (_dir, path) = temp_path();
         let store = UserKeyStore::new(path.clone());
         store.save(&fixture("t")).expect("save");
 
@@ -325,7 +333,8 @@ mod tests {
 
     #[test]
     fn load_returns_none_when_there_is_no_file() {
-        assert!(UserKeyStore::new(temp_path()).load().is_none());
+        let (_dir, path) = temp_path();
+        assert!(UserKeyStore::new(path).load().is_none());
     }
 
     /// Every corruption is the same answer, and the answer is "ask for the
@@ -378,7 +387,7 @@ mod tests {
         ];
 
         for (name, plain) in cases {
-            let path = temp_path();
+            let (_dir, path) = temp_path();
             let protected = crate::session_store::protect(&plain).expect("DPAPI");
             std::fs::write(&path, protected).expect("write");
             let store = UserKeyStore::new(path);
@@ -391,7 +400,7 @@ mod tests {
     /// somebody else's. The unwrap fails and the answer is the same `None`.
     #[test]
     fn a_file_that_was_never_protected_loads_as_none() {
-        let path = temp_path();
+        let (_dir, path) = temp_path();
         std::fs::write(&path, b"not a DPAPI blob").expect("write");
         let store = UserKeyStore::new(path);
         assert!(store.load().is_none());
@@ -409,7 +418,7 @@ mod tests {
     /// production code for the sake of one assertion.
     #[test]
     fn a_session_that_cannot_be_refreshed_is_declined_rather_than_written() {
-        let path = temp_path();
+        let (_dir, path) = temp_path();
         let store = UserKeyStore::new(path.clone());
 
         assert!(!store.save(&fixture("")).expect("save"));
@@ -418,7 +427,8 @@ mod tests {
 
     #[test]
     fn clear_is_happy_when_the_file_is_already_gone() {
-        UserKeyStore::new(temp_path()).clear().expect("clearing nothing is fine");
+        let (_dir, path) = temp_path();
+        UserKeyStore::new(path).clear().expect("clearing nothing is fine");
     }
 
     /// Two stores at two paths do not see each other's records. The property
@@ -426,8 +436,12 @@ mod tests {
     /// than only at `accounts::user_key_path_for`.
     #[test]
     fn two_accounts_paths_hold_two_independent_records() {
-        let a = UserKeyStore::new(temp_path());
-        let b = UserKeyStore::new(temp_path());
+        // Two guards, so the two stores really are two directories: the whole
+        // property under test is that they do not see each other.
+        let (_a_dir, a_path) = temp_path();
+        let (_b_dir, b_path) = temp_path();
+        let a = UserKeyStore::new(a_path);
+        let b = UserKeyStore::new(b_path);
 
         a.save(&Authenticated {
             session: Session::from_refresh_token(Zeroizing::new("a-token".to_string())),
@@ -461,11 +475,11 @@ mod tests {
     /// that a store must not write anywhere it resolved for itself.
     #[test]
     fn save_writes_only_the_path_it_was_given() {
-        let dir = std::env::temp_dir().join(format!(
-            "deskwarden-test-userkey-dir-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir");
+        // A directory of this test's own. It used to be named by pid alone, so
+        // every run that drew a recycled pid inherited the previous one's
+        // contents -- and the `before` snapshot below is a census of exactly
+        // those contents, which is the one thing here that must start empty.
+        let dir = crate::test_scratch::ScratchDir::new("test-userkey-dir");
         let before: Vec<_> = std::fs::read_dir(&dir)
             .expect("read")
             .filter_map(|e| e.ok().map(|e| e.file_name()))
