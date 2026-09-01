@@ -2286,6 +2286,12 @@ fn main() {
                 &mut estate.active_account,
                 identity.account.as_ref(),
                 identity.as_details(),
+                // **The startup card's sign-in is where an established
+                // account meets the choice modal**, so this is the one call
+                // of the four that can carry a real answer. Read off the
+                // identity rather than out of `as_details`, which does not
+                // carry it.
+                identity.use_official_bw_crypto,
             ) {
                 // Published only from the ADOPTED answer, never from the raw
                 // one: an email under the wrong account is the same wrong
@@ -3767,6 +3773,12 @@ fn adopt_startup_prefetch(
     active_account: &mut Option<Account>,
     started_for: Option<&accounts::AccountId>,
     details: login_ui::BwStatusDetails,
+    // Carried past `as_details`, which drops it. Discarded with the details
+    // when the guard below rejects them, and for the same reason: an answer
+    // about account A must not be written into account B, and a backend
+    // written into the wrong account is worse than a stale email -- it
+    // decides which client opens that vault.
+    chosen_backend: Option<bool>,
 ) -> Option<login_ui::BwStatusDetails> {
     if !prefetch_still_describes_the_active_account(
         started_for,
@@ -3778,7 +3790,13 @@ fn adopt_startup_prefetch(
         );
         return None;
     }
-    learn_active_account_details(settings_path, accounts_state, active_account, &details);
+    learn_active_account_details(
+        settings_path,
+        accounts_state,
+        active_account,
+        &details,
+        chosen_backend,
+    );
     Some(details)
 }
 
@@ -3817,6 +3835,13 @@ fn learn_active_account_details(
     accounts_state: &mut Option<accounts::AccountsState>,
     active_account: &mut Option<Account>,
     details: &login_ui::BwStatusDetails,
+    // What the sign-in window's backend-choice modal answered, or `None` when
+    // nothing put the question. A fourth parameter rather than a field of
+    // `details`, because `BwStatusDetails` is the shape of a `bw status`
+    // answer and a `bw status` does not have this opinion -- see
+    // `login_ui::SignedInIdentity::use_official_bw_crypto`, which is where
+    // the value comes from and why it is not carried by `as_details`.
+    chosen_backend: Option<bool>,
 ) {
     let (Some(state), Some(active)) = (accounts_state.as_mut(), active_account.as_mut()) else {
         // `StartupAccounts::NoAccountList`: this app has no `Account` of its
@@ -3840,8 +3865,34 @@ fn learn_active_account_details(
         );
         return;
     }
-    let changed = state.learn_active_details(email, server_url);
-    accounts::learn_account_details(active, email, server_url);
+    let mut changed = state.learn_active_details(email, server_url);
+    // **The backend the sign-in window's choice modal was answered with, on
+    // an account that already existed.**
+    //
+    // `None` on every other caller, and most callers are other callers: a
+    // `bw status` answer has no opinion about which client should serve an
+    // account, and neither has a warm launch. It is `Some` only when a
+    // sign-in window put the question and the user answered it, which on a
+    // self-hosted server is every sign-in.
+    //
+    // **Both copies, through the mutator that exists for this field.** The
+    // `AccountsState` is what `persist_accounts` below writes, and `active`
+    // is what `login_context` and `switch_to_account` name the account by;
+    // updating one and not the other is the disagreement the id guard above
+    // exists to prevent, arrived at from the other direction.
+    // `set_active_backend_preference` is the same call the Preferences
+    // toggle makes, so there is one writer of this field and not two.
+    //
+    // **The key hygiene is already done by the time this runs**, and that is
+    // not an omission here: `login_ui::direct_login_for_this_sign_in`
+    // re-settled the backend from this very answer before the sign-in
+    // authenticated, and `settle_the_vault_backend` is what clears or fills
+    // `userkey.bin`. This function records what happened; it is not the
+    // thing that makes it happen.
+    if let Some(chosen) = chosen_backend {
+        changed |= state.set_active_backend_preference(chosen);
+    }
+    accounts::learn_account_details(active, email, server_url, chosen_backend);
     if !changed {
         return;
     }
@@ -7557,6 +7608,17 @@ fn run_vault_loop(
                 &mut est.accounts,
                 &mut est.active_account,
                 &details,
+                // **`None`, and not a gap this change opens.** These details
+                // come out of a vault window, which was opened with the
+                // identity of a sign-in that had already happened -- and the
+                // two sign-ins that can run under a vault window,
+                // `authenticate_for_switch` and `reauthenticate`, drop their
+                // identity at the source and always did. There is no answer
+                // to lose here. The startup card's sign-in, which is where an
+                // established account actually meets the choice modal,
+                // reaches `learn_active_account_details` through
+                // `adopt_startup_prefetch` and carries its answer.
+                None,
             );
             est.details = Some(details);
         }
@@ -8709,6 +8771,11 @@ fn add_account(
     // carries it out of that window, so nothing has to be asked. An account
     // minted by `prepare_new_account` carries an empty email until exactly
     // here, and a blank row is one the user cannot tell from any other.
+    // **Read off the identity before `as_details` drops it.** The choice the
+    // sign-in window's backend modal collected does not survive into
+    // `BwStatusDetails` -- deliberately, because that type is the shape of a
+    // `bw status` answer and a `bw status` has no opinion here.
+    let chosen_backend = session.identity.use_official_bw_crypto;
     let details = session.identity.as_details();
     if details.user_email.is_none() {
         log::warn!(
@@ -8726,8 +8793,18 @@ fn add_account(
     // `prepare_new_account`, so the answer comes from the server this sign-in
     // was actually against: self-hosted gets the built-in client, and
     // bitwarden.com gets `bw serve`.
-    let use_official_bw_crypto =
-        accounts::official_cli_after_sign_in(Some(&prepared), details.server_url.as_deref());
+    // `chosen_backend` is what the user answered in the sign-in window's
+    // choice modal, and it is why this is not a derivation: a self-hoster who
+    // picked the official CLI would otherwise be written down as a built-in
+    // client account, and would find `bw serve` running against a record that
+    // says it is not. `None` on every path that never put the question --
+    // bitwarden.com, and an account that was not freshly minted -- where the
+    // derivation below is unchanged.
+    let use_official_bw_crypto = accounts::official_cli_after_sign_in(
+        Some(&prepared),
+        details.server_url.as_deref(),
+        chosen_backend,
+    );
     let added = Account {
         id: prepared.id.clone(),
         email: details.user_email.unwrap_or_default(),
@@ -17493,6 +17570,11 @@ mod tests {
                 account: Some(accounts::AccountId::parse(&id.repeat(32)).expect("a 32-hex test id")),
                 user_email: Some(email.to_string()),
                 server_url: Some("https://vault.example.eu".to_string()),
+                // These fixtures are about which ACCOUNT an answer is
+                // written into, which is orthogonal to which client serves
+                // it. `None` leaves the backend derivation exactly where
+                // these tests found it.
+                use_official_bw_crypto: None,
             }
         }
 
@@ -25820,6 +25902,10 @@ mod tests {
                 account: None,
                 user_email: Some(email.to_string()),
                 server_url: Some("https://vault.example.com".to_string()),
+                // A bitwarden.com sign-in, which is never asked -- there is
+                // no choice on an official server. `add_account`'s
+                // derivation answers for it, unchanged.
+                use_official_bw_crypto: None,
             },
         }
     }
@@ -25933,6 +26019,7 @@ mod tests {
             &mut active,
             Some(&signed_in.id),
             signed_in_as("ana@example.com"),
+            None,
         );
 
         assert!(
@@ -25984,6 +26071,7 @@ mod tests {
             &mut active,
             Some(&blank_a.id),
             signed_in_as("ana@example.com"),
+            None,
         );
         assert_eq!(
             cached.as_ref().and_then(|d| d.user_email.as_deref()),
@@ -26045,6 +26133,7 @@ mod tests {
                 &mut active,
                 None,
                 signed_in_as("ana@example.com"),
+                None,
             )
             .is_none(),
             "an answer about the CLI's default profile was adopted as this account's own"
@@ -26070,6 +26159,7 @@ mod tests {
                 &mut no_active,
                 Some(&blank.id),
                 signed_in_as("ana@example.com"),
+                None,
             )
             .is_none(),
             "an app with no account list cached an answer it has nowhere to attribute"
@@ -26088,6 +26178,7 @@ mod tests {
                 &mut active,
                 Some(&blank.id),
                 signed_in_as("ana@example.com"),
+                None,
             )
             .is_some(),
             "control: the matching case must be adopted, or the `is_none`s above say nothing"
@@ -26134,6 +26225,7 @@ mod tests {
             &mut state,
             &mut active,
             &signed_in_as("ana-NEW@example.com"),
+            None,
         );
 
         let state_ref = state.as_ref().unwrap();
@@ -26177,6 +26269,7 @@ mod tests {
             &mut state,
             &mut active,
             &signed_in_as("ana-NEW@example.com"),
+            None,
         );
         assert_eq!(
             state.as_ref().unwrap().active().email,
@@ -26224,6 +26317,7 @@ mod tests {
             &mut state,
             &mut active,
             &signed_in_as("ana@example.com"),
+            None,
         );
 
         assert_eq!(
@@ -26287,6 +26381,7 @@ mod tests {
                 user_email: None,
                 server_url: None,
             },
+            None,
         );
         assert_eq!(active.as_ref().unwrap().email, "ana@example.com");
         assert!(
@@ -26302,6 +26397,7 @@ mod tests {
             &mut state,
             &mut active,
             &signed_in_as("ana@example.com"),
+            None,
         );
         assert!(
             settings_path.exists(),
@@ -26332,6 +26428,7 @@ mod tests {
             &mut state,
             &mut active,
             &signed_in_as("ana@example.com"),
+            None,
         );
         assert!(settings_path.exists(), "control: the first call wrote the file");
         let written = std::fs::metadata(&settings_path).unwrap().len();
@@ -26344,6 +26441,7 @@ mod tests {
             &mut state,
             &mut active,
             &signed_in_as("ana@example.com"),
+            None,
         );
         assert!(
             !settings_path.exists(),
@@ -26365,6 +26463,7 @@ mod tests {
             &mut state,
             &mut active,
             &signed_in_as("ana@example.com"),
+            None,
         );
         assert!(state.is_none() && active.is_none());
         assert!(!settings_path.exists());
@@ -33144,11 +33243,17 @@ mod vault_backend_choice_tests {
         account: &Account,
         typed_email: &str,
         typed_server: Option<&str>,
+        // What the sign-in window's backend-choice modal was answered with,
+        // exactly as `build_login_frame` hands it over. `None` is a sign-in
+        // that was never asked -- an official server, or any of the callers
+        // that predate the modal.
+        chosen_backend: Option<bool>,
     ) -> (usize, bool) {
         let direct = login_ui::direct_login_for_this_sign_in(
             Some(account),
             typed_email,
             typed_server,
+            chosen_backend,
         )
         .map(|direct| login_ui::DirectRestLogin {
             second_factor: a_grant_that_refuses(),
@@ -33204,8 +33309,17 @@ mod vault_backend_choice_tests {
              is not starting from the state the report describes"
         );
 
-        let (spawns, direct) =
-            spawns_during_a_sign_in(&mint, "owner@nw37.powerapps.net", Some("https://nw37.powerapps.net"));
+        // `None`: this test is about the DERIVATION, which is what a
+        // self-hosted mint gets when nothing was answered. The choice
+        // modal's own two answers are
+        // `choosing_the_built_in_client_spawns_nothing` and
+        // `choosing_the_official_cli_puts_a_self_hoster_on_it` below.
+        let (spawns, direct) = spawns_during_a_sign_in(
+            &mint,
+            "owner@nw37.powerapps.net",
+            Some("https://nw37.powerapps.net"),
+            None,
+        );
 
         assert_eq!(
             spawns, 0,
@@ -33246,6 +33360,9 @@ mod vault_backend_choice_tests {
             &mint,
             "owner@example.com",
             Some("https://vault.bitwarden.com"),
+            // An official server is never asked which client to use -- the
+            // CLI is the only one that opens that vault.
+            None,
         );
 
         assert!(!direct, "a bitwarden.com sign-in was handed a direct-REST login");
@@ -33257,6 +33374,135 @@ mod vault_backend_choice_tests {
         assert!(
             backend_policy::direct_rest_login().is_none(),
             "the re-settle left a direct-REST login installed for a bitwarden.com account"
+        );
+
+        backend_policy::uninstall_resettle();
+        backend_policy::uninstall_env();
+        *TEST_SETTLEMENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// **Choosing the built-in client spawns NOTHING**, counted rather than
+    /// asserted about.
+    ///
+    /// The house rule this extends: the last two backend bugs were both
+    /// caught by counting subprocesses, because both looked correct in every
+    /// string a test could read and both ran `bw.exe` anyway. A test that
+    /// only checked the modal's copy would pass against a build that
+    /// downloaded 37 MB the moment "Use the built-in client" was pressed.
+    ///
+    /// **The account here is ESTABLISHED and on the official CLI**, which is
+    /// the case the derivation gets wrong: `official_cli_after_sign_in`
+    /// answers `true` for it from its record, so a sign-in that ignored the
+    /// user's answer would take the `bw serve` arm and spawn. The count is
+    /// therefore measuring the choice and not the derivation agreeing with
+    /// it by luck -- and `sign_in_derivation_would_have_spawned` below is
+    /// that claim, asserted rather than assumed.
+    #[test]
+    fn choosing_the_built_in_client_spawns_nothing() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("chose-built-in");
+        let established = Account {
+            id: accounts::AccountId::generate(),
+            email: "owner@example.eu".to_string(),
+            server_url: Some("https://vault.example.eu".to_string()),
+            // On the CLI today. The choice modal opens with this in the
+            // affirmative position and the user presses the other button.
+            use_official_bw_crypto: true,
+        };
+        accounts::ensure_account_dir(&config, &established.id).expect("the account directory");
+        let slot = empty_slot();
+        *TEST_SETTLEMENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((config.to_path_buf(), Arc::clone(&slot)));
+        backend_policy::install_resettle(resettle_through_the_test_settlement);
+
+        // **The control, and it is the whole test.** Signed in with no
+        // answer, this same account spawns the CLI -- so a zero below is the
+        // user's choice being honoured and not this fixture being incapable
+        // of spawning.
+        let (sign_in_derivation_would_have_spawned, _) = spawns_during_a_sign_in(
+            &established,
+            "owner@example.eu",
+            Some("https://vault.example.eu"),
+            None,
+        );
+        assert_eq!(
+            sign_in_derivation_would_have_spawned, 1,
+            "control: this established account did not run the CLI unasked, so the zero \
+             below would prove nothing -- the fixture is not on the backend this test \
+             exists to move it off"
+        );
+
+        // The answer: "Use the built-in client", which is
+        // `CliModalAction::UseBuiltIn` -> `chosen_backend = Some(false)`.
+        let (spawns, direct) = spawns_during_a_sign_in(
+            &established,
+            "owner@example.eu",
+            Some("https://vault.example.eu"),
+            Some(false),
+        );
+        assert_eq!(
+            spawns, 0,
+            "pressing \"Use the built-in client\" reached for `bw.exe` {spawns} time(s). \
+             The one thing that button promises is that nothing is downloaded and no second \
+             program runs; a spawn here is that promise broken in the only way the user \
+             would notice"
+        );
+        assert!(
+            direct,
+            "control: the sign-in spawned nothing AND took no direct-REST arm, so it did \
+             not authenticate at all and the count above is measuring nothing"
+        );
+
+        backend_policy::uninstall_resettle();
+        backend_policy::uninstall_env();
+        *TEST_SETTLEMENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// **And the other button really does put a self-hoster on the CLI**,
+    /// against the account whose derivation says the opposite.
+    ///
+    /// The mirror of the test above, and it is the half that keeps that one
+    /// honest: a build that ignored `chosen_backend` entirely and always took
+    /// the direct-REST arm on a self-hosted address would pass
+    /// `choosing_the_built_in_client_spawns_nothing` perfectly.
+    #[test]
+    fn choosing_the_official_cli_puts_a_self_hoster_on_it() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("chose-the-cli");
+        let mint = a_fresh_mint();
+        accounts::ensure_account_dir(&config, &mint.id).expect("the account directory");
+        let slot = empty_slot();
+        *TEST_SETTLEMENT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((config.to_path_buf(), Arc::clone(&slot)));
+        backend_policy::install_resettle(resettle_through_the_test_settlement);
+
+        let (unasked, unasked_direct) = spawns_during_a_sign_in(
+            &mint,
+            "owner@example.eu",
+            Some("https://vault.example.eu"),
+            None,
+        );
+        assert_eq!((unasked, unasked_direct), (0, true),
+            "control: a self-hosted mint that was never asked did not take the built-in \
+             client, so this fixture is not the one whose derivation the answer below has \
+             to beat");
+
+        let (spawns, direct) = spawns_during_a_sign_in(
+            &mint,
+            "owner@example.eu",
+            Some("https://vault.example.eu"),
+            Some(true),
+        );
+        assert!(
+            !direct,
+            "pressing \"Use the Bitwarden CLI\" on a self-hosted account still handed the \
+             sign-in a direct-REST login, so the answer was collected and then thrown away"
+        );
+        assert_eq!(
+            spawns, 1,
+            "the sign-in that chose the official CLI ran it {spawns} time(s) instead of once"
         );
 
         backend_policy::uninstall_resettle();

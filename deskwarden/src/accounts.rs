@@ -495,8 +495,36 @@ pub(crate) fn is_a_fresh_mint(account: &Account) -> bool {
 /// **An established account answers from its record**, and the typed address
 /// is ignored: it has a backend already serving it, and `learn_account_details`
 /// will not move it either.
+///
+/// **`chosen_this_sign_in` is the user's own answer, and it beats BOTH of
+/// the answers below.** The sign-in window asks a self-hoster which client
+/// should open their vault (`bw_acquire::CliSetupState::Choosing`) on every
+/// sign-in, established account included, because the owner's rule is
+/// "always ... prompt which one to use (self-hosted) when login" and the
+/// silent derivation was the defect. `None` means nothing was asked, which is
+/// every caller that is not that modal: a `bw status` answer being learned, a
+/// preview, a test -- and every sign-in to an official Bitwarden server,
+/// where there is no choice to put.
+///
+/// **It reaches the established arm too, and a sign-in is the one moment
+/// that is safe.** The stored record is otherwise final: this function is
+/// what `learn_account_details` and `main`'s added-account path both write
+/// from, and the alternative -- Preferences -- has to ask for a restart and a
+/// fresh sign-in precisely to reach the state a sign-in is already in. The
+/// backend is re-settled from this value a moment later
+/// (`login_ui::direct_login_for_this_sign_in` ->
+/// `backend_policy::resettle_for` -> `main`'s `settle_the_vault_backend`),
+/// and that settlement is what clears or writes `userkey.bin`, so the key
+/// hygiene rides along rather than being something this caller must remember.
 #[must_use]
-pub fn official_cli_after_sign_in(account: Option<&Account>, server_url: Option<&str>) -> bool {
+pub fn official_cli_after_sign_in(
+    account: Option<&Account>,
+    server_url: Option<&str>,
+    chosen_this_sign_in: Option<bool>,
+) -> bool {
+    if let Some(chosen) = chosen_this_sign_in {
+        return chosen;
+    }
     match account {
         Some(account) if !is_a_fresh_mint(account) => account.use_official_bw_crypto,
         // `None` is a host with no account record at all, which is a sign-in
@@ -505,10 +533,17 @@ pub fn official_cli_after_sign_in(account: Option<&Account>, server_url: Option<
     }
 }
 
+/// `chosen_this_sign_in` is what the sign-in window's choice modal answered,
+/// threaded here so the value this function writes is the user's own answer
+/// rather than the derivation made in their absence. `None` everywhere the
+/// question was never put -- see [`official_cli_after_sign_in`], which is
+/// where the two are reconciled, so the precedence lives in ONE function and
+/// this one cannot disagree with the gate that showed the modal.
 pub fn learn_account_details(
     account: &mut Account,
     email: Option<&str>,
     server_url: Option<&str>,
+    chosen_this_sign_in: Option<bool>,
 ) -> bool {
     // **The one moment an account's backend is decided, and it is decided
     // once.**
@@ -550,7 +585,23 @@ pub fn learn_account_details(
             changed = true;
         }
     }
-    if completing_a_fresh_mint {
+    // **An answered sign-in writes its answer whatever the account's age.**
+    //
+    // This is the one place the guard above is deliberately not consulted.
+    // "Was blank" is the right test for a DERIVATION, because a derivation is
+    // a guess and re-guessing an established account's backend from a `bw
+    // login` that only moved its address would move a vault nobody asked to
+    // move. It is the wrong test for an ANSWER: the user was shown which
+    // client this account is on and pressed the other one, on the sign-in
+    // that re-settles the backend and re-authenticates, which is the only
+    // moment the change is free. Refusing it here would leave the modal
+    // painting a choice it cannot keep.
+    if let Some(chosen) = chosen_this_sign_in {
+        if account.use_official_bw_crypto != chosen {
+            account.use_official_bw_crypto = chosen;
+            changed = true;
+        }
+    } else if completing_a_fresh_mint {
         // The same function the sign-in window's CLI gate asks, so the modal
         // that window decides to show and the backend this write settles on
         // are one answer and not two. See `official_cli_after_sign_in`.
@@ -565,10 +616,14 @@ pub fn learn_account_details(
         // here with `true`, which is both the value the mint already carried
         // and the right one; the assignment is unconditional so that the two
         // arms cannot drift apart.
+        //
+        // Reached only when nothing was answered -- the arm above has the
+        // answered case -- so this is the derivation exactly as it always
+        // was, and `None` is passed to the assertion below to say so.
         let official = !crate::backend_policy::is_self_hosted(account.server_url.as_deref());
         debug_assert_eq!(
             official,
-            official_cli_after_sign_in(None, account.server_url.as_deref()),
+            official_cli_after_sign_in(None, account.server_url.as_deref(), None),
             "the sign-in gate and this write must agree about the backend a new account gets"
         );
         if account.use_official_bw_crypto != official {
@@ -1014,11 +1069,21 @@ impl AccountsState {
     /// contains the active id (see [`switch_targets`]), so no row it holds can
     /// be the one this just rewrote, and rebuilding it here would be a second
     /// place deciding what a switch target is.
+    /// **No backend choice reaches here, and that is deliberate.** This
+    /// learns what a `bw status` (or a sign-in's own report) said about an
+    /// account's address and server; a backend choice is not one of those
+    /// facts, and its only writer is the added-account path, which builds a
+    /// finished [`Account`] rather than filling in a blank one. Threading
+    /// `None` through both calls keeps this function unable to move a
+    /// backend by accident. See [`set_active_backend_preference`] for the
+    /// path that does move one, on purpose.
+    ///
+    /// [`set_active_backend_preference`]: Self::set_active_backend_preference
     pub fn learn_active_details(&mut self, email: Option<&str>, server_url: Option<&str>) -> bool {
-        let mut changed = learn_account_details(&mut self.active, email, server_url);
+        let mut changed = learn_account_details(&mut self.active, email, server_url, None);
         let id = self.active.id.clone();
         for account in self.accounts.iter_mut().filter(|a| a.id == id) {
-            changed |= learn_account_details(account, email, server_url);
+            changed |= learn_account_details(account, email, server_url, None);
         }
         changed
     }
@@ -1434,6 +1499,7 @@ mod tests {
                 &mut minted,
                 Some("me@example.com"),
                 Some("https://vault.example.com"),
+                None,
             ),
             "the sign-in taught the account nothing"
         );
@@ -1447,6 +1513,76 @@ mod tests {
             VaultBackendChoice::DirectRest,
             "a new self-hosted account did not get the built-in client"
         );
+    }
+
+    /// **The sign-in window's answer lands on `use_official_bw_crypto`, on a
+    /// mint AND on an established account, in both directions.**
+    ///
+    /// The point of this test is that it asserts the FIELD and not the copy.
+    /// A modal can paint two immaculate paragraphs and two correct buttons
+    /// and still write nothing -- that is this repo's own defect class, "a
+    /// test that passes because it never reached the thing it names", and a
+    /// suite that checked `CliSetupState::body()` would have been fully green
+    /// against it.
+    ///
+    /// Four cases, because the two that matter are the ones the derivation
+    /// gets wrong: an established CLI account answering "built-in", and a
+    /// self-hosted mint answering "the CLI". Each is paired with the
+    /// derivation's own answer so a build that ignored the parameter fails
+    /// on exactly half of them rather than passing on the half that agrees.
+    #[test]
+    fn the_sign_ins_answer_is_what_lands_on_the_account() {
+        use crate::backend_policy::{VaultBackendChoice, choose};
+        let established = |official| Account {
+            id: AccountId::generate(),
+            email: "me@example.eu".to_string(),
+            server_url: Some("https://vault.example.eu".to_string()),
+            use_official_bw_crypto: official,
+        };
+        let self_hosted = Some("https://vault.example.eu");
+
+        for (mut account, chosen, want, what) in [
+            (established(true), Some(false), false, "an established CLI account chose built-in"),
+            (established(false), Some(true), true, "an established built-in account chose the CLI"),
+            (a_mint(), Some(true), true, "a new self-hosted account chose the CLI"),
+            (a_mint(), Some(false), false, "a new self-hosted account chose built-in"),
+            // The unanswered pair, unchanged: the established account keeps
+            // what it had, and the mint takes the derivation. These are the
+            // control -- without them a build that wrote `chosen` in
+            // unconditionally, clobbering every account a `bw status` touched,
+            // would pass the four above.
+            (established(true), None, true, "an unasked established CLI account"),
+            (a_mint(), None, false, "an unasked new self-hosted account"),
+        ] {
+            learn_account_details(&mut account, Some("me@example.eu"), self_hosted, chosen);
+            assert_eq!(
+                account.use_official_bw_crypto, want,
+                "{what}: the record says {} instead. The modal collected an answer and the \
+                 account did not keep it, so the next launch settles onto the client the \
+                 user did not pick",
+                account.use_official_bw_crypto
+            );
+            // And the answer is spent, not merely stored: `choose` is what
+            // actually selects a backend at startup, so this is the claim
+            // the user experiences.
+            assert_eq!(
+                choose(account.server_url.as_deref(), account.use_official_bw_crypto),
+                if want { VaultBackendChoice::BwServe } else { VaultBackendChoice::DirectRest },
+                "{what}: the recorded preference does not select the backend it names"
+            );
+        }
+    }
+
+    /// A blank record, the shape `prepare_new_account` and `resolve_startup`
+    /// mint one in. A helper because the test above needs a fresh one per
+    /// case and `learn_account_details` mutates it.
+    fn a_mint() -> Account {
+        Account {
+            id: AccountId::generate(),
+            email: String::new(),
+            server_url: None,
+            use_official_bw_crypto: true,
+        }
     }
 
     /// A new account on bitwarden.com gets `bw serve`, which is what keeps the
@@ -1465,7 +1601,7 @@ mod tests {
             server_url: None,
             use_official_bw_crypto: true,
         };
-        learn_account_details(&mut minted, Some("me@example.com"), None);
+        learn_account_details(&mut minted, Some("me@example.com"), None, None);
 
         assert!(minted.use_official_bw_crypto, "a bitwarden.com account left the official CLI");
         assert_eq!(
@@ -1494,6 +1630,7 @@ mod tests {
             &mut on_the_cli,
             Some("me@example.com"),
             Some("https://vault.example.com"),
+            None,
         );
         assert!(
             on_the_cli.use_official_bw_crypto,
@@ -1507,6 +1644,7 @@ mod tests {
             &mut on_the_built_in_client,
             Some("me@example.com"),
             Some("https://vault.example.com"),
+            None,
         );
         assert!(
             !on_the_built_in_client.use_official_bw_crypto,

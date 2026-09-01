@@ -465,6 +465,75 @@ impl AcquireStage {
 /// opening a second one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliSetupState {
+    /// **State 0, and only on a self-hosted sign-in: the CHOICE.**
+    ///
+    /// On bitwarden.com there is no choice to put -- the official CLI is the
+    /// only client that opens that vault, and [`Self::Asking`] says so. On a
+    /// self-hosted server both clients work, so which one runs is a decision
+    /// with costs on both sides, and until now the app made it silently:
+    /// `accounts::official_cli_after_sign_in` answered "built-in" for a fresh
+    /// mint and nothing said so. The owner's instruction was the opposite --
+    ///
+    /// > "If self-hosted selected - show another modal prompting to install
+    /// > CLI or offering using build in with pros and conses - Use A or use
+    /// > B, progress bar, ok"
+    ///
+    /// -- and, on finding it absent, "there were no question when login and
+    /// it started using bw by default - should ask".
+    ///
+    /// **A state of this modal rather than a second modal.** It reaches
+    /// `login_ui::draw_cli_setup_modal` unchanged, which is what makes the
+    /// choice inherit the allocated button row, the card-height measurement
+    /// and `cli_setup_modal_layout_tests` -- the apparatus that exists
+    /// because the requirement modal shipped blank. Choosing the CLI moves
+    /// this same modal to [`Self::Working`] and the SAME acquisition worker
+    /// runs; choosing the built-in client downloads nothing and spawns
+    /// nothing.
+    ///
+    /// **Shown on EVERY self-hosted sign-in, established account included.**
+    /// The owner's rule, verbatim: "always either notify (if bw.com) or
+    /// prompt which one to use (self-hosted) when login".
+    ///
+    /// It is not nagging, because a returning user's own previous answer is
+    /// `in_use` below -- carried out of `Account.use_official_bw_crypto` --
+    /// and it sits in the affirmative button position, so pressing through is
+    /// one keystroke and lands where they already were. What the repetition
+    /// buys is that the answer becomes changeable at the one moment changing
+    /// it is free: a sign-in re-settles the backend from the record it is
+    /// about (`login_ui::direct_login_for_this_sign_in` ->
+    /// `backend_policy::resettle_for`), which is the same settlement that
+    /// clears or writes `userkey.bin`, and it re-authenticates anyway. A
+    /// change made in Preferences has to ask for a restart and a fresh
+    /// sign-in to reach that state; a change made here is already in it.
+    ///
+    /// **No "don't ask again".** The silent default is the defect this state
+    /// exists to remove, and a checkbox would put it back one click later.
+    Choosing {
+        /// **What this sign-in would use if the user answered nothing**:
+        /// `true` for the official CLI, `false` for the built-in client.
+        ///
+        /// Always `accounts::official_cli_after_sign_in(account, server,
+        /// None)` -- the one rule, which already answers both cases: an
+        /// established account's own record, and the derivation for a mint.
+        /// This module does not recompute either, which is why there is no
+        /// `is_self_hosted` call anywhere in this state.
+        ///
+        /// It decides which button sits in the affirmative position, and that
+        /// is the whole of what "preselected" means here: a POSITION, not a
+        /// default. Nothing is chosen until a button is pressed, and closing
+        /// the window chooses neither.
+        in_use: bool,
+        /// Whether this account has signed in before -- `!is_a_fresh_mint`.
+        ///
+        /// It changes one sentence and nothing else. A returning user is told
+        /// which client they are on, because they are on one and pressing
+        /// through should not feel like a coin toss; a brand new account is
+        /// not told it is "currently using" a client it has never run.
+        /// Carried rather than inferred from [`Self::in_use`], which cannot
+        /// tell the two apart: a mint on a self-hosted address and an
+        /// established built-in account both arrive here as `false`.
+        established: bool,
+    },
     /// **State 1.** The ask. Nothing has been fetched.
     Asking,
     /// **State 1, reached from the other direction.** The same ask, worded
@@ -495,11 +564,53 @@ pub enum CliSetupState {
     Failed(AcquireRefusal),
 }
 
+/// **What acquiring the CLI costs, said once.**
+///
+/// Three states put this sentence to the user -- [`CliSetupState::Asking`],
+/// [`CliSetupState::AskingToRecover`] and [`CliSetupState::Choosing`] -- and
+/// it is the sentence the whole disclosure rests on: what is fetched, from
+/// whom, what is checked, how big it is, and how often. Three copies would
+/// drift, and the copy that drifted would be the one quoting the wrong size
+/// to the user deciding whether to accept it.
+///
+/// Written to follow a modal verb ("Deskwarden will ...", "Choosing the
+/// Bitwarden CLI will ...") so the same clause serves a statement of intent
+/// and a consequence of a button. The lead-in is the caller's; this constant
+/// starts at the bare infinitive and must keep doing so.
+const DOWNLOAD_DISCLOSURE: &str = "download it from Bitwarden, check that Bitwarden signed it, \
+     and install it. It is about 37 MB, and this happens once.";
+
+/// The two clients, named once each.
+///
+/// Both names appear in a button label and in prose, and the button is what
+/// the user is looking for when they read the prose. Two spellings of one
+/// thing -- "the Bitwarden CLI" in a sentence and "Official CLI" on the
+/// button -- is a user hunting for a control that is on screen.
+const OFFICIAL_CLI_NAME: &str = "the Bitwarden CLI";
+const BUILT_IN_NAME: &str = "Deskwarden's built-in client";
+
 /// What the user did in the modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CliModalAction {
     /// State 1's OK: begin.
     Begin,
+    /// [`CliSetupState::Choosing`]'s "Use the built-in client".
+    ///
+    /// **Downloads nothing and starts nothing.** It records the answer
+    /// against the account and lets the sign-in the user was already
+    /// attempting carry on -- which is the whole difference between this
+    /// button and the other one, and what
+    /// `login_ui::choosing_the_built_in_client_spawns_nothing` holds it to.
+    UseBuiltIn,
+    /// [`CliSetupState::Choosing`]'s "Use the Bitwarden CLI".
+    ///
+    /// Records the answer and then runs the SAME acquisition [`Begin`] runs
+    /// -- literally the same match arm and the same worker, so there is one
+    /// downloader in this app and not two. See `login_ui`'s
+    /// `CliModalAction::Begin | CliModalAction::UseOfficialCli` arm.
+    ///
+    /// [`Begin`]: Self::Begin
+    UseOfficialCli,
     /// State 1's Cancel. Returns the user to the server choice -- not an
     /// error card and not a dead end.
     Cancel,
@@ -512,6 +623,11 @@ impl CliSetupState {
     #[must_use]
     pub fn title(&self) -> &'static str {
         match self {
+            // A question, and phrased as one. Not "Choose a backend": the
+            // user did not come here to pick an implementation, they came to
+            // sign in, and the word for the thing that opens their vault is
+            // the thing it does.
+            Self::Choosing { .. } => "Which client should open this vault?",
             Self::Asking => "The Bitwarden CLI is required",
             Self::AskingToRecover => "The Bitwarden CLI is missing",
             Self::Working { .. } => "Installing the Bitwarden CLI",
@@ -528,12 +644,64 @@ impl CliSetupState {
     #[must_use]
     pub fn body(&self) -> Vec<String> {
         match self {
+            // **The two options, each with what it costs, and neither
+            // recommended in words.** `prefs_ui`'s rule: name what the thing
+            // does and what the user gives up. Neither paragraph is a
+            // recommendation and neither is shorter than the other, so the
+            // prose order carries no preference -- the BUTTONS carry the
+            // preselection (see `buttons`), and they are the half that moves.
+            // The paragraphs stay put so that a user who signs in twice
+            // reads the same text in the same order both times.
+            Self::Choosing { in_use, established } => vec![
+                // **Says which one is in use, in the body, before the
+                // options.** The buttons cannot say it -- their labels are
+                // the two answers and both have to read as available -- and
+                // a returning user pressing through deserves to know they
+                // are pressing through rather than switching.
+                if *established {
+                    format!(
+                        "This is a self-hosted server, so either client can open its \
+                         vault. This account is using {}. Choosing the other one takes \
+                         effect on this sign-in.",
+                        if *in_use { OFFICIAL_CLI_NAME } else { BUILT_IN_NAME }
+                    )
+                } else {
+                    "This is a self-hosted server, so either client can open its vault. \
+                     Deskwarden asks every time you sign in, and either answer takes \
+                     effect on this sign-in."
+                        .to_string()
+                },
+                // Three costs, and the third is the one a user cannot find
+                // out any other way. It is the same sentence
+                // `prefs_ui::official_crypto_description` puts under the
+                // toggle, because a user who meets this decision twice must
+                // not meet two different accounts of it.
+                "Deskwarden's built-in client talks to your server itself. Nothing is \
+                 downloaded, no second program is installed, and no background process \
+                 keeps running. It sends text only -- it cannot put a file in a Send, or \
+                 ask for an email address before one can be opened. And the key that \
+                 unlocks your vault is kept on this PC, protected by Windows: unlike a \
+                 session it never expires, so anyone who can run programs as you on this \
+                 PC can use it."
+                    .to_string(),
+                // The CLI's case, made honestly, including the part that is
+                // an argument against the built-in client: it is not
+                // Bitwarden's code. `rest::crypto`'s module doc is where the
+                // test-vector claim comes from, and it is stated as what it
+                // is -- a check on the cryptography, not on the whole
+                // client.
+                "The official Bitwarden CLI is Bitwarden's own program, written and \
+                 maintained by them, and it holds your keys in a background process of its \
+                 own instead. Deskwarden's built-in client is a separate implementation of \
+                 the same protocol; its cryptography is checked against Bitwarden's \
+                 published test vectors, but it is not Bitwarden's code."
+                    .to_string(),
+                format!("Choosing {OFFICIAL_CLI_NAME} will {DOWNLOAD_DISCLOSURE}"),
+            ],
             Self::Asking => vec![
                 "Signing in to a Bitwarden server requires the official Bitwarden CLI."
                     .to_string(),
-                "Deskwarden will download it from Bitwarden, check that Bitwarden signed \
-                 it, and install it. It is about 37 MB, and this happens once."
-                    .to_string(),
+                format!("Deskwarden will {DOWNLOAD_DISCLOSURE}"),
                 "Press OK to continue, or Cancel to go back and choose a different server. \
                  A self-hosted server can be used without it."
                     .to_string(),
@@ -543,9 +711,7 @@ impl CliSetupState {
                  this computer. Antivirus software, a cleanup tool, or a failed CLI update \
                  can remove it."
                     .to_string(),
-                "Deskwarden will download it from Bitwarden, check that Bitwarden signed \
-                 it, and install it. It is about 37 MB, and this happens once."
-                    .to_string(),
+                format!("Deskwarden will {DOWNLOAD_DISCLOSURE}"),
                 "Press OK to reinstall it now, or Cancel to start without your vault. \
                  Deskwarden will still open, and you can sign out or switch accounts from \
                  the tray."
@@ -599,6 +765,38 @@ impl CliSetupState {
     #[must_use]
     pub fn buttons(&self) -> Vec<(&'static str, CliModalAction)> {
         match self {
+            // **Two answers and no Cancel, because there is no third
+            // outcome.** Every other state of this modal has one thing to do
+            // and a way out of it; this one is a fork, and both prongs
+            // continue the sign-in. A Cancel here would be a button that
+            // returns the user to a form whose Continue leads straight back
+            // to this modal.
+            //
+            // **The client already in use goes LAST**, which
+            // `draw_cli_setup_modal`'s right-to-left row puts at the right
+            // edge -- the affirmative position, under the user's hand. So a
+            // returning user presses through to where they already were, and
+            // a new self-hosted account's affirmative is the built-in client,
+            // which is what the app would have chosen silently.
+            //
+            // The ORDER carries the preselection because there is nothing
+            // else it could be carried by: these are two buttons, not a radio
+            // group with a Continue, and a modal with a preselected radio
+            // still needs a third control to commit it -- three clicks and a
+            // default that can be committed without being read. Two labelled
+            // answers cannot be pressed by accident and cannot be pressed
+            // without saying which one.
+            //
+            // Both labels name their own answer in full, so the swap cannot
+            // become a trap: a user who reads the button they are pressing
+            // is told what it does wherever it sits, and neither label is
+            // "OK" or "Continue" -- the two words that would make position
+            // the only information.
+            Self::Choosing { in_use, .. } => {
+                let cli = ("Use the Bitwarden CLI", CliModalAction::UseOfficialCli);
+                let built_in = ("Use the built-in client", CliModalAction::UseBuiltIn);
+                if *in_use { vec![built_in, cli] } else { vec![cli, built_in] }
+            }
             Self::Asking | Self::AskingToRecover => {
                 vec![("Cancel", CliModalAction::Cancel), ("OK", CliModalAction::Begin)]
             }
@@ -1402,7 +1600,7 @@ mod tests {
         };
 
         let needs_cli = |account: Option<&Account>, typed: Option<&str>| {
-            this_sign_in_needs_the_cli(typed, official_cli_after_sign_in(account, typed))
+            this_sign_in_needs_the_cli(typed, official_cli_after_sign_in(account, typed, None))
         };
 
         // **A new account signing in to a self-hosted server: no download.**
@@ -1544,6 +1742,140 @@ mod tests {
             AcquireRefusal::CouldNotInstall("x".into()),
         ] {
             assert!(r.retryable(), "{:?} should offer another attempt", r.message());
+        }
+    }
+
+    /// Every shape of the choice modal, for the tests below.
+    fn every_choice() -> Vec<CliSetupState> {
+        let mut out = Vec::new();
+        for in_use in [false, true] {
+            for established in [false, true] {
+                out.push(CliSetupState::Choosing { in_use, established });
+            }
+        }
+        out
+    }
+
+    /// **The choice states both options honestly and steers toward neither.**
+    ///
+    /// `prefs_ui`'s rules, applied to the one screen where a user picks
+    /// between two clients: name what each does and what it costs, never the
+    /// word "secure", and no marketing. The specific claims asserted here are
+    /// the ones a reader cannot check for themselves and would be worse off
+    /// not being told.
+    #[test]
+    fn the_choice_names_both_costs_and_recommends_neither() {
+        for state in every_choice() {
+            let body = state.body().join(" ");
+
+            // **The built-in client's real costs.** The first two are the
+            // brief's own list; the third is the one the brief did not have
+            // and `prefs_ui::official_crypto_description` does -- the stored
+            // vault key. An omission the user cannot discover is worse than
+            // a stated limitation, and this is the sentence that states it.
+            assert!(
+                body.contains("never expires") && body.contains("kept on this PC"),
+                "{state:?} does not say the built-in client keeps a non-expiring vault key \
+                 on this PC. That is the cost the user cannot find out any other way, and \
+                 it is the one Preferences already tells them about: {body:?}"
+            );
+            // **And what it cannot do**, established from `rest::send`:
+            // text-only Sends, and no email gate. Named because a user who
+            // picks the built-in client and then cannot attach a file has
+            // been surprised by a limit that was known at this screen.
+            assert!(
+                body.contains("cannot put a file in a Send"),
+                "{state:?} does not name the built-in client's Send limits: {body:?}"
+            );
+
+            // **The CLI's real case, including the part that argues against
+            // the other option.** A choice screen that would not say
+            // "Deskwarden's client is not Bitwarden's code" is a choice
+            // screen selling one of its answers.
+            assert!(
+                body.contains("not Bitwarden's code"),
+                "{state:?} never says the built-in client is not Bitwarden's own code, \
+                 which is the honest case FOR the CLI: {body:?}"
+            );
+            assert!(
+                body.contains("test vectors"),
+                "{state:?} claims the built-in client's cryptography without saying what \
+                 checks it: {body:?}"
+            );
+            // The cost of the other side, in the same words the requirement
+            // modal uses.
+            assert!(
+                body.contains("37 MB") && body.contains("Bitwarden signed it"),
+                "{state:?} asks for a download without disclosing its size or the check: \
+                 {body:?}"
+            );
+
+            // **No steering.** "secure" is `prefs_ui`'s named ban;
+            // "recommended" and "best" would pick for the user, which is the
+            // one thing this modal exists not to do.
+            for banned in ["secure", "Secure", "recommend", "Recommend", "best", "safer"] {
+                assert!(
+                    !body.contains(banned),
+                    "{state:?} uses {banned:?}, which either makes a claim this app cannot \
+                     stand behind or chooses for the user: {body:?}"
+                );
+            }
+        }
+    }
+
+    /// **The client in use is named, and it decides which button is where.**
+    ///
+    /// The preselection, asserted as behaviour rather than as a comment: the
+    /// affirmative slot is the LAST button (`draw_cli_setup_modal` lays the
+    /// row out right-to-left), and it must hold the option the sign-in would
+    /// take if the user pressed nothing.
+    #[test]
+    fn the_choice_preselects_the_client_already_in_use() {
+        for in_use in [false, true] {
+            for established in [false, true] {
+                let state = CliSetupState::Choosing { in_use, established };
+                let buttons = state.buttons();
+                assert_eq!(buttons.len(), 2, "{state:?} is a fork and must offer two answers");
+                let (label, action) = *buttons.last().expect("two buttons");
+                let want = if in_use {
+                    CliModalAction::UseOfficialCli
+                } else {
+                    CliModalAction::UseBuiltIn
+                };
+                assert_eq!(
+                    action, want,
+                    "{state:?} put {label:?} in the affirmative position, which is not the \
+                     client this sign-in would use if nothing were pressed. A returning \
+                     user pressing through would silently switch backends"
+                );
+                // Neither answer may be missing, whichever the order.
+                let actions: Vec<_> = buttons.iter().map(|(_, a)| *a).collect();
+                assert!(
+                    actions.contains(&CliModalAction::UseBuiltIn)
+                        && actions.contains(&CliModalAction::UseOfficialCli),
+                    "{state:?} does not offer both clients: {actions:?}"
+                );
+                // No Cancel: both prongs continue the sign-in, and a Cancel
+                // would return the user to a form whose Continue leads
+                // straight back here.
+                assert!(
+                    !actions.contains(&CliModalAction::Cancel),
+                    "{state:?} offers a Cancel that has nowhere to go"
+                );
+
+                // The established arm names the client in use; the mint arm
+                // must not claim one, because it has never run either.
+                let body = state.body().join(" ");
+                let names_the_cli_as_in_use = body.contains("account is using the Bitwarden CLI");
+                let names_built_in_as_in_use =
+                    body.contains("account is using Deskwarden's built-in client");
+                assert_eq!(
+                    (names_the_cli_as_in_use, names_built_in_as_in_use),
+                    (established && in_use, established && !in_use),
+                    "{state:?} says the wrong thing about which client is in use. A brand \
+                     new account has not used either: {body:?}"
+                );
+            }
         }
     }
 
