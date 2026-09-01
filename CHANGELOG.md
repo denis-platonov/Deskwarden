@@ -8,6 +8,21 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## 0.15.4 - 2026-09-01
+
+### Signing in to your own server really does not need the Bitwarden CLI
+
+0.15.3 stopped one call to that program on this path. There was a second,
+and it was the one that mattered: the sign-in itself. Typing a self-hosted
+address on a machine without the program failed with **The system cannot
+find the file specified**, because the sign-in was deciding how to
+authenticate from what Deskwarden knew when it started — before you had
+typed anything — rather than from the address you just entered.
+
+It now decides from the address you typed. On a self-hosted server with the
+built-in client, signing in runs no part of the Bitwarden CLI, and there is
+a test that counts and requires zero.
+
 ## 0.15.3 - 2026-09-01
 
 ### Signing in to your own server no longer asks for the Bitwarden CLI
