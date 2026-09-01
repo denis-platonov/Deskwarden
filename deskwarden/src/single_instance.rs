@@ -825,6 +825,18 @@ mod tests {
     // and so write `ASKS`. Those tests assert nothing about the shared four,
     // but the tests that DO assert about them cannot survive the writes.
     //
+    // The counters are not the only process-wide state this lock covers. The
+    // module's `ON_TAKEOVER` is shared the same way, and one test --
+    // `what_main_publishes_is_what_the_listener_reads` -- publishes to it and
+    // reads it back. It takes this same lock rather than a second one: a lock
+    // with a single taker serialises nothing, and one mechanism here cannot
+    // deadlock against itself. The two `run_shutdown` tests beside it look
+    // like takers and are not; `run_shutdown` is split out of
+    // `run_takeover_shutdown` precisely so they pass the hook as an argument
+    // and never reach the static. Anything later that calls `on_takeover` or
+    // `run_takeover_shutdown` -- without naming `ON_TAKEOVER` -- is a taker
+    // and belongs under this lock.
+    //
     // Poison is deliberately ignored, the way `vault_service::tests::SERIALISE`
     // and `backend_policy::tests::ENV_LOCK` ignore it. A panicking test poisons
     // this lock, and every later test failing to acquire it would report the
@@ -1382,8 +1394,16 @@ mod tests {
     /// The published hook really is what `run_takeover_shutdown` reads --
     /// the control for the two tests above, which drive `run_shutdown`
     /// directly.
+    ///
+    /// The only test in this module that touches [`ON_TAKEOVER`], which is
+    /// process-wide the way the four counters are. It takes [`SERIALISE`] for
+    /// the same reason they do, and from before the publish until after the
+    /// read, so a later test that reaches the static -- directly, or through
+    /// `on_takeover`/`run_takeover_shutdown` without ever naming it -- joins
+    /// an ordering that already exists instead of inventing a second one.
     #[test]
     fn what_main_publishes_is_what_the_listener_reads() {
+        let _serialised = SERIALISE.lock().unwrap_or_else(|e| e.into_inner());
         let ran = Arc::new(AtomicU32::new(0));
         let ran_in_hook = Arc::clone(&ran);
         on_takeover(Arc::new(move || {
