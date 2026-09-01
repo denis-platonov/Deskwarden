@@ -1824,17 +1824,30 @@ fn draw_cli_setup_modal(
             let buttons = state.buttons();
             if !buttons.is_empty() {
                 ui.add_space(6.0);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Reversed, because a right-to-left layout places the
-                    // first thing added at the RIGHT edge -- and the
-                    // affirmative button belongs there. `buttons()` lists
-                    // them left to right, which is how they read.
-                    for (label, what) in buttons.iter().rev() {
-                        if ui.button(RichText::new(*label).size(12.0)).clicked() {
-                            action = Some(*what);
+                // **Allocated one row tall.** A bare
+                // `with_layout(right_to_left)` inherits the parent's whole
+                // remaining rect, and in a `Ui` whose height is itself
+                // derived from where this content ends, that is a feedback
+                // loop rather than a cosmetic slip -- the button row claimed
+                // every pixel the card had, the card grew to hold it, and
+                // the row claimed those too. `allocate_ui_with_layout` fixes
+                // the row at one interactive row, which is all a button row
+                // was ever asking for.
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        // Reversed, because a right-to-left layout places
+                        // the first thing added at the RIGHT edge -- and the
+                        // affirmative button belongs there. `buttons()`
+                        // lists them left to right, which is how they read.
+                        for (label, what) in buttons.iter().rev() {
+                            if ui.button(RichText::new(*label).size(12.0)).clicked() {
+                                action = Some(*what);
+                            }
                         }
-                    }
-                });
+                    },
+                );
             }
         });
     action
@@ -1930,7 +1943,21 @@ pub fn draw_login_window(
         );
         ui.add_space(14.0);
         let pressed = draw_cli_setup_modal(ui, state);
-        *flow_bottom = ui.min_rect().bottom();
+        // **Where the content ENDED**, which is the same measurement the
+        // main path takes at the bottom of this function rather than a
+        // second way of asking.
+        //
+        // The blank modal of 0.15.2 was not caused here -- it was the
+        // unconstrained button row in `draw_cli_setup_modal`, which claimed
+        // the card's whole remaining height and so made every "how tall is
+        // the content" question answer "as tall as the card", which
+        // `login_card_height` then grew the card to match. But
+        // `min_rect().bottom()` is the bottom of the region this `Ui` was
+        // GIVEN, and this arm's caller computes that region from this very
+        // number; the cursor is a reading of what was painted instead, so it
+        // cannot close that loop a second time however the modal's insides
+        // are rearranged later.
+        *flow_bottom = ui.next_widget_position().y;
         return pressed.map(LoginAction::CliModal);
     }
 
@@ -3499,15 +3526,27 @@ pub fn build_login_frame(
                             }
                             choice => choice.config_url().map(str::to_string),
                         };
+                        // **The backend decision on its own**, separate from
+                        // the question of whether the CLI is installed.
+                        // `needs_cli` below is that decision AND three
+                        // circumstances (nothing missing, not resuming, not
+                        // already present); `bw config server` cares only
+                        // about the decision, because it writes into the
+                        // CLI's own `data.json` and that file is meaningless
+                        // to an account whose vault is served by
+                        // `RestBackend`. Bound once and read twice so the
+                        // modal and the config call cannot disagree about
+                        // which backend this sign-in is for.
+                        let cli_is_the_backend = crate::bw_acquire::this_sign_in_needs_the_cli(
+                            effective_server.as_deref(),
+                            crate::accounts::official_cli_after_sign_in(
+                                signin_account.as_ref(),
+                                effective_server.as_deref(),
+                            ),
+                        );
                         let needs_cli = missing.is_none()
                             && !resume_submit_after_setup
-                            && crate::bw_acquire::this_sign_in_needs_the_cli(
-                                effective_server.as_deref(),
-                                crate::accounts::official_cli_after_sign_in(
-                                    signin_account.as_ref(),
-                                    effective_server.as_deref(),
-                                ),
-                            )
+                            && cli_is_the_backend
                             && crate::bw_acquire::resolve_present_and_trusted().is_none();
                         resume_submit_after_setup = false;
                         if needs_cli {
@@ -3539,31 +3578,55 @@ pub fn build_login_frame(
                                 choice => choice.config_url().map(str::to_string),
                             };
                             match target {
-                                // Into THIS account's `data.json`, not
-                                // whatever profile the process is pointed at:
-                                // `bw config server` is a write, and aimed at
-                                // the wrong directory it re-points the account
-                                // the user is already signed into.
-                                Some(url) => match configure_server_in(&url, profile_dir.as_deref())
-                                {
-                                    Ok(()) => {
-                                        // The identity's server URL, set from
-                                        // the SAME string the CLI was just
-                                        // configured with. Recorded on the
-                                        // success of that call and not
-                                        // beside it, so a failed
-                                        // `bw config server` cannot leave
-                                        // this window about to record a
-                                        // server it never reached.
-                                        configured_server = Some(url);
-                                        true
+                                // **Only when the CLI is the backend.**
+                                // `bw config server` writes into the CLI's
+                                // own `data.json`; on the direct-REST path
+                                // there is no CLI to write to -- and on a
+                                // machine where `bw.exe` is deliberately
+                                // absent, running it at all is the "cannot
+                                // find the file specified" that made a
+                                // self-hosted sign-in impossible.
+                                Some(url) if cli_is_the_backend => {
+                                    // Into THIS account's `data.json`, not
+                                    // whatever profile the process is
+                                    // pointed at: `bw config server` is a
+                                    // write, and aimed at the wrong
+                                    // directory it re-points the account the
+                                    // user is already signed into.
+                                    match configure_server_in(&url, profile_dir.as_deref()) {
+                                        Ok(()) => {
+                                            // The identity's server URL, set
+                                            // from the SAME string the CLI
+                                            // was just configured with.
+                                            // Recorded on the success of
+                                            // that call and not beside it,
+                                            // so a failed `bw config server`
+                                            // cannot leave this window about
+                                            // to record a server it never
+                                            // reached.
+                                            configured_server = Some(url);
+                                            true
+                                        }
+                                        Err(e) => {
+                                            log::warn!("bw config server failed: {e}");
+                                            form.error = Some(e);
+                                            false
+                                        }
                                     }
-                                    Err(e) => {
-                                        log::warn!("bw config server failed: {e}");
-                                        form.error = Some(e);
-                                        false
-                                    }
-                                },
+                                }
+                                // The direct path records the SAME URL in
+                                // the SAME variable, and that is the whole
+                                // of where the server is carried: nothing
+                                // ran, so there is no call whose success to
+                                // hang it on, but `configured_server` is
+                                // what `identity_after_sign_in` reads below,
+                                // so an account signed in here still ends up
+                                // with its `server_url` set. Skipping the
+                                // subprocess must not also skip the record.
+                                Some(url) => {
+                                    configured_server = Some(url);
+                                    true
+                                }
                                 None => false,
                             }
                         } else {
@@ -12148,6 +12211,108 @@ mod the_sign_in_asks_no_cli_tests {
         );
     }
 
+    /// **A direct-REST sign-in runs no `bw config server`, and still records
+    /// its server.**
+    ///
+    /// The 0.15.2 bug, exactly: the owner typed a self-hosted URL into a
+    /// fresh sign-in on a machine with no `bw.exe` -- deliberately, that
+    /// being the entire premise of the built-in client -- pressed Continue,
+    /// and got
+    ///
+    /// > failed to run `bw config server` from the verified Bitwarden CLI
+    /// > path [...] The system cannot find the file specified. (os error 2)
+    ///
+    /// under the form. The submit arm called [`configure_server_in`] whenever
+    /// a server URL was typed, with no backend guard on it at all, and
+    /// `bw config server` is a **write into the CLI's own `data.json`** -- a
+    /// file an account served by `RestBackend` does not have and does not
+    /// read.
+    ///
+    /// Two halves, and the second is the one that makes the first safe to
+    /// want. Skipping the subprocess must not also skip the RECORD: the
+    /// direct path has no successful call to hang the URL on, so it writes
+    /// the same `configured_server` the CLI path writes, which is what
+    /// `identity_after_sign_in` reads and therefore the only reason the
+    /// account ends up knowing its own server.
+    #[test]
+    fn a_direct_rest_sign_in_never_runs_bw_config_server() {
+        // ---- the decision itself, both ways ----------------------------
+        //
+        // The negative: a self-hosted server with the built-in client is the
+        // account that must not touch the CLI.
+        assert_eq!(
+            crate::backend_policy::choose(Some(SELF_HOSTED), false),
+            VaultBackendChoice::DirectRest,
+            "the fixture this test is built on is not a direct-REST account, so everything \
+             below asserts about the wrong backend"
+        );
+        assert!(
+            !crate::bw_acquire::this_sign_in_needs_the_cli(Some(SELF_HOSTED), false),
+            "a self-hosted sign-in with the built-in client is being told it needs the CLI"
+        );
+        // **The positive control**, and it is the half that keeps the guard
+        // honest: a guard that answered `false` for everything would satisfy
+        // the assertion above and quietly stop configuring the server for
+        // every `bw serve` account that has ever worked.
+        assert!(
+            crate::bw_acquire::this_sign_in_needs_the_cli(None, true),
+            "a bitwarden.com sign-in no longer needs the CLI, so the guard added below now \
+             skips `bw config server` for the accounts that genuinely require it"
+        );
+        assert!(
+            crate::bw_acquire::this_sign_in_needs_the_cli(Some(SELF_HOSTED), true),
+            "a self-hoster who kept the official-CLI setting on is no longer on the CLI path"
+        );
+
+        // ---- and the call site sits behind exactly that decision --------
+        let source = include_str!("login_ui.rs").replace("\r\n", "\n");
+        let production = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .expect("this file has test modules")
+            .0;
+
+        // The CALL, with its arguments -- not the definition, which spells
+        // the parameters and lives above the window.
+        let call = concat!("configure_server", "_in(&url, profile_dir.as_deref())");
+        assert_eq!(
+            production.matches(call).count(),
+            1,
+            "`{call}` is no longer in this file exactly once, so the guard this test checks \
+             for may be sitting in front of one call while another runs unguarded"
+        );
+        let before = &production[..production.find(call).expect("counted just above")];
+        let arm = &before[before.len().saturating_sub(600)..];
+        assert!(
+            arm.contains("cli_is_the_backend"),
+            "the `bw config server` call is not guarded by `cli_is_the_backend`. Unguarded it \
+             spawns the Bitwarden CLI for a sign-in that has no CLI and needs none, which is \
+             the error the owner met on a fresh self-hosted sign-in"
+        );
+
+        // The guard is the backend decision and not a re-derivation of it: a
+        // second opinion here is how the modal and the spawn come to
+        // disagree about which backend this sign-in is for.
+        let bound = concat!("let cli_is_the_backend = crate::bw_acquire::this_sign_in_needs", "_the_cli(");
+        assert_eq!(
+            production.matches(bound).count(),
+            1,
+            "`cli_is_the_backend` is no longer bound from `this_sign_in_needs_the_cli`, so the \
+             guard above may be reading something other than the backend policy"
+        );
+
+        // **Both arms record the server.** Two writes, not one: the CLI arm
+        // on the success of its call, the direct arm on its own. One would
+        // mean an account that signed in without ever learning its server.
+        assert_eq!(
+            production.matches("configured_server = Some(url)").count(),
+            2,
+            "the two `configured_server = Some(url)` writes -- the CLI path's, on the success \
+             of `bw config server`, and the direct path's, which is the only place that path \
+             records the server at all -- are no longer both here. With the direct one missing \
+             a self-hosted account signs in and never learns its own server URL"
+        );
+    }
+
     /// **Why collapsing `Locked` into `Unlocked` on the account arm is safe.**
     ///
     /// [`account_details_for`] answers `Unlocked` for any named account and
@@ -12650,9 +12815,12 @@ mod identity_without_a_spawn_tests {
         // the window's end of the prompt channel, and the one that holds the
         // retired "run `bw login` in a terminal" message down. Seventeen now:
         // `the_sign_in_asks_no_cli_tests` guards the gate that stopped this
-        // window spawning `bw status` for a direct-REST account.
+        // window spawning `bw status` for a direct-REST account. Eighteen
+        // now: `cli_setup_modal_layout_tests` drives the CLI-setup modal
+        // through real frames, the surface that shipped blank in 0.15.2
+        // while every test it had asserted on its strings.
         assert_eq!(
-            modules, 17,
+            modules, 18,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -13299,5 +13467,260 @@ mod two_step_message_tests {
                 "a user-facing sign-in message names the CLI: {message:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_setup_modal_layout_tests {
+    //! **The CLI-setup modal has to fit in the card it is measured into.**
+    //!
+    //! 0.15.2 shipped this modal rendering as an empty white panel with a
+    //! Cancel and an OK on it and no text whatever. Every test the modal had
+    //! asserted on `CliSetupState::title()` and `body()` -- the two functions
+    //! that were never wrong -- so the suite was green while the surface was
+    //! blank. That is this project's own defect class: a test that passes
+    //! because it never reached the thing it names.
+    //!
+    //! What was actually wrong was a layout loop. `draw_cli_setup_modal`
+    //! ended in a bare `with_layout(right_to_left)`, which inherits its
+    //! parent's whole remaining rect rather than the one row a button row
+    //! needs. `draw_login_window` then reported the bottom of that expanded
+    //! content as `flow_bottom`, and `run_login_flow` computed the CARD's
+    //! height from it -- so the row claimed the card's space, the card grew
+    //! to hold the row, and the row claimed the new space too. Measured, it
+    //! gained exactly `FOOTER_RESERVE - CARD_MARGIN_BOTTOM` (32px) every
+    //! frame, without limit. `login_card_rect` centres the card, so the
+    //! heading and the body were pushed off the top of the window while the
+    //! card's own fill covered it: the text was always drawn, and drawn out
+    //! of sight.
+    //!
+    //! So these tests drive the real frame loop -- the same feedback the
+    //! window runs -- rather than asking the state for its strings.
+
+    use super::*;
+
+    const WINDOW: Vec2 = egui::vec2(1100.0, 760.0);
+
+    fn raw_input() -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, WINDOW)),
+            ..Default::default()
+        }
+    }
+
+    /// Fonts live, for `first_run_notice_tests`' reason: a font set
+    /// registered during a frame is only usable from the next one, so the
+    /// throwaway frames are load-bearing and a galley measured without them
+    /// is measured against the wrong metrics.
+    fn styled_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        ctx
+    }
+
+    /// Each painted string **with the rect it was painted into**.
+    ///
+    /// The position is the whole point here, and collecting the strings alone
+    /// is the mistake this module exists to stop repeating. egui emits a
+    /// `Shape::Text` whether or not the galley lands anywhere a person could
+    /// see it, so a walk that kept only `galley.text()` finds every line of
+    /// the modal present and correct in the exact frame whose panel is blank
+    /// on screen.
+    fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((
+                text.galley.text().to_string(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, out);
+                }
+            }
+            // Everything else is geometry this module does not assert on.
+            _ => {}
+        }
+    }
+
+    /// One frame of the modal, drawn into the card geometry a given card
+    /// height produces, answering the height the window would ask for next
+    /// and every string it painted.
+    ///
+    /// **This is `run_login_flow`'s loop and not a model of it**: the same
+    /// `vault_skeleton` -> `login_card_rect` -> `login_card_content_rect` ->
+    /// `draw_login_window` -> `login_card_height` chain, reached through the
+    /// same helpers, so a change to any link is a change this test sees.
+    fn one_frame(
+        ctx: &egui::Context,
+        state: &crate::bw_acquire::CliSetupState,
+        card_height: f32,
+    ) -> (f32, Vec<(String, egui::Rect)>) {
+        let mut form = LoginForm::default();
+        let mut flow_bottom = 0.0f32;
+        let mut content_top = 0.0f32;
+        let output = ctx.run_ui(raw_input(), |ui| {
+            let skeleton = vault_skeleton(ui.max_rect());
+            let card = login_card_rect(&skeleton, card_height);
+            let content = login_card_content_rect(card);
+            content_top = content.min.y;
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(content)
+                    .layout(egui::Layout::top_down(egui::Align::Min)),
+                |ui| {
+                    ui.set_min_width(ui.available_width());
+                    let _ = draw_login_window(
+                        ui,
+                        BwStatus::Unauthenticated,
+                        None,
+                        "vault.example.eu",
+                        HelloState { available: false, enrolled: false },
+                        &mut form,
+                        &mut flow_bottom,
+                        false,
+                        false,
+                        Some(state),
+                    );
+                },
+            );
+        });
+        let mut painted = Vec::new();
+        for shape in output.shapes.iter().map(|clipped| &clipped.shape) {
+            walk(shape, &mut painted);
+        }
+        (login_card_height(flow_bottom, content_top), painted)
+    }
+
+    /// **The card height settles.** The bug, stated as the thing it did.
+    #[test]
+    fn the_modals_measured_height_does_not_run_away() {
+        let ctx = styled_context();
+        let state = crate::bw_acquire::CliSetupState::Asking;
+
+        let mut card_height = LOGIN_CARD_INITIAL_HEIGHT;
+        let mut seen = Vec::new();
+        for _ in 0..12 {
+            card_height = one_frame(&ctx, &state, card_height).0;
+            seen.push(card_height);
+        }
+
+        let settled = *seen.last().expect("twelve frames were run");
+        let earlier = seen[seen.len() - 2];
+        assert!(
+            (settled - earlier).abs() <= 0.5,
+            "the card height is still moving after twelve frames ({seen:?}). Each frame \
+             measures content whose size was derived from the previous frame's measurement, \
+             so a height that has not settled never will -- it grew 32px per frame in 0.15.2 \
+             until the card was so tall that `login_card_rect`, which centres it, held the \
+             modal's text above the top of the window"
+        );
+        assert!(
+            settled < WINDOW.y,
+            "the modal's card wants {settled}px in a {}px window, so it cannot be centred in \
+             it and still be visible",
+            WINDOW.y
+        );
+    }
+
+    /// **And the text is actually on screen**, which is what the owner did
+    /// not see.
+    ///
+    /// Asserted on the painted galleys of a settled frame rather than on
+    /// `state.body()`: the strings were always correct, and reading them back
+    /// out of the state is precisely the test that stayed green through the
+    /// blank panel.
+    #[test]
+    fn the_settled_modal_paints_its_heading_and_body_inside_the_window() {
+        let ctx = styled_context();
+        let state = crate::bw_acquire::CliSetupState::Asking;
+
+        // Settle first, then look: the frame worth asserting on is the one
+        // the user would be looking at.
+        //
+        // **Two hundred frames, not a dozen**, and the number is doing work.
+        // A settled layout reaches its fixed point on the first frame and
+        // every frame after it is the same, so the count costs nothing when
+        // the modal is right. When it is wrong the growth is only 32px a
+        // frame -- a dozen frames of it still leaves the text roughly where
+        // it started, which is how a shorter loop here watched the runaway
+        // happen and called it fine. Two hundred frames is a few seconds of
+        // a real window, which is how long the owner looked at the blank
+        // panel before screenshotting it.
+        let mut card_height = LOGIN_CARD_INITIAL_HEIGHT;
+        let mut painted = Vec::new();
+        for _ in 0..200 {
+            let (height, shapes) = one_frame(&ctx, &state, card_height);
+            card_height = height;
+            painted = shapes;
+        }
+
+        // The window the user is looking at. A galley outside it was painted
+        // and cannot be read, which is the entire complaint.
+        let window = egui::Rect::from_min_size(Pos2::ZERO, WINDOW);
+        let find = |needle: &str| -> egui::Rect {
+            let (_, rect) = painted
+                .iter()
+                .find(|(text, _)| text == needle)
+                .unwrap_or_else(|| {
+                    let all: Vec<&str> = painted.iter().map(|(t, _)| t.as_str()).collect();
+                    panic!("the settled modal never painted {needle:?}. Painted: {all:?}")
+                });
+            *rect
+        };
+
+        for needle in std::iter::once(state.title().to_string()).chain(state.body()) {
+            let rect = find(&needle);
+            assert!(
+                window.contains_rect(rect),
+                "the settled modal painted {needle:?} at {rect:?}, which is outside the \
+                 {window:?} the user can see. This is the 0.15.2 failure exactly: the text \
+                 was never missing from the frame, it was above the top of the window, \
+                 because the card it is centred in had grown without bound"
+            );
+        }
+        // The buttons too -- and their presence is the positive control for
+        // the assertions above: a blank panel WITH its buttons is exactly the
+        // shape the bug had, so a test that only found the buttons would have
+        // passed against it.
+        for (label, _) in state.buttons() {
+            let rect = find(label);
+            assert!(
+                window.contains_rect(rect),
+                "the settled modal painted its {label:?} button at {rect:?}, outside {window:?}"
+            );
+        }
+    }
+
+    /// The button row is allocated, not left to inherit the card.
+    ///
+    /// A source guard beside the behavioural ones, because what it protects
+    /// reads as entirely ordinary: a bare `with_layout(right_to_left)` here
+    /// looks like a right-aligned row and is the whole bug.
+    #[test]
+    fn the_modals_button_row_is_given_a_height() {
+        let source = include_str!("login_ui.rs").replace("\r\n", "\n");
+        let production = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .expect("this file has test modules")
+            .0;
+        let modal = production
+            .split_once(concat!("fn draw_cli_setup", "_modal("))
+            .expect("no `draw_cli_setup_modal` in this file")
+            .1;
+        let modal = &modal[..modal.find("\n/// ").unwrap_or(modal.len())];
+        assert!(
+            modal.len() > 500,
+            "the sliced modal body is {} bytes, which is not the function: the assertion \
+             below would pass against nothing",
+            modal.len()
+        );
+        assert!(
+            modal.contains(concat!("allocate_ui_with", "_layout(")),
+            "the modal's button row no longer allocates its own rect. A bare `with_layout` \
+             takes the parent's whole remaining space, and this modal's parent is sized FROM \
+             this modal's content -- which is the loop that shipped a blank panel in 0.15.2"
+        );
     }
 }
