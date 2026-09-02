@@ -21028,9 +21028,14 @@ mod preferences_modal_wiring_tests {
             // added `mod the_gears_seed` -- which source each half of the
             // preferences page's input comes from, and that the modal's
             // in-flight copy still outranks both.
+            // 63 as of the no-CLI-on-the-direct-path audit, which added
+            // `mod no_cli_on_the_direct_path_tests` -- what this window's
+            // export and its Sends actually EXECUTE on each backend, counted
+            // at `job_object`'s spawn recorder rather than inferred from
+            // which backend was chosen.
             // Raised deliberately: one more module must now be a clean,
             // column-0, gated block that the walk really reaches.
-            modules, 62,
+            modules, 63,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -32752,6 +32757,195 @@ mod reprompt_gating_tests {
         assert!(
             opens(&RepromptGate::unprovable(), &plain()),
             "control: an unprovable gate blocked an unprotected item too"
+        );
+    }
+}
+
+#[cfg(test)]
+mod no_cli_on_the_direct_path_tests {
+    //! **What these vault-window actions EXECUTE, counted, on both backends.**
+    //!
+    //! The house defect this closes is named in `backend_policy::selected`'s
+    //! own docs and was found three times in three months: a test that asks
+    //! *which backend was chosen* passes for a code path that then goes and
+    //! runs `bw.exe` anyway. Every existing pin over this window's export and
+    //! its Sends asks the first question. These ask the second, with
+    //! `job_object::spawn_probe` -- the same recorder
+    //! `export_wiring::the_export_child_is_spawned_into_the_job_this_window_holds`
+    //! uses, which refuses the spawn and records what was handed to it, so a
+    //! count here is a count of real production code reaching a real
+    //! `CreateProcess` call and not of a substitute.
+    //!
+    //! **Every one of them has a positive control on the other backend.** A
+    //! zero-spawn assertion is worth nothing unless the same action, driven
+    //! the same way on a `bw serve` account, spawns exactly once -- otherwise
+    //! the assertion would be satisfied by a helper that reached nothing at
+    //! all, which is the failure mode the whole file guards against.
+    //!
+    //! The environment lock is held across each test for the reason
+    //! `export_wiring::spawns_of_one_export` gives: `backend_policy`'s
+    //! environment is process-wide and this suite runs in parallel.
+
+    use super::*;
+    use crate::job_object::spawn_probe::{Attempt, SpawnProbe};
+
+    type TempDir = crate::test_scratch::ScratchDir;
+
+    /// A `DirectRest` environment whose credential reader finds nothing.
+    ///
+    /// **The reader answering `None` is the point, not a shortcut.** It is a
+    /// signed-out direct-REST account, which is `SendError::Locked` -- a
+    /// refusal reached without a network round trip and without a
+    /// subprocess. What is being counted is the spawn, and an account that
+    /// could reach the server would make these tests depend on one.
+    fn a_direct_rest_env() -> crate::backend_policy::BackendEnv {
+        fn never(
+            _server_url: &str,
+            _email: &str,
+            _device_id: &str,
+            _password: &[u8],
+        ) -> Result<crate::rest::api::LoginOutcome, String> {
+            Err("this fixture never logs in".to_string())
+        }
+        crate::backend_policy::BackendEnv {
+            choice: crate::backend_policy::VaultBackendChoice::DirectRest,
+            credentials: Some(std::sync::Arc::new(|| None)),
+            direct: Some(crate::login_ui::DirectRestLogin {
+                server_url: "https://vault.example.com".to_string(),
+                email: "someone@example.com".to_string(),
+                device_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                second_factor: crate::login_ui::SecondFactorSeam {
+                    start: never,
+                    ..crate::login_ui::PRODUCTION_SECOND_FACTOR
+                },
+                prompt: None,
+                adopt: std::sync::Arc::new(|_authenticated| {}),
+            }),
+        }
+    }
+
+    fn a_bw_serve_env() -> crate::backend_policy::BackendEnv {
+        crate::backend_policy::BackendEnv {
+            choice: crate::backend_policy::VaultBackendChoice::BwServe,
+            direct: None,
+            credentials: None,
+        }
+    }
+
+    /// Runs `action` with the given backend installed and the spawn recorder
+    /// armed, and reports every child it tried to start.
+    ///
+    /// `remember_verified_bw_exe` is first-wins and idempotent, and the path
+    /// is a fiction: without it the `bw serve` arm refuses before reaching
+    /// the spawn at all, which would make the positive controls below report
+    /// zero for a reason that has nothing to do with the backend.
+    fn spawns_under(
+        env: crate::backend_policy::BackendEnv,
+        action: impl FnOnce(),
+    ) -> Vec<Attempt> {
+        let _guard = crate::backend_policy::tests::hold_the_env_lock();
+        crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
+            r"C:\deskwarden-test\first\bw.exe",
+        ));
+        assert!(
+            crate::backend_policy::install_env(env),
+            "the fixture environment was refused, so this test would have measured the \
+             default backend rather than the one it names"
+        );
+        let probe = SpawnProbe::arm();
+        action();
+        let attempts = probe.attempts();
+        drop(probe);
+        crate::backend_policy::uninstall_env();
+        attempts
+    }
+
+    /// The programs a run tried to start, for a message that says which.
+    fn programs(attempts: &[Attempt]) -> Vec<String> {
+        attempts
+            .iter()
+            .map(|a| a.program.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    // ---- the export --------------------------------------------------------
+
+    /// **An export on a direct-REST account starts no process at all.**
+    ///
+    /// Driven through `pick_and_export`, which is the window's own blocking
+    /// entry point: the save dialog is the one substitute, and `run_export`,
+    /// `real_export_runner` and the runner it picks are the shipping ones.
+    #[test]
+    fn an_export_on_a_direct_rest_account_spawns_no_cli() {
+        let temp = TempDir::new("direct-export");
+        let destination = temp.path().join("vault.json");
+        let attempts = spawns_under(a_direct_rest_env(), || {
+            let _ = export_thread::pick_and_export(move || Some(destination), "session-token");
+        });
+        assert!(
+            attempts.is_empty(),
+            "an export on an account whose vault is reached over REST started {} child \
+             process(es) -- on a machine with no bw.exe this is the `os error 2` the owner \
+             reported: {:?}",
+            attempts.len(),
+            programs(&attempts)
+        );
+    }
+
+    /// The control that makes the assertion above mean something: the same
+    /// call, the same helper, a `bw serve` account, exactly one child.
+    #[test]
+    fn an_export_on_a_bw_serve_account_still_spawns_the_cli_exactly_once() {
+        let temp = TempDir::new("cli-export");
+        let destination = temp.path().join("vault.json");
+        let attempts = spawns_under(a_bw_serve_env(), || {
+            let _ = export_thread::pick_and_export(move || Some(destination), "session-token");
+        });
+        assert_eq!(
+            attempts.len(),
+            1,
+            "control: an export on a `bw serve` account did not reach the CLI exactly once, \
+             so the zero counted for the direct-REST account is not evidence of anything: \
+             {:?}",
+            programs(&attempts)
+        );
+    }
+
+    // ---- the Sends list ----------------------------------------------------
+
+    /// **Opening Sends on a direct-REST account starts no process either.**
+    ///
+    /// This is the action behind the second half of the owner's report: the
+    /// Sends screen is drawn by the UI process, and until that process
+    /// published a backend policy of its own this path read the default and
+    /// went to `bw send list`.
+    #[test]
+    fn listing_sends_on_a_direct_rest_account_spawns_no_cli() {
+        let attempts = spawns_under(a_direct_rest_env(), || {
+            let _ = send_fetch_thread::real_send_list("session-token");
+        });
+        assert!(
+            attempts.is_empty(),
+            "a Sends fetch on an account whose vault is reached over REST started {} child \
+             process(es): {:?}",
+            attempts.len(),
+            programs(&attempts)
+        );
+    }
+
+    /// The control for the fetch, in the shape the export's has.
+    #[test]
+    fn listing_sends_on_a_bw_serve_account_still_spawns_the_cli_exactly_once() {
+        let attempts = spawns_under(a_bw_serve_env(), || {
+            let _ = send_fetch_thread::real_send_list("session-token");
+        });
+        assert_eq!(
+            attempts.len(),
+            1,
+            "control: a Sends fetch on a `bw serve` account did not reach the CLI exactly \
+             once, so the zero counted for the direct-REST account is not evidence of \
+             anything: {:?}",
+            programs(&attempts)
         );
     }
 }
