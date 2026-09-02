@@ -192,76 +192,104 @@ const UI_LOADED_DESCRIPTION: &str =
 /// caused it, so the user would turn `bw` back on and find this row still
 /// grey with nothing on the page explaining the delay.
 const BACKEND_DESCRIPTION: &str =
-    "Faster, and uses about 110 MB while idle. Off runs it only while the vault window is \
+    "Faster, and uses about 118 MB while idle. Off runs it only while the vault window is \
      open; autofill is unaffected either way.";
 
-/// The backend choice's label.
+/// The backend choice's label: the QUESTION, with the two answers beside it.
 ///
-/// The owner's own words for the setting, kept as they were written. It names
-/// `bw` because that is what the row is about and what the user will see in
-/// Task Manager; the description is where the trade is spelled out.
+/// **It stopped being a switch, and this label is where that shows.** It read
+/// "Use the official Bitwarden CLI" over an on/off pill, which named one side
+/// and left the other as the unnamed absence of it -- a user who wanted the
+/// built-in client had to work out that "off" meant a second product existed.
+/// The owner's instruction was to make both sides visible as peers, so the row
+/// now asks which client, and [`OFFICIAL_CHOICE`] and [`BUILT_IN_CHOICE`]
+/// answer it in a two-cell [`choice_button`] picker.
 ///
-/// # Which way round it is, said once and never restated
+/// So this string deliberately names NEITHER client: naming one here would put
+/// it back in the privileged position the pill gave it. The naming happens in
+/// the two cells, which are the same size as each other on screen and in the
+/// sentence.
 ///
-/// **On means `bw`.** The field behind this row is
-/// `accounts::Account::use_official_bw_crypto`, and `true` is the official
-/// CLI -- so the pill is on when this app is doing what `bw serve` has always
-/// done, and off is the built-in client. The label reads
-/// that way on purpose ("use official bw" is true when the pill is on) and
-/// [`official_crypto_description`] opens by naming both states rather than
-/// leaving the reader to infer the second from the first.
-///
-/// That is worth this much prose because the inversion is invisible: a row
-/// wired to `!use_official_bw_crypto` paints, clicks and persists perfectly,
-/// and the only symptom is that an account shows the pill off while `bw` is
-/// serving it, or that a user who thinks they have turned `bw` on has
-/// turned it off. `the_backend_row_is_on_when_bw_is_the_backend` pins it
-/// against [`crate::backend_policy::choose`] rather than against the field,
-/// so an inversion anywhere between the pill and the decision fails.
-///
-/// It said "Use official bw for crypto": "bw" is a filename and "crypto" is a
-/// word about internals, and neither is what the user is choosing between.
-const OFFICIAL_CRYPTO_LABEL: &str = "Use the official Bitwarden CLI";
+/// It is the sign-in window's own question, in the same words
+/// (`bw_acquire::CliSetupState::Choosing`'s "Which client should open this
+/// vault?"), because a user who meets the choice in both places is meeting one
+/// decision and not two.
+const BACKEND_CHOICE_LABEL: &str = "Which client opens this vault";
 
-/// The description shown under the [`OFFICIAL_CRYPTO_LABEL`] toggle, in its
-/// two states.
+/// The picker's first cell: the official CLI.
+///
+/// **Names `bw` the way the user will meet it**, which is
+/// [`BACKEND_LABEL`]'s rule and the reason both are pinned by
+/// `the_two_backend_labels_name_the_cli_and_not_this_codebases_words`.
+/// "bw" is a filename and "crypto" is a word about internals; the official
+/// Bitwarden CLI is a thing a person can look up and find in Task Manager.
+const OFFICIAL_CHOICE: &str = "The official Bitwarden CLI";
+
+/// The picker's second cell: this app's own client.
+///
+/// **Named as a product rather than as "not the CLI"**, which is the whole of
+/// what the two-cell control buys over the pill it replaced. It is
+/// Deskwarden's, and saying so is what makes the two cells peers rather than a
+/// thing and its absence.
+const BUILT_IN_CHOICE: &str = "Deskwarden's built-in client";
+
+/// The description shown under [`BACKEND_CHOICE_LABEL`], in its two states.
 ///
 /// A pure function of one fact, for [`disk_cache_description`]'s reason
-/// exactly: this is the text a user reads before accepting a security
-/// tradeoff, so it is asserted by tests rather than buried in an eframe
+/// exactly: this is the text a user reads before deciding where their master
+/// key lives, so it is asserted by tests rather than buried in an eframe
 /// closure where nothing can reach it.
 ///
-/// Four properties the tests below hold, each deliberate:
+/// # It is two short paragraphs now, and it was four long ones
 ///
-///  * **it says what turning it off buys**, in the owner's terms -- "much
-///    lighter and faster" -- rather than making the user infer it from the
-///    absence of a background process;
-///  * **it says what turning it off costs, without a euphemism**: the
+/// The owner's instruction: "four paragraphs under a settings row is too
+/// much". The four were carrying the whole argument -- what each side buys,
+/// what each side costs, what the switch does to `userkey.bin` -- under a row
+/// in a settings list, which is not where an argument belongs. The sign-in
+/// window puts the same fork to the user with room to make it
+/// (`bw_acquire::CliSetupState::Choosing`), and the confirmation this row
+/// raises carries the key hygiene ([`backend_switch_prompt`]). What is left
+/// here is what a person needs to pick a cell: one sentence per client, and
+/// one sentence saying when the pick applies.
+///
+/// Three properties the tests below still hold, each deliberate:
+///
+///  * **each side is named and costed.** The memory figures are the README's
+///    measured table -- ~118 MB for the `bw serve` subprocess, ~21 MB total
+///    for the built-in client -- and not a fourth number invented here. The
+///    row said "about 110 MB" for years and nothing measured agrees with it;
+///  * **the cost of the built-in client is stated without a euphemism**: the
 ///    passwords are stored in the app. Not "credentials are cached locally";
 ///    the key that opens the vault is kept on this PC and it does not expire,
 ///    which is the sentence [`crate::user_key_store`]'s own module doc opens
-///    with and the one a user has to weigh;
-///  * **it says the change takes effect on restart.** A setting that appears
-///    to do nothing when clicked is a setting the user clicks again, and the
-///    thing they would be clicking is the one that decides where their master
-///    key lives. See [`draw_general`]'s note for why a live switch is not on
-///    offer;
+///    with and the one a user has to weigh. It is the one paragraph of the
+///    four that could not be shortened away;
 ///  * **when the row is unavailable it says why in the row**, readable without
 ///    hovering -- the same rule the disk-cache row follows, and for the same
 ///    reason: a ghosted control with no explanation reads as a bug.
+///
+/// # "The next time you sign in", not "the next time Deskwarden starts"
+///
+/// This sentence was inherited and had gone stale. The choice is applied by
+/// `main`'s `settle_the_vault_backend`, which used to run only at startup --
+/// so "restart" was the whole truth. Since 0.15.4 a sign-in re-settles the
+/// live process for the account it is about
+/// (`login_ui::direct_login_for_this_sign_in` ->
+/// `backend_policy::resettle_for`), and the sign-in window offers this
+/// account's stored answer as the preselected cell
+/// (`accounts::official_cli_after_sign_in`, which reads exactly the field this
+/// row writes). A restart is one way to reach a sign-in and is no longer the
+/// only one, so the row names the moment rather than one route to it.
 fn official_crypto_description(self_hosted: bool) -> &'static str {
     if self_hosted {
-        "On, this account's vault goes through the official Bitwarden CLI — the \
-         `bw` program — which holds your keys in a background process of its own.\n\n\
-         Off is much lighter and faster — Deskwarden's built-in client talks to your server \
-         itself, so no background process keeps running, and signing in no longer uses the \
-         CLI either — but \
-         in that case your passwords are stored in the app: the \
-         key that unlocks your vault is kept on this PC, protected by Windows, and unlike a \
-         session it never expires. Anyone who can run programs as you on this PC can use it.\n\n\
-         Changing this takes effect the next time Deskwarden starts, and either direction \
-         asks you to sign in again. Turning it back on also deletes the stored vault key from \
-         this PC, so nothing is left behind by the switch."
+        "The official Bitwarden CLI is the `bw` program: it holds your keys in a background \
+         process of its own, and costs about 118 MB of RAM. Deskwarden's built-in client \
+         talks to your server itself for about 21 MB in total — but then the key that \
+         unlocks your vault is stored in the app, kept on this PC and protected by Windows, \
+         and unlike a session it never expires, so anyone who can run programs as you on \
+         this PC can use it.\n\n\
+         Changing this takes effect the next time you sign in to this account, and the \
+         sign-in window asks the same question there with this answer already offered."
     } else {
         // Not a silent no-op under the same label, and not a hidden row. The
         // owner's rule is "disabled if not self-hosted vault to avoid issues
@@ -3059,33 +3087,41 @@ const BACKEND_SWITCH_CANCEL_BUTTON: &str = "Leave it";
 /// names the consequence rather than asking "are you sure". Three facts, and
 /// the third only where it is true:
 ///
-///  * **the app has to be restarted.** The choice is captured once, by
-///    `main`'s `BackendSettlement`, and never re-read -- so the click changes
-///    nothing this session, and a user who is not told that clicks it again;
-///  * **you have to sign in again.** Either direction re-derives the vault
-///    key from the master password. A login prompt nobody was warned about
-///    reads as a fault;
+///  * **it does not take effect now.** The choice is applied by
+///    `settle_the_vault_backend`, which this click does not run -- so the
+///    click changes nothing this session, and a user who is not told that
+///    clicks it again;
+///  * **you have to sign in again, and that is the moment it lands.** Either
+///    direction re-derives the vault key from the master password, and the
+///    re-settle rides along with it
+///    (`login_ui::direct_login_for_this_sign_in`). A login prompt nobody was
+///    warned about reads as a fault;
 ///  * **and, going back to `bw` only, the stored vault key is deleted from
 ///    this PC.** That is the good news of that direction and the reason it
 ///    cannot be worded generically: said in both, it would be a lie in one;
 ///    left out of both, the user cannot tell whether turning this back on
 ///    undoes what turning it off did.
 ///
-/// **It does not promise a relaunch.** Nothing in this program restarts it --
-/// there is no `current_exe` respawn anywhere -- so the sentence asks the
-/// user to close and reopen Deskwarden themselves. A confirmation whose Yes
-/// implied a restart that never came would be the worst of the three
-/// possible wordings.
+/// **It does not promise a relaunch, and it no longer demands one.** Nothing
+/// in this program restarts it -- there is no `current_exe` respawn anywhere
+/// -- so where a restart is named the sentence asks the user to close and
+/// reopen Deskwarden themselves. But a restart is no longer the only route:
+/// since 0.15.4 a sign-in re-settles the live process for the account it is
+/// about (`login_ui::direct_login_for_this_sign_in` ->
+/// `backend_policy::resettle_for`), so signing out and back in reaches the
+/// same place. The sentence names the moment -- the next sign-in -- and then
+/// both routes to it, rather than naming one route as though it were the
+/// requirement.
 fn backend_switch_prompt(switch: BackendSwitch) -> &'static str {
     if switch.deletes_the_stored_vault_key() {
-        "Switch back to the official Bitwarden CLI? It does not take effect until Deskwarden is \
-         restarted -- close it and open it again yourself -- and you will have to sign in again \
-         when it comes back. This also deletes the vault key stored on this PC, so nothing is \
+        "Switch back to the official Bitwarden CLI? It does not take effect until you next \
+         sign in to this account -- either sign out and back in, or close Deskwarden and open \
+         it again yourself. This also deletes the vault key stored on this PC, so nothing is \
          left behind by the switch."
     } else {
-        "Switch to Deskwarden's built-in client? It does not take effect until Deskwarden is \
-         restarted -- close it and open it again yourself -- and you will have to sign in again \
-         when it comes back."
+        "Switch to Deskwarden's built-in client? It does not take effect until you next sign \
+         in to this account -- either sign out and back in, or close Deskwarden and open it \
+         again yourself."
     }
 }
 
@@ -3114,9 +3150,9 @@ fn backend_switch_row(ui: &mut Ui, switch: BackendSwitch) -> Option<RowAction> {
 
 /// **Which backend holds the vault, and whether it is kept warm.**
 ///
-/// The parent is `use_official_bw_crypto`: on -- the shipped default -- the
-/// vault goes through the official `bw` CLI, and off it goes through
-/// Deskwarden's own built-in client. The child is `keep_backend_running`,
+/// The parent is `use_official_bw_crypto`, drawn as a two-cell picker: the
+/// official `bw` CLI, or Deskwarden's own built-in client. The child is
+/// `keep_backend_running`,
 /// which is a trade about the `bw serve` subprocess and therefore means
 /// nothing when there is no subprocess.
 ///
@@ -3137,9 +3173,12 @@ fn backend_switch_row(ui: &mut Ui, switch: BackendSwitch) -> Option<RowAction> {
 ///
 /// # The parent ghosts and the child hides, two rows apart
 ///
-/// The parent is a [`child_toggle_row`]: on an account the built-in client
-/// cannot serve it goes grey under a sentence naming the remedy, and the
-/// returned value is the stored one unchanged, so a click writes nothing. The
+/// The parent is a [`backend_choice_row`] -- a two-cell picker naming both
+/// clients, where it used to be an on/off pill naming only the CLI. On an
+/// account the built-in client cannot serve it goes grey under a sentence
+/// naming the remedy, and the returned value is the stored one unchanged, so
+/// a click writes nothing; that is [`child_toggle_row`]'s contract, kept by
+/// the control that replaced it. The
 /// child is not drawn at all on the backend that has no subprocess, because
 /// there is no remedy for it to name -- the remedy would be the switch one row
 /// above it -- and the only sentence a ghost could carry there is a confession
@@ -3159,9 +3198,8 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
         // to have moved it: the click is a proposal, and nothing but
         // `Confirm` below writes the field.
         let stored = state.settings.use_official_bw_crypto;
-        let clicked = child_toggle_row(
+        let clicked = backend_choice_row(
             ui,
-            OFFICIAL_CRYPTO_LABEL,
             official_crypto_description(self_hosted),
             stored,
             self_hosted,
@@ -3680,6 +3718,125 @@ fn choice_button(ui: &mut Ui, label: &str, selected: bool) -> bool {
         ink,
     );
     response.clicked()
+}
+
+/// [`choice_button`]'s disabled twin, in [`control_row_ghosted`]'s idiom.
+///
+/// A separate function rather than an `enabled` parameter on
+/// [`choice_button`], which is exactly the shape
+/// [`theme::toggle_pill_disabled`] and [`row_text_ghosted`] already take on
+/// this page: the three live call sites in the mint form have no disabled
+/// state and gain nothing from carrying one.
+///
+/// **Disabled means disabled, not merely painted grey** -- [`child_toggle_row`]'s
+/// rule, on the control that replaced it here. The cell senses no click and
+/// sets no hover cursor, so there is no path by which it can be pressed.
+///
+/// **The cell in force is still legible.** It keeps [`theme::BLUE_WASH`], the
+/// same "this is the one that is on" the live control uses, while both labels
+/// go to [`theme::TEXT_GHOST`]. A picker that greyed both cells identically
+/// would tell a user on `bitwarden.com` that they have no client, when what
+/// is true is that they have this one and cannot change it.
+fn choice_button_ghosted(ui: &mut Ui, label: &str, selected: bool) {
+    let galley_width = ui
+        .painter()
+        .layout_no_wrap(
+            label.to_owned(),
+            FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
+            theme::INK,
+        )
+        .size()
+        .x;
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(galley_width + CHOICE_PADDING, STEPPER_HEIGHT),
+        Sense::hover(),
+    );
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(STEPPER_RADIUS),
+        if selected { theme::BLUE_WASH } else { theme::CARD },
+        Stroke::new(1.0, theme::BORDER_STRONG),
+        StrokeKind::Inside,
+    );
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
+        theme::TEXT_GHOST,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        theme::TEXT_GHOST,
+    );
+}
+
+/// **Which client opens this vault: a two-cell picker, not an on/off pill.**
+///
+/// Returns the value after this frame -- `true` for the official CLI, which
+/// is `Account::use_official_bw_crypto`'s own direction, so nothing between
+/// this row and [`crate::backend_policy::choose`] has to invert anything.
+///
+/// # Why a picker and not the switch it replaces
+///
+/// The owner's instruction was to name both sides. A switch labelled "Use the
+/// official Bitwarden CLI" makes the built-in client the unnamed absence of
+/// something: it has no label, no position of its own, and a user who wants it
+/// has to infer that "off" is a second product rather than a feature being
+/// declined. The two cells are the same shape as each other, and the label
+/// above them ([`BACKEND_CHOICE_LABEL`]) is the question rather than one of
+/// the answers.
+///
+/// # It reuses [`choice_button`] rather than inventing a control
+///
+/// This page already has an either-or control and already draws it twice, on
+/// this very section's sibling card: the mint form's subject and access
+/// pickers ([`draw_mint_form`]). Selected is `BLUE_WASH` behind `BLUE_DEEP`,
+/// which is the nav's own language for "this is the one in force". A new
+/// widget here would have been a third dialect of "selected" in one window.
+///
+/// The layout is that card's too -- a full-width [`card_row`] with the label
+/// and copy above the cells, not [`control_row`]'s 160-point trailing column,
+/// which neither cell's name fits in.
+///
+/// # Ghosted, it hands back what it was given
+///
+/// [`child_toggle_row`]'s contract, kept exactly: on an account the built-in
+/// client cannot serve, both cells are inert, the row says why in the row, and
+/// the returned value is the stored one -- so a click writes nothing.
+fn backend_choice_row(ui: &mut Ui, description: &str, official: bool, enabled: bool) -> bool {
+    let mut next = official;
+    card_row(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+        let (title, body) = if enabled {
+            (theme::INK, theme::TEXT_FAINT)
+        } else {
+            (theme::TEXT_GHOST, theme::TEXT_GHOST)
+        };
+        ui.label(theme::semibold(BACKEND_CHOICE_LABEL, 14.0).color(title));
+        ui.label(RichText::new(description).size(12.0).color(body));
+        ui.horizontal(|ui| {
+            if enabled {
+                // Two independent presses rather than one flip, so that
+                // pressing the cell already in force is a no-op and
+                // `backend_switch` sees no proposal -- which is what keeps a
+                // confirmation off the screen of a user who clicked the
+                // client they were already on.
+                if choice_button(ui, OFFICIAL_CHOICE, official) {
+                    next = true;
+                }
+                if choice_button(ui, BUILT_IN_CHOICE, !official) {
+                    next = false;
+                }
+            } else {
+                choice_button_ghosted(ui, OFFICIAL_CHOICE, official);
+                choice_button_ghosted(ui, BUILT_IN_CHOICE, !official);
+            }
+        });
+    });
+    next
 }
 
 /// This page's button: [`scan_button`]'s box at a width its own label needs.
@@ -5301,32 +5458,42 @@ mod tests {
                 .count()
         }
 
-        /// The fill colour of every toggle pill, top to bottom.
+        /// The fill of the smallest rectangle painted behind a text run.
         ///
-        /// **The only way to read a pill's state from outside the widget.**
-        /// [`theme::toggle_pill`] paints its track `theme::BLUE` when on and
-        /// `theme::TOGGLE_OFF` when off, and nothing else on this window
-        /// paints a 40x22 rectangle -- so the colour at index *n* is the
-        /// state of the *n*th row's switch. Needed because the one guarantee
-        /// worth pinning about the backend row is which way round it is, and
-        /// a test that read only the settings field would pass a row that
-        /// painted every value backwards.
+        /// **How a [`choice_button`] cell's state is read back**, and the
+        /// reason the backend row's pins got stronger rather than weaker when
+        /// it stopped being a pill. The helper it replaced could only say "the
+        /// nth switch"; this says "the cell labelled *this*", so an assertion
+        /// about which client is selected names the client instead of
+        /// counting rows -- and a row reordering can no longer make a test
+        /// pass by pointing it at a different control.
         ///
-        /// Ordered by painted y, exactly as [`Self::rects_of_size`] is and
-        /// for the same reason.
-        fn pill_fills(&self) -> Vec<egui::Color32> {
-            let mut found: Vec<(f32, egui::Color32)> = self
+        /// Smallest containing rectangle, not the first: the cell sits inside
+        /// the card, which sits inside the body, and all three contain the
+        /// label's centre.
+        fn fill_behind(&self, needle: &str) -> egui::Color32 {
+            let text = self.rect_of(needle);
+            let mut found: Vec<&RectShape> = self
                 .rects
                 .iter()
-                .filter(|r| {
-                    (r.rect.width() - TOGGLE_SIZE.x).abs() < 0.5
-                        && (r.rect.height() - TOGGLE_SIZE.y).abs() < 0.5
-                })
-                .map(|r| (r.rect.top(), r.fill))
+                .filter(|r| r.rect.contains(text.center()))
                 .collect();
-            found.sort_by(|a, b| a.0.total_cmp(&b.0));
-            found.into_iter().map(|(_, fill)| fill).collect()
+            found.sort_by(|a, b| a.rect.area().total_cmp(&b.rect.area()));
+            found
+                .first()
+                .unwrap_or_else(|| panic!("nothing was painted behind {needle:?}"))
+                .fill
         }
+
+        // **`pill_fills` is gone, and [`Self::fill_behind`] above is what
+        // replaced it.** It read the fill of the *n*th 40x22 rectangle on the
+        // page, and existed for exactly one claim: which way round the
+        // backend row was. That row is a two-cell `choice_button` picker now
+        // and paints no pill at all, so its only caller went -- and what took
+        // its place says *which cell*, by label, rather than which index.
+        // Kept as a note rather than as an `allow(dead_code)` helper, because
+        // an unused reader of pill colours is how the next test comes to
+        // assert on a row it never located.
 
         /// Every rectangle of exactly this size, top to bottom -- how a
         /// control that paints no text of its own (the toggle pill) is
@@ -5808,8 +5975,14 @@ mod tests {
     #[test]
     fn the_built_in_client_row_does_not_say_the_cli_signs_you_in() {
         let copy = official_crypto_description(true);
+        // **The positive control moved with the sentence it anchors.** It
+        // used to be "signing in no longer uses the CLI either", which was a
+        // clause of the four-paragraph copy the owner asked to shrink. The
+        // same fact is now carried by the clause below -- the built-in client
+        // is what talks to the server -- and this is the clause whose removal
+        // would make the assertion under it vacuous.
         assert!(
-            copy.contains("signing in no longer uses the"),
+            copy.contains("talks to your server itself"),
             "control: the clause this test is about is gone from the row, so the assertion \
              below is about a paragraph that no longer exists: {copy}"
         );
@@ -5822,7 +5995,7 @@ mod tests {
 
     /// **The row says what it costs, not only what it buys.**
     ///
-    /// The backend row beside it names its ~111 MB; this one holds about
+    /// The backend row beside it names its ~118 MB; this one holds about
     /// 100 MB in a second process, and a user who discovers that in Task
     /// Manager rather than here has been surprised by their own settings.
     /// That surprise is the report this whole split came from.
@@ -6897,23 +7070,24 @@ mod tests {
         assert!(!state.settings.cache_vault_to_disk, "the default: nothing on disk");
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        // THIRD pill down on the Vault page: the backend card's two rows are
-        // above it, and the disk-cache card's own child is directly below.
-        // Named by index rather than by position on a card, because that is
-        // what `rects_of_size` returns -- and asserted against the count, so
-        // an index that has drifted fails here rather than quietly clicking
-        // the row above.
+        // THIRD pill down on the Vault page: `keep_backend_running` and
+        // `keep_ui_loaded` are above it, and the disk-cache card's own child
+        // is directly below. Named by index rather than by position on a
+        // card, because that is what `rects_of_size` returns -- and asserted
+        // against the count, so an index that has drifted fails here rather
+        // than quietly clicking the row above.
         let pills = first.rects_of_size(TOGGLE_SIZE);
         assert_eq!(
             pills.len(),
-            5,
-            "the Vault page paints five pills: the backend choice and its child, the \
-             instant-open switch beside them, and the disk copy and its child. It was four \
-             until `keep_ui_loaded` was added as the third, which shifted the disk rows \
-             down by one -- and an index that has drifted must fail here rather than \
+            4,
+            "the Vault page paints four pills: `keep_backend_running`, the instant-open \
+             switch beside it, and the disk copy and its child. It was FIVE while the \
+             backend choice was an on/off pill; that row is a two-cell `choice_button` \
+             picker now and paints no 40x22 rectangle at all, so every index below is one \
+             lower than it was -- and an index that has drifted must fail here rather than \
              quietly click the row above"
         );
-        let pill = pills[3].center();
+        let pill = pills[2].center();
         tall_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.cache_vault_to_disk,
@@ -6968,7 +7142,10 @@ mod tests {
 
         let first = tall_frame(&ctx, &mut state, &[]);
         // FOURTH pill: the backend card's two, then the disk copy, then this.
-        let child = first.rects_of_size(TOGGLE_SIZE)[4].center();
+        // The backend choice itself paints no pill -- it is a two-cell
+        // picker -- so the four are `keep_backend_running`, `keep_ui_loaded`,
+        // the disk copy, and this.
+        let child = first.rects_of_size(TOGGLE_SIZE)[3].center();
         tall_frame(&ctx, &mut state, &click(child));
         assert!(
             state.settings.read_through_cache,
@@ -6986,7 +7163,7 @@ mod tests {
         // a row that is inert always. Turn the parent on -- through the pane,
         // so it is the same click path -- and the child is live, moves its
         // own field, and changes what the policy answers.
-        let parent = first.rects_of_size(TOGGLE_SIZE)[3].center();
+        let parent = first.rects_of_size(TOGGLE_SIZE)[2].center();
         tall_frame(&ctx, &mut state, &click(parent));
         assert!(state.settings.cache_vault_to_disk, "the control could not turn the parent on");
         assert_eq!(
@@ -6995,7 +7172,7 @@ mod tests {
         );
 
         let second = tall_frame(&ctx, &mut state, &[]);
-        let child = second.rects_of_size(TOGGLE_SIZE)[4].center();
+        let child = second.rects_of_size(TOGGLE_SIZE)[3].center();
         tall_frame(&ctx, &mut state, &click(child));
         assert!(
             !state.settings.read_through_cache,
@@ -7256,11 +7433,13 @@ mod tests {
         assert!(state.settings.keep_backend_running, "the default");
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        // SECOND pill: the crypto switch is the parent and paints first.
-        // Clicking this one must not move it, which is what the neighbouring
-        // assertion here pins -- a child wired to its parent's field is
-        // exactly the mix-up this card's rebuild could have introduced.
-        let pill = first.rects_of_size(TOGGLE_SIZE)[1].center();
+        // FIRST pill: the parent above it is a two-cell `choice_button`
+        // picker and paints no 40x22 rectangle, so this child is the topmost
+        // pill on the page. Clicking it must not move the parent, which is
+        // what the neighbouring assertion here pins -- a child wired to its
+        // parent's field is exactly the mix-up this card's rebuild could have
+        // introduced.
+        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
         tall_frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.keep_backend_running);
         assert!(state.settings.use_official_bw_crypto, "the parent's toggle moved");
@@ -7295,7 +7474,7 @@ mod tests {
         assert!(state.settings.keep_backend_running, "the default");
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(TOGGLE_SIZE)[1].center();
+        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
         tall_frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.keep_backend_running,
@@ -8894,7 +9073,7 @@ mod tests {
     fn every_setting_that_decides_where_the_vault_comes_from_is_on_the_vault_page() {
         let vault = paint_vault_with_hello(true);
         let gathered =
-            [OFFICIAL_CRYPTO_LABEL, BACKEND_LABEL, DISK_CACHE_LABEL, READ_THROUGH_LABEL];
+            [BACKEND_CHOICE_LABEL, BACKEND_LABEL, DISK_CACHE_LABEL, READ_THROUGH_LABEL];
         for label in gathered {
             assert!(
                 vault.contains(label),
@@ -9082,7 +9261,7 @@ mod tests {
     }
 
     /// **The count, which is the half a `contains` loop is structurally blind
-    /// to.** Five pills on the `bw` page and four on the built-in one, and
+    /// to.** Four pills on the `bw` page and three on the built-in one, and
     /// both numbers spelled out rather than derived, so a row added to either
     /// page has to be re-pinned here deliberately.
     ///
@@ -9092,22 +9271,61 @@ mod tests {
     /// `read_through_cache` counts even though `Settings::default` leaves the
     /// disk copy off, and the difference between these two numbers is exactly
     /// the one row this split hides rather than ghosts.
+    ///
+    /// # Both numbers went down by one, and the row that left is still counted
+    ///
+    /// It was five and four while the backend choice was an on/off pill.
+    /// [`backend_choice_row`] draws a two-cell [`choice_button`] picker
+    /// instead, which paints no 40x22 rectangle -- so a count alone would now
+    /// be satisfied by a page that had simply dropped the choice. The second
+    /// half of this test is the replacement: **both cells are painted on both
+    /// pages**, and exactly one of them is the one in force. Without it the
+    /// counts above would be a weaker pin than the ones they replaced.
     #[test]
     fn the_vault_page_paints_one_fewer_pill_on_the_built_in_client() {
+        let bw = paint_vault_for(Some("self"), true);
+        let built_in = paint_vault_for(Some("self"), false);
         assert_eq!(
-            paint_vault_for(Some("self"), true).count_of_size(TOGGLE_SIZE),
-            5,
-            "the `bw` Vault page's five pills: the backend switch, `keep_backend_running`, \
-             `keep_ui_loaded`, `cache_vault_to_disk`, and `read_through_cache` ghosted \
-             under it"
-        );
-        assert_eq!(
-            paint_vault_for(Some("self"), false).count_of_size(TOGGLE_SIZE),
+            bw.count_of_size(TOGGLE_SIZE),
             4,
-            "the built-in Vault page must lose exactly one pill -- `keep_backend_running` -- \
-             and keep the other four: the switch back, `keep_ui_loaded`, the disk copy and \
-             its ghosted child"
+            "the `bw` Vault page's four pills: `keep_backend_running`, `keep_ui_loaded`, \
+             `cache_vault_to_disk`, and `read_through_cache` ghosted under it. The backend \
+             choice is not among them -- it is a picker, and it is counted below"
         );
+        assert_eq!(
+            built_in.count_of_size(TOGGLE_SIZE),
+            3,
+            "the built-in Vault page must lose exactly one pill -- `keep_backend_running` -- \
+             and keep the other three: `keep_ui_loaded`, the disk copy and its ghosted child"
+        );
+
+        // **The picker is on both pages, both cells, and the selected one is
+        // the client that page is on.** This is what the two counts above
+        // stopped being able to say when the pill became a picker.
+        for (what, painted, official) in
+            [("the `bw` page", &bw, true), ("the built-in page", &built_in, false)]
+        {
+            assert!(
+                painted.contains(OFFICIAL_CHOICE) && painted.contains(BUILT_IN_CHOICE),
+                "{what} does not offer both clients as peers; got {:?}",
+                painted.strings()
+            );
+            let (selected, other) = if official {
+                (OFFICIAL_CHOICE, BUILT_IN_CHOICE)
+            } else {
+                (BUILT_IN_CHOICE, OFFICIAL_CHOICE)
+            };
+            assert_eq!(
+                painted.fill_behind(selected),
+                theme::BLUE_WASH,
+                "{what} does not show {selected:?} as the client in force"
+            );
+            assert_ne!(
+                painted.fill_behind(other),
+                theme::BLUE_WASH,
+                "{what} shows both clients as selected"
+            );
+        }
     }
 
     // **`the_ghosted_backend_copy_names_the_switch_that_disabled_it` is gone
@@ -9126,20 +9344,29 @@ mod tests {
     /// the machinery.**
     ///
     /// One exemption, and it is named here rather than left implicit: the
-    /// backend switch itself. It has to name both backends, because naming
-    /// them is the choice it is asking the user to make -- a switch that hid
-    /// what it was switching between would be unusable. That is the whole of
+    /// backend picker itself. It has to name both backends, because naming
+    /// them is the choice it is asking the user to make -- a control that hid
+    /// what it was choosing between would be unusable. That is the whole of
     /// the exemption, and confining it to one row is what makes it affordable.
+    ///
+    /// **The exemption grew from two strings to four, and not by one inch
+    /// more than the control did.** The row used to paint a label and a
+    /// description; it now paints a label, a description and two cells,
+    /// because naming both clients as peers is the change. Every one is still
+    /// matched by equality against a named constant, so a new row still
+    /// cannot claim the exemption by accident -- which is the property that
+    /// made this scan worth writing.
     #[test]
     fn the_built_in_vault_page_names_no_subprocess() {
         let painted = paint_vault_for(Some("self"), false);
         let switch_copy = official_crypto_description(true);
+        let exempt = [BACKEND_CHOICE_LABEL, OFFICIAL_CHOICE, BUILT_IN_CHOICE, switch_copy];
         let offending: Vec<&str> = painted
             .strings()
             .into_iter()
-            // The exemption, matched on the switch's own two strings rather
-            // than on a substring, so a new row cannot claim it by accident.
-            .filter(|s| *s != OFFICIAL_CRYPTO_LABEL && *s != switch_copy)
+            // The exemption, matched on the picker's own strings rather than
+            // on a substring, so a new row cannot claim it by accident.
+            .filter(|s| !exempt.contains(s))
             .filter(|s| {
                 s.contains("bw serve") || s.contains("Bitwarden CLI") || s.contains("backend")
             })
@@ -9159,10 +9386,13 @@ mod tests {
         );
         // ...and the exempt row really is on it, so the filter is excusing a
         // string that is actually there rather than one that never was.
-        assert!(
-            painted.contains(OFFICIAL_CRYPTO_LABEL),
-            "the exempted switch is not on the page, so the exemption is excusing nothing"
-        );
+        for label in [BACKEND_CHOICE_LABEL, OFFICIAL_CHOICE, BUILT_IN_CHOICE] {
+            assert!(
+                painted.contains(label),
+                "the exempted {label:?} is not on the page, so the exemption is excusing \
+                 nothing"
+            );
+        }
         // ...and the needles find something on the OTHER page, so they are
         // needles that can match.
         let bw_page = paint_vault_for(Some("self"), true);
@@ -9183,11 +9413,19 @@ mod tests {
     /// named -- so it had better name it the way the user will meet it.
     #[test]
     fn the_two_backend_labels_name_the_cli_and_not_this_codebases_words() {
-        for label in [BACKEND_LABEL, OFFICIAL_CRYPTO_LABEL] {
+        // The needle is unchanged; what carries it moved. It was the backend
+        // row's own label, which named the CLI because the pill's ON meant
+        // the CLI. The picker's cell is where the CLI is named now, and the
+        // rule is the same rule.
+        for label in [BACKEND_LABEL, OFFICIAL_CHOICE] {
             assert!(
                 label.contains("Bitwarden CLI"),
                 "{label:?} does not name the program the user will see in Task Manager"
             );
+        }
+        // ...and it applies to every string this control paints, including
+        // the two that are new.
+        for label in [BACKEND_LABEL, BACKEND_CHOICE_LABEL, OFFICIAL_CHOICE, BUILT_IN_CHOICE] {
             assert!(
                 !label.to_lowercase().contains("crypto"),
                 "{label:?} names an internal concept the user is not choosing between"
@@ -9197,10 +9435,35 @@ mod tests {
                 "{label:?} uses this file's own word for `bw serve`"
             );
         }
-        // The control: the two are still different rows, and the one about
-        // keeping it running still says so. Without this, both could collapse
-        // to the same string and pass every assertion above.
-        assert_ne!(BACKEND_LABEL, OFFICIAL_CRYPTO_LABEL);
+        // **The other side is named too, and that is the change.** An on/off
+        // pill made the built-in client the unnamed absence of the CLI; the
+        // second cell is what stops it being that.
+        assert!(
+            BUILT_IN_CHOICE.contains("built-in client"),
+            "{BUILT_IN_CHOICE:?} does not name the second client, so the choice has one \
+             named side and one blank"
+        );
+        // **And the question names neither**, so the two cells are peers
+        // rather than a default with an alternative beside it. This is the
+        // assertion that fails if somebody folds one client's name back into
+        // the row label.
+        assert!(
+            !BACKEND_CHOICE_LABEL.contains("Bitwarden CLI")
+                && !BACKEND_CHOICE_LABEL.contains("built-in"),
+            "{BACKEND_CHOICE_LABEL:?} names one of the two answers, which puts it back in \
+             the privileged position the on/off pill gave it"
+        );
+        // The control: these are still four different strings, and the one
+        // about keeping it running still says so. Without this, they could
+        // collapse and pass every assertion above.
+        for pair in [
+            (BACKEND_LABEL, BACKEND_CHOICE_LABEL),
+            (BACKEND_CHOICE_LABEL, OFFICIAL_CHOICE),
+            (OFFICIAL_CHOICE, BUILT_IN_CHOICE),
+            (BACKEND_LABEL, OFFICIAL_CHOICE),
+        ] {
+            assert_ne!(pair.0, pair.1);
+        }
         assert!(BACKEND_LABEL.contains("running"), "the row no longer says what it decides");
     }
 
@@ -9339,8 +9602,16 @@ mod tests {
     /// through this helper: a click on this row now costs two presses, and
     /// spelling both out at each of their call sites would bury the
     /// assertion they exist for.
-    fn take_the_backend_switch(ctx: &egui::Context, state: &mut PrefsState, pill: Pos2) {
-        let asked = tall_click(ctx, state, pill);
+    ///
+    /// **It takes the cell's LABEL, not a rectangle.** It used to take the
+    /// backend pill's `Pos2`, found by index among the page's 40x22 pills,
+    /// because there was one pill per side of a switch and the switch's side
+    /// was its index. There are two named cells now, so the caller says which
+    /// client it is pressing -- and a test that pressed the wrong control
+    /// cannot pass by having pressed a control that happened to be there.
+    fn take_the_backend_switch(ctx: &egui::Context, state: &mut PrefsState, cell: &str) {
+        let shown = tall_frame(ctx, state, &[]);
+        let asked = tall_click(ctx, state, shown.rect_of(cell).center());
         let yes = asked.ink_of(BACKEND_SWITCH_CONFIRM_BUTTON).rect.center();
         let _ = tall_click(ctx, state, yes);
     }
@@ -9367,49 +9638,59 @@ mod tests {
         assert!(state.settings.use_official_bw_crypto, "the shipped default");
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
-        let asked = tall_click(&ctx, &mut state, pill);
+        let other_client = first.rect_of(BUILT_IN_CHOICE).center();
+        let asked = tall_click(&ctx, &mut state, other_client);
 
         assert!(
             state.settings.use_official_bw_crypto,
             "one click moved the backend with no confirmation"
         );
         assert!(
-            asked.any_containing("restarted"),
-            "the question does not say the app has to be restarted: {:?}",
+            asked.any_containing("open it again yourself"),
+            "the question leaves who restarts the app unsaid, and nothing here restarts it: \
+             {:?}",
             asked.strings()
         );
         // **The needle is one only the question carries.** The row's own
-        // description also says the switch asks you to sign in again, so
-        // "sign in again" alone would be satisfied by the page that was
-        // already on screen before anything was clicked -- a vacuous
-        // assertion, and one that would then hold just as well after the
-        // question had gone.
+        // description also says the switch applies at the next sign-in, so
+        // "sign in" alone would be satisfied by the page that was already on
+        // screen before anything was clicked -- a vacuous assertion, and one
+        // that would then hold just as well after the question had gone.
         assert!(
-            asked.any_containing("sign in again when it comes back"),
+            asked.any_containing("either sign out and back in"),
             "the question does not say the user has to sign in again: {:?}",
             asked.strings()
         );
-        // The pill is still painted where it was. A row that moved on the
-        // click and moved back on the refusal would satisfy every value
-        // assertion here and still show the user a switch that flipped
-        // itself.
+        // The picker is still showing what it showed. A control that moved on
+        // the click and moved back on the refusal would satisfy every value
+        // assertion here and still show the user a choice that flipped
+        // itself. Both cells, because a picker that showed BOTH as selected
+        // would pass an assertion about either one alone.
         assert_eq!(
-            asked.pill_fills()[0],
-            theme::BLUE,
-            "the pill moved before the question was answered"
+            asked.fill_behind(OFFICIAL_CHOICE),
+            theme::BLUE_WASH,
+            "the picker moved before the question was answered"
+        );
+        assert_ne!(
+            asked.fill_behind(BUILT_IN_CHOICE),
+            theme::BLUE_WASH,
+            "the cell that was merely proposed is painted as the one in force"
         );
 
         let no = asked.ink_of(BACKEND_SWITCH_CANCEL_BUTTON).rect.center();
         let left = tall_click(&ctx, &mut state, no);
         assert!(state.settings.use_official_bw_crypto, "saying no switched the backend anyway");
-        assert_eq!(left.pill_fills()[0], theme::BLUE, "the pill moved on a refusal");
+        assert_eq!(
+            left.fill_behind(OFFICIAL_CHOICE),
+            theme::BLUE_WASH,
+            "the picker moved on a refusal"
+        );
         assert!(
             state.pending_backend_switch.is_none(),
             "the question is still pending, so the row is stuck on it"
         );
         assert!(
-            !left.any_containing("sign in again when it comes back"),
+            !left.any_containing("either sign out and back in"),
             "the question is still on screen after it was answered: {:?}",
             left.strings()
         );
@@ -9417,13 +9698,34 @@ mod tests {
         // And the whole thing can be attempted again -- the assertion the
         // never-cleared pending state would fail, and the one that makes the
         // clearing above mean something.
-        let again = tall_click(&ctx, &mut state, pill);
+        let again = tall_click(&ctx, &mut state, left.rect_of(BUILT_IN_CHOICE).center());
         assert!(
-            again.any_containing("sign in again when it comes back"),
-            "a second press of the pill raises nothing, so the row can only be refused once: \
-             {:?}",
+            again.any_containing("either sign out and back in"),
+            "a second press of the other client raises nothing, so the row can only be \
+             refused once: {:?}",
             again.strings()
         );
+
+        // **Pressing the client already in force proposes nothing.** The
+        // pill this replaced had no such state -- every click on it was a
+        // flip -- so this is a question the picker newly makes it possible to
+        // ask, and a confirmation raised by it would be one the user never
+        // asked for. Cleared first, so what is measured is the new press and
+        // not the question left standing above it.
+        let cleared = tall_click(
+            &ctx,
+            &mut state,
+            again.ink_of(BACKEND_SWITCH_CANCEL_BUTTON).rect.center(),
+        );
+        let same_client =
+            tall_click(&ctx, &mut state, cleared.rect_of(OFFICIAL_CHOICE).center());
+        assert!(
+            !same_client.any_containing("either sign out and back in"),
+            "pressing the client this account is already on raised a confirmation for a \
+             change nobody asked for: {:?}",
+            same_client.strings()
+        );
+        assert!(state.settings.use_official_bw_crypto, "and it changed nothing");
     }
 
     /// Saying yes really does switch -- the control for the test above, which
@@ -9447,8 +9749,7 @@ mod tests {
         );
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
-        let asked = tall_click(&ctx, &mut state, pill);
+        let asked = tall_click(&ctx, &mut state, first.rect_of(BUILT_IN_CHOICE).center());
         let yes = asked.ink_of(BACKEND_SWITCH_CONFIRM_BUTTON).rect.center();
         let after = tall_click(&ctx, &mut state, yes);
 
@@ -9459,12 +9760,17 @@ mod tests {
         );
         assert!(state.pending_backend_switch.is_none(), "the question outlived its answer");
         assert_eq!(
-            after.pill_fills()[0],
-            theme::TOGGLE_OFF,
-            "the switch was taken and the pill still shows the old state"
+            after.fill_behind(BUILT_IN_CHOICE),
+            theme::BLUE_WASH,
+            "the switch was taken and the picker still shows the old client"
+        );
+        assert_ne!(
+            after.fill_behind(OFFICIAL_CHOICE),
+            theme::BLUE_WASH,
+            "the picker shows both clients as the one in force"
         );
         assert!(
-            !after.any_containing("sign in again when it comes back"),
+            !after.any_containing("either sign out and back in"),
             "the question is still on screen after it was taken: {:?}",
             after.strings()
         );
@@ -9504,22 +9810,41 @@ mod tests {
         // above is the only difference and not an excuse for a thinner
         // sentence on one side.
         for (name, prompt) in [("back to bw", back), ("to the built-in client", away)] {
+            // **The moment, not one route to it.** This used to demand the
+            // word "restarted", which was the whole truth while
+            // `settle_the_vault_backend` ran only at startup. Since 0.15.4 a
+            // sign-in re-settles the live process
+            // (`login_ui::direct_login_for_this_sign_in` ->
+            // `backend_policy::resettle_for`), so a restart is one way in and
+            // no longer the requirement. The question names the moment.
             assert!(
-                prompt.contains("restarted"),
-                "the {name} question does not say the app has to be restarted: {prompt:?}"
+                prompt.contains("next sign in to this account"),
+                "the {name} question does not say when the switch lands: {prompt:?}"
             );
+            // **And BOTH routes to it**, because naming only one of two is
+            // how the stale sentence got here: a user told "restart" will
+            // restart, and a user told only "sign out" will not think of the
+            // restart that also works.
             assert!(
-                prompt.contains("sign in again"),
-                "the {name} question does not say the user has to sign in again: {prompt:?}"
+                prompt.contains("sign out and back in"),
+                "the {name} question does not offer the sign-out route: {prompt:?}"
             );
             // **It does not promise a relaunch it cannot perform.** Nothing
             // in this program respawns it, so a Yes that said "restarting
             // now" would be a lie told at the moment the user is agreeing to
             // something.
             assert!(
-                prompt.contains("close it and open it again yourself"),
+                prompt.contains("open it again yourself"),
                 "the {name} question leaves who restarts the app unsaid, and nothing here \
                  restarts it: {prompt:?}"
+            );
+            // **And it does not claim a restart is REQUIRED**, which is the
+            // sentence 0.15.4 made false and which this row inherited for two
+            // releases.
+            assert!(
+                !prompt.contains("until Deskwarden is restarted"),
+                "the {name} question still demands a restart the app no longer needs: \
+                 {prompt:?}"
             );
         }
     }
@@ -9564,14 +9889,16 @@ mod tests {
         assert!(state.settings.use_official_bw_crypto, "the shipped default");
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        // FIRST pill on the Vault page: the backend choice is the top row of
-        // the top card, which is where the page's reading order puts it.
-        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
-        tall_frame(&ctx, &mut state, &click(pill));
-        assert!(
-            state.settings.use_official_bw_crypto,
-            "a click on the ghosted pill changed the setting anyway"
-        );
+        // **Both cells, pressed by name.** The ghosted picker still paints
+        // the client in force, so a test that pressed only the other one
+        // would miss a control that had gone live on the selected side.
+        for cell in [BUILT_IN_CHOICE, OFFICIAL_CHOICE] {
+            tall_frame(&ctx, &mut state, &click(first.rect_of(cell).center()));
+            assert!(
+                state.settings.use_official_bw_crypto,
+                "a click on the ghosted {cell:?} changed the setting anyway"
+            );
+        }
         assert!(
             first
                 .strings()
@@ -9579,6 +9906,20 @@ mod tests {
                 .any(|t| t.contains("Only available on a self-hosted server")),
             "the ghosted row does not say why, so it reads as a bug; got {:?}",
             first.strings()
+        );
+        // **Ghosted, it still shows which client this account is on.** A
+        // picker that greyed both cells identically would tell a
+        // `bitwarden.com` user they have no client at all, when what is true
+        // is that they have this one and cannot change it.
+        assert_eq!(
+            first.fill_behind(OFFICIAL_CHOICE),
+            theme::BLUE_WASH,
+            "the ghosted picker does not say which client is serving this account"
+        );
+        assert_ne!(
+            first.fill_behind(BUILT_IN_CHOICE),
+            theme::BLUE_WASH,
+            "the ghosted picker shows the client this account cannot use as the one in force"
         );
     }
 
@@ -9593,32 +9934,38 @@ mod tests {
         let ctx = tall_context();
         let mut state = on_a_self_hosted_server();
 
-        let first = tall_frame(&ctx, &mut state, &[]);
-        let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
-        take_the_backend_switch(&ctx, &mut state, pill);
+        take_the_backend_switch(&ctx, &mut state, BUILT_IN_CHOICE);
         assert!(
             !state.settings.use_official_bw_crypto,
-            "the row did not turn off on a self-hosted server"
+            "the row did not move to the built-in client on a self-hosted server"
         );
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
         assert!(!state.settings.service_enabled, "the wrong row's toggle moved");
 
-        take_the_backend_switch(&ctx, &mut state, pill);
-        assert!(state.settings.use_official_bw_crypto, "and back on again");
+        take_the_backend_switch(&ctx, &mut state, OFFICIAL_CHOICE);
+        assert!(state.settings.use_official_bw_crypto, "and back to the official CLI again");
     }
 
     /// **The one guarantee on this page that cannot be seen by looking: the
-    /// pill is ON when `bw` is the backend, and OFF when the built-in client
-    /// is.**
+    /// cell showing as chosen is the client that will actually serve the
+    /// vault.**
+    ///
+    /// The name is kept from when this row was a pill and the claim was "the
+    /// pill is ON when `bw` is the backend". It is the same claim about the
+    /// same inversion, read off a control that now names both sides -- and it
+    /// got easier to state, not harder: the assertions below say *which
+    /// client* is shown as chosen, where they used to say which colour a
+    /// nameless rectangle was painted.
     ///
     /// An inverted row paints, clicks and persists perfectly. Nothing about
-    /// it looks wrong -- the switch moves, the setting is written back, the
+    /// it looks wrong -- the control moves, the setting is written back, the
     /// counter-assertions on the neighbouring tests all hold -- and the only
-    /// symptoms are that a fresh install shows the pill off while running the
-    /// official CLI, and that a user who turns it on has opted in to the
-    /// built-in client and stored a non-expiring master key on their PC in
-    /// the belief they had done the opposite.
+    /// symptoms are that a fresh install shows the built-in client as chosen
+    /// while running the official CLI, and that a user who presses "The
+    /// official Bitwarden CLI" has opted in to the built-in client and stored
+    /// a non-expiring master key on their PC in the belief they had done the
+    /// opposite.
     ///
     /// So this is asserted **through
     /// [`crate::backend_policy::choose`]** -- the function that actually
@@ -9649,33 +9996,42 @@ mod tests {
         );
         let first = tall_frame(&ctx, &mut state, &[]);
         assert_eq!(
-            first.pill_fills()[0],
-            theme::BLUE,
-            "the pill for the shipped default is painted off, so a fresh install shows the \
-             official CLI switched off while it is running the official CLI"
+            first.fill_behind(OFFICIAL_CHOICE),
+            theme::BLUE_WASH,
+            "the shipped default does not show the official CLI as chosen, so a fresh \
+             install offers the built-in client while it is running the official CLI"
+        );
+        assert_ne!(
+            first.fill_behind(BUILT_IN_CHOICE),
+            theme::BLUE_WASH,
+            "both cells are painted as chosen, so the control says nothing"
         );
 
-        // Clicking it turns it OFF, and the policy then selects the built-in
-        // direct-REST client -- the state whose whole cost is the copy under
-        // this row.
-        take_the_backend_switch(&ctx, &mut state, first.rects_of_size(TOGGLE_SIZE)[0].center());
+        // Pressing the other cell moves to the built-in direct-REST client --
+        // the state whose whole cost is the copy under this row.
+        take_the_backend_switch(&ctx, &mut state, BUILT_IN_CHOICE);
         assert!(!state.settings.use_official_bw_crypto);
         assert_eq!(
             choose(SERVER, state.settings.use_official_bw_crypto),
             VaultBackendChoice::DirectRest,
-            "turning the row OFF did not select the built-in client, so the label's two \
-             states do not mean what it says they mean"
+            "pressing the built-in client's cell did not select the built-in client, so the \
+             two cells do not mean what they say they mean"
         );
         let second = tall_frame(&ctx, &mut state, &[]);
         assert_eq!(
-            second.pill_fills()[0],
-            theme::TOGGLE_OFF,
-            "the pill is painted on for a configuration served by the built-in client"
+            second.fill_behind(BUILT_IN_CHOICE),
+            theme::BLUE_WASH,
+            "a configuration served by the built-in client does not show it as chosen"
+        );
+        assert_ne!(
+            second.fill_behind(OFFICIAL_CHOICE),
+            theme::BLUE_WASH,
+            "the official CLI is still painted as chosen on a vault the built-in client serves"
         );
 
         // ...and back, so the two paints above are telling the states apart
         // rather than reporting one constant twice.
-        take_the_backend_switch(&ctx, &mut state, second.rects_of_size(TOGGLE_SIZE)[0].center());
+        take_the_backend_switch(&ctx, &mut state, OFFICIAL_CHOICE);
         assert!(state.settings.use_official_bw_crypto);
         assert_eq!(
             choose(SERVER, state.settings.use_official_bw_crypto),
@@ -9683,75 +10039,121 @@ mod tests {
         );
 
         // And the copy reads the same way round as the control does. A row
-        // whose pill is right and whose sentence is backwards is the same
+        // whose control is right and whose sentence is backwards is the same
         // defect delivered in prose.
+        //
+        // **This used to pin an ON paragraph and an OFF paragraph**, in that
+        // order, because the row was a pill and its copy had to name both of
+        // its states. There are no states to name now -- the cells carry the
+        // names -- so what is pinned is that the copy describes the two
+        // clients in the order the cells are drawn in, which is the same
+        // claim about the same possible inversion: a reader who matches the
+        // first sentence to the first cell must be matching the right pair.
         let copy = official_crypto_description(true);
-        // The needle grew rather than shrank when the parenthetical went. It
-        // used to be "On (the default)", and "the default" stopped being true
-        // of this row: the backend is a property of the account now, derived
-        // from its server when it is first signed in, so a self-hosted account
-        // defaults to the built-in client and this row's ON is not what it
-        // opens on. What replaces it asserts the same position AND that the
-        // sentence is scoped to one account, which is the fact that changed.
-        let on = copy
-            .find("On, this account's vault")
-            .expect("the copy no longer names the on state, scoped to the account");
-        let off = copy.find("Off is much lighter").expect("the copy no longer names the off state");
-        assert!(on < off, "the copy describes the off state first, under a label that reads on");
+        let official = copy
+            .find("The official Bitwarden CLI")
+            .expect("the copy no longer describes the official CLI");
+        let built_in = copy
+            .find("Deskwarden's built-in client")
+            .expect("the copy no longer describes the built-in client");
         assert!(
-            copy[on..off].contains("official Bitwarden CLI"),
-            "the copy's ON paragraph does not say the official CLI is what ON means: {:?}",
-            &copy[on..off]
+            official < built_in,
+            "the copy describes the built-in client first, under a picker whose first cell \
+             is the official CLI: {copy:?}"
         );
+        // ...and the cells are drawn in that order, so the comparison above
+        // is against the layout rather than against a memory of it. `bw`'s
+        // cell is to the LEFT of the built-in client's.
+        let painted = tall_frame(&ctx, &mut state, &[]);
         assert!(
-            copy[off..].contains("built-in client"),
-            "the copy's OFF paragraph does not say the built-in client is what OFF means: {:?}",
-            &copy[off..]
+            painted.rect_of(OFFICIAL_CHOICE).center().x
+                < painted.rect_of(BUILT_IN_CHOICE).center().x,
+            "the cells are drawn in the opposite order to the copy above them"
         );
     }
 
     /// **What the enabled copy has to say**, asserted as text rather than
     /// trusted to a reviewer: this is what a user reads before deciding where
     /// their master key lives.
+    ///
+    /// # Two needles left this test, and neither lost its cover
+    ///
+    /// The four-paragraph copy this row used to carry also said that the
+    /// switch re-authenticates and that going back deletes `userkey.bin`.
+    /// Those are consequences of *taking* the switch, not of choosing between
+    /// two clients, and they are said where they are acted on: the
+    /// confirmation this row raises
+    /// ([`backend_switch_prompt`]), which
+    /// `only_the_switch_back_to_bw_mentions_the_deleted_vault_key` pins on
+    /// both directions and which no user can take the switch without reading.
+    /// Moving them there is what let the row shrink from four paragraphs to
+    /// two, which is what the owner asked for.
+    ///
+    /// # The needles that grew
+    ///
+    /// It used to check that the copy said what the built-in client buys in
+    /// the owner's own words -- "much lighter and faster" -- and said nothing
+    /// at all about how much lighter. It now checks the two measured numbers
+    /// from the README's table, ~118 MB and ~21 MB, which is a claim a stale
+    /// figure fails: the row said "about 110 MB" for two releases and nothing
+    /// measured anywhere in this repository agrees with it.
+    ///
+    /// And it checks that the copy does NOT demand a restart, which is the
+    /// sentence 0.15.4 made false. See [`official_crypto_description`].
     #[test]
     fn the_backend_rows_copy_states_the_gain_the_cost_and_the_restart() {
         let copy = official_crypto_description(true);
+        // Both clients named, in the copy as well as on the cells. A
+        // description that named only one would put the other back in the
+        // unnamed position the on/off pill gave it.
         assert!(
-            copy.contains("much lighter and faster"),
-            "the copy does not say what turning it off buys, in the owner's own words"
+            copy.contains("official Bitwarden CLI") && copy.contains("built-in client"),
+            "the copy does not name both clients: {copy:?}"
+        );
+        // **What each side costs, from the README's measured table.** ~118 MB
+        // for the `bw serve` subprocess, ~21 MB for the whole app on the
+        // built-in client -- the same two figures `README.md`'s memory table
+        // publishes, so a reader who compares them finds one answer.
+        assert!(
+            copy.contains("118 MB"),
+            "the copy does not say what the official CLI costs in memory: {copy:?}"
         );
         assert!(
-            copy.contains("your passwords are stored in the app"),
-            "the copy does not say what turning it off costs, without a euphemism"
+            copy.contains("21 MB"),
+            "the copy does not say what the built-in client costs in memory, so \
+             \"lighter\" is a claim with no number behind it: {copy:?}"
+        );
+        // The stale figure, named so it cannot come back.
+        assert!(
+            !copy.contains("110 MB"),
+            "the copy is back on the 110 MB nothing in this repository measures: {copy:?}"
+        );
+        assert!(
+            copy.contains("stored in the app"),
+            "the copy does not say what the built-in client costs, without a euphemism"
         );
         assert!(
             copy.contains("never expires"),
             "the copy does not say the stored key outlives a session, which is the one \
              property that makes it different from the session token this app already keeps"
         );
+        // **When it applies.** A setting that appears to do nothing when
+        // clicked is a setting the user clicks again, and the thing they
+        // would be clicking is the one that decides where their master key
+        // lives.
         assert!(
-            copy.contains("next time Deskwarden starts"),
-            "the copy does not say the change takes effect on restart, so a user who clicks it \
-             and sees nothing happen clicks it again"
+            copy.contains("next time you sign in to this account"),
+            "the copy does not say when the change takes effect, so a user who presses a \
+             cell and sees nothing happen presses it again: {copy:?}"
         );
-        // **The two costs a restart alone does not describe.** Switching in
-        // either direction re-derives the vault key, so the master password
-        // is asked for again -- a user who expects a relaunch and gets a
-        // login prompt will assume something broke. And `main` deletes
-        // `userkey.bin` when an account stops being served over REST
-        // (`user_key_store::UserKeyStore::clear`), which is the reassuring
-        // half: turning the built-in client back off does not leave a
-        // non-expiring master key on the disk. Both are consequences of
-        // clicking this row and neither is visible from it.
+        // **And it no longer says the wrong moment.** `settle_the_vault_backend`
+        // used to run only at startup; since 0.15.4 a sign-in re-settles the
+        // live process, so "the next time Deskwarden starts" names a route
+        // rather than the requirement -- and names the slower of the two.
         assert!(
-            copy.contains("asks you to sign in again"),
-            "the copy does not say the switch re-authenticates, so a login prompt after a \
-             relaunch reads as a failure: {copy:?}"
-        );
-        assert!(
-            copy.contains("deletes the stored vault key from this PC"),
-            "the copy does not say the stored key is removed when the switch goes back, so a \
-             user cannot tell whether turning this back on undoes what it did: {copy:?}"
+            !copy.contains("next time Deskwarden starts"),
+            "the copy still tells the user to restart, which stopped being the requirement \
+             when `direct_login_for_this_sign_in` began re-settling the backend: {copy:?}"
         );
         // The disabled twin says what would make it available, and does not
         // repeat the trade -- there is nothing to weigh on a server this
@@ -9759,8 +10161,8 @@ mod tests {
         let ghosted = official_crypto_description(false);
         assert!(ghosted.contains("Only available on a self-hosted server"));
         assert!(
-            !ghosted.contains("much lighter and faster"),
-            "the unavailable row offers a trade the user cannot take"
+            !ghosted.contains("21 MB") && !ghosted.contains("118 MB"),
+            "the unavailable row offers a trade the user cannot take: {ghosted:?}"
         );
     }
 

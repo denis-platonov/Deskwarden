@@ -18,6 +18,7 @@
 //! cargo run --example ui_preview -- --login --screenshot  # the login window
 //! cargo run --example ui_preview -- --cli-setup --screenshot      # the CLI requirement modal
 //! cargo run --example ui_preview -- --backend-choice --screenshot # the self-hosted backend choice
+//! cargo run --example ui_preview -- --vault --screenshot        # the Vault page, both clients
 //! cargo run --example ui_preview -- --all                 # EVERY surface below
 //! ```
 //!
@@ -308,6 +309,27 @@ enum Surface {
     /// local timestamp and outcome -- including one that failed, so the two
     /// inks are in one picture.
     PrefsBreachesHistory,
+    /// **The Vault page with the official Bitwarden CLI chosen**, on a
+    /// self-hosted account -- the only account where the choice is live.
+    ///
+    /// Its own surface because the page's whole shape depends on the answer:
+    /// the two-cell picker at the top says which client, and the row about
+    /// keeping `bw serve` running exists only on this side of it. That is a
+    /// claim about a picture -- does the page read as one decision and its
+    /// consequences? -- and no count of painted rectangles answers it.
+    ///
+    /// **The page had no preview at all until now**, which is how a settings
+    /// screen ships with copy nobody has read at its real width. The sibling
+    /// requirement modal shipped blank for exactly that reason.
+    PrefsVaultOfficialCli,
+    /// **The same page with Deskwarden's built-in client chosen**, and the
+    /// picture the pair exists for: one row fewer, because
+    /// `keep_backend_running` is about a subprocess this side does not have.
+    ///
+    /// Rendered beside its twin rather than instead of it, so the difference
+    /// between the two states is something a reviewer can see rather than
+    /// something they have to take on trust.
+    PrefsVaultBuiltIn,
     /// **The Password health screen with breach findings on it**, All filter.
     ///
     /// The state the whole breach half exists for, and the one no rect
@@ -507,6 +529,8 @@ const ALL: &[Surface] = &[
     Surface::PrefsBreachesRunning,
     Surface::PrefsBreachesFailed,
     Surface::PrefsBreachesHistory,
+    Surface::PrefsVaultOfficialCli,
+    Surface::PrefsVaultBuiltIn,
     Surface::VaultList,
     Surface::VaultRail,
     Surface::VaultHealth,
@@ -569,6 +593,8 @@ impl Surface {
             Surface::PrefsBreachesRunning => "prefs_breaches_running",
             Surface::PrefsBreachesFailed => "prefs_breaches_failed",
             Surface::PrefsBreachesHistory => "prefs_breaches_history",
+            Surface::PrefsVaultOfficialCli => "prefs_vault_official_cli",
+            Surface::PrefsVaultBuiltIn => "prefs_vault_built_in",
             Surface::VaultList => "vault_item_list",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
@@ -656,7 +682,9 @@ impl Surface {
             | Surface::PrefsBreachesIdle
             | Surface::PrefsBreachesRunning
             | Surface::PrefsBreachesFailed
-            | Surface::PrefsBreachesHistory => egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT),
+            | Surface::PrefsBreachesHistory
+            | Surface::PrefsVaultOfficialCli
+            | Surface::PrefsVaultBuiltIn => egui::vec2(PREFS_BODY_WIDTH, PREFS_BODY_HEIGHT),
             // The WHOLE window, chrome included -- the one prefs surface that
             // is not the body alone, because the seam it exists to show is
             // between the two.
@@ -736,6 +764,11 @@ fn main() -> eframe::Result {
     // The self-hosted sign-in's backend choice. Its own flag, because it is
     // its own question and a reviewer asks to see one or the other.
     let backend_choice = arg("--backend-choice");
+    // Preferences' Vault page, in both of its backend-picker states. One
+    // flag for the pair, exactly as `--backend-choice` is one flag for the
+    // two shapes of the modal it names: the two pictures are only useful
+    // beside each other, because what they are for is the difference.
+    let vault = arg("--vault");
     let login = signin || cli_setup || backend_choice || arg("--login");
     let list = arg("--list");
     let rail = arg("--rail");
@@ -749,6 +782,8 @@ fn main() -> eframe::Result {
         vec![Surface::LoginCliSetup]
     } else if backend_choice {
         vec![Surface::LoginBackendChoice, Surface::LoginBackendChoiceReturning]
+    } else if vault {
+        vec![Surface::PrefsVaultOfficialCli, Surface::PrefsVaultBuiltIn]
     } else if signin {
         vec![Surface::LoginSignin]
     } else if login {
@@ -792,6 +827,11 @@ fn main() -> eframe::Result {
         // A DIRECTORY, not a file: this flag renders two surfaces, and a
         // single path would leave the second one overwriting the first.
         target_dir().join("ui_preview_backend_choice")
+    } else if vault {
+        // A DIRECTORY too, and for `--backend-choice`'s reason: this flag
+        // renders the Vault page in both of its picker states, and the whole
+        // point of the pair is that they can be laid side by side.
+        target_dir().join("ui_preview_vault")
     } else if signin {
         target_dir().join("ui_preview_signin.png")
     } else if login {
@@ -821,7 +861,7 @@ fn main() -> eframe::Result {
                 // returning account meets. Without this both would be
                 // written to one path and the reviewer would be looking at
                 // whichever finished last, believing it was the only one.
-                directory: all || backend_choice,
+                directory: all || backend_choice || vault,
                 out,
                 form: LoginForm::default(),
                 // The app name a real 3c card would have been pre-filled with,
@@ -1057,6 +1097,9 @@ impl eframe::App for Preview {
             | Surface::PrefsBreachesRunning
             | Surface::PrefsBreachesFailed
             | Surface::PrefsBreachesHistory => self.draw_prefs_breaches(root, self.current()),
+            Surface::PrefsVaultOfficialCli | Surface::PrefsVaultBuiltIn => {
+                self.draw_prefs_vault(root, self.current())
+            }
             Surface::PrefsWindowChrome => self.draw_prefs_window(root),
             Surface::VaultList => self.draw_vault_list(root),
             Surface::VaultRail => self.draw_vault_rail(root),
@@ -1291,6 +1334,41 @@ impl Preview {
     /// The history is supplied here rather than read off disk: this example
     /// must not touch `%APPDATA%\Deskwarden`, and the instants below are
     /// stated so the picture is the same one twice running.
+    /// The Vault page, in each of the two states the backend picker has.
+    ///
+    /// **A self-hosted account throughout**, installed through
+    /// `PrefsState::show_account_source` and never through
+    /// `prefs_ui::publish_account_status`: that writes a process-wide value,
+    /// and this example draws every surface in one process. It has to be
+    /// self-hosted, because that is the only account where the choice is live
+    /// -- on `bitwarden.com` both cells are ghosted and the two pictures
+    /// would be the same picture.
+    ///
+    /// Nothing here reads a vault, a file or the network. The state is
+    /// rebuilt each frame, as `draw_prefs` rebuilds its own: there is nothing
+    /// on this page to carry between frames, and the Windows Hello probe
+    /// `PrefsState::new` installs answers "unavailable" without asking the
+    /// OS.
+    fn draw_prefs_vault(&mut self, root: &mut egui::Ui, surface: Surface) {
+        fn self_hosted() -> Option<prefs_ui::AccountStatus> {
+            Some(prefs_ui::AccountStatus::SignedIn {
+                email: Some("someone@example.com".to_string()),
+                server: Some("https://vault.example.com".to_string()),
+            })
+        }
+
+        theme::paint_window_background(root);
+        let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings {
+            use_official_bw_crypto: matches!(surface, Surface::PrefsVaultOfficialCli),
+            ..deskwarden::settings::Settings::default()
+        });
+        state.show(prefs_ui::Section::Vault);
+        state.show_account_source(self_hosted);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new())
+            .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));
+    }
+
     fn draw_prefs_breaches(&mut self, root: &mut egui::Ui, surface: Surface) {
         use deskwarden::breach_scan::ScanStage;
         use deskwarden::scan_history::{ScanHistory, ScanRecord};
