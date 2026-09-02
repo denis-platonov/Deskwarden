@@ -35,6 +35,32 @@ Deskwarden now checks before it opens the window, and when there is no stored
 key it keeps the window in the process that *can* sign you in, so signing in
 stores the key and finishes the switch.
 
+## 0.15.7 - 2026-09-02
+
+### Your own server needs no Bitwarden CLI, in every window
+
+Three things still reached for that program on a self-hosted account using
+the built-in client, and all three are fixed:
+
+- **The vault window refused to open at all** without it, and told you to
+  reinstall Deskwarden to get it back — which would not have worked, since
+  setup stopped installing it in 0.15.1.
+- **Exporting your vault and anything to do with Sends** reached for it from
+  inside that window, and failed.
+- The window and the background service each decided which client to use
+  before being told which one you had chosen, so both assumed the CLI.
+
+Deskwarden now settles that question once in every process it starts. There
+are tests that count what actually runs and require zero.
+
+### The memory figures are ones you can check
+
+Every memory number shown in the app is now measured on the counter Windows
+Task Manager shows in its **Memory** column, and says which state it applies
+to. The tray is about **19 MB**; the vault window about **76 MB** while it is
+open. A figure of "100 MB in a second process" appeared nowhere in any
+measurement and is gone.
+
 ## 0.15.6 - 2026-09-01
 
 ### Your first sign-in is remembered straight away
