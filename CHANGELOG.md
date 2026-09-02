@@ -35,6 +35,29 @@ Deskwarden now checks before it opens the window, and when there is no stored
 key it keeps the window in the process that *can* sign you in, so signing in
 stores the key and finishes the switch.
 
+## 0.15.5 - 2026-09-01
+
+### Signing in asks which client should open your vault
+
+On a **self-hosted** server, signing in now asks whether to use Deskwarden's
+built-in client or Bitwarden's official CLI, and says what each one costs
+you. It asks every time, with your last answer already selected, so changing
+your mind is one click rather than a hunt through Preferences. Either answer
+takes effect on that sign-in.
+
+On **bitwarden.com or bitwarden.eu** there is no choice to make — those
+servers need the CLI — so it tells you what it is about to install
+instead of asking.
+
+### A window that cannot open now says why
+
+Switching to the built-in client could leave the vault window silently
+failing to open: no window, no error, nothing in front of you. The tray and
+autofill kept working, which made it stranger.
+
+The window now opens anyway — and where it genuinely cannot, it says which
+of the five reasons stopped it instead of exiting quietly.
+
 ## 0.15.4 - 2026-09-01
 
 ### Signing in to your own server really does not need the Bitwarden CLI
