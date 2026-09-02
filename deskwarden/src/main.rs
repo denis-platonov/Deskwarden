@@ -11015,7 +11015,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         // released while hidden. Without that release the setting would
         // silently pin `bw serve` up: `stop_backend_if_idle` asks
         // `vault_service::anyone_else_attached`, so a hidden child that
-        // stayed attached would hold ~111 MB of backend against a user
+        // stayed attached would hold ~118 MB of backend against a user
         // who turned `keep_backend_running` OFF for exactly that reason.
         // Two settings, two answers, neither quietly deciding the other.
         let env = deskwarden::vault_service::windows_env();

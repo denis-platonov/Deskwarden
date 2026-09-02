@@ -7,7 +7,7 @@
 /// Whether the backend should be running right now.
 ///
 /// With `keep_backend_running` the answer is always yes -- today's
-/// behaviour, everything instant, ~111 MB held at idle. Without it, the
+/// behaviour, everything instant, ~118 MB held at idle. Without it, the
 /// backend is only started for the operations that genuinely need it
 /// (`open_vault_window`, the tray's Sync item, "Add app...") and torn back
 /// down again once idle (`stop_backend_if_idle`, called from `main`'s own

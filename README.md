@@ -322,19 +322,30 @@ figures, not estimates.
 
 Deskwarden has two backends and two processes, so a single number would be
 wrong four ways. What follows is private working set -- the figure Windows
-Task Manager's "Memory" column shows -- measured on one machine, on 0.11.1.
+Task Manager's "Memory" column shows -- measured on one machine, re-measured
+on 0.15.6.
+
+**Which counter, and why it matters here.** The same idle process reads
+~19 MB of private working set, ~44 MB of working set, and ~21 MB of private
+bytes: three numbers, a factor of two apart, all correct. PowerShell's
+`Get-Process` reports the latter two and not the first, so a figure checked
+that way will not match this table and nothing is wrong. Every number below
+is private working set, which is what Task Manager shows you by default.
 
 **The tray, which is the state that lasts hours:**
 
 | | Deskwarden's own process | `bw serve` beside it |
 | --- | --- | --- |
 | Default backend (official CLI) | ~10 MB | ~118 MB |
-| Direct backend (self-hosted only) | ~21 MB | **none** |
+| Direct backend (self-hosted only) | ~19 MB | **none** |
 
 The direct backend's own process is larger because it holds the vault and the
 cryptography itself. It is still about a seventh of the pair it replaces.
 
-**The vault window** is its own process and costs ~76 MB while open. It exits
+**The vault window** costs ~76 MB while open, usually in a process of its
+own. Usually, not always: on the direct backend, before a master password has
+been entered once, only the tray process can ask for one -- so it hosts the
+window itself and you see a single process carrying both figures. It exits
 when you close it, and that is the point: it is an accelerated-graphics window,
 and the GPU driver never returns what it takes, so the only way to get that
 memory back is for the process holding it to end. Everything that appears
@@ -346,7 +357,7 @@ costing under 2 MB each and loading no driver at all.
 sits at 132-135 MB across its four processes. Deskwarden on the default backend
 is close to parity once the CLI is counted -- which it has to be, because it is
 what does the vault work. On the direct backend, idling in the tray, it is
-~21 MB against ~132 MB.
+~19 MB against ~132 MB.
 
 If idle RAM matters and you are on the default backend, `bw serve` can be shut
 down when nothing needs it: Preferences -> Sync & account -> "Keep the

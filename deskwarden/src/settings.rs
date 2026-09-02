@@ -765,7 +765,7 @@ pub struct Settings {
     /// Whether `bw serve` stays running while the vault is unlocked.
     ///
     /// `true` (the default) is today's behaviour: everything is instant and
-    /// the backend holds ~111 MB at idle. `false` runs it only while the
+    /// the backend holds ~118 MB at idle. `false` runs it only while the
     /// vault window is open; reads come from `VaultCache` either way, so
     /// autofill is unaffected.
     pub keep_backend_running: bool,
@@ -776,7 +776,7 @@ pub struct Settings {
     /// its process, and the next open is a cold start -- measured at 263 ms
     /// to the first frame and 5.65 s to 1668 items on screen. `true` keeps
     /// that process alive with its viewport hidden, so every reopen is
-    /// immediate, at the cost of roughly 100 MB held while the vault is
+    /// immediate, at the cost of roughly 76 MB held while the vault is
     /// unlocked.
     ///
     /// **The sibling of [`Settings::keep_backend_running`] above, and the
@@ -1770,7 +1770,7 @@ mod tests {
         assert!(!Settings::default().cache_vault_to_disk);
     }
 
-    /// **Off unless asked for.** This setting spends ~100 MB for speed,
+    /// **Off unless asked for.** This setting spends ~76 MB for speed,
     /// and a memory cost nobody chose is the complaint this whole split
     /// came from ("tray again is 50Mb").
     #[test]

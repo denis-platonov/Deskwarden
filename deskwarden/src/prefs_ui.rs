@@ -153,7 +153,7 @@ const UI_LOADED_LABEL: &str = "Open the vault instantly";
 /// that what they have to tell the app actually gets told.
 const UI_LOADED_DESCRIPTION: &str =
     "Keeps the vault window loaded and hidden after you close it, so it opens \
-     immediately next time. Holds about 100 MB while the vault is unlocked. \
+     immediately next time. Holds about 76 MB while the vault is unlocked. \
      Locking, switching account or changing these settings closes it fully.";
 
 /// The description under [`BACKEND_LABEL`].
@@ -255,7 +255,7 @@ const BUILT_IN_CHOICE: &str = "Deskwarden's built-in client";
 /// Three properties the tests below still hold, each deliberate:
 ///
 ///  * **each side is named and costed.** The memory figures are the README's
-///    measured table -- ~118 MB for the `bw serve` subprocess, ~21 MB total
+///    measured table -- ~118 MB for the `bw serve` subprocess, ~19 MB total
 ///    for the built-in client -- and not a fourth number invented here. The
 ///    row said "about 110 MB" for years and nothing measured agrees with it;
 ///  * **the cost of the built-in client is stated without a euphemism**: the
@@ -284,7 +284,7 @@ fn official_crypto_description(self_hosted: bool) -> &'static str {
     if self_hosted {
         "The official Bitwarden CLI is the `bw` program: it holds your keys in a background \
          process of its own, and costs about 118 MB of RAM. Deskwarden's built-in client \
-         talks to your server itself for about 21 MB in total — but then the key that \
+         talks to your server itself for about 19 MB in total — but then the key that \
          unlocks your vault is stored in the app, kept on this PC and protected by Windows, \
          and unlike a session it never expires, so anyone who can run programs as you on \
          this PC can use it.\n\n\
@@ -5996,7 +5996,8 @@ mod tests {
     /// **The row says what it costs, not only what it buys.**
     ///
     /// The backend row beside it names its ~118 MB; this one holds about
-    /// 100 MB in a second process, and a user who discovers that in Task
+    /// 76 MB -- in the window's own process where there is one, and in the tray
+    /// process where the window is hosted there -- and a user who finds it in Task
     /// Manager rather than here has been surprised by their own settings.
     /// That surprise is the report this whole split came from.
     #[test]
@@ -6004,6 +6005,33 @@ mod tests {
         assert!(
             UI_LOADED_DESCRIPTION.contains("MB"),
             "the row does not say what it costs, so the memory is a surprise: \
+             {UI_LOADED_DESCRIPTION}"
+        );
+        // **The measured figure, not a round one.** A kept-loaded vault window
+        // is ~76 MB of private working set -- Task Manager's "Memory" column,
+        // the counter `README.md`'s table publishes. The row said "about
+        // 100 MB" and nothing in this repository measures that.
+        assert!(
+            UI_LOADED_DESCRIPTION.contains("76 MB"),
+            "the row is off the measured vault-window figure: {UI_LOADED_DESCRIPTION}"
+        );
+        for stale in ["100 MB", "110 MB", "111 MB"] {
+            assert!(
+                !UI_LOADED_DESCRIPTION.contains(stale),
+                "the row is back on {stale}, which nothing in this repository measures: \
+                 {UI_LOADED_DESCRIPTION}"
+            );
+        }
+        // **And it does not claim a second process.** Whether the window has
+        // one is decided by `RealVaultOps::open_window`: the daemon hosts the
+        // window ITSELF on an account served by the built-in client with no
+        // stored user key, so on that configuration -- the owner's -- there is
+        // no second process and the memory lands on the tray process. A row
+        // that promised one sent the user looking in Task Manager for a
+        // process that is not there.
+        assert!(
+            !UI_LOADED_DESCRIPTION.contains("second process"),
+            "the row promises a second process the built-in client does not always have: \
              {UI_LOADED_DESCRIPTION}"
         );
         assert!(
@@ -10094,7 +10122,7 @@ mod tests {
     /// It used to check that the copy said what the built-in client buys in
     /// the owner's own words -- "much lighter and faster" -- and said nothing
     /// at all about how much lighter. It now checks the two measured numbers
-    /// from the README's table, ~118 MB and ~21 MB, which is a claim a stale
+    /// from the README's table, ~118 MB and ~19 MB, which is a claim a stale
     /// figure fails: the row said "about 110 MB" for two releases and nothing
     /// measured anywhere in this repository agrees with it.
     ///
@@ -10111,7 +10139,7 @@ mod tests {
             "the copy does not name both clients: {copy:?}"
         );
         // **What each side costs, from the README's measured table.** ~118 MB
-        // for the `bw serve` subprocess, ~21 MB for the whole app on the
+        // for the `bw serve` subprocess, ~19 MB for the whole app on the
         // built-in client -- the same two figures `README.md`'s memory table
         // publishes, so a reader who compares them finds one answer.
         assert!(
@@ -10119,15 +10147,22 @@ mod tests {
             "the copy does not say what the official CLI costs in memory: {copy:?}"
         );
         assert!(
-            copy.contains("21 MB"),
+            copy.contains("19 MB"),
             "the copy does not say what the built-in client costs in memory, so \
              \"lighter\" is a claim with no number behind it: {copy:?}"
         );
         // The stale figure, named so it cannot come back.
-        assert!(
-            !copy.contains("110 MB"),
-            "the copy is back on the 110 MB nothing in this repository measures: {copy:?}"
-        );
+        // The stale figures, named so they cannot come back. "110 MB" was
+        // the row's own for two releases; "111 MB" was `backend_policy`'s
+        // fourth number for the same subprocess; "21 MB" was the built-in
+        // client's figure before it was re-measured on 0.15.6 (~19 MB).
+        for stale in ["110 MB", "111 MB", "21 MB"] {
+            assert!(
+                !copy.contains(stale),
+                "the copy is back on {stale}, which nothing in this repository measures: \
+                 {copy:?}"
+            );
+        }
         assert!(
             copy.contains("stored in the app"),
             "the copy does not say what the built-in client costs, without a euphemism"
@@ -10161,7 +10196,7 @@ mod tests {
         let ghosted = official_crypto_description(false);
         assert!(ghosted.contains("Only available on a self-hosted server"));
         assert!(
-            !ghosted.contains("21 MB") && !ghosted.contains("118 MB"),
+            !ghosted.contains("19 MB") && !ghosted.contains("118 MB"),
             "the unavailable row offers a trade the user cannot take: {ghosted:?}"
         );
     }

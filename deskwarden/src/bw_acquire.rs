@@ -638,7 +638,7 @@ impl CliSetupState {
             // them: name what the thing does and what it costs.
             //
             // The built-in client gets its case first and gets the BLUE
-            // button (see `buttons`), because running in about a fifth of the
+            // button (see `buttons`), because running in about a seventh of the
             // memory with no second process is what this app is FOR. What
             // keeps that from being a sales pitch is the third paragraph:
             // it is the built-in client's own costs, not the CLI's, and it is
@@ -676,14 +676,14 @@ impl CliSetupState {
             //
             // **The figures are `README.md`'s measured table**, not
             // estimates and not the round numbers they were asked for:
-            // ~10 MB for Deskwarden beside ~118 MB for `bw serve`, ~21 MB for
+            // ~10 MB for Deskwarden beside ~118 MB for `bw serve`, ~19 MB for
             // the built-in client with nothing beside it, and the backend's
             // ~8 s cold start after a restart. A user can check every one of
             // them in Task Manager, which is why they are the measured ones.
             Self::Choosing => vec![
                 format!(
-                    "{BUILT_IN_NAME} talks to your server itself: about 21 MB of memory, \
-                     no second program, and no wait after a restart. Running small is what \
+                    "{BUILT_IN_NAME} talks to your server itself: about 19 MB of memory in the \
+                     tray, no second program, and no wait after a restart. Running small is what \
                      this app is for."
                 ),
                 // **Not `{OFFICIAL_CLI_NAME}` at the front.** That
@@ -1849,12 +1849,31 @@ mod tests {
             // A cost named without its size is not a cost the user can weigh,
             // and these four are `README.md`'s measured figures. Asserted
             // individually so a paragraph that drops one fails naming it.
-            for figure in ["21 MB", "118 MB", "10 MB", "8 seconds"] {
+            for figure in ["19 MB", "118 MB", "10 MB", "8 seconds"] {
                 assert!(
                     body.contains(figure),
                     "{state:?} does not say {figure:?}. The choice between these two \
                      clients IS the resource cost, and a user cannot weigh it against a \
                      paragraph of adjectives: {body:?}"
+                );
+            }
+
+            // **A figure without its state is not checkable.** ~19 MB is the
+            // TRAY, and the same process holding an open vault window is far
+            // larger -- so a user who reads a bare "19 MB", opens the vault
+            // and looks in Task Manager finds the copy wrong. Naming the
+            // state is what makes the number something they can verify.
+            assert!(
+                body.contains("19 MB of memory in the tray"),
+                "{state:?} gives the built-in client's memory with no state attached, so \
+                 the figure cannot be checked against Task Manager: {body:?}"
+            );
+
+            // The figures that were never measured anywhere in this repository.
+            for stale in ["21 MB", "100 MB", "110 MB", "111 MB"] {
+                assert!(
+                    !body.contains(stale),
+                    "{state:?} is back on {stale}: {body:?}"
                 );
             }
 
