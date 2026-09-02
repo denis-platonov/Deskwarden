@@ -35,6 +35,38 @@ Deskwarden now checks before it opens the window, and when there is no stored
 key it keeps the window in the process that *can* sign you in, so signing in
 stores the key and finishes the switch.
 
+## 0.15.6 - 2026-09-01
+
+### Your first sign-in is remembered straight away
+
+After signing in for the first time, Deskwarden kept showing you as signed
+in to nothing: **Settings** claimed you were using the Bitwarden CLI when you
+had chosen the built-in client, and the account menu showed a long code
+instead of your address. The vault itself was fine — only the record of it
+was missing, and it was not written until you closed the vault window.
+
+It is written the moment you sign in now.
+
+### The Vault settings page follows the client you chose
+
+**Which client opens this vault** is now a pair of named choices rather than
+a switch for one of them, and the settings that only apply to the Bitwarden
+CLI disappear when you are not using it.
+
+Changing it takes effect the next time you sign in to that account — not
+after a restart, as the old wording said.
+
+### The sign-in question is shorter, and two of its warnings were wrong
+
+It said the built-in client could not put a file in a Send, or ask for an
+e-mail address before one is opened. Neither is a reason to choose one
+client over the other: the Bitwarden CLI does not do those things here
+either. Both claims are gone.
+
+What remains is the honest comparison: about 21 MB of memory and no wait
+after a restart, against about 118 MB and roughly 8 seconds — and the one
+real cost, that the key unlocking your vault is then kept on this PC.
+
 ## 0.15.5 - 2026-09-01
 
 ### Signing in asks which client should open your vault
