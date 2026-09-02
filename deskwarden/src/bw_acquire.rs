@@ -494,10 +494,9 @@ pub enum CliSetupState {
     /// The owner's rule, verbatim: "always either notify (if bw.com) or
     /// prompt which one to use (self-hosted) when login".
     ///
-    /// It is not nagging, because a returning user's own previous answer is
-    /// `in_use` below -- carried out of `Account.use_official_bw_crypto` --
-    /// and it sits in the affirmative button position, so pressing through is
-    /// one keystroke and lands where they already were. What the repetition
+    /// It is not nagging, because both answers are one keystroke away and
+    /// the answer the sign-in would otherwise take silently is on the screen
+    /// as a labelled button rather than as a default. What the repetition
     /// buys is that the answer becomes changeable at the one moment changing
     /// it is free: a sign-in re-settles the backend from the record it is
     /// about (`login_ui::direct_login_for_this_sign_in` ->
@@ -508,32 +507,22 @@ pub enum CliSetupState {
     ///
     /// **No "don't ask again".** The silent default is the defect this state
     /// exists to remove, and a checkbox would put it back one click later.
-    Choosing {
-        /// **What this sign-in would use if the user answered nothing**:
-        /// `true` for the official CLI, `false` for the built-in client.
-        ///
-        /// Always `accounts::official_cli_after_sign_in(account, server,
-        /// None)` -- the one rule, which already answers both cases: an
-        /// established account's own record, and the derivation for a mint.
-        /// This module does not recompute either, which is why there is no
-        /// `is_self_hosted` call anywhere in this state.
-        ///
-        /// It decides which button sits in the affirmative position, and that
-        /// is the whole of what "preselected" means here: a POSITION, not a
-        /// default. Nothing is chosen until a button is pressed, and closing
-        /// the window chooses neither.
-        in_use: bool,
-        /// Whether this account has signed in before -- `!is_a_fresh_mint`.
-        ///
-        /// It changes one sentence and nothing else. A returning user is told
-        /// which client they are on, because they are on one and pressing
-        /// through should not feel like a coin toss; a brand new account is
-        /// not told it is "currently using" a client it has never run.
-        /// Carried rather than inferred from [`Self::in_use`], which cannot
-        /// tell the two apart: a mint on a self-hosted address and an
-        /// established built-in account both arrive here as `false`.
-        established: bool,
-    },
+    ///
+    /// **One shape, always -- no fields.** It carried two: `in_use`, the
+    /// client this sign-in would otherwise take, and `established`, whether
+    /// the account had signed in before. Between them they varied a sentence
+    /// of the body and the ORDER of the buttons. The owner's ruling on that
+    /// was to make it "same all the time", so a user who signs in twice reads
+    /// the same words in the same order and finds the same button under the
+    /// same finger -- and this modal has one layout to fit in the window
+    /// rather than four.
+    ///
+    /// **Nothing about the stored answer is lost**, because this modal was
+    /// never where it was honoured: the sign-in reads
+    /// `accounts::official_cli_after_sign_in`, and the button pressed here is
+    /// the `chosen_backend` handed to it. What went is the presentation
+    /// varying, not the record.
+    Choosing,
     /// **State 1.** The ask. Nothing has been fetched.
     Asking,
     /// **State 1, reached from the other direction.** The same ask, worded
@@ -644,59 +633,79 @@ impl CliSetupState {
     #[must_use]
     pub fn body(&self) -> Vec<String> {
         match self {
-            // **The two options, each with what it costs, and neither
-            // recommended in words.** `prefs_ui`'s rule: name what the thing
-            // does and what the user gives up. Neither paragraph is a
-            // recommendation and neither is shorter than the other, so the
-            // prose order carries no preference -- the BUTTONS carry the
-            // preselection (see `buttons`), and they are the half that moves.
-            // The paragraphs stay put so that a user who signs in twice
-            // reads the same text in the same order both times.
-            Self::Choosing { in_use, established } => vec![
-                // **Says which one is in use, in the body, before the
-                // options.** The buttons cannot say it -- their labels are
-                // the two answers and both have to read as available -- and
-                // a returning user pressing through deserves to know they
-                // are pressing through rather than switching.
-                if *established {
-                    format!(
-                        "This is a self-hosted server, so either client can open its \
-                         vault. This account is using {}. Choosing the other one takes \
-                         effect on this sign-in.",
-                        if *in_use { OFFICIAL_CLI_NAME } else { BUILT_IN_NAME }
-                    )
-                } else {
-                    "This is a self-hosted server, so either client can open its vault. \
-                     Deskwarden asks every time you sign in, and either answer takes \
-                     effect on this sign-in."
-                        .to_string()
-                },
-                // Three costs, and the third is the one a user cannot find
-                // out any other way. It is the same sentence
-                // `prefs_ui::official_crypto_description` puts under the
-                // toggle, because a user who meets this decision twice must
-                // not meet two different accounts of it.
-                "Deskwarden's built-in client talks to your server itself. Nothing is \
-                 downloaded, no second program is installed, and no background process \
-                 keeps running. It sends text only -- it cannot put a file in a Send, or \
-                 ask for an email address before one can be opened. And the key that \
-                 unlocks your vault is kept on this PC, protected by Windows: unlike a \
-                 session it never expires, so anyone who can run programs as you on this \
-                 PC can use it."
+            // **Two clients, each with its cost, in numbers.** `prefs_ui`'s
+            // rule, applied to the one screen where the user picks between
+            // them: name what the thing does and what it costs.
+            //
+            // The built-in client gets its case first and gets the BLUE
+            // button (see `buttons`), because running in about a fifth of the
+            // memory with no second process is what this app is FOR. What
+            // keeps that from being a sales pitch is the third paragraph:
+            // it is the built-in client's own costs, not the CLI's, and it is
+            // the paragraph a modal selling one answer would drop.
+            //
+            // **Two things this paragraph deliberately does NOT say**, both
+            // of which it said in 0.15.5 and both of which were false as
+            // costs:
+            //
+            //  * "it sends text only". True of the built-in client and
+            //    equally true of the CLI path -- `send::plan_to_invocation`
+            //    builds a text Send and nothing in this app builds any other
+            //    kind, which `rest::send`'s module doc states outright: this
+            //    is "parity with the other backend and not a subtraction from
+            //    it".
+            //  * "it cannot ask for an email address before one can be
+            //    opened". `rest::send::email_gated` refuses such a link BY
+            //    NAME, which reads as a limitation -- but the CLI path is
+            //    `bw send receive [--passwordenv X] <url>`
+            //    (`send::receive_invocation`) and carries no e-mail or OTP
+            //    route either. The direct path is the one that names the
+            //    case; naming it is not losing it.
+            //
+            // A cost that both options share is not a cost of choosing this
+            // one, and printing it beside a blue button is how a modal ends
+            // up looking even-handed while misleading.
+            //
+            // The one that IS real stays: `user_key_store`'s own module doc
+            // -- "a master key does not expire and cannot be revoked" -- and
+            // it is worded exactly as `prefs_ui::official_crypto_description`
+            // words it, because a user who meets this decision twice must not
+            // meet two accounts of it. It is a property of the stored KEY,
+            // not a claim about when the vault locks, which is a separate
+            // Preferences setting and is not what this sentence is about.
+            //
+            // **The figures are `README.md`'s measured table**, not
+            // estimates and not the round numbers they were asked for:
+            // ~10 MB for Deskwarden beside ~118 MB for `bw serve`, ~21 MB for
+            // the built-in client with nothing beside it, and the backend's
+            // ~8 s cold start after a restart. A user can check every one of
+            // them in Task Manager, which is why they are the measured ones.
+            Self::Choosing => vec![
+                format!(
+                    "{BUILT_IN_NAME} talks to your server itself: about 21 MB of memory, \
+                     no second program, and no wait after a restart. Running small is what \
+                     this app is for."
+                ),
+                // **Not `{OFFICIAL_CLI_NAME}` at the front.** That
+                // constant is the phrase "the Bitwarden CLI", written to sit
+                // MID-sentence, and this paragraph opened with it: the
+                // rendered modal read "the Bitwarden CLI is Bitwarden's own
+                // program", lowercase, at the start of a paragraph. Caught by
+                // looking at the picture, which is the only place a
+                // capital letter lives. `no_body_line_starts_in_lower_case`
+                // is the assertion that means the next one is not.
+                format!(
+                    "The Bitwarden CLI is Bitwarden's own program, run beside Deskwarden: \
+                     about 118 MB of memory on top of Deskwarden's 10 MB, and about 8 \
+                     seconds after a restart before the vault answers. Choosing \
+                     {OFFICIAL_CLI_NAME} will {DOWNLOAD_DISCLOSURE}"
+                ),
+                "What it costs: the key that unlocks your vault is kept on this PC, \
+                 protected by Windows, and unlike a session it never expires, so anyone \
+                 who can run programs as you on this PC can use it. And its cryptography \
+                 is checked against Bitwarden's published test vectors, but it is not \
+                 Bitwarden's code."
                     .to_string(),
-                // The CLI's case, made honestly, including the part that is
-                // an argument against the built-in client: it is not
-                // Bitwarden's code. `rest::crypto`'s module doc is where the
-                // test-vector claim comes from, and it is stated as what it
-                // is -- a check on the cryptography, not on the whole
-                // client.
-                "The official Bitwarden CLI is Bitwarden's own program, written and \
-                 maintained by them, and it holds your keys in a background process of its \
-                 own instead. Deskwarden's built-in client is a separate implementation of \
-                 the same protocol; its cryptography is checked against Bitwarden's \
-                 published test vectors, but it is not Bitwarden's code."
-                    .to_string(),
-                format!("Choosing {OFFICIAL_CLI_NAME} will {DOWNLOAD_DISCLOSURE}"),
             ],
             Self::Asking => vec![
                 "Signing in to a Bitwarden server requires the official Bitwarden CLI."
@@ -759,11 +768,20 @@ impl CliSetupState {
         }
     }
 
-    /// The buttons this state offers, left to right.
+    /// The buttons this state offers, left to right: label, what pressing it
+    /// means, and whether it is the PRIMARY -- the one
+    /// [`crate::login_ui::draw_cli_setup_modal`] paints with
+    /// `theme::primary_button`, the app's blue filled action button.
+    ///
+    /// The flag rather than a rule in the drawing code ("the last one is
+    /// blue"), because only one state has an answer worth leaning on and the
+    /// others must not acquire a blue button by sitting last. At most one
+    /// `true` per state -- `at_most_one_button_is_the_primary` holds that,
+    /// since two blue buttons name no preference at all.
     ///
     /// A failed signature offers no retry: see [`AcquireRefusal::retryable`].
     #[must_use]
-    pub fn buttons(&self) -> Vec<(&'static str, CliModalAction)> {
+    pub fn buttons(&self) -> Vec<(&'static str, CliModalAction, bool)> {
         match self {
             // **Two answers and no Cancel, because there is no third
             // outcome.** Every other state of this modal has one thing to do
@@ -772,33 +790,36 @@ impl CliSetupState {
             // returns the user to a form whose Continue leads straight back
             // to this modal.
             //
-            // **The client already in use goes LAST**, which
-            // `draw_cli_setup_modal`'s right-to-left row puts at the right
-            // edge -- the affirmative position, under the user's hand. So a
-            // returning user presses through to where they already were, and
-            // a new self-hosted account's affirmative is the built-in client,
-            // which is what the app would have chosen silently.
+            // **The same two buttons in the same places, every time.** The
+            // order used to move: the client already in use was placed last,
+            // which `draw_cli_setup_modal`'s right-to-left row puts at the
+            // right edge. The owner's ruling was "same all the time", and a
+            // fixed row is the stronger position anyway -- a control that
+            // swaps sides between sign-ins is a control that can be pressed
+            // from muscle memory and mean the other thing.
             //
-            // The ORDER carries the preselection because there is nothing
-            // else it could be carried by: these are two buttons, not a radio
-            // group with a Continue, and a modal with a preselected radio
-            // still needs a third control to commit it -- three clicks and a
-            // default that can be committed without being read. Two labelled
-            // answers cannot be pressed by accident and cannot be pressed
-            // without saying which one.
+            // **The built-in client is the primary**, the third element, and
+            // `draw_cli_setup_modal` paints it with `theme::primary_button` --
+            // the same blue as the login card's Continue, not a colour minted
+            // here. It sits last, so the right-to-left row puts it at the
+            // right edge: the affirmative position AND the blue one, which is
+            // the whole of how this modal says which way it leans. It says it
+            // in weight rather than in words, and
+            // `the_choice_names_both_costs_and_recommends_neither` still
+            // holds the PROSE to naming neither.
             //
-            // Both labels name their own answer in full, so the swap cannot
-            // become a trap: a user who reads the button they are pressing
-            // is told what it does wherever it sits, and neither label is
-            // "OK" or "Continue" -- the two words that would make position
-            // the only information.
-            Self::Choosing { in_use, .. } => {
-                let cli = ("Use the Bitwarden CLI", CliModalAction::UseOfficialCli);
-                let built_in = ("Use the built-in client", CliModalAction::UseBuiltIn);
-                if *in_use { vec![built_in, cli] } else { vec![cli, built_in] }
-            }
+            // Both labels name their own answer in full, so neither is "OK"
+            // or "Continue" -- the two words that would make position and
+            // colour the only information.
+            Self::Choosing => vec![
+                ("Use the Bitwarden CLI", CliModalAction::UseOfficialCli, false),
+                ("Use the built-in client", CliModalAction::UseBuiltIn, true),
+            ],
             Self::Asking | Self::AskingToRecover => {
-                vec![("Cancel", CliModalAction::Cancel), ("OK", CliModalAction::Begin)]
+                vec![
+                    ("Cancel", CliModalAction::Cancel, false),
+                    ("OK", CliModalAction::Begin, false),
+                ]
             }
             // **No Cancel during state 2.** Not offered rather than offered
             // and unsafe: the transfer runs on a worker that owns the temp
@@ -811,8 +832,8 @@ impl CliSetupState {
             // process that goes away before it leaves nothing behind, and the
             // scratch directory is swept at the next attempt.
             Self::Working { .. } => Vec::new(),
-            Self::Installed(_) => vec![("OK", CliModalAction::Close)],
-            Self::Failed(_) => vec![("Close", CliModalAction::Close)],
+            Self::Installed(_) => vec![("OK", CliModalAction::Close, false)],
+            Self::Failed(_) => vec![("Close", CliModalAction::Close, false)],
         }
     }
 }
@@ -1746,14 +1767,13 @@ mod tests {
     }
 
     /// Every shape of the choice modal, for the tests below.
+    ///
+    /// **There is exactly one**, and this function stays as a function
+    /// rather than being inlined so that the tests below keep reading "every
+    /// shape" -- if the state ever regains a field, they widen by widening
+    /// this, and no assertion below has to be remembered.
     fn every_choice() -> Vec<CliSetupState> {
-        let mut out = Vec::new();
-        for in_use in [false, true] {
-            for established in [false, true] {
-                out.push(CliSetupState::Choosing { in_use, established });
-            }
-        }
-        out
+        vec![CliSetupState::Choosing]
     }
 
     /// **The choice states both options honestly and steers toward neither.**
@@ -1779,14 +1799,29 @@ mod tests {
                  on this PC. That is the cost the user cannot find out any other way, and \
                  it is the one Preferences already tells them about: {body:?}"
             );
-            // **And what it cannot do**, established from `rest::send`:
-            // text-only Sends, and no email gate. Named because a user who
-            // picks the built-in client and then cannot attach a file has
-            // been surprised by a limit that was known at this screen.
-            assert!(
-                body.contains("cannot put a file in a Send"),
-                "{state:?} does not name the built-in client's Send limits: {body:?}"
-            );
+            // **And what it must NOT claim.** This assertion was the
+            // opposite one in 0.15.5: it required the modal to say the
+            // built-in client "cannot put a file in a Send". That is true and
+            // is not a COST, because the CLI path in this app builds text
+            // Sends too (`rest::send`'s module doc: "parity with the other
+            // backend and not a subtraction from it"), and neither path can
+            // receive an e-mail-gated Send -- `send::receive_invocation` is
+            // `bw send receive [--passwordenv X] <url>` and has no e-mail or
+            // OTP route.
+            //
+            // Reversed rather than deleted, and reversed knowingly: a modal
+            // that hands one answer the blue button and then invents
+            // drawbacks for it is not being even-handed, it is being wrong,
+            // and the wrongness runs in the direction that flatters the OTHER
+            // answer. The direction of this guard is the whole point of it.
+            for parity in ["text only", "file in a Send", "email address", "e-mail address"] {
+                assert!(
+                    !body.contains(parity),
+                    "{state:?} presents {parity:?} as something the built-in client gives \
+                     up. Both clients are equal on it in this app, so it is not a cost of \
+                     this choice: {body:?}"
+                );
+            }
 
             // **The CLI's real case, including the part that argues against
             // the other option.** A choice screen that would not say
@@ -1810,9 +1845,30 @@ mod tests {
                  {body:?}"
             );
 
-            // **No steering.** "secure" is `prefs_ui`'s named ban;
-            // "recommended" and "best" would pick for the user, which is the
-            // one thing this modal exists not to do.
+            // **The numbers, which are the whole point of the rewrite.**
+            // A cost named without its size is not a cost the user can weigh,
+            // and these four are `README.md`'s measured figures. Asserted
+            // individually so a paragraph that drops one fails naming it.
+            for figure in ["21 MB", "118 MB", "10 MB", "8 seconds"] {
+                assert!(
+                    body.contains(figure),
+                    "{state:?} does not say {figure:?}. The choice between these two \
+                     clients IS the resource cost, and a user cannot weigh it against a \
+                     paragraph of adjectives: {body:?}"
+                );
+            }
+
+            // **No steering IN THE PROSE.** "secure" is `prefs_ui`'s named
+            // ban; "recommend" and "best" would pick for the user in words.
+            //
+            // The modal does now lean -- the built-in client holds the blue
+            // primary button (see `buttons`) and its case is stated first.
+            // That is deliberate, and this guard is deliberately NOT relaxed
+            // to match: a lean carried by weight is one a user can see and
+            // discount, and a lean carried by the word "recommended" is a
+            // claim about which client is better that this app has no
+            // standing to make. The costs are stated either way, which is
+            // what makes the weight honest rather than a sales pitch.
             for banned in ["secure", "Secure", "recommend", "Recommend", "best", "safer"] {
                 assert!(
                     !body.contains(banned),
@@ -1823,59 +1879,114 @@ mod tests {
         }
     }
 
-    /// **The client in use is named, and it decides which button is where.**
+    /// **One row, one order, and the built-in client is the blue one.**
     ///
-    /// The preselection, asserted as behaviour rather than as a comment: the
-    /// affirmative slot is the LAST button (`draw_cli_setup_modal` lays the
-    /// row out right-to-left), and it must hold the option the sign-in would
-    /// take if the user pressed nothing.
+    /// The behaviour that replaced the preselection-by-position this modal
+    /// shipped with in 0.15.5. The order no longer depends on anything, so
+    /// there is nothing left to parameterise over -- what is asserted instead
+    /// is that the row is what it claims to be: two answers, no Cancel, and
+    /// the affirmative slot (LAST, because `draw_cli_setup_modal` lays the
+    /// row out right-to-left) held by the built-in client AND marked primary.
     #[test]
-    fn the_choice_preselects_the_client_already_in_use() {
-        for in_use in [false, true] {
-            for established in [false, true] {
-                let state = CliSetupState::Choosing { in_use, established };
-                let buttons = state.buttons();
-                assert_eq!(buttons.len(), 2, "{state:?} is a fork and must offer two answers");
-                let (label, action) = *buttons.last().expect("two buttons");
-                let want = if in_use {
-                    CliModalAction::UseOfficialCli
-                } else {
-                    CliModalAction::UseBuiltIn
-                };
-                assert_eq!(
-                    action, want,
-                    "{state:?} put {label:?} in the affirmative position, which is not the \
-                     client this sign-in would use if nothing were pressed. A returning \
-                     user pressing through would silently switch backends"
-                );
-                // Neither answer may be missing, whichever the order.
-                let actions: Vec<_> = buttons.iter().map(|(_, a)| *a).collect();
-                assert!(
-                    actions.contains(&CliModalAction::UseBuiltIn)
-                        && actions.contains(&CliModalAction::UseOfficialCli),
-                    "{state:?} does not offer both clients: {actions:?}"
-                );
-                // No Cancel: both prongs continue the sign-in, and a Cancel
-                // would return the user to a form whose Continue leads
-                // straight back here.
-                assert!(
-                    !actions.contains(&CliModalAction::Cancel),
-                    "{state:?} offers a Cancel that has nowhere to go"
-                );
+    fn the_choice_puts_the_built_in_client_in_the_blue_affirmative_slot() {
+        for state in every_choice() {
+            let buttons = state.buttons();
+            assert_eq!(buttons.len(), 2, "{state:?} is a fork and must offer two answers");
 
-                // The established arm names the client in use; the mint arm
-                // must not claim one, because it has never run either.
-                let body = state.body().join(" ");
-                let names_the_cli_as_in_use = body.contains("account is using the Bitwarden CLI");
-                let names_built_in_as_in_use =
-                    body.contains("account is using Deskwarden's built-in client");
-                assert_eq!(
-                    (names_the_cli_as_in_use, names_built_in_as_in_use),
-                    (established && in_use, established && !in_use),
-                    "{state:?} says the wrong thing about which client is in use. A brand \
-                     new account has not used either: {body:?}"
+            let (label, action, primary) = *buttons.last().expect("two buttons");
+            assert_eq!(
+                (action, primary),
+                (CliModalAction::UseBuiltIn, true),
+                "{state:?} put {label:?} in the affirmative slot. The built-in client \
+                 belongs there, and it belongs there blue: it is what this app is for, \
+                 and the button is the only place the modal says so"
+            );
+
+            // The other one is offered, and offered plainly.
+            let (other_label, other_action, other_primary) =
+                *buttons.first().expect("two buttons");
+            assert_eq!(
+                (other_action, other_primary),
+                (CliModalAction::UseOfficialCli, false),
+                "{state:?} offers {other_label:?} as its first button. Two primaries name \
+                 no preference, and a missing CLI answer is not a fork"
+            );
+
+            // No Cancel: both prongs continue the sign-in, and a Cancel
+            // would return the user to a form whose Continue leads straight
+            // back here.
+            let actions: Vec<_> = buttons.iter().map(|(_, a, _)| *a).collect();
+            assert!(
+                !actions.contains(&CliModalAction::Cancel),
+                "{state:?} offers a Cancel that has nowhere to go"
+            );
+
+            // **And the copy no longer varies with the account.** The
+            // sentence that did -- naming the client in use -- is the one
+            // the owner cut, and its absence is asserted rather than assumed
+            // because reinstating it is a one-line change that no other test
+            // here would notice.
+            let body = state.body().join(" ");
+            assert!(
+                !body.contains("account is using"),
+                "{state:?} tells the user which client the account is using, which is the \
+                 per-account sentence this modal was flattened to remove: {body:?}"
+            );
+        }
+    }
+
+    /// **No paragraph starts in lower case, in any state.**
+    ///
+    /// The defect this catches is specific and has happened twice in this
+    /// modal: [`OFFICIAL_CLI_NAME`] is the phrase "the Bitwarden CLI",
+    /// written to sit mid-sentence, and a paragraph interpolating it at the
+    /// front renders "the Bitwarden CLI is Bitwarden's own program" -- which
+    /// compiles, reads fine in the source, and is visible only in the picture.
+    /// The sibling defect was a missing verb ("Choosing it **download** it"),
+    /// which no test could have found either.
+    ///
+    /// Every state, not just the choice: the constants are shared, so any
+    /// state can acquire this the same way.
+    #[test]
+    fn no_body_line_starts_in_lower_case() {
+        let states = every_choice().into_iter().chain([
+            CliSetupState::Asking,
+            CliSetupState::AskingToRecover,
+            CliSetupState::Installed(AcquiredCli {
+                path: std::path::PathBuf::from(r"C:\invented\bw.exe"),
+                version: Some("2026.1.0".to_string()),
+                bytes: 37 * 1024 * 1024,
+            }),
+            CliSetupState::Failed(AcquireRefusal::Declined),
+        ]);
+        for state in states {
+            for line in state.body() {
+                let first = line.chars().next().expect("a body line is not empty");
+                assert!(
+                    !first.is_lowercase(),
+                    "{state:?} paints a paragraph starting {first:?}: {line:?}. A shared \
+                     name constant is written for the middle of a sentence"
                 );
             }
+        }
+    }
+
+    /// **At most one blue button per state**, which is what makes the flag
+    /// mean "lean this way" rather than "this is a button".
+    #[test]
+    fn at_most_one_button_is_the_primary() {
+        for state in every_choice().into_iter().chain([
+            CliSetupState::Asking,
+            CliSetupState::AskingToRecover,
+            CliSetupState::Working { stage: AcquireStage::Verifying },
+            CliSetupState::Failed(AcquireRefusal::Declined),
+        ]) {
+            let primaries = state.buttons().iter().filter(|(_, _, p)| *p).count();
+            assert!(
+                primaries <= 1,
+                "{state:?} marks {primaries} buttons primary; two blue buttons express no \
+                 preference between them"
+            );
         }
     }
 
@@ -1996,8 +2107,8 @@ mod tests {
     fn the_ask_offers_ok_and_cancel_and_nothing_else() {
         let buttons = CliSetupState::Asking.buttons();
         assert_eq!(buttons.len(), 2, "state 1 offers {buttons:?}, not two buttons");
-        assert_eq!(buttons[0], ("Cancel", CliModalAction::Cancel));
-        assert_eq!(buttons[1], ("OK", CliModalAction::Begin));
+        assert_eq!(buttons[0], ("Cancel", CliModalAction::Cancel, false));
+        assert_eq!(buttons[1], ("OK", CliModalAction::Begin, false));
     }
 
     /// **State 2 has a determinate bar and never a bare spinner.**
@@ -2051,7 +2162,7 @@ mod tests {
         assert!(body.contains("2026.8.0"), "{body:?} does not name the version");
         assert!(body.contains("36.9 MB"), "{body:?} does not name the size");
         assert!(body.contains("continue"), "{body:?} does not say what OK does");
-        assert_eq!(state.buttons(), vec![("OK", CliModalAction::Close)]);
+        assert_eq!(state.buttons(), vec![("OK", CliModalAction::Close, false)]);
         // Control: a DIFFERENT install produces a different body, so the
         // state is reading the value it was handed rather than printing a
         // fixed confirmation.

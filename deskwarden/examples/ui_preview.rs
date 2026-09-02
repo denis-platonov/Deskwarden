@@ -152,12 +152,11 @@ enum Surface {
     /// meets: `CliSetupState::Choosing`. A surface of its own beside
     /// `login_cli_setup` because the two are different questions -- that one
     /// states a requirement, this one puts a fork -- and because this body is
-    /// four paragraphs to that one's three, which is the length that decides
-    /// whether the card still fits the window.
+    /// three paragraphs to that one's three, and it carries the app's blue
+    /// primary button, which is 32px in a row the requirement modal fills
+    /// with 18px ones -- between them, the length that decides whether the
+    /// card still fits the window.
     LoginBackendChoice,
-    /// The same modal met by an account that has signed in before and is on
-    /// the official CLI: it names the client in use and swaps the buttons.
-    LoginBackendChoiceReturning,
     /// The vault window's read pane for an ordinary login.
     LoginDetail,
     /// The read pane for a **card**: brand mark, masked number, and the
@@ -482,7 +481,6 @@ const ALL: &[Surface] = &[
     Surface::LoginSignin,
     Surface::LoginCliSetup,
     Surface::LoginBackendChoice,
-    Surface::LoginBackendChoiceReturning,
     Surface::LoginDetail,
     Surface::CardDetail,
     Surface::CardDetailRevealed,
@@ -538,7 +536,6 @@ impl Surface {
             Surface::LoginSignin => "login_signin",
             Surface::LoginCliSetup => "login_cli_setup",
             Surface::LoginBackendChoice => "login_backend_choice",
-            Surface::LoginBackendChoiceReturning => "login_backend_choice_returning",
             Surface::LoginDetail => "detail_login",
             Surface::CardDetail => "detail_card",
             Surface::CardDetailRevealed => "detail_card_revealed",
@@ -614,7 +611,6 @@ impl Surface {
             | Surface::LoginSignin
             | Surface::LoginCliSetup
             | Surface::LoginBackendChoice
-            | Surface::LoginBackendChoiceReturning
             | Surface::LoginUnlockBusy => egui::vec2(470.0, 588.0),
             // Wide enough for the design's own 260px track with room
             // either side, and tall enough for six of them stacked with
@@ -721,7 +717,6 @@ impl Surface {
                 | Surface::LoginSignin
                 | Surface::LoginCliSetup
                 | Surface::LoginBackendChoice
-                | Surface::LoginBackendChoiceReturning
                 | Surface::LoginUnlockBusy
         )
     }
@@ -734,7 +729,7 @@ fn main() -> eframe::Result {
     let signin = arg("--signin");
     let cli_setup = arg("--cli-setup");
     // The self-hosted sign-in's backend choice. Its own flag, because it is
-    // its own question and a reviewer asks to see one or the other.
+    // its own question and a reviewer asks to see it on its own.
     let backend_choice = arg("--backend-choice");
     let login = signin || cli_setup || backend_choice || arg("--login");
     let list = arg("--list");
@@ -748,7 +743,7 @@ fn main() -> eframe::Result {
     } else if cli_setup {
         vec![Surface::LoginCliSetup]
     } else if backend_choice {
-        vec![Surface::LoginBackendChoice, Surface::LoginBackendChoiceReturning]
+        vec![Surface::LoginBackendChoice]
     } else if signin {
         vec![Surface::LoginSignin]
     } else if login {
@@ -789,9 +784,11 @@ fn main() -> eframe::Result {
     } else if cli_setup {
         target_dir().join("ui_preview_cli_setup.png")
     } else if backend_choice {
-        // A DIRECTORY, not a file: this flag renders two surfaces, and a
-        // single path would leave the second one overwriting the first.
-        target_dir().join("ui_preview_backend_choice")
+        // A FILE again. It was a directory while this flag rendered two
+        // surfaces -- the modal a new account met and the differently worded
+        // one a returning account met. The modal is the same every time now,
+        // so a second shot would be a duplicate of the first.
+        target_dir().join("ui_preview_backend_choice.png")
     } else if signin {
         target_dir().join("ui_preview_signin.png")
     } else if login {
@@ -816,12 +813,7 @@ fn main() -> eframe::Result {
             Ok(Box::new(Preview {
                 queue,
                 at: 0,
-                // `--backend-choice` too, because it renders two surfaces:
-                // the modal a new self-hosted account meets and the one a
-                // returning account meets. Without this both would be
-                // written to one path and the reviewer would be looking at
-                // whichever finished last, believing it was the only one.
-                directory: all || backend_choice,
+                directory: all,
                 out,
                 form: LoginForm::default(),
                 // The app name a real 3c card would have been pre-filled with,
@@ -1006,31 +998,16 @@ impl eframe::App for Preview {
                 false,
                 Some(&deskwarden::bw_acquire::CliSetupState::Asking),
             ),
-            // A brand new self-hosted account: no client in use yet, so the
-            // built-in one holds the affirmative position.
+            // **One shot, because there is one modal.** It used to be two:
+            // the state carried the client in use and whether the account had
+            // signed in before, and those varied a sentence and the button
+            // order. They do not exist any more.
             Surface::LoginBackendChoice => self.draw_login(
                 root,
                 &ctx,
                 true,
                 false,
-                Some(&deskwarden::bw_acquire::CliSetupState::Choosing {
-                    in_use: false,
-                    established: false,
-                }),
-            ),
-            // The returning half of the same modal, and the one worth its own
-            // PNG: it carries an extra sentence naming the client in use, and
-            // its buttons are in the OTHER order, because the preselection is
-            // a position. A single shot could show neither of those.
-            Surface::LoginBackendChoiceReturning => self.draw_login(
-                root,
-                &ctx,
-                true,
-                false,
-                Some(&deskwarden::bw_acquire::CliSetupState::Choosing {
-                    in_use: true,
-                    established: true,
-                }),
+                Some(&deskwarden::bw_acquire::CliSetupState::Choosing),
             ),
             Surface::LoginDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Login)),
             Surface::CardDetail => self.draw_pane(root, PaneKind::Detail(DetailShot::Card)),

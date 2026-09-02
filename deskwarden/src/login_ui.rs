@@ -1853,16 +1853,36 @@ fn draw_cli_setup_modal(
                 // the row claimed those too. `allocate_ui_with_layout` fixes
                 // the row at one interactive row, which is all a button row
                 // was ever asking for.
+                // **`BUTTON_HEIGHT`, not `interact_size.y`.** The row now
+                // holds a `theme::primary_button`, which is 32px tall by
+                // design and taller than egui's 18px interact size; a row
+                // allocated shorter than its tallest child is a row that
+                // overflows into whatever the card measures next. A constant
+                // either way, so the feedback loop this allocation exists to
+                // break stays broken.
                 ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+                    egui::vec2(ui.available_width(), theme::BUTTON_HEIGHT),
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
                         // Reversed, because a right-to-left layout places
                         // the first thing added at the RIGHT edge -- and the
                         // affirmative button belongs there. `buttons()`
                         // lists them left to right, which is how they read.
-                        for (label, what) in buttons.iter().rev() {
-                            if ui.button(RichText::new(*label).size(12.0)).clicked() {
+                        //
+                        // **The primary is the app's blue button**, not a
+                        // fill chosen here: `theme::primary_button` is the
+                        // same control the login card's Continue is, so the
+                        // one answer this modal leans toward is painted in
+                        // the same blue as every other affirmative action in
+                        // the app. `CliSetupState::buttons` decides WHICH,
+                        // and only the choice state names one.
+                        for (label, what, primary) in buttons.iter().rev() {
+                            let clicked = if *primary {
+                                theme::primary_button(ui, label, None).clicked()
+                            } else {
+                                ui.button(RichText::new(*label).size(12.0)).clicked()
+                            };
+                            if clicked {
                                 action = Some(*what);
                             }
                         }
@@ -3727,24 +3747,18 @@ pub fn build_login_frame(
                             && chosen_backend.is_none()
                             && crate::backend_policy::is_self_hosted(effective_server.as_deref());
                         if should_ask_which_client {
-                            cli_setup = Some(crate::bw_acquire::CliSetupState::Choosing {
-                                // **The one rule, asked with `None`**, which
-                                // is what makes this a preselection of the
-                                // answer that would otherwise be taken
-                                // silently rather than a fourth opinion about
-                                // backends. An established account answers
-                                // from its record; a mint answers from the
-                                // derivation, which on a self-hosted address
-                                // is the built-in client.
-                                in_use: crate::accounts::official_cli_after_sign_in(
-                                    signin_account.as_ref(),
-                                    effective_server.as_deref(),
-                                    None,
-                                ),
-                                established: signin_account
-                                    .as_ref()
-                                    .is_some_and(|a| !crate::accounts::is_a_fresh_mint(a)),
-                            });
+                            // **No fields, so nothing about this account
+                            // is read to build it.** It used to carry the
+                            // client this sign-in would otherwise take and
+                            // whether the account was a mint, and both only
+                            // ever changed how the modal LOOKED. The record
+                            // is still what settles the backend -- the
+                            // sign-in below reads
+                            // `accounts::official_cli_after_sign_in` with the
+                            // `chosen_backend` this modal returns -- so what
+                            // was dropped is a second reading of it, taken
+                            // only to word a sentence.
+                            cli_setup = Some(crate::bw_acquire::CliSetupState::Choosing);
                             form.error = None;
                             ui.ctx().request_repaint();
                             return;
@@ -13899,23 +13913,16 @@ mod cli_setup_modal_layout_tests {
         (login_card_height(flow_bottom, content_top), painted)
     }
 
-    /// **Every shape the CHOICE modal has**, which is four: two clients in
-    /// use, times told-and-not-told that a client is in use.
+    /// **Every shape the CHOICE modal has**, which is now one.
     ///
-    /// All four, not a representative one, because the four differ in
-    /// exactly the two dimensions that decide whether this modal fits: the
-    /// `established` arm adds a sentence to the longest paragraph in the
-    /// body, and `in_use` swaps the button labels, whose widths differ by
-    /// several characters. A single case would leave three untested layouts
-    /// of a modal whose sibling shipped blank.
+    /// It was four -- two clients in use, times told-and-not-told which was
+    /// in use -- because those two flags varied a sentence of the body and
+    /// the widths of the buttons, and so varied whether the card fitted. The
+    /// state carries neither any more, so four cases would be four runs of
+    /// the same layout. Kept as a function, and the loop below kept, so that
+    /// a state that regains a field is covered by widening this alone.
     fn every_choosing_state() -> Vec<crate::bw_acquire::CliSetupState> {
-        let mut states = Vec::new();
-        for in_use in [false, true] {
-            for established in [false, true] {
-                states.push(crate::bw_acquire::CliSetupState::Choosing { in_use, established });
-            }
-        }
-        states
+        vec![crate::bw_acquire::CliSetupState::Choosing]
     }
 
     /// The choice modal settles and paints, held to the same two assertions
@@ -13923,11 +13930,11 @@ mod cli_setup_modal_layout_tests {
     /// `run_login_flow`'s real loop.
     ///
     /// **It is the state most likely to overflow**, which is why it gets its
-    /// own test rather than a mention: four paragraphs to the requirement
-    /// modal's three, one of them the longest string this window paints, and
-    /// two buttons whose labels are sentences rather than "OK" and "Cancel".
-    /// If any card in this app is going to be too tall for the window, it is
-    /// this one.
+    /// own test rather than a mention: three paragraphs of prose and two
+    /// buttons whose labels are sentences rather than "OK" and "Cancel", one
+    /// of them a 32px `theme::primary_button` in a row that used to be
+    /// allocated 18px. If any card in this app is going to be too tall for
+    /// the window, it is this one.
     #[test]
     fn the_choice_modal_settles_and_paints_inside_the_window() {
         let ctx = styled_context();
@@ -13979,7 +13986,7 @@ mod cli_setup_modal_layout_tests {
             }
             // Both answers, and their presence is the positive control: a
             // blank panel WITH its buttons is the exact shape the bug had.
-            for (label, _) in state.buttons() {
+            for (label, _, _) in state.buttons() {
                 let rect = find(label);
                 assert!(
                     window.contains_rect(rect),
@@ -14080,7 +14087,7 @@ mod cli_setup_modal_layout_tests {
         // the assertions above: a blank panel WITH its buttons is exactly the
         // shape the bug had, so a test that only found the buttons would have
         // passed against it.
-        for (label, _) in state.buttons() {
+        for (label, _, _) in state.buttons() {
             let rect = find(label);
             assert!(
                 window.contains_rect(rect),
@@ -14117,6 +14124,26 @@ mod cli_setup_modal_layout_tests {
             "the modal's button row no longer allocates its own rect. A bare `with_layout` \
              takes the parent's whole remaining space, and this modal's parent is sized FROM \
              this modal's content -- which is the loop that shipped a blank panel in 0.15.2"
+        );
+        // **And the blue button is the app's**, not one minted here. The
+        // choice modal leans toward the built-in client with colour rather
+        // than with the word "recommended" (`bw_acquire`'s
+        // `the_choice_names_both_costs_and_recommends_neither` still bans
+        // that word), so the colour has to be the one the rest of the app
+        // means by "the affirmative action": `theme::primary_button`, which
+        // is what the login card's Continue is. A local `Button::fill(...)`
+        // would read identically at a glance and drift at the next palette
+        // change.
+        assert!(
+            modal.contains(concat!("theme::primary", "_button(")),
+            "the modal no longer paints its primary answer with the app's blue button. A \
+             hand-rolled fill here is a second definition of the app's affirmative colour"
+        );
+        assert!(
+            !modal.contains("theme::BLUE"),
+            "the modal names a palette colour directly. The blue belongs to \
+             `theme::primary_button`, which owns the fill, the radius, the height and the \
+             disabled fade together"
         );
     }
 }
