@@ -6893,6 +6893,52 @@ fn why_a_ui_process_could_not_read_this_vault(
     }
 }
 
+/// **Whether a UI process must refuse to open a window because there is no
+/// `bw.exe`.**
+///
+/// The child's half of the same question `fn main`'s startup gate asks, off
+/// the same pure function -- `backend_policy::choose`, over this account's
+/// server URL and this account's own `use_official_bw_crypto` -- so the
+/// daemon and the window it spawns cannot come to different answers about a
+/// binary neither of them may need.
+///
+/// **This was unconditional, and it is the shipped defect.** A self-hosted
+/// account on the built-in client, on a PC with no CLI, got a message box
+/// saying the window could not find `bw.exe` -- for a window that reaches
+/// `bw` nowhere on that account. Its three stated reasons were all gone by
+/// then: the `bw status` spawn was removed and the window reads the account
+/// instead, `vault_window`'s `real_export_runner` returns a direct-REST
+/// runner, and `real_send_create`, `real_send_list` and `real_send_receive`
+/// each return before their CLI arm exists.
+///
+/// A pure function of two values with no `Path`, no `Settings` and no I/O in
+/// the signature, in the shape of [`backend_policy::choose`] itself, so the
+/// decision the entry point makes is the thing a test can drive rather than
+/// something only reachable by opening a window.
+///
+/// `None` -- open the window -- on every direct-REST account, and on every
+/// account at all once the CLI is on disk. `BwServe` with nothing on disk is
+/// the one arm that refuses, and it refuses for a reason that has not
+/// changed: on that account `bw.exe` IS the vault, so the window would be a
+/// window over nothing.
+fn why_a_ui_process_cannot_use_the_cli(
+    account: Option<&Account>,
+    a_cli_is_on_disk: bool,
+) -> Option<deskwarden::ui_process::UiStartFailure> {
+    if a_cli_is_on_disk {
+        return None;
+    }
+    match backend_policy::choose(
+        account.and_then(|a| a.server_url.as_deref()),
+        account.is_none_or(|a| a.use_official_bw_crypto),
+    ) {
+        backend_policy::VaultBackendChoice::BwServe => {
+            Some(deskwarden::ui_process::UiStartFailure::NoBwExe)
+        }
+        backend_policy::VaultBackendChoice::DirectRest => None,
+    }
+}
+
 /// `CREATE_BREAKAWAY_FROM_JOB`, from `windows::Win32::System::Threading`.
 const CREATE_BREAKAWAY_FROM_JOB: u32 =
     windows::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB.0;
@@ -10751,23 +10797,6 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         Err(e) => eprintln!("warning: {e}"),
     }
 
-    // The same gate the daemon passes before anything spawns the CLI. The
-    // vault window reaches `bw` for a status fetch, an export and a Send, so
-    // this process needs the verified path recorded exactly as the daemon
-    // does -- and it must be the *verified* one for the same reason: a
-    // `bw.exe` appearing on disk later must never be the one that gets a
-    // session token.
-    let Some(bw_exe) = deskwarden::bw_path::resolve_bw_exe() else {
-        log::error!("a ui process could not resolve bw.exe; it will not open a window");
-        return deskwarden::ui_process::UiStartFailure::NoBwExe.exit_code();
-    };
-    if !bw_exe.exists() {
-        log::error!("a ui process found no bw.exe at {}", bw_exe.display());
-        return deskwarden::ui_process::UiStartFailure::NoBwExe.exit_code();
-    }
-    check_bw_signature(&bw_exe);
-    deskwarden::bw_path::remember_verified_bw_exe(bw_exe);
-
     let settings_path = config_dir.join("settings.json");
     let settings = settings::Settings::load(&settings_path);
     // This process is the one that makes the copies, so it is the one whose
@@ -10783,6 +10812,67 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         // process would only be noise.
         None,
     );
+    // The active account the gate below asks `backend_policy::choose` about.
+    // Borrowed from `startup` rather than read off the tuple built
+    // underneath it, because that tuple's `AccountsState` is constructed
+    // over `bw_path::multi_account_availability()` -- which reads the very
+    // path this gate is about to record.
+    let startup_account = match &startup {
+        accounts::StartupAccounts::Ready { active, .. } => Some(active),
+        _ => None,
+    };
+    // **The same gate the daemon passes, decided by the same pure function.**
+    // It used to refuse unconditionally, over three reasons that were all
+    // already gone; `why_a_ui_process_cannot_use_the_cli` is where that is
+    // written down, and it is the only thing here that decides.
+    //
+    // **Nothing about the `bw serve` arm is relaxed.** A file that exists is
+    // still graded by `check_bw_signature`, and the resolved path is still
+    // recorded through `remember_verified_bw_exe`, because a `bw.exe`
+    // appearing on disk later must never be the one that gets a session
+    // token.
+    //
+    // Resolution is one question and refusal is another, and they are asked
+    // in that order: an install directory that cannot be worked out yields no
+    // path, which is the same "no CLI on disk" the refusal is about.
+    let resolved = deskwarden::bw_path::resolve_bw_exe();
+    let on_disk = resolved.as_deref().is_some_and(std::path::Path::exists);
+    if let Some(failure) = why_a_ui_process_cannot_use_the_cli(startup_account, on_disk) {
+        log::error!(
+            "a ui process has no bw.exe and this account's vault is served by one; it will \
+             not open a window"
+        );
+        return failure.exit_code();
+    }
+    match resolved {
+        Some(bw_exe) if on_disk => {
+            // Graded whenever it EXISTS, not only when it is the backend:
+            // the same supply-chain control the daemon states at its own
+            // gate, and for the same reason -- an account switch can make a
+            // `bw serve` account active later in this same process.
+            check_bw_signature(&bw_exe);
+            deskwarden::bw_path::remember_verified_bw_exe(bw_exe);
+        }
+        Some(bw_exe) => {
+            log::info!(
+                "no bw.exe at {}, and this window does not need one: its vault is read by \
+                 talking to the server",
+                bw_exe.display()
+            );
+            // Recorded even though nothing is there. The daemon does the
+            // same, and for a reason this process shares:
+            // `bw_path::multi_account_availability` -- read a few lines
+            // below to build the titlebar's switcher -- answers off this
+            // one recorded path, and a `bw.exe` appearing on disk later
+            // must never be the one that gets a session token.
+            deskwarden::bw_path::remember_verified_bw_exe(bw_exe);
+        }
+        None => log::warn!(
+            "a ui process could not work out its install directory, so it recorded no bw.exe; \
+             this account does not need one"
+        ),
+    }
+
     let (active_account, accounts_state) = match &startup {
         accounts::StartupAccounts::Ready { active, accounts, .. } => (
             Some(active.clone()),
@@ -33300,6 +33390,131 @@ mod vault_backend_choice_tests {
             Some(deskwarden::ui_process::UiStartFailure::NoStoredVaultKey),
             "the daemon would have spawned a UI process that can only exit, and its exit is \
              what the owner saw as `the main UI does not open`"
+        );
+    }
+
+    /// **A window the built-in client can open is not refused over a CLI it
+    /// never runs.**
+    ///
+    /// The shipped defect, and the owner met it as a message box: self-hosted
+    /// account, built-in client, no `bw.exe` on the machine, and the vault
+    /// window would not open at all. The UI process demanded the CLI before
+    /// it had read anything about the account, so `UiStartFailure::NoBwExe`
+    /// was the answer for an account whose window reaches `bw` nowhere.
+    ///
+    /// **Fails on `main`**, where the entry point had no gate to ask: the
+    /// demand was three statements with no condition on them.
+    ///
+    /// This asserts on the decision itself -- the `Option<UiStartFailure>`
+    /// the entry point returns on -- rather than on a backend choice passed
+    /// alongside it, so it cannot pass by never reaching the refusal it
+    /// names.
+    #[test]
+    fn a_built_in_client_account_with_no_cli_still_opens_its_window() {
+        let account = account_on_the_built_in_client(Some("https://vault.example.com"));
+        assert_eq!(
+            why_a_ui_process_cannot_use_the_cli(Some(&account), false),
+            None,
+            "a self-hosted account on the built-in client was refused its vault window over a \
+             missing bw.exe -- for a window that reaches `bw` on no path it can take"
+        );
+    }
+
+    /// **The positive control: the same absence, on the account where it is
+    /// a real loss.**
+    ///
+    /// Same missing file, same function, and the answer must be the opposite
+    /// one. Without this the test above passes for a gate that has stopped
+    /// refusing anything at all -- and on a `bw serve` account `bw.exe` IS
+    /// the vault, so a window opened there would be a window over nothing.
+    #[test]
+    fn a_bw_serve_account_with_no_cli_is_still_refused_its_window() {
+        let account = account_on(Some("https://vault.example.com"));
+        assert_eq!(
+            why_a_ui_process_cannot_use_the_cli(Some(&account), false),
+            Some(deskwarden::ui_process::UiStartFailure::NoBwExe),
+            "a `bw serve` account with no CLI was given a window whose vault cannot be \
+             reached by any route"
+        );
+    }
+
+    /// **And a fresh install, which is the same arm and the one that must
+    /// not be broken by widening it.**
+    ///
+    /// No account at all: `backend_policy::choose(None, true)` is `BwServe`,
+    /// so the refusal stands here too. The remedy is the one the message now
+    /// names -- Deskwarden downloads the CLI itself -- and not the reinstall
+    /// it used to name, which has produced no `bw.exe` since 0.15.1.
+    #[test]
+    fn a_launch_with_no_account_is_still_refused_a_window_without_the_cli() {
+        assert_eq!(
+            why_a_ui_process_cannot_use_the_cli(None, false),
+            Some(deskwarden::ui_process::UiStartFailure::NoBwExe),
+            "a fresh install is `BwServe` by `choose(None, true)`, so a window over no \
+             backend at all would open"
+        );
+    }
+
+    /// **The control on the other input**: with the CLI on disk, neither
+    /// backend is refused. Proves the two tests above turn on the missing
+    /// file and not on the account fixtures alone.
+    #[test]
+    fn a_cli_on_disk_refuses_neither_backend() {
+        for account in [
+            account_on(Some("https://vault.example.com")),
+            account_on_the_built_in_client(Some("https://vault.example.com")),
+            account_on(None),
+        ] {
+            assert_eq!(
+                why_a_ui_process_cannot_use_the_cli(Some(&account), true),
+                None,
+                "a window was refused over a bw.exe that is present: {account:?}"
+            );
+        }
+    }
+
+    /// **The entry point really routes through it.**
+    ///
+    /// The house defect is a test that passes because it never reached the
+    /// thing it names, and the three above drive a function rather than
+    /// `run_as_a_ui_process` -- which cannot be called from a test, since it
+    /// opens a window. So this reads the entry point's own source and holds
+    /// that the function they drive is the only thing there that reaches
+    /// `NoBwExe`. A second, ungated refusal added next to it fails here.
+    #[test]
+    fn the_ui_process_refuses_over_a_missing_cli_in_exactly_one_place() {
+        // Bounded at both ends, and by single-line needles for the CRLF
+        // reason every other source guard in this file states. The tail
+        // matters more than usual here: unbounded, the slice would run to
+        // the end of the file and swallow this very test module, whose own
+        // assertions name `NoBwExe` -- and the count below would then be
+        // asserting about itself.
+        let whole = include_str!("main.rs");
+        let child = whole
+            .split_once("fn run_as_a_ui_process")
+            .expect("control: the UI process entry point was renamed")
+            .1;
+        let child = child
+            .split_once("fn backend_is_listening(")
+            .expect("control: the item after the UI entry point was renamed")
+            .0;
+        assert!(
+            child.contains(concat!("resolve_bw", "_exe()")),
+            "control: the slice is not the UI process entry point -- it never resolves a CLI \
+             at all, so the assertions below would be about nothing"
+        );
+        assert!(
+            child.contains(concat!("why_a_ui_process_cannot_use", "_the_cli(")),
+            "the UI process decides for itself whether a missing bw.exe is fatal, so its \
+             answer can drift from the daemon's -- which is how the unconditional demand \
+             shipped in the first place"
+        );
+        assert_eq!(
+            child.matches(concat!("UiStartFailure::", "NoBwExe")).count(),
+            0,
+            "the UI process names `NoBwExe` itself somewhere. Every refusal over a missing \
+             CLI has to come back from `why_a_ui_process_cannot_use_the_cli`, or the tests \
+             above are asserting about a decision the entry point does not make"
         );
     }
 

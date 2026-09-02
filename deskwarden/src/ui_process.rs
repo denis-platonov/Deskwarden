@@ -319,8 +319,9 @@ pub enum DaemonExit {
 /// `log::warn!`. To the user that is a tray click that did nothing --
 /// reported, on a shipped build, as "the main UI does not open". A window
 /// that cannot open has to say so, and it has to say WHICH thing is missing,
-/// because the five have five different remedies: one is a re-install, one is
-/// a sign-in, and one is a preference to turn back off.
+/// because the five have five different remedies: one is a restart that
+/// re-downloads the CLI, one is a sign-in, and one is a preference to turn
+/// back off.
 ///
 /// So the child names the cause on the way out and the daemon reads it back.
 /// The codes start at [`Self::FIRST_EXIT_CODE`] and run upwards, **above**
@@ -400,9 +401,20 @@ impl UiStartFailure {
                  settings folder. Check that your user profile folder is available, then try \
                  again."
             }
+            // **"Install Deskwarden again to put it back" was false**, and
+            // had been since 0.15.1: the installer stopped bundling and
+            // stopped downloading the CLI, so a re-install produces no
+            // `bw.exe` at all and the user is sent round a loop. Deskwarden
+            // fetches it itself now -- `bw_acquire::acquire_if_needed`, from
+            // the sign-in card's Submit and from `main`'s own
+            // `recover_a_missing_cli_with`, which offers on the next launch
+            // that tries to start the vault service. That offer is the
+            // remedy this names, because it is the one the user can reach
+            // without signing out first.
             Self::NoBwExe => {
-                "Deskwarden could not open the vault window: it could not find the Bitwarden \
-                 CLI (bw.exe) that the window needs. Install Deskwarden again to put it back."
+                "Deskwarden could not open the vault window: the Bitwarden CLI (bw.exe) that \
+                 serves this account's vault is not on this PC. Restart Deskwarden and it \
+                 will offer to download and install it for you."
             }
             Self::NoSessionToken => {
                 "Deskwarden could not open the vault window: there is no saved session for \
