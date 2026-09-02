@@ -10552,6 +10552,18 @@ fn run_as_the_vault_service(mode: deskwarden::service_host::Mode) -> i32 {
     // default backend -- the ones who would most benefit, since `bw serve`
     // has no authentication at all and this puts scoped, expiring keys in
     // front of it.
+    // **And the policy the `match` below reads, which this process never
+    // published.** Without this line `selected()` answered its default and
+    // the `DirectRest` arm was unreachable in production: the service pointed
+    // at a `bw serve` the daemon had deliberately not started. See
+    // `child_process_backend_env`; a refusal leaves this process on
+    // `bw serve`, which is the behaviour it had before the line existed.
+    if !backend_policy::install_env(child_process_backend_env(&config_dir, Some(account))) {
+        log::error!(
+            "the vault service could not publish its backend policy; it will serve through \
+             `bw serve`"
+        );
+    }
     let inner: std::sync::Arc<dyn deskwarden::vault_backend::VaultBackend> =
         match backend_policy::selected() {
             backend_policy::VaultBackendChoice::DirectRest => {
@@ -10906,6 +10918,27 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
             ),
         },
     );
+    // **And the backend policy itself, which the cache above reads and this
+    // process never published.**
+    //
+    // The cache was pointed at the right backend and nothing else in this
+    // process was told: `backend_policy::selected()` answered its default,
+    // `BwServe`, so the vault window's Sends and its export took the CLI arm
+    // on an account that has no CLI. See `child_process_backend_env` for why it
+    // is that function and not `settle_the_vault_backend`.
+    //
+    // Installed through the same `install_env` the daemon uses, so the
+    // choice/login/credentials pairing is checked here exactly as it is
+    // there. A refusal leaves this process on `bw serve`, which is the
+    // behaviour it had before this line existed.
+    if !backend_policy::install_env(child_process_backend_env(
+        &config_dir,
+        active_account.as_ref(),
+    )) {
+        log::error!(
+            "a ui process could not publish its backend policy; this window stays on `bw serve`"
+        );
+    }
     // **The About page's update flow, installed HERE as well as in the
     // daemon.**
     //
@@ -12186,6 +12219,118 @@ fn bw_serve_env() -> backend_policy::BackendEnv {
         choice: backend_policy::VaultBackendChoice::BwServe,
         direct: None,
         credentials: None,
+    }
+}
+
+/// The [`backend_policy::BackendEnv`] a **child process** runs on: the UI
+/// process that draws the vault window, and the vault service.
+///
+/// # The defect this exists to close
+///
+/// This binary has three entry points and only ONE of them published a
+/// backend policy. `fn main` installed an environment; `run_as_a_ui_process`
+/// and `run_as_the_vault_service` installed nothing, so
+/// [`backend_policy::selected`] answered its **default** -- `BwServe` -- in
+/// both of them, whatever the account was.
+///
+/// In the UI process that meant every action on the vault window that asks
+/// the policy which backend it is on -- `vault_window`'s `real_send_list`,
+/// `real_send_create`, `real_send_delete`, `real_send_receive` and
+/// `real_export_runner` -- took the CLI arm on an account whose vault is
+/// reached over REST. On a machine with no `bw.exe` each of them ended in
+/// `os error 2`, on a window that had opened and read the vault perfectly
+/// well: the export and every Send simply did not work.
+///
+/// In the service it meant the `DirectRest` arm of the `match` in
+/// `run_as_the_vault_service` was **unreachable in production**. The service
+/// pointed at `bw serve` for an account the daemon had deliberately not
+/// started one for, so every request timed out against a port nothing was
+/// listening on -- and the refusal that names the real cause ("no vault key
+/// is stored for it") could never be printed.
+///
+/// It is the same class as the two comments in `run_as_a_ui_process` already
+/// name -- the Updates page and the Breaches page, both surfaces the split
+/// moved without moving what they read -- and the same class as the vault
+/// cache beside it: a process that decides one thing and does another.
+///
+/// # Why an installed environment and not a parameter at the five call sites
+///
+/// The alternative considered was threading the choice into the vault
+/// window's five branches the way `login_ui::spawn_auth` now takes its
+/// `direct` argument. It is the right shape THERE and the wrong shape here,
+/// for a reason that is written out at length in [`backend_policy::BackendEnv`]'s
+/// own doc: those five are not all of them. `rest::send::active_account` and
+/// `rest::export::export_document` read the environment two calls below the
+/// branch, for the server URL and the credential; `app_window`'s API-key page
+/// reads it as well. A parameter reaches the five that are visible from the
+/// window and leaves the rest reading a global that is still wrong -- which
+/// is "eleven of them get it and the twelfth does not", the exact state that
+/// doc says the environment exists to prevent. One install per process makes
+/// every reader right at once, and it is the *same* mechanism the daemon uses
+/// rather than a second one.
+///
+/// # Not [`settle_the_vault_backend`], and that is deliberate
+///
+/// That function is the daemon's and it does three things this process must
+/// not: it deletes `userkey.bin` on the `bw serve` arm, it probes the server
+/// with a live `list_items`, and it deletes the stored key when that probe
+/// fails. A child window process repeating any of them would make a transient
+/// network failure destroy the daemon's credential. What is shared instead is
+/// the decision -- [`backend_policy::choose`], the same pure function off the
+/// same two account fields -- so this cannot disagree with the daemon about
+/// which backend is in force.
+///
+/// # `adopt` never runs here
+///
+/// It is the sign-in sink, and this process does not sign in: `run_as_a_ui_
+/// process` returns `UiStartFailure::NoSessionToken` rather than showing a
+/// login window, and no path from the vault window reaches `login_ui`'s
+/// worker. The sink is a loud log line rather than a silent no-op so that a
+/// future sign-in moved into this process is a report and not a key written
+/// to a store nothing else in this process reads.
+fn child_process_backend_env(
+    config_dir: &Path,
+    account: Option<&accounts::Account>,
+) -> backend_policy::BackendEnv {
+    let choice = backend_policy::choose(
+        account.and_then(|a| a.server_url.as_deref()),
+        account.is_none_or(|a| a.use_official_bw_crypto),
+    );
+    // The same fallible match `settle_the_vault_backend` writes, and for its
+    // stated reason: `choose` cannot answer `DirectRest` without a server URL,
+    // so this cannot fail on that arm, but an `expect` in a launch path
+    // resting on another module's property is not worth the line it saves.
+    let direct = match (choice, account) {
+        (backend_policy::VaultBackendChoice::DirectRest, Some(account)) => account
+            .server_url
+            .as_deref()
+            .map(|server_url| (account, server_url.to_string())),
+        _ => None,
+    };
+    let Some((account, server_url)) = direct else {
+        return bw_serve_env();
+    };
+    let credentials = {
+        let key_store =
+            user_key_store::UserKeyStore::new(accounts::user_key_path_for(config_dir, &account.id));
+        std::sync::Arc::new(move || key_store.load()) as backend_policy::Credentials
+    };
+    backend_policy::BackendEnv {
+        choice: backend_policy::VaultBackendChoice::DirectRest,
+        credentials: Some(credentials),
+        direct: Some(login_ui::DirectRestLogin {
+            server_url,
+            email: account.email.clone(),
+            device_id: device_id_for(&account.id),
+            second_factor: login_ui::PRODUCTION_SECOND_FACTOR,
+            prompt: None,
+            adopt: std::sync::Arc::new(|_authenticated| {
+                log::error!(
+                    "a UI process completed a direct-REST login, which it has no backend slot \
+                     to adopt into; signing in belongs to the daemon"
+                );
+            }),
+        }),
     }
 }
 
@@ -33938,6 +34083,175 @@ mod vault_backend_choice_tests {
         );
         // Stable, said as a property rather than inferred from the shape.
         assert_eq!(device_id_for(&id), device);
+    }
+
+    // ---- what a UI PROCESS runs on ------------------------------------------
+    //
+    // The daemon and the UI process are separate entry points, and every
+    // defect on this branch so far has been one of them fixed while the other
+    // kept the old behaviour. These are the second entry point, asked the
+    // same questions.
+
+    /// **The defect: a UI process that published no backend at all.**
+    ///
+    /// `run_as_a_ui_process` built the right vault cache for a built-in-client
+    /// account and installed no `BackendEnv`, so `backend_policy::selected()`
+    /// answered its default -- `BwServe` -- in the very process that draws the
+    /// vault window. Its export and all four of its Sends actions branch on
+    /// that answer, so each of them took the CLI arm on an account that has no
+    /// CLI.
+    #[test]
+    fn a_ui_process_for_a_built_in_client_account_selects_direct_rest() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("ui-direct");
+        let account = account_on_the_built_in_client(Some("https://vault.example.com"));
+        accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
+
+        let env = child_process_backend_env(&config, Some(&account));
+        assert!(
+            backend_policy::install_env(env),
+            "the environment a UI process would install was refused, so that process would \
+             have stayed on `bw serve` -- which is the defect, not the fix"
+        );
+        assert!(
+            !backend_policy::bw_serve_is_selected(),
+            "a UI process for a built-in-client account would still send its export and its \
+             Sends to `bw.exe`"
+        );
+        let login = backend_policy::direct_rest_login()
+            .expect("a direct-REST process with no login cannot reach the server at all");
+        assert_eq!(
+            login.server_url, "https://vault.example.com",
+            "the window would talk to a server this account never named"
+        );
+        assert_eq!(login.email, account.email);
+        assert!(
+            backend_policy::direct_rest_credentials().is_some(),
+            "every Send on this window would be permanently `Locked`"
+        );
+        backend_policy::uninstall_env();
+    }
+
+    /// The control: the same function, an account on the official CLI, and
+    /// `bw serve` unchanged. Without this the assertion above would be
+    /// satisfied by a function that answered `DirectRest` for everything --
+    /// which would gate the CLI off for the users who need it.
+    #[test]
+    fn a_ui_process_for_an_official_account_stays_on_bw_serve() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("ui-official");
+        let account = account_on(Some("https://vault.example.com"));
+        accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
+
+        assert!(backend_policy::install_env(child_process_backend_env(&config, Some(&account))));
+        assert!(
+            backend_policy::bw_serve_is_selected(),
+            "control: a UI process for a `bw serve` account was pointed at the built-in client"
+        );
+        assert!(backend_policy::direct_rest_login().is_none());
+        backend_policy::uninstall_env();
+
+        // And a process that resolved no account at all -- the state a UI
+        // process is in when `settings.json` names none. `choose(None, true)`
+        // is `BwServe` by definition, and inventing a server here would point
+        // a window at somebody else's.
+        assert!(backend_policy::install_env(child_process_backend_env(&config, None)));
+        assert!(backend_policy::bw_serve_is_selected());
+        backend_policy::uninstall_env();
+    }
+
+    /// **It must not do what the daemon's settlement does.**
+    ///
+    /// `settle_the_vault_backend` deletes `userkey.bin` on its `bw serve` arm
+    /// and deletes it again when its live probe fails. A child window process
+    /// repeating either would let a transient network failure destroy the
+    /// credential the DAEMON is still reading the vault through -- and the
+    /// user would be asked for their master password again for no reason they
+    /// could see. This asserts the file survives both arms.
+    #[test]
+    fn a_ui_process_never_deletes_the_daemons_stored_vault_key() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("ui-keeps-key");
+        for account in [
+            account_on_the_built_in_client(Some("https://vault.example.com")),
+            account_on(Some("https://vault.example.com")),
+        ] {
+            accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
+            let path = accounts::user_key_path_for(&config, &account.id);
+            std::fs::write(&path, b"the daemon's stored vault key").expect("a scratch file");
+            let _ = child_process_backend_env(&config, Some(&account));
+            assert!(
+                path.exists(),
+                "a UI process deleted the stored vault key for an account served by {:?}",
+                backend_policy::choose(
+                    account.server_url.as_deref(),
+                    account.use_official_bw_crypto
+                )
+            );
+        }
+    }
+
+    /// **Source pin: every entry point in this binary publishes a backend
+    /// policy, and the two children publish it before they read one.**
+    ///
+    /// The three defects fixed on this branch before today were each one
+    /// entry point corrected while another kept the old behaviour, and this
+    /// one was two entry points that had never been corrected at all. A
+    /// behavioural test can drive `child_process_backend_env`; nothing can
+    /// drive `run_as_a_ui_process` or `run_as_the_vault_service`, which bind
+    /// ports, open windows and end the process. So the wiring is pinned to
+    /// the source, which is the only thing that can see it.
+    ///
+    /// **The ordering half is the load-bearing half for the service.** Its
+    /// `match backend_policy::selected()` chooses the backend it will serve
+    /// through for the whole life of the process; an install written after
+    /// that line would be correct-looking, green on every other test here,
+    /// and completely without effect.
+    #[test]
+    fn both_child_entry_points_install_a_backend_policy_before_reading_one() {
+        fn without_comments(text: &str) -> String {
+            text.lines()
+                .map(|line| if line.trim_start().starts_with("//") { "" } else { line })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        /// From one `fn` header to the start of the next top-level item.
+        fn body_after(code: &str, head: &str) -> String {
+            let at = code.find(head).unwrap_or_else(|| {
+                panic!("control: {head:?} is not in main.rs, so this pin measures nothing")
+            });
+            let rest = &code[at..];
+            let end = rest[1..].find("\nfn ").map_or(rest.len(), |off| off + 1);
+            rest[..end].to_string()
+        }
+        let code = without_comments(include_str!("main.rs"));
+        // Split so this test's own source is not a second occurrence of the
+        // call it is counting -- the reason the pin above this one gives.
+        let install = concat!("install_env(child_process_", "backend_env(");
+
+        for head in ["fn run_as_a_ui_process(", "fn run_as_the_vault_service("] {
+            let body = body_after(&code, head);
+            assert_eq!(
+                body.matches(install).count(),
+                1,
+                "{head:?} does not publish a backend policy exactly once, so \
+                 `backend_policy::selected()` answers its `BwServe` default in that process \
+                 -- which is the vault window's export and its Sends going to a `bw.exe` the \
+                 account does not have, and the vault service serving through a `bw serve` \
+                 the daemon never started"
+            );
+        }
+
+        let service = body_after(&code, "fn run_as_the_vault_service(");
+        let installed_at = service.find(install).expect("counted one above");
+        let read_at = service
+            .find(concat!("backend_policy::", "selected()"))
+            .expect("control: the service no longer reads the policy, so there is no order");
+        assert!(
+            installed_at < read_at,
+            "the vault service reads the backend policy before it publishes one, so the \
+             policy it acts on is the default and not this account's"
+        );
     }
 }
 
