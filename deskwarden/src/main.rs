@@ -1654,6 +1654,11 @@ fn main() {
     // NO sign-in card -- a resumed session, whose account was named on some
     // earlier launch.
     let account_for_the_toolbar: Option<Account> = login.account.map(|(_, a)| a.clone());
+    // Owned for the `build_vault` callback below, which writes the account
+    // record on the frame the vault is built. `main`'s own `settings_path` is
+    // read again by the drain far below this window, so this is a clone
+    // rather than a borrow.
+    let settings_path_for_the_record = settings_path.clone();
 
     let cache_for_vault = cache.clone();
     let fill_stats_for_vault = fill_stats.clone();
@@ -1717,6 +1722,12 @@ fn main() {
             // This is what step 4 (`park_and_work` handing `wait` the park)
             // exists for.
             let park_for_work = park.handle();
+            // **A second handle, for the record the SIGN-IN establishes.**
+            // The `build_vault` callback runs on this thread on the frame the
+            // worker's answer is drained -- the worker has ended by then, so
+            // this hold contends with nothing. See
+            // `record_the_startup_sign_in`.
+            let park_for_the_record = park.handle();
             window = Some(app_window::run(
                 sign_in_account
                     .as_ref()
@@ -1740,6 +1751,23 @@ fn main() {
                 // cache has to be filled BEFORE the vault frame is built, or
                 // the window's first vault frame paints an empty vault as data.
                 move |token, work: &mut StartupWork, signed_in| {
+                    // **THE FIRST SIGN-IN'S RECORD IS WRITTEN HERE**, before
+                    // the cache fill and before the `?` below, so a vault that
+                    // fails to build still leaves the account named. `main`'s
+                    // drain of this same identity is the statement after
+                    // `app_window::run` returns, and this window does not
+                    // return until the user closes the vault -- see
+                    // `record_the_startup_sign_in`.
+                    //
+                    // The switcher's seed is rebound from what it answers: the
+                    // clone captured above was taken before the card was even
+                    // shown, so on a first install it is the blank mint.
+                    let accounts_for_vault = record_the_startup_sign_in(
+                        &settings_path_for_the_record,
+                        &park_for_the_record,
+                        signed_in,
+                    )
+                    .or(accounts_for_vault);
                     // Annotated: without it, deref coercion picks
                     // `&mut [VaultItem]` and `mem::take` asks for a `Default`
                     // slice.
@@ -3798,6 +3826,75 @@ fn adopt_startup_prefetch(
         chosen_backend,
     );
     Some(details)
+}
+
+/// **Where a FIRST sign-in's record is written -- on the frame the vault is
+/// built, not on the statement after the window closes.**
+///
+/// The hole this closes, off the owner's own disk: a clean 0.15.5 install,
+/// one self-hosted sign-in, "built-in client" pressed at the choice modal,
+/// and `settings.json` still holding the mint afterwards -- `"email": ""`,
+/// `"server_url": null`, `"use_official_bw_crypto": true` -- while
+/// `accounts/<id>/userkey.bin` sat beside it, which nothing but the
+/// direct-REST backend writes. The sign-in did exactly what was asked of it;
+/// the RECORD was a lie about it. Preferences reads the record, so the Vault
+/// page showed "Use the official Bitwarden CLI" switched on, and the
+/// CLI-only rows under it, for an account that has never touched the CLI.
+///
+/// **It was a timing bug, not a lost value.** `main`'s drain of
+/// `the_startup_windows_identity` adopts all three facts correctly -- but it
+/// is the statement AFTER `app_window::run` returns, and that one window is
+/// the sign-in card, the spinner AND the vault. It returns when the user
+/// closes the vault, which on a first install is the END of the session. On
+/// an ESTABLISHED account nobody could tell, because its record already said
+/// all three; on a mint the record stays blank for the whole run.
+///
+/// So the answer is recorded here instead: the `build_vault` callback is the
+/// one place that holds the identity while the window is still opening, and
+/// `app_window` hands it over precisely because the account on disk cannot
+/// name itself yet.
+///
+/// **Through `adopt_startup_prefetch`, which is the same guarded write the
+/// later drain performs.** One rule, two moments -- not two rules. The drain
+/// is left where it is rather than moved here, because a window closed before
+/// the vault was ever built never reaches this call at all. Running both
+/// costs nothing: the second pass finds every field already equal, changes
+/// nothing, and writes no file.
+///
+/// **The refreshed `AccountsState` is RETURNED**, and the vault window's
+/// account switcher is seeded from it. That seed used to be a clone taken
+/// before the window opened -- on a first install, the blank mint, which is
+/// how the switcher came to name a 32-character hash. A caller that ignored
+/// this answer would fall straight back to that clone, so it is bound at the
+/// one call site.
+///
+/// `None` means the caller keeps the seed it already had: there was no
+/// identity (a resumed session showed no card, and the API-key stage has no
+/// card to have learned an address from), or the guard rejected it as
+/// describing some other account, or the estate has already been reclaimed.
+fn record_the_startup_sign_in(
+    settings_path: &Path,
+    park: &EstatePark,
+    signed_in: Option<&login_ui::SignedInIdentity>,
+) -> Option<accounts::AccountsState> {
+    let identity = signed_in?;
+    park.with(|est| {
+        // Not discarded: a rejected adoption wrote nothing, so there is
+        // nothing to reseed the switcher from either, and the `?` says so
+        // rather than handing back an account list the guard just refused.
+        adopt_startup_prefetch(
+            settings_path,
+            &mut est.accounts,
+            &mut est.active_account,
+            identity.account.as_ref(),
+            identity.as_details(),
+            // The choice modal's answer, which is the whole of what the
+            // owner's report was about. `as_details` drops it -- see
+            // `login_ui::SignedInIdentity::use_official_bw_crypto`.
+            identity.use_official_bw_crypto,
+        )?;
+        est.accounts.clone()
+    })?
 }
 
 /// **The one place a `bw status` answer becomes something this app remembers
@@ -23875,10 +23972,71 @@ mod tests {
             let adopt = concat!("adopt_startup_", "prefetch(");
             assert_eq!(
                 production.matches(adopt).count(),
+                3,
+                "expected the definition and exactly TWO call sites, which are the two \
+                 moments the startup window's identity can be adopted: \
+                 `record_the_startup_sign_in`, on the frame the vault is built, and `main`'s \
+                 drain, on the statement after the window closes. Neither may be a second \
+                 COPY of the decision -- both go through this one function -- and a third \
+                 caller is. An absent one is worse than dead code: without the first, a fresh \
+                 install's record stays blank for the whole session (the window does not \
+                 return until the user closes the vault); without the second, a window closed \
+                 before the vault was ever built records nothing at all"
+            );
+
+            // **The first of those two, and where it sits.** The record has to
+            // be written from inside the callback that is HANDED the identity,
+            // because that is the only moment it exists while the window is
+            // still opening. A call moved out of this block is a call that
+            // happens after `app_window::run` returns, which is the shipped
+            // bug this pin was written against: 0.15.5 signed a fresh install
+            // in to a self-hosted server, wrote `userkey.bin`, and left
+            // `settings.json` holding `"email": ""` and
+            // `"use_official_bw_crypto": true` for the rest of the run.
+            let record = concat!("record_the_startup_sign", "_in(");
+            assert_eq!(
+                production.matches(record).count(),
                 2,
-                "expected the definition and exactly one call site -- `main`'s drain of the \
-                 startup prefetch; a second caller is a second copy of this decision, and an \
-                 absent one means the tested function is dead code"
+                "expected the definition and exactly one call site -- the `build_vault` \
+                 callback `app_window::run` is given. A second caller is a second moment \
+                 nothing decides between; none at all is the 0.15.5 behaviour back again"
+            );
+            let building = block_after(concat!(
+                "move |token, work: &mut StartupWork, signed", "_in| {"
+            ));
+            assert!(
+                building.contains(concat!("record_the_startup_sign", "_in(")),
+                "the vault-building callback does not record the sign-in, so the account \
+                 record is written only after the window closes -- which on a first install \
+                 is the end of the session: {building:?}"
+            );
+            // **Bound, and bound to the switcher's seed.** `let _ =
+            // record_the_startup_sign_in(..);` -- this repo's signature defect
+            // -- would still persist the record but would leave the vault
+            // window's account menu on the clone taken before the card was
+            // shown, which on a first install is the blank mint that names a
+            // 32-character hash.
+            assert!(
+                building.contains(concat!(
+                    "let accounts_for_vault = record_the_startup_sign", "_in("
+                )),
+                "the recorded answer is not bound to the account list the vault window is \
+                 seeded from, so the switcher still names whatever was cloned before the \
+                 sign-in: {building:?}"
+            );
+            assert!(
+                building.contains(concat!(".or(accounts_for", "_vault);")),
+                "the pre-window clone is not the fallback, so a launch that recorded nothing \
+                 -- a resumed session, a rejected identity -- hands the vault window no \
+                 account list at all: {building:?}"
+            );
+            // The identity really is what it is asked about. Passing `None`
+            // compiles, records nothing, and leaves every other assertion here
+            // green.
+            assert!(
+                building.contains(concat!("signed", "_in,")),
+                "the callback records something other than the identity it was handed: \
+                 {building:?}"
             );
 
             // **There is no drain any more.** This used to slice the frame
@@ -26352,6 +26510,254 @@ mod tests {
             reloaded.active_account.as_ref(),
             Some(&blank.id),
             "the active account was moved by something that only learns an address"
+        );
+    }
+
+    /// The estate `record_the_startup_sign_in` writes through, parked exactly
+    /// as `park_and_work` parks it. Nothing here spawns anything: the two
+    /// fields under test are `accounts` and `active_account`, and every other
+    /// field is the same inert seed `a_child_that_arrives_after_the_deadline_
+    /// gave_up_is_stopped_not_orphaned` uses.
+    fn parked_holding(dir: &Path, active: &Account) -> EstatePark {
+        EstatePark::holding(SessionEstate {
+            cache: Arc::new(VaultCache::new(VaultBridge::new(
+                "http://127.0.0.1:1".to_string(),
+            ))),
+            engine: MatchEngine::new(),
+            child: None,
+            token: String::new(),
+            details: None,
+            task_in_progress: None,
+            store: session_store::SessionStore::new(dir.join("session.bin")),
+            accounts: Some(accounts_state(
+                deskwarden::bw_path::MultiAccountAvailability::Available,
+                vec![active.clone()],
+                active,
+            )),
+            active_account: Some(active.clone()),
+            settings: deskwarden::settings::Settings::default(),
+        })
+    }
+
+    /// What the sign-in card publishes: the address that was typed, the server
+    /// it was configured with, and the choice modal's answer.
+    fn first_sign_in_to(
+        account: &Account,
+        server: &str,
+        chosen: Option<bool>,
+    ) -> login_ui::SignedInIdentity {
+        login_ui::SignedInIdentity {
+            account: Some(account.id.clone()),
+            user_email: Some("me@example.eu".to_string()),
+            server_url: Some(server.to_string()),
+            use_official_bw_crypto: chosen,
+        }
+    }
+
+    /// **THE SHIPPED BUG, from the owner's disk.** A clean 0.15.5 install, one
+    /// self-hosted sign-in, "built-in client" pressed at the choice modal --
+    /// and `settings.json` afterwards still holding the mint: `"email": ""`,
+    /// `"server_url": null`, `"use_official_bw_crypto": true`, beside an
+    /// `accounts/<id>/userkey.bin` that only the direct-REST backend writes.
+    /// The sign-in was right; Preferences reads the RECORD, so the Vault page
+    /// offered the CLI rows for an account that has never touched the CLI.
+    ///
+    /// **Asserted on what is written and read back**, never on the estate in
+    /// memory. The in-memory behaviour was already correct in 0.15.5 -- the
+    /// window signed in on the backend the user picked -- and a test that read
+    /// the estate would have passed against the shipped app.
+    ///
+    /// **Its backend assertion cannot stand alone**, and its sibling is why:
+    /// on a self-hosted address `false` is also what the DERIVATION answers,
+    /// so an answer dropped on the way here would still land on `false` in
+    /// this test. `the_same_first_sign_in_answering_the_official_cli_persists_
+    /// true` is the arm the derivation gets wrong, and it is what makes a
+    /// dropped answer fail rather than pass.
+    #[test]
+    fn a_first_sign_ins_three_facts_are_persisted_before_the_vault_opens() {
+        let scratch = ScratchConfig::with_accounts("first-sign-in", &[ACCOUNT_A]);
+        let settings_path = scratch.path().join("settings.json");
+        let mint = account(ACCOUNT_A, "");
+        assert!(
+            mint.email.is_empty() && mint.server_url.is_none() && mint.use_official_bw_crypto,
+            "control: this is not the record `resolve_startup` mints, so what follows is not \
+             the first sign-in at all"
+        );
+        let park = parked_holding(scratch.path(), &mint);
+
+        let seeded = record_the_startup_sign_in(
+            &settings_path,
+            &park,
+            Some(&first_sign_in_to(&mint, "https://vault.example.eu", Some(false))),
+        );
+
+        let reloaded = settings::Settings::load(&settings_path);
+        let written = reloaded
+            .accounts
+            .first()
+            .expect("the account list was not written at all");
+        assert_eq!(
+            written.email, "me@example.eu",
+            "the address the user typed was not recorded, so every menu naming this account \
+             names its 32-character directory until the window is closed: {written:?}"
+        );
+        assert_eq!(
+            written.server_url.as_deref(),
+            Some("https://vault.example.eu"),
+            "the self-hosted server this account was signed in to was not recorded, so the \
+             next launch derives its backend from an address it does not have: {written:?}"
+        );
+        assert!(
+            !written.use_official_bw_crypto,
+            "the choice modal was answered \"built-in client\" and the record says the \
+             official CLI -- which is the owner's report verbatim: Preferences shows the CLI \
+             switch on, and the CLI-only rows under it, for an account served by the \
+             direct-REST backend: {written:?}"
+        );
+
+        assert_eq!(
+            seeded
+                .as_ref()
+                .map(|state| state.active().email.as_str()),
+            Some("me@example.eu"),
+            "the vault window is seeded from what this answers, and it answered with the \
+             blank mint -- so the account switcher still names the hash"
+        );
+    }
+
+    /// The positive control, on the other answer. Without it every assertion
+    /// above passes against a function that writes `false` unconditionally.
+    #[test]
+    fn the_same_first_sign_in_answering_the_official_cli_persists_true() {
+        let scratch = ScratchConfig::with_accounts("first-sign-in-cli", &[ACCOUNT_A]);
+        let settings_path = scratch.path().join("settings.json");
+        let mint = account(ACCOUNT_A, "");
+        let park = parked_holding(scratch.path(), &mint);
+
+        record_the_startup_sign_in(
+            &settings_path,
+            &park,
+            Some(&first_sign_in_to(&mint, "https://vault.example.eu", Some(true))),
+        );
+
+        let reloaded = settings::Settings::load(&settings_path);
+        let written = reloaded.accounts.first().expect("no account list was written");
+        assert!(
+            written.use_official_bw_crypto,
+            "a self-hoster who pressed \"Use the Bitwarden CLI\" had their answer overwritten \
+             by the derivation the modal exists to replace: {written:?}"
+        );
+        assert_eq!(
+            written.email, "me@example.eu",
+            "control: this arm learned nothing either, so the assertion above says nothing"
+        );
+    }
+
+    /// **An established account's settled answer is not re-opened**, which is
+    /// the half `accounts::learn_account_details` guards on `is_a_fresh_mint`
+    /// for. A sign-in that put no question -- an official Bitwarden server has
+    /// no choice to offer -- must leave the stored preference exactly where it
+    /// was, even though the address it carries is self-hosted-looking.
+    #[test]
+    fn an_established_accounts_backend_is_untouched_by_a_later_sign_in() {
+        let scratch = ScratchConfig::with_accounts("established", &[ACCOUNT_A]);
+        let settings_path = scratch.path().join("settings.json");
+        let mut established = account(ACCOUNT_A, "me@example.eu");
+        established.server_url = Some("https://vault.example.eu".to_string());
+        established.use_official_bw_crypto = true;
+        let park = parked_holding(scratch.path(), &established);
+
+        record_the_startup_sign_in(
+            &settings_path,
+            &park,
+            Some(&login_ui::SignedInIdentity {
+                account: Some(established.id.clone()),
+                user_email: Some("me-RENAMED@example.eu".to_string()),
+                server_url: Some("https://vault.example.eu".to_string()),
+                // Nothing was asked, so nothing may be re-derived.
+                use_official_bw_crypto: None,
+            }),
+        );
+
+        let reloaded = settings::Settings::load(&settings_path);
+        let written = reloaded.accounts.first().expect("no account list was written");
+        assert!(
+            written.use_official_bw_crypto,
+            "a re-sign-in re-derived an established account's backend from its own server \
+             address and moved a vault nobody asked to move: {written:?}"
+        );
+        assert_eq!(
+            written.email, "me-RENAMED@example.eu",
+            "control: this call learned nothing at all, so the assertion above holds against \
+             a function that does not run"
+        );
+    }
+
+    /// The guard is live at this call site too. The startup window can switch,
+    /// add or remove an account before the vault is built, so an identity that
+    /// names somebody else must be dropped here exactly as `main`'s drain
+    /// drops it -- and the vault window must be left on the seed it had rather
+    /// than handed the wrong account's list.
+    #[test]
+    fn an_identity_naming_another_account_records_nothing_here_either() {
+        let scratch = ScratchConfig::with_accounts("wrong-account", &[ACCOUNT_A, ACCOUNT_B]);
+        let settings_path = scratch.path().join("settings.json");
+        let active = account(ACCOUNT_A, "");
+        let park = parked_holding(scratch.path(), &active);
+
+        let seeded = record_the_startup_sign_in(
+            &settings_path,
+            &park,
+            Some(&login_ui::SignedInIdentity {
+                account: deskwarden::accounts::AccountId::parse(ACCOUNT_B),
+                user_email: Some("someone-else@example.eu".to_string()),
+                server_url: Some("https://vault.example.eu".to_string()),
+                use_official_bw_crypto: Some(false),
+            }),
+        );
+
+        assert!(
+            seeded.is_none(),
+            "a rejected identity still handed the vault window an account list, so the \
+             switcher is seeded from an adoption that did not happen"
+        );
+        assert!(
+            !settings_path.exists(),
+            "another account's address and backend were written into the active account's \
+             entry: {:?}",
+            std::fs::read_to_string(&settings_path)
+        );
+
+        // The positive control on the same scratch directory: the SAME call
+        // with the right account does write.
+        assert!(
+            record_the_startup_sign_in(
+                &settings_path,
+                &park,
+                Some(&first_sign_in_to(&active, "https://vault.example.eu", Some(false))),
+            )
+            .is_some(),
+            "control: nothing in this harness can record anything, so the assertions above \
+             say nothing"
+        );
+        assert!(settings_path.exists(), "control: no file is written on the agreeing case");
+    }
+
+    /// A launch that showed no card -- a resumed session -- has no identity,
+    /// and must not write. The account it is on was named on some earlier
+    /// launch, and blanking that here would put the hash back and persist it.
+    #[test]
+    fn a_launch_with_no_sign_in_records_nothing() {
+        let scratch = ScratchConfig::with_accounts("no-card", &[ACCOUNT_A]);
+        let settings_path = scratch.path().join("settings.json");
+        let known = account(ACCOUNT_A, "me@example.eu");
+        let park = parked_holding(scratch.path(), &known);
+
+        assert!(record_the_startup_sign_in(&settings_path, &park, None).is_none());
+        assert!(
+            !settings_path.exists(),
+            "a launch that showed no sign-in card rewrote settings.json anyway: {:?}",
+            std::fs::read_to_string(&settings_path)
         );
     }
 
