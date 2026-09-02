@@ -2637,7 +2637,7 @@ pub fn picker_follow_up(
         }
         // **There is no `SearchVault` outcome any more, and that is the
         // point.** Asking to search used to answer one, and `main` spent the
-        // ~100 MB egui vault window on it -- to search a vault this daemon
+        // ~76 MB egui vault window on it -- to search a vault this daemon
         // already holds in memory, from a card that costs ~2 MB. The card now
         // answers the request itself, in place, in its own search mode: see
         // `picker_prompt::run_with`. Nothing routes out of the picker to that
@@ -9389,7 +9389,7 @@ mod picker_wiring_tests {
     ///
     /// **Searching is no longer among them.** `Outcome::SearchVault` is gone:
     /// the card answers a search request itself, in its own search mode, rather
-    /// than spending the ~100 MB vault window on a vault the daemon already
+    /// than spending the ~76 MB vault window on a vault the daemon already
     /// holds. *New login* and *Edit binding* still legitimately open that
     /// window, and those are what is asserted here.
     #[test]

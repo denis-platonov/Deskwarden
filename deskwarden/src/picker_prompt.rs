@@ -88,7 +88,7 @@ pub enum Event {
     ///
     /// **This no longer leaves the card.** It switches the same window into
     /// [`Outcome`]-less search mode -- a focused text box over the same list --
-    /// rather than answering an outcome that opened the ~100 MB vault window
+    /// rather than answering an outcome that opened the ~76 MB vault window
     /// to search a vault the daemon already holds in memory.
     Search,
     /// The search box's contents changed. Carries what is in it now, exactly
@@ -229,7 +229,7 @@ pub struct PickerCalls {
 /// same [`Event::Chose`] the candidate list is, leading to the same
 /// `show_palette` step and the same [`Outcome::Fill`]. **One dispatch path**,
 /// which is the whole reason the mode lives here rather than in a second
-/// window: the alternative was `Outcome::SearchVault`, which opened the ~100 MB
+/// window: the alternative was `Outcome::SearchVault`, which opened the ~76 MB
 /// egui vault window to search a vault the daemon already holds in memory, and
 /// which never gave that memory back to the process.
 ///
@@ -1055,7 +1055,7 @@ pub fn search_row_label(truncated: bool) -> (&'static str, &'static str) {
 // Asked for by the app's owner: "search should open the same text box and
 // focus on it where user can find something, not separate window, results
 // shown in the same window". The row that used to answer `Outcome::SearchVault`
-// -- and so open the ~100 MB egui vault window to search a vault the daemon
+// -- and so open the ~76 MB egui vault window to search a vault the daemon
 // already holds in memory -- now switches this card into the mode below.
 // ---------------------------------------------------------------------------
 
@@ -4298,7 +4298,7 @@ mod tests {
         );
 
         // **And *Search vault* stays on this card.** It used to answer
-        // `Outcome::SearchVault`, which `main` spent the ~100 MB egui vault
+        // `Outcome::SearchVault`, which `main` spent the ~76 MB egui vault
         // window on. It now reaches the vault through the searcher seam and
         // shows the answer here: the card is never closed for it, so the only
         // way this loop ends is the Cancel that follows.
@@ -4327,7 +4327,7 @@ mod tests {
             1,
             "*Search vault* did not reach the vault at all. It is the empty card's only route \
              to a login saved under another name, and the whole point of answering it here is \
-             that it must not open the ~100 MB vault window to do it"
+             that it must not open the ~76 MB vault window to do it"
         );
     }
 
@@ -4466,7 +4466,7 @@ mod tests {
     /// **Asking to search closes nothing and answers no outcome.**
     ///
     /// The regression this guards is the one being removed: `Event::Search`
-    /// used to answer `Outcome::SearchVault`, which `main` spent the ~100 MB
+    /// used to answer `Outcome::SearchVault`, which `main` spent the ~76 MB
     /// egui vault window on -- to search a vault the daemon already holds in
     /// memory, from a card that costs ~2 MB.
     #[test]

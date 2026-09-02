@@ -43,7 +43,7 @@
 //! field**, with no border of its own on either. Results are drawn as rows by
 //! the same painter the candidates use. Picking one leads to the same *What should I type?* step. There is no
 //! second window and no egui anywhere on the path; the mode that used to answer
-//! this row opened the ~100 MB vault window to search a vault the daemon
+//! this row opened the ~76 MB vault window to search a vault the daemon
 //! already held in memory. Any fixture reaches it -- the example's vault is
 //! `vault_fixture`, deliberately larger than the card's cap so the overflow
 //! notice is visible on an empty query.
