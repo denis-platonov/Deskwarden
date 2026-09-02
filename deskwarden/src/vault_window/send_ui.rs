@@ -5381,14 +5381,24 @@ mod source_pins {
                 // pinned to one, one file down -- so this is still the count
                 // of every place that could.
                 //
-                // **Three in `main.rs`, not four, since the startup door
-                // stopped drawing in the daemon.** That branch built a vault
-                // frame in this process and named the type to do it; the
-                // window now runs in a process of its own and the branch asks
-                // `UiWindows` for it instead. One construction fewer is one
-                // fewer place that could reach the pointer, which is the
-                // direction this pin wants.
-                vec![("main.rs", 3), ("vault_window/mod.rs", 5)],
+                // **Four in `main.rs`.** Three of them are the daemon's, and
+                // it went from four to three when the startup door stopped
+                // drawing in the daemon: that branch built a vault frame in
+                // this process and named the type to do it, and it now asks
+                // `UiWindows` for a process instead.
+                //
+                // **The fourth is the `--ui` child's own, and it is on the
+                // other side of the boundary this pin is drawn around.** A
+                // direct-REST child that opens on a sign-in card hosts the
+                // vault stage itself, through `app_window::run`, and builds
+                // the frame for it -- so it names the type exactly as the
+                // daemon's remaining three do. It is a `production()` like the
+                // others, which is the only constructor there is; nothing here
+                // reads `env.sync`, and that read is still pinned to one, one
+                // file down. So this is a fourth place the pointer EXISTS and
+                // not a fourth place it can be reached from, which is the
+                // property this count stands for.
+                vec![("main.rs", 4), ("vault_window/mod.rs", 5)],
             ),
         ] {
             let files = crate_sources();

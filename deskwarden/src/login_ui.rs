@@ -8,6 +8,10 @@ use crate::hello::{self, HelloState};
 use crate::rest::api::Authenticated;
 use crate::theme;
 use eframe::egui::{self, Color32, CornerRadius, Margin, Pos2, RichText, Sense, Stroke, Vec2};
+// For `SignedInIdentity` alone, which is the one type in this file that
+// crosses a process boundary -- see its doc. Nothing else here is serialised,
+// and nothing here that holds a password ever may be.
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -466,7 +470,19 @@ pub fn identity_after_sign_in(
 /// learned into the wrong account is worse than no address at all. `main`
 /// runs it through the same id guard
 /// (`prefetch_still_describes_the_active_account`) the prefetch already used.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **It crosses a process boundary, and every field in it is already in
+/// `settings.json`.** Since the direct-REST sign-in card moved into the
+/// `--ui` child, this is what that child carries home through
+/// [`crate::ui_process::UiVaultResult`] so the daemon can adopt an identity it
+/// never saw established. There is no token here and no password: the master
+/// key goes to that account's own `userkey.bin` through the existing
+/// per-account [`crate::user_key_store::UserKeyStore`], and the password is
+/// zeroized in the child without ever being written, spawned or transmitted.
+/// An email, a server address and a backend answer are the three things this
+/// app writes into `settings.json` in the clear anyway, which is exactly the
+/// bar `ui_process`'s module doc sets for the result file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedInIdentity {
     /// The account the window was opened for. `None` on a
     /// `StartupAccounts::NoAccountList` app, which has no account to record

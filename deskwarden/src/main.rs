@@ -876,7 +876,43 @@ fn main() {
     // The alternative -- carry on with an empty slot -- is a launch whose
     // vault reads as empty for a reason nothing on screen explains, which is
     // the worst failure mode available on this branch.
+    // **WHERE that master password gets typed, which is the whole of this
+    // branch's memory win.**
+    //
+    // A direct-REST account with an empty slot needs a sign-in. Until now the
+    // only way this file could ask for one was to drop the cached session,
+    // which routes startup into the arm that calls `app_window::run` **in the
+    // daemon** -- and a daemon that draws once holds the OpenGL driver's
+    // committed arenas until it exits. Measured: ~19 MB before, ~59 MB for
+    // the rest of the process's life after.
+    //
+    // A `--ui` child can take that sign-in now, on this account, provided
+    // there is a server to sign in TO. So the question is asked here, once,
+    // and spent three times below.
+    let the_sign_in_belongs_to_a_child = the_startup_sign_in_belongs_to_a_ui_process(
+        backend_choice,
+        vault_slot.is_filled(),
+        active_account.as_ref(),
+    );
     let cached_session = match (backend_choice, vault_slot.is_filled()) {
+        // **The child takes it, so startup must NOT drop the session.**
+        //
+        // Dropping it is how this file used to say "ask for the master
+        // password", and it says that to the arm that draws. Keeping a
+        // session -- an empty one if there was none, which is truthful,
+        // because a direct-REST account authenticates with the master key in
+        // `userkey.bin` and never with a `bw` token -- keeps startup in the
+        // arm that SPAWNS. The window that opens there opens on the card,
+        // because the child reads the same empty key store this line just did.
+        (backend_policy::VaultBackendChoice::DirectRest, false)
+            if the_sign_in_belongs_to_a_child =>
+        {
+            log::info!(
+                "this account has no usable stored master key; the sign-in card opens in a \
+                 ui process, so this daemon draws nothing and keeps its ~19 MB"
+            );
+            Some(cached_session.unwrap_or_default())
+        }
         (backend_policy::VaultBackendChoice::DirectRest, false) => {
             log::info!(
                 "this account has no usable stored master key, so this launch asks for the \
@@ -1474,7 +1510,20 @@ fn main() {
         cache.items().len()
     );
     }
-    if surface == FirstSurface::StayInTheTray && !cache_first {
+    // **`&& !the_sign_in_belongs_to_a_child`, and without it this arm draws.**
+    //
+    // Everything below waits for a vault that is READY, and a vault whose
+    // master key has not been typed yet never becomes ready on its own. So
+    // this wait would spend its whole deadline and end `Unreachable`, whose
+    // answer is `recover_from_failed_vault_wait` -- which asks for the master
+    // password, in this process, with a window. That is the exact draw this
+    // branch exists to remove, reached by the arm that is supposed to be the
+    // silent one: a login autostart.
+    //
+    // The launch comes up in the tray instead, armed from whatever local copy
+    // there is, and the sign-in happens in a child the moment the user asks
+    // for a window.
+    if surface == FirstSurface::StayInTheTray && !cache_first && !the_sign_in_belongs_to_a_child {
     // **NO WINDOW: a login autostart boots in the background.**
     //
     // The owner: "if it autostart with minimized - it goes to tray", and, on
@@ -1580,6 +1629,16 @@ fn main() {
     // shared cache, which the tray, the global hotkey and every later
     // fill read. Both processes wait through the same readiness at the
     // same time rather than one after the other.
+    //
+    // **Except when the child is still asking for the master password.**
+    // Then there is nothing to be ready: the vault backend does not exist
+    // until that card is answered, so this probe would fail on every
+    // launch and hand the failure to `recover_from_failed_vault_wait`,
+    // which puts a SECOND master-password window on screen -- in the
+    // daemon -- behind the child's own. The daemon arms what it can from
+    // the local copy and picks the rest up when the child reports home;
+    // see `adopt_a_childs_sign_in`.
+    if !the_sign_in_belongs_to_a_child {
     let items = match wait_for_vault_ready(vault.as_ref(), &schedule) {
         Ok(items) => items,
         // Unchanged, and still the heavier recovery: kill the backend,
@@ -1599,6 +1658,27 @@ fn main() {
         ),
     };
     arm_autofill_and_seed_cache(&startup_entries, &cache, items, startup_epoch);
+    }
+    }
+    // **The launch whose vault is behind a card in another process.**
+    //
+    // No probe ran and nothing was fetched, so there is no second half owing
+    // and `arm_autofill_and_seed_cache` would be wrong for the reason the
+    // missing-CLI arm gives: it writes at `Source::Backend`, which would
+    // overwrite a perfectly good encrypted disk cache with the empty `Vec`
+    // this launch actually has. This arms the engine FROM the cache and
+    // writes nothing back.
+    //
+    // `!cache_first` because that arm has already done exactly this, and
+    // arming twice would replay a snapshot over itself.
+    if the_sign_in_belongs_to_a_child && !cache_first {
+        arm_autofill_from_the_local_copy(&startup_entries, &cache);
+        log::info!(
+            "this launch's vault is locked until a ui process takes the master password; \
+             the tray, the fill hotkey and autofill come up now over {} item(s) of local \
+             copy, and the backend is settled again when that child reports home",
+            cache.items().len()
+        );
     }
 
     SessionEstate {
@@ -2546,7 +2626,19 @@ fn main() {
                 estate.accounts.as_mut(),
             );
         }
-        if let Some(result) = ui_windows.poll_the_vault_window(&config_dir) {
+        if let Some((result, signed_in)) = ui_windows.poll_the_vault_window(&config_dir) {
+            // **Before the follow-up, because the follow-up may switch
+            // accounts.** `open_vault_window` acts on `switch_to` and an
+            // account settle re-points everything this adoption writes -- so
+            // an identity applied afterwards would be written against
+            // whichever account the switch landed on. The same ordering, and
+            // the same reason, as the startup drain's own guard.
+            adopt_a_childs_sign_in(
+                &settings_path,
+                &mut estate.accounts,
+                &mut estate.active_account,
+                signed_in.as_ref(),
+            );
             estate = open_vault_window(
                 estate,
                 VaultDeps {
@@ -3826,6 +3918,84 @@ fn adopt_startup_prefetch(
         chosen_backend,
     );
     Some(details)
+}
+
+/// **What the daemon does with a sign-in it never saw.**
+///
+/// The direct-REST sign-in card runs in a `--ui` child now, so the two facts
+/// the daemon used to learn by hosting that card -- whose account this is, and
+/// which client opens it -- arrive instead in the child's result file, as a
+/// [`login_ui::SignedInIdentity`]. This is where they land.
+///
+/// # Two things happen, and the order is not arbitrary
+///
+/// The record first, through the same [`adopt_startup_prefetch`] the startup
+/// window's own drain uses -- so the account-id guard
+/// (`prefetch_still_describes_the_active_account`) runs here exactly as it
+/// does there, and an answer about the account the child was opened for
+/// cannot be written into whichever account the daemon is on now.
+///
+/// **Then the backend, and only if the record was accepted.** The child wrote
+/// `userkey.bin`; until this daemon re-settles, its own slot is still the
+/// empty one this launch came up with, so the tray, the hotkey and autofill
+/// are all reading a vault that is not there. Re-settling is what fills it,
+/// and it is the same `settle_the_vault_backend` an account switch runs.
+///
+/// # At [`WhenSettling::JustProvenByASignIn`], which is the whole reason that
+/// enum exists
+///
+/// That settle probes the server with a live `list_items`, and on a plain
+/// failure it DELETES `userkey.bin` and asks for the master password again.
+/// Here that would be catastrophic in a quiet way: the key was derived from a
+/// master password seconds ago and used in the child to read this very vault,
+/// so a probe that fails at this moment means the network blinked between two
+/// processes -- and the app would answer it by throwing away the sign-in the
+/// user has just completed, then asking them to do it again. See
+/// `the_daemon_keeps_a_key_a_child_just_wrote_when_the_probe_blinks`.
+fn adopt_a_childs_sign_in(
+    settings_path: &Path,
+    accounts_state: &mut Option<accounts::AccountsState>,
+    active_account: &mut Option<Account>,
+    signed_in: Option<&login_ui::SignedInIdentity>,
+) {
+    let Some(identity) = signed_in else {
+        return;
+    };
+    log::info!("a ui process signed in; adopting the identity it established");
+    if adopt_startup_prefetch(
+        settings_path,
+        accounts_state,
+        active_account,
+        identity.account.as_ref(),
+        identity.as_details(),
+        identity.use_official_bw_crypto,
+    )
+    .is_none()
+    {
+        // The guard refused: the child signed in to an account this daemon is
+        // no longer on. Nothing is written and nothing is re-settled -- the
+        // backend that is live is the one for the account actually in use,
+        // and re-pointing it at the other one is precisely the mix-up the
+        // guard exists to stop.
+        return;
+    }
+    let Some(account) = active_account.as_ref() else {
+        return;
+    };
+    let Some(settlement) = SETTLEMENT.get() else {
+        return;
+    };
+    let env = settle_the_vault_backend_when(
+        &settlement.config_dir,
+        Some(account),
+        &settlement.slot,
+        WhenSettling::JustProvenByASignIn,
+    );
+    let choice = install_backend_env(env, &settlement.slot);
+    log::info!(
+        "after the ui process's sign-in, {}'s vault is served by {choice:?}",
+        account.email
+    );
 }
 
 /// **Where a FIRST sign-in's record is written -- on the frame the vault is
@@ -6617,7 +6787,7 @@ impl UiWindows {
     fn poll_the_vault_window(
         &mut self,
         config_dir: &Path,
-    ) -> Option<vault_window::VaultWindowResult> {
+    ) -> Option<(vault_window::VaultWindowResult, Option<login_ui::SignedInIdentity>)> {
         let answer = match self.vault.as_mut()?.child.try_wait() {
             Ok(Some(status)) => Ok(Some(status.code())),
             Ok(None) => Ok(None),
@@ -6755,7 +6925,7 @@ fn what_the_vault_ui_process_reported(
     pid: u32,
     code: Option<i32>,
     config_dir: &Path,
-) -> vault_window::VaultWindowResult {
+) -> (vault_window::VaultWindowResult, Option<login_ui::SignedInIdentity>) {
     let path = deskwarden::ui_process::result_path(config_dir, pid);
     let from_file = deskwarden::ui_process::read_result(&path);
     deskwarden::ui_process::forget_result(&path);
@@ -6771,7 +6941,16 @@ fn what_the_vault_ui_process_reported(
     let crossing = ui_vault_outcome(pid, code, from_file, &UiFailureEnv::production());
     log::info!("UI process {pid} came home with {crossing:?}");
 
-    vault_window::VaultWindowResult {
+    // **The identity travels beside the result, not inside it.**
+    //
+    // `VaultWindowResult` is what a vault WINDOW produced, and both hosts
+    // build one -- including the in-process window, which has no sign-in
+    // stage and could only ever put `None` there. A field that one producer
+    // can never fill is a field every reader has to remember is meaningless
+    // in half the cases. So the sign-in rides home as a second value, from
+    // the one place that can have one.
+    let signed_in = crossing.signed_in;
+    let result = vault_window::VaultWindowResult {
         locked: crossing.locked,
         needs_reauth: crossing.needs_reauth,
         edited_settings: crossing.edited_settings,
@@ -6783,7 +6962,8 @@ fn what_the_vault_ui_process_reported(
         // `bw status` spawn -- which is already what a window closed before
         // its own fetch returned costs today.
         account_details: None,
-    }
+    };
+    (result, signed_in)
 }
 
 /// **The union of the two carriers, and the refusal to read a code that is
@@ -6853,24 +7033,89 @@ fn ui_vault_outcome(
     deskwarden::ui_process::UiVaultResult::union(from_file, from_exit_code)
 }
 
+/// **Whether this launch's sign-in card opens in a `--ui` child or in the
+/// daemon**, which is the one decision that says whether this daemon ever
+/// creates an OpenGL context.
+///
+/// # Why it is a function and not three conditions at the call site
+///
+/// `fn main` is the process entry point and nothing in this crate can run it
+/// (see `search_asked_for`). A decision left inline there is a decision no
+/// test reaches -- and this one is worth ~40 MB of a user's RAM for the life
+/// of the process, permanently, because the driver's committed arenas come
+/// back only at exit. Pulled out here it is pure, total over its three
+/// inputs, and driven directly by
+/// `the_daemon_draws_no_window_on_the_direct_rest_sign_in_path`.
+///
+/// # The three inputs, and why each is necessary
+///
+/// * `backend_choice` -- only the direct-REST sign-in has moved. A `bw serve`
+///   sign-in produces a session token that **the daemon** must start
+///   `bw serve` with, and the child's only carrier home is a file it writes
+///   as it exits; that answer would arrive long after the window needed the
+///   backend it describes. So the `bw serve` card stays in the daemon, and
+///   that is a deliberate scope line rather than an oversight.
+/// * `a_key_is_already_stored` -- if the slot is filled there is no sign-in
+///   to place at all, and the window opens straight onto the vault.
+/// * `account` -- with **a recorded server URL**, because that is what the
+///   child would sign in to. Without one there is nothing a card can do, and
+///   the daemon's own recovery is the only thing left; see
+///   `ui_process::direct_rest_start_failure`, which refuses the spawn on the
+///   same fact from the other side.
+///
+/// # It answers `false` when it cannot be sure
+///
+/// Every unknown lands on the daemon, which is the arm that has always
+/// worked. Getting this wrong towards `true` is a window that never opens;
+/// getting it wrong towards `false` costs memory and nothing else.
+fn the_startup_sign_in_belongs_to_a_ui_process(
+    backend_choice: backend_policy::VaultBackendChoice,
+    a_key_is_already_stored: bool,
+    account: Option<&Account>,
+) -> bool {
+    if backend_choice != backend_policy::VaultBackendChoice::DirectRest {
+        return false;
+    }
+    if a_key_is_already_stored {
+        return false;
+    }
+    account.is_some_and(|account| {
+        account.server_url.as_deref().is_some_and(|url| !url.trim().is_empty())
+    })
+}
+
 /// **Whether spawning a UI process for this account would produce a window.**
 ///
-/// Asked by the daemon *before* the spawn, and answered off the same two facts
-/// the child would read a moment later: `backend_policy::choose` over the
-/// account, and -- on the direct-REST arm only -- whether `userkey.bin` and a
-/// server URL exist. `deskwarden::ui_process::direct_rest_start_failure` is
-/// the shared decision, so the two processes cannot come to different answers.
+/// Asked by the daemon *before* the spawn, and answered off the same facts the
+/// child would read a moment later: `backend_policy::choose` over the account,
+/// and -- on the direct-REST arm only -- whether a server URL exists.
+/// `deskwarden::ui_process::direct_rest_start_failure` is the shared decision,
+/// so the two processes cannot come to different answers.
+///
+/// # It no longer reads `userkey.bin`, and that is this branch
+///
+/// It used to, and a missing key was a refusal: the daemon kept the window in
+/// its own process because the child could not ask for a master password. On
+/// a direct-REST account the child can now, so a missing key is the opening
+/// frame of that window rather than a reason to host it here -- and hosting it
+/// here was what left the daemon holding the OpenGL driver for the life of the
+/// process.
+///
+/// **The parameter therefore has no reader left, and is kept anyway.** Every
+/// caller has a `config_dir` in hand, the `bw serve` half of this decision is
+/// expected to grow one back when that sign-in moves too, and a signature
+/// churned twice is a worse diff than an underscore. It is named `_config_dir`
+/// so that the absence is something a reader trips over rather than infers.
 ///
 /// `None` on the `bw serve` arm and on no-account-at-all, which is what
 /// `choose` answers for an account with no server: those windows open, and
 /// have always opened, without a stored key.
 ///
 /// This is deliberately a **read**, not a probe: it does not talk to the
-/// server and it does not decrypt anything. The question is only whether the
-/// child has the two inputs it refuses without; whether the key still works is
+/// server and it does not decrypt anything. Whether the key still works is
 /// `settle_the_vault_backend`'s probe, and it belongs to the daemon.
 fn why_a_ui_process_could_not_read_this_vault(
-    config_dir: &Path,
+    _config_dir: &Path,
     account: Option<&Account>,
 ) -> Option<deskwarden::ui_process::UiStartFailure> {
     match backend_policy::choose(
@@ -6880,15 +7125,7 @@ fn why_a_ui_process_could_not_read_this_vault(
         backend_policy::VaultBackendChoice::BwServe => None,
         backend_policy::VaultBackendChoice::DirectRest => {
             let account = account?;
-            deskwarden::ui_process::direct_rest_start_failure(
-                user_key_store::UserKeyStore::new(accounts::user_key_path_for(
-                    config_dir,
-                    &account.id,
-                ))
-                .load()
-                .is_some(),
-                account.server_url.is_some(),
-            )
+            deskwarden::ui_process::direct_rest_start_failure(account.server_url.is_some())
         }
     }
 }
@@ -10912,13 +11149,38 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         None => config_dir.join("session.bin"),
     };
     let store = session_store::SessionStore::new(session_path);
-    let Some(session_token) = store.load() else {
+    // **Which backend this account is on, asked HERE because it decides
+    // whether a missing session token is fatal.**
+    //
+    // It used to be asked further down, after the token had already been
+    // refused over -- which was right while every sign-in belonged to the
+    // daemon, and wrong the moment the direct-REST card moved here. A
+    // direct-REST account does not read its vault through a session token at
+    // all; it reads it with the master key in `userkey.bin`. Refusing that
+    // window for want of a token was refusing it for want of something it
+    // never uses, and before the first sign-in there has never been one.
+    //
+    // `choose` is the same pure function the daemon asks, over the same two
+    // fields of the same account record, so the two processes cannot come to
+    // different answers about it.
+    let choice = backend_policy::choose(
+        active_account.as_ref().and_then(|a| a.server_url.as_deref()),
+        active_account.as_ref().is_none_or(|a| a.use_official_bw_crypto),
+    );
+    let session_token = store.load();
+    if session_token.is_none() && choice == backend_policy::VaultBackendChoice::BwServe {
+        // **Still a refusal on this arm, and deliberately still one.** A
+        // `bw serve` sign-in produces a token that the DAEMON has to start
+        // `bw serve` WITH, and the only carrier this process has home is a
+        // file it writes as it exits -- which would arrive long after the
+        // window needed the backend it describes. So that half of the sign-in
+        // has not moved, and half-moving it would deadlock the window. See
+        // `ui_process::UiVaultResult::signed_in`.
         log::error!(
-            "a ui process found no session token; signing in belongs to the daemon, so this \
-             window will not open"
+            "a ui process found no session token for an account served by `bw serve`; that              sign-in belongs to the daemon, so this window will not open"
         );
         return deskwarden::ui_process::UiStartFailure::NoSessionToken.exit_code();
-    };
+    }
 
     // **Which backend this window reads through, asked rather than assumed.**
     //
@@ -10951,54 +11213,80 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     );
     let fingerprint = disk_cache_fingerprint(active_account.as_ref());
     let to_disk = settings.cache_vault_to_disk;
+    // **The slot a sign-in in THIS process fills.**
+    //
+    // Empty unless the direct-REST arm below finds no stored key, in which
+    // case it is what the cache reads through and `adopt` is what fills it --
+    // the same late-bound shape the daemon has always used at its own
+    // startup, for the same reason: the backend does not exist until a master
+    // password has been typed, and the window has to be on screen before that
+    // can happen.
+    let vault_slot: vault_backend::SharedLateBoundBackend =
+        Arc::new(vault_backend::LateBoundBackend::empty());
+    // **Whether this window opens on a sign-in card rather than on the
+    // vault.** Decided here, where the stored key is read, and spent once
+    // below to pick the host.
+    let mut sign_in_here = false;
     let cache = Arc::new(
-        match backend_policy::choose(
-            active_account.as_ref().and_then(|a| a.server_url.as_deref()),
-            active_account.as_ref().is_none_or(|a| a.use_official_bw_crypto),
-        ) {
+        match choice {
             backend_policy::VaultBackendChoice::DirectRest => {
-                // Both halves or neither: the stored key, and the server it
-                // was derived against. Missing either means this window
-                // cannot read the vault directly -- and falling back to
-                // `bw serve` would be the original defect in the other
-                // direction, talking to a backend the daemon has
-                // deliberately not started.
+                // The stored key, and the server it was derived against.
+                //
+                // **A missing key is no longer a refusal, and that is this
+                // change.** It used to be one because a UI process could not
+                // ask for a master password; it can now, so the remedy for
+                // "no stored key" is to derive one rather than to exit. A
+                // missing SERVER is still a refusal, because there is nothing
+                // to sign in to -- and falling back to `bw serve` would be
+                // the original defect in the other direction, talking to a
+                // backend the daemon has deliberately not started.
                 let stored = active_account.as_ref().and_then(|a| {
                     deskwarden::user_key_store::UserKeyStore::new(
                         accounts::user_key_path_for(&config_dir, &a.id),
                     )
                     .load()
                 });
-                let server_url = active_account.as_ref().and_then(|a| a.server_url.clone());
-                // **Which half is missing, not merely that one is.** The two
-                // have different remedies and the daemon puts one of them on
-                // the screen, so the answer has to survive the exit -- see
-                // `deskwarden::ui_process::direct_rest_start_failure`, which
-                // the daemon also asks BEFORE spawning, so that this refusal
-                // is the race and not the ordinary case.
-                let asked = deskwarden::ui_process::direct_rest_start_failure(
-                    stored.is_some(),
-                    server_url.is_some(),
-                );
-                let Some((authenticated, server_url)) = stored.zip(server_url) else {
-                    let failure =
-                        asked.unwrap_or(deskwarden::ui_process::UiStartFailure::NoStoredVaultKey);
+                let Some(server_url) = active_account.as_ref().and_then(|a| a.server_url.clone())
+                else {
+                    let failure = deskwarden::ui_process::UiStartFailure::NoServerUrl;
                     log::error!(
                         "this window cannot read the vault directly over REST: {}",
                         failure.log_line()
                     );
                     return failure.exit_code();
                 };
-                log::info!("this window reads the vault directly over REST at {server_url}");
-                VaultCache::with_disk_cache(
-                    rest::backend::RestBackend::new(
-                        rest::api::RestClient::new(server_url),
-                        authenticated,
-                    ),
-                    disk,
-                    fingerprint,
-                    to_disk,
-                )
+                match stored {
+                    Some(authenticated) => {
+                        log::info!(
+                            "this window reads the vault directly over REST at {server_url}"
+                        );
+                        VaultCache::with_disk_cache(
+                            rest::backend::RestBackend::new(
+                                rest::api::RestClient::new(server_url),
+                                authenticated,
+                            ),
+                            disk,
+                            fingerprint,
+                            to_disk,
+                        )
+                    }
+                    None => {
+                        // **The window opens on the card, and the cache reads
+                        // through a slot that is still empty.** Nothing asks
+                        // it for an item until the vault stage, which is
+                        // entered only after `adopt` has filled it.
+                        log::info!(
+                            "this window has no stored master key for {server_url}; it opens on                              the sign-in card and derives one"
+                        );
+                        sign_in_here = true;
+                        VaultCache::with_disk_cache(
+                            Arc::clone(&vault_slot),
+                            disk,
+                            fingerprint,
+                            to_disk,
+                        )
+                    }
+                }
             }
             backend_policy::VaultBackendChoice::BwServe => VaultCache::with_disk_cache(
                 VaultBridge::new(BW_SERVE_URL),
@@ -11021,10 +11309,34 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // choice/login/credentials pairing is checked here exactly as it is
     // there. A refusal leaves this process on `bw serve`, which is the
     // behaviour it had before this line existed.
-    if !backend_policy::install_env(child_process_backend_env(
-        &config_dir,
-        active_account.as_ref(),
-    )) {
+    //
+    // **Two environments, and which one is installed is the whole of whether
+    // this window may sign in.** `child_sign_in_backend_env` differs from the
+    // sibling in one field -- a real `adopt` -- and it is built only on the
+    // arm that found no stored key. A window opened against an existing
+    // credential gets the sibling, whose sink refuses, so a stray login path
+    // in that window is a loud log line rather than a second key.
+    let signing_in_env = sign_in_here
+        .then(|| {
+            let account = active_account.as_ref()?;
+            let server_url = account.server_url.as_deref()?;
+            Some(child_sign_in_backend_env(
+                &config_dir,
+                account,
+                server_url,
+                &vault_slot,
+            ))
+        })
+        .flatten();
+    // **`sign_in_here` is re-derived from the environment that was actually
+    // built, not trusted from above.** The `?`s inside the closure can each
+    // answer `None`, and a window that believed it was about to sign in while
+    // holding a sink that refuses would open a card whose Unlock button
+    // silently did nothing. Re-reading it here means the two cannot disagree.
+    let sign_in_here = signing_in_env.is_some();
+    if !backend_policy::install_env(signing_in_env.unwrap_or_else(|| {
+        child_process_backend_env(&config_dir, active_account.as_ref())
+    })) {
         log::error!(
             "a ui process could not publish its backend policy; this window stays on `bw serve`"
         );
@@ -11210,17 +11522,149 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         }
     });
 
-    let result = vault_window::run(
-        cache,
-        fill_stats::FillStats::new(config_dir.join("fill-stats.json")),
-        details,
-        session_token,
-        icon_cache_dir,
-        settings.auto_lock(),
-        backend_already_running,
-        accounts_state,
-        hide,
-    );
+    // **Two hosts, and the sign-in decides which.**
+    //
+    // `vault_window::run` opens straight onto the vault and is what every
+    // window with a usable credential still uses. `app_window::run` is the
+    // card-then-spinner-then-vault host -- ONE OS window at the vault's own
+    // geometry -- and it runs here, in this child, for a direct-REST account
+    // whose stored key is gone. It used to run in the daemon, which is what
+    // left the daemon holding the OpenGL driver for the rest of its life.
+    let (result, signed_in_here) = if sign_in_here {
+        // Everything the host's `'static` closures need, taken by value here.
+        // A frame closure cannot borrow this stack frame, which is the same
+        // copy-out the daemon's own startup host makes.
+        let cache_for_vault = Arc::clone(&cache);
+        let fill_stats_for_vault =
+            fill_stats::FillStats::new(config_dir.join("fill-stats.json"));
+        let icon_cache_dir_for_vault = icon_cache_dir.clone();
+        let auto_lock_for_vault = settings.auto_lock();
+        let accounts_for_vault = accounts_state.clone();
+        let account_for_the_toolbar: Option<accounts::Account> = active_account.clone();
+        let card_account = active_account
+            .as_ref()
+            .map(|account| (config_dir.clone(), account.clone()));
+        let outcome = app_window::run(
+            card_account
+                .as_ref()
+                .map(|(config_dir, account)| (config_dir.as_path(), account)),
+            // **Always `false`, because a UI process never mints.** The
+            // first-run notice is offered against the account
+            // `accounts::resolve_startup` created on this launch, and this
+            // process passes `None` where the daemon passes a mint sink --
+            // see `resolve_startup` above. So there is never a newly minted
+            // account here to offer it for.
+            false,
+            SETUP_MESSAGE,
+            // **Nothing to start, and that is the direct-REST arm's whole
+            // shape.** The daemon's copy of this closure calls
+            // `try_start_backend`, because on `bw serve` the backend is a
+            // child process that has to be spawned with the token the card
+            // just produced. A direct-REST account has no such process: by
+            // the time this runs, `adopt` has already put a live
+            // `RestBackend` in the slot the cache reads through, so the work
+            // between the card and the vault is genuinely nothing and the
+            // spinner is brief rather than fake.
+            |_token| (),
+            move |token, _work: &mut (), signed_in| {
+                let (_options, frame, handles) = vault_window::build_frame(
+                    cache_for_vault,
+                    fill_stats_for_vault,
+                    // Whose vault this is, straight off the sign-in that just
+                    // happened -- and nothing was spawned to find out. Falls
+                    // back to the account record on disk for a window that
+                    // somehow reached the vault without a card.
+                    the_details_this_window_opens_with(
+                        signed_in,
+                        account_for_the_toolbar.as_ref(),
+                    ),
+                    token.to_string(),
+                    icon_cache_dir_for_vault,
+                    auto_lock_for_vault,
+                    // **`true`: there is no readiness to wait for.** This flag
+                    // asks whether `bw serve` was already up, and on this
+                    // account nothing ever consults `bw serve` at all. A
+                    // `false` here would make the vault's first load pay a
+                    // `wait_for_vault_ready` against a port with nothing on
+                    // it, which is the exact defect the cache arm above this
+                    // was written to fix.
+                    true,
+                    accounts_for_vault,
+                    // This window's first frame installed the fonts, rounded
+                    // the corners and raised it, two stages ago.
+                    true,
+                    vault_window::VaultFrameEnv::production(),
+                );
+                Some((frame, handles))
+            },
+            // **The lock ends this window rather than rebuilding inside it.**
+            //
+            // `Finished` immediately, and a `rebuild_vault` below that answers
+            // `None`, together mean: the session is down and does not come
+            // back here. That is deliberate and it is today's behaviour for
+            // this process -- a lock in a UI window has always closed it and
+            // let the daemon run the real recovery, which is the only place
+            // that can tear `bw serve` down and clear the match engine. The
+            // daemon learns of it through `locked`, on both carriers.
+            //
+            // There is nothing for a teardown worker to do here: this process
+            // owns no backend, no job object and no match engine.
+            |step_tx, _token_rx| {
+                let _ = step_tx.send(app_window::TeardownStep::Finished);
+            },
+            // `None`: see the teardown above. The window ends and the daemon
+            // takes it from there.
+            |_edited_before_lock| None,
+        );
+        log::info!(
+            "the sign-in window painted {:?} and came home {} an identity",
+            outcome.stages,
+            if outcome.identity.is_some() { "with" } else { "without" }
+        );
+        // **A window that reached no vault still reports.** A closed card
+        // leaves `vault` as `None`, and what stands in for it is the "nothing
+        // needs doing" result -- which is the truthful one: nothing was
+        // locked, nothing was switched, and the daemon should land in the tray
+        // rather than run a recovery over a user who simply changed their
+        // mind.
+        //
+        // **Spelled out rather than a `Default`.** Every field here is a
+        // decision, and three of them drive teardown; a derived `Default` on
+        // that struct would make "I have nothing to say" the same expression
+        // as "I forgot to fill this in", on the type where forgetting means a
+        // lock that does not lock.
+        let nothing_needs_doing = vault_window::VaultWindowResult {
+            locked: false,
+            needs_reauth: false,
+            edited_settings: None,
+            switch_to: None,
+            add_account: false,
+            remove_account: false,
+            account_details: None,
+        };
+        (outcome.vault.unwrap_or(nothing_needs_doing), outcome.identity)
+    } else {
+        (
+            vault_window::run(
+                cache,
+                fill_stats::FillStats::new(config_dir.join("fill-stats.json")),
+                details,
+                // The token is only ever read by the CLI-backed operations,
+                // which a direct-REST account does not take; empty rather
+                // than absent because that is what every one of those arms
+                // already treats as "no CLI session here".
+                session_token.unwrap_or_default(),
+                icon_cache_dir,
+                settings.auto_lock(),
+                backend_already_running,
+                accounts_state,
+                hide,
+            ),
+            // This host has no sign-in stage at all, so there is never an
+            // identity to carry.
+            None,
+        )
+    };
 
     // **The way home.** See `ui_process`: the file carries the two outcomes
     // that have a payload, the exit code carries the four that do not, and
@@ -11232,6 +11676,12 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         switch_to: result.switch_to,
         add_account: result.add_account,
         remove_account: result.remove_account,
+        // **What the sign-in stage established, if this window had one.**
+        // `None` on every window that opened straight onto the vault, which is
+        // every launch with a usable stored key. Carried here and nowhere else
+        // because the daemon cannot learn it any other way: it never saw the
+        // card. See `UiVaultResult::signed_in`.
+        signed_in: signed_in_here,
     };
     let path = deskwarden::ui_process::result_path(&config_dir, std::process::id());
     if let Err(e) = deskwarden::ui_process::write_result(&path, &crossing) {
@@ -12121,10 +12571,46 @@ fn device_id_for(id: &accounts::AccountId) -> String {
 /// indistinguishable -- to the user and to the log -- from a vault that is.
 /// So the only fallback is asking.
 #[must_use = "the environment this returns has to be installed, or `login_ui`'s sign-in               worker derives nothing and the slot this filled is never refilled"]
+/// **Why this settlement is happening**, which decides one thing only: what a
+/// failed live probe does to the stored master key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhenSettling {
+    /// A launch, or an account switch. The key on disk is of unknown age and
+    /// unknown validity, and a probe that fails is evidence it is stale --
+    /// so it is deleted and the master password asked for again. This is the
+    /// behaviour every caller but one has always had.
+    Fresh,
+    /// **Immediately after a `--ui` child signed in and wrote this key.**
+    ///
+    /// A probe that fails HERE is not evidence of a stale key: the key was
+    /// derived from a master password seconds ago, in another process, and
+    /// used there to decrypt this very vault. What a failure means at this
+    /// moment is a network that blinked between two processes -- and deleting
+    /// the credential over that would make a dropped packet cost the user
+    /// their sign-in, on the one path where the app has just proved the key
+    /// good. The key stays; the next settle will re-probe it.
+    JustProvenByASignIn,
+}
+
+/// [`settle_the_vault_backend_when`] at [`WhenSettling::Fresh`], which is
+/// every caller but the one that follows a child's sign-in.
+///
+/// A wrapper rather than a fourth argument at thirteen call sites: twelve of
+/// them would all be passing the same word, and a word repeated twelve times
+/// is a word eleven of them can get wrong.
 fn settle_the_vault_backend(
     config_dir: &Path,
     account: Option<&accounts::Account>,
     slot: &vault_backend::SharedLateBoundBackend,
+) -> backend_policy::BackendEnv {
+    settle_the_vault_backend_when(config_dir, account, slot, WhenSettling::Fresh)
+}
+
+fn settle_the_vault_backend_when(
+    config_dir: &Path,
+    account: Option<&accounts::Account>,
+    slot: &vault_backend::SharedLateBoundBackend,
+    when: WhenSettling,
 ) -> backend_policy::BackendEnv {
     use backend_policy::VaultBackendChoice;
 
@@ -12222,9 +12708,23 @@ fn settle_the_vault_backend(
                 );
                 slot.adopt(backend);
             }
+            // **The message, not the key**: `VaultError`'s `Display` carries
+            // a status and a route. See `debug_leak_guard`.
+            //
+            // **And whether the key goes with it depends on why we are here.**
+            // On a launch a failed probe is evidence of a stale key. Straight
+            // after a child signed in it is evidence of nothing except a
+            // network that blinked, because that key decrypted this vault in
+            // another process moments ago -- and deleting it would hand the
+            // user back the sign-in they just completed. See [`WhenSettling`].
+            Err(e) if when == WhenSettling::JustProvenByASignIn => {
+                log::warn!(
+                    "the stored master key for this account did not answer ({e:?}); keeping \
+                     it, because a ui process derived it from a master password moments ago \
+                     and read this vault with it"
+                );
+            }
             Err(e) => {
-                // The message, not the key: `VaultError`'s `Display` carries a
-                // status and a route. See `debug_leak_guard`.
                 log::warn!(
                     "the stored master key for this account no longer works ({e:?}); deleting \
                      it and asking for the master password again"
@@ -12370,14 +12870,20 @@ fn bw_serve_env() -> backend_policy::BackendEnv {
 /// same two account fields -- so this cannot disagree with the daemon about
 /// which backend is in force.
 ///
-/// # `adopt` never runs here
+/// # `adopt` never runs on THIS environment, and there is now one it does
 ///
-/// It is the sign-in sink, and this process does not sign in: `run_as_a_ui_
-/// process` returns `UiStartFailure::NoSessionToken` rather than showing a
-/// login window, and no path from the vault window reaches `login_ui`'s
-/// worker. The sink is a loud log line rather than a silent no-op so that a
-/// future sign-in moved into this process is a report and not a key written
-/// to a store nothing else in this process reads.
+/// `adopt` is the sign-in sink. A window built on this environment does not
+/// sign in -- it was opened because a usable credential already existed -- so
+/// the sink stays a loud log line rather than a silent no-op, which is what
+/// makes a sign-in that reached the wrong environment a report instead of a
+/// key written into a store nothing else in this process reads.
+///
+/// **A UI process CAN sign in now, on the direct-REST arm, and it builds
+/// [`child_sign_in_backend_env`] instead when it does.** That sibling is this
+/// function with one difference -- a real `adopt` -- and the difference is
+/// deliberately a separate function rather than a flag, so that "this window
+/// may write `userkey.bin`" is a decision a reader can see being made at the
+/// call site rather than a `bool` threaded through it.
 fn child_process_backend_env(
     config_dir: &Path,
     account: Option<&accounts::Account>,
@@ -12420,6 +12926,108 @@ fn child_process_backend_env(
                      to adopt into; signing in belongs to the daemon"
                 );
             }),
+        }),
+    }
+}
+
+/// [`child_process_backend_env`], for the one window that is allowed to sign
+/// in: a direct-REST account in a `--ui` child with no stored master key.
+///
+/// # What it adds, and it is exactly one thing
+///
+/// A real `adopt`. The sibling's sink logs an error, because a window opened
+/// against an existing credential has no business deriving a second one; this
+/// one writes the derived key to that account's own `userkey.bin` through the
+/// existing per-account [`user_key_store::UserKeyStore`] and puts the live
+/// backend in `slot`. **There is no second credential store and no second
+/// location**: this is the same `accounts::user_key_path_for` the daemon
+/// writes, reads and protects, so the key this child derives is the key the
+/// daemon finds on its next settle.
+///
+/// # What it still does NOT do, and this is the load-bearing half
+///
+/// It does not delete anything, and it does not probe. Both omissions are the
+/// sibling's, held for the sibling's stated reason: `settle_the_vault_backend`
+/// deletes `userkey.bin` on its `bw serve` arm and again when a live
+/// `list_items` fails, and a child repeating either would let one transient
+/// network failure destroy the credential the daemon depends on.
+/// `a_ui_process_never_deletes_the_daemons_stored_vault_key` drives this
+/// function as well as the sibling, so the two cannot drift apart on it.
+///
+/// # Why it takes a slot when the sibling does not
+///
+/// Because there is nothing to read the vault through until the password has
+/// been typed. The sibling is built for a window whose backend is already
+/// constructible from disk; this one is built for a window that opens on a
+/// card, so the cache reads through a [`vault_backend::LateBoundBackend`] and
+/// this sink is what fills it -- the same late-bound shape, and the same
+/// ordering, the daemon has always used at its own startup.
+fn child_sign_in_backend_env(
+    config_dir: &Path,
+    account: &accounts::Account,
+    server_url: &str,
+    slot: &vault_backend::SharedLateBoundBackend,
+) -> backend_policy::BackendEnv {
+    // The one construction, so the sink and the credential reader cannot come
+    // to build different clients against different servers. A closure rather
+    // than two copies, exactly as `settle_the_vault_backend` writes one.
+    let build = {
+        let server_url = server_url.to_string();
+        move |authenticated| {
+            Box::new(rest::backend::RestBackend::new(
+                rest::api::RestClient::new(server_url.clone()),
+                authenticated,
+            )) as Box<dyn vault_backend::VaultBackend>
+        }
+    };
+    let adopt = {
+        let slot = Arc::clone(slot);
+        let key_store =
+            user_key_store::UserKeyStore::new(accounts::user_key_path_for(config_dir, &account.id));
+        std::sync::Arc::new(move |authenticated: rest::api::Authenticated| {
+            // **Written before it is adopted**, and the order is the daemon's
+            // own: a process that dies between the two still leaves the key it
+            // just derived, so the next launch does not ask again. `save`
+            // answering `false` means the login carried no refresh token --
+            // not an error, and not a reason to refuse the backend this window
+            // is about to draw with.
+            match key_store.save(&authenticated) {
+                Ok(true) => log::info!(
+                    "the master key derived in this window was stored for the next launch"
+                ),
+                Ok(false) => log::info!(
+                    "this login carries no refresh token, so nothing was stored; the master \
+                     password will be asked for again next launch"
+                ),
+                Err(e) => log::warn!("the derived master key could not be stored ({e})"),
+            }
+            slot.adopt(build(authenticated));
+            log::info!("the direct-REST vault backend is live in this window");
+        }) as std::sync::Arc<dyn Fn(rest::api::Authenticated) + Send + Sync>
+    };
+    // The same store `adopt` writes, read rather than written -- one source,
+    // so a Send cannot be signed with a credential the vault is not being read
+    // through. The sibling's reasoning, unchanged.
+    let credentials = {
+        let key_store =
+            user_key_store::UserKeyStore::new(accounts::user_key_path_for(config_dir, &account.id));
+        std::sync::Arc::new(move || key_store.load()) as backend_policy::Credentials
+    };
+    backend_policy::BackendEnv {
+        choice: backend_policy::VaultBackendChoice::DirectRest,
+        credentials: Some(credentials),
+        direct: Some(login_ui::DirectRestLogin {
+            server_url: server_url.to_string(),
+            email: account.email.clone(),
+            device_id: device_id_for(&account.id),
+            // **The second-factor prompt reaches this window because the
+            // window is what shows it.** `PRODUCTION_SECOND_FACTOR` is the
+            // provider list; `prompt` is filled in by the host that has a code
+            // stage to show it on, which for this account is `app_window::run`
+            // running in this very process.
+            second_factor: login_ui::PRODUCTION_SECOND_FACTOR,
+            prompt: None,
+            adopt,
         }),
     }
 }
@@ -16343,13 +16951,17 @@ mod tests {
         // each call site.
         assert_eq!(
             main_body.matches(concat!("arm_autofill_from_the_", "local_copy(")).count(),
-            2,
-            "startup no longer has exactly the two unpaired arming sites this guard knows \
-             about: the cache-first arm, and the launch whose vault backend could not be \
-             started because the Bitwarden CLI is gone. Zero means one of them stopped arming \
-             autofill at all -- a tray, a hotkey and a dead match engine for the whole \
-             session. Three or more means a new launch shape adopted the exemption without \
-             anyone deciding it had earned it"
+            3,
+            "startup no longer has exactly the three unpaired arming sites this guard knows \
+             about: the cache-first arm, the launch whose vault backend could not be started \
+             because the Bitwarden CLI is gone, and the launch whose vault is locked behind \
+             a sign-in card in a ui process. All three have the same shape and the same \
+             reason -- nothing was FETCHED, so there is no second half owing, and seeding \
+             the cache at `Source::Backend` would overwrite a good encrypted disk copy with \
+             an empty `Vec`. Zero means one of them stopped arming autofill at all -- a \
+             tray, a hotkey and a dead match engine for the whole session. Four or more \
+             means a new launch shape adopted the exemption without anyone deciding it had \
+             earned it"
         );
         assert!(
             body_of(&code, concat!("fn arm_autofill_from_the_", "local_copy("))
@@ -20958,6 +21570,12 @@ mod tests {
                             .then(deskwarden::accounts::AccountId::generate),
                         edited_settings: (bits & 32 != 0)
                             .then(deskwarden::settings::Settings::default),
+                        // **Not a seventh bit, and deliberately so.** A
+                        // sign-in is never a reason to close -- `on_close`
+                        // does not read this field, and must not start to.
+                        // Adding it to the sweep would assert the opposite of
+                        // the rule this test holds.
+                        signed_in: None,
                     };
                     let window = VaultWindowResult {
                         locked: crossing.locked,
@@ -24207,13 +24825,16 @@ mod tests {
             let adopt = concat!("adopt_startup_", "prefetch(");
             assert_eq!(
                 production.matches(adopt).count(),
-                3,
-                "expected the definition and exactly TWO call sites, which are the two \
-                 moments the startup window's identity can be adopted: \
-                 `record_the_startup_sign_in`, on the frame the vault is built, and `main`'s \
-                 drain, on the statement after the window closes. Neither may be a second \
-                 COPY of the decision -- both go through this one function -- and a third \
-                 caller is. An absent one is worse than dead code: without the first, a fresh \
+                4,
+                "expected the definition and exactly THREE call sites, which are the three \
+                 moments an identity this app did not already know can be adopted: \
+                 `record_the_startup_sign_in`, on the frame the daemon's own startup window \
+                 builds its vault; `main`'s drain, on the statement after that window \
+                 closes; and `adopt_a_childs_sign_in`, when a `--ui` child that took the \
+                 sign-in itself reports home. None may be a second COPY of the decision -- \
+                 all three go through this one function, so the account-id guard runs on \
+                 every one of them -- and a fourth caller is. An absent one is worse than \
+                 dead code: without the first, a fresh \
                  install's record stays blank for the whole session (the window does not \
                  return until the user closes the vault); without the second, a window closed \
                  before the vault was ever built records nothing at all"
@@ -31711,8 +32332,14 @@ mod startup_shape_tests {
             "control: the sliced branch does not contain its own `}} else {{`, so it is not \
              the branch"
         );
+        // A control, not a budget: it exists to catch a slice that ran away
+        // to the end of the file or stopped at the first brace, not to keep
+        // the branch small. Raised from 40_000 when the cached-session arm
+        // grew the three conditions that keep a direct-REST sign-in out of
+        // this daemon; the branch is prose-heavy and every line of that prose
+        // is an argument this file is expected to carry.
         assert!(
-            (4_000..40_000).contains(&region.len()),
+            (4_000..60_000).contains(&region.len()),
             "the sliced startup branch is {} bytes, which is not the branch",
             region.len()
         );
@@ -33526,15 +34153,22 @@ mod vault_backend_choice_tests {
     /// Fails on `main`, where nothing asks: the daemon spawned, the child
     /// exited `UI_COULD_NOT_START`, and the user saw a click that did nothing.
     #[test]
-    fn a_built_in_client_account_with_no_stored_key_is_not_given_a_ui_process() {
+    fn a_built_in_client_account_with_no_stored_key_is_given_a_ui_process() {
         let config = scratch_config("no-stored-key");
         let account = account_on_the_built_in_client(Some("https://vault.example.com"));
         accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
+        assert!(
+            !accounts::user_key_path_for(&config, &account.id).exists(),
+            "control: this account must really have no stored key, or the assertion below \
+             passes without reaching the state it names"
+        );
         assert_eq!(
             why_a_ui_process_could_not_read_this_vault(&config, Some(&account)),
-            Some(deskwarden::ui_process::UiStartFailure::NoStoredVaultKey),
-            "the daemon would have spawned a UI process that can only exit, and its exit is \
-             what the owner saw as `the main UI does not open`"
+            None,
+            "a direct-REST account with no stored key is exactly the window this branch \
+             moved into a child: the card derives the key there. Refusing the spawn keeps \
+             the sign-in in the daemon, which is what loads the OpenGL driver into a \
+             process that never gives it back"
         );
     }
 
@@ -33663,6 +34297,154 @@ mod vault_backend_choice_tests {
         );
     }
 
+    /// **THE DELIVERABLE: on the direct-REST sign-in path the daemon draws
+    /// nothing.**
+    ///
+    /// This is the decision worth ~40 MB of a user's RAM for the life of the
+    /// process. `fn main` cannot be run by any test in this crate -- that is
+    /// recorded at `search_asked_for`, and it is why the *Search the vault*
+    /// defect shipped with every test passing -- so the decision was pulled
+    /// out into `the_startup_sign_in_belongs_to_a_ui_process`, and this drives
+    /// it over every combination that reaches it.
+    ///
+    /// # What "draws nothing" means here, precisely
+    ///
+    /// `true` routes startup into the arm that calls
+    /// `UiWindows::ask_for_the_vault_window` -- a `CreateProcess` and no GL
+    /// context in this process. `false` routes it into the arm that calls
+    /// `app_window::run`, which builds an `eframe` window HERE and maps the
+    /// OpenGL driver into the daemon permanently, because the driver's
+    /// committed arenas come back only at process exit.
+    ///
+    /// # The `bw serve` row is not an oversight
+    ///
+    /// It is the scope line of this branch, asserted so that a later change
+    /// which quietly flips it has to come through here. A `bw serve` sign-in
+    /// produces the session token the DAEMON must start `bw serve` with, and
+    /// the child's only carrier home is a file written as it exits -- which
+    /// arrives long after the window needs the backend it describes. Moving
+    /// that half needs a live channel, not this flag.
+    #[test]
+    fn the_daemon_draws_no_window_on_the_direct_rest_sign_in_path() {
+        use backend_policy::VaultBackendChoice::{BwServe, DirectRest};
+        let self_hosted = account_on_the_built_in_client(Some("https://vault.example.com"));
+        let no_server = account_on_the_built_in_client(None);
+        let official = account_on(Some("https://vault.example.com"));
+
+        for (choice, stored, account, expected, why) in [
+            // The owner's launch: self-hosted, built-in client, no stored key.
+            // This is the row the whole branch is for.
+            (
+                DirectRest,
+                false,
+                Some(&self_hosted),
+                true,
+                "the sign-in card must open in a ui process, or this daemon draws once and \
+                 holds the graphics driver until sign-out",
+            ),
+            // Nothing to sign in to. No card can help, so the daemon keeps it
+            // and its own recovery is the only thing left.
+            (
+                DirectRest,
+                false,
+                Some(&no_server),
+                false,
+                "an account with no server URL has nothing for a card to sign in TO",
+            ),
+            // No sign-in is owed at all: the window opens on the vault.
+            (
+                DirectRest,
+                true,
+                Some(&self_hosted),
+                false,
+                "there is no sign-in to place when the slot is already filled",
+            ),
+            // The scope line, asserted rather than assumed.
+            (
+                BwServe,
+                false,
+                Some(&official),
+                false,
+                "a `bw serve` sign-in produces the token the daemon starts the backend \
+                 with, and the exit-time result file cannot deliver it in time",
+            ),
+            // No account resolved at all -- `settings.json` names none.
+            (DirectRest, false, None, false, "there is no account to sign in as"),
+        ] {
+            assert_eq!(
+                the_startup_sign_in_belongs_to_a_ui_process(choice, stored, account),
+                expected,
+                "{choice:?} with a_key_already_stored={stored} and account={:?}: {why}",
+                account.map(|a| a.server_url.clone())
+            );
+        }
+    }
+
+    /// **A probe that blinks must not cost the user the sign-in they just
+    /// finished.**
+    ///
+    /// The hazard this branch introduced and the one the coordinator named:
+    /// a `--ui` child derives the master key, writes `userkey.bin`, and
+    /// reports home; the daemon then re-settles to fill its own slot -- and
+    /// `settle_the_vault_backend`'s live `list_items` probe DELETES the
+    /// stored key when it fails. `https://127.0.0.1:9` is a port nothing
+    /// listens on, so the probe here really does fail, which is what makes
+    /// this test reach the arm it names rather than passing over a key that
+    /// never got probed.
+    ///
+    /// Both directions are asserted from one setup, because the whole claim
+    /// is that the two settlements differ *only* in this.
+    #[test]
+    fn the_daemon_keeps_a_key_a_child_just_wrote_when_the_probe_blinks() {
+        let _guard = hold_the_settle_lock();
+        let config = scratch_config("probe-blink");
+        // A server that is reachable enough to fail fast and never enough to
+        // answer. The account is on the built-in client, so `choose` really
+        // does say `DirectRest` and the probe arm really is entered.
+        let account = account_on_the_built_in_client(Some("https://127.0.0.1:9"));
+        accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
+        let path = accounts::user_key_path_for(&config, &account.id);
+        let store = user_key_store::UserKeyStore::new(path.clone());
+
+        assert!(store.store_a_fixture_key().expect("the fixture key was written"));
+        assert!(
+            store.load().is_some(),
+            "control: the fixture key does not load, so the settle below would take the \
+             no-stored-key arm and never reach the probe this test is about"
+        );
+        let _ = settle_the_vault_backend_when(
+            &config,
+            Some(&account),
+            &empty_slot(),
+            WhenSettling::JustProvenByASignIn,
+        );
+        assert!(
+            path.exists(),
+            "the daemon deleted a master key a ui process had just derived from a master \
+             password and read this vault with. One dropped packet would then cost the user \
+             the sign-in they had just completed, and they would be asked to do it again \
+             with nothing on screen explaining why"
+        );
+
+        // **The other direction, so this is not a settle that stopped
+        // deleting altogether.** Same key, same dead server, same function --
+        // only the reason changes, and on a launch a failed probe IS evidence
+        // of a stale key and must still clear it.
+        assert!(store.store_a_fixture_key().expect("the fixture key was written"));
+        let _ = settle_the_vault_backend_when(
+            &config,
+            Some(&account),
+            &empty_slot(),
+            WhenSettling::Fresh,
+        );
+        assert!(
+            !path.exists(),
+            "control: an ordinary launch stopped deleting a stored key its probe rejected, \
+             so the assertion above holds for every settlement rather than for the one it \
+             names"
+        );
+    }
+
     /// **The positive control, and it is a real key.** Same account, same
     /// directory, one file written through the very store the daemon reads --
     /// so this is not "the function answers None for anything", it is the file
@@ -33700,16 +34482,20 @@ mod vault_backend_choice_tests {
     /// asserted there, in `ui_process`, rather than faked into an `Account`
     /// this app cannot build.
     #[test]
-    fn the_two_built_in_client_failures_are_two_different_answers() {
+    fn a_missing_server_is_the_one_built_in_client_failure_left() {
         assert_eq!(
-            deskwarden::ui_process::direct_rest_start_failure(false, true),
-            Some(deskwarden::ui_process::UiStartFailure::NoStoredVaultKey)
+            deskwarden::ui_process::direct_rest_start_failure(false),
+            Some(deskwarden::ui_process::UiStartFailure::NoServerUrl),
+            "an account record with no server has nothing to sign in to, so no card can \
+             rescue it and the spawn must still be refused"
         );
         assert_eq!(
-            deskwarden::ui_process::direct_rest_start_failure(true, false),
-            Some(deskwarden::ui_process::UiStartFailure::NoServerUrl)
+            deskwarden::ui_process::direct_rest_start_failure(true),
+            None,
+            "a recorded server is the whole of what a direct-REST child needs to OPEN. \
+             Whether it has a key decides which stage it opens ON, and that is the \
+             child's own business now"
         );
-        assert_eq!(deskwarden::ui_process::direct_rest_start_failure(true, true), None);
     }
 
     /// **The `bw serve` account is untouched**, which is the whole install
@@ -34375,34 +35161,69 @@ mod vault_backend_choice_tests {
         backend_policy::uninstall_env();
     }
 
-    /// **It must not do what the daemon's settlement does.**
+    /// **Neither UI environment may do what the daemon's settlement does.**
     ///
     /// `settle_the_vault_backend` deletes `userkey.bin` on its `bw serve` arm
     /// and deletes it again when its live probe fails. A child window process
     /// repeating either would let a transient network failure destroy the
     /// credential the DAEMON is still reading the vault through -- and the
     /// user would be asked for their master password again for no reason they
-    /// could see. This asserts the file survives both arms.
+    /// could see. This asserts the file survives every arm of both builders.
+    ///
+    /// **`child_sign_in_backend_env` is driven here too, and that is the
+    /// point.** It is the one environment in a UI process with a real
+    /// `adopt`, so it is the one that could plausibly grow a `clear()` beside
+    /// the `save()` -- by symmetry with the daemon's settlement, which is
+    /// exactly how the original defect got written. Its own doc claims this
+    /// test covers it; this is what makes that claim true rather than a
+    /// comment.
     #[test]
     fn a_ui_process_never_deletes_the_daemons_stored_vault_key() {
         let _guard = hold_the_settle_lock();
         let config = scratch_config("ui-keeps-key");
+        let slot: vault_backend::SharedLateBoundBackend =
+            Arc::new(vault_backend::LateBoundBackend::empty());
         for account in [
             account_on_the_built_in_client(Some("https://vault.example.com")),
             account_on(Some("https://vault.example.com")),
         ] {
             accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
             let path = accounts::user_key_path_for(&config, &account.id);
-            std::fs::write(&path, b"the daemon's stored vault key").expect("a scratch file");
-            let _ = child_process_backend_env(&config, Some(&account));
-            assert!(
-                path.exists(),
-                "a UI process deleted the stored vault key for an account served by {:?}",
-                backend_policy::choose(
-                    account.server_url.as_deref(),
-                    account.use_official_bw_crypto
-                )
-            );
+            for builder in ["the ordinary window", "the signing-in window"] {
+                std::fs::write(&path, b"the daemon's stored vault key").expect("a scratch file");
+                match builder {
+                    "the ordinary window" => {
+                        let _ = child_process_backend_env(&config, Some(&account));
+                    }
+                    // Built for whatever this account records; on the
+                    // `bw serve` account it is simply an environment nothing
+                    // would install, and building it must still touch nothing.
+                    _ => {
+                        let _ = child_sign_in_backend_env(
+                            &config,
+                            &account,
+                            account.server_url.as_deref().expect("both accounts record one"),
+                            &slot,
+                        );
+                    }
+                }
+                assert!(
+                    path.exists(),
+                    "{builder}'s backend environment deleted the stored vault key for an \
+                     account served by {:?}",
+                    backend_policy::choose(
+                        account.server_url.as_deref(),
+                        account.use_official_bw_crypto
+                    )
+                );
+                assert_eq!(
+                    std::fs::read(&path).expect("the key file"),
+                    b"the daemon's stored vault key",
+                    "{builder}'s backend environment REWROTE the stored vault key without a \
+                     sign-in having happened. Only `adopt` may write this file, and only \
+                     with a credential a master password just produced"
+                );
+            }
         }
     }
 
@@ -34441,11 +35262,21 @@ mod vault_backend_choice_tests {
         }
         let code = without_comments(include_str!("main.rs"));
         // Split so this test's own source is not a second occurrence of the
-        // call it is counting -- the reason the pin above this one gives.
-        let install = concat!("install_env(child_process_", "backend_env(");
+        // calls it is counting -- the reason the pin above this one gives.
+        let install = concat!("backend_policy::install_", "env(");
+        let ordinary = concat!("child_process_", "backend_env(");
+        let signing_in = concat!("child_sign_in_", "backend_env(");
 
         for head in ["fn run_as_a_ui_process(", "fn run_as_the_vault_service("] {
             let body = body_after(&code, head);
+            // **The install itself, counted whatever it is handed.** It used
+            // to be pinned as the one literal `install_env(child_process_
+            // backend_env(`, which stopped being the whole truth when the UI
+            // process gained a SECOND environment to publish -- the sign-in
+            // one -- chosen between at the single call. Counting the install
+            // rather than one of its arguments is what keeps this pin about
+            // the property it names: exactly one publication per process,
+            // before anything reads one.
             assert_eq!(
                 body.matches(install).count(),
                 1,
@@ -34457,7 +35288,39 @@ mod vault_backend_choice_tests {
             );
         }
 
+        // **Which environments each entry point may build, named rather than
+        // inferred.** The count above says a policy is published exactly
+        // once; it cannot say WHICH, and the two differ in the one field that
+        // decides whether that process may write `userkey.bin`.
+        //
+        // The UI process builds both and chooses between them at the single
+        // install: the sign-in environment for a direct-REST window that
+        // found no stored key, the ordinary one for every other window. The
+        // vault service builds only the ordinary one and must never build the
+        // other -- it draws nothing, so it can take no password, and a
+        // sign-in sink in a process with no card is a key written by nobody.
+        let ui = body_after(&code, "fn run_as_a_ui_process(");
+        for (needle, count, why) in [
+            (ordinary, 1, "the window that opens against an existing credential"),
+            (signing_in, 1, "the window that opens on a sign-in card"),
+        ] {
+            assert_eq!(
+                ui.matches(needle).count(),
+                count,
+                "`fn run_as_a_ui_process` names {needle:?} {} time(s), not {count}. It is \
+                 the builder for {why}, and a UI process that lost it either cannot sign \
+                 in at all or signs in through a sink that refuses and drops the key",
+                ui.matches(needle).count()
+            );
+        }
         let service = body_after(&code, "fn run_as_the_vault_service(");
+        assert_eq!(
+            service.matches(signing_in).count(),
+            0,
+            "the vault service builds a signing-in backend environment. That process draws \
+             no window, so nothing in it can ask for a master password -- a real `adopt` \
+             there is a sink that can only ever be reached by accident"
+        );
         let installed_at = service.find(install).expect("counted one above");
         let read_at = service
             .find(concat!("backend_policy::", "selected()"))

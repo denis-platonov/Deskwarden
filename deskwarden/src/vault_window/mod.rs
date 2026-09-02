@@ -5124,6 +5124,14 @@ fn close_or_hide(
         switch_to: switch_to.borrow().clone(),
         add_account: *add_account.borrow(),
         remove_account: *remove_account.borrow(),
+        // **Never a reason to close, so never `Some` here.** A sign-in is not
+        // an outcome of the vault window at all -- it happened in the sign-in
+        // stage, before this frame existed, and the host that ran that stage
+        // is what carries it home. This construction exists only to ask
+        // `on_close` whether there is anything worth exiting for, and a
+        // sign-in is not: `userkey.bin` is already written, so a window that
+        // hides rather than exits has lost nothing.
+        signed_in: None,
     };
     // **Deliver before deciding.** This covers Alt+F4 with the modal still
     // up -- the case the every-frame write into `edited_settings` exists

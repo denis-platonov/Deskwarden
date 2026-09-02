@@ -23,17 +23,44 @@ with the one thing you can do about it: a missing vault key, a missing server
 address, a missing sign-in, a missing Bitwarden CLI, or an unreadable settings
 folder.
 
+### Signing in to your own server no longer costs the tray 40 MB
+
+On an account served by the built-in client, the sign-in card now opens in the
+same short-lived process as the vault window rather than in the background one.
+
+This matters because of how graphics drivers work: the first window a process
+draws maps the OpenGL driver into it, and closing the window does not give that
+memory back — only ending the process does. Deskwarden's background process is
+meant to sit in the tray at about 19 MB, and it did, right up until the launch
+where it had to ask for your master password. From then on it held roughly
+59 MB for as long as it ran, whether or not a window was open.
+
+The window that asks now exits when you close it, and takes the driver with it.
+The background process stays a tray icon, on every launch, signed in or not.
+
+**Accounts on the official Bitwarden CLI are unchanged for now.** That sign-in
+produces a session token the background process itself has to start `bw serve`
+with, so it still happens there; moving it needs a different mechanism and is
+being done separately.
+
 ### Switching to the built-in client no longer strands the account
 
 The built-in client reads your vault with a master key kept on this PC, and
 that key is written only by a sign-in taken through Deskwarden. An account that
 switched to the built-in client — or whose sign-in did not leave a key behind —
-had nothing for the vault window's process to read, and that process cannot ask
-for a master password.
+had nothing for the vault window's process to read, and that process could not
+ask for a master password.
 
-Deskwarden now checks before it opens the window, and when there is no stored
-key it keeps the window in the process that *can* sign you in, so signing in
-stores the key and finishes the switch.
+It can now: the window opens on a sign-in card, stores the key, and carries on
+into your vault, which finishes the switch without the background process ever
+drawing anything.
+
+### The tray icon no longer disappears while you sign in
+
+On a launch that needed your master password, the tray icon was missing until
+you closed the vault — the background process was busy being the window. It
+builds the tray first now, so the icon, the fill hotkey and autofill are all
+there while the sign-in card is still on screen.
 
 ## 0.15.7 - 2026-09-02
 

@@ -345,10 +345,22 @@ pub enum UiStartFailure {
     /// No saved session for this account. Signing in belongs to the daemon,
     /// so the child cannot fix this itself.
     NoSessionToken,
-    /// **The one the backend switch produces.** This account is served by the
-    /// built-in client, which reads the vault with a master key kept in
-    /// `userkey.bin` -- and there is no such file. See
-    /// [`direct_rest_start_failure`].
+    /// **No longer produced by anything, and kept so the codes below it do
+    /// not move.**
+    ///
+    /// It meant: this account is served by the built-in client, which reads
+    /// the vault with a master key kept in `userkey.bin`, and there is no such
+    /// file. That was a refusal only because a UI process could not ask for a
+    /// master password. It can now -- a direct-REST child with no stored key
+    /// opens the sign-in card and derives one -- so the condition this named
+    /// is the ordinary first frame of a window rather than a reason not to
+    /// open it.
+    ///
+    /// Retained rather than deleted because [`Self::ALL`] is what
+    /// [`Self::exit_code`] indexes: removing a variant would silently
+    /// renumber `NoServerUrl`, and exit codes are the one thing here a
+    /// half-updated shortcut or a stale log line can still be read against.
+    /// `the_start_failure_codes_are_stable` holds the numbering.
     NoStoredVaultKey,
     /// Served by the built-in client, but no server address is recorded, so
     /// there is nothing to read the vault from.
@@ -452,38 +464,47 @@ impl UiStartFailure {
     }
 }
 
-/// **Whether a direct-REST account can be read by a process that cannot ask
-/// for a master password**, which is every UI process.
+/// **Whether a direct-REST account gives a UI process anything to open a
+/// window on.**
 ///
 /// One pure function with two callers that must never disagree: the UI child,
 /// which uses it to pick the exit code it dies with, and the daemon, which
-/// uses it BEFORE spawning to find out that the child would die -- and opens
-/// the window itself instead, where the sign-in card can derive the key and
-/// finish the switch the user asked for.
+/// asks it BEFORE spawning so that it never starts a child whose only possible
+/// act is to exit.
 ///
-/// The key is reported before the server URL because it is the half the
-/// backend switch actually strands: `userkey.bin` is written only by a
-/// sign-in taken on the direct-REST path, so an account that reached this
-/// setting from `bw serve` has never had one, and an account whose daemon
-/// login carried no refresh token has one in memory and none on disk (see
-/// `user_key_store::UserKeyStore::save`, which answers `Ok(false)` there).
-/// That second case is the shipped defect: the DAEMON reads the vault fine
-/// and the CHILD cannot, which is why the failure looked like nothing at all.
+/// # It used to ask about the stored key, and it deliberately no longer does
+///
+/// The old rule was "no `userkey.bin`, no window", because a UI process could
+/// not ask for a master password -- so a direct-REST account with no stored
+/// key was a window the child could not fill, and the daemon opened it
+/// **itself**, which is precisely how the daemon came to hold the OpenGL
+/// driver for the rest of its life.
+///
+/// A direct-REST child signs in now. A missing key is the ordinary opening
+/// state of that window rather than a reason to refuse it: the card derives
+/// one, `child_sign_in_backend_env`'s sink writes it to the same per-account
+/// `userkey.bin` the daemon reads, and the window carries on into the vault.
+///
+/// # What still refuses, and why it is not the same question
+///
+/// A missing server URL. There is nothing to sign in *to*, so no card can
+/// help -- this is an account record that is incomplete rather than one that
+/// is merely locked, and no amount of typing a password fixes it.
+///
+/// `choose` cannot answer `DirectRest` without a self-hosted URL, so in
+/// practice this arm is unreachable through an `Account`; it is answered
+/// anyway because the child reads the URL as an `Option` off a record the
+/// daemon may have rewritten since, and "unreachable" is not a thing a
+/// process boundary lets either side assume.
 #[must_use]
-pub fn direct_rest_start_failure(
-    a_vault_key_is_stored: bool,
-    a_server_url_is_recorded: bool,
-) -> Option<UiStartFailure> {
-    if !a_vault_key_is_stored {
-        return Some(UiStartFailure::NoStoredVaultKey);
-    }
+pub fn direct_rest_start_failure(a_server_url_is_recorded: bool) -> Option<UiStartFailure> {
     if !a_server_url_is_recorded {
         return Some(UiStartFailure::NoServerUrl);
     }
     None
 }
 
-/// **The vault window's six daemon-actionable outcomes**, as they cross the
+/// **The vault window's seven daemon-actionable outcomes**, as they cross the
 /// process boundary.
 ///
 /// A near-copy of [`crate::vault_window::VaultWindowResult`] minus
@@ -496,6 +517,11 @@ pub fn direct_rest_start_failure(
 /// **Nothing here is a secret.** No session token, no master password, no
 /// vault item. `switch_to` is an account id and `edited_settings` is the
 /// preferences block; both already live in `settings.json` beside this file.
+/// `signed_in` is the newest field and holds to the same bar: an email, a
+/// server address and a backend answer, which are the three things
+/// `settings.json` is *made of*. The master password that produced them never
+/// leaves the child's address space, and the key it derived goes to that
+/// account's own `userkey.bin` rather than through here.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiVaultResult {
@@ -515,6 +541,26 @@ pub struct UiVaultResult {
     pub add_account: bool,
     /// The account menu asked to remove the active one.
     pub remove_account: bool,
+    /// **What a direct-REST sign-in in this child established**, for the
+    /// daemon to adopt into `settings.json`.
+    ///
+    /// `Some` only when this child actually drew a sign-in card and the user
+    /// completed it. A window that opened straight onto the vault -- which is
+    /// every launch with a usable stored key -- leaves this `None`.
+    ///
+    /// **Direct-REST only, and that is a scope fact rather than a shape
+    /// one.** A `bw serve` sign-in still happens in the daemon, because the
+    /// token it produces is what the daemon must start `bw serve` WITH -- and
+    /// a carrier that only arrives when this process exits cannot serve a
+    /// backend the window needs before it can draw. See this module's doc.
+    ///
+    /// A payload field, so like `switch_to` and `edited_settings` it has no
+    /// exit-code backup and its loss is recoverable: `userkey.bin` is already
+    /// written by the time this is, so a child killed between the two leaves a
+    /// working sign-in whose *address* the daemon relearns on its next settle.
+    /// That is the same cost a stale email already carries, and it is why this
+    /// is not worth a second carrier.
+    pub signed_in: Option<crate::login_ui::SignedInIdentity>,
 }
 
 impl UiVaultResult {
@@ -545,10 +591,10 @@ impl UiVaultResult {
 
     /// The four booleans, read back out of an exit status.
     ///
-    /// **Only the booleans.** `switch_to` and `edited_settings` cannot be
-    /// reconstructed from a status word and are left empty here; the file is
-    /// the only carrier for those, and [`UiVaultResult::union`] is where the
-    /// two sources are put back together.
+    /// **Only the booleans.** `switch_to`, `edited_settings` and `signed_in`
+    /// cannot be reconstructed from a status word and are left empty here; the
+    /// file is the only carrier for those, and [`UiVaultResult::union`] is
+    /// where the two sources are put back together.
     pub fn from_exit_code(code: i32) -> Self {
         Self {
             locked: code & Self::EXIT_LOCKED != 0,
@@ -557,6 +603,7 @@ impl UiVaultResult {
             remove_account: code & Self::EXIT_REMOVE_ACCOUNT != 0,
             edited_settings: None,
             switch_to: None,
+            signed_in: None,
         }
     }
 
@@ -577,9 +624,11 @@ impl UiVaultResult {
             needs_reauth: file.needs_reauth || from_exit_code.needs_reauth,
             add_account: file.add_account || from_exit_code.add_account,
             remove_account: file.remove_account || from_exit_code.remove_account,
-            // No exit-code carrier exists for either; the file is all there is.
+            // No exit-code carrier exists for any of the three; the file is
+            // all there is.
             edited_settings: file.edited_settings,
             switch_to: file.switch_to,
+            signed_in: file.signed_in,
         }
     }
 }
@@ -1187,6 +1236,49 @@ mod tests {
         );
     }
 
+    /// **The exit code each start failure dies with, written out by hand.**
+    ///
+    /// `exit_code` indexes [`UiStartFailure::ALL`], so the numbers are a
+    /// property of that array's ORDER rather than of any variant -- which
+    /// means deleting or reordering a variant silently renumbers every one
+    /// after it, with nothing failing to say so. That is not hypothetical
+    /// here: `NoStoredVaultKey` stopped being produced when the direct-REST
+    /// sign-in moved into the child, and deleting it as dead would have
+    /// quietly moved `NoServerUrl` from 69 to 68.
+    ///
+    /// The literals are the point. A test that recomputed them from `ALL`
+    /// would agree with any renumbering it was handed, which is the house's
+    /// own "a test that passes because it never reached the thing it names".
+    #[test]
+    fn the_start_failure_codes_are_stable() {
+        for (failure, code) in [
+            (UiStartFailure::NoConfigDirectory, 66),
+            (UiStartFailure::NoBwExe, 67),
+            (UiStartFailure::NoSessionToken, 68),
+            (UiStartFailure::NoStoredVaultKey, 69),
+            (UiStartFailure::NoServerUrl, 70),
+        ] {
+            assert_eq!(
+                failure.exit_code(),
+                code,
+                "{failure:?} changed the code it exits with. These are read back by the \
+                 daemon to pick the sentence it shows the user, so a renumbering turns one \
+                 failure into another's message"
+            );
+            assert_eq!(
+                UiStartFailure::from_exit_code(code),
+                Some(failure),
+                "{code} no longer reads back as {failure:?}"
+            );
+        }
+        assert_eq!(
+            UiStartFailure::ALL.len(),
+            5,
+            "a sixth start failure was added without being given a code above; the four \
+             lines above are the whole of what a reader can check the numbering against"
+        );
+    }
+
     /// The serialised form is inspected as text, not as a struct, because
     /// what matters is what a reader of the file on disk can see.
     #[test]
@@ -1198,6 +1290,17 @@ mod tests {
             switch_to: Some(AccountId::generate()),
             add_account: true,
             remove_account: true,
+            // **Populated, because an empty `signed_in` would make this test
+            // pass by never reaching the field it exists to check.** This is
+            // the newest thing to cross the boundary and the only one born of
+            // a master password, so it is the one whose serialised form most
+            // needs looking at. Every value here is a plausible real one.
+            signed_in: Some(crate::login_ui::SignedInIdentity {
+                account: Some(AccountId::generate()),
+                user_email: Some("someone@example.com".to_string()),
+                server_url: Some("https://vault.example.com".to_string()),
+                use_official_bw_crypto: Some(false),
+            }),
         };
         let json = serde_json::to_string(&result).expect("serialise");
         let lowered = json.to_lowercase();
