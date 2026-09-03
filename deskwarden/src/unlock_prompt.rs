@@ -35,10 +35,20 @@
 //! # What it does NOT own
 //!
 //! It does not unlock anything itself. It collects a master password and hands
-//! it to [`crate::login_ui::run_bw_with_password`] -- the same function
-//! `login_ui::spawn_auth` calls, with the same arguments, against the same
-//! profile directory. There is exactly one route to a session token in this
-//! app and this is not a second one; it is a second way to *ask*.
+//! it to [`crate::login_ui::authenticate_then_wipe`] -- the same function
+//! `login_ui::spawn_auth` calls, against the same profile directory and with
+//! the same two arms behind it. There is exactly one route from a master
+//! password to an unlocked vault in this app and this is not a second one; it
+//! is a second way to *ask*.
+//!
+//! **Both arms, and that is a correction.** This used to name
+//! `run_bw_with_password` -- the CLI arm alone -- with no consultation of
+//! [`crate::backend_policy`] anywhere on the path. The locked card that opens
+//! this prompt is raised on `VaultCache::is_populated` alone (see
+//! `app::disposition`, which takes no backend input at all), so it is raised
+//! on direct-REST accounts too -- and there `bw unlock` addresses a profile
+//! that was never signed in to, on a machine that need not have a `bw.exe`.
+//! See [`run_bw_unlock`].
 //!
 //! # The password, honestly
 //!
@@ -341,21 +351,81 @@ pub static REAL: PromptCalls = PromptCalls {
     close: win32::close,
 };
 
-/// `bw unlock --raw`, through the function `login_ui::spawn_auth` already
-/// uses.
+/// **The master password, turned into an unlocked vault by whichever backend
+/// this account is on.**
 ///
 /// **This is the reuse the brief is about.** There is one place in this app
-/// that turns a master password into a session token, and it is
-/// `login_ui::run_bw_with_password`. A copy here -- even a faithful one --
-/// would be a second route to the vault key that could drift on the argument
-/// vector, on `--passwordenv`, or on which profile directory it lands in.
+/// that turns a master password into a session, and it is
+/// [`crate::login_ui::authenticate_then_wipe`] -- the same function
+/// `login_ui`'s sign-in worker calls, with the same two arms behind it. A
+/// copy here -- even a faithful one -- would be a second route to the vault
+/// key that could drift on the argument vector, on `--passwordenv`, on which
+/// profile directory it lands in, or on which backend it reaches at all.
+///
+/// # The `bw serve` arm is byte-for-byte what it was
+///
+/// This named [`crate::login_ui::run_bw_with_password`] directly, with no
+/// consultation of [`crate::backend_policy`] anywhere on the path. That call
+/// is still the whole of the CLI arm: `authenticate_then_wipe` with a `None`
+/// login runs `run_cli(&password)` and enrols on success, and the enrolment
+/// passed here does nothing -- so on every `bw serve` account this function
+/// runs exactly `bw unlock --raw`, against exactly the directory
+/// [`PROFILE_DIR`] holds, and nothing else. That is what
+/// `the_unlock_asks_which_backend` is about.
+///
+/// **No Hello re-enrolment**, which is why `enroll` is a no-op rather than
+/// `hello::enroll_for`. A sign-in is where quick unlock is set up; an unlock
+/// is where it is spent. Sealing the password again here would be this
+/// surface acquiring a side effect the call it replaced never had.
+///
+/// # The direct-REST arm is the defect this closes
+///
+/// On a direct-REST account there is no `bw` session behind this profile and
+/// there may be no `bw.exe` at all -- `fn main` stopped treating its absence
+/// as fatal for exactly these accounts. `bw unlock` there could only ever
+/// fail, and [`run_with`] does not give up on a failed attempt: it shows the
+/// error and asks again. So the locked card's *Unlock* button was a button
+/// that could not unlock, on the one account whose vault the daemon reads
+/// with no subprocess at all.
+///
+/// [`crate::backend_policy::direct_rest_login`] is gated on the choice and
+/// not merely on the field (see its own doc), so `Some` here means this
+/// process really is serving the active account over REST -- and the active
+/// account is the one this prompt is for, since `unlock_from_the_locked_card`
+/// derives [`PROFILE_DIR`] from it. Its `adopt` sink writes the derived key
+/// to that account's [`crate::user_key_store`] and puts a
+/// [`crate::rest::backend::RestBackend`] in the vault slot, which is exactly
+/// what the resettle behind this prompt goes on to repopulate from:
+/// `restart_backend_after_unlock` answers `NoSubprocess` on this account and
+/// falls through to the readiness probe for that reason.
+///
+/// **A two-step account still cannot complete here**, and it now says so
+/// instead of blaming a CLI. The daemon installs `DirectRestLogin::prompt`
+/// as `None` -- it has no code stage to draw -- so a second factor ends the
+/// attempt with the message `authenticate_then_wipe` returns, which
+/// [`run_with`] puts in the error row. That is the state such an account was
+/// already in on this surface; what changes is that the reason reported is
+/// the true one. The route that does complete one is the tray's Open Vault,
+/// whose window has the stage.
 ///
 /// Called on a worker thread by [`win32::unlock`], which is what keeps the
-/// window painting while the CLI is out. The `String` it is handed is wiped by
-/// that caller.
+/// window painting while the derivation -- or the CLI -- is out. The `String`
+/// it is handed is wiped by that caller; the copy made here is wiped by
+/// `authenticate_then_wipe`, which takes it by value into a `Zeroizing` on
+/// its first line and drops that on every path out, unwinds included.
 fn run_bw_unlock(password: &str) -> Result<String, String> {
     let dir = PROFILE_DIR.lock().ok().and_then(|slot| slot.clone());
-    crate::login_ui::run_bw_with_password(&["unlock", "--raw"], password, dir.as_deref())
+    crate::login_ui::authenticate_then_wipe(
+        password.to_string(),
+        |password| {
+            crate::login_ui::run_bw_with_password(&["unlock", "--raw"], password, dir.as_deref())
+        },
+        // See "No Hello re-enrolment" above: an unlock does not re-seal the
+        // master password for quick unlock. A closure that does nothing is
+        // what keeps the CLI arm identical to the call this replaced.
+        |_| {},
+        crate::backend_policy::direct_rest_login(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2321,7 +2391,7 @@ mod no_thread_quit_pin {
     /// `#[cfg(test)]` on its own unindented line, up to and including the next
     /// unindented `}`. Every gated module in this file has that shape, and
     /// `the_cut_really_discards_something` checks that rather than assuming it.
-    fn production_only(source: &str) -> String {
+    pub(super) fn production_only(source: &str) -> String {
         let mut out = String::new();
         let mut skipping = false;
         for line in source.lines() {
@@ -2402,6 +2472,122 @@ mod no_thread_quit_pin {
         assert!(
             !source().contains(FORBIDDEN),
             "the unlock prompt posts a thread quit. `close` destroys this window              SYNCHRONOUSLY on the calling thread, and that thread goes on to run              egui windows: `unlock_from_the_locked_card` returns into              `resume_fill_after_unlock`, which opens the autofill overlay and the              preflight window. Nothing drains the quit in between, so the next              `eframe::run_native` takes it out of `GetMessageW`, leaves its loop              BEFORE it draws, and returns its default answer -- the fill the user              just unlocked for silently does nothing. `GONE` is what `next` reads;              the quit is redundant as well as harmful."
+        );
+    }
+}
+
+/// **The unlock this prompt performs is the one this account's backend
+/// understands.**
+///
+/// [`run_bw_unlock`] used to name [`crate::login_ui::run_bw_with_password`]
+/// directly -- the CLI arm, and only the CLI arm -- with no consultation of
+/// [`crate::backend_policy`] anywhere on the path from the locked card to the
+/// spawn. The card that opens this prompt is raised on
+/// `VaultCache::is_populated` alone (`crate::app::disposition` takes no
+/// backend input at all), so it is raised on direct-REST accounts too, where
+/// `bw unlock` addresses a profile that was never signed in to.
+///
+/// Three source facts, because this file's `bw` calls cannot be *run* by a
+/// test -- `bw_path`'s verified-exe path is a process global other tests in
+/// this suite set, so calling [`run_bw_unlock`] here would attempt a
+/// `CreateProcess` against whatever they left behind:
+///
+///  * the two-armed function is what the worker calls, and it is handed a
+///    [`crate::backend_policy`] answer rather than `None`;
+///  * the CLI arm still asks for `unlock --raw`, which the closure's `&str`
+///    signature would not have protected;
+///  * there is no second, ungated route to the CLI left in this file.
+///
+/// What `authenticate_then_wipe` then DOES with the two arms is pinned where
+/// it lives, by `login_ui`'s `a_direct_rest_account_never_spawns_the_cli` and
+/// its `a_bw_serve_account_still_spawns_the_cli` control, both driven over
+/// closures that record instead of spawning. This module is about the wiring
+/// into it, which is the part that was missing.
+#[cfg(test)]
+mod the_unlock_asks_which_backend {
+    use super::no_thread_quit_pin::production_only;
+
+    fn source() -> String {
+        production_only(include_str!("unlock_prompt.rs"))
+    }
+
+    /// **The `bw serve` arm still runs exactly `bw unlock --raw`.**
+    ///
+    /// The argument vector, unchanged, because that is the half of the CLI
+    /// arm the reshuffle could have altered silently: `authenticate_then_wipe`
+    /// hands its `run_cli` closure a `&str` and nothing else, so a closure
+    /// that had picked up a different subcommand -- or lost `--raw`, and with
+    /// it the bare-token output this prompt returns -- would still compile and
+    /// still be reached.
+    ///
+    /// **A source pin and not a call, deliberately.** Calling
+    /// [`super::run_bw_unlock`] takes the CLI arm all the way to
+    /// `Command::output`, and `bw_path`'s verified-exe path is a process
+    /// global that other tests in this suite set -- so a call here would be a
+    /// test that attempts a `CreateProcess` against whatever path happened to
+    /// be installed, which is both flaky and the thing no test in this crate
+    /// may do. Observed once, as `os error 3`.
+    ///
+    /// What the arm DOES once entered is `login_ui`'s
+    /// `a_bw_serve_account_still_spawns_the_cli`, over a `run_cli` that
+    /// records instead of spawning.
+    #[test]
+    fn the_cli_arm_still_asks_for_an_unlock_and_a_raw_token() {
+        assert!(
+            source().contains(concat!("&[\"unlock\", ", "\"--raw\"]")),
+            "the unlock prompt's CLI arm no longer runs `bw unlock --raw`. Without \
+             `--raw` the CLI prints a sentence and this prompt returns it as a session \
+             token; with a different subcommand it returns nothing usable at all"
+        );
+    }
+
+    /// **The other arm is asked for.**
+    ///
+    /// A source pin and not a behaviour test, deliberately: taking the
+    /// direct-REST arm for real means `DirectRestLogin::second_factor.start`,
+    /// which is six hundred thousand PBKDF2 iterations and a network round
+    /// trip to a self-hosted server. No test in this crate may do either.
+    #[test]
+    fn the_unlock_worker_consults_the_backend_policy() {
+        let source = source();
+        assert!(
+            source.contains(concat!("authenticate_then_", "wipe(")),
+            "the unlock prompt no longer turns the master password into a session through \
+             the one function that has both arms, so a direct-REST account is back to \
+             being offered a `bw unlock` against a profile it never signed in to"
+        );
+        assert!(
+            source.contains(concat!("direct_rest_", "login()")),
+            "the unlock prompt asks for no direct-REST login, so `authenticate_then_wipe` \
+             is handed `None` and the CLI arm is the only one it can take"
+        );
+    }
+
+    /// **And there is no second route to the CLI in this file.**
+    ///
+    /// One mention, inside the closure `authenticate_then_wipe` calls only on
+    /// the `bw serve` arm. A second would be a `bw unlock` reachable without
+    /// the backend having been consulted, which is exactly the shape this
+    /// change removed.
+    #[test]
+    fn the_cli_is_named_once_and_only_inside_the_gated_closure() {
+        let source = source();
+        assert_eq!(
+            source.matches(concat!("run_bw_with_", "password(")).count(),
+            1,
+            "`bw unlock` is spawned from more than one place in this file, so the arm \
+             `authenticate_then_wipe` gates is not the only way to one"
+        );
+        let at = source
+            .find(concat!("authenticate_then_", "wipe("))
+            .expect("asserted by the test above");
+        let cli = source
+            .find(concat!("run_bw_with_", "password("))
+            .expect("asserted by the count above");
+        assert!(
+            at < cli,
+            "the one `bw unlock` is written BEFORE the call that is supposed to gate it, \
+             so it is not the closure's body"
         );
     }
 }
