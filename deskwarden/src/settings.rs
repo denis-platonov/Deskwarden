@@ -1205,6 +1205,50 @@ pub struct Settings {
     /// into a field nothing consults, which is harmless and is the reason
     /// this doc exists rather than the field being deleted outright.
     ///
+    /// # Why it is still here, and not replaced by a named carrier
+    ///
+    /// The obvious tidy-up is to delete this field and give the three
+    /// transports an `EditedSettings { settings, use_official_bw_crypto }`
+    /// of their own: [`crate::prefs_ui::run`]'s in/out shape,
+    /// `ui_process::write_edited_settings` / `read_edited_settings`, and
+    /// `vault_window::VaultWindowResult::edited_settings` by way of
+    /// `ui_process::UiVaultResult`. **Two of those three are on-disk formats
+    /// written by one process and read by another, and that is what stops
+    /// it.**
+    ///
+    /// The carrier is not a field ADDITION, which serde forgives in both
+    /// directions here -- `deny_unknown_fields` appears nowhere in this
+    /// crate, so an unknown key is ignored, and the `serde(default)` on this
+    /// struct means a missing one takes its default. It is a **re-nesting**
+    /// of the whole top-level object, from the flat block those files hold
+    /// today to `{"settings": {..}, "use_official_bw_crypto": ..}`. Neither
+    /// direction survives it:
+    ///
+    /// * **An old file read by the new shape.** `settings` is missing. Give
+    ///   the carrier `serde(default)` and it parses into
+    ///   `Settings::default()` -- every preference on the machine silently
+    ///   reset, with no error to notice. Leave it off and the parse fails,
+    ///   which for `UiVaultResult` discards the WHOLE window result rather
+    ///   than the settings alone: `read_result` answers `None` for a parse
+    ///   failure, taking `locked`, `switch_to` and `signed_in` with it.
+    /// * **A new file read by an old binary**, which is the one that cannot
+    ///   be made loud at all. Every real key now sits under `settings`, so
+    ///   an old reader sees an object with no key it recognises -- and this
+    ///   struct's own `serde(default)` makes that a SUCCESSFUL parse into
+    ///   all-defaults. `an_older_settings_file_parses_trusting_official_bw_
+    ///   crypto` demonstrates exactly that behaviour on a two-key file; a
+    ///   zero-key one is the same code path.
+    ///
+    /// The mid-upgrade window is narrow -- `updater::launch_installer`
+    /// releases the app mutex and the process exits before setup replaces
+    /// the binary, so a live daemon does not normally spawn a child of
+    /// another version -- but these per-pid files outlive a daemon that was
+    /// killed rather than closed, and `edited_settings_path` names them by a
+    /// pid Windows will reuse. A dead field costs nothing; a silent reset of
+    /// every preference on the machine is not a trade worth making for it.
+    /// If the carrier is ever wanted, the flat shape is what has to be kept:
+    /// a sibling key beside the others, which is what this field already is.
+    ///
     /// **Turning it back ON deletes the stored vault key.** The key
     /// [`crate::user_key_store`] writes does not expire and cannot be
     /// revoked, so the settlement that stops selecting direct REST is also
