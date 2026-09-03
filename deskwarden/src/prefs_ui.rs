@@ -8200,6 +8200,30 @@ mod tests {
             "the copy does not name the addresses this pill does NOT govern, so a user reading \
              the label would think it did: {DIRECT_ICONS_DESCRIPTION:?}"
         );
+        // **No stray carriage return, and this is not paranoia.** These
+        // sources are CRLF and Rust's string line-continuation is a
+        // backslash followed by a newline; a `\` + CRLF that the lexer did
+        // not fold would leave a literal CR inside the copy, which paints as
+        // a blank and reads on screen as a wrong line break. Asserted on the
+        // constant rather than trusted, because the failure is invisible in
+        // a diff.
+        //
+        // Spelled `char::from(13u8)` rather than as an escaped CR literal
+        // on purpose: writing one into a CRLF source is the very hazard
+        // under test here, and this spelling has nothing in it that a
+        // line-ending pass can mangle.
+        assert!(
+            !DIRECT_ICONS_DESCRIPTION.contains(char::from(13u8)),
+            "a literal carriage return survived a line continuation into the copy"
+        );
+        assert!(
+            !DIRECT_ICONS_LABEL.contains(char::from(13u8)),
+            "a literal carriage return survived into the label"
+        );
+        // The control: the same check on a neighbour that has always been
+        // fine, so a `contains` that could never be true is not what is
+        // passing here.
+        assert!(FETCH_ICONS_DESCRIPTION.contains("On by default"));
         // The house rule, as a test: this page never calls anything secure.
         assert!(
             !DIRECT_ICONS_DESCRIPTION.to_ascii_lowercase().contains("secure"),
