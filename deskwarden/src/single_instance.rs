@@ -568,7 +568,15 @@ fn create_quit_event() -> windows::core::Result<HANDLE> {
 
 /// Signals a running instance's quit event. `false` means there was none to
 /// open -- see [`GaveUp::NoOneToAsk`].
-fn signal_quit() -> bool {
+///
+/// `pub(crate)` for exactly one second caller: `updater::stand_down_for_install`
+/// has to stand the daemon down before it starts the installer, because setup
+/// carries `AppMutex=` and would otherwise refuse the silent install without
+/// saying so. It asks through THIS function rather than opening the event
+/// itself, so there stays one place that knows the event's name and what
+/// "nobody was listening" means. Not `pub`: nothing outside this crate has any
+/// business ending the app.
+pub(crate) fn signal_quit() -> bool {
     unsafe {
         let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(QUIT_EVENT_NAME))
         else {
@@ -577,6 +585,93 @@ fn signal_quit() -> bool {
         let set = SetEvent(handle).is_ok();
         let _ = CloseHandle(handle);
         set
+    }
+}
+
+/// How long [`stand_down_for_install`] waits for every other Deskwarden in
+/// this logon session to let go of the app mutex.
+///
+/// The same budget [`TAKEOVER_TIMEOUT`] gives a
+/// duplicate launch, and for the same reason: what is being waited for is one
+/// Deskwarden's own shutdown path, which clears the clipboard and zeroizes its
+/// caches on the way out. Longer would make a stuck daemon look like a hung
+/// button; shorter would report a failure the app was two hundred milliseconds
+/// from not having.
+const HANDOVER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll interval for [`stand_down_for_install`].
+const HANDOVER_POLL: Duration = Duration::from_millis(100);
+
+/// **Hands the whole app over to the installer, and reports whether it
+/// actually got it.**
+///
+/// # The shipped bug this exists for
+///
+/// `installer/deskwarden.iss` carries `AppMutex=`, and the self-update runs
+/// setup with `/VERYSILENT /SUPPRESSMSGBOXES`. So a Deskwarden still holding
+/// [`app_mutex::APP_MUTEX_NAME`] when setup starts does not produce an
+/// error, a dialog or a log line: setup opens the mutex, decides the app is
+/// running, has no interactive answer available for the box it would otherwise
+/// show, and exits. From the app's side the spawn SUCCEEDED -- `Command::spawn`
+/// returned `Ok` -- so the old code called `process::exit(0)` and reported
+/// nothing at all.
+///
+/// [`crate::updater`]'s launcher already released the mutex, and until the Preferences
+/// window moved into its own process that was the whole story: one process
+/// held it and that process was the one launching setup. It is not the story
+/// any more. `main.rs` takes the mutex only on the daemon branch --
+/// `LaunchIntent::Ui` exits into `run_as_a_ui_process` well above
+/// `app_mutex::acquire()` -- and Preferences is drawn by a UI process now. So
+/// the release in `launch_installer` runs in a process that never acquired,
+/// where it is documented to be a no-op, while the DAEMON goes on holding the
+/// name. Every ingredient of that failure is invisible: the release is a
+/// no-op, the spawn succeeds, and the exit is of the wrong process.
+///
+/// # What this does instead
+///
+/// It performs the handover rather than assuming it: let go of this process's
+/// own hold, ask any other copy to stand down through the quit event
+/// `single_instance` already owns, then wait for the NAME to become free --
+/// which is established by taking it, not by trusting the ask. The answer is a
+/// fact about a kernel object, so a caller that gets `true` knows setup's
+/// `OpenMutex` will fail and its check will pass.
+///
+/// **Taking the mutex here is deliberate, not a side effect.** It is the only
+/// evidence available that the name is gone, and [`crate::updater`]'s launcher's own
+/// `app_mutex::release()` -- the line pinned into its launch seam --
+/// is what lets go of it again immediately before the spawn. That line was
+/// belt-and-braces before this function existed; it is load-bearing now.
+///
+/// **It never forces.** `single_instance` can terminate other Deskwardens and
+/// deliberately is not asked to here: `app_mutex`'s header records why
+/// (`CloseApplications=no`), which is that a `TerminateProcess` skips every
+/// destructor -- leaving the user's copied password on the clipboard and their
+/// secrets unwiped in freed memory, as a side effect of installing an update.
+/// A copy that will not go is reported to the user, not killed.
+pub(crate) fn stand_down_for_install() -> bool {
+    // This process's own handle first. `app_mutex::acquire` (or a previous
+    // `take_if_free`) opened one, and a named kernel object lives as long as
+    // any handle does -- so a process that skipped this would wait out the
+    // whole budget against itself, exactly as `TakeoverEnv::let_go` records.
+    app_mutex::release();
+    // Nothing listening is not a failure: it means no daemon is running, and
+    // the poll below is then the thing that says so, one way or the other.
+    // A UI process asking is asking the daemon that spawned it, whose
+    // takeover listener is what answers.
+    if signal_quit() {
+        log::info!("asked the running Deskwarden to stand down so the installer can replace it");
+    } else {
+        log::info!("no other Deskwarden was listening for a stand-down request");
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if app_mutex::take_if_free() {
+            return true;
+        }
+        if started.elapsed() >= HANDOVER_TIMEOUT {
+            return false;
+        }
+        std::thread::sleep(HANDOVER_POLL);
     }
 }
 

@@ -939,7 +939,6 @@ const UPDATE_AUTOMATIC_OFF_NOTE: &str =
     "Automatic checks are off — the switch above. This button still asks, because you asked it \
      to.";
 
-const UPDATE_NOTES_LABEL: &str = "What is new";
 /// Shown in place of the notes when the release has none. A release with an
 /// empty body is normal; an empty box is not distinguishable from a box that
 /// failed to load.
@@ -4575,7 +4574,14 @@ fn release_notes(ui: &mut Ui, body: &str) {
     let shown = crate::updater::release_notes_for_display(body);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
-        ui.label(theme::semibold(UPDATE_NOTES_LABEL, 14.0).color(theme::INK));
+        // **No heading of our own here.** This region used to open with
+        // `UPDATE_NOTES_LABEL`, and the result on a real release was three
+        // headings stacked over one set of notes: "What is new", then
+        // `updater::notes_heading`'s "Deskwarden 0.15.11", then the body's own
+        // "What's new in 0.15.11" from `.github/workflows/release.yml`. The
+        // body's is the one that stays -- it is written by the release, it
+        // names the version, and it is the only one of the three the app does
+        // not author. See `updater::notes_heading` for the other removal.
         if shown.is_empty() {
             ui.label(RichText::new(UPDATE_NOTES_EMPTY).size(12.0).color(theme::TEXT_FAINT));
             return;
@@ -11268,18 +11274,26 @@ mod tests {
             .join("\n")
     }
 
-    /// The white card the notes heading is painted on, found by containment
-    /// rather than by index -- the Updates page has several cards and their
-    /// order is not this test's business.
+    /// The white card the notes are painted on, found by containment rather
+    /// than by index -- the Updates page has several cards and their order is
+    /// not this test's business.
+    ///
+    /// **Anchored on [`UPDATE_SECTION_LABEL`], which is on that same card.**
+    /// It used to be anchored on a notes heading of the app's own, and that
+    /// heading is gone: the release body brings its own (see
+    /// `updater::notes_heading`). The section label is the better anchor
+    /// anyway -- it is the one string on this card that is identical for every
+    /// stage and every release, so the two paints being compared below are
+    /// located by something that does not vary with what is being compared.
     fn notes_card_rect(painted: &Painted) -> Rect {
-        let heading = painted.rect_of(UPDATE_NOTES_LABEL);
+        let anchor = painted.rect_of(UPDATE_SECTION_LABEL);
         painted
             .rects
             .iter()
             .map(|r| r.rect)
-            .filter(|r| r.contains(heading.center()) && r.width() > heading.width())
+            .filter(|r| r.contains(anchor.center()) && r.width() > anchor.width())
             .min_by(|a, b| a.width().partial_cmp(&b.width()).unwrap())
-            .expect("the notes heading is painted on no card at all")
+            .expect("the update card's own label is painted on no card at all")
     }
 
     /// Is a scrollbar-width rectangle painted in ink anyone can see?
@@ -11685,9 +11699,21 @@ mod tests {
         );
 
         assert!(painted.contains("Version 9.9.9 is available."), "got {:?}", painted.strings());
-        assert!(painted.contains(UPDATE_NOTES_LABEL));
         assert!(painted.contains("Fixed the thing"), "got {:?}", painted.strings());
         assert!(painted.contains(UPDATE_DOWNLOAD_BUTTON));
+        // **And the app writes no heading of its own over them.** A release
+        // body already opens with `## What's new in <version>`, composed by
+        // `.github/workflows/release.yml`, so a heading here made the page
+        // stack two -- three, with `updater::notes_heading` -- over one set of
+        // notes. This is the assertion that keeps them from coming back: it
+        // names the exact words that were removed, so a re-added heading is
+        // red rather than merely different.
+        assert!(
+            !painted.strings().iter().any(|t| t.contains(concat!("What is", " new"))),
+            "the notes region is writing a heading of its own again, above the one the \
+             release already carries: {:?}",
+            painted.strings()
+        );
     }
 
     /// Every run of ink the notes region painted, joined.

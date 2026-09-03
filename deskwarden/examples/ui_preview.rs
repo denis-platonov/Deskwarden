@@ -281,6 +281,13 @@ enum Surface {
     /// the card still fit" is exactly what a picture answers and an assertion
     /// does not.
     PrefsUpdatesDownloading,
+    /// **Downloaded, verified, and offering the restart.**
+    ///
+    /// The one stage of this flow that had no picture, and it is the stage the
+    /// button the user pressed lives on. "Click restart to update - nothing
+    /// happens" was reported against a surface no screenshot in this set
+    /// showed, which is a poor place for the set to have a hole.
+    PrefsUpdatesReady,
     /// A failed download, with the reason on the page and a retry beside it.
     /// The old flow's failure went to a tray tooltip, visible only to someone
     /// already hovering a 16px icon.
@@ -522,6 +529,7 @@ const ALL: &[Surface] = &[
     Surface::PrefsUpdatesManyReleases,
     Surface::PrefsWindowChrome,
     Surface::PrefsUpdatesDownloading,
+    Surface::PrefsUpdatesReady,
     Surface::PrefsUpdatesFailed,
     Surface::PrefsBreachesIdle,
     Surface::PrefsBreachesRunning,
@@ -585,6 +593,7 @@ impl Surface {
             Surface::PrefsUpdatesManyReleases => "prefs_updates_many_releases",
             Surface::PrefsWindowChrome => "prefs_window_chrome",
             Surface::PrefsUpdatesDownloading => "prefs_updates_downloading",
+            Surface::PrefsUpdatesReady => "prefs_updates_ready",
             Surface::PrefsUpdatesFailed => "prefs_updates_failed",
             Surface::PrefsBreachesIdle => "prefs_breaches_idle",
             Surface::PrefsBreachesRunning => "prefs_breaches_running",
@@ -674,6 +683,7 @@ impl Surface {
             | Surface::PrefsUpdatesShortNotes
             | Surface::PrefsUpdatesManyReleases
             | Surface::PrefsUpdatesDownloading
+            | Surface::PrefsUpdatesReady
             | Surface::PrefsUpdatesFailed
             | Surface::PrefsBreachesIdle
             | Surface::PrefsBreachesRunning
@@ -1069,6 +1079,7 @@ impl eframe::App for Preview {
             | Surface::PrefsUpdatesShortNotes
             | Surface::PrefsUpdatesManyReleases
             | Surface::PrefsUpdatesDownloading
+            | Surface::PrefsUpdatesReady
             | Surface::PrefsUpdatesFailed => self.draw_prefs_updates(root, self.current()),
             Surface::PrefsBreachesIdle
             | Surface::PrefsBreachesRunning
@@ -1454,6 +1465,16 @@ impl Preview {
             // deliberately NOT in the subset, painted as the characters they
             // are.
             body: concat!(
+                // **The release's own heading, first**, because that is what
+                // production sends: `.github/workflows/release.yml` opens
+                // every published body with this line. It is also the only
+                // heading over these notes now -- the panel's own "What is
+                // new" and `updater::notes_heading`'s "Deskwarden 0.9.0" were
+                // both removed, and this fixture is where that is reviewable.
+                // Without it, this picture showed a body no release has ever
+                // had and the duplication was invisible here.
+                "## What's new in 0.9.0\n",
+                "\n",
                 "## Added\n",
                 "- The update flow moved out of the tray and onto **this page**.\n",
                 "- Release notes are shown *before* anything is downloaded.\n",
@@ -1524,31 +1545,39 @@ impl Preview {
             // window, which is what it was always really measuring.
             Surface::PrefsUpdatesManyReleases => UpdateStage::Available(ReleaseInfo {
                 body: concat!(
-                    "## Deskwarden 0.9.0\n",
+                    "## What's new in 0.9.0\n",
                     "- Release notes now cover **every** version you skipped.\n",
                     "- The scrollbar appears only when there is more to read.\n",
                     "\n",
+                    // **The one release still filed under a heading of the
+                    // app's own**, and the reason `updater::notes_heading`
+                    // survives at all: this release published nothing, so
+                    // there is no `## What's new in 0.8.6` of its own to name
+                    // it, and without this line the sentence below would sit
+                    // unattributed between two other releases' notes. Every
+                    // other entry here carries the heading `release.yml` wrote
+                    // for it, which is why they no longer carry two.
                     "## Deskwarden 0.8.6\n",
                     "_This release came with no notes._\n",
                     "\n",
-                    "## Deskwarden 0.8.5\n",
+                    "## What's new in 0.8.5\n",
                     "- The vault window remembers its size, via `settings.json`.\n",
                     "- Details on [the release page](https://example.invalid/r).\n",
                     "\n",
-                    "## Deskwarden 0.8.4\n",
+                    "## What's new in 0.8.4\n",
                     "- Cyrillic names render in the app's own typeface.\n",
                     "- One Deskwarden per session, and starting it again takes over.\n",
                     "- Password health rows line up with the item list again.\n",
                     "\n",
-                    "## Deskwarden 0.8.3\n",
+                    "## What's new in 0.8.3\n",
                     "- The favourite star is lighter, rounder and quieter.\n",
                     "- Browsers no longer get the \"no saved login\" card.\n",
                     "\n",
-                    "## Deskwarden 0.8.2\n",
+                    "## What's new in 0.8.2\n",
                     "- The autofill prompt setting silences every pop-up.\n",
                     "- The reveal eye is taller and rounder.\n",
                     "\n",
-                    "## Deskwarden 0.8.1\n",
+                    "## What's new in 0.8.1\n",
                     "- The tray menu names the account it is signed in as.\n",
                     "- Preferences opens on the page it was last left on.\n",
                 )
@@ -1560,8 +1589,24 @@ impl Preview {
                 done: 2_400_000,
                 total: Some(6_291_456),
             },
+            Surface::PrefsUpdatesReady => UpdateStage::Ready(release),
+            // **The handover refusal, not a network one.** A connection that
+            // closed was already covered by the download's own error; what
+            // this flow had no picture of is the failure the user actually
+            // hit, where the installer is downloaded and verified and cannot
+            // be run because another Deskwarden still holds the app mutex.
+            // That case used to produce no message at all -- the process
+            // exited on a spawn that succeeded and an install that did not --
+            // so this is the picture of the thing that was missing.
             Surface::PrefsUpdatesFailed => UpdateStage::Failed {
-                message: "failed to download installer: connection closed".to_string(),
+                message: "another Deskwarden is still running, so the installer would find \
+                          the app in use and give up without showing anything. Quit every \
+                          Deskwarden window and try again. (It still holds \
+                          Local\\Deskwarden-63CBCB72-5383-4AE7-AFB7-5EE0530E4630; the \
+                          verified installer is at \
+                          C:\\Users\\you\\AppData\\Local\\Deskwarden\\cache\\updates\\\
+                          deskwarden-0.9.0-installer.exe.)"
+                    .to_string(),
                 release: Some(release),
             },
             _ => UpdateStage::UpToDate,

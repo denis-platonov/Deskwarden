@@ -69,7 +69,7 @@
 
 use crate::updater::{self, ReleaseInfo};
 use semver::Version;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, OnceLock};
 
@@ -430,18 +430,87 @@ impl UpdatePanel {
     /// exit on a background thread would mean a window still taking clicks
     /// while its process was being replaced.
     pub fn install_now(&mut self) {
-        let release = match &self.stage {
-            UpdateStage::Ready(r) => r.clone(),
-            _ => return,
-        };
         let Some(env) = env() else {
+            // **Said, not merely rendered.** The stage below puts this on
+            // screen, but a build in which this happens is a build somebody
+            // has to be able to diagnose from a log file they were sent.
+            log::error!(
+                "install was pressed but this process installed no update environment; the \
+                 update cannot be applied. That is a defect, not a setting"
+            );
             self.stage = UpdateStage::Unavailable;
             return;
         };
+        self.install_now_with(
+            &env.download_dir,
+            &*env.before_install,
+            updater::apply_update,
+            // `process::exit` diverges, so production never returns from here
+            // and the `return` below it is unreachable in the shipped app.
+            // Typed `fn()` rather than `fn() -> !` so a test can pass a
+            // counting stub; see `install_now_with`.
+            || std::process::exit(0),
+        );
+    }
+
+    /// [`install_now`](Self::install_now)'s whole body, with the two things it
+    /// does to the outside world as parameters.
+    ///
+    /// # Why this shape exists
+    ///
+    /// The shipped defect was that pressing the button produced the intent log
+    /// line and then nothing at all -- no install, no exit, no error. A test
+    /// asserting the intent was logged would have passed on the day it
+    /// shipped. What was missing is a test that presses install and COUNTS
+    /// whether the apply was reached, and that cannot be written over
+    /// `install_now`: it reads a process-wide `OnceLock` no test may install
+    /// into (see [`install_env`]), and it ends in `process::exit`.
+    ///
+    /// So both are parameters here. `apply` is a `fn` pointer for
+    /// `UpdaterEnv`'s reason -- it has an address, so
+    /// [`tests::install_forwards_the_real_apply_and_the_real_exit`] can assert
+    /// that [`install_now`](Self::install_now) hands over the REAL
+    /// [`updater::apply_update`] rather than a stand-in that agrees with
+    /// whatever a test wanted. `before_install` is a `&dyn Fn` because it is
+    /// the one field of [`UpdateEnv`] that is genuinely a closure over
+    /// `main`'s locals.
+    ///
+    /// **Every arm is loud.** A button that does nothing and says nothing is
+    /// the failure shape this whole module was written to delete, and it came
+    /// back on this path. Each way out of this function now either succeeds or
+    /// states why -- in the log AND, through the stage, on the page.
+    fn install_now_with(
+        &mut self,
+        download_dir: &Path,
+        before_install: &dyn Fn(),
+        apply: fn(&Path, &ReleaseInfo) -> Result<(), String>,
+        exit: fn(),
+    ) {
+        let release = match &self.stage {
+            UpdateStage::Ready(r) => r.clone(),
+            // Not reachable from the page -- `draw_update_card` only routes a
+            // click here from `Ready` -- so reaching it means the panel and
+            // the button disagree about what is on screen. Logged rather than
+            // returned into silence, because that disagreement is exactly what
+            // a dead button looks like from the user's side.
+            other => {
+                log::warn!(
+                    "install was pressed while the update panel was on {other:?}, which has \
+                     no verified installer to run; nothing was started"
+                );
+                return;
+            }
+        };
         log::info!("installing update v{}; shutting down for it", release.version);
-        (env.before_install)();
-        match updater::apply_update(&env.download_dir, &release) {
-            Ok(()) => std::process::exit(0),
+        before_install();
+        match apply(download_dir, &release) {
+            Ok(()) => {
+                log::info!(
+                    "installer for v{} started; exiting so it can replace this build",
+                    release.version
+                );
+                exit();
+            }
             Err(message) => {
                 log::error!("update install failed: {message}");
                 self.stage = UpdateStage::Failed { message, release: Some(release) };
@@ -482,6 +551,8 @@ pub fn download_label(done: u64, total: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     fn release(v: &str) -> ReleaseInfo {
         ReleaseInfo {
@@ -508,6 +579,249 @@ mod tests {
         panel.apply(UpdateMsg::Checked(Ok(None)));
 
         assert_eq!(panel.stage(), &UpdateStage::UpToDate);
+    }
+
+    // -----------------------------------------------------------------
+    // PRESSING INSTALL REACHES THE INSTALL
+    //
+    // The defect: the user pressed "Restart to update" twice, the log
+    // carried `installing update v0.15.11; shutting down for it` twice, and
+    // nothing else happened -- no install, no exit, no error line. Every
+    // test in this module passed throughout, because every one of them was
+    // about the state machine and none of them pressed the button.
+    //
+    // These count the apply through the seam. `install_now_with` is
+    // `install_now`'s whole body, so what they drive is the shipped path
+    // minus the `OnceLock` no test may write and the `process::exit` no test
+    // may run.
+    // -----------------------------------------------------------------
+
+    /// What one `install_now_with` press observed.
+    #[derive(Default)]
+    struct Pressed {
+        /// Every `(download_dir, version)` the apply was asked for. **Empty
+        /// is the bug**: a press that never reached the installer.
+        applied: Vec<(PathBuf, Version)>,
+        /// How many times the teardown ran.
+        torn_down: usize,
+        /// How many times the process would have exited.
+        exited: usize,
+    }
+
+    /// A press's observations, for one test at a time.
+    ///
+    /// A `static` rather than a captured closure because the seam is a `fn`
+    /// pointer, for [`updater::UpdaterEnv`]'s reason: a pointer has an
+    /// address, so [`install_forwards_the_real_apply_and_the_real_exit`] can
+    /// assert that `install_now` hands over the real
+    /// [`updater::apply_update`] and not a forwarder.
+    static PRESSED: Mutex<Option<Pressed>> = Mutex::new(None);
+
+    /// Serialises the press tests, so [`PRESSED`] means one press.
+    static PRESS_LOCK: Mutex<()> = Mutex::new(());
+
+    /// What the substituted apply answers next.
+    static APPLY_ANSWER: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+    fn pressed() -> MutexGuard<'static, Option<Pressed>> {
+        PRESSED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn substitute_apply(dir: &Path, release: &ReleaseInfo) -> Result<(), String> {
+        if let Some(p) = pressed().as_mut() {
+            p.applied.push((dir.to_path_buf(), release.version.clone()));
+        }
+        APPLY_ANSWER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("the test did not program an apply answer")
+    }
+
+    fn substitute_exit() {
+        if let Some(p) = pressed().as_mut() {
+            p.exited += 1;
+        }
+    }
+
+    /// Presses install on `panel` with the seam recording, and reports what
+    /// the press reached.
+    fn press_install(panel: &mut UpdatePanel, answer: Result<(), String>) -> Pressed {
+        let _serial = PRESS_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *pressed() = Some(Pressed::default());
+        *APPLY_ANSWER.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(answer);
+
+        let dir = PathBuf::from(r"Z:\deskwarden-update-panel-test-never-created");
+        let torn_down = Arc::new(AtomicUsize::new(0));
+        let teardown = {
+            let torn_down = Arc::clone(&torn_down);
+            move || {
+                torn_down.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        panel.install_now_with(&dir, &teardown, substitute_apply, substitute_exit);
+
+        let mut out = pressed().take().expect("the press harness lost its recorder");
+        out.torn_down = torn_down.load(Ordering::SeqCst);
+        out
+    }
+
+    fn ready_panel(v: &str) -> UpdatePanel {
+        UpdatePanel::parked(UpdateStage::Ready(release(v)))
+    }
+
+    /// **Pressing install on a ready release REACHES THE INSTALL.**
+    ///
+    /// This is the assertion the shipped build fails, and the one no existing
+    /// test made. It counts the apply rather than the intent: an
+    /// `install_now` that logged "shutting down for it" and then returned --
+    /// which is what the user's log looks like -- records zero applies here
+    /// and reds, while the pinned log line is untouched.
+    #[test]
+    fn pressing_install_on_a_ready_release_reaches_the_installer_exactly_once() {
+        let mut panel = ready_panel("0.15.11");
+
+        let p = press_install(&mut panel, Ok(()));
+
+        assert_eq!(
+            p.applied.len(),
+            1,
+            "pressing install reached the installer {} times, not once. Zero is the shipped \
+             bug: the intent was logged and nothing was started",
+            p.applied.len()
+        );
+        assert_eq!(
+            p.applied[0].1,
+            Version::parse("0.15.11").unwrap(),
+            "the install was asked for a different version than the one the panel was \
+             showing as ready"
+        );
+        assert_eq!(
+            p.torn_down, 1,
+            "the vault cache and the clipboard were not cleared before the handover; an \
+             installer that replaces this binary must not leave a decrypted vault behind it"
+        );
+        assert_eq!(
+            p.exited, 1,
+            "the installer was started and this process did not exit. Setup carries \
+             `AppMutex=` and would find the app still running"
+        );
+    }
+
+    /// **The negative control**: the same press, on a panel that is NOT on a
+    /// ready release, reaches nothing.
+    ///
+    /// Without this, the test above passes on an `install_now_with` that
+    /// applies unconditionally -- which would start an installer for a
+    /// release that had never been downloaded or verified.
+    #[test]
+    fn pressing_install_without_a_verified_installer_reaches_nothing() {
+        for stage in [
+            UpdateStage::Idle,
+            UpdateStage::UpToDate,
+            UpdateStage::Available(release("0.15.11")),
+            UpdateStage::Downloading { release: release("0.15.11"), done: 1, total: None },
+        ] {
+            let mut panel = UpdatePanel::parked(stage.clone());
+
+            let p = press_install(&mut panel, Ok(()));
+
+            assert!(
+                p.applied.is_empty(),
+                "install reached the installer from {stage:?}, where nothing has been \
+                 downloaded or verified: {:?}",
+                p.applied
+            );
+            assert_eq!(p.exited, 0, "the process would have exited from {stage:?}");
+            assert_eq!(p.torn_down, 0, "the vault cache was cleared for nothing from {stage:?}");
+        }
+    }
+
+    /// **A failed install is reported on the page, and the process stays
+    /// alive.**
+    ///
+    /// This is the arm the handover refusal now lands on. `apply_update`
+    /// returning `Err` used to be the only loud arm on this path and it must
+    /// stay loud: the message travels into [`UpdateStage::Failed`], which
+    /// `prefs_ui::draw_update_card` renders as "Update failed: ...". An
+    /// `exit` on this arm would take the window down and leave the user with
+    /// the same silence they reported.
+    #[test]
+    fn an_install_that_fails_says_so_on_the_page_rather_than_exiting() {
+        let mut panel = ready_panel("0.15.11");
+
+        let p = press_install(
+            &mut panel,
+            Err("another Deskwarden is still running and holds the mutex".to_string()),
+        );
+
+        assert_eq!(p.applied.len(), 1, "control: the press did reach the installer");
+        assert_eq!(
+            p.exited, 0,
+            "the process exited on a FAILED install, which is the dead button the user \
+             reported: the window vanishes and nothing is installed"
+        );
+        match panel.stage() {
+            UpdateStage::Failed { message, release } => {
+                assert!(
+                    message.contains("another Deskwarden is still running"),
+                    "the reason `updater` gave did not reach the page: {message}"
+                );
+                assert_eq!(
+                    release.as_ref().map(|r| r.version.clone()),
+                    Some(Version::parse("0.15.11").unwrap()),
+                    "the failure forgot which release it was for, so the retry has nothing \
+                     to retry"
+                );
+            }
+            other => panic!("a failed install left the panel on {other:?} rather than Failed"),
+        }
+    }
+
+    /// The production press hands over the REAL apply and the REAL exit.
+    ///
+    /// Every test above substitutes both, so without this they are assertions
+    /// about the harness. `fn_addr_eq` sees a wrapper, a forwarder or a rename
+    /// as a different address, whatever it is spelled.
+    #[test]
+    fn install_forwards_the_real_apply_and_the_real_exit() {
+        let real_apply: fn(&Path, &ReleaseInfo) -> Result<(), String> = updater::apply_update;
+        let forwarded: fn(&Path, &ReleaseInfo) -> Result<(), String> = updater::apply_update;
+
+        assert!(
+            std::ptr::fn_addr_eq(forwarded, real_apply),
+            "control: `fn_addr_eq` answers false for one function against itself"
+        );
+        assert!(
+            !std::ptr::fn_addr_eq(forwarded, substitute_apply
+                as fn(&Path, &ReleaseInfo) -> Result<(), String>),
+            "control: the substitute compares EQUAL to the real apply, so every press test \
+             above is vacuous"
+        );
+        // And the source says `install_now` passes that function rather than
+        // one of its own. A pointer test cannot reach inside `install_now`,
+        // because `install_now` does not return -- so the statement is pinned
+        // where it is written.
+        let body = include_str!("update_panel.rs");
+        let start = body.find("pub fn install_now(&mut self)").expect(
+            "update_panel.rs no longer declares `install_now`, so the page's button reaches \
+             something this test has never seen",
+        );
+        let end = start
+            + body[start..]
+                .find("fn install_now_with")
+                .expect("`install_now` no longer forwards to `install_now_with`");
+        let forwarding = &body[start..end];
+        assert!(
+            forwarding.contains("updater::apply_update"),
+            "`install_now` no longer hands `install_now_with` the real `updater::apply_update`; \
+             the button now reaches something else entirely: {forwarding}"
+        );
+        assert!(
+            forwarding.contains("std::process::exit(0)"),
+            "`install_now` no longer exits after starting the installer. Setup carries \
+             `AppMutex=` and refuses, in silence, to install over a running Deskwarden"
+        );
     }
 
     #[test]

@@ -906,7 +906,34 @@ fn installer_from(release: &serde_json::Value) -> Result<(String, Sha256Digest),
     Ok((installer_url, parse_asset_digest(digest_field)?))
 }
 
-/// Heading a release's notes are filed under in the joined body.
+/// Heading a release's notes are filed under in the joined body **when the
+/// release published none of its own**.
+///
+/// # Why this is no longer written above every release
+///
+/// It used to be, and the Updates page said this, stacked, about one release:
+///
+/// ```text
+/// New releases
+/// Version 0.15.11 is available.
+/// What is new
+/// Deskwarden 0.15.11
+/// What's new in 0.15.11
+/// ```
+///
+/// Five lines, four of them saying the same thing. The last one is not ours to
+/// remove and is the one worth keeping: `.github/workflows/release.yml`
+/// composes every release body since v0.9.0 and opens it with
+/// `## What's new in <version>`, so a release with notes already names itself,
+/// in its own words, at the top of its own notes. A second heading naming the
+/// same version immediately above it is duplication that this function was
+/// adding.
+///
+/// It still runs for a release that published NO notes, and that case is the
+/// whole reason it survives: [`NO_NOTES_FOR_RELEASE`] has no version in it, so
+/// without a heading a skipped release with an empty body would appear in the
+/// range as an unattributed sentence. The range must stay a range -- see
+/// [`notes_across`].
 fn notes_heading(version: &Version) -> String {
     format!("## Deskwarden {version}")
 }
@@ -938,14 +965,24 @@ fn notes_across(releases: &[(Version, &serde_json::Value)]) -> String {
         if !out.is_empty() {
             out.push_str("\n\n");
         }
-        out.push_str(&notes_heading(version));
-        out.push('\n');
         // Absent, null, or a non-string are all one case: a release with no
         // notes. Not an error -- a release genuinely may have an empty body,
         // and failing over missing prose would turn "no notes" into "no
         // update".
         let notes = release["body"].as_str().unwrap_or_default().trim();
-        out.push_str(if notes.is_empty() { NO_NOTES_FOR_RELEASE } else { notes });
+        if notes.is_empty() {
+            // Nothing else here names the version, so this is what keeps the
+            // release IN the range rather than turning it into a stray
+            // sentence between two other releases' notes.
+            out.push_str(&notes_heading(version));
+            out.push('\n');
+            out.push_str(NO_NOTES_FOR_RELEASE);
+        } else {
+            // The body opens with its own `## What's new in <version>` --
+            // `release.yml` puts it there -- so it is already filed under a
+            // heading that names it. See [`notes_heading`].
+            out.push_str(notes);
+        }
     }
     if releases.len() > MAX_NOTES_RELEASES {
         out.push_str(&format!(
@@ -1362,6 +1399,15 @@ pub struct UpdaterEnv {
     hash: fn(&Path) -> Result<Sha256Digest, String>,
     /// [`launch_installer`] in production -- the module's only process start.
     launch: fn(&Path) -> Result<(), String>,
+    /// [`stand_down_for_install`] in production -- the handover, answering
+    /// whether the app mutex is actually free.
+    ///
+    /// A seam for the same absolute constraint the other two have: no test in
+    /// this crate may stand the user's running Deskwarden down. What is left
+    /// on this side of it is the part that shipped broken -- that a handover
+    /// which did NOT happen stops the launch and says so, rather than starting
+    /// an installer that will refuse in silence.
+    stand_down: fn() -> bool,
 }
 
 impl UpdaterEnv {
@@ -1372,7 +1418,17 @@ impl UpdaterEnv {
     /// every source guard in this file, so that a test-gated item up here
     /// cannot truncate the slice those guards read.
     pub fn production() -> Self {
-        Self { hash: file_sha256, launch: launch_installer }
+        Self {
+            hash: file_sha256,
+            launch: launch_installer,
+            // Lives in `single_instance` rather than here for two reasons.
+            // The mechanism is that module's -- it already owns the quit
+            // event, the app mutex handover and the budget a stand-down gets
+            // -- and this file's production slice may not name `thread` at
+            // all, which `the_only_process_start_in_this_module_is_the_launch_seam`
+            // enforces and which a poll loop would have broken.
+            stand_down: crate::single_instance::stand_down_for_install,
+        }
     }
 }
 
@@ -1432,6 +1488,34 @@ fn apply_update_with(dest_dir: &Path, release: &ReleaseInfo, env: &UpdaterEnv) -
              {expected}",
             path = installer_path.display(),
             expected = release.installer_sha256
+        ));
+    }
+    // **The handover, before the launch and checked.**
+    //
+    // Not housekeeping and not belt-and-braces: setup carries `AppMutex=`, and
+    // this run is `/VERYSILENT /SUPPRESSMSGBOXES`, so a Deskwarden still
+    // holding the name makes the install a silent no-op that `Command::spawn`
+    // still reports as `Ok`. That is the shipped defect -- see
+    // [`stand_down_for_install`] -- and the only way it can be reported is to
+    // establish the handover HERE, where there is still a `Result` to put it
+    // in, rather than to discover it in a process that has already exited.
+    //
+    // The installer is deliberately NOT discarded on this arm, unlike the two
+    // above it. Those refuse because the FILE is wrong; this one refuses
+    // because the MOMENT is wrong, and the verified bytes are still the right
+    // bytes to launch once the other copy has gone.
+    if !(env.stand_down)() {
+        return Err(format!(
+            // The action first, the diagnosis after it. This string is read
+            // in two places with opposite needs: on the page, by someone who
+            // wants to know what to do, and in a log file sent to us, by
+            // someone who needs the mutex and the path. Leading with the
+            // GUID served only the second reader.
+            "another Deskwarden is still running, so the installer would find the app in \
+             use and give up without showing anything. Quit every Deskwarden window and \
+             try again. (It still holds {mutex}; the verified installer is at {path}.)",
+            path = installer_path.display(),
+            mutex = crate::app_mutex::APP_MUTEX_NAME,
         ));
     }
     (env.launch)(&installer_path)
@@ -1579,9 +1663,21 @@ mod tests {
 
         assert_eq!(
             release.body,
-            "## Deskwarden 1.2.0\nFixed\n- the overlay no longer lies",
-            "the notes must be the release's own prose, under a heading naming which \
-             release they belong to"
+            "Fixed\n- the overlay no longer lies",
+            "the notes must be the release's own prose, verbatim and with nothing added \
+             above it"
+        );
+        // **And nothing writes a SECOND heading over it.** `release.yml`
+        // opens every published body with `## What's new in <version>`, so a
+        // `## Deskwarden <version>` added here is the duplication the Updates
+        // page was showing: two headings, naming one release, one above the
+        // other. Asserted separately from the equality above so the reason
+        // this string is what it is survives a future edit to the fixture.
+        assert!(
+            !release.body.contains(&notes_heading(&release.version)),
+            "a release that published its own notes was given a second version heading on \
+             top of them: {:?}",
+            release.body
         );
     }
 
@@ -1663,13 +1759,25 @@ mod tests {
     /// Newest first, because the first thing on screen should be the thing
     /// being installed, and every skipped release named -- the range is the
     /// answer to "what changed", and a range missing its middle is not one.
+    ///
+    /// **The fixture bodies now open the way real ones do.**
+    /// `.github/workflows/release.yml` composes every published body with a
+    /// leading `## What's new in <version>`, and this test's bodies used to
+    /// carry no version at all -- so the version numbers it looks for below
+    /// could only ever have come from [`notes_heading`], which is the heading
+    /// that was removed for duplicating the released one. Written as it is
+    /// here, the assertion says what it always claimed to say: that a user
+    /// three releases behind is shown each skipped version, NAMED, newest
+    /// first. What supplies the name is now the release, which is where it
+    /// comes from in production.
     #[test]
     fn the_notes_cover_every_release_the_user_skipped_newest_first() {
+        let released = |v: &str, what: &str| format!("## What's new in {v}\\n{what}");
         let releases = [
-            a_release_json("v0.8.4", "the newest thing", ""),
-            a_release_json("v0.8.3", "the middle thing", ""),
-            a_release_json("v0.8.2", "the oldest thing", ""),
-            a_release_json("v0.8.1", "already installed", ""),
+            a_release_json("v0.8.4", &released("0.8.4", "the newest thing"), ""),
+            a_release_json("v0.8.3", &released("0.8.3", "the middle thing"), ""),
+            a_release_json("v0.8.2", &released("0.8.2", "the oldest thing"), ""),
+            a_release_json("v0.8.1", &released("0.8.1", "already installed"), ""),
         ];
 
         let release = check_against(&releases, "0.8.1").unwrap().expect("an update");
@@ -1685,6 +1793,20 @@ mod tests {
         let newest = release.body.find("0.8.4").unwrap();
         let oldest = release.body.find("0.8.2").unwrap();
         assert!(newest < oldest, "the range is not newest-first: {:?}", release.body);
+        // **And each skipped release is named ONCE.** The panel used to stack
+        // `notes_heading`'s "Deskwarden 0.8.4" directly above the release's
+        // own "What's new in 0.8.4"; over a range that was one duplicated
+        // heading per version rather than one. Asserted over the range rather
+        // than over a single release, because the range is where it was worst.
+        for skipped in ["0.8.4", "0.8.3", "0.8.2"] {
+            let version = Version::parse(skipped).unwrap();
+            assert!(
+                !release.body.contains(&notes_heading(&version)),
+                "v{skipped} carries a second heading of the app's own on top of the one the \
+                 release published: {:?}",
+                release.body
+            );
+        }
     }
 
     /// **The artefact comes from ONE release, and it is the newest.**
@@ -2955,6 +3077,20 @@ mod tests {
         Ok(())
     }
 
+    /// How many handovers the on-disk pair asked for. Counted for the same
+    /// reason [`DISK_LAUNCHES`] is: the positive case below asserts that a
+    /// launch was preceded by one, so a `stand_down` that stopped being called
+    /// is visible here rather than only in the routing window.
+    static DISK_HANDOVERS: Mutex<usize> = Mutex::new(0);
+
+    /// The on-disk pair's handover: always succeeds. These two tests are about
+    /// the HASHER, and a handover that could fail here would make the launch
+    /// they assert depend on something they do not vary.
+    fn disk_stand_down() -> bool {
+        *DISK_HANDOVERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) += 1;
+        true
+    }
+
     /// Runs `apply_update_with` over a REAL directory with the REAL hasher and
     /// only the launch substituted, and reports what happened.
     ///
@@ -2964,6 +3100,7 @@ mod tests {
     fn apply_over_real_file(tag: &str, bytes: &[u8], claimed: Sha256Digest) -> AppliedOnDisk {
         let _serial = DISK_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         DISK_LAUNCHES.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+        *DISK_HANDOVERS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = 0;
 
         let dir = scratch_dir(tag);
         let release = ReleaseInfo {
@@ -2977,7 +3114,7 @@ mod tests {
 
         // The REAL `file_sha256`, not a substitute: these two tests are the
         // only ones that exercise the hasher through the gate.
-        let env = UpdaterEnv::substitute(file_sha256, disk_launch);
+        let env = UpdaterEnv::substitute(file_sha256, disk_launch, disk_stand_down);
         let result = apply_update_with(&dir, &release, &env);
         let launched =
             DISK_LAUNCHES.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
@@ -3245,6 +3382,19 @@ mod tests {
         /// non-empty when it should be empty, an unverified installer would
         /// have been started for real.**
         launched: Vec<(u64, PathBuf)>,
+        /// What the substitute `stand_down` answers: `true` for "every other
+        /// Deskwarden has gone and the app mutex is free", `false` for the
+        /// situation that shipped -- a daemon still holding it.
+        handover: bool,
+        /// How many times `stand_down` was ASKED, per window.
+        ///
+        /// Counted rather than merely answered, because the failure this seam
+        /// exists for is a launch that happens without the handover having
+        /// been established at all. A `stand_down` deleted from
+        /// `apply_update_with` would still leave every existing routing test
+        /// green; an empty vector here says the launch was not preceded by a
+        /// handover, which is precisely the shipped bug in miniature.
+        stood_down: Vec<u64>,
     }
 
     static RECORDER: Mutex<Recorder> = Mutex::new(Recorder {
@@ -3252,6 +3402,8 @@ mod tests {
         answer: None,
         hashed: Vec::new(),
         launched: Vec::new(),
+        handover: true,
+        stood_down: Vec::new(),
     });
 
     /// Held for the whole of one routing window, so exactly one window is
@@ -3287,6 +3439,15 @@ mod tests {
     fn substitute_launch(path: &Path) -> Result<(), String> {
         record_launch(path);
         Ok(())
+    }
+
+    /// Records that the handover was asked for, and answers what the window
+    /// programmed.
+    fn substitute_stand_down() -> bool {
+        let mut r = recorder();
+        let generation = r.generation;
+        r.stood_down.push(generation);
+        r.handover
     }
 
     /// Panics if anything reached the seam AFTER the window that caused it
@@ -3485,6 +3646,12 @@ mod tests {
             r.generation += 1;
             let generation = r.generation;
             r.answer = answer;
+            // Every window starts from "the handover succeeded", so the
+            // existing routing cases -- which are about the DIGEST -- keep
+            // saying only what they were written to say. The window that is
+            // about the handover programs it below.
+            r.handover = true;
+            r.stood_down.clear();
             // **The previous window's leavings are TAKEN before they are
             // judged, and the recorder is released before either judgement.**
             //
@@ -3512,6 +3679,16 @@ mod tests {
 
         fn hashed(&self) -> Vec<PathBuf> {
             entries_of_window(&recorder().hashed, self.generation, "verify")
+        }
+
+        /// How many handovers this window asked for.
+        fn handovers(&self) -> usize {
+            recorder().stood_down.iter().filter(|g| **g == self.generation).count()
+        }
+
+        /// Programs what `stand_down` will answer for the rest of this window.
+        fn refuse_the_handover(&self) {
+            recorder().handover = false;
         }
 
         /// Wait for the recorder to stop changing before it is read.
@@ -3593,6 +3770,8 @@ mod tests {
         // erase the evidence.
         r.hashed.retain(|(g, _)| *g != generation);
         r.launched.retain(|(g, _)| *g != generation);
+        r.stood_down.retain(|g| *g != generation);
+        r.handover = true;
         // Retire the generation. From here until the next `open` the recorder
         // stamps entries no session will ever claim.
         r.generation += 1;
@@ -3626,8 +3805,9 @@ mod tests {
         fn substitute(
             hash: fn(&Path) -> Result<Sha256Digest, String>,
             launch: fn(&Path) -> Result<(), String>,
+            stand_down: fn() -> bool,
         ) -> Self {
-            Self { hash, launch }
+            Self { hash, launch, stand_down }
         }
     }
 
@@ -3640,13 +3820,26 @@ mod tests {
         /// correct launch must equal. Carried out of the window rather than
         /// recomputed by the caller, because the window number is part of it.
         expected: PathBuf,
+        /// How many times the handover seam was asked.
+        handovers: usize,
     }
 
     /// Runs `apply_update_with` against the recording seam, with `verify`
     /// programmed to answer `answer`, and reports every path that reached
     /// either half of the seam ON ANY THREAD.
     fn route_recording(answer: Result<Sha256Digest, String>) -> Routed {
+        route_recording_with(answer, true)
+    }
+
+    /// [`route_recording`], with the handover programmed.
+    ///
+    /// `handover: false` is the situation the user hit: a verified installer,
+    /// at the right path, with another Deskwarden still holding the app mutex.
+    fn route_recording_with(answer: Result<Sha256Digest, String>, handover: bool) -> Routed {
         let session = Session::open(Some(answer));
+        if !handover {
+            session.refuse_the_handover();
+        }
 
         // A directory that does not exist and is never created: nothing on
         // this path may touch the disk, because nothing on this path reads the
@@ -3661,7 +3854,8 @@ mod tests {
             installer_sha256: release_digest(),
             body: String::new(),
         };
-        let env = UpdaterEnv::substitute(substitute_hash, substitute_launch);
+        let env =
+            UpdaterEnv::substitute(substitute_hash, substitute_launch, substitute_stand_down);
         let result = apply_update_with(&dir, &release, &env);
         session.settle();
         Routed {
@@ -3669,6 +3863,7 @@ mod tests {
             launched: session.launched(),
             hashed: session.hashed(),
             expected: routed_path(session.generation),
+            handovers: session.handovers(),
         }
     }
 
@@ -3710,6 +3905,75 @@ mod tests {
     /// [`ROUTING_DIR_PREFIX`].
     fn routed_path(window: u64) -> PathBuf {
         routing_dir(window).join(installer_file_name(&Version::parse("9.9.9").unwrap()))
+    }
+
+    /// **THE SHIPPED BUG: a verified installer is not launched while another
+    /// Deskwarden still holds the app mutex, and the refusal says so.**
+    ///
+    /// The user pressed "Restart to update" on 0.15.9 with 0.15.11 published,
+    /// twice, and nothing happened either time. The log carried the intent
+    /// line from `update_panel::install_now` and then NOTHING -- no error, no
+    /// exit, and a vault window respawning seventeen seconds later. What had
+    /// happened is that Preferences moved into its own process:
+    /// `LaunchIntent::Ui` exits into `run_as_a_ui_process` above `main`'s
+    /// `app_mutex::acquire()`, so the UI process never holds the mutex,
+    /// `launch_installer`'s `app_mutex::release()` is the documented no-op
+    /// there, and the DAEMON went on holding the name. Setup carries
+    /// `AppMutex=` and this run is `/VERYSILENT /SUPPRESSMSGBOXES`, so it
+    /// found the app in use, had no interactive answer for the box it would
+    /// have shown, and exited. `Command::spawn` had already returned `Ok`, so
+    /// the panel called `process::exit(0)` on a successful launch of an
+    /// installer that did nothing.
+    ///
+    /// Every existing test in this file passes on that code, and would have
+    /// passed on the day it shipped: they are all about the DIGEST, and the
+    /// digest was right. This is the assertion the defect fails.
+    #[test]
+    fn a_verified_installer_is_not_launched_while_another_deskwarden_holds_the_mutex() {
+        let routed = route_recording_with(Ok(release_digest()), false);
+
+        assert_eq!(
+            routed.handovers, 1,
+            "the handover seam was asked {} times, not once. A launch that never asks \
+             whether the app mutex is free is the shipped bug: setup refuses in silence \
+             and the app reports a successful spawn",
+            routed.handovers
+        );
+        assert!(
+            routed.launched.is_empty(),
+            "an installer was started while another Deskwarden still held the app mutex \
+             ({:?}). In production that is a silent no-op the user sees as a dead button",
+            routed.launched
+        );
+        let error = routed.result.expect_err(
+            "a handover that did not happen must be an error, not a success. Returning \
+             `Ok` here is what let `install_now` call `process::exit(0)` with nothing \
+             installed and nothing logged",
+        );
+        assert!(
+            error.contains(crate::app_mutex::APP_MUTEX_NAME),
+            "the refusal does not name the mutex that is actually held, so nobody reading \
+             it can tell what to close: {error}"
+        );
+    }
+
+    /// The handover is asked for **after** the digest gate, not before it.
+    ///
+    /// The order is not cosmetic. Standing the daemon down is destructive --
+    /// it ends the user's running app -- and doing that for an installer that
+    /// is then refused would close the vault window to accomplish nothing. So
+    /// a wrong digest must cost the user nothing at all, which means the
+    /// handover seam is never even reached on that path.
+    #[test]
+    fn a_wrong_digest_never_stands_the_running_app_down() {
+        let routed = route_recording(Ok(wrong_digest()));
+
+        assert_eq!(
+            routed.handovers, 0,
+            "a refused installer stood the running Deskwarden down anyway. The user's app \
+             was closed for an update that was never going to be applied"
+        );
+        assert!(routed.launched.is_empty(), "control: the refusal still held");
     }
 
     /// **The gate is consulted: a well-formed installer with the WRONG
@@ -3799,9 +4063,22 @@ mod tests {
     /// that runs.
     #[test]
     fn the_matching_installer_is_launched_and_it_is_the_file_that_was_hashed() {
-        let Routed { result, launched, hashed, expected } = route_recording(Ok(release_digest()));
+        let Routed { result, launched, hashed, expected, handovers } =
+            route_recording(Ok(release_digest()));
 
         assert!(result.is_ok(), "the matching installer was refused: {result:?}");
+        // **The positive control for
+        // [`a_verified_installer_is_not_launched_while_another_deskwarden_holds_the_mutex`].**
+        // That test asserts the launch is NOT reached when the handover fails;
+        // this is the same path with the handover succeeding, so neither of
+        // them can pass on an `apply_update_with` that had simply stopped
+        // launching, or on a `stand_down` gate that refused everything.
+        assert_eq!(
+            handovers, 1,
+            "the successful path asked for the handover {handovers} times, not once. A \
+             launch that does not stand the other Deskwarden down is the shipped bug: \
+             setup finds the app in use and gives up without saying anything"
+        );
         assert_eq!(
             launched,
             vec![expected],
@@ -4154,6 +4431,7 @@ mod tests {
         // address.
         let real_hash: fn(&Path) -> Result<Sha256Digest, String> = file_sha256;
         let real_launch: fn(&Path) -> Result<(), String> = launch_installer;
+        let real_stand_down: fn() -> bool = crate::single_instance::stand_down_for_install;
 
         assert!(
             std::ptr::fn_addr_eq(env.hash, real_hash),
@@ -4166,6 +4444,25 @@ mod tests {
             std::ptr::fn_addr_eq(env.launch, real_launch),
             "`UpdaterEnv::production` hands the launcher something other than the real \
              `launch_installer`"
+        );
+        // **The third seam, pinned for the reason the other two are.** A
+        // `stand_down` substituted for `|| true` would compile, would spell
+        // the field, and would restore exactly the shipped bug: an installer
+        // started while the daemon still holds the app mutex, refused by setup
+        // in silence.
+        assert!(
+            std::ptr::fn_addr_eq(env.stand_down, real_stand_down),
+            "`UpdaterEnv::production` hands the launcher something other than the real \
+             `stand_down_for_install`. A stand-in that answers `true` without standing \
+             anything down is the shipped defect with a seam around it"
+        );
+        // CONTROL, for the handover the same way as for the launch: a
+        // different function of the same signature reads as different.
+        let handover_decoy: fn() -> bool = not_the_handover;
+        assert!(
+            !std::ptr::fn_addr_eq(env.stand_down, handover_decoy),
+            "control: a different `fn() -> bool` compares EQUAL to the production handover, \
+             so the assertion above is vacuous"
         );
 
         // CONTROL: the comparison discriminates. A function of the right
@@ -4188,6 +4485,11 @@ mod tests {
     /// The decoy [`production_holds_the_real_hash_and_the_real_launch`]
     /// compares against: `launch`'s signature exactly, and nothing else.
     fn not_the_launcher(_: &Path) -> Result<(), String> {
+        unreachable!("never called -- this exists to have an address")
+    }
+
+    /// The decoy for the handover seam: `stand_down`'s signature exactly.
+    fn not_the_handover() -> bool {
         unreachable!("never called -- this exists to have an address")
     }
 
