@@ -4354,7 +4354,7 @@ mod source_pins {
     /// way `the_item_list_is_drawn_only_inside_the_not_sends_gate` slices its
     /// gate, so the pins below can say "inside there and nowhere else" rather
     /// than "somewhere in the file".
-    /// `mod send_tasks`'s text -- the module that chooses between `bw send`
+    /// `mod backend_tasks`'s text -- the module that chooses between `bw send`
     /// and the built-in client, and holds both implementations.
     ///
     /// [`sealed_module`]'s body with one opener changed, and a separate
@@ -4362,9 +4362,9 @@ mod source_pins {
     /// helper taking the opener as an argument is a helper a caller can be
     /// handed the wrong opener for, which would slice the other module and
     /// assert about it under this one's name.
-    fn send_tasks_module() -> String {
+    fn backend_tasks_module() -> String {
         let production = production();
-        let opener = concat!("mod send_", "tasks {\r\n");
+        let opener = concat!("mod backend_", "tasks {\r\n");
         assert_eq!(
             production.matches(opener).count(),
             1,
@@ -4375,11 +4375,11 @@ mod source_pins {
         let rest = &production[start + opener.len()..];
         let end = rest
             .find("\r\n}\r\n")
-            .expect("`mod send_tasks` has no closing brace at column zero");
+            .expect("`mod backend_tasks` has no closing brace at column zero");
         rest[..end].to_string()
     }
 
-    /// One `impl .. {` block inside [`send_tasks_module`], by its header line.
+    /// One `impl .. {` block inside [`backend_tasks_module`], by its header line.
     ///
     /// The header is matched whole and must occur exactly once, and the block
     /// ends at the first `}` written at four spaces -- which inside that
@@ -4389,12 +4389,12 @@ mod source_pins {
         // A trailing newline, because the module slice stops at its own last
         // `}` -- so without one the LAST impl block in it has no closer to
         // find and this panics on the block it is most often asked for.
-        let module = format!("{}\r\n", send_tasks_module());
+        let module = format!("{}\r\n", backend_tasks_module());
         let opener = format!("    {header} {{\r\n");
         assert_eq!(
             module.matches(&opener).count(),
             1,
-            "{opener:?} is not in `mod send_tasks` exactly once"
+            "{opener:?} is not in `mod backend_tasks` exactly once"
         );
         let start = module.find(&opener).expect("counted just above");
         let rest = &module[start + opener.len()..];
@@ -4406,7 +4406,7 @@ mod source_pins {
 
     /// [`body_of`], but reading a REGION rather than the whole production --
     /// which is what makes it usable on `fn list(`, a name three items in
-    /// `mod send_tasks` share (the trait's declaration and the two impls').
+    /// `mod backend_tasks` share (the trait's declaration and the two impls').
     fn body_in(region: &str, name: &str, indent: &str) -> String {
         // A trailing newline, for [`tasks_impl`]'s reason: a region slice
         // stops at its own last `}`, so the LAST item in one would have no
@@ -4486,8 +4486,8 @@ mod source_pins {
     /// under it. Three more functions in three other modules carried the same
     /// branch, written out longhand, and six defects shipped in a day from
     /// exactly that duplication. The branch lives once now, in
-    /// `send_tasks::tasks_for`, and the two arms are the two implementations
-    /// of `send_tasks::SendTasks`.
+    /// `backend_tasks::tasks_for`, and the two arms are the two implementations
+    /// of `backend_tasks::BackendTasks`.
     ///
     /// So the single equality becomes four, and together they assert strictly
     /// more than it did:
@@ -4524,7 +4524,7 @@ mod source_pins {
             squashed(&sanitized(&body_of(concat!("real_send_", "list"), "    "))),
             squashed(
                 "session: &str, ) -> Result<Vec<crate::send::SendSummary>, \
-                 crate::send::SendError> { super::send_tasks::tasks_for(Some(session)).list()"
+                 crate::send::SendError> { super::backend_tasks::tasks_for(Some(session)).send_list()"
             ),
             "`real_send_list` is no longer exactly the delegation to the chosen backend with \
              the session it was handed. A branch written back into this function is a fifth \
@@ -4535,12 +4535,12 @@ mod source_pins {
 
         // 2. The gate: one `selected()` read, and the whole of the choice.
         assert_eq!(
-            squashed(&sanitized(&body_in(&send_tasks_module(), "tasks_for", "    "))),
+            squashed(&sanitized(&body_in(&backend_tasks_module(), "tasks_for", "    "))),
             squashed(
-                "session: Option<&str>) -> Box<dyn SendTasks + '_> { if \
+                "session: Option<&str>) -> Box<dyn BackendTasks + '_> { if \
                  crate::backend_policy::selected() == \
                  crate::backend_policy::VaultBackendChoice::DirectRest { return \
-                 Box::new(DirectRestSendTasks); } Box::new(CliSendTasks { session })"
+                 Box::new(DirectRestTasks); } Box::new(CliTasks { session })"
             ),
             "`tasks_for` is no longer exactly one `selected()` gate over the two \
              implementations. Either a `bw serve` account can now be sent down the REST arm, \
@@ -4551,8 +4551,8 @@ mod source_pins {
         // 3. The CLI implementation.
         assert_eq!(
             squashed(&sanitized(&body_in(
-                &tasks_impl("impl SendTasks for CliSendTasks<'_>"),
-                "list",
+                &tasks_impl("impl BackendTasks for CliTasks<'_>"),
+                "send_list",
                 "        ",
             ))),
             squashed(&format!(
@@ -4568,8 +4568,8 @@ mod source_pins {
         // 4. The built-in implementation, which names no `bw` at all.
         assert_eq!(
             squashed(&sanitized(&body_in(
-                &tasks_impl("impl SendTasks for DirectRestSendTasks"),
-                "list",
+                &tasks_impl("impl BackendTasks for DirectRestTasks"),
+                "send_list",
                 "        ",
             ))),
             squashed(
@@ -4583,7 +4583,7 @@ mod source_pins {
             production().matches(concat!("crate::send::cli_send_", "list(")).count(),
             1,
             "`cli_send_list` is called somewhere other than the CLI implementation of \
-             `SendTasks` -- and every other caller is unproven ground for which thread it \
+             `BackendTasks` -- and every other caller is unproven ground for which thread it \
              runs on and which backend the account is on"
         );
     }
@@ -4611,7 +4611,7 @@ mod source_pins {
             squashed(&sanitized(&body_of(concat!("real_send_", "receive"), "    "))),
             squashed(
                 "link: &str) -> RecordImportReport { \
-                 super::send_tasks::tasks_for(None).receive(link)"
+                 super::backend_tasks::tasks_for(None).send_receive(link)"
             ),
             "`real_send_receive` is no longer exactly the delegation to the chosen backend \
              with NO session. Anything at all added, removed or rebound here fails -- \
@@ -4621,8 +4621,8 @@ mod source_pins {
 
         assert_eq!(
             squashed(&sanitized(&body_in(
-                &tasks_impl("impl SendTasks for CliSendTasks<'_>"),
-                "receive",
+                &tasks_impl("impl BackendTasks for CliTasks<'_>"),
+                "send_receive",
                 "        ",
             ))),
             squashed(&format!(
@@ -4643,8 +4643,8 @@ mod source_pins {
 
         assert_eq!(
             squashed(&sanitized(&body_in(
-                &tasks_impl("impl SendTasks for DirectRestSendTasks"),
-                "receive",
+                &tasks_impl("impl BackendTasks for DirectRestTasks"),
+                "send_receive",
                 "        ",
             ))),
             squashed(&format!(
@@ -4664,7 +4664,7 @@ mod source_pins {
             production().matches(concat!("crate::send::cli_send_", "receive(")).count(),
             1,
             "`cli_send_receive` is called somewhere other than the CLI implementation of \
-             `SendTasks`"
+             `BackendTasks`"
         );
         assert_eq!(
             production()
@@ -4672,7 +4672,7 @@ mod source_pins {
                 .count(),
             1,
             "`receive_on_active_account` is called somewhere other than the built-in \
-             implementation of `SendTasks`"
+             implementation of `BackendTasks`"
         );
     }
 
@@ -4694,8 +4694,8 @@ mod source_pins {
     /// nothing would otherwise report both halves as satisfied.
     #[test]
     fn the_cli_sentence_survives_for_the_cli_and_is_gone_for_the_built_in_client() {
-        let cli = sanitized(&tasks_impl("impl SendTasks for CliSendTasks<'_>"));
-        let direct = sanitized(&tasks_impl("impl SendTasks for DirectRestSendTasks"));
+        let cli = sanitized(&tasks_impl("impl BackendTasks for CliTasks<'_>"));
+        let direct = sanitized(&tasks_impl("impl BackendTasks for DirectRestTasks"));
 
         // **The control.** The sentence is produced in the CLI half, so the
         // absence below is a statement about live code and not about a needle
@@ -4714,7 +4714,7 @@ mod source_pins {
         // sentence is the symptom, the spawn is the thing.
         assert!(
             !direct.contains(concat!("cli_send_", "")),
-            "the built-in implementation of `SendTasks` names a `bw send` entry point"
+            "the built-in implementation of `BackendTasks` names a `bw send` entry point"
         );
         assert!(
             cli.contains(concat!("cli_send_", "receive")),
@@ -4722,23 +4722,25 @@ mod source_pins {
         );
     }
 
-    /// **The Sends backend is chosen in exactly one place, and these are all
-    /// the places that can ask.**
+    /// **The backend is chosen in exactly one place, and these are all the
+    /// places that can ask.**
     ///
-    /// `send_tasks::tasks_for` is the only way to obtain a `SendTasks`, so
-    /// this census over the whole crate's production is what makes the "one
-    /// swap point" claim checkable rather than asserted. Five mentions in
-    /// `mod.rs`: the definition, and the four workers -- the list, the create,
-    /// the revoke and the receive. Nowhere else at all, and in particular not
-    /// in the frame closure, where any of the four would block the eframe
-    /// thread on a `bw` child for up to sixty seconds.
+    /// `backend_tasks::tasks_for` is the only way to obtain a `BackendTasks`,
+    /// so this census over the whole crate's production is what makes the
+    /// "one swap point" claim checkable rather than asserted. Seven mentions
+    /// in `mod.rs`: the definition, and the six workers -- the Sends list,
+    /// create, revoke and receive, the vault export, and the Sync button.
+    /// Nowhere else at all, and in particular not in the frame closure, where
+    /// four of the six would block the eframe thread on a `bw` child for up
+    /// to sixty seconds.
     ///
-    /// A SIXTH mention is either a fifth caller, which is unproven ground for
-    /// which thread it runs on, or a second definition. A FIFTH operation is
-    /// meant to be added to the trait, where both implementations must answer
-    /// it or the crate does not compile -- not by asking here again.
+    /// An EIGHTH mention is either a seventh caller, which is unproven ground
+    /// for which thread it runs on and which backend it reaches, or a second
+    /// definition. A seventh OPERATION is meant to be added to the trait,
+    /// where both implementations must answer it or the crate does not
+    /// compile -- not by asking here again.
     #[test]
-    fn the_sends_backend_is_chosen_in_exactly_one_place() {
+    fn the_backend_is_chosen_in_exactly_one_place() {
         let files = crate_sources();
         assert!(
             files.len() > 30,
@@ -4755,17 +4757,18 @@ mod source_pins {
             .collect();
         assert_eq!(
             seen,
-            vec![("vault_window/mod.rs", 5)],
+            vec![("vault_window/mod.rs", 7)],
             "{needle:?} is written in the crate's production at {seen:?}, not the one \
-             definition plus the four workers that are the whole of how a `SendTasks` can be \
-             obtained. A fifth caller is a Sends operation on unproven ground -- which \
-             thread it runs on, and which backend it reaches"
+             definition plus the six workers that are the whole of how a `BackendTasks` can \
+             be obtained. A seventh caller is one of this window's backend-sensitive \
+             actions on unproven ground -- which thread it runs on, and which backend it \
+             reaches"
         );
 
         // And the module exports nothing but the trait and the gate. A
         // `pub(super) fn blocking_send_list()` added inside it would keep the
         // count above unchanged and hand the frame closure a `bw` child back.
-        let module = sanitized(&send_tasks_module());
+        let module = sanitized(&backend_tasks_module());
         let exports: Vec<String> = module
             .split_whitespace()
             .filter(|t| t.starts_with("pub"))
@@ -4774,8 +4777,8 @@ mod source_pins {
         assert_eq!(
             exports,
             vec!["pub(super)".to_string(), "pub(super)".to_string()],
-            "`mod send_tasks` exports {exports:?}, not exactly the trait and the gate. \
-             Everything else in that module is a blocking `bw send` child or the value that \
+            "`mod backend_tasks` exports {exports:?}, not exactly the trait and the gate. \
+             Everything else in that module is a blocking `bw` child or the value that \
              holds the vault session, and neither is anybody else's to name"
         );
     }
@@ -5798,21 +5801,21 @@ mod source_pins {
         // **`cli_send_list` is sealed in a DIFFERENT block from the other
         // two, and that split is the structural change this pin records.**
         // The blocking call is the CLI implementation of
-        // `send_tasks::SendTasks` -- the one module in which this window
+        // `backend_tasks::BackendTasks` -- the one module in which this window
         // chooses between `bw send` and the built-in client for all four
         // Sends operations -- while `real_send_list` and
         // `spawn_send_list_with`, which are the thread boundary and nothing
         // else, stayed in `mod send_fetch_thread`. Every needle is still
         // confined to exactly ONE named module, which is the whole of what
         // this test ever asserted; the fourth column says which.
-        let tasks = sanitized(&send_tasks_module());
+        let tasks = sanitized(&backend_tasks_module());
         assert!(
             tasks.len() > 200,
-            "control: the `mod send_tasks` slice is only {} bytes, which is not a module's \
+            "control: the `mod backend_tasks` slice is only {} bytes, which is not a module's \
              worth",
             tasks.len()
         );
-        for (needle, defined_in_send_rs, is_seal_needle, in_send_tasks) in [
+        for (needle, defined_in_send_rs, is_seal_needle, in_backend_tasks) in [
             (concat!("cli_send_", "list"), 1usize, true, true),
             (concat!("real_send_", "list"), 0, true, false),
             (concat!("spawn_send_list_", "with"), 0, true, false),
@@ -5926,8 +5929,8 @@ mod source_pins {
                 continue;
             }
             let total = production.matches(needle).count() - defined_in_send_rs;
-            let (home, inside) = if in_send_tasks {
-                ("mod send_tasks", tasks.matches(needle).count())
+            let (home, inside) = if in_backend_tasks {
+                ("mod backend_tasks", tasks.matches(needle).count())
             } else {
                 ("mod send_fetch_thread", block.matches(needle).count())
             };

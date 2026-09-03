@@ -6910,58 +6910,64 @@ fn spawn_aux_load(
 
 /// **The Sends' backend as an interface with two implementations**, and the
 /// one place in this window that chooses between them.
-mod send_tasks {
+mod backend_tasks {
     //! # Why this module exists
     //!
-    //! `list`, `create`, `delete` and `receive` were four functions in four
-    //! other modules that each read [`crate::backend_policy::selected`] and
-    //! hand-branched on the answer. Four hand-branches is four chances to
-    //! write the fifth one wrong, and this app shipped that mistake
-    //! repeatedly in a single day -- an `os error 2` on these actions on an
-    //! account that has no `bw.exe` to run, found by the owner using the app
-    //! and by none of the suite's four thousand tests.
+    //! Six of this window's actions -- the Sends list, create, revoke and
+    //! receive, the vault export, and the Sync button -- were six functions
+    //! in five other modules that each read
+    //! [`crate::backend_policy::selected`] and hand-branched on the answer.
+    //! Six hand-branches is six chances to write the seventh one wrong, and
+    //! this app shipped that mistake six times in a single day: an
+    //! `os error 2` or `os error 3` on every one of these, on an account that
+    //! has no `bw.exe` to run. All six were found by the owner using the app,
+    //! and none by the suite's four thousand tests.
     //!
     //! [`crate::vault_backend::VaultBackend`] is the shape that has never
     //! produced one of those: nineteen operations, two implementations, one
-    //! swap. This module is that shape for the Sends. The four workers below
-    //! no longer contain the word `DirectRest`; they name [`tasks_for`], and
-    //! a fifth operation added to [`SendTasks`] does not compile until both
-    //! implementations answer it.
+    //! swap, zero defects. This module is that shape for the six. The six
+    //! workers below no longer contain the word `DirectRest`; they name
+    //! [`tasks_for`], and a seventh operation added to [`BackendTasks`] does
+    //! not compile until both implementations answer it.
     //!
-    //! # Why a SIBLING trait rather than four more `VaultBackend` methods
+    //! # Why a SIBLING trait rather than six more `VaultBackend` methods
     //!
-    //! Every CLI arm here needs three things no REST arm has any use for: a
+    //! Every CLI arm here needs things no REST arm has any use for: a
     //! [`crate::job_object::KillOnCloseJob`] to put the child in, the active
     //! account's profile directory, and the vault session.
     //! `crate::vault_bridge::VaultBridge` holds none of the three, so putting
     //! these on `VaultBackend` would mean either widening that type's
     //! construction for operations it does not perform, or giving trait
-    //! methods parameters that exactly one implementation reads.
+    //! methods parameters that exactly one implementation reads. And two of
+    //! the six are not vault data at all: `VaultBackend`'s own doc says it is
+    //! the vault's data and only that, and the Sync button is a lifecycle
+    //! action on the thing holding the vault while the export is a runner
+    //! handed to `vault_export::run_export`.
     //!
-    //! A sibling trait absorbs the asymmetry **at construction**:
-    //! `CliSendTasks` is the value that holds the session, and reads the job
-    //! and the profile directory at the moment it uses them;
-    //! `DirectRestSendTasks` is a unit struct because it needs nothing. The
-    //! trait's own methods carry only what the OPERATION is about -- a plan,
-    //! an id, a link.
+    //! A sibling trait absorbs the asymmetry **at construction**: `CliTasks`
+    //! is the value that holds the session, and reads the job and the profile
+    //! directory at the moment it uses them; `DirectRestTasks` is a unit
+    //! struct because it needs nothing. The trait's own methods carry only
+    //! what the OPERATION is about -- a plan, an id, a link, or nothing.
     //!
-    //! # Read here, on the worker thread
+    //! # Asked here, on the worker thread
     //!
-    //! [`tasks_for`] is called from the blocking half of each of the four
+    //! [`tasks_for`] is called from the blocking half of each of the six
     //! workers, never from the frame closure, and that is the same position
-    //! the four `selected()` reads it replaces were written in, for the same
+    //! the six `selected()` reads it replaces were written in, for the same
     //! reason: an account switch replaces the choice between the frame and
     //! the thread. The profile directory is read inside the CLI methods, one
-    //! step later, exactly where each of those four functions read it before.
+    //! step later, exactly where each of those six functions read it before.
     //!
     //! # What holds the frame closure out
     //!
-    //! `tasks_for` is the only way to obtain a [`SendTasks`], and
-    //! `send_ui::source_pins::the_sends_backend_is_chosen_in_exactly_one_place`
+    //! `tasks_for` is the only way to obtain a [`BackendTasks`], and
+    //! `send_ui::source_pins::the_backend_is_chosen_in_exactly_one_place`
     //! counts every mention of it in the crate's production: the definition
-    //! and the four workers, and nothing else. The four `cli_send_*` calls
-    //! are sealed inside this block by the four seals that used to name the
-    //! four worker modules.
+    //! and the six workers, and nothing else. The four `cli_send_*` calls are
+    //! sealed inside this block by the four seals that used to name the four
+    //! Sends worker modules, and this module's export list is pinned to the
+    //! trait and the gate, so nothing else here can be named from outside.
 
     use super::{RecordImportReport, SendCreateReport, SendDeleteReport};
 
@@ -6971,11 +6977,26 @@ mod send_tasks {
     /// module doc: those are what one implementation is CONSTRUCTED with and
     /// the other has no use for, and a parameter only one impl reads is the
     /// smell this shape exists to avoid.
-    pub(super) trait SendTasks {
-        fn list(&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError>;
-        fn create(&self, plan: &crate::send::SendPlan) -> SendCreateReport;
-        fn delete(&self, id: &str, name: &str) -> SendDeleteReport;
-        fn receive(&self, link: &str) -> RecordImportReport;
+    pub(super) trait BackendTasks {
+        /// **The Sync button.** Not a vault operation at all -- it is a
+        /// lifecycle action on whatever is holding the vault -- and it is
+        /// here for the reason the module doc gives rather than for a
+        /// taxonomy: it was one of the six hand-branches, it shipped one of
+        /// the six defects, and a decision made in one place is the whole
+        /// point of this trait. `crate::vault_backend::VaultBackend` is
+        /// deliberately vault DATA and says so; this one is the window's
+        /// actions, which is a different set.
+        fn sync(&self) -> Result<(), String>;
+        /// **A runner, not an export.** Everything above this -- the sweep,
+        /// the staging file, the verdict and the promotion -- is
+        /// `vault_export::run_export`, and it is identical on both backends
+        /// because the backend is a value handed to it and not a code path
+        /// through it.
+        fn export_runner(&self) -> crate::vault_export::ExportRunner;
+        fn send_list(&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError>;
+        fn send_create(&self, plan: &crate::send::SendPlan) -> SendCreateReport;
+        fn send_delete(&self, id: &str, name: &str) -> SendDeleteReport;
+        fn send_receive(&self, link: &str) -> RecordImportReport;
     }
 
     /// **The swap, and the whole of it.**
@@ -6985,25 +7006,90 @@ mod send_tasks {
     /// neither implementation has anything to do with a session there. On the
     /// CLI side an absent session would reach `bw` as an empty `BW_SESSION`,
     /// which answers "locked": an error, never a wrong action.
-    pub(super) fn tasks_for(session: Option<&str>) -> Box<dyn SendTasks + '_> {
+    pub(super) fn tasks_for(session: Option<&str>) -> Box<dyn BackendTasks + '_> {
         if crate::backend_policy::selected()
             == crate::backend_policy::VaultBackendChoice::DirectRest
         {
-            return Box::new(DirectRestSendTasks);
+            return Box::new(DirectRestTasks);
         }
-        Box::new(CliSendTasks { session })
+        Box::new(CliTasks { session })
     }
 
     /// The built-in client: this process talks to the Bitwarden server and
     /// starts no child at all.
-    struct DirectRestSendTasks;
+    struct DirectRestTasks;
 
-    impl SendTasks for DirectRestSendTasks {
-        fn list(&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
+    impl BackendTasks for DirectRestTasks {
+        /// **`Ok(())`, and that is not a stub.** `bw sync` is `bw`'s own
+        /// local cache being refilled from the server; this process has no
+        /// such cache to refill, because the thing that would read it --
+        /// `VaultCache` over a `crate::rest::backend::RestBackend` -- goes to
+        /// the server itself. The re-fetch a user means when they press Sync
+        /// is the `VaultLoadRequest { force_refresh: true, .. }` the caller
+        /// already spawns on `Ok(())`, and that request is the one that
+        /// really talks to the server. So the honest answer here is "there is
+        /// nothing to run first", and the pill's claim is still earned rather
+        /// than asserted: if that forced reload fails,
+        /// `apply_vault_load_result` turns this `Ok` into an `Err` and the
+        /// pill says so.
+        fn sync(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        /// The direct-REST runner: it builds the archive in this process and
+        /// stages it where the CLI would have written one.
+        ///
+        /// **It starts no child, so there is no job to put one in.** That is
+        /// not a weakening of the guarantee `export_thread::export_job`
+        /// carries; it is the guarantee becoming vacuous, and
+        /// `export_wiring::a_direct_rest_export_starts_no_child_process`
+        /// asserts it at `job_object`'s spawn probe rather than here in prose.
+        ///
+        /// # What it holds, and for how long
+        ///
+        /// `rest::export::export_document` hands back a `Zeroizing<String>`,
+        /// and it is dropped -- wiped -- before the file is read back. Its
+        /// contents are the server's own ciphertext throughout: that module
+        /// decrypts nothing and re-encrypts nothing, so **no vault plaintext
+        /// exists on this path at any moment**, which is the property the CLI
+        /// path had for free by doing the work in another process.
+        ///
+        /// # Why it reads the file back rather than trusting the buffer
+        ///
+        /// `observe_partial` is called for the same reason
+        /// `CliExportRunner::run` calls it: `classify` must judge the FILE. A
+        /// short write, a full disk or an antivirus truncation all leave a
+        /// document this process believes it produced and the user cannot
+        /// restore from, and only the bytes on disk can answer that.
+        fn export_runner(&self) -> crate::vault_export::ExportRunner {
+            crate::vault_export::ExportRunner::from_fn(|plan, _session| {
+                let document = match crate::rest::export::export_document() {
+                    Ok(document) => document,
+                    Err(problem) => return nothing_was_exported(rest_sentence(problem)),
+                };
+                if let Err(e) = std::fs::write(plan.partial_path(), document.as_bytes()) {
+                    return nothing_was_exported(format!(
+                        "The export could not be written to {} ({e}).",
+                        plan.partial_path().display()
+                    ));
+                }
+                drop(document);
+
+                let (written, head) = crate::vault_export::observe_partial(plan);
+                crate::vault_export::RawExport {
+                    exit_ok: true,
+                    stderr: String::new(),
+                    written,
+                    head,
+                }
+            })
+        }
+
+        fn send_list(&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
             crate::rest::send::list_on_active_account()
         }
 
-        fn create(&self, plan: &crate::send::SendPlan) -> SendCreateReport {
+        fn send_create(&self, plan: &crate::send::SendPlan) -> SendCreateReport {
             let name = plan.name.trim().to_string();
             // The same real clock the CLI arm passes, so the two backends
             // stamp the same instant: the one the user pressed Create at.
@@ -7015,7 +7101,7 @@ mod send_tasks {
             }
         }
 
-        fn delete(&self, id: &str, name: &str) -> SendDeleteReport {
+        fn send_delete(&self, id: &str, name: &str) -> SendDeleteReport {
             match crate::rest::send::delete_on_active_account(id) {
                 Ok(()) => SendDeleteReport::Deleted { name: name.to_string() },
                 Err(error) => SendDeleteReport::Failed { name: name.to_string(), error },
@@ -7026,7 +7112,7 @@ mod send_tasks {
         /// this arm reaches the same `RecordImportReport::Read` as the CLI's
         /// with nothing of the account's, and `send_ui::RECEIVE_NEEDS_THE_CLI`
         /// -- which is about a missing `bw.exe` -- is unreachable from it.
-        fn receive(&self, link: &str) -> RecordImportReport {
+        fn send_receive(&self, link: &str) -> RecordImportReport {
             match crate::rest::send::receive_on_active_account(link, None) {
                 Ok(body) => RecordImportReport::Read(Box::new(
                     crate::record::payload::read_json(&body),
@@ -7036,17 +7122,47 @@ mod send_tasks {
         }
     }
 
+    /// One `ExportProblem`, as the sentence the report will carry.
+    ///
+    /// `Locked` becomes `vault_export::LOCKED_SENTENCE` and nothing else,
+    /// because that constant is the one string in this program written to
+    /// satisfy `vault_export::SESSION_VOCABULARY` -- which is what routes a
+    /// locked account to `ExportOutcome::SessionInvalid` through `classify`'s
+    /// single table, rather than through a second judgement made here.
+    fn rest_sentence(problem: crate::rest::export::ExportProblem) -> String {
+        match problem {
+            crate::rest::export::ExportProblem::Locked => {
+                crate::vault_export::LOCKED_SENTENCE.to_string()
+            }
+            crate::rest::export::ExportProblem::Failed(why) => why,
+        }
+    }
+
+    /// An observation for a run that produced no file at all.
+    ///
+    /// `written` is `Err`, not `Ok(0)`: nothing looked, so nothing knows.
+    /// `vault_export::RawExport`'s own doc is where that distinction is
+    /// argued, and this is the REST twin of its private `nothing_ran`.
+    fn nothing_was_exported(why: String) -> crate::vault_export::RawExport {
+        crate::vault_export::RawExport {
+            exit_ok: false,
+            stderr: why,
+            written: Err("no export was produced, so nothing was checked".to_string()),
+            head: Vec::new(),
+        }
+    }
+
     /// `bw send`, as a backend: every operation is a real child process.
     ///
     /// **The session is held here and nowhere in a signature above**, as a
     /// borrow of the worker thread's own `Zeroizing<String>` -- so this struct
     /// makes no second copy of the vault-unlocking token, and it cannot
     /// outlive the thread that owns it.
-    struct CliSendTasks<'a> {
+    struct CliTasks<'a> {
         session: Option<&'a str>,
     }
 
-    impl CliSendTasks<'_> {
+    impl CliTasks<'_> {
         /// The session as `bw` will see it. See [`tasks_for`] for why the
         /// empty string is the honest answer for the one caller that has none.
         fn session(&self) -> &str {
@@ -7073,13 +7189,27 @@ mod send_tasks {
         }
     }
 
-    impl SendTasks for CliSendTasks<'_> {
-        fn list(&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
+    impl BackendTasks for CliTasks<'_> {
+        fn sync(&self) -> Result<(), String> {
+            super::bw_serve::run_bw_sync(self.session())
+        }
+
+        /// The production CLI runner, in **this window's own export job** --
+        /// `export_thread::export_job`, which is a second `OnceLock` and not
+        /// `sends_job`, for the reason that function's doc gives: the runner
+        /// takes an `Arc<Option<KillOnCloseJob>>` where `sends_job` answers a
+        /// `&'static`, and reusing it would have meant widening a runner's
+        /// signature.
+        fn export_runner(&self) -> crate::vault_export::ExportRunner {
+            crate::vault_export::real_runner(super::export_thread::export_job())
+        }
+
+        fn send_list(&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
             let data_dir = Self::data_dir();
             crate::send::cli_send_list(Self::job(), data_dir.as_deref(), self.session())
         }
 
-        fn create(&self, plan: &crate::send::SendPlan) -> SendCreateReport {
+        fn send_create(&self, plan: &crate::send::SendPlan) -> SendCreateReport {
             let name = plan.name.trim().to_string();
             let data_dir = Self::data_dir();
             match crate::send::cli_send_create(
@@ -7101,7 +7231,7 @@ mod send_tasks {
             }
         }
 
-        fn delete(&self, id: &str, name: &str) -> SendDeleteReport {
+        fn send_delete(&self, id: &str, name: &str) -> SendDeleteReport {
             let data_dir = Self::data_dir();
             match crate::send::cli_send_delete(
                 Self::job(),
@@ -7119,7 +7249,7 @@ mod send_tasks {
             }
         }
 
-        fn receive(&self, link: &str) -> RecordImportReport {
+        fn send_receive(&self, link: &str) -> RecordImportReport {
             let data_dir = Self::data_dir();
             match crate::send::cli_send_receive(Self::job(), data_dir.as_deref(), link, None) {
                 // The read happens HERE, on this thread. See
@@ -7265,12 +7395,12 @@ mod send_fetch_thread {
         session: &str,
     ) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
         // **The backend is chosen in one place and this is not it.**
-        // `super::send_tasks::tasks_for` is that place, for all four Sends
+        // `super::backend_tasks::tasks_for` is that place, for all four Sends
         // operations; what is still decided HERE is *when* it is asked, and
         // the answer is the same as it always was -- on this thread, not
         // captured from the frame, because an account switch replaces the
         // choice between the frame and the thread.
-        super::send_tasks::tasks_for(Some(session)).list()
+        super::backend_tasks::tasks_for(Some(session)).send_list()
     }
 
     /// The job every `bw send` child this window starts is placed in.
@@ -7927,110 +8057,37 @@ mod export_thread {
         pick_and_export_with(pick, session, real_export_runner)
     }
 
-    /// **The one place this window decides which backend does the export**,
-    /// and the whole of that decision.
+    /// **Where this window ASKS which backend does the export.** The
+    /// decision itself is `backend_tasks::tasks_for`'s, and is made in that
+    /// one place for all six of this window's backend-sensitive actions.
     ///
     /// `real_send_list`'s line, in `real_send_list`'s position and for its
-    /// reasons: the choice is read HERE, on the worker thread, and not
-    /// captured from the frame, because an account switch replaces it between
-    /// the click and the export. Everything below this function is shared --
-    /// `run_export` sweeps, stages, judges and promotes identically for both
-    /// answers, because the backend is a runner and not a code path through
-    /// that function.
+    /// reasons: the question is asked HERE, on the worker thread, and not
+    /// captured from the frame, because an account switch replaces the answer
+    /// between the click and the export. Everything below this function is
+    /// shared -- `run_export` sweeps, stages, judges and promotes identically
+    /// for both answers, because the backend is a runner and not a code path
+    /// through that function.
     ///
-    /// **Why the branch is not in `vault_export` itself.** That file is one
-    /// of the two `job_object::tests::the_two_job_bearing_modules_cannot_name_a_bare_command`
+    /// **Why neither implementation is in `vault_export` itself.** That file
+    /// is one of the two `job_object::tests::the_two_job_bearing_modules_cannot_name_a_bare_command`
     /// governs, and its RULE 7 closes the set of items it may NAME -- a
     /// helper it can call is a helper that could start a `bw` outside the
     /// kill-on-close job on its behalf, invisibly to the probe. Putting the
-    /// REST branch there would have meant widening that allow-list by four
-    /// items to buy nothing; putting it here costs nothing and is where the
-    /// Sends branches already are.
+    /// REST runner there would have meant widening that allow-list by four
+    /// items to buy nothing.
     pub(super) fn real_export_runner() -> vault_export::ExportRunner {
-        if crate::backend_policy::selected()
-            == crate::backend_policy::VaultBackendChoice::DirectRest
-        {
-            return rest_export_runner();
-        }
-        vault_export::real_runner(export_job())
-    }
-
-    /// The direct-REST runner: it builds the archive in this process and
-    /// stages it where the CLI would have written one.
-    ///
-    /// **It starts no child, so there is no job to put one in.** That is not
-    /// a weakening of the guarantee `export_job` carries; it is the guarantee
-    /// becoming vacuous, and `export_wiring::a_direct_rest_export_starts_no_child_process`
-    /// asserts it at `job_object`'s spawn probe rather than here in prose.
-    ///
-    /// # What it holds, and for how long
-    ///
-    /// `rest::export::export_document` hands back a `Zeroizing<String>`, and
-    /// it is dropped -- wiped -- before the file is read back. Its contents
-    /// are the server's own ciphertext throughout: that module decrypts
-    /// nothing and re-encrypts nothing, so **no vault plaintext exists on
-    /// this path at any moment**, which is the property the CLI path had for
-    /// free by doing the work in another process.
-    ///
-    /// # Why it reads the file back rather than trusting the buffer
-    ///
-    /// `observe_partial` is called for the same reason `CliExportRunner::run`
-    /// calls it: `classify` must judge the FILE. A short write, a full disk
-    /// or an antivirus truncation all leave a document this process believes
-    /// it produced and the user cannot restore from, and only the bytes on
-    /// disk can answer that.
-    fn rest_export_runner() -> vault_export::ExportRunner {
-        vault_export::ExportRunner::from_fn(|plan, _session| {
-            let document = match crate::rest::export::export_document() {
-                Ok(document) => document,
-                Err(problem) => return nothing_was_exported(rest_sentence(problem)),
-            };
-            if let Err(e) = std::fs::write(plan.partial_path(), document.as_bytes()) {
-                return nothing_was_exported(format!(
-                    "The export could not be written to {} ({e}).",
-                    plan.partial_path().display()
-                ));
-            }
-            drop(document);
-
-            let (written, head) = vault_export::observe_partial(plan);
-            vault_export::RawExport {
-                exit_ok: true,
-                stderr: String::new(),
-                written,
-                head,
-            }
-        })
-    }
-
-    /// One `ExportProblem`, as the sentence the report will carry.
-    ///
-    /// `Locked` becomes [`vault_export::LOCKED_SENTENCE`] and nothing else,
-    /// because that constant is the one string in this program written to
-    /// satisfy `vault_export::SESSION_VOCABULARY` -- which is what routes a
-    /// locked account to `ExportOutcome::SessionInvalid` through `classify`'s
-    /// single table, rather than through a second judgement made here.
-    fn rest_sentence(problem: crate::rest::export::ExportProblem) -> String {
-        match problem {
-            crate::rest::export::ExportProblem::Locked => {
-                vault_export::LOCKED_SENTENCE.to_string()
-            }
-            crate::rest::export::ExportProblem::Failed(why) => why,
-        }
-    }
-
-    /// An observation for a run that produced no file at all.
-    ///
-    /// `written` is `Err`, not `Ok(0)`: nothing looked, so nothing knows.
-    /// `vault_export::RawExport`'s own doc is where that distinction is
-    /// argued, and this is the REST twin of its private `nothing_ran`.
-    fn nothing_was_exported(why: String) -> vault_export::RawExport {
-        vault_export::RawExport {
-            exit_ok: false,
-            stderr: why,
-            written: Err("no export was produced, so nothing was checked".to_string()),
-            head: Vec::new(),
-        }
+        // **The backend is chosen in one place and this is not it.** See
+        // `super::backend_tasks::tasks_for`, which is the whole of that
+        // choice for all six of this window's backend-sensitive actions.
+        // What is still decided HERE is *when* it is asked: on the worker
+        // thread, not captured from the frame, because an account switch
+        // replaces the choice between the click and the export.
+        //
+        // `None` for the session: an `ExportRunner` is handed the session at
+        // the moment it runs, by `run_export`, so neither implementation has
+        // any use for one at construction.
+        super::backend_tasks::tasks_for(None).export_runner()
     }
 
     /// [`pick_and_export`] with the runner as a value too, **and the only one
@@ -8567,8 +8624,8 @@ mod send_delete_thread {
     //! The seal is
     //! `super::send_delete_wiring::every_mention_of_the_blocking_delete_is_sealed_inside_its_own_module`:
     //! `real_send_delete` must be inside this block, and `cli_send_delete` --
-    //! the blocking call itself -- must be inside `mod send_tasks`, which is
-    //! the CLI implementation of `send_tasks::SendTasks` and the one place
+    //! the blocking call itself -- must be inside `mod backend_tasks`, which is
+    //! the CLI implementation of `backend_tasks::BackendTasks` and the one place
     //! this window chooses between `bw send` and the built-in client. Each
     //! needle is still confined to exactly one named module; a call written
     //! in the frame closure spells one of them and fails.
@@ -8595,10 +8652,10 @@ mod send_delete_thread {
     /// through `std::thread::spawn`.
     pub(super) fn real_send_delete(id: &str, name: &str, session: &str) -> SendDeleteReport {
         // `real_send_list`'s line, in its position and for its reason: the
-        // backend is chosen by `super::send_tasks::tasks_for` and by nothing
+        // backend is chosen by `super::backend_tasks::tasks_for` and by nothing
         // written here, and it is asked on THIS thread because an account
         // switch replaces the choice between the frame and the thread.
-        super::send_tasks::tasks_for(Some(session)).delete(id, name)
+        super::backend_tasks::tasks_for(Some(session)).send_delete(id, name)
     }
 
     /// Revokes one Send on a background thread. The frame closure's one entry
@@ -8943,8 +9000,8 @@ mod send_receive_thread {
     //! The seal is
     //! `super::send_create_wiring::every_mention_of_the_blocking_receive_is_sealed_inside_its_own_module`:
     //! `real_send_receive` must be inside this block, and `cli_send_receive` --
-    //! the blocking call itself -- must be inside `mod send_tasks`, which is
-    //! the CLI implementation of `send_tasks::SendTasks` and the one place
+    //! the blocking call itself -- must be inside `mod backend_tasks`, which is
+    //! the CLI implementation of `backend_tasks::BackendTasks` and the one place
     //! this window chooses between `bw send` and the built-in client. Each
     //! needle is still confined to exactly one named module; a call written
     //! in the frame closure spells one of them and fails.
@@ -8984,8 +9041,8 @@ mod send_receive_thread {
         // `real_send_list`'s line, in its position and for its reason -- with
         // `None` for the session, which is what makes this the anonymous one
         // of the four: the link is the credential, so neither implementation
-        // has a use for a session here. See `super::send_tasks::tasks_for`.
-        super::send_tasks::tasks_for(None).receive(link)
+        // has a use for a session here. See `super::backend_tasks::tasks_for`.
+        super::backend_tasks::tasks_for(None).send_receive(link)
     }
 
     /// Fetches one Send on a background thread. The frame closure's one entry
@@ -9170,8 +9227,8 @@ mod send_create_thread {
     //! The seal is
     //! `super::send_create_wiring::every_mention_of_the_blocking_create_is_sealed_inside_its_own_module`:
     //! `real_send_create` must be inside this block, and `cli_send_create` --
-    //! the blocking call itself -- must be inside `mod send_tasks`, which is
-    //! the CLI implementation of `send_tasks::SendTasks` and the one place
+    //! the blocking call itself -- must be inside `mod backend_tasks`, which is
+    //! the CLI implementation of `backend_tasks::BackendTasks` and the one place
     //! this window chooses between `bw send` and the built-in client. Each
     //! needle is still confined to exactly one named module; a call written
     //! in the frame closure spells one of them and fails.
@@ -9209,12 +9266,12 @@ mod send_create_thread {
         session: &str,
     ) -> SendCreateReport {
         // `real_send_list`'s line, in its position and for its reason: the
-        // backend is chosen by `super::send_tasks::tasks_for` and by nothing
+        // backend is chosen by `super::backend_tasks::tasks_for` and by nothing
         // written here, and it is asked on THIS thread because an account
         // switch replaces the choice between the frame and the thread. The
         // name is read off the plan by whichever implementation answers, and
         // is the only field of it that reaches the report.
-        super::send_tasks::tasks_for(Some(session)).create(plan)
+        super::backend_tasks::tasks_for(Some(session)).send_create(plan)
     }
 
     /// Publishes one Send on a background thread. The frame closure's one
@@ -9936,28 +9993,31 @@ fn spawn_vault_load_with_schedule(
 /// [`crate::backend_policy::selected`] exists to make unforgettable, and the
 /// only one of them that was in the vault window's own toolbar.
 ///
-/// **The direct-REST arm is `Ok(())` and that is not a stub.** `bw sync` is
-/// `bw`'s own local cache being refilled from the server; this process has no
-/// such cache to refill, because the thing that would read it --
-/// [`VaultCache`] over a [`crate::rest::backend::RestBackend`] -- goes to the
-/// server itself. The re-fetch a user means when they press Sync is the
-/// `VaultLoadRequest { force_refresh: true, .. }` the caller already spawns
-/// on `Ok(())`, and that request is the one that really talks to the server.
-/// So the honest answer here is "there is nothing to run first", and the
-/// pill's claim is still earned rather than asserted: if that forced reload
-/// fails, `apply_vault_load_result` turns this `Ok` into an `Err` and the
-/// pill says so.
+/// **The direct-REST arm is `Ok(())` and that is not a stub** -- the reason
+/// is recorded on the implementation itself, in
+/// `backend_tasks::BackendTasks for DirectRestTasks`, along with why the
+/// pill's claim is still earned rather than asserted.
 ///
-/// Read here, on the sync thread, rather than captured from the frame --
+/// **The two arms are not written here any more.** Sync was one of six
+/// hand-branches on `backend_policy::selected()` scattered through this
+/// window, and six defects shipped from that shape in a day; the choice is
+/// `backend_tasks::tasks_for`'s now, made once for all six. Sync is the odd
+/// one of the six in kind -- it is a lifecycle action on whatever holds the
+/// vault rather than a vault operation, which is why it is not on
+/// `crate::vault_backend::VaultBackend` -- but it is not odd in the way that
+/// mattered: it was a branch a caller could forget, and now there is no
+/// caller that can.
+///
+/// Asked here, on the sync thread, rather than captured from the frame --
 /// exactly the reason `send_fetch_thread::real_send_list` gives for reading
 /// it in the same place: an account switch replaces this between the frame
 /// and the thread.
 fn sync_the_selected_backend(session_token: &str) -> Result<(), String> {
-    if crate::backend_policy::selected() == crate::backend_policy::VaultBackendChoice::DirectRest
-    {
-        return Ok(());
-    }
-    bw_serve::run_bw_sync(session_token)
+    // `real_send_list`'s line, in its position and for its reason: the
+    // backend is chosen by `backend_tasks::tasks_for` and by nothing written
+    // here, and it is asked on THIS thread because an account switch replaces
+    // the choice between the frame and the thread.
+    backend_tasks::tasks_for(Some(session_token)).sync()
 }
 
 /// Spawns a one-shot background thread that runs the SELECTED backend's sync
@@ -22101,18 +22161,49 @@ mod export_wiring {
     /// the cheap half of closing it; the expensive half, which counts real
     /// `CreateProcess` attempts, is
     /// `no_cli_on_the_direct_path_tests::pressing_sync_on_a_direct_rest_account_spawns_no_cli`.
+    ///
+    /// **Three equalities now, where there was one, and they assert more.**
+    /// The gate is no longer written in this function: Sync is one of the six
+    /// backend-sensitive actions behind `backend_tasks::BackendTasks`, chosen
+    /// once by `backend_tasks::tasks_for` for all of them. So this pins the
+    /// delegation, and then each implementation's answer in its own right --
+    /// which is strictly more than the single body was saying, because the
+    /// old string could not distinguish "the `DirectRest` arm returns `Ok`"
+    /// from "the `DirectRest` arm returns `Ok` and the other one still runs
+    /// `bw sync`" once either half was edited.
     #[test]
     fn the_sync_the_window_runs_is_gated_on_the_selected_backend() {
-        let body = concat!(
-            "fn sync_the_selected_",
-            "backend(session_token: &str) -> Result<(), String> { if crate::backend_policy::selected() == crate::backend_policy::VaultBackendChoice::DirectRest { return Ok(()); } bw_serve::run_bw_",
-            "sync(session_token) }"
-        );
-        assert_eq!(
-            code_squashed(production()).matches(body).count(),
-            1,
-            "the vault window's sync is no longer exactly `DirectRest` -> `Ok(())` and \n             everything else -> `bw sync`. Removing the gate is the `os error 3` the owner \n             reported on every press of Sync; removing the `bw sync` is a Sync that does \n             nothing on the backend that has one, with the whole-body pin over \n             `spawn_vault_sync` still green"
-        );
+        let squashed = code_squashed(production());
+        for (body, complaint) in [
+            (
+                concat!(
+                    "fn sync_the_selected_",
+                    "backend(session_token: &str) -> Result<(), String> { \
+                     backend_tasks::tasks_for(Some(session_token)).sync() }"
+                ),
+                "the vault window's sync is no longer exactly the delegation to the chosen \
+                 backend with the window's own session. A gate written back into this \
+                 function is a seventh copy of a decision that is meant to be made once",
+            ),
+            (
+                concat!("fn ", "sync(&self) -> Result<(), String> { Ok(()) }"),
+                "the built-in client's sync is no longer exactly `Ok(())`. If it runs \
+                 something it is the `os error 3` the owner reported on every press of Sync; \
+                 if it returns an error the window paints a red `Sync failed` pill and skips \
+                 the forced reload, so the button does nothing and says so",
+            ),
+            (
+                concat!(
+                    "fn ", "sync(&self) -> Result<(), String> { super::bw_serve::run_bw_",
+                    "sync(self.session()) }"
+                ),
+                "the `bw serve` sync is no longer exactly one `bw sync` with the session \
+                 this value was constructed with -- a Sync that does nothing on the backend \
+                 that has one, with every other pin over this seam green",
+            ),
+        ] {
+            assert_eq!(squashed.matches(body).count(), 1, "{complaint}");
+        }
     }
 
     /// **`spawn_vault_load` is the delegation and nothing else** --
@@ -25155,19 +25246,35 @@ mod export_wiring {
         // nothing else in it -- a second condition, a second call or a
         // reordering that let a `bw serve` account take the REST arm all fail
         // here and none of them could have failed before.
+        // **The hop is two equalities now, and the pair asserts more than
+        // the one it replaces.** The `selected()` branch is not written here
+        // any more: the export is one of the six backend-sensitive actions
+        // behind `backend_tasks::BackendTasks`, chosen once by
+        // `backend_tasks::tasks_for` for all of them and pinned there. What
+        // is left to say HERE is that this window's own runner-picking hop is
+        // nothing but that delegation, and that the CLI implementation it can
+        // reach still puts its child in this window's job.
         let branch = concat!(
-            "pub(super) fn real_export_", "runner() -> vault_export::ExportRunner { if \
-             crate::backend_policy::selected() == \
-             crate::backend_policy::VaultBackendChoice::DirectRest { return \
-             rest_export_runner(); } vault_export::real_runner(export_job()) }"
+            "pub(super) fn real_export_", "runner() -> vault_export::ExportRunner { \
+             super::backend_tasks::tasks_for(None).export_runner() }"
         );
         assert_eq!(
             squashed(production()).matches(branch).count(),
             1,
-            "`real_export_runner` is no longer exactly one `selected()` branch over the \
-             production CLI runner and this window's own job. Either a `bw serve` account \
-             can now be sent down the REST arm, or the export child has stopped joining \
-             the kill-on-close job this window holds"
+            "`real_export_runner` is no longer exactly the delegation to the chosen \
+             backend's runner. A branch written back into it is a seventh copy of a \
+             decision that is meant to be made once"
+        );
+        let cli = concat!(
+            "fn export_", "runner(&self) -> crate::vault_export::ExportRunner { \
+             crate::vault_export::real_runner(super::export_thread::export_", "job()) }"
+        );
+        assert_eq!(
+            squashed(production()).matches(cli).count(),
+            1,
+            "the `bw serve` export runner is no longer exactly the production CLI runner in \
+             this window's own job -- the export child has stopped joining the kill-on-close \
+             job this window holds"
         );
     }
 
@@ -30279,7 +30386,7 @@ mod send_delete_wiring {
     }
 
     /// `mod send_delete_thread`'s text, by brace matching from its opener.
-    /// `mod send_tasks`'s text, by brace matching from its opener.
+    /// `mod backend_tasks`'s text, by brace matching from its opener.
     ///
     /// [`sealed_module`]'s body with one head string changed, and a separate
     /// function for the reason `sealed_create_module`'s doc gives: the
@@ -30289,17 +30396,17 @@ mod send_delete_wiring {
     ///
     /// **Why the three Sends seals now need it.** The blocking `cli_send_*`
     /// calls no longer live in the four worker modules; they are the CLI
-    /// implementation of `send_tasks::SendTasks`, which is the one place this
+    /// implementation of `backend_tasks::BackendTasks`, which is the one place this
     /// window chooses between `bw send` and the built-in client. Each needle
     /// is still confined to exactly one named module -- the call to the
     /// module that performs it, the thread boundary to the module that
     /// spawns it -- so the seals assert what they always did.
-    pub(super) fn send_tasks_module() -> String {
+    pub(super) fn backend_tasks_module() -> String {
         let source = production();
-        let head = concat!("mod send_", "tasks {");
+        let head = concat!("mod backend_", "tasks {");
         let at = source
             .rfind(head)
-            .expect("`mod send_tasks` is not in this file's production");
+            .expect("`mod backend_tasks` is not in this file's production");
         let after = &source[at..];
         let code = code_braces_only(after);
         let mut depth = 0i32;
@@ -30315,7 +30422,7 @@ mod send_delete_wiring {
                 _ => {}
             }
         }
-        panic!("`mod send_tasks` is never closed");
+        panic!("`mod backend_tasks` is never closed");
     }
 
     fn sealed_module() -> String {
@@ -30382,20 +30489,20 @@ mod send_delete_wiring {
 
         // **Two blocks, and which one a needle belongs in is the structural
         // change this pin records.** `cli_send_delete` -- the blocking call
-        // itself -- is the CLI implementation of `send_tasks::SendTasks`, in
+        // itself -- is the CLI implementation of `backend_tasks::BackendTasks`, in
         // the one module that chooses between `bw send` and the built-in
         // client for all four Sends operations. `real_send_delete` and
         // `spawn_send_delete_with`, which are the thread boundary and nothing
         // else, stayed here. Every needle is still confined to exactly ONE
         // named module, which is the whole of what this test ever asserted.
-        let tasks = code_braces_only(&send_tasks_module());
+        let tasks = code_braces_only(&backend_tasks_module());
         assert!(
             tasks.len() > 200,
-            "control: the `mod send_tasks` slice is only {} bytes, which is not a module's \
+            "control: the `mod backend_tasks` slice is only {} bytes, which is not a module's \
              worth",
             tasks.len()
         );
-        for (needle, defined_in_send_rs, in_send_tasks) in [
+        for (needle, defined_in_send_rs, in_backend_tasks) in [
             (concat!("cli_send_", "delete"), 1usize, true),
             (concat!("real_send_", "delete"), 0, false),
             (concat!("spawn_send_delete_", "with"), 0, false),
@@ -30419,8 +30526,8 @@ mod send_delete_wiring {
                     }
                 })
                 .sum();
-            let (home, inside) = if in_send_tasks {
-                ("mod send_tasks", tasks.matches(needle).count())
+            let (home, inside) = if in_backend_tasks {
+                ("mod backend_tasks", tasks.matches(needle).count())
             } else {
                 ("mod send_delete_thread", block.matches(needle).count())
             };
@@ -30451,27 +30558,27 @@ mod send_delete_wiring {
     /// and it would still pass the pointer test on its own terms.
     #[test]
     fn the_revoke_module_mints_no_job_of_its_own() {
-        // **The block read is `mod send_tasks`**, which is where the revoke's
+        // **The block read is `mod backend_tasks`**, which is where the revoke's
         // `bw send` child is now started -- the CLI implementation of
-        // `send_tasks::SendTasks`. The claim is unchanged and so is its
+        // `backend_tasks::BackendTasks`. The claim is unchanged and so is its
         // reason; only the module that has to satisfy it moved. It is
         // additionally stronger than the version that read
         // `mod send_delete_thread`: that block held the revoke alone, and this
         // one holds all four `bw send` children this window can start, so a
         // second cell minted for ANY of them fails here.
-        let block = code_braces_only(&send_tasks_module());
+        let block = code_braces_only(&backend_tasks_module());
         assert!(
             block.contains(concat!("send_fetch_thread::sends_", "job()")),
-            "`mod send_tasks` no longer names the Sends job"
+            "`mod backend_tasks` no longer names the Sends job"
         );
         assert!(
             !block.contains("OnceLock"),
-            "`mod send_tasks` mints a process-lifetime cell of its own; the revoke is \
+            "`mod backend_tasks` mints a process-lifetime cell of its own; the revoke is \
              the same account's `bw send` child as the fetch and belongs in the same job"
         );
         assert!(
             !block.contains(concat!("KillOnCloseJob::", "new")),
-            "`mod send_tasks` creates a job of its own"
+            "`mod backend_tasks` creates a job of its own"
         );
         // And `None` is never written as the job.
         assert!(
@@ -31943,17 +32050,17 @@ mod send_create_wiring {
         // Two blocks, for the reason
         // `send_delete_wiring::every_mention_of_the_blocking_delete_is_sealed_inside_its_own_module`
         // records: the blocking call is the CLI implementation of
-        // `send_tasks::SendTasks` and the thread boundary stayed here, and
+        // `backend_tasks::BackendTasks` and the thread boundary stayed here, and
         // each needle is still confined to exactly one named module.
         let tasks =
-            send_delete_wiring::code_braces_only(&send_delete_wiring::send_tasks_module());
+            send_delete_wiring::code_braces_only(&send_delete_wiring::backend_tasks_module());
         assert!(
             tasks.len() > 200,
-            "control: the `mod send_tasks` slice is only {} bytes, which is not a module's \
+            "control: the `mod backend_tasks` slice is only {} bytes, which is not a module's \
              worth",
             tasks.len()
         );
-        for (needle, defined_in_send_rs, in_send_tasks) in [
+        for (needle, defined_in_send_rs, in_backend_tasks) in [
             (concat!("cli_send_", "create"), 1usize, true),
             (concat!("real_send_", "create"), 0, false),
             (concat!("spawn_send_create_", "with"), 0, false),
@@ -31977,8 +32084,8 @@ mod send_create_wiring {
                     }
                 })
                 .sum();
-            let (home, inside) = if in_send_tasks {
-                ("mod send_tasks", tasks.matches(needle).count())
+            let (home, inside) = if in_backend_tasks {
+                ("mod backend_tasks", tasks.matches(needle).count())
             } else {
                 ("mod send_create_thread", block.matches(needle).count())
             };
@@ -32009,19 +32116,19 @@ mod send_create_wiring {
     /// and it would still pass the pointer test on its own terms.
     #[test]
     fn the_create_module_mints_no_job_of_its_own() {
-        // `mod send_tasks`, for
+        // `mod backend_tasks`, for
         // [`super::send_delete_wiring::the_revoke_module_mints_no_job_of_its_own`]'s
         // recorded reason: that is where the create's `bw send` child is
         // started now.
         let block =
-            send_delete_wiring::code_braces_only(&send_delete_wiring::send_tasks_module());
+            send_delete_wiring::code_braces_only(&send_delete_wiring::backend_tasks_module());
         assert!(
             block.contains(concat!("send_fetch_thread::sends_", "job()")),
-            "`mod send_tasks` no longer names the Sends job"
+            "`mod backend_tasks` no longer names the Sends job"
         );
         assert!(
             !block.contains(concat!("Once", "Lock")),
-            "`mod send_tasks` mints a cell of its own, which is a second handle held \
+            "`mod backend_tasks` mints a cell of its own, which is a second handle held \
              for one purpose"
         );
         // And `None` is never written as the job for the publish.
@@ -32120,17 +32227,17 @@ mod send_create_wiring {
         // Two blocks, for
         // `send_delete_wiring::every_mention_of_the_blocking_delete_is_sealed_inside_its_own_module`'s
         // recorded reason: the blocking call is the CLI implementation of
-        // `send_tasks::SendTasks` and the thread boundary stayed here, and
+        // `backend_tasks::BackendTasks` and the thread boundary stayed here, and
         // each needle is still confined to exactly one named module.
         let tasks =
-            send_delete_wiring::code_braces_only(&send_delete_wiring::send_tasks_module());
+            send_delete_wiring::code_braces_only(&send_delete_wiring::backend_tasks_module());
         assert!(
             tasks.len() > 200,
-            "control: the `mod send_tasks` slice is only {} bytes, which is not a module's \
+            "control: the `mod backend_tasks` slice is only {} bytes, which is not a module's \
              worth",
             tasks.len()
         );
-        for (needle, defined_in_send_rs, in_send_tasks) in [
+        for (needle, defined_in_send_rs, in_backend_tasks) in [
             (concat!("cli_send_", "receive"), 1usize, true),
             (concat!("real_send_", "receive"), 0, false),
             (concat!("spawn_send_receive_", "with"), 0, false),
@@ -32154,8 +32261,8 @@ mod send_create_wiring {
                     }
                 })
                 .sum();
-            let (home, inside) = if in_send_tasks {
-                ("mod send_tasks", tasks.matches(needle).count())
+            let (home, inside) = if in_backend_tasks {
+                ("mod backend_tasks", tasks.matches(needle).count())
             } else {
                 ("mod send_receive_thread", block.matches(needle).count())
             };
@@ -32181,19 +32288,19 @@ mod send_create_wiring {
     /// restated for the fourth `bw send` child this window can start.
     #[test]
     fn the_receive_module_mints_no_job_of_its_own() {
-        // `mod send_tasks`, for
+        // `mod backend_tasks`, for
         // [`super::send_delete_wiring::the_revoke_module_mints_no_job_of_its_own`]'s
         // recorded reason: that is where the receive's `bw send` child is
         // started now.
         let block =
-            send_delete_wiring::code_braces_only(&send_delete_wiring::send_tasks_module());
+            send_delete_wiring::code_braces_only(&send_delete_wiring::backend_tasks_module());
         assert!(
             block.contains(concat!("send_fetch_thread::sends_", "job()")),
-            "`mod send_tasks` no longer names the Sends job"
+            "`mod backend_tasks` no longer names the Sends job"
         );
         assert!(
             !block.contains(concat!("Once", "Lock")),
-            "`mod send_tasks` mints a cell of its own, which is a second handle \
+            "`mod backend_tasks` mints a cell of its own, which is a second handle \
              held for one purpose"
         );
         // And `None` is never written as the job for the fetch.
