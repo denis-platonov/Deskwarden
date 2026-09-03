@@ -6908,6 +6908,248 @@ fn spawn_aux_load(
     });
 }
 
+/// **The Sends' backend as an interface with two implementations**, and the
+/// one place in this window that chooses between them.
+mod send_tasks {
+    //! # Why this module exists
+    //!
+    //! `list`, `create`, `delete` and `receive` were four functions in four
+    //! other modules that each read [`crate::backend_policy::selected`] and
+    //! hand-branched on the answer. Four hand-branches is four chances to
+    //! write the fifth one wrong, and this app shipped that mistake
+    //! repeatedly in a single day -- an `os error 2` on these actions on an
+    //! account that has no `bw.exe` to run, found by the owner using the app
+    //! and by none of the suite's four thousand tests.
+    //!
+    //! [`crate::vault_backend::VaultBackend`] is the shape that has never
+    //! produced one of those: nineteen operations, two implementations, one
+    //! swap. This module is that shape for the Sends. The four workers below
+    //! no longer contain the word `DirectRest`; they name [`tasks_for`], and
+    //! a fifth operation added to [`SendTasks`] does not compile until both
+    //! implementations answer it.
+    //!
+    //! # Why a SIBLING trait rather than four more `VaultBackend` methods
+    //!
+    //! Every CLI arm here needs three things no REST arm has any use for: a
+    //! [`crate::job_object::KillOnCloseJob`] to put the child in, the active
+    //! account's profile directory, and the vault session.
+    //! `crate::vault_bridge::VaultBridge` holds none of the three, so putting
+    //! these on `VaultBackend` would mean either widening that type's
+    //! construction for operations it does not perform, or giving trait
+    //! methods parameters that exactly one implementation reads.
+    //!
+    //! A sibling trait absorbs the asymmetry **at construction**:
+    //! `CliSendTasks` is the value that holds the session, and reads the job
+    //! and the profile directory at the moment it uses them;
+    //! `DirectRestSendTasks` is a unit struct because it needs nothing. The
+    //! trait's own methods carry only what the OPERATION is about -- a plan,
+    //! an id, a link.
+    //!
+    //! # Read here, on the worker thread
+    //!
+    //! [`tasks_for`] is called from the blocking half of each of the four
+    //! workers, never from the frame closure, and that is the same position
+    //! the four `selected()` reads it replaces were written in, for the same
+    //! reason: an account switch replaces the choice between the frame and
+    //! the thread. The profile directory is read inside the CLI methods, one
+    //! step later, exactly where each of those four functions read it before.
+    //!
+    //! # What holds the frame closure out
+    //!
+    //! `tasks_for` is the only way to obtain a [`SendTasks`], and
+    //! `send_ui::source_pins::the_sends_backend_is_chosen_in_exactly_one_place`
+    //! counts every mention of it in the crate's production: the definition
+    //! and the four workers, and nothing else. The four `cli_send_*` calls
+    //! are sealed inside this block by the four seals that used to name the
+    //! four worker modules.
+
+    use super::{RecordImportReport, SendCreateReport, SendDeleteReport};
+
+    /// The four Sends operations, as this window performs them.
+    ///
+    /// **No session, no data directory and no job in any signature.** See the
+    /// module doc: those are what one implementation is CONSTRUCTED with and
+    /// the other has no use for, and a parameter only one impl reads is the
+    /// smell this shape exists to avoid.
+    pub(super) trait SendTasks {
+        fn list(&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError>;
+        fn create(&self, plan: &crate::send::SendPlan) -> SendCreateReport;
+        fn delete(&self, id: &str, name: &str) -> SendDeleteReport;
+        fn receive(&self, link: &str) -> RecordImportReport;
+    }
+
+    /// **The swap, and the whole of it.**
+    ///
+    /// `session` is `None` for the receive and only for the receive: a
+    /// receive is anonymous -- the link carries the decryption key -- so
+    /// neither implementation has anything to do with a session there. On the
+    /// CLI side an absent session would reach `bw` as an empty `BW_SESSION`,
+    /// which answers "locked": an error, never a wrong action.
+    pub(super) fn tasks_for(session: Option<&str>) -> Box<dyn SendTasks + '_> {
+        if crate::backend_policy::selected()
+            == crate::backend_policy::VaultBackendChoice::DirectRest
+        {
+            return Box::new(DirectRestSendTasks);
+        }
+        Box::new(CliSendTasks { session })
+    }
+
+    /// The built-in client: this process talks to the Bitwarden server and
+    /// starts no child at all.
+    struct DirectRestSendTasks;
+
+    impl SendTasks for DirectRestSendTasks {
+        fn list(&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
+            crate::rest::send::list_on_active_account()
+        }
+
+        fn create(&self, plan: &crate::send::SendPlan) -> SendCreateReport {
+            let name = plan.name.trim().to_string();
+            // The same real clock the CLI arm passes, so the two backends
+            // stamp the same instant: the one the user pressed Create at.
+            match crate::rest::send::create_on_active_account(plan, &crate::send::SystemClock) {
+                Ok(created) => {
+                    SendCreateReport::Created { name, access_url: created.access_url }
+                }
+                Err(error) => SendCreateReport::Failed { name, error },
+            }
+        }
+
+        fn delete(&self, id: &str, name: &str) -> SendDeleteReport {
+            match crate::rest::send::delete_on_active_account(id) {
+                Ok(()) => SendDeleteReport::Deleted { name: name.to_string() },
+                Err(error) => SendDeleteReport::Failed { name: name.to_string(), error },
+            }
+        }
+
+        /// **No vault credential in hand at all**: the key is in the link. So
+        /// this arm reaches the same `RecordImportReport::Read` as the CLI's
+        /// with nothing of the account's, and `send_ui::RECEIVE_NEEDS_THE_CLI`
+        /// -- which is about a missing `bw.exe` -- is unreachable from it.
+        fn receive(&self, link: &str) -> RecordImportReport {
+            match crate::rest::send::receive_on_active_account(link, None) {
+                Ok(body) => RecordImportReport::Read(Box::new(
+                    crate::record::payload::read_json(&body),
+                )),
+                Err(error) => RecordImportReport::Failed(error.user_message().to_string()),
+            }
+        }
+    }
+
+    /// `bw send`, as a backend: every operation is a real child process.
+    ///
+    /// **The session is held here and nowhere in a signature above**, as a
+    /// borrow of the worker thread's own `Zeroizing<String>` -- so this struct
+    /// makes no second copy of the vault-unlocking token, and it cannot
+    /// outlive the thread that owns it.
+    struct CliSendTasks<'a> {
+        session: Option<&'a str>,
+    }
+
+    impl CliSendTasks<'_> {
+        /// The session as `bw` will see it. See [`tasks_for`] for why the
+        /// empty string is the honest answer for the one caller that has none.
+        fn session(&self) -> &str {
+            self.session.unwrap_or("")
+        }
+
+        /// The active account's profile directory, **read at the moment of use
+        /// and not captured from the frame**: `bw_path` keeps it as process
+        /// state precisely so that every spawn in this crate reaches the same
+        /// account, and a copy taken a frame earlier is a copy that can be
+        /// stale.
+        fn data_dir() -> Option<std::path::PathBuf> {
+            crate::bw_path::active_data_dir()
+        }
+
+        /// The job every `bw send` child this window starts is placed in:
+        /// [`super::send_fetch_thread::sends_job`] itself, reused rather than
+        /// mirrored, for the reason that function's own doc gives. All four
+        /// operations are the same `bw send` against the same account started
+        /// by the same window; a second cell would be a second handle held for
+        /// one purpose.
+        fn job() -> Option<&'static crate::job_object::KillOnCloseJob> {
+            super::send_fetch_thread::sends_job()
+        }
+    }
+
+    impl SendTasks for CliSendTasks<'_> {
+        fn list(&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
+            let data_dir = Self::data_dir();
+            crate::send::cli_send_list(Self::job(), data_dir.as_deref(), self.session())
+        }
+
+        fn create(&self, plan: &crate::send::SendPlan) -> SendCreateReport {
+            let name = plan.name.trim().to_string();
+            let data_dir = Self::data_dir();
+            match crate::send::cli_send_create(
+                Self::job(),
+                data_dir.as_deref(),
+                self.session(),
+                plan,
+                // The real clock, read here and nowhere in `send.rs`. The
+                // deletion date the CLI is given is the one the composer's own
+                // expiry line was worded from, to the second the user pressed
+                // Create rather than to the second the form was drawn.
+                &crate::send::SystemClock,
+            ) {
+                Ok(created) => SendCreateReport::Created {
+                    name,
+                    access_url: created.access_url,
+                },
+                Err(error) => SendCreateReport::Failed { name, error },
+            }
+        }
+
+        fn delete(&self, id: &str, name: &str) -> SendDeleteReport {
+            let data_dir = Self::data_dir();
+            match crate::send::cli_send_delete(
+                Self::job(),
+                data_dir.as_deref(),
+                self.session(),
+                id,
+            ) {
+                Ok(()) => SendDeleteReport::Deleted {
+                    name: name.to_string(),
+                },
+                Err(error) => SendDeleteReport::Failed {
+                    name: name.to_string(),
+                    error,
+                },
+            }
+        }
+
+        fn receive(&self, link: &str) -> RecordImportReport {
+            let data_dir = Self::data_dir();
+            match crate::send::cli_send_receive(Self::job(), data_dir.as_deref(), link, None) {
+                // The read happens HERE, on this thread. See
+                // `super::RecordImportReport` for why the raw body must not
+                // cross the channel.
+                Ok(body) => RecordImportReport::Read(Box::new(
+                    crate::record::payload::read_json(&body),
+                )),
+                // **The one place `bw.exe`'s absence is still a real loss,
+                // said as a missing tool rather than as a bad link.** A user
+                // told only that the link could not be read goes and checks
+                // the link, which is the wrong thing to check: three of the
+                // four Send operations work on this account without `bw` at
+                // all, and this one does not. Only the two arms that mean
+                // "there was no CLI to run" are rephrased -- a server refusal,
+                // a timeout or a wrong share password still say what they are.
+                Err(
+                    error @ (crate::send::SendError::NoVerifiedCli(_)
+                    | crate::send::SendError::SpawnFailed(_)),
+                ) => RecordImportReport::Failed(format!(
+                    "{} ({})",
+                    crate::vault_window::send_ui::RECEIVE_NEEDS_THE_CLI,
+                    error.user_message()
+                )),
+                Err(error) => RecordImportReport::Failed(error.user_message().to_string()),
+            }
+        }
+    }
+}
+
 /// The Sends fetch's thread boundary, **with the blocking call sealed in**.
 mod send_fetch_thread {
     //! This module is a privacy boundary and that is its entire reason for
@@ -7022,36 +7264,13 @@ mod send_fetch_thread {
     pub(super) fn real_send_list(
         session: &str,
     ) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {
-        // Read here and not captured from the frame, exactly as the profile
-        // directory below is and for the same reason: an account switch
-        // replaces this between the frame and the thread.
-        if crate::backend_policy::selected()
-            == crate::backend_policy::VaultBackendChoice::DirectRest
-        {
-            return crate::rest::send::list_on_active_account();
-        }
-        // Read on the fetching thread, not captured from the frame: `bw_path`
-        // keeps the active account's profile directory as process state
-        // precisely so that every spawn in this crate reaches the same
-        // account, and a copy taken a frame earlier is a copy that can be
-        // stale.
-        let data_dir = crate::bw_path::active_data_dir();
-        // The job, and why the child must be in one. This command carries the
-        // vault-unlocking session in its ENVIRONMENT BLOCK, and on Windows an
-        // environment block is readable by any process holding
-        // `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION` on the target --
-        // which, for a same-user same-integrity process, is the default and
-        // needs no elevation. So an orphaned `bw send list` is a live vault
-        // key sitting in another process's address space for as long as it
-        // lives. That is the same hazard `bw serve` is in a job for; argv is
-        // clean here (`SESSION_ENV` goes through `command.env` and never
-        // `command.args`, asserted in `send.rs`) so the cheap
-        // `Get-CimInstance Win32_Process` read does not reach it, but the
-        // environment read does. `KillOnCloseJob` closes that window: when
-        // this process dies, by any route including a `TerminateProcess` the
-        // app never runs code after, the kernel closes the handle and every
-        // member child dies with it.
-        crate::send::cli_send_list(sends_job(), data_dir.as_deref(), session)
+        // **The backend is chosen in one place and this is not it.**
+        // `super::send_tasks::tasks_for` is that place, for all four Sends
+        // operations; what is still decided HERE is *when* it is asked, and
+        // the answer is the same as it always was -- on this thread, not
+        // captured from the frame, because an account switch replaces the
+        // choice between the frame and the thread.
+        super::send_tasks::tasks_for(Some(session)).list()
     }
 
     /// The job every `bw send` child this window starts is placed in.
@@ -8347,10 +8566,12 @@ mod send_delete_thread {
     //!
     //! The seal is
     //! `super::send_delete_wiring::every_mention_of_the_blocking_delete_is_sealed_inside_its_own_module`:
-    //! every occurrence of `cli_send_delete` and `real_send_delete` in the
-    //! crate's production, outside `send.rs` where the first is defined, must
-    //! be inside this block. A call written in the frame closure spells the
-    //! first of those and fails.
+    //! `real_send_delete` must be inside this block, and `cli_send_delete` --
+    //! the blocking call itself -- must be inside `mod send_tasks`, which is
+    //! the CLI implementation of `send_tasks::SendTasks` and the one place
+    //! this window chooses between `bw send` and the built-in client. Each
+    //! needle is still confined to exactly one named module; a call written
+    //! in the frame closure spells one of them and fails.
     //!
     //! The session travels as a `Zeroizing<String>` this thread drops, and it
     //! reaches the child in `BW_SESSION` and never in argv --
@@ -8359,34 +8580,6 @@ mod send_delete_thread {
     use eframe::egui;
 
     use super::{SendDeleteReport, SendDeleteSender};
-
-    /// The job every `bw send delete` child this window starts is placed in.
-    ///
-    /// **[`super::send_fetch_thread::sends_job`] itself, reused rather than
-    /// mirrored**, and the reasoning is the one that function's own doc gives,
-    /// not a new one. `mod export_thread` minted a second `OnceLock` because
-    /// `vault_export::CliExportRunner` takes `Arc<Option<KillOnCloseJob>>`
-    /// while `sends_job` answers `Option<&'static KillOnCloseJob>`, so
-    /// reusing it there would have meant widening a runner's signature. There
-    /// is no such difference here: `crate::send::cli_send_delete` takes
-    /// exactly `Option<&crate::job_object::KillOnCloseJob>`, which is what
-    /// `sends_job` already answers, and the child is the same `bw send`
-    /// against the same account started by the same window as the Sends
-    /// fetch. Two jobs would be two handles held for one purpose.
-    ///
-    /// It is **not** `main.rs`'s job, for `sends_job`'s reasons, which apply
-    /// unchanged. And `None` is never passed deliberately: `sends_job`
-    /// degrades to `None` only when the kernel refuses to make a job at all,
-    /// and refusing to revoke a public link because a job object could not be
-    /// created would be a strictly worse trade than revoking it unprotected.
-    ///
-    /// One cell, so every call answers the SAME job -- which is what lets
-    /// `super::send_delete_wiring::the_revoke_child_is_spawned_into_the_job_this_window_holds`
-    /// compare the job that arrived at the spawn with this function's answer
-    /// by pointer identity.
-    fn delete_job() -> Option<&'static crate::job_object::KillOnCloseJob> {
-        super::send_fetch_thread::sends_job()
-    }
 
     /// **One whole revoke, blocking, from the id to the verdict** -- and the
     /// wiring's own entry point, in the sense that everything above it is a
@@ -8401,32 +8594,11 @@ mod send_delete_thread {
     /// blocking half is a plain function and not something only reachable
     /// through `std::thread::spawn`.
     pub(super) fn real_send_delete(id: &str, name: &str, session: &str) -> SendDeleteReport {
-        // Read here and not captured from the frame, exactly as the profile
-        // directory below is and for the same reason: an account switch
-        // replaces this between the frame and the thread.
-        if crate::backend_policy::selected()
-            == crate::backend_policy::VaultBackendChoice::DirectRest
-        {
-            return match crate::rest::send::delete_on_active_account(id) {
-                Ok(()) => SendDeleteReport::Deleted { name: name.to_string() },
-                Err(error) => SendDeleteReport::Failed { name: name.to_string(), error },
-            };
-        }
-        // Read on the revoking thread, not captured from the frame:
-        // `bw_path` keeps the active account's profile directory as process
-        // state precisely so that every spawn in this crate reaches the same
-        // account, and a copy taken a frame earlier is a copy that can be
-        // stale.
-        let data_dir = crate::bw_path::active_data_dir();
-        match crate::send::cli_send_delete(delete_job(), data_dir.as_deref(), session, id) {
-            Ok(()) => SendDeleteReport::Deleted {
-                name: name.to_string(),
-            },
-            Err(error) => SendDeleteReport::Failed {
-                name: name.to_string(),
-                error,
-            },
-        }
+        // `real_send_list`'s line, in its position and for its reason: the
+        // backend is chosen by `super::send_tasks::tasks_for` and by nothing
+        // written here, and it is asked on THIS thread because an account
+        // switch replaces the choice between the frame and the thread.
+        super::send_tasks::tasks_for(Some(session)).delete(id, name)
     }
 
     /// Revokes one Send on a background thread. The frame closure's one entry
@@ -8770,10 +8942,12 @@ mod send_receive_thread {
     //!
     //! The seal is
     //! `super::send_create_wiring::every_mention_of_the_blocking_receive_is_sealed_inside_its_own_module`:
-    //! every occurrence of `cli_send_receive` and `real_send_receive` in the
-    //! crate's production, outside `send.rs` where the first is defined, must
-    //! be inside this block. A call written in the frame closure spells the
-    //! first of those and fails.
+    //! `real_send_receive` must be inside this block, and `cli_send_receive` --
+    //! the blocking call itself -- must be inside `mod send_tasks`, which is
+    //! the CLI implementation of `send_tasks::SendTasks` and the one place
+    //! this window chooses between `bw send` and the built-in client. Each
+    //! needle is still confined to exactly one named module; a call written
+    //! in the frame closure spells one of them and fails.
     //!
     //! **The link reaches the child in argv and there is nowhere else it
     //! could.** That decision is not taken here: `crate::send::receive_invocation`
@@ -8788,16 +8962,6 @@ mod send_receive_thread {
     use eframe::egui;
 
     use super::{RecordImportReport, RecordImportSender};
-
-    /// The job every `bw send receive` child this window starts is placed in.
-    ///
-    /// **`super::send_fetch_thread::sends_job` itself, reused rather than
-    /// mirrored**, for `mod send_create_thread`'s `create_job` reason and not
-    /// a new one: the child is the same `bw send` started by the same window,
-    /// and two jobs would be two handles held for one purpose.
-    fn receive_job() -> Option<&'static crate::job_object::KillOnCloseJob> {
-        super::send_fetch_thread::sends_job()
-    }
 
     /// **One whole fetch, blocking, from the link to the record** -- the
     /// wiring's own entry point, in the sense that everything above it is a
@@ -8817,58 +8981,11 @@ mod send_receive_thread {
     /// takes the `Option` and this passes `None`; the day a record Send is
     /// given a share password, this is the line that grows an argument.
     pub(super) fn real_send_receive(link: &str) -> RecordImportReport {
-        // **The built-in client reads the link itself, and returns before any
-        // of the CLI path below exists.** `real_send_list`'s branch, in the
-        // same position and read the same way -- from
-        // `backend_policy::selected()` here rather than from the frame,
-        // because an account switch replaces it between the frame and this
-        // thread.
-        //
-        // `receive_on_active_account` needs no vault credential at all: the
-        // key is in the link. So this arm reaches the same
-        // `RecordImportReport::Read` as the one below it with nothing of the
-        // account's in hand, and `RECEIVE_NEEDS_THE_CLI` -- which is about a
-        // missing `bw.exe` -- is unreachable from it.
-        if crate::backend_policy::selected()
-            == crate::backend_policy::VaultBackendChoice::DirectRest
-        {
-            return match crate::rest::send::receive_on_active_account(link, None) {
-                Ok(body) => RecordImportReport::Read(Box::new(
-                    crate::record::payload::read_json(&body),
-                )),
-                Err(error) => RecordImportReport::Failed(error.user_message().to_string()),
-            };
-        }
-        // Read on the fetching thread, not captured from the frame:
-        // `bw_path` keeps the active account's profile directory as process
-        // state precisely so every spawn in this crate reaches the same
-        // account, and a copy taken a frame earlier can be stale.
-        let data_dir = crate::bw_path::active_data_dir();
-        match crate::send::cli_send_receive(receive_job(), data_dir.as_deref(), link, None) {
-            // The read happens HERE, on this thread. See
-            // `super::RecordImportReport` for why the raw body must not cross
-            // the channel.
-            Ok(body) => RecordImportReport::Read(Box::new(
-                crate::record::payload::read_json(&body),
-            )),
-            // **The one place `bw.exe`'s absence is still a real loss, said
-            // as a missing tool rather than as a bad link.** A user told only
-            // that the link could not be read goes and checks the link, which
-            // is the wrong thing to check: three of the four Send operations
-            // work on this account without `bw` at all, and this one does
-            // not. Only the two arms that mean "there was no CLI to run" are
-            // rephrased -- a server refusal, a timeout or a wrong share
-            // password still say what they are.
-            Err(
-                error @ (crate::send::SendError::NoVerifiedCli(_)
-                | crate::send::SendError::SpawnFailed(_)),
-            ) => RecordImportReport::Failed(format!(
-                "{} ({})",
-                crate::vault_window::send_ui::RECEIVE_NEEDS_THE_CLI,
-                error.user_message()
-            )),
-            Err(error) => RecordImportReport::Failed(error.user_message().to_string()),
-        }
+        // `real_send_list`'s line, in its position and for its reason -- with
+        // `None` for the session, which is what makes this the anonymous one
+        // of the four: the link is the credential, so neither implementation
+        // has a use for a session here. See `super::send_tasks::tasks_for`.
+        super::send_tasks::tasks_for(None).receive(link)
     }
 
     /// Fetches one Send on a background thread. The frame closure's one entry
@@ -9052,10 +9169,12 @@ mod send_create_thread {
     //!
     //! The seal is
     //! `super::send_create_wiring::every_mention_of_the_blocking_create_is_sealed_inside_its_own_module`:
-    //! every occurrence of `cli_send_create` and `real_send_create` in the
-    //! crate's production, outside `send.rs` where the first is defined, must
-    //! be inside this block. A call written in the frame closure spells the
-    //! first of those and fails.
+    //! `real_send_create` must be inside this block, and `cli_send_create` --
+    //! the blocking call itself -- must be inside `mod send_tasks`, which is
+    //! the CLI implementation of `send_tasks::SendTasks` and the one place
+    //! this window chooses between `bw send` and the built-in client. Each
+    //! needle is still confined to exactly one named module; a call written
+    //! in the frame closure spells one of them and fails.
     //!
     //! **The plan's secrets reach the child on stdin and nowhere else**, and
     //! the session in `BW_SESSION` and never in argv. Neither decision is
@@ -9067,29 +9186,6 @@ mod send_create_thread {
     use eframe::egui;
 
     use super::{SendCreateReport, SendCreateSender};
-
-    /// The job every `bw send create` child this window starts is placed in.
-    ///
-    /// **`super::send_fetch_thread::sends_job` itself, reused rather than
-    /// mirrored**, for the reason `mod send_delete_thread`'s `delete_job`
-    /// gives and not a new one: `crate::send::cli_send_create` takes exactly
-    /// `Option<&crate::job_object::KillOnCloseJob>`, which is what `sends_job`
-    /// already answers, and the child is the same `bw send` against the same
-    /// account started by the same window. Two jobs would be two handles held
-    /// for one purpose.
-    ///
-    /// `None` is never passed deliberately: `sends_job` degrades to `None`
-    /// only when the kernel refuses to make a job at all, and refusing to
-    /// publish because a job object could not be created would be the worse
-    /// trade.
-    ///
-    /// One cell, so every call answers the SAME job -- which is what lets
-    /// `super::send_create_wiring::the_create_child_is_spawned_into_the_job_this_window_holds`
-    /// compare the job that arrived at the spawn with this function's answer
-    /// by pointer identity.
-    fn create_job() -> Option<&'static crate::job_object::KillOnCloseJob> {
-        super::send_fetch_thread::sends_job()
-    }
 
     /// **One whole create, blocking, from the plan to the verdict** -- and the
     /// wiring's own entry point, in the sense that everything above it is a
@@ -9112,53 +9208,13 @@ mod send_create_thread {
         plan: &crate::send::SendPlan,
         session: &str,
     ) -> SendCreateReport {
-        // Read on the creating thread, not captured from the frame:
-        // `bw_path` keeps the active account's profile directory as process
-        // state precisely so that every spawn in this crate reaches the same
-        // account, and a copy taken a frame earlier is a copy that can be
-        // stale.
-        let name = plan.name.trim().to_string();
-        // Read here and not captured from the frame, exactly as the profile
-        // directory below is and for the same reason: an account switch
-        // replaces this between the frame and the thread.
-        if crate::backend_policy::selected()
-            == crate::backend_policy::VaultBackendChoice::DirectRest
-        {
-            // The same real clock the CLI arm passes, so the two backends
-            // stamp the same instant: the one the user pressed Create at.
-            return match crate::rest::send::create_on_active_account(
-                plan,
-                &crate::send::SystemClock,
-            ) {
-                Ok(created) => {
-                    SendCreateReport::Created { name, access_url: created.access_url }
-                }
-                Err(error) => SendCreateReport::Failed { name, error },
-            };
-        }
-        // Read on the creating thread, not captured from the frame:
-        // `bw_path` keeps the active account's profile directory as process
-        // state precisely so that every spawn in this crate reaches the same
-        // account, and a copy taken a frame earlier is a copy that can be
-        // stale.
-        let data_dir = crate::bw_path::active_data_dir();
-        match crate::send::cli_send_create(
-            create_job(),
-            data_dir.as_deref(),
-            session,
-            plan,
-            // The real clock, read here and nowhere in `send.rs`. The
-            // deletion date the CLI is given is the one the composer's own
-            // expiry line was worded from, to the second the user pressed
-            // Create rather than to the second the form was drawn.
-            &crate::send::SystemClock,
-        ) {
-            Ok(created) => SendCreateReport::Created {
-                name,
-                access_url: created.access_url,
-            },
-            Err(error) => SendCreateReport::Failed { name, error },
-        }
+        // `real_send_list`'s line, in its position and for its reason: the
+        // backend is chosen by `super::send_tasks::tasks_for` and by nothing
+        // written here, and it is asked on THIS thread because an account
+        // switch replaces the choice between the frame and the thread. The
+        // name is read off the plan by whichever implementation answers, and
+        // is the only field of it that reaches the report.
+        super::send_tasks::tasks_for(Some(session)).create(plan)
     }
 
     /// Publishes one Send on a background thread. The frame closure's one
@@ -30223,6 +30279,45 @@ mod send_delete_wiring {
     }
 
     /// `mod send_delete_thread`'s text, by brace matching from its opener.
+    /// `mod send_tasks`'s text, by brace matching from its opener.
+    ///
+    /// [`sealed_module`]'s body with one head string changed, and a separate
+    /// function for the reason `sealed_create_module`'s doc gives: the
+    /// `rfind` of a literal opener is the whole of how these slices are
+    /// located, and a shared helper taking the opener as an argument is a
+    /// helper a caller can be handed the WRONG opener for.
+    ///
+    /// **Why the three Sends seals now need it.** The blocking `cli_send_*`
+    /// calls no longer live in the four worker modules; they are the CLI
+    /// implementation of `send_tasks::SendTasks`, which is the one place this
+    /// window chooses between `bw send` and the built-in client. Each needle
+    /// is still confined to exactly one named module -- the call to the
+    /// module that performs it, the thread boundary to the module that
+    /// spawns it -- so the seals assert what they always did.
+    pub(super) fn send_tasks_module() -> String {
+        let source = production();
+        let head = concat!("mod send_", "tasks {");
+        let at = source
+            .rfind(head)
+            .expect("`mod send_tasks` is not in this file's production");
+        let after = &source[at..];
+        let code = code_braces_only(after);
+        let mut depth = 0i32;
+        for (offset, ch) in code.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return after[..offset + 1].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`mod send_tasks` is never closed");
+    }
+
     fn sealed_module() -> String {
         let source = production();
         let head = concat!("mod send_delete_", "thread {");
@@ -30285,10 +30380,25 @@ mod send_delete_wiring {
              containment assertion here is vacuous"
         );
 
-        for (needle, defined_in_send_rs) in [
-            (concat!("cli_send_", "delete"), 1usize),
-            (concat!("real_send_", "delete"), 0),
-            (concat!("spawn_send_delete_", "with"), 0),
+        // **Two blocks, and which one a needle belongs in is the structural
+        // change this pin records.** `cli_send_delete` -- the blocking call
+        // itself -- is the CLI implementation of `send_tasks::SendTasks`, in
+        // the one module that chooses between `bw send` and the built-in
+        // client for all four Sends operations. `real_send_delete` and
+        // `spawn_send_delete_with`, which are the thread boundary and nothing
+        // else, stayed here. Every needle is still confined to exactly ONE
+        // named module, which is the whole of what this test ever asserted.
+        let tasks = code_braces_only(&send_tasks_module());
+        assert!(
+            tasks.len() > 200,
+            "control: the `mod send_tasks` slice is only {} bytes, which is not a module's \
+             worth",
+            tasks.len()
+        );
+        for (needle, defined_in_send_rs, in_send_tasks) in [
+            (concat!("cli_send_", "delete"), 1usize, true),
+            (concat!("real_send_", "delete"), 0, false),
+            (concat!("spawn_send_delete_", "with"), 0, false),
         ] {
             let total: usize = files
                 .iter()
@@ -30309,7 +30419,11 @@ mod send_delete_wiring {
                     }
                 })
                 .sum();
-            let inside = block.matches(needle).count();
+            let (home, inside) = if in_send_tasks {
+                ("mod send_tasks", tasks.matches(needle).count())
+            } else {
+                ("mod send_delete_thread", block.matches(needle).count())
+            };
             assert!(
                 total > 0,
                 "control: {needle:?} is not in production outside `send.rs` at all, so \
@@ -30318,7 +30432,7 @@ mod send_delete_wiring {
             assert_eq!(
                 inside, total,
                 "{needle:?} occurs {total} times in the crate's production outside `send.rs` \
-                 but only {inside} of them are inside `mod send_delete_thread`. A mention \
+                 but only {inside} of them are inside `{home}`. A mention \
                  outside that block -- in the frame closure or in a sibling file -- is a \
                  blocking `bw send delete` reachable from the eframe thread, where it freezes \
                  the window, titlebar included, for up to sixty seconds"
@@ -30337,19 +30451,27 @@ mod send_delete_wiring {
     /// and it would still pass the pointer test on its own terms.
     #[test]
     fn the_revoke_module_mints_no_job_of_its_own() {
-        let block = code_braces_only(&sealed_module());
+        // **The block read is `mod send_tasks`**, which is where the revoke's
+        // `bw send` child is now started -- the CLI implementation of
+        // `send_tasks::SendTasks`. The claim is unchanged and so is its
+        // reason; only the module that has to satisfy it moved. It is
+        // additionally stronger than the version that read
+        // `mod send_delete_thread`: that block held the revoke alone, and this
+        // one holds all four `bw send` children this window can start, so a
+        // second cell minted for ANY of them fails here.
+        let block = code_braces_only(&send_tasks_module());
         assert!(
             block.contains(concat!("send_fetch_thread::sends_", "job()")),
-            "`mod send_delete_thread` no longer names the Sends job"
+            "`mod send_tasks` no longer names the Sends job"
         );
         assert!(
             !block.contains("OnceLock"),
-            "`mod send_delete_thread` mints a process-lifetime cell of its own; the revoke is \
+            "`mod send_tasks` mints a process-lifetime cell of its own; the revoke is \
              the same account's `bw send` child as the fetch and belongs in the same job"
         );
         assert!(
             !block.contains(concat!("KillOnCloseJob::", "new")),
-            "`mod send_delete_thread` creates a job of its own"
+            "`mod send_tasks` creates a job of its own"
         );
         // And `None` is never written as the job.
         assert!(
@@ -31818,10 +31940,23 @@ mod send_create_wiring {
              containment assertion here is vacuous"
         );
 
-        for (needle, defined_in_send_rs) in [
-            (concat!("cli_send_", "create"), 1usize),
-            (concat!("real_send_", "create"), 0),
-            (concat!("spawn_send_create_", "with"), 0),
+        // Two blocks, for the reason
+        // `send_delete_wiring::every_mention_of_the_blocking_delete_is_sealed_inside_its_own_module`
+        // records: the blocking call is the CLI implementation of
+        // `send_tasks::SendTasks` and the thread boundary stayed here, and
+        // each needle is still confined to exactly one named module.
+        let tasks =
+            send_delete_wiring::code_braces_only(&send_delete_wiring::send_tasks_module());
+        assert!(
+            tasks.len() > 200,
+            "control: the `mod send_tasks` slice is only {} bytes, which is not a module's \
+             worth",
+            tasks.len()
+        );
+        for (needle, defined_in_send_rs, in_send_tasks) in [
+            (concat!("cli_send_", "create"), 1usize, true),
+            (concat!("real_send_", "create"), 0, false),
+            (concat!("spawn_send_create_", "with"), 0, false),
         ] {
             let total: usize = files
                 .iter()
@@ -31842,7 +31977,11 @@ mod send_create_wiring {
                     }
                 })
                 .sum();
-            let inside = block.matches(needle).count();
+            let (home, inside) = if in_send_tasks {
+                ("mod send_tasks", tasks.matches(needle).count())
+            } else {
+                ("mod send_create_thread", block.matches(needle).count())
+            };
             assert!(
                 total > 0,
                 "control: {needle:?} is not in production outside `send.rs` at all, so \
@@ -31851,7 +31990,7 @@ mod send_create_wiring {
             assert_eq!(
                 inside, total,
                 "{needle:?} occurs {total} times in the crate's production outside \
-                 `send.rs` but only {inside} of them are inside `mod send_create_thread`. A \
+                 `send.rs` but only {inside} of them are inside `{home}`. A \
                  mention outside that block -- in the frame closure or in a sibling file -- \
                  is a blocking `bw send create` reachable from the eframe thread, where it \
                  freezes the window, titlebar included, for up to sixty seconds"
@@ -31870,15 +32009,26 @@ mod send_create_wiring {
     /// and it would still pass the pointer test on its own terms.
     #[test]
     fn the_create_module_mints_no_job_of_its_own() {
-        let block = send_delete_wiring::code_braces_only(&sealed_create_module());
+        // `mod send_tasks`, for
+        // [`super::send_delete_wiring::the_revoke_module_mints_no_job_of_its_own`]'s
+        // recorded reason: that is where the create's `bw send` child is
+        // started now.
+        let block =
+            send_delete_wiring::code_braces_only(&send_delete_wiring::send_tasks_module());
         assert!(
             block.contains(concat!("send_fetch_thread::sends_", "job()")),
-            "`mod send_create_thread` no longer names the Sends job"
+            "`mod send_tasks` no longer names the Sends job"
         );
         assert!(
             !block.contains(concat!("Once", "Lock")),
-            "`mod send_create_thread` mints a cell of its own, which is a second handle held \
+            "`mod send_tasks` mints a cell of its own, which is a second handle held \
              for one purpose"
+        );
+        // And `None` is never written as the job for the publish.
+        assert!(
+            !block.contains(concat!("cli_send_create(", "None")),
+            "the create is started with no job at all, so an orphaned `bw send create` would \
+             outlive this process with the vault session in its environment"
         );
     }
 
@@ -31967,10 +32117,23 @@ mod send_create_wiring {
              containment assertion here is vacuous"
         );
 
-        for (needle, defined_in_send_rs) in [
-            (concat!("cli_send_", "receive"), 1usize),
-            (concat!("real_send_", "receive"), 0),
-            (concat!("spawn_send_receive_", "with"), 0),
+        // Two blocks, for
+        // `send_delete_wiring::every_mention_of_the_blocking_delete_is_sealed_inside_its_own_module`'s
+        // recorded reason: the blocking call is the CLI implementation of
+        // `send_tasks::SendTasks` and the thread boundary stayed here, and
+        // each needle is still confined to exactly one named module.
+        let tasks =
+            send_delete_wiring::code_braces_only(&send_delete_wiring::send_tasks_module());
+        assert!(
+            tasks.len() > 200,
+            "control: the `mod send_tasks` slice is only {} bytes, which is not a module's \
+             worth",
+            tasks.len()
+        );
+        for (needle, defined_in_send_rs, in_send_tasks) in [
+            (concat!("cli_send_", "receive"), 1usize, true),
+            (concat!("real_send_", "receive"), 0, false),
+            (concat!("spawn_send_receive_", "with"), 0, false),
         ] {
             let total: usize = files
                 .iter()
@@ -31991,7 +32154,11 @@ mod send_create_wiring {
                     }
                 })
                 .sum();
-            let inside = block.matches(needle).count();
+            let (home, inside) = if in_send_tasks {
+                ("mod send_tasks", tasks.matches(needle).count())
+            } else {
+                ("mod send_receive_thread", block.matches(needle).count())
+            };
             assert!(
                 total > 0,
                 "control: {needle:?} is not in production outside `send.rs` at all, so \
@@ -32000,7 +32167,7 @@ mod send_create_wiring {
             assert_eq!(
                 inside, total,
                 "{needle:?} occurs {total} times in the crate's production outside \
-                 `send.rs` but only {inside} of them are inside `mod send_receive_thread`. A \
+                 `send.rs` but only {inside} of them are inside `{home}`. A \
                  mention outside that block -- in the frame closure, in `record_ui` beside \
                  the Fetch button, or in any other sibling file -- is a blocking \
                  `bw send receive` reachable from the eframe thread, where it freezes the \
@@ -32014,15 +32181,26 @@ mod send_create_wiring {
     /// restated for the fourth `bw send` child this window can start.
     #[test]
     fn the_receive_module_mints_no_job_of_its_own() {
-        let block = send_delete_wiring::code_braces_only(&sealed_receive_module());
+        // `mod send_tasks`, for
+        // [`super::send_delete_wiring::the_revoke_module_mints_no_job_of_its_own`]'s
+        // recorded reason: that is where the receive's `bw send` child is
+        // started now.
+        let block =
+            send_delete_wiring::code_braces_only(&send_delete_wiring::send_tasks_module());
         assert!(
             block.contains(concat!("send_fetch_thread::sends_", "job()")),
-            "`mod send_receive_thread` no longer names the Sends job"
+            "`mod send_tasks` no longer names the Sends job"
         );
         assert!(
             !block.contains(concat!("Once", "Lock")),
-            "`mod send_receive_thread` mints a cell of its own, which is a second handle \
+            "`mod send_tasks` mints a cell of its own, which is a second handle \
              held for one purpose"
+        );
+        // And `None` is never written as the job for the fetch.
+        assert!(
+            !block.contains(concat!("cli_send_receive(", "None")),
+            "the receive is started with no job at all, so an orphaned `bw send receive` \
+             would outlive this process"
         );
     }
 

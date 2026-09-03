@@ -4354,6 +4354,76 @@ mod source_pins {
     /// way `the_item_list_is_drawn_only_inside_the_not_sends_gate` slices its
     /// gate, so the pins below can say "inside there and nowhere else" rather
     /// than "somewhere in the file".
+    /// `mod send_tasks`'s text -- the module that chooses between `bw send`
+    /// and the built-in client, and holds both implementations.
+    ///
+    /// [`sealed_module`]'s body with one opener changed, and a separate
+    /// function rather than a parameterised one for that function's reason: a
+    /// helper taking the opener as an argument is a helper a caller can be
+    /// handed the wrong opener for, which would slice the other module and
+    /// assert about it under this one's name.
+    fn send_tasks_module() -> String {
+        let production = production();
+        let opener = concat!("mod send_", "tasks {\r\n");
+        assert_eq!(
+            production.matches(opener).count(),
+            1,
+            "{opener:?} is not in production exactly once -- the module the four Sends \
+             backends are chosen in is gone, or there are two of them"
+        );
+        let start = production.find(opener).expect("counted just above");
+        let rest = &production[start + opener.len()..];
+        let end = rest
+            .find("\r\n}\r\n")
+            .expect("`mod send_tasks` has no closing brace at column zero");
+        rest[..end].to_string()
+    }
+
+    /// One `impl .. {` block inside [`send_tasks_module`], by its header line.
+    ///
+    /// The header is matched whole and must occur exactly once, and the block
+    /// ends at the first `}` written at four spaces -- which inside that
+    /// module is the impl's own close and nothing else, because every method
+    /// and every `match` inside one is indented further.
+    fn tasks_impl(header: &str) -> String {
+        // A trailing newline, because the module slice stops at its own last
+        // `}` -- so without one the LAST impl block in it has no closer to
+        // find and this panics on the block it is most often asked for.
+        let module = format!("{}\r\n", send_tasks_module());
+        let opener = format!("    {header} {{\r\n");
+        assert_eq!(
+            module.matches(&opener).count(),
+            1,
+            "{opener:?} is not in `mod send_tasks` exactly once"
+        );
+        let start = module.find(&opener).expect("counted just above");
+        let rest = &module[start + opener.len()..];
+        let end = rest
+            .find("\r\n    }\r\n")
+            .expect("that impl block has no closing brace at four spaces");
+        rest[..end].to_string()
+    }
+
+    /// [`body_of`], but reading a REGION rather than the whole production --
+    /// which is what makes it usable on `fn list(`, a name three items in
+    /// `mod send_tasks` share (the trait's declaration and the two impls').
+    fn body_in(region: &str, name: &str, indent: &str) -> String {
+        // A trailing newline, for [`tasks_impl`]'s reason: a region slice
+        // stops at its own last `}`, so the LAST item in one would have no
+        // closer to find and this would panic on it.
+        let region = &format!("{region}\r\n");
+        let opener = format!("fn {name}(");
+        let start = region
+            .find(&opener)
+            .unwrap_or_else(|| panic!("`{name}` is gone from that region"));
+        let rest = &region[start + opener.len()..];
+        let closer = format!("\r\n{indent}}}\r\n");
+        let end = rest.find(&closer).unwrap_or_else(|| {
+            panic!("`{name}` has no closing brace at the indentation {indent:?}")
+        });
+        rest[..end].to_string()
+    }
+
     fn sealed_module() -> String {
         let production = production();
         let opener = concat!("mod send_fetch_", "thread {\r\n");
@@ -4409,139 +4479,182 @@ mod source_pins {
         );
     }
 
-    /// **`real_send_list` is the whole of the fetch, as an equality.**
+    /// **The fetch is four equalities now, and that is the point.**
     ///
-    /// This replaces a set of NEEDLES, and the replacement is the point. The
-    /// old pin required the body to *contain*
-    /// `CliSendRunner::with_session(None, data_dir.as_deref(), session)`,
-    /// which pins the SPELLING of an identifier and says nothing about what
-    /// that identifier is bound to. Its own doc argued needles were safe here
-    /// because "`real_send_list` is a plain function with no closure in it,
-    /// so there is no inside and outside to move code between" -- reasoning
-    /// about code MOTION, which does not cover REBINDING. Measured on
-    /// `49f0f51`, inserting one statement above the pinned line:
+    /// This used to be ONE whole-body equality over `real_send_list`, whose
+    /// body was a `backend_policy::selected()` branch with a `bw send list`
+    /// under it. Three more functions in three other modules carried the same
+    /// branch, written out longhand, and six defects shipped in a day from
+    /// exactly that duplication. The branch lives once now, in
+    /// `send_tasks::tasks_for`, and the two arms are the two implementations
+    /// of `send_tasks::SendTasks`.
     ///
-    /// ```ignore
-    /// let session = "";
-    /// let runner = crate::send::CliSendRunner::with_session(None, .., session);
-    /// ```
+    /// So the single equality becomes four, and together they assert strictly
+    /// more than it did:
     ///
-    /// left every needle word-perfect and the suite green at 2097 passed / 0
-    /// failed, while production set `BW_SESSION=""` on every `bw send list`
-    /// and a real vault answered `Locked` -- the exact bug `07f0e09` is named
-    /// for fixing.
+    ///  1. `real_send_list` is the delegation and nothing else -- no branch of
+    ///     its own, nothing hoisted above the call, and the session it was
+    ///     handed is the session that goes in.
+    ///  2. `tasks_for` is exactly one `selected()` gate over the two
+    ///     implementations. This is the only place the choice is made, for
+    ///     all four Sends operations.
+    ///  3. The CLI implementation is exactly one `bw send list`, in this
+    ///     window's job, for the active account, with the session the value
+    ///     was constructed with.
+    ///  4. The built-in implementation is exactly one call to the REST
+    ///     client, and it cannot reach a `bw` because it does not name one.
     ///
-    /// So this is the same shape as
-    /// [`spawn_send_list_only_hands_the_real_fetch_to_the_tested_spawner`],
-    /// which the reviewer attacked and could not defeat: a whole-body
-    /// equality, where any inserted statement, any rebinding, any extra
-    /// argument and any swapped callee all change the compared string.
+    /// Each is a whole-body equality for the reason the one it replaces
+    /// records: a needle pins the SPELLING of an identifier and says nothing
+    /// about what it is bound to, and one inserted `let session = "";` above
+    /// a pinned line was measured to leave every needle word-perfect while
+    /// production set `BW_SESSION=""` on every `bw send list`.
     ///
     /// **Comments are blanked first**, so this pins the code and not the
-    /// prose around it -- the body carries a long comment about why the job
-    /// is there, and an equality that included it would fail on a typo fix.
+    /// prose around it.
     ///
     /// **It is not the only guard, and deliberately.** An equality still only
     /// says the text is what it was; it cannot say what that text DOES.
     /// [`the_real_fetch_runs_bw_send_list_in_a_job_with_the_session_it_was_given`]
-    /// says that, by running this very function. The two fail to different
-    /// mutations -- a body rewritten to something equivalent-but-wrong fails
-    /// here; a `sends_job` or `with_session` that quietly stopped carrying
-    /// what it names fails there -- and neither subsumes the other.
+    /// says that, by running the production function itself.
     #[test]
     fn the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account() {
-        let expected = squashed(&format!(
-            // **Re-pinned by `2026-08-30-sends-without-the-cli`, and the addition
-            // is the backend branch and nothing else.** The `bw serve` arm below
-            // it is textually what it was, which is the property that matters:
-            // this equality is what says the CLI path did not change, and it now
-            // also says a REST account returns BEFORE reaching it. The branch
-            // reads `backend_policy::selected()` here rather than taking it from
-            // the frame for the same reason `active_data_dir` is read here -- an
-            // account switch replaces both between the frame and the thread.
-            "session: &str, ) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> \
-             {{ if crate::backend_policy::selected() == \
-             crate::backend_policy::VaultBackendChoice::DirectRest {{ \
-             return crate::rest::send::list_on_active_account(); }} \
-             let data_dir = crate::bw_path::active_data_{}(); \
-             crate::send::cli_send_{}({}(), data_dir.as_deref(), session)",
-            "dir",
-            "list",
-            concat!("sends_", "job"),
-        ));
-        let actual = squashed(&sanitized(&body_of(concat!("real_send_", "list"), "    ")));
+        // 1. The worker: the delegation and nothing else.
         assert_eq!(
-            actual, expected,
-            "`real_send_list` is no longer exactly one `bw send list`, in this window's job, \
-             for the active account, with the session it was handed. Anything at all added, \
-             removed or rebound here fails -- including a `let session = ..;` above the call, \
-             which every needle-shaped pin over this function was measured to allow"
+            squashed(&sanitized(&body_of(concat!("real_send_", "list"), "    "))),
+            squashed(
+                "session: &str, ) -> Result<Vec<crate::send::SendSummary>, \
+                 crate::send::SendError> { super::send_tasks::tasks_for(Some(session)).list()"
+            ),
+            "`real_send_list` is no longer exactly the delegation to the chosen backend with \
+             the session it was handed. A branch written back into this function is a fifth \
+             copy of the decision this refactor exists to hold in one place; a `let session = \
+             ..` above the call is the measured defect that retired the needle-shaped pin \
+             this equality replaced"
         );
+
+        // 2. The gate: one `selected()` read, and the whole of the choice.
+        assert_eq!(
+            squashed(&sanitized(&body_in(&send_tasks_module(), "tasks_for", "    "))),
+            squashed(
+                "session: Option<&str>) -> Box<dyn SendTasks + '_> { if \
+                 crate::backend_policy::selected() == \
+                 crate::backend_policy::VaultBackendChoice::DirectRest { return \
+                 Box::new(DirectRestSendTasks); } Box::new(CliSendTasks { session })"
+            ),
+            "`tasks_for` is no longer exactly one `selected()` gate over the two \
+             implementations. Either a `bw serve` account can now be sent down the REST arm, \
+             or a REST account can reach `bw` -- and this is the ONE place either could \
+             happen for any of the four Sends operations"
+        );
+
+        // 3. The CLI implementation.
+        assert_eq!(
+            squashed(&sanitized(&body_in(
+                &tasks_impl("impl SendTasks for CliSendTasks<'_>"),
+                "list",
+                "        ",
+            ))),
+            squashed(&format!(
+                "&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> {{ \
+                 let data_dir = Self::data_{}(); crate::send::cli_send_{}(Self::job(), \
+                 data_dir.as_deref(), self.session())",
+                "dir", "list",
+            )),
+            "the CLI Sends fetch is no longer exactly one `bw send list`, in this window's \
+             job, for the active account, with the session the value was constructed with"
+        );
+
+        // 4. The built-in implementation, which names no `bw` at all.
+        assert_eq!(
+            squashed(&sanitized(&body_in(
+                &tasks_impl("impl SendTasks for DirectRestSendTasks"),
+                "list",
+                "        ",
+            ))),
+            squashed(
+                "&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError> { \
+                 crate::rest::send::list_on_active_account()"
+            ),
+            "the built-in Sends fetch is no longer exactly one call to the REST client"
+        );
+
         assert_eq!(
             production().matches(concat!("crate::send::cli_send_", "list(")).count(),
             1,
-            "`cli_send_list` is called somewhere other than `real_send_list` -- and every \
-             other caller is unproven ground for which thread it runs on"
+            "`cli_send_list` is called somewhere other than the CLI implementation of \
+             `SendTasks` -- and every other caller is unproven ground for which thread it \
+             runs on and which backend the account is on"
         );
     }
 
-    /// **`real_send_receive` is the whole of the fetch, as an equality.**
-    ///
+    /// **The receive is four equalities**, on
     /// [`the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account`]'s
-    /// shape and its reason, applied to the receive now that it has two arms.
-    /// A whole-body equality rather than a set of needles because a needle
-    /// pins the SPELLING of an identifier and says nothing about what it is
-    /// bound to, nor about what runs before it: the measured defect that
-    /// retired the needle version of the list's pin was one inserted statement
-    /// above the pinned line, which left every needle word-perfect.
+    /// terms and for its reasons.
     ///
-    /// Three properties, and the equality holds all three at once:
+    /// The three properties the single equality this replaces held are all
+    /// still held, and each is now held by a smaller, more specific string:
     ///
-    ///  1. **A `DirectRest` account returns BEFORE the CLI arm.** Not merely
-    ///     that a branch exists -- that the `return` is inside it, so no
-    ///     `bw.exe` is reached and `RECEIVE_NEEDS_THE_CLI` cannot be produced.
-    ///  2. **The `bw serve` arm is textually what it was.** This equality is
-    ///     what says the CLI path did not change while a second one was added
-    ///     beside it, which is the whole promise made to a user on the
-    ///     official CLI.
+    ///  1. **A `DirectRest` account never reaches the CLI arm.** It is not a
+    ///     `return` inside a branch any more; the two arms are two types, and
+    ///     the built-in one does not name `cli_send_receive` at all.
+    ///  2. **The `bw serve` arm is textually what it was.** The CLI
+    ///     implementation's body is the old CLI half, word for word, less the
+    ///     `active_data_dir()` call that moved to `Self::data_dir()`.
     ///  3. **Neither arm is handed anything of the account's.** A receive is
-    ///     addressed by a link; the link is the credential. A parameter or a
-    ///     `let` that brought one in changes this string.
-    ///
-    /// Comments are blanked first, so this pins the code and not the prose
-    /// around it -- the body carries a long comment about the branch, and an
-    /// equality that included it would fail on a typo fix.
+    ///     addressed by a link; the link is the credential. `real_send_receive`
+    ///     passes `None` for the session and that is pinned here, so a
+    ///     credential brought into either arm changes one of these strings.
     #[test]
     fn the_delegated_receive_reads_the_link_on_the_backend_the_policy_chose() {
-        let expected = squashed(&format!(
-            "link: &str) -> RecordImportReport {{ \
-             if crate::backend_policy::selected() == \
-             crate::backend_policy::VaultBackendChoice::DirectRest {{ \
-             return match crate::rest::send::{}(link, None) {{ \
-             Ok(body) => RecordImportReport::Read(Box::new( \
-             crate::record::payload::read_json(&body), )), \
-             Err(error) => RecordImportReport::Failed(error.user_message().to_string()), }}; }} \
-             let data_dir = crate::bw_path::active_data_{}(); \
-             match crate::send::cli_send_{}({}(), data_dir.as_deref(), link, None) {{ \
-             Ok(body) => RecordImportReport::Read(Box::new( \
-             crate::record::payload::read_json(&body), )), \
-             Err( error @ (crate::send::SendError::NoVerifiedCli(_) \
-             | crate::send::SendError::SpawnFailed(_)), \
-             ) => RecordImportReport::Failed(format!( \" \", \
-             crate::vault_window::send_ui::RECEIVE_NEEDS_THE_CLI, error.user_message() )), \
-             Err(error) => RecordImportReport::Failed(error.user_message().to_string()), }}",
-            concat!("receive_on_active_", "account"),
-            "dir",
-            "receive",
-            concat!("receive_", "job"),
-        ));
-        let actual = squashed(&sanitized(&body_of(concat!("real_send_", "receive"), "    ")));
         assert_eq!(
-            actual, expected,
-            "`real_send_receive` is no longer exactly one link read on the chosen backend. \
-             Anything at all added, removed or rebound here fails -- including a credential \
-             brought into either arm, and including a `DirectRest` branch that falls THROUGH \
-             to the CLI instead of returning"
+            squashed(&sanitized(&body_of(concat!("real_send_", "receive"), "    "))),
+            squashed(
+                "link: &str) -> RecordImportReport { \
+                 super::send_tasks::tasks_for(None).receive(link)"
+            ),
+            "`real_send_receive` is no longer exactly the delegation to the chosen backend \
+             with NO session. Anything at all added, removed or rebound here fails -- \
+             including a credential brought in, which a receive has no use for on either \
+             backend"
+        );
+
+        assert_eq!(
+            squashed(&sanitized(&body_in(
+                &tasks_impl("impl SendTasks for CliSendTasks<'_>"),
+                "receive",
+                "        ",
+            ))),
+            squashed(&format!(
+                "&self, link: &str) -> RecordImportReport {{ let data_dir = Self::data_{}(); \
+                 match crate::send::cli_send_{}(Self::job(), data_dir.as_deref(), link, None) \
+                 {{ Ok(body) => RecordImportReport::Read(Box::new( \
+                 crate::record::payload::read_json(&body), )), Err( error @ \
+                 (crate::send::SendError::NoVerifiedCli(_) | \
+                 crate::send::SendError::SpawnFailed(_)), ) => \
+                 RecordImportReport::Failed(format!( \" \", \
+                 crate::vault_window::send_ui::RECEIVE_NEEDS_THE_CLI, error.user_message() \
+                 )), Err(error) => RecordImportReport::Failed(error.user_message().to_string()), }}",
+                "dir", "receive",
+            )),
+            "the CLI receive is no longer exactly one `bw send receive`, in this window's \
+             job, for the active account, with the link and no session"
+        );
+
+        assert_eq!(
+            squashed(&sanitized(&body_in(
+                &tasks_impl("impl SendTasks for DirectRestSendTasks"),
+                "receive",
+                "        ",
+            ))),
+            squashed(&format!(
+                "&self, link: &str) -> RecordImportReport {{ match crate::rest::send::{}(link, \
+                 None) {{ Ok(body) => RecordImportReport::Read(Box::new( \
+                 crate::record::payload::read_json(&body), )), Err(error) => \
+                 RecordImportReport::Failed(error.user_message().to_string()), }}",
+                concat!("receive_on_active_", "account"),
+            )),
+            "the built-in receive is no longer exactly one link read against the REST client"
         );
 
         // The two arms are reached from nowhere else. A second caller of
@@ -4550,14 +4663,16 @@ mod source_pins {
         assert_eq!(
             production().matches(concat!("crate::send::cli_send_", "receive(")).count(),
             1,
-            "`cli_send_receive` is called somewhere other than `real_send_receive`"
+            "`cli_send_receive` is called somewhere other than the CLI implementation of \
+             `SendTasks`"
         );
         assert_eq!(
             production()
                 .matches(concat!("crate::rest::send::receive_on_active_", "account("))
                 .count(),
             1,
-            "`receive_on_active_account` is called somewhere other than `real_send_receive`"
+            "`receive_on_active_account` is called somewhere other than the built-in \
+             implementation of `SendTasks`"
         );
     }
 
@@ -4565,44 +4680,103 @@ mod source_pins {
     /// the built-in client.**
     ///
     /// The sentence itself does not move -- a user on `bw serve` is not
-    /// affected by this branch at all, and
+    /// affected by this at all, and
     /// [`the_receive_sentence_says_what_is_missing_without_condemning_what_is_not`]
-    /// still holds its wording. What is new is where it can be produced from,
-    /// and that is a property of the body above rather than of the string, so
-    /// it is asserted against the same two slices.
+    /// still holds its wording. What is asserted here is where it can be
+    /// produced from.
     ///
-    /// Control, and it is the half that makes this mean anything: the sentence
-    /// IS still produced in the `bw serve` arm, found by the same read. A slice
-    /// cut wrong would report both halves as satisfied.
+    /// **The cut is a type boundary now, not a `split_once` on the first
+    /// statement of the second arm.** The two arms were two halves of one
+    /// function body and had to be separated by finding a line inside one of
+    /// them; they are two `impl` blocks now, so the slice cannot land in the
+    /// wrong place. The control -- that the sentence IS still produced on the
+    /// CLI side -- is kept exactly as it was, because a slice that found
+    /// nothing would otherwise report both halves as satisfied.
     #[test]
     fn the_cli_sentence_survives_for_the_cli_and_is_gone_for_the_built_in_client() {
-        let body = sanitized(&body_of(concat!("real_send_", "receive"), "    "));
-        let (direct, cli) = body
-            .split_once(concat!("let data_dir = crate::bw_path::active_data_", "dir"))
-            .expect("control: the CLI arm's first statement is gone, so this test cut nothing");
+        let cli = sanitized(&tasks_impl("impl SendTasks for CliSendTasks<'_>"));
+        let direct = sanitized(&tasks_impl("impl SendTasks for DirectRestSendTasks"));
 
         // **The control.** The sentence is produced in the CLI half, so the
         // absence below is a statement about live code and not about a needle
         // that matches nothing anywhere.
         assert!(
             cli.contains("RECEIVE_NEEDS_THE_CLI"),
-            "control: the `bw serve` arm no longer names RECEIVE_NEEDS_THE_CLI at all, so the \
-             assertion below is searching text it could never have found"
+            "control: the `bw serve` implementation no longer names RECEIVE_NEEDS_THE_CLI at \
+             all, so the assertion below is searching text it could never have found"
         );
         assert!(
             !direct.contains("RECEIVE_NEEDS_THE_CLI"),
             "the built-in client can reach the sentence that tells a user to install \
              Bitwarden's command-line tool. It does not need one: it reads the link itself"
         );
-        // And the built-in half reaches no `bw` at all -- the sentence is the
-        // symptom, the spawn is the thing.
+        // And the built-in implementation reaches no `bw` at all -- the
+        // sentence is the symptom, the spawn is the thing.
         assert!(
-            !direct.contains(concat!("cli_send_", "receive")),
-            "the built-in client arm reaches a `bw send receive`"
+            !direct.contains(concat!("cli_send_", "")),
+            "the built-in implementation of `SendTasks` names a `bw send` entry point"
         );
         assert!(
             cli.contains(concat!("cli_send_", "receive")),
-            "control: the `bw serve` arm no longer spawns a `bw send receive`"
+            "control: the `bw serve` implementation no longer spawns a `bw send receive`"
+        );
+    }
+
+    /// **The Sends backend is chosen in exactly one place, and these are all
+    /// the places that can ask.**
+    ///
+    /// `send_tasks::tasks_for` is the only way to obtain a `SendTasks`, so
+    /// this census over the whole crate's production is what makes the "one
+    /// swap point" claim checkable rather than asserted. Five mentions in
+    /// `mod.rs`: the definition, and the four workers -- the list, the create,
+    /// the revoke and the receive. Nowhere else at all, and in particular not
+    /// in the frame closure, where any of the four would block the eframe
+    /// thread on a `bw` child for up to sixty seconds.
+    ///
+    /// A SIXTH mention is either a fifth caller, which is unproven ground for
+    /// which thread it runs on, or a second definition. A FIFTH operation is
+    /// meant to be added to the trait, where both implementations must answer
+    /// it or the crate does not compile -- not by asking here again.
+    #[test]
+    fn the_sends_backend_is_chosen_in_exactly_one_place() {
+        let files = crate_sources();
+        assert!(
+            files.len() > 30,
+            "control: the crate walk found only {} source files, which is not this crate",
+            files.len()
+        );
+        let needle = concat!("tasks_", "for(");
+        let seen: Vec<(&str, usize)> = files
+            .iter()
+            .map(|(path, text)| {
+                (path.as_str(), sanitized(&production_region(text)).matches(needle).count())
+            })
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        assert_eq!(
+            seen,
+            vec![("vault_window/mod.rs", 5)],
+            "{needle:?} is written in the crate's production at {seen:?}, not the one \
+             definition plus the four workers that are the whole of how a `SendTasks` can be \
+             obtained. A fifth caller is a Sends operation on unproven ground -- which \
+             thread it runs on, and which backend it reaches"
+        );
+
+        // And the module exports nothing but the trait and the gate. A
+        // `pub(super) fn blocking_send_list()` added inside it would keep the
+        // count above unchanged and hand the frame closure a `bw` child back.
+        let module = sanitized(&send_tasks_module());
+        let exports: Vec<String> = module
+            .split_whitespace()
+            .filter(|t| t.starts_with("pub"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            exports,
+            vec!["pub(super)".to_string(), "pub(super)".to_string()],
+            "`mod send_tasks` exports {exports:?}, not exactly the trait and the gate. \
+             Everything else in that module is a blocking `bw send` child or the value that \
+             holds the vault session, and neither is anybody else's to name"
         );
     }
 
@@ -5621,11 +5795,28 @@ mod source_pins {
         // COUNTS over `send.rs` alone, which is the half of this pin that
         // catches a second construction written in that file; `cli_send_list`
         // takes over as the seal needle.
-        for (needle, defined_in_send_rs, is_seal_needle) in [
-            (concat!("cli_send_", "list"), 1usize, true),
-            (concat!("real_send_", "list"), 0, true),
-            (concat!("spawn_send_list_", "with"), 0, true),
-            (concat!("list_", "sends"), 2, false),
+        // **`cli_send_list` is sealed in a DIFFERENT block from the other
+        // two, and that split is the structural change this pin records.**
+        // The blocking call is the CLI implementation of
+        // `send_tasks::SendTasks` -- the one module in which this window
+        // chooses between `bw send` and the built-in client for all four
+        // Sends operations -- while `real_send_list` and
+        // `spawn_send_list_with`, which are the thread boundary and nothing
+        // else, stayed in `mod send_fetch_thread`. Every needle is still
+        // confined to exactly ONE named module, which is the whole of what
+        // this test ever asserted; the fourth column says which.
+        let tasks = sanitized(&send_tasks_module());
+        assert!(
+            tasks.len() > 200,
+            "control: the `mod send_tasks` slice is only {} bytes, which is not a module's \
+             worth",
+            tasks.len()
+        );
+        for (needle, defined_in_send_rs, is_seal_needle, in_send_tasks) in [
+            (concat!("cli_send_", "list"), 1usize, true, true),
+            (concat!("real_send_", "list"), 0, true, false),
+            (concat!("spawn_send_list_", "with"), 0, true, false),
+            (concat!("list_", "sends"), 2, false, false),
             // **Both of these moved by one when `cli_send_delete` landed**,
             // and the move is the deliberate decision this comment records
             // rather than a number that drifted: `cli_send_delete`'s body
@@ -5645,7 +5836,7 @@ mod source_pins {
             // `impl SendRunner for CliSendRunner<'_>` and the THREE entry
             // points -- the definitions and the three pinned constructions,
             // and no fourth.
-            (concat!("CliSendRunner", "::with_session"), 3, false),
+            (concat!("CliSendRunner", "::with_session"), 3, false, false),
             // **Moved by one AGAIN when `cli_send_receive` landed**, and this
             // time on the OTHER constructor, which is the whole of what makes
             // the move worth recording rather than a number that drifted: a
@@ -5655,7 +5846,7 @@ mod source_pins {
             // `pub struct CliSendRunner`, `impl<'a> CliSendRunner<'a>`,
             // `impl SendRunner for CliSendRunner<'_>` and the FOUR entry
             // points, and no fifth.
-            (concat!("CliSendRunner", ""), 7, false),
+            (concat!("CliSendRunner", ""), 7, false, false),
             // **One, and it was zero until the receive landed.** This row used
             // to be the whole of what refused the measured `warm_cache`
             // survivor -- a blocking `bw send list` built from the constructor
@@ -5665,7 +5856,7 @@ mod source_pins {
             // the survivor spelled one more of each than the file accounts
             // for. The single production use is `cli_send_receive`'s, and a
             // second one is a second sessionless blocking child.
-            (concat!("CliSendRunner", "::new"), 1, false),
+            (concat!("CliSendRunner", "::new"), 1, false, false),
             // The revoke's two, on the same terms as `list_sends` and
             // `list_invocation` above. `delete_send` is its definition plus
             // the one call in `cli_send_delete`; `delete_invocation` is its
@@ -5673,8 +5864,8 @@ mod source_pins {
             // of either is a second blocking `bw send delete` written inside
             // the privacy boundary, where the private runner and the private
             // `delete_invocation` are both still in scope.
-            (concat!("delete_", "send"), 2, false),
-            (concat!("delete_", "invocation"), 2, false),
+            (concat!("delete_", "send"), 2, false, false),
+            (concat!("delete_", "invocation"), 2, false, false),
             // **The bypass, counted.** `runner.run(&list_invocation(..))` is
             // a complete blocking `bw send list` that spells neither
             // `list_sends` nor `cli_send_list`; the author documented it for
@@ -5682,7 +5873,7 @@ mod source_pins {
             // used exactly it, one file over. `list_invocation` is private to
             // `crate::send`, so this row and the closure above are together
             // the whole of what refuses a second use of it.
-            (concat!("list_", "invocation"), 2, false),
+            (concat!("list_", "invocation"), 2, false, false),
             // **The create's two, on the same terms as the revoke's pair
             // above.** `create_send` is its definition plus the one call in
             // `cli_send_create`; `plan_to_invocation` is its definition plus
@@ -5693,8 +5884,8 @@ mod source_pins {
             // `list_invocation`: `runner.run(&plan_to_invocation(..))` is a
             // whole blocking publish that spells neither `create_send` nor
             // `cli_send_create`.
-            (concat!("create_", "send"), 2, false),
-            (concat!("plan_to_", "invocation"), 2, false),
+            (concat!("create_", "send"), 2, false, false),
+            (concat!("plan_to_", "invocation"), 2, false, false),
             // **The receive's three, on the same terms as the three families
             // above**, and they are counted HERE rather than sealed here: the
             // seal for the receive is
@@ -5715,9 +5906,9 @@ mod source_pins {
             // `list_invocation` this builder is `pub`, so the count is the
             // only thing standing between it and a second runner built beside
             // it.
-            (concat!("cli_send_", "receive"), 1, false),
-            (concat!("receive_", "send"), 2, false),
-            (concat!("receive_", "invocation"), 2, false),
+            (concat!("cli_send_", "receive"), 1, false, false),
+            (concat!("receive_", "send"), 2, false, false),
+            (concat!("receive_", "invocation"), 2, false, false),
         ] {
             assert_eq!(
                 send_rs.matches(needle).count(),
@@ -5735,7 +5926,11 @@ mod source_pins {
                 continue;
             }
             let total = production.matches(needle).count() - defined_in_send_rs;
-            let inside = block.matches(needle).count();
+            let (home, inside) = if in_send_tasks {
+                ("mod send_tasks", tasks.matches(needle).count())
+            } else {
+                ("mod send_fetch_thread", block.matches(needle).count())
+            };
             assert!(
                 total > 0,
                 "control: {needle:?} is not in production at all, so requiring it to be inside \
@@ -5746,7 +5941,7 @@ mod source_pins {
                 "{needle:?} occurs {total} times in the CRATE's production (every file under \
                  `src`, less the {defined_in_send_rs} definition(s) in `send.rs`) but only \
                  {inside} of them are \
-                 inside `mod send_fetch_thread`. Every mention outside that block -- in \
+                 inside `{home}`. Every mention outside that block -- in \
                  `mod.rs` or in any sibling file, which `pub(super)` admits -- is a blocking \
                  `bw send list` reachable from the eframe frame closure, where it freezes the \
                  window -- titlebar included -- for up to sixty seconds"
