@@ -7626,6 +7626,18 @@ Deskwarden could not start the                      process that draws it. Pleas
         // and that is exactly why the vault frame it rebuilds below is built
         // with a fresh answer rather than with this one.
         let backend_already_running = backend_is_running(&mut est.child);
+        // **The same fact, asked the way the vault frame needs it.**
+        // `backend_already_running` above is the right input to
+        // `needs_backend_start` and the wrong one to hand the window on its
+        // own: on a direct-REST account there is no child and never will be,
+        // so it is `false` forever and the window pays a whole-vault sync to
+        // probe a backend that does not exist. Same decision the UI process
+        // makes, through the same function -- this host is the daemon's
+        // in-process fallback and must not answer it differently.
+        let skip_readiness_wait = backend_policy::may_skip_the_readiness_probe(
+            backend_policy::bw_serve_is_selected(),
+            backend_already_running,
+        );
 
         // Reads don't need `bw serve` at all (the vault frame paints
         // entirely from `cache`); writes and TOTP do. If save-memory mode tore
@@ -7670,7 +7682,7 @@ Deskwarden could not start the                      process that draws it. Pleas
             // Read fresh on every pass, so a timeout changed in the preferences
             // window below governs the window this loop is about to reopen.
             est.settings.auto_lock(),
-            backend_already_running,
+            skip_readiness_wait,
             // Cloned per pass, not once outside the loop: a switch below replaces
             // the state, and the window reopened after it has to offer the account
             // the user just left rather than the one they are now on.
@@ -11870,7 +11882,16 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // Asked of the port rather than of a child handle: this process has no
     // child. `bw serve` is the daemon's, and all this window needs to know is
     // whether it may skip the readiness wait before its first `populate()`.
-    let backend_already_running = backend_is_listening();
+    //
+    // **The port is only half the question**, and on a direct-REST account it
+    // is the wrong half: nothing is listening there and nothing ever will be,
+    // so this alone said "wait for the backend" forever and bought an
+    // eight-second whole-vault sync on every window open. See
+    // `may_skip_the_readiness_probe`.
+    let skip_readiness_wait = backend_policy::may_skip_the_readiness_probe(
+        backend_policy::bw_serve_is_selected(),
+        backend_is_listening(),
+    );
 
     // **What this process does instead of exiting, when the setting says
     // it may stay loaded.**
@@ -12163,7 +12184,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                 session_token.unwrap_or_default(),
                 icon_cache_dir,
                 settings.auto_lock(),
-                backend_already_running,
+                skip_readiness_wait,
                 accounts_state,
                 hide,
                 // **The overlay's *Search vault*, opened over here.** Taken

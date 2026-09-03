@@ -2,16 +2,16 @@
 //!
 //! # What this is
 //!
-//! Every vault operation the app performs goes through one of exactly twenty
-//! calls. Until now those calls were inherent methods on
+//! Every vault operation the app performs goes through one of exactly
+//! twenty-one calls. Until now those calls were inherent methods on
 //! [`crate::vault_bridge::VaultBridge`], the client for the `bw serve`
 //! subprocess, and `VaultCache` stored that concrete type -- so "talk to the
 //! vault" and "talk to `bw serve` over loopback" were the same sentence and
 //! there was no place to say the first without the second.
 //!
 //! [`VaultBackend`] is that place, and it is deliberately nothing more: it is
-//! the existing twenty methods, with the existing signatures, moved behind a
-//! name that does not mention `bw`. `VaultBridge` implements it by delegating
+//! the existing methods, with the existing signatures, moved behind a name
+//! that does not mention `bw`. `VaultBridge` implements it by delegating
 //! to the methods it already had -- **no route, no header, no timeout and no
 //! error mapping changed** in the introduction of this trait. Behaviour is
 //! carried by the impl, and the only impl today is the one that was already
@@ -32,15 +32,15 @@
 //! that needs it, and production code neither knows nor gains a line.
 //!
 //! The `fn`-pointer seams used elsewhere in this crate are the right shape
-//! for *one* injected call; this is twenty that must move together and share
-//! a connection, which is what an object with methods is.
+//! for *one* injected call; this is a score of them that must move together
+//! and share a connection, which is what an object with methods is.
 //!
 //! The cost is dynamic dispatch. It is not a cost worth measuring here: every
 //! one of these calls is an HTTP round trip, or is about to become one.
 //!
 //! # For whoever writes the second backend
 //!
-//! **Eighteen of these twenty operations are vault data.** A backend talking
+//! **All but two of these operations are vault data.** A backend talking
 //! to a Bitwarden server directly can serve them from `GET /api/sync` plus
 //! the cipher and folder write endpoints.
 //!
@@ -65,7 +65,7 @@ use crate::app_match::AppMatch;
 use crate::vault_bridge::{Folder, GenerateRequest, NewItem, VaultBridge, VaultError, VaultItem};
 use zeroize::Zeroizing;
 
-/// The twenty vault operations, as the app performs them.
+/// The twenty-one vault operations, as the app performs them.
 ///
 /// See the module docs for why this is a trait, and for the two operations a
 /// backend that is not `bw serve` has to compute for itself.
@@ -84,6 +84,31 @@ pub trait VaultBackend: Send + Sync {
     fn list_items(&self) -> Result<Vec<VaultItem>, VaultError>;
     fn get_item(&self, id: &str) -> Result<VaultItem, VaultError>;
     fn list_folders(&self) -> Result<Vec<Folder>, VaultError>;
+    /// Both halves of the vault, in **as few round trips as this backend
+    /// needs** -- which is the whole reason it exists beside the two calls
+    /// above rather than being spelled out of them at the call site.
+    ///
+    /// [`crate::vault_cache::VaultCache::populate`] wants items *and*
+    /// folders, always, and it is the only caller. On `bw serve` asking for
+    /// them separately is right and free: two loopback requests to a process
+    /// that already holds the plaintext. On [`crate::rest::backend`] the two
+    /// halves **ride the same `GET /api/sync` payload**, so asking separately
+    /// fetches every cipher on the account twice and decrypts the whole vault
+    /// twice -- six seconds of a measured fifteen, on a 1,668-item account.
+    ///
+    /// **Deliberately not a defaulted method**, though a default of
+    /// `list_items()` then `list_folders()` would compile and would be
+    /// correct for most impls. `CachingBackend` states the rule this trait is
+    /// kept to -- a new method must fail to compile in every impl until
+    /// somebody decides what it means there -- and a default is exactly how
+    /// the one impl that has something better to say would silently keep
+    /// saying the slow thing. The forwarding impls are where that matters
+    /// most: a `CachingBackend` or a `LateBoundBackend` wrapping a
+    /// `RestBackend` would inherit the default, call its own `list_items` and
+    /// its own `list_folders`, and the override underneath would never be
+    /// reached. That is this project's house defect -- a fast path that is
+    /// never arrived at -- and it would be invisible.
+    fn list_vault(&self) -> Result<crate::vault_cache::VaultSnapshot, VaultError>;
     fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<VaultItem, VaultError>;
     fn create_folder(&self, name: &str) -> Result<Folder, VaultError>;
     fn update_folder(&self, id: &str, name: &str) -> Result<Folder, VaultError>;
@@ -131,6 +156,19 @@ impl VaultBackend for VaultBridge {
     }
     fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
         VaultBridge::list_folders(self)
+    }
+    /// **Two calls here, and that is the right answer for this backend.**
+    ///
+    /// `bw serve` has no combined route, and it does not need one: both of
+    /// these are loopback requests against a process that is already holding
+    /// the decrypted vault. This is what `populate` did before `list_vault`
+    /// existed and what it must keep doing here -- the order too, items then
+    /// folders, because the write window `VaultCache::write_back_at_epoch`
+    /// guards is described in terms of it.
+    fn list_vault(&self) -> Result<crate::vault_cache::VaultSnapshot, VaultError> {
+        let items = VaultBridge::list_items(self)?;
+        let folders = VaultBridge::list_folders(self)?;
+        Ok(crate::vault_cache::VaultSnapshot { items, folders })
     }
     fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<VaultItem, VaultError> {
         VaultBridge::set_app_match(self, item, m)
@@ -280,6 +318,16 @@ impl VaultBackend for CachingBackend {
     fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
         self.inner.list_folders()
     }
+    /// Straight through, **as one call**. Forwarding to `self.inner
+    /// .list_vault()` rather than to this type's own `list_items` and
+    /// `list_folders` is the entire point: the inner backend is the only one
+    /// that knows whether its two halves come off one payload, and calling
+    /// the two methods here would throw that answer away. The file cache this
+    /// type consults has nothing to offer a whole-vault read -- it answers
+    /// `get_item` and only `get_item`.
+    fn list_vault(&self) -> Result<crate::vault_cache::VaultSnapshot, VaultError> {
+        self.inner.list_vault()
+    }
     fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<VaultItem, VaultError> {
         self.inner.set_app_match(item, m)
     }
@@ -343,6 +391,11 @@ impl VaultBackend for Box<dyn VaultBackend> {
     }
     fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
         (**self).list_folders()
+    }
+    /// Forwarded, so the backend underneath keeps its own answer. See
+    /// [`VaultBackend::list_vault`].
+    fn list_vault(&self) -> Result<crate::vault_cache::VaultSnapshot, VaultError> {
+        (**self).list_vault()
     }
     fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<VaultItem, VaultError> {
         (**self).set_app_match(item, m)
@@ -417,7 +470,7 @@ impl VaultBackend for Box<dyn VaultBackend> {
 /// not: it *owns* the session and the master key (see its module doc, which
 /// says so as a design decision rather than an accident), so there is no
 /// "empty" `RestBackend` and there should not be one -- a constructor that
-/// took no credentials would be a constructor every one of its twenty methods
+/// took no credentials would be a constructor every one of its methods
 /// then had to re-check.
 ///
 /// So the emptiness lives **here**, in one small type outside `rest/`, and it
@@ -523,6 +576,13 @@ impl VaultBackend for LateBoundBackend {
     fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
         self.with(|b| b.list_folders())
     }
+    /// Forwarded **through one `with`**, so the adopted backend answers this
+    /// itself. Two `with` calls around its `list_items` and `list_folders`
+    /// would also compile and would cost a `RestBackend` an extra full sync.
+    /// See [`VaultBackend::list_vault`].
+    fn list_vault(&self) -> Result<crate::vault_cache::VaultSnapshot, VaultError> {
+        self.with(|b| b.list_vault())
+    }
     fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<VaultItem, VaultError> {
         self.with(|b| b.set_app_match(item, m))
     }
@@ -597,6 +657,11 @@ impl VaultBackend for SharedLateBoundBackend {
     }
     fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
         (**self).list_folders()
+    }
+    /// Forwarded, so the backend underneath keeps its own answer. See
+    /// [`VaultBackend::list_vault`].
+    fn list_vault(&self) -> Result<crate::vault_cache::VaultSnapshot, VaultError> {
+        (**self).list_vault()
     }
     fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<VaultItem, VaultError> {
         (**self).set_app_match(item, m)
@@ -698,6 +763,9 @@ mod late_bound_tests {
         }
         fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
             Ok(Vec::new())
+        }
+        fn list_vault(&self) -> Result<crate::vault_cache::VaultSnapshot, VaultError> {
+            Ok(crate::vault_cache::VaultSnapshot { items: vec![item(self.0)], folders: Vec::new() })
         }
         fn set_app_match(&self, item: &VaultItem, _m: &AppMatch) -> Result<VaultItem, VaultError> {
             Ok(item.clone())
@@ -881,6 +949,12 @@ mod caching_backend_tests {
         }
         fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
             Ok(Vec::new())
+        }
+        /// Counted with the reads, and empty like the two calls it stands in
+        /// for: this double exists to count `get_item` against the disk
+        /// cache, and a whole-vault read is not one of those.
+        fn list_vault(&self) -> Result<crate::vault_cache::VaultSnapshot, VaultError> {
+            Ok(crate::vault_cache::VaultSnapshot { items: Vec::new(), folders: Vec::new() })
         }
         fn list_trash(&self) -> Result<Vec<VaultItem>, VaultError> {
             Ok(Vec::new())

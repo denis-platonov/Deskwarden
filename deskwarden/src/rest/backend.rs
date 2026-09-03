@@ -2,7 +2,8 @@
 //!
 //! [`crate::rest::api`] is the HTTP, [`crate::rest::sync`] the read mapping
 //! and [`crate::rest::write`] the write mapping. This file is the *seam*: the
-//! twenty operations of [`VaultBackend`] expressed in terms of those three,
+//! twenty-one operations of [`VaultBackend`] expressed in terms of those
+//! three,
 //! and nothing else. There is no route, no header and no cryptography here --
 //! if you are looking for one, it is in one of those modules.
 //!
@@ -39,19 +40,31 @@
 //! per operation, in each method's doc, so a caller choosing between two ways
 //! to ask the same question can see which one is cheaper.
 //!
-//! The three call sites worth knowing about, because they are the ones that
-//! were free before:
+//! The call sites worth knowing about, because they are the ones that were
+//! free before:
 //!
-//! * [`crate::vault_cache::VaultCache::populate`] calls `list_items` **and**
-//!   `list_folders`, which is **two** full syncs per populate.
+//! * [`crate::vault_cache::VaultCache::populate`] takes the whole vault in
+//!   **one** sync, through [`VaultBackend::list_vault`]. It used to call
+//!   `list_items` and then `list_folders` -- two full syncs and two
+//!   whole-vault decrypts to read two halves of one payload.
 //! * [`crate::bw_serve::wait_for_vault_ready`] polls `list_items` on a retry
-//!   schedule -- one full sync per attempt.
+//!   schedule -- one full sync per attempt. **Not reached on this backend
+//!   any more**: it exists to wait out a `bw serve` cold start, there is no
+//!   `bw serve` here, and
+//!   [`crate::backend_policy::may_skip_the_readiness_probe`] now says so
+//!   before the probe is spawned. It was the largest of the three costs, and
+//!   the only one nothing logged.
 //! * `VaultCache`'s restore/unarchive path reads the item back with
 //!   `get_item` to refresh its `revisionDate` -- one full sync per gesture.
+//!   Still true, and still the price of a gesture rather than of a window.
+//!
+//! Together those two changes are the difference between three full syncs and
+//! one on a cold vault window; on the owner's 1,668-item account that was
+//! about fifteen seconds against about one.
 //!
 //! # What this backend refuses
 //!
-//! **Nothing.** All twenty operations are implemented.
+//! **Nothing.** All twenty-one operations are implemented.
 //!
 //! There were six refusals, and they are worth reading about in the order
 //! they were lifted, because in every case the refusal named the trap the
@@ -123,7 +136,7 @@ use crate::vault_bridge::{
 /// able to leave five of them behind.
 const BACKEND: &str = "the direct-REST vault backend";
 
-/// A Bitwarden server, as one of this app's twenty-operation vault backends.
+/// A Bitwarden server, as one of this app's vault backends.
 ///
 /// Construct with [`RestBackend::new`] from a client and a completed login.
 pub struct RestBackend {
@@ -353,6 +366,26 @@ impl VaultBackend for RestBackend {
     fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
         let (vault, _) = self.synced()?;
         Ok(vault.folders)
+    }
+
+    /// **Cost: one full sync, for both halves.** This is the method the
+    /// module docs' "two full syncs per populate" line was describing the
+    /// absence of.
+    ///
+    /// The ciphers and the folder names arrive in the same `GET /api/sync`
+    /// payload and are decrypted by the same `decrypt_vault` pass, so
+    /// `list_items` followed by `list_folders` fetches and decrypts the whole
+    /// account twice to read two halves of one answer. Here they are simply
+    /// both taken off the one `synced()` that already produced them.
+    ///
+    /// `Self::live` for the items, exactly as `list_items` does -- trashed
+    /// and archived ciphers are filtered out of the vault list here and must
+    /// stay filtered out when the same list is fetched this way, or the
+    /// single-sync path would paint deleted items that the two-call path
+    /// hides.
+    fn list_vault(&self) -> Result<crate::vault_cache::VaultSnapshot, VaultError> {
+        let (vault, _) = self.synced()?;
+        Ok(crate::vault_cache::VaultSnapshot { items: Self::live(&vault), folders: vault.folders })
     }
 
     /// **Cost: one full sync, then one `PUT`.**
@@ -973,8 +1006,23 @@ fn crypto_error(e: CryptoError) -> VaultError {
     VaultError::Http(format!("this vault's cryptography failed: {e}"))
 }
 
+/// `pub` for the same reason [`crate::rest::crypto`]'s and
+/// [`crate::rest::sync`]'s test modules are, and under the same limit: a
+/// sibling module's tests need a **real** `RestBackend` answering a **real**
+/// mock server, and every input to one -- the client, the login, the master
+/// key -- is private to this file.
+///
+/// The sibling is `vault_window`, and what it needs it for is the one
+/// assertion neither module can make alone: that opening a cold vault window
+/// on this backend costs exactly one `GET /api/sync`. A double that merely
+/// counts calls would pass that test while the app still made three, because
+/// the quantity being asserted about is HTTP requests and only this file
+/// knows how to produce a backend that makes them.
+///
+/// No production item changed visibility, and nothing here compiles into the
+/// shipped binary.
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::rest::api::Device;
     use crate::rest::crypto::tests::{key_from_64, seal};
@@ -1138,7 +1186,38 @@ mod tests {
     /// a suite nobody runs; `crypto.rs` pins the real cost separately. The
     /// server is returned so the caller can add write mocks to it and so it
     /// outlives the backend.
-    fn logged_in() -> (crate::test_http::MockServer, RestBackend) {
+    /// A `RestBackend` on a mock server that answers prelogin, the token and
+    /// the sync, holding the fixture vault [`sync_body`] describes.
+    ///
+    /// The sync mock here is deliberately **uncounted** (`expect_at_least(1)`):
+    /// most tests in this file are about some other route and would otherwise
+    /// be asserting about a number they do not care about.
+    pub fn logged_in() -> (crate::test_http::MockServer, RestBackend) {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_body())
+            .expect_at_least(1)
+            .create();
+        (server, backend)
+    }
+
+    /// [`logged_in`] with **the sync route not declared at all**, for a caller
+    /// that wants to declare it itself and count it exactly.
+    ///
+    /// The split exists rather than a re-declaration on top of `logged_in`
+    /// because which of two overlapping mockito mocks answers a request is a
+    /// property of the mocking library, not of this app, and a counting test
+    /// that quietly measured the wrong one of the two would be precisely the
+    /// defect it was written to catch. With no first mock there is nothing to
+    /// out-rank: the caller's is the only route that can answer, so the number
+    /// it reports is the number of syncs the app performed.
+    ///
+    /// The login itself performs **no sync** -- `fixture_login` is prelogin
+    /// and the token endpoint, and `RestBackend::new` does not fetch -- so a
+    /// caller's `.expect(n)` counts only what it goes on to ask the backend
+    /// for, with nothing to subtract for the fixture.
+    pub fn signed_in_with_no_sync_route() -> (crate::test_http::MockServer, RestBackend) {
         let mut server = crate::test_http::server();
         server
             .mock("POST", "/identity/accounts/prelogin")
@@ -1151,15 +1230,16 @@ mod tests {
                     "token_type":"Bearer","scope":"api offline_access"}"#,
             )
             .create();
-        server
-            .mock("GET", "/api/sync?excludeDomains=true")
-            .with_body(sync_body())
-            .expect_at_least(1)
-            .create();
 
         let client = RestClient::new(server.url());
         let authenticated = fixture_login(&client);
         (server, RestBackend::new(client, authenticated))
+    }
+
+    /// The body the fixture server answers `GET /api/sync` with: a vault of
+    /// one live item, one trashed, one archived, and one folder named `Work`.
+    pub fn sync_payload() -> String {
+        sync_body()
     }
 
     /// The control every other test in this file rests on: the fixture really
@@ -1217,6 +1297,54 @@ mod tests {
         let folders = backend.list_folders().expect("folders");
         assert_eq!(folders.len(), 1);
         assert_eq!(folders[0].name, "Work");
+    }
+
+    /// **The whole vault for one sync, and the count is the assertion.**
+    ///
+    /// `folders_come_off_the_same_sync` above establishes that the folder
+    /// names ride the cipher payload; this establishes that the app can
+    /// actually get both halves for the price of the one payload they ride
+    /// on. `list_items` then `list_folders` -- what `VaultCache::populate`
+    /// did before `list_vault` existed -- is the control, and it must be
+    /// **two**: not because two is wanted, but because a `.expect(1)` that
+    /// also passed for the old spelling would be measuring nothing.
+    ///
+    /// Both halves are checked for content, not just counted. A `list_vault`
+    /// that returned one full sync's worth of empty vectors would satisfy a
+    /// request count on its own.
+    #[test]
+    fn the_whole_vault_costs_one_sync_where_asking_twice_costs_two() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+
+        let vault = backend.list_vault().expect("the vault");
+        sync.assert();
+
+        // The same answers the two separate calls give, or this is a cheaper
+        // route to a different vault. `live-1` only: the fixture's trashed
+        // and archived ciphers must stay filtered out here exactly as
+        // `list_items` filters them, which a bare `vault.items` would not do.
+        assert_eq!(vault.items.len(), 1, "the live item, without the trashed or archived ones");
+        assert_eq!(vault.items[0].id, "live-1");
+        assert_eq!(vault.folders.len(), 1);
+        assert_eq!(vault.folders[0].name, "Work");
+
+        // The control, on its own server so the count above stays clean.
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let twice = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(2)
+            .create();
+        let items = backend.list_items().expect("items");
+        let folders = backend.list_folders().expect("folders");
+        twice.assert();
+        assert_eq!(items.len(), vault.items.len());
+        assert_eq!(folders.len(), vault.folders.len());
     }
 
     /// An id the vault does not hold is a refusal that names the id, and
@@ -1702,7 +1830,7 @@ mod tests {
     //
     // Repointing it was tried and does not work, which is the interesting
     // part: **this backend has no reachable refusal left.** Every one of the
-    // twenty operations answers -- that is pinned, from the other direction,
+    // operations answers -- that is pinned, from the other direction,
     // by `no_operation_this_backend_offers_refuses_any_more`. The only
     // `Unsupported` it can still produce is `generate` meeting a missing or
     // altered `assets/wordlist.txt`, and a test may not arrange that: it

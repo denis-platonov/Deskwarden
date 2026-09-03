@@ -192,7 +192,7 @@ pub mod ui_process;
 /// See its own docs for what a caller owes the user when a stored record
 /// stops working.
 pub mod user_key_store;
-/// The seam between the app and whatever is holding the vault: the twenty
+/// The seam between the app and whatever is holding the vault: the twenty-one
 /// vault operations as a trait, implemented by `bw serve`'s client and by
 /// the direct-REST backend. Nothing about what any call does over the wire
 /// lives here.

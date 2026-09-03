@@ -3,7 +3,7 @@
 //!
 //! # Why this module exists at all, and why it is not inside `rest/`
 //!
-//! [`crate::vault_backend`]'s docs say it plainly: of the twenty vault
+//! [`crate::vault_backend`]'s docs say it plainly: of the vault
 //! operations, `generate` is the one with **no server endpoint anywhere**.
 //! `bw serve`'s `GET /generate` is not a Bitwarden API route at all -- it is
 //! the `bw` CLI running its own generator in-process and handing the result

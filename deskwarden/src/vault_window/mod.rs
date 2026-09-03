@@ -483,15 +483,24 @@ pub fn build_frame(
     // recovery -- close this window and return first), so the value stays
     // correct for this whole call, not just at the instant it was read.
     // Threaded through to every `spawn_vault_load` call below (review Minor
-    // 3): a backend that was already up needs no readiness wait before its
-    // `populate()`, exactly the exemption `spawn_sync` already makes in
-    // `main.rs` for the same reason. Without it, every forced post-sync
-    // reload paid for a redundant `list_items()` (`wait_for_vault_ready`'s
-    // own probe) on top of `populate()`'s -- the whole vault fetched twice,
-    // on every sync, hitting default mode (`keep_backend_running: true`,
-    // where the backend is essentially always already running) hardest even
-    // though that mode never touches the memory-saving setting at all.
-    backend_already_running: bool,
+    // 3): a backend that needs no readiness wait before its `populate()`,
+    // exactly the exemption `spawn_sync` already makes in `main.rs` for the
+    // same reason. Without it, every forced post-sync reload paid for a
+    // redundant `list_items()` (`wait_for_vault_ready`'s own probe) on top of
+    // `populate()`'s -- the whole vault fetched twice, on every sync, hitting
+    // default mode (`keep_backend_running: true`, where the backend is
+    // essentially always already running) hardest even though that mode never
+    // touches the memory-saving setting at all.
+    //
+    // **Named for the decision, not for the observation behind it**, which is
+    // what it was called when the only reason to skip was "`bw serve` is
+    // already up". There is a second reason now and it is not an observation
+    // at all: a direct-REST account has no `bw serve` to wait for, ever, and
+    // there the probe is a whole-vault `GET /api/sync` answering a question
+    // nobody asked. Both callers compute this through
+    // `backend_policy::may_skip_the_readiness_probe`, which is where the two
+    // reasons are written down; this module only carries the answer.
+    skip_readiness_wait: bool,
     // What the titlebar's account switcher offers, and the one door to it (see
     // `account_switcher`). By value rather than by reference because the
     // update closure below is `'static`; `None` in exactly one state --
@@ -512,7 +521,7 @@ pub fn build_frame(
         session_token,
         icon_cache_dir,
         auto_lock,
-        backend_already_running,
+        skip_readiness_wait,
         accounts,
         pre_styled,
         env,
@@ -545,7 +554,7 @@ pub fn build_frame_with_search(
     session_token: String,
     icon_cache_dir: std::path::PathBuf,
     auto_lock: AutoLock,
-    backend_already_running: bool,
+    skip_readiness_wait: bool,
     accounts: Option<crate::accounts::AccountsState>,
     pre_styled: bool,
     env: VaultFrameEnv,
@@ -825,8 +834,9 @@ pub fn build_frame_with_search(
     // false`: the snapshot from unlock (if any) is current, so this only
     // actually hits the backend the first time the window is opened after
     // unlock -- see `spawn_vault_load`'s doc comment. `skip_readiness_wait`:
-    // see `backend_already_running`'s own doc -- skips the readiness wait
-    // when the caller already knows `bw serve` is up.
+    // carried straight from this function's parameter of the same name --
+    // skips the readiness wait when the caller has already decided it would
+    // buy nothing.
     // **The number nothing in this app reported, and the one the user was
     // actually timing.** `main.rs` logs how long it takes to hand off to
     // eframe (microseconds) and this module logs how long eframe takes to
@@ -851,7 +861,7 @@ pub fn build_frame_with_search(
             force_refresh: false,
             era: window_era,
             generation: load_generation,
-            skip_readiness_wait: backend_already_running,
+            skip_readiness_wait,
         },
     );
     let mut items: Vec<VaultItem> = Vec::new();
@@ -1765,7 +1775,7 @@ pub fn build_frame_with_search(
                 // apart from the initial load's (review Important 2) --
                 // whichever of the two was still in flight when this fires
                 // is now superseded and its eventual result gets dropped
-                // rather than applied. `backend_already_running`: same
+                // rather than applied. `skip_readiness_wait`: same
                 // readiness-wait exemption as the initial spawn above (review
                 // Minor 3) -- carried for this whole window session, not
                 // re-checked here, since nothing in this window's lifetime
@@ -1806,7 +1816,7 @@ pub fn build_frame_with_search(
                         force_refresh: true,
                         era: window_era,
                         generation: load_generation,
-                        skip_readiness_wait: backend_already_running,
+                        skip_readiness_wait,
                     },
                 );
             } else if let Err(e) = &result {
@@ -5574,7 +5584,7 @@ pub fn run(
     session_token: String,
     icon_cache_dir: std::path::PathBuf,
     auto_lock: AutoLock,
-    backend_already_running: bool,
+    skip_readiness_wait: bool,
     accounts: Option<crate::accounts::AccountsState>,
     // `Some` when this process was started with `keep_ui_loaded` on, in
     // which case a plain close hides the window instead of ending it and
@@ -5602,7 +5612,7 @@ pub fn run(
         session_token,
         icon_cache_dir,
         auto_lock,
-        backend_already_running,
+        skip_readiness_wait,
         accounts,
         // This host owns its window, so its first frame is the one that
         // installs the fonts, rounds the corners and raises it.
@@ -9584,10 +9594,12 @@ struct VaultLoadRequest {
     /// superseded result apart from the one it's actually still waiting on --
     /// see `run`'s `load_generation` doc.
     generation: u64,
-    /// Whether `bw serve` is already known to be up -- see `run`'s
-    /// `backend_already_running` parameter doc. Skips the
-    /// `wait_for_vault_ready` probe in the worker when true, the same
-    /// exemption `spawn_sync` in `main.rs` already makes for the same reason.
+    /// Whether the `wait_for_vault_ready` probe would buy anything -- see
+    /// `run`'s parameter of the same name, and
+    /// [`crate::backend_policy::may_skip_the_readiness_probe`] for the two
+    /// reasons it can be true.
+    /// Skips the probe in the worker when set, the same exemption
+    /// `spawn_sync` in `main.rs` already makes for the same reason.
     skip_readiness_wait: bool,
 }
 
@@ -14949,14 +14961,56 @@ mod spawn_vault_load_tests {
         items.assert();
     }
 
+    /// **The probe still runs on `bw serve`, and the decision that spares a
+    /// direct-REST account does not spare this one.**
+    ///
+    /// # What this pinned before, and what it pins now
+    ///
+    /// Before: with `skip_readiness_wait: false`, `list_items()` is hit twice
+    /// -- once by `wait_for_vault_ready`, once by `populate()`. That is all
+    /// it said, and it pinned the double fetch **as intended**, which for
+    /// this backend it is: the probe is a loopback call against a process
+    /// that is holding the plaintext, and it is the only thing standing
+    /// between a `bw serve` that is mid-cold-start and a bogus
+    /// connection-refused failure a moment later.
+    ///
+    /// Now: that, unchanged, **plus** the reason `false` is the right input
+    /// here in the first place. The double fetch was pinned without anything
+    /// pinning who asks for it, so the same `false` reached a direct-REST
+    /// account -- where the probe is not a loopback call but a `GET
+    /// /api/sync` carrying every cipher on the account, waiting for a `bw
+    /// serve` that is never going to start. This now drives
+    /// `may_skip_the_readiness_probe`, the one decision both hosts in
+    /// `main.rs` compute this flag from, and holds that it answers `false`
+    /// for exactly this situation -- `bw serve` selected, nothing yet on the
+    /// port -- and `true` for a direct-REST account whatever the port says.
+    ///
+    /// So the needle moved toward asserting more: the two fetches are still
+    /// required, and the account they are required *for* is now named.
     #[test]
     fn without_the_skip_the_readiness_probe_hits_list_items_before_populate_does() {
-        // The other half of the regression guard above: with
-        // `skip_readiness_wait: false` (the default for an unknown backend
-        // state), `list_items()` is hit twice -- once by
-        // `wait_for_vault_ready`, once by `populate()` -- so this is the
-        // behaviour Minor 3's exemption must NOT apply when the caller does
-        // not already know the backend is up.
+        // The input half, driven through the real decision rather than
+        // assumed. `false` below is not a bare literal any more: it is what
+        // this function answers for the host this test is about.
+        assert!(
+            !crate::backend_policy::may_skip_the_readiness_probe(true, false),
+            "a `bw serve` account with nothing yet on the port must still wait: the probe is \
+             the only thing between a mid-cold-start backend and a bogus connection-refused \
+             failure from the `populate()` behind it"
+        );
+        assert!(
+            crate::backend_policy::may_skip_the_readiness_probe(true, true),
+            "control: `bw serve` already answering needs no wait -- otherwise the assertion \
+             above would hold for a function that simply always says `false`"
+        );
+        assert!(
+            crate::backend_policy::may_skip_the_readiness_probe(false, false),
+            "**the direct-REST account this pin was silently covering.** Nothing is listening \
+             on `bw serve`'s port and nothing ever will be, so the observation is `false` \
+             forever and the two fetches below became two whole-vault syncs on every window \
+             open"
+        );
+
         let mut server = crate::test_http::server();
         let items = server
             .mock("GET", "/list/object/items")
@@ -14990,6 +15044,100 @@ mod spawn_vault_load_tests {
         let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("load thread must report back");
         assert!(result.is_ok());
         items.assert();
+    }
+
+    /// **THE DELIVERABLE: a cold vault window on a direct-REST account costs
+    /// exactly one `GET /api/sync`.**
+    ///
+    /// The owner measured fifteen seconds to open a 1,668-item vault, and it
+    /// was three full syncs and three whole-vault decrypts:
+    ///
+    ///  1. `wait_for_vault_ready`'s `list_items` probe (~8s), taken because
+    ///     `backend_is_listening()` is `false` forever on an account with no
+    ///     `bw serve` -- now decided by
+    ///     [`crate::backend_policy::may_skip_the_readiness_probe`];
+    ///  2. `populate()`'s `list_items` (~1s);
+    ///  3. `populate_with_at_epoch`'s `list_folders` (~6s, and unlogged) --
+    ///     now off the same sync as the items, via
+    ///     [`crate::vault_backend::VaultBackend::list_vault`].
+    ///
+    /// # Why this counts requests rather than measuring time
+    ///
+    /// "It got faster" is not a fact a test can hold. The number the user was
+    /// actually paying is `GET /api/sync` calls, and this asserts that number
+    /// through a real `RestBackend` against a real mock server -- not a
+    /// counting double, which would happily report `1` while the shipped app
+    /// made three, because a double cannot tell you that `VaultCache` reached
+    /// the fast path rather than the two-call one behind it.
+    ///
+    /// # It goes through the wrapper the UI process actually builds
+    ///
+    /// The cache is built over a `SharedLateBoundBackend` holding the
+    /// `RestBackend`, which is the shape `main.rs`'s direct-REST arm
+    /// constructs. That is the point of the assertion, not incidental
+    /// scaffolding: `list_vault` is a trait method with **no default**
+    /// precisely so a forwarding impl cannot inherit "call `list_items`, then
+    /// call `list_folders`" and silently strand the one-sync override
+    /// underneath it. A wrapper that forwarded the two halves separately
+    /// still returns a correct vault and would pass every other test in this
+    /// crate; it fails here, at `.expect(1)`.
+    #[test]
+    fn one_sync_fills_a_cold_vault_window_on_a_direct_rest_account() {
+        use crate::vault_backend::LateBoundBackend;
+
+        let (mut server, backend) = crate::rest::backend::tests::signed_in_with_no_sync_route();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(crate::rest::backend::tests::sync_payload())
+            .expect(1)
+            .create();
+
+        // The UI process's own shape: the cache holds an `Arc<LateBoundBackend>`
+        // and the sign-in fills it. `adopt` rather than a constructor taking
+        // the backend, so the forwarding this test is about is really in the
+        // path.
+        let slot: crate::vault_backend::SharedLateBoundBackend =
+            std::sync::Arc::new(LateBoundBackend::empty());
+        slot.adopt(Box::new(backend));
+        let cache = Arc::new(VaultCache::new(slot));
+
+        let (tx, rx) = mpsc::channel();
+        let era = cache.epoch().era();
+        spawn_vault_load_with_schedule(
+            Arc::clone(&cache),
+            tx,
+            VaultLoadRequest {
+                // Exactly what `run` spawns on a cold window: nothing has been
+                // fetched yet, so `vault_load_step` takes the `Populate` arm
+                // whatever this says.
+                force_refresh: false,
+                era,
+                generation: 1,
+                // What `may_skip_the_readiness_probe` answers for this
+                // account -- pinned as that function's own answer by
+                // `without_the_skip_the_readiness_probe_hits_list_items_before_populate_does`,
+                // so this is not a hopeful literal.
+                skip_readiness_wait: true,
+            },
+            vec![],
+        );
+
+        let (_, result) = rx.recv_timeout(Duration::from_secs(30)).expect("load thread must report back");
+        let snapshot = result.expect("the window loads");
+
+        // **The count is the deliverable.** An empty schedule would make a
+        // readiness probe cost nothing in wall time but it would still be a
+        // request, so this is the assertion that fails if the probe comes
+        // back or if the folders go back to a second sync.
+        sync.assert();
+
+        // The window is actually filled, so the one sync is not one sync that
+        // fetched nothing. Both halves, because the folders are the half the
+        // second sync used to be for -- a `list_vault` that dropped them
+        // would satisfy the count above.
+        assert_eq!(snapshot.items.len(), 1, "the fixture's one live item");
+        assert_eq!(snapshot.folders.len(), 1, "the folders came off the same sync");
+        assert_eq!(snapshot.folders[0].name, "Work");
     }
 
     #[test]
