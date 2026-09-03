@@ -91,6 +91,75 @@ pub fn settings_name(pid: u32) -> String {
     format!(r"Local\Deskwarden-UI-Settings-{pid}")
 }
 
+/// **The name a UI process presses to say "I have signed in; start
+/// `bw serve` with the token I just stored".**
+///
+/// A sibling of [`settings_name`] and not a reuse of it. Both are the child
+/// ringing the daemon, but they mean different things at different moments,
+/// and a shared name would have the daemon reading a settings file when a
+/// sign-in rang -- or, far worse, consuming the sign-in's ring while looking
+/// for a preferences edit, leaving the window waiting for a backend nobody
+/// was ever going to start.
+///
+/// **Created by the DAEMON**, at the spawn that produces the pid, for
+/// [`settings_name`]'s reason: "the daemon is listening" is what the child's
+/// `SetEvent` answer MEANS, and a doorbell created lazily would have the
+/// child concluding no daemon exists.
+///
+/// # What crosses, and what does not
+///
+/// The ring says only *there is something to read*. What the daemon then
+/// reads is `ui-signin-<pid>.json`, a [`crate::login_ui::SignedInIdentity`]:
+/// an account id, an email, a server URL and a backend answer -- the three
+/// things this app writes into `settings.json` in the clear anyway.
+///
+/// **The token does not travel this way and neither does the password.** The
+/// child writes the session token into that account's own DPAPI
+/// `session.bin` before it rings, and the daemon loads it back out of the
+/// same store. So the secret goes to the place that already holds it, under
+/// the same user's credentials, and the file that crosses carries no
+/// credential at all.
+///
+/// Auto-reset, like every other event in this module: this means *there is
+/// something to read now*, which is a token to be consumed.
+#[must_use]
+pub fn signin_name(pid: u32) -> String {
+    format!(r"Local\Deskwarden-UI-SignIn-{pid}")
+}
+
+/// **The name the daemon presses to say "`bw serve` is up on the token you
+/// stored; go and draw the vault".**
+///
+/// The only DAEMON-TO-CHILD event in this module other than
+/// [`signal_name`], and the answer to [`signin_name`]'s ring.
+///
+/// # Why an event and not a port probe
+///
+/// The child's obvious move after ringing is to poll the `bw serve` port
+/// until something answers, and that is wrong in a way that is invisible
+/// until it bites: **the port can be up with a stale token.** An orphaned
+/// `bw serve` from a previous unclean exit holds
+/// `crate::bw_serve::BW_SERVE_PORT` and answers a TCP handshake perfectly
+/// well while serving a session that has nothing to do with the password
+/// just typed. A child that took that as readiness would open a vault
+/// window onto somebody else's vault, or -- more usually -- onto a locked
+/// one, and report it as an empty vault with no explanation.
+///
+/// So readiness is asserted by the one process that KNOWS: the daemon,
+/// which owns the `bw serve` child, started it itself, and started it with
+/// this token. Nothing else in the system can honestly answer the question.
+///
+/// **Created by the CHILD, before it rings**, which is the reverse of
+/// [`signin_name`] and is load-bearing. The daemon's `SetEvent` lands the
+/// instant the backend is up; if the child created this name after ringing,
+/// that set could arrive with nobody listening and the child would then wait
+/// out its whole deadline for a signal that had already been sent. Creating
+/// it first makes the ordering impossible to get wrong.
+#[must_use]
+pub fn backend_ready_name(pid: u32) -> String {
+    format!(r"Local\Deskwarden-UI-Backend-Ready-{pid}")
+}
+
 /// A live handle to the event, closed when this is dropped.
 pub struct Signal(HANDLE);
 
@@ -308,6 +377,105 @@ mod tests {
     #[test]
     fn pressing_a_doorbell_nobody_holds_fails_cleanly() {
         assert!(!(ShowEnv::production().set)(&settings_name(0xFFFF_FFE0)));
+    }
+
+    /// **Five names, all different.** The sign-in doorbell and the
+    /// readiness answer join the three that were here, and every pair of the
+    /// five has to differ: two of these are the two ends of one handshake,
+    /// and a handshake whose ends share a name is a process signalling
+    /// itself.
+    ///
+    /// The pair that would hurt most is `signin`/`settings`, because both
+    /// are the child ringing the daemon and the daemon polls both on the
+    /// same pass -- a shared name would have a sign-in consumed by the
+    /// settings poll, and the window would then wait out its deadline for a
+    /// backend nobody was going to start.
+    #[test]
+    fn the_sign_in_doorbell_and_its_answer_are_their_own_names() {
+        for name in [signin_name(1234), backend_ready_name(1234)] {
+            assert!(name.starts_with(r"Local\"), "not logon-session scoped: {name}");
+            assert!(name.contains("1234"), "not per-process: {name}");
+        }
+        assert_ne!(signin_name(1234), signin_name(1235));
+        assert_ne!(backend_ready_name(1234), backend_ready_name(1235));
+
+        // Every pair of the five, by construction rather than by a list a
+        // sixth name could be left off of.
+        let all = [
+            ("show", signal_name(1234)),
+            ("visible", visible_name(1234)),
+            ("settings", settings_name(1234)),
+            ("signin", signin_name(1234)),
+            ("backend-ready", backend_ready_name(1234)),
+        ];
+        for (i, (a_name, a)) in all.iter().enumerate() {
+            for (b_name, b) in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "`{a_name}` and `{b_name}` share the name {a}");
+            }
+        }
+    }
+
+    /// **The whole handshake, over the real kernel, in the direction
+    /// production runs it.**
+    ///
+    /// A fake would prove only that the fake works, which is this crate's
+    /// standing defect class. Both halves are here because the ORDER is the
+    /// design: the child creates its readiness ear BEFORE it rings, so the
+    /// daemon's answer cannot land on nobody.
+    ///
+    /// The daemon's poll is zero-timeout, because `main`'s loop is what
+    /// answers the tray and can never block -- so that is what is asserted
+    /// rather than a convenient long wait.
+    #[test]
+    fn the_sign_in_doorbell_is_answered_by_the_readiness_event() {
+        // A pid this process does not have, so a parallel test that really
+        // is this process cannot collide with it.
+        let pid = std::process::id() ^ 0x2222;
+        let env = ShowEnv::production();
+
+        // THE DAEMON, at the spawn: it creates the ear it will poll.
+        let doorbell = (env.create)(&signin_name(pid)).expect("the doorbell should be creatable");
+        // THE CHILD, before it rings: its own ear for the answer.
+        let ready = (env.create)(&backend_ready_name(pid)).expect("the ear should be creatable");
+
+        assert!(!doorbell.wait(0), "the doorbell rang before anybody pressed it");
+        assert!(!ready.wait(0), "the backend read as ready before anybody said so");
+
+        // THE CHILD rings, having already stored its token.
+        assert!((env.set)(&signin_name(pid)), "pressing the sign-in doorbell failed");
+        assert!(
+            doorbell.wait(0),
+            "a rung sign-in doorbell did not read as rung on a zero-timeout poll, so the \
+             daemon's loop would never learn a child had signed in"
+        );
+        assert!(
+            !doorbell.wait(0),
+            "the sign-in doorbell did not auto-reset; one sign-in would restart `bw serve` \
+             on every pass of the daemon's loop"
+        );
+
+        // THE DAEMON answers, having started `bw serve` with that token.
+        assert!((env.set)(&backend_ready_name(pid)), "answering the sign-in failed");
+        assert!(
+            ready.wait(1_000),
+            "the child never saw the readiness answer, so it would sit on the spinner until \
+             its deadline and then report a vault it could have drawn"
+        );
+        assert!(!ready.wait(0), "the readiness event did not auto-reset");
+    }
+
+    /// Nobody listening is a clean `false` at both ends, which is what makes
+    /// the mid-sign-in failures survivable rather than hangs.
+    ///
+    /// A daemon that died between the spawn and the ring: the child's press
+    /// answers `false` and it stops waiting. A child that died between the
+    /// ring and the vault: the daemon's answer answers `false`, and the
+    /// backend it just started is still correct and still serving.
+    #[test]
+    fn ringing_and_answering_a_process_that_is_gone_fails_cleanly() {
+        let env = ShowEnv::production();
+        assert!(!(env.set)(&signin_name(0xFFFF_FFD0)));
+        assert!(!(env.set)(&backend_ready_name(0xFFFF_FFD0)));
     }
 
     /// **Held means visible, and the holding really is observable from

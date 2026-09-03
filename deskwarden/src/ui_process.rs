@@ -789,6 +789,98 @@ pub fn read_edited_settings(path: &Path) -> Option<Settings> {
     }
 }
 
+/// **Where a UI process leaves the sign-in it just completed, so the daemon
+/// can start `bw serve` while that window is still on screen.**
+///
+/// The third per-pid file, and a DIFFERENT name from the other two for
+/// [`edited_settings_path`]'s reason and one more. [`result_path`] is the
+/// child's last act; this one is written in the MIDDLE of the child's life,
+/// while it waits on the spinner -- so sharing a name with the result would
+/// be a write racing the daemon's post-reap read, and sharing one with the
+/// settings delivery would have a preferences edit and a sign-in overwriting
+/// each other in a window that does both.
+///
+/// # What is in it, and why that is allowed to be in a file
+///
+/// A [`crate::login_ui::SignedInIdentity`]: an account id, an email, a
+/// server URL, and what the backend-choice modal answered. Every one of
+/// those is already written into `settings.json` in the clear, in this same
+/// directory -- which is the bar this module's own doc sets, and the same
+/// bar [`UiVaultResult::signed_in`] already clears carrying this exact type
+/// home by the other route.
+///
+/// **The session token is NOT in it, and that is the design and not an
+/// omission.** The child writes the token into that account's own DPAPI
+/// `session.bin` through [`crate::session_store::SessionStore`] before it
+/// rings, and the daemon loads it back out of that same store. So the secret
+/// goes only where it already lives, wrapped under the user's credentials,
+/// and never appears in a file the daemon has to read as plain JSON. The
+/// master password appears nowhere at all: not here, not in an argument, not
+/// in an environment variable.
+pub fn signed_in_path(config_dir: &Path, pid: u32) -> PathBuf {
+    config_dir.join(format!("ui-signin-{pid}.json"))
+}
+
+/// Write the sign-in a UI process just completed, **atomically**.
+///
+/// Temp-then-rename for [`write_edited_settings`]'s reason and with more at
+/// stake: this file is read while both processes are alive, and the daemon
+/// acts on it by starting a subprocess. A half-written file that parsed
+/// would be a `bw serve` started for the wrong account.
+pub fn write_signed_in(
+    path: &Path,
+    identity: &crate::login_ui::SignedInIdentity,
+) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(identity).map_err(io::Error::other)?;
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, json)?;
+    std::fs::rename(&temp, path)
+}
+
+/// Read the sign-in a UI process delivered, from the daemon, after the
+/// doorbell rang.
+///
+/// `None` for every failure -- absent, unreadable, unparseable -- and each is
+/// the same thing from the daemon's side: there is no sign-in here to act on,
+/// so nothing is started and the child is not told the backend is ready. It
+/// will give up on its own deadline and say so, which is the honest outcome;
+/// starting `bw serve` off a file that did not parse would be starting it for
+/// an account nobody named.
+#[must_use]
+pub fn read_signed_in(path: &Path) -> Option<crate::login_ui::SignedInIdentity> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<crate::login_ui::SignedInIdentity>(&text) {
+            Ok(identity) => Some(identity),
+            Err(e) => {
+                log::warn!(
+                    "a UI process's sign-in delivery at {} did not parse ({e}); no backend \
+                     will be started for it",
+                    path.display()
+                );
+                None
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => {
+            log::warn!(
+                "could not read a UI process's sign-in delivery at {}: {e}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Delete a sign-in delivery once it has been acted on. Best effort, for
+/// [`forget_result`]'s reason.
+pub fn forget_signed_in(path: &Path) {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != io::ErrorKind::NotFound {
+            log::warn!("could not delete {} after acting on it: {e}", path.display());
+        }
+    }
+}
+
 /// Delete a delivery once it has been applied. Best effort, for
 /// [`forget_result`]'s reason.
 pub fn forget_edited_settings(path: &Path) {
@@ -1232,6 +1324,80 @@ mod tests {
         assert!(
             edited_settings_path(dir, 77).to_string_lossy().contains("77"),
             "not named by pid, so a dead window's file could be read as a live one's"
+        );
+    }
+
+    /// **Three per-pid files, all different**, and the sign-in delivery is
+    /// the third.
+    ///
+    /// Sharing the result file's name would be a mid-life write racing the
+    /// daemon's post-reap delete; sharing the settings delivery's would have
+    /// a window that both signs in and edits preferences overwriting one
+    /// with the other -- and the loser would be a `bw serve` that never
+    /// started, behind a spinner that never ended.
+    #[test]
+    fn the_sign_in_delivery_is_its_own_file() {
+        let dir = Path::new(r"C:\config");
+        assert_ne!(signed_in_path(dir, 77), result_path(dir, 77));
+        assert_ne!(signed_in_path(dir, 77), edited_settings_path(dir, 77));
+        assert_ne!(signed_in_path(dir, 77), signed_in_path(dir, 78));
+        assert!(
+            signed_in_path(dir, 77).to_string_lossy().contains("77"),
+            "not named by pid, so a dead window's sign-in could start a backend for a live \
+             one's account"
+        );
+    }
+
+    /// **The sign-in round trip, and it carries no credential.**
+    ///
+    /// The round trip is the obvious half. The half worth pinning is the
+    /// other one: the bytes that actually land on disk are searched for the
+    /// token and the password, because the whole licence for putting this
+    /// file in the config directory is that it holds nothing a
+    /// `settings.json` does not already hold in the clear.
+    #[test]
+    fn a_sign_in_delivery_round_trips_and_holds_no_secret() {
+        let dir = scratch("signin", line!());
+        let path = signed_in_path(&dir, 77);
+
+        assert!(
+            read_signed_in(&path).is_none(),
+            "control: read something before anything was written"
+        );
+
+        let identity = crate::login_ui::SignedInIdentity {
+            account: Some(AccountId::generate()),
+            user_email: Some("someone@example.com".to_string()),
+            server_url: Some("https://vault.example.com".to_string()),
+            use_official_bw_crypto: Some(false),
+        };
+        write_signed_in(&path, &identity).expect("the write should succeed");
+        assert_eq!(read_signed_in(&path).as_ref(), Some(&identity));
+
+        // **The rename really is the landing.** A truncate-in-place
+        // implementation passes the round trip above and still leaves a
+        // window in which the daemon reads an empty file.
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "the temp file survived the write, so the rename is not what lands"
+        );
+
+        // **Nothing secret is in the bytes.** These two values are what the
+        // child holds at the moment it writes this file; neither may appear.
+        let raw = std::fs::read_to_string(&path).expect("the file should be readable");
+        for secret in ["the-session-token", "correct-horse-battery-staple"] {
+            assert!(
+                !raw.contains(secret),
+                "the sign-in delivery contains {secret:?}. The token goes to the account's \
+                 DPAPI `session.bin` and the password goes nowhere at all: {raw}"
+            );
+        }
+
+        forget_signed_in(&path);
+        assert!(
+            read_signed_in(&path).is_none(),
+            "the delivery survived being forgotten, so a second pass would start `bw serve` \
+             again for a sign-in already acted on"
         );
     }
 

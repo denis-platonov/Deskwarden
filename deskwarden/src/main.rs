@@ -893,6 +893,19 @@ fn main() {
         backend_choice,
         vault_slot.is_filled(),
         active_account.as_ref(),
+        // **Whether a `bw serve` sign-in is owed at all.** The `bw serve`
+        // arm's copy of the direct-REST arm's `userkey.bin` question, read
+        // off the store this launch has already loaded. A launch that still
+        // has a good session token owes no card and must not be routed as
+        // though it did -- the three sites below suppress the readiness
+        // probe and the backend start on this flag.
+        cached_session.is_some(),
+        // **The `bw serve` arm's other half**, and the mirror of the server
+        // URL the direct-REST arm reads: a `bw serve` sign-in is `bw login`
+        // run inside the child, so a child with no `bw.exe` would exit
+        // without drawing while this daemon had already decided not to draw
+        // either.
+        the_cli_is_missing().is_none(),
     );
     let cached_session = match (backend_choice, vault_slot.is_filled()) {
         // **The child takes it, so startup must NOT drop the session.**
@@ -919,6 +932,29 @@ fn main() {
                  master password even though its `bw` session is still good"
             );
             None
+        }
+        // **The `bw serve` sign-in, routed into the arm that SPAWNS.**
+        //
+        // `cached_session` is `None` here -- that is what
+        // `the_sign_in_belongs_to_a_child` was told a moment ago -- and a
+        // `None` is exactly what routes this launch into the `} else {` arm
+        // that calls `app_window::run` in this process. Substituting an
+        // empty token keeps it in the arm that asks a child for a window.
+        //
+        // **The empty string is truthful and it is never used as a token.**
+        // Every site below that would read it is suppressed on this same
+        // flag: no `start_backend` (there is nothing to start it WITH until
+        // the card is answered), no readiness probe, no
+        // `recover_from_failed_vault_wait`. What replaces it is the child's
+        // doorbell -- see `UiWindows::take_a_childs_sign_in`, which is where
+        // the real token arrives and where `bw serve` is actually started.
+        (backend_policy::VaultBackendChoice::BwServe, _) if the_sign_in_belongs_to_a_child => {
+            log::info!(
+                "this account has no `bw` session token; the sign-in card opens in a ui \
+                 process, so this daemon draws nothing and keeps its ~19 MB. `bw serve` is \
+                 started when that child rings to say the master password was accepted"
+            );
+            Some(String::new())
         }
         _ => cached_session,
     };
@@ -1444,9 +1480,21 @@ fn main() {
     // "the gate said no" and "the CLI is gone and the user declined to put it
     // back" flatten to the same `None` -- which is correct, because what both
     // mean to everything below is "there is no `bw serve` child here".
-    bw_serve_child = (!cache_first && backend_policy::bw_serve_is_selected())
-        .then(|| start_backend(&session_token, job_ref(&job)))
-        .flatten();
+    //
+    // **And not when the sign-in belongs to a child**, which is the third
+    // condition and the one this line grew when the `bw serve` card moved
+    // out. `session_token` on that launch is the empty string -- the
+    // substitution a few hundred lines above, which is what kept startup in
+    // the arm that spawns -- and starting `bw serve` with it would spawn a
+    // backend authenticated as nobody, hold `BW_SERVE_PORT` against the real
+    // start, and answer every read with a locked vault. The backend for this
+    // launch is started once, from `UiWindows::take_a_childs_sign_in`, with
+    // the token the child actually produced.
+    bw_serve_child = (!cache_first
+        && !the_sign_in_belongs_to_a_child
+        && backend_policy::bw_serve_is_selected())
+    .then(|| start_backend(&session_token, job_ref(&job)))
+    .flatten();
     // Assigned before either arm rather than by both: the tray arm opens no
     // window, so it has no vault session to report, and the visible arm
     // overwrites this with whatever its window came home holding.
@@ -1820,7 +1868,14 @@ fn main() {
                 // the main thread is a dialog behind a window nobody can
                 // reach. The failure is carried back instead and is just as
                 // fatal, one frame later, on the thread that can show it.
-                move |token| StartupWork::produce(
+                // **The identity is unread on this arm**, and that is a fact
+                // about which process this is rather than an omission. This
+                // window is the DAEMON's own: whatever it establishes it
+                // learns directly, through `record_the_startup_sign_in` on
+                // the frame the vault is built. Nothing has to be told across
+                // a process boundary, so there is nobody to tell. The `--ui`
+                // child's copy of this closure is the one that reads it.
+                move |token, _identity| StartupWork::produce(
                     &token,
                     &job_for_work,
                     &vault_for_work,
@@ -2217,6 +2272,9 @@ fn main() {
             job.clone(),
             Arc::clone(&estate.cache),
             false,
+            // No child is waiting on this one: it is the cache-first
+            // launch's own background start, not a sign-in handshake.
+            None,
             backend_op_tx.clone(),
         );
     }
@@ -2625,6 +2683,73 @@ fn main() {
                 edited,
                 estate.accounts.as_mut(),
             );
+        }
+        // **A SIGN-IN from a window that is still open, and the reason the
+        // `bw serve` card could move out of this process at all.**
+        //
+        // Above the reap for `take_edited_settings`'s reason and one that is
+        // sharper here: this pass may both take a sign-in and find the window
+        // gone, and the backend still has to be started. The child stored the
+        // token and rang before it exited, so the sign-in is real whether or
+        // not the window survived it -- see `answer_the_childs_sign_in` for
+        // what happens to the answer nobody is waiting for.
+        //
+        // **The daemon does not block here**, which is the whole point: the
+        // start is handed to `spawn_sync`'s worker and reported back through
+        // the same `backend_op_rx` drain every other background start uses.
+        // A `try_start_backend` on this thread is a port wait plus a
+        // `bw sync` -- up to ~30 s with the tray, the hotkey, the foreground
+        // watcher and the match engine all stopped, which is precisely the
+        // freeze this whole change exists to remove.
+        if let Some((pid, signed_in)) = ui_windows.take_a_childs_sign_in(&config_dir) {
+            // The record first, and through the same adoption the child's
+            // exit-time identity goes through -- so the account-id guard runs
+            // here exactly as it does there and a sign-in for an account this
+            // daemon is no longer on writes nothing.
+            adopt_a_childs_sign_in(
+                &settings_path,
+                &mut estate.accounts,
+                &mut estate.active_account,
+                Some(&signed_in),
+            );
+            // **The token, read back out of the store the child wrote it
+            // to** -- and this is the line that keeps the secret off the
+            // boundary. The child put it in this account's DPAPI
+            // `session.bin`; nothing about it travelled in the file that
+            // just rang, in an argument or in an environment variable.
+            //
+            // Re-read AFTER the adoption above, because that adoption can
+            // re-point which account is active and therefore which
+            // `session.bin` is the right one.
+            match estate.store.load() {
+                Some(token) => {
+                    estate.token = token.clone();
+                    estate.task_in_progress = Some((Instant::now(), BackendOpKind::Sync));
+                    spawn_sync(
+                        token,
+                        job.clone(),
+                        Arc::clone(&estate.cache),
+                        // Nothing is running: this launch deliberately did
+                        // not start one, because until this ring there was
+                        // no token to start it with.
+                        false,
+                        Some(pid),
+                        backend_op_tx.clone(),
+                    );
+                }
+                // **The second mid-sign-in failure**: the child rang but the
+                // store has nothing in it, so its `save` failed or was
+                // undone. Nothing is started and the child is not answered;
+                // it gives up on its own deadline with a screen that says
+                // so, which is honest. Starting `bw serve` with the empty
+                // string instead would bind the port to a backend
+                // authenticated as nobody.
+                None => log::error!(
+                    "the vault window (process {pid}) rang to say it had signed in, but this \
+                     account's session store is empty -- so there is no token to start \
+                     `bw serve` with and that window will report the vault as unreachable"
+                ),
+            }
         }
         if let Some((result, signed_in)) = ui_windows.poll_the_vault_window(&config_dir) {
             // **Before the follow-up, because the follow-up may switch
@@ -3314,6 +3439,9 @@ fn main() {
                         job.clone(),
                         estate.cache.clone(),
                         currently_running,
+                        // The tray's Sync item; no window is waiting to be
+                        // told a backend came up for it.
+                        None,
                         backend_op_tx.clone(),
                     );
                 }
@@ -6504,6 +6632,25 @@ struct OpenUiWindow {
     /// behaviour before this channel existed. See
     /// [`UiWindows::take_edited_settings`].
     settings_doorbell: Option<deskwarden::ui_show::Signal>,
+    /// **The daemon's ear for a sign-in from a window that is still open**,
+    /// created at the same spawn and for the same reason its sibling above
+    /// is: "the daemon is listening" is what the child's `SetEvent` answer
+    /// MEANS.
+    ///
+    /// A separate ear rather than a second use of `settings_doorbell`,
+    /// because the two are polled on the same pass and mean different
+    /// things -- a shared one would have a sign-in consumed by the settings
+    /// poll, leaving the child on the spinner waiting for a backend nobody
+    /// was going to start. See [`deskwarden::ui_show::signin_name`].
+    ///
+    /// `None` is survivable but it COSTS something, unlike the settings
+    /// doorbell's `None`: that one falls back to delivering the edit in the
+    /// result file, and this one has no fallback at all -- the child's press
+    /// answers `false`, it stops waiting, and it reports a sign-in the
+    /// daemon adopts after the window closes. The user gets their vault on
+    /// the next open rather than in the window they are looking at. See
+    /// [`UiWindows::take_a_childs_sign_in`].
+    signin_doorbell: Option<deskwarden::ui_show::Signal>,
 }
 
 /// **The UI processes the daemon has open, one slot per surface.**
@@ -6788,6 +6935,45 @@ impl UiWindows {
         edited
     }
 
+    /// **Take the sign-in an open window just completed**, if it rang for
+    /// one.
+    ///
+    /// The exact shape of [`take_edited_settings`](Self::take_edited_settings)
+    /// -- zero-timeout poll, once per pass of `main`'s loop, read only after
+    /// the doorbell, file deleted once taken -- because it is the same
+    /// mechanism carrying a different fact. A blocking wait is impossible
+    /// here: this loop is what drains the hotkey, watches the foreground and
+    /// answers the tray, and that is precisely what this whole change exists
+    /// to keep alive during a sign-in.
+    ///
+    /// **The pid comes back with the identity**, because the caller has to
+    /// answer the child on that pid's own readiness name and must not read
+    /// the slot again to find it -- between the two reads the window could
+    /// have been reaped, and answering the wrong pid is answering a window
+    /// that is not waiting.
+    fn take_a_childs_sign_in(
+        &self,
+        config_dir: &Path,
+    ) -> Option<(u32, login_ui::SignedInIdentity)> {
+        let open = self.vault.as_ref()?;
+        if !open.signin_doorbell.as_ref()?.wait(0) {
+            return None;
+        }
+        let path = deskwarden::ui_process::signed_in_path(config_dir, open.pid);
+        let identity = deskwarden::ui_process::read_signed_in(&path);
+        deskwarden::ui_process::forget_signed_in(&path);
+        // **A ring with no readable file is not answered**, and the child is
+        // deliberately left to time out rather than told a backend is ready.
+        // Telling it otherwise would open a vault window onto a `bw serve`
+        // that was never started; its own deadline says so honestly instead.
+        let identity = identity?;
+        log::info!(
+            "the vault window (process {}) signed in and is waiting for `bw serve`",
+            open.pid
+        );
+        Some((open.pid, identity))
+    }
+
     fn poll_the_vault_window(
         &mut self,
         config_dir: &Path,
@@ -6942,7 +7128,29 @@ fn spawn_the_vault_window_in_its_own_process(
              edit made in that window will close it rather than being delivered live"
         );
     }
-    Some(OpenUiWindow { child, pid, opened_at: Instant::now(), settings_doorbell })
+    // **The sign-in doorbell, created here for the same reason and at the
+    // same moment.** Before the child can possibly ring it: the child is
+    // already running, but it cannot reach its own sign-in stage without
+    // first drawing a card and waiting for a human to type a master
+    // password, and this is one `CreateEventW` on the statement after the
+    // spawn.
+    let signin_doorbell = (deskwarden::ui_show::ShowEnv::production().create)(
+        &deskwarden::ui_show::signin_name(pid),
+    );
+    if signin_doorbell.is_none() {
+        log::warn!(
+            "could not create the sign-in doorbell for UI process {pid}; if that window \
+             signs in, `bw serve` will not be started until it closes and the vault it \
+             shows will be the local copy alone"
+        );
+    }
+    Some(OpenUiWindow {
+        child,
+        pid,
+        opened_at: Instant::now(),
+        settings_doorbell,
+        signin_doorbell,
+    })
 }
 
 /// **What a finished UI process reported**, from its exit code and its file.
@@ -7075,21 +7283,49 @@ fn ui_vault_outcome(
 /// inputs, and driven directly by
 /// `the_daemon_draws_no_window_on_the_direct_rest_sign_in_path`.
 ///
-/// # The three inputs, and why each is necessary
+/// # The four inputs, and why each is necessary
 ///
-/// * `backend_choice` -- only the direct-REST sign-in has moved. A `bw serve`
-///   sign-in produces a session token that **the daemon** must start
-///   `bw serve` with, and the child's only carrier home is a file it writes
-///   as it exits; that answer would arrive long after the window needed the
-///   backend it describes. So the `bw serve` card stays in the daemon, and
-///   that is a deliberate scope line rather than an oversight.
+/// * `backend_choice` -- **both sign-ins have moved now**, and the two arms
+///   ask different further questions. See below.
 /// * `a_key_is_already_stored` -- if the slot is filled there is no sign-in
-///   to place at all, and the window opens straight onto the vault.
-/// * `account` -- with **a recorded server URL**, because that is what the
-///   child would sign in to. Without one there is nothing a card can do, and
-///   the daemon's own recovery is the only thing left; see
-///   `ui_process::direct_rest_start_failure`, which refuses the spawn on the
-///   same fact from the other side.
+///   to place at all, and the window opens straight onto the vault. Read on
+///   the direct-REST arm only: it is about `userkey.bin`, which a `bw serve`
+///   account does not have and does not read.
+/// * `a_session_token_is_already_stored` -- the `bw serve` arm's own copy of
+///   that same question, and a SEPARATE input rather than the same one
+///   reused. The two backends store different credentials in different files
+///   and either can be present without the other; one parameter serving both
+///   would answer "a sign-in is owed" off whichever file the caller happened
+///   to have looked at. Read on the `bw serve` arm only.
+/// * `account` -- with **a recorded server URL** on the direct-REST arm,
+///   because that is what the child would sign in to. Without one there is
+///   nothing a card can do; see `ui_process::direct_rest_start_failure`,
+///   which refuses the spawn on the same fact from the other side.
+/// * `a_cli_is_available` -- read on the `bw serve` arm only, and it is the
+///   same shape as the server URL on the other one: the thing the child
+///   would sign in WITH. A `bw serve` sign-in is `bw login` in the child, so
+///   with no `bw.exe` on disk that child would start, find the CLI gone and
+///   exit through `why_a_ui_process_cannot_use_the_cli` without drawing --
+///   and this daemon would have already decided not to draw either, which is
+///   a launch with no window and no explanation.
+///
+/// # The `bw serve` arm, which used to answer `false` unconditionally
+///
+/// It answered `false` because a `bw serve` sign-in produces the session
+/// token that **the daemon** must start `bw serve` with, and the child's only
+/// carrier home was [`deskwarden::ui_process::UiVaultResult`] -- a file
+/// written as the child EXITS. The child would have been waiting for a
+/// backend described by an answer it could only send by dying first, which is
+/// a deadlock and not a scope line.
+///
+/// The carrier is what changed. `deskwarden::ui_show::signin_name` is a
+/// live doorbell rung from the middle of the child's life, while it sits on
+/// the spinner stage between the card and the vault: the child stores the
+/// token in that account's DPAPI `session.bin`, rings, and waits on
+/// `deskwarden::ui_show::backend_ready_name`; this daemon reads the identity,
+/// loads the token back out of the same store, starts `bw serve` with it, and
+/// answers. Neither the token nor the password crosses in a file, an argument
+/// or an environment variable.
 ///
 /// # It answers `false` when it cannot be sure
 ///
@@ -7100,16 +7336,29 @@ fn the_startup_sign_in_belongs_to_a_ui_process(
     backend_choice: backend_policy::VaultBackendChoice,
     a_key_is_already_stored: bool,
     account: Option<&Account>,
+    a_session_token_is_already_stored: bool,
+    a_cli_is_available: bool,
 ) -> bool {
-    if backend_choice != backend_policy::VaultBackendChoice::DirectRest {
-        return false;
+    match backend_choice {
+        backend_policy::VaultBackendChoice::DirectRest => {
+            if a_key_is_already_stored {
+                return false;
+            }
+            account.is_some_and(|account| {
+                account.server_url.as_deref().is_some_and(|url| !url.trim().is_empty())
+            })
+        }
+        // **No account-record condition on this arm**, and that is the
+        // difference between the two rather than a gap in this one. The
+        // direct-REST card signs in to a server named in `settings.json`, so
+        // a missing record is a card with nothing to do; the `bw serve` card
+        // signs in through `bw`, which holds its own profile and its own
+        // server, and a first-install launch with no account record at all is
+        // exactly the launch that card exists for.
+        backend_policy::VaultBackendChoice::BwServe => {
+            !a_session_token_is_already_stored && a_cli_is_available
+        }
     }
-    if a_key_is_already_stored {
-        return false;
-    }
-    account.is_some_and(|account| {
-        account.server_url.as_deref().is_some_and(|url| !url.trim().is_empty())
-    })
 }
 
 /// **Whether spawning a UI process for this account would produce a window.**
@@ -9963,11 +10212,29 @@ fn spawn_backend_start(
 /// `try_start_backend` already runs `bw sync` itself as part of coming up
 /// (see its doc), so this only issues a separate, explicit sync when the
 /// backend was already running and therefore never got that free one.
+/// **`tell_when_ready` is the sign-in handshake's other end**, and `None` on
+/// every caller but one.
+///
+/// `Some(pid)` means a `--ui` child is sitting on its spinner stage having
+/// just signed in, waiting to be told that `bw serve` is up on the token it
+/// stored. It is answered on this thread, the instant the readiness wait
+/// below succeeds and BEFORE the cache populate that follows it: the child
+/// has its own vault to draw and must not wait out the daemon's ~1 s fill of
+/// a cache it does not read.
+///
+/// **It is answered only on the success arm**, which is the whole of the
+/// failure story for "the daemon could not start `bw serve` after being
+/// rung". A child told nothing gives up on its own deadline and says so on
+/// screen; a child told "ready" over a backend that never started would open
+/// a vault window onto nothing and report it as an empty vault. See
+/// `deskwarden::ui_show::backend_ready_name`, which is also why this is an
+/// event rather than the child probing the port itself.
 fn spawn_sync(
     session_token: String,
     job: Arc<Option<job_object::KillOnCloseJob>>,
     cache: Arc<VaultCache>,
     currently_running: bool,
+    tell_when_ready: Option<u32>,
     tx: mpsc::Sender<BackendOp>,
 ) {
     std::thread::spawn(move || {
@@ -10002,6 +10269,17 @@ fn spawn_sync(
             }
         };
 
+        // **The child is answered HERE**, between the readiness wait and the
+        // populate, and only when the wait actually succeeded. See this
+        // function's `tell_when_ready` doc for why the ordering is both
+        // halves of the design: as early as the answer can honestly be
+        // given, and never on a failure.
+        if ready.is_ok() {
+            if let Some(pid) = tell_when_ready {
+                answer_the_childs_sign_in(pid);
+            }
+        }
+
         let outcome = match ready {
             Err(e) => SyncOutcome::Failed(e),
             Ok(probe_items) => sync_outcome_from(&cache, sync_epoch, probe_items),
@@ -10009,6 +10287,34 @@ fn spawn_sync(
 
         let _ = tx.send(BackendOp::Sync { child, outcome });
     });
+}
+
+/// **Tell a `--ui` child that `bw serve` is up on the token it stored.**
+///
+/// The daemon's half of `deskwarden::ui_show`'s sign-in handshake, and the
+/// end of the round trip that began with
+/// [`UiWindows::take_a_childs_sign_in`].
+///
+/// `false` from the `set` means nobody is listening on that name, which is
+/// the third of the three mid-sign-in failures: the child died between
+/// ringing the doorbell and reaching its vault. **Nothing is undone.** The
+/// backend that was just started is correct -- it is serving the account
+/// whose master password was genuinely accepted -- and the token is in that
+/// account's `session.bin` where the next window will find it. So this is
+/// logged and no more; the user's next *Open Vault* opens straight onto the
+/// vault with no card at all.
+fn answer_the_childs_sign_in(pid: u32) {
+    if (deskwarden::ui_show::ShowEnv::production().set)(
+        &deskwarden::ui_show::backend_ready_name(pid),
+    ) {
+        log::info!("told the vault window (process {pid}) that `bw serve` is ready");
+    } else {
+        log::warn!(
+            "the vault window (process {pid}) was not waiting to be told `bw serve` is \
+             ready; it closed before its vault stage. The backend stays up and the token \
+             stays stored, so the next window opens straight onto the vault"
+        );
+    }
 }
 
 /// **How a tray Sync refreshes the vault, given what its start attempt
@@ -11233,19 +11539,26 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
         active_account.as_ref().is_none_or(|a| a.use_official_bw_crypto),
     );
     let session_token = store.load();
-    if session_token.is_none() && choice == backend_policy::VaultBackendChoice::BwServe {
-        // **Still a refusal on this arm, and deliberately still one.** A
-        // `bw serve` sign-in produces a token that the DAEMON has to start
-        // `bw serve` WITH, and the only carrier this process has home is a
-        // file it writes as it exits -- which would arrive long after the
-        // window needed the backend it describes. So that half of the sign-in
-        // has not moved, and half-moving it would deadlock the window. See
-        // `ui_process::UiVaultResult::signed_in`.
-        log::error!(
-            "a ui process found no session token for an account served by `bw serve`; that              sign-in belongs to the daemon, so this window will not open"
-        );
-        return deskwarden::ui_process::UiStartFailure::NoSessionToken.exit_code();
-    }
+    // **This used to be a refusal, and the refusal is what is gone.**
+    //
+    // It read: a `bw serve` sign-in produces a token that the DAEMON has to
+    // start `bw serve` with, and the only carrier this process has home is a
+    // file it writes as it exits -- which would arrive long after the window
+    // needed the backend it describes. That was true, and it was a deadlock
+    // rather than a scope line: the child waited on a backend, the daemon
+    // waited on a file written only at exit.
+    //
+    // `deskwarden::ui_show::signin_name` is the carrier that did not exist
+    // then. It is rung from the MIDDLE of this process's life -- from the
+    // spinner stage between the card and the vault, which
+    // `app_window::run`'s `prepare` already owns -- so the daemon learns of
+    // the sign-in while this window is still on screen and still able to use
+    // what it starts. See `the_bw_serve_sign_in_this_window_runs`.
+    //
+    // A window with no token now opens on the card, exactly as the
+    // direct-REST arm below already does.
+    let a_bw_serve_sign_in_is_owed =
+        session_token.is_none() && choice == backend_policy::VaultBackendChoice::BwServe;
 
     // **Which backend this window reads through, asked rather than assumed.**
     //
@@ -11398,7 +11711,17 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // answer `None`, and a window that believed it was about to sign in while
     // holding a sink that refuses would open a card whose Unlock button
     // silently did nothing. Re-reading it here means the two cannot disagree.
-    let sign_in_here = signing_in_env.is_some();
+    //
+    // **Two ways to be signing in now, and the `bw serve` one is the second
+    // disjunct.** The direct-REST arm needs a built environment because its
+    // sign-in ends by putting a live `RestBackend` in this process's own
+    // slot, and the sink that does that is what `signing_in_env` IS. The
+    // `bw serve` arm needs no such environment: its sign-in ends by handing a
+    // token to the DAEMON, which owns the backend. So there is no sink to
+    // check and nothing that could silently refuse -- the condition is simply
+    // that no token was found for an account served by `bw serve`, which is
+    // exactly what was read off the store above.
+    let sign_in_here = signing_in_env.is_some() || a_bw_serve_sign_in_is_owed;
     if !backend_policy::install_env(signing_in_env.unwrap_or_else(|| {
         child_process_backend_env(&config_dir, active_account.as_ref())
     })) {
@@ -11595,6 +11918,15 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // geometry -- and it runs here, in this child, for a direct-REST account
     // whose stored key is gone. It used to run in the daemon, which is what
     // left the daemon holding the OpenGL driver for the rest of its life.
+    // **Which of the two sign-ins this window is about to run**, decided
+    // once here and read inside the `'static` closures below, which cannot
+    // reach back into this stack frame to ask again.
+    //
+    // `sign_in_here && !signing_in_env.is_some()` is not how it is spelled,
+    // deliberately: `signing_in_env` has been moved by the `install_env`
+    // call above, and re-deriving this from the backend choice is the same
+    // answer read off the same two facts the child started from.
+    let signing_in_over_bw_serve = a_bw_serve_sign_in_is_owed;
     let (result, signed_in_here) = if sign_in_here {
         // Everything the host's `'static` closures need, taken by value here.
         // A frame closure cannot borrow this stack frame, which is the same
@@ -11621,17 +11953,49 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
             // account here to offer it for.
             false,
             SETUP_MESSAGE,
-            // **Nothing to start, and that is the direct-REST arm's whole
-            // shape.** The daemon's copy of this closure calls
-            // `try_start_backend`, because on `bw serve` the backend is a
-            // child process that has to be spawned with the token the card
-            // just produced. A direct-REST account has no such process: by
-            // the time this runs, `adopt` has already put a live
-            // `RestBackend` in the slot the cache reads through, so the work
-            // between the card and the vault is genuinely nothing and the
-            // spinner is brief rather than fake.
-            |_token| (),
-            move |token, _work: &mut (), signed_in| {
+            // **THE STAGE BETWEEN THE CARD AND THE VAULT, and it now has two
+            // shapes because two sign-ins reach it.**
+            //
+            // On the DIRECT-REST arm there is nothing to start. By the time
+            // this runs, `adopt` has already put a live `RestBackend` in the
+            // slot the cache reads through, so the work between the card and
+            // the vault is genuinely nothing and the spinner is brief rather
+            // than fake.
+            //
+            // On the `bw serve` arm this is the whole handshake, and it runs
+            // HERE for a reason nothing else in this process could satisfy:
+            // it is the only stage that happens after a master password has
+            // been accepted and before a vault item is drawn. The daemon owns
+            // `bw serve` and must start it with this token; this window
+            // cannot draw a vault until it has. See
+            // `hand_the_bw_serve_sign_in_to_the_daemon`.
+            //
+            // **It runs on a worker thread**, which is what makes the wait
+            // honest rather than a frozen card: `app_window::run` spawns this
+            // closure and shows its spinner stage until the answer lands.
+            // **It answers whether the vault may be read**, which is what the
+            // stage after it needs to know and what a `()` could not say. On
+            // the direct-REST arm that is unconditionally true; on the
+            // `bw serve` arm it is whether the daemon answered.
+            {
+                let config_dir = config_dir.clone();
+                // The path rather than the store: `SessionStore` is
+                // deliberately not `Clone`, and widening a type that wraps
+                // DPAPI to satisfy a closure would be the wrong direction.
+                let session_path = store.path().to_path_buf();
+                move |token: String, identity: Option<login_ui::SignedInIdentity>| {
+                    if !signing_in_over_bw_serve {
+                        return true;
+                    }
+                    hand_the_bw_serve_sign_in_to_the_daemon(
+                        &config_dir,
+                        &session_path,
+                        &token,
+                        identity.as_ref(),
+                    )
+                }
+            },
+            move |token, work: &mut bool, signed_in| {
                 let (_options, frame, handles) = vault_window::build_frame(
                     cache_for_vault,
                     fill_stats_for_vault,
@@ -11646,14 +12010,26 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                     token.to_string(),
                     icon_cache_dir_for_vault,
                     auto_lock_for_vault,
-                    // **`true`: there is no readiness to wait for.** This flag
-                    // asks whether `bw serve` was already up, and on this
-                    // account nothing ever consults `bw serve` at all. A
-                    // `false` here would make the vault's first load pay a
+                    // **Whether the vault may be read without waiting, taken
+                    // from what the stage before this one answered.**
+                    //
+                    // It used to be a bare `true`, which was correct while
+                    // only the direct-REST sign-in reached here: nothing on
+                    // that account ever consults `bw serve`, and a `false`
+                    // would make the vault's first load pay a
                     // `wait_for_vault_ready` against a port with nothing on
-                    // it, which is the exact defect the cache arm above this
-                    // was written to fix.
-                    true,
+                    // it.
+                    //
+                    // That is still what the direct-REST arm answers. The
+                    // `bw serve` arm answers whether the DAEMON said its
+                    // backend was ready -- and a `false` there is the first
+                    // mid-sign-in failure told truthfully: the vault does its
+                    // own readiness wait, that wait fails, and the window
+                    // says the vault could not be loaded. A hardcoded `true`
+                    // would instead skip the wait and paint an EMPTY VAULT as
+                    // though it were the user's, which is the worst outcome
+                    // available on this path.
+                    *work,
                     accounts_for_vault,
                     // This window's first frame installed the fonts, rounded
                     // the corners and raised it, two stages ago.
@@ -11770,6 +12146,150 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     }
     log::info!("ui process {} is done: {crossing:?}", std::process::id());
     crossing.exit_code()
+}
+
+/// **How long a `--ui` child waits for the daemon to start `bw serve` after
+/// it has signed in.**
+///
+/// Generous, because what it is waiting for is a `bw sync` and a Node cold
+/// start that the daemon's own startup regularly spends eight seconds on,
+/// and because the thing on screen while it waits is an honest spinner
+/// rather than a frozen card. Bounded, because a child that waited forever
+/// on a daemon that died would be a window nobody can explain and nobody can
+/// close out of.
+///
+/// Larger than [`deskwarden::bw_serve::READINESS_DEADLINE`] on purpose: the
+/// daemon spends that deadline itself, on the readiness probe, before it
+/// answers -- so a child bounded by the same number would give up exactly
+/// when its answer was due.
+const BACKEND_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(90);
+
+/// **The `bw serve` sign-in's handshake, from the child's side.**
+///
+/// Runs on `app_window::run`'s worker thread, in the stage between the card
+/// and the vault, with the session token the card just produced. `true` means
+/// the vault may be read now.
+///
+/// # The four steps, and why they are in this order
+///
+/// 1. **The token goes to that account's DPAPI `session.bin`**, through the
+///    same [`deskwarden::session_store::SessionStore`] every other path in
+///    this app reads it from. FIRST, because the daemon's answer to the
+///    doorbell is to load it back out of that file -- a ring that arrived
+///    before the write would find nothing there. A failed write is fatal to
+///    the handshake and returns early: ringing anyway would have the daemon
+///    start `bw serve` with a stale token or none at all.
+/// 2. **The readiness ear is created**, before the ring. See
+///    [`deskwarden::ui_show::backend_ready_name`]: the daemon's `SetEvent`
+///    lands the instant its backend is up, and a name created after the ring
+///    could miss it entirely.
+/// 3. **The identity file is written, then the doorbell is rung.** That
+///    order, and never the other, so the daemon cannot read a file that is
+///    not finished -- the same rule the settings delivery follows.
+/// 4. **The wait**, bounded by [`BACKEND_HANDSHAKE_DEADLINE`].
+///
+/// # What crosses, and what does not
+///
+/// Out: an account id, an email, a server URL and a backend answer -- the
+/// [`login_ui::SignedInIdentity`] this window established, every field of
+/// which `settings.json` already holds in the clear. In: one bit, "the
+/// backend is up".
+///
+/// **The master password does not appear here at all**, and the session
+/// token appears only on its way into the store that already holds it,
+/// wrapped under the user's own credentials. Neither is an argument, neither
+/// is an environment variable, and neither is in the file that crosses.
+///
+/// # The two failures this function itself defines
+///
+/// A `false` from any step means the window does not get a vault it can
+/// trust, and it says so: the caller hands this answer to `build_frame`,
+/// which then makes the vault do its own readiness wait rather than skipping
+/// it. What the user sees is the window explaining that the vault could not
+/// be loaded -- not an empty vault presented as theirs.
+///
+/// The third failure is the daemon's and is not visible here: a child that
+/// dies after ringing is handled by `answer_the_childs_sign_in`, which finds
+/// nobody listening and leaves the started backend and the stored token
+/// alone.
+fn hand_the_bw_serve_sign_in_to_the_daemon(
+    config_dir: &Path,
+    session_path: &Path,
+    token: &str,
+    identity: Option<&login_ui::SignedInIdentity>,
+) -> bool {
+    // 1. The token, into the store the daemon will read it back out of.
+    let store = session_store::SessionStore::new(session_path.to_path_buf());
+    if let Err(e) = store.save(token) {
+        log::error!(
+            "this window signed in but could not store the session token at {} ({e}); the \
+             daemon has nothing to start `bw serve` with, so it is not being asked to",
+            session_path.display()
+        );
+        return false;
+    }
+
+    // 2. The ear, BEFORE the ring. See this function's doc.
+    let pid = std::process::id();
+    let Some(ready) = (deskwarden::ui_show::ShowEnv::production().create)(
+        &deskwarden::ui_show::backend_ready_name(pid),
+    ) else {
+        log::error!(
+            "this window could not create the event the daemon answers a sign-in on; it \
+             will not ring, because a ring it cannot hear the answer to would start a \
+             backend for a window that had already given up"
+        );
+        return false;
+    };
+
+    // 3. The file, then the doorbell.
+    let Some(identity) = identity else {
+        log::error!(
+            "this window produced a session token but no identity to name the account it \
+             belongs to; the daemon cannot be told which account to start `bw serve` for"
+        );
+        return false;
+    };
+    let path = deskwarden::ui_process::signed_in_path(config_dir, pid);
+    if let Err(e) = deskwarden::ui_process::write_signed_in(&path, identity) {
+        log::error!(
+            "this window could not leave its sign-in for the daemon at {} ({e})",
+            path.display()
+        );
+        return false;
+    }
+    if !(deskwarden::ui_show::ShowEnv::production().set)(&deskwarden::ui_show::signin_name(pid)) {
+        // **The first mid-sign-in failure, and it is the daemon that is
+        // gone** -- it died between spawning this window and now, or it
+        // could not create the doorbell at all. Nothing is lost that this
+        // process can recover: the token is stored, so the next launch finds
+        // a good session and opens straight onto the vault.
+        log::error!(
+            "this window signed in, but no daemon is listening for it; `bw serve` will not \
+             be started for this window. The token is stored, so the next launch will find \
+             a good session"
+        );
+        deskwarden::ui_process::forget_signed_in(&path);
+        return false;
+    }
+
+    // 4. The wait. The spinner stage is on screen for the whole of it.
+    log::info!("this window signed in and is waiting for the daemon to start `bw serve`");
+    let answered = ready.wait(
+        u32::try_from(BACKEND_HANDSHAKE_DEADLINE.as_millis())
+            .unwrap_or(windows::Win32::System::Threading::INFINITE),
+    );
+    if answered {
+        log::info!("the daemon reported `bw serve` ready; this window is opening the vault");
+    } else {
+        log::error!(
+            "the daemon did not report `bw serve` ready within {BACKEND_HANDSHAKE_DEADLINE:?} \
+             of this window signing in; the vault stage will do its own readiness wait and \
+             report what it finds rather than showing an empty vault as though it were the \
+             user's"
+        );
+    }
+    answered
 }
 
 /// Whether anything is listening on `bw serve`'s constant port.
@@ -34521,28 +35041,37 @@ mod vault_backend_choice_tests {
     /// OpenGL driver into the daemon permanently, because the driver's
     /// committed arenas come back only at process exit.
     ///
-    /// # The `bw serve` row is not an oversight
+    /// # The `bw serve` rows used to be the scope line, and are now the
+    /// second half of the deliverable
     ///
-    /// It is the scope line of this branch, asserted so that a later change
-    /// which quietly flips it has to come through here. A `bw serve` sign-in
+    /// They read `false` unconditionally, because a `bw serve` sign-in
     /// produces the session token the DAEMON must start `bw serve` with, and
-    /// the child's only carrier home is a file written as it exits -- which
-    /// arrives long after the window needs the backend it describes. Moving
-    /// that half needs a live channel, not this flag.
+    /// the child's only carrier home was a file written as it EXITS -- which
+    /// arrives long after the window needs the backend it describes. That was
+    /// a deadlock, not a scope line, and what fixed it was a live channel:
+    /// `deskwarden::ui_show::signin_name` rung from the child's spinner
+    /// stage, answered on `deskwarden::ui_show::backend_ready_name`.
+    ///
+    /// So this arm now has two conditions of its own, and both are rows
+    /// below: a sign-in is only owed when there is no session token, and the
+    /// child can only run one when there is a `bw.exe` for it to run.
     #[test]
-    fn the_daemon_draws_no_window_on_the_direct_rest_sign_in_path() {
+    fn the_daemon_draws_no_window_on_either_sign_in_path() {
         use backend_policy::VaultBackendChoice::{BwServe, DirectRest};
         let self_hosted = account_on_the_built_in_client(Some("https://vault.example.com"));
         let no_server = account_on_the_built_in_client(None);
         let official = account_on(Some("https://vault.example.com"));
 
-        for (choice, stored, account, expected, why) in [
+        // `(choice, key_stored, account, token_stored, cli, expected, why)`
+        for (choice, stored, account, token, cli, expected, why) in [
             // The owner's launch: self-hosted, built-in client, no stored key.
             // This is the row the whole branch is for.
             (
                 DirectRest,
                 false,
                 Some(&self_hosted),
+                false,
+                true,
                 true,
                 "the sign-in card must open in a ui process, or this daemon draws once and \
                  holds the graphics driver until sign-out",
@@ -34554,6 +35083,8 @@ mod vault_backend_choice_tests {
                 false,
                 Some(&no_server),
                 false,
+                true,
+                false,
                 "an account with no server URL has nothing for a card to sign in TO",
             ),
             // No sign-in is owed at all: the window opens on the vault.
@@ -34562,24 +35093,69 @@ mod vault_backend_choice_tests {
                 true,
                 Some(&self_hosted),
                 false,
+                true,
+                false,
                 "there is no sign-in to place when the slot is already filled",
             ),
-            // The scope line, asserted rather than assumed.
+            // No account resolved at all -- `settings.json` names none.
+            (DirectRest, false, None, false, true, false, "there is no account to sign in as"),
+            // **THE ROW THAT FLIPPED.** A `bw serve` account with no session
+            // token and a CLI to sign in with: the card opens in the child,
+            // which stores the token and rings the daemon for a backend.
             (
                 BwServe,
                 false,
                 Some(&official),
                 false,
-                "a `bw serve` sign-in produces the token the daemon starts the backend \
-                 with, and the exit-time result file cannot deliver it in time",
+                true,
+                true,
+                "the `bw serve` sign-in card must open in a ui process too; the live \
+                 doorbell is what made it possible, and without this row the daemon draws \
+                 on the commonest sign-in there is",
             ),
-            // No account resolved at all -- `settings.json` names none.
-            (DirectRest, false, None, false, "there is no account to sign in as"),
+            // A `bw serve` launch that owes no card at all.
+            (
+                BwServe,
+                false,
+                Some(&official),
+                true,
+                true,
+                false,
+                "a launch whose `bw` session is still good owes no sign-in, and routing it \
+                 as though it did would suppress the backend start it actually needs",
+            ),
+            // The mirror of the direct-REST arm's missing server URL: the
+            // thing the child would sign in WITH is not there.
+            (
+                BwServe,
+                false,
+                Some(&official),
+                false,
+                false,
+                false,
+                "with no `bw.exe` the child would exit without drawing, and this daemon \
+                 would have already decided not to draw either -- a launch with no window \
+                 and no explanation",
+            ),
+            // The `bw serve` arm reads neither the account record nor the
+            // stored master key: `bw` holds its own profile, and a first
+            // install with no account record is exactly what its card is for.
+            (
+                BwServe,
+                true,
+                None,
+                false,
+                true,
+                true,
+                "a first-install `bw serve` launch has no account record yet, which is the \
+                 launch the card exists for rather than a reason to draw here",
+            ),
         ] {
             assert_eq!(
-                the_startup_sign_in_belongs_to_a_ui_process(choice, stored, account),
+                the_startup_sign_in_belongs_to_a_ui_process(choice, stored, account, token, cli),
                 expected,
-                "{choice:?} with a_key_already_stored={stored} and account={:?}: {why}",
+                "{choice:?} with a_key_already_stored={stored}, a_token_stored={token}, \
+                 a_cli={cli} and account={:?}: {why}",
                 account.map(|a| a.server_url.clone())
             );
         }

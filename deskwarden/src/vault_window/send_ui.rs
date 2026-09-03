@@ -5362,12 +5362,20 @@ mod source_pins {
         // waiting for `bw serve`, so the backend is started and reconciled
         // *behind* the arm rather than above it -- a second call, on a path
         // that has no session to hand the window because no window is open
-        // on it. The count moved with a reason; it is still exact, and a
-        // fourth still fails.
+        // on it.
+        //
+        // **It is four in `main.rs` since the `bw serve` sign-in moved into
+        // the `--ui` child**, and the fourth is that move's whole mechanism.
+        // A child that signs in stores its token and rings the daemon; the
+        // daemon answers by starting the backend, and it does that through
+        // this same spawner rather than a second one, because doing it
+        // inline would block the loop that answers the tray for up to ~30 s
+        // -- the exact freeze the child was moved out to remove. The count
+        // moved with a reason; it is still exact, and a fifth still fails.
         for (needle, expected) in [
             (
                 concat!("spawn_", "sync"),
-                vec![("main.rs", 3usize), ("vault_window/mod.rs", 3)],
+                vec![("main.rs", 4usize), ("vault_window/mod.rs", 3)],
             ),
             (concat!("env.", "sync"), vec![("vault_window/mod.rs", 1)]),
             (concat!("spawn_vault_", "sync"), vec![("vault_window/mod.rs", 2)]),

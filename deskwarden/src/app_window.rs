@@ -1238,7 +1238,14 @@ pub fn run<P, W, V, T, B>(
 ) -> StartupOutcome<P>
 where
     P: Send + 'static,
-    W: FnOnce(String) -> P + Send + 'static,
+    // **The identity is the second argument**, and it is what lets a sign-in
+    // that happened in a `--ui` child be acted on by the daemon WHILE the
+    // window is still up. `prepare` is the one stage between the card and the
+    // vault, so it is the only place from which a child can say "this account
+    // signed in, start its backend" in time for its own vault stage to use
+    // the answer. `None` on the post-lock card's path, where no card
+    // established anything new.
+    W: FnOnce(String, Option<login_ui::SignedInIdentity>) -> P + Send + 'static,
     // **The identity is the third argument, and it is why this host can build
     // a NAMED vault toolbar on a first install.** The worker that produced `P`
     // ran before the account had an address on disk; the card that ran before
@@ -1503,9 +1510,24 @@ where
                         // `take`, not `clone`: the worker gets the only
                         // sender, so its death is a `Disconnected` the stage
                         // can act on.
+                        // **The identity goes to the worker with the token**,
+                        // cloned out of the cell that was written three
+                        // statements above this one. `prepare` is
+                        // `Send + 'static` and cannot borrow an `Rc<RefCell>`
+                        // living on the frame thread, so the clone is what
+                        // crosses.
+                        //
+                        // It is here because a `bw serve` sign-in in a `--ui`
+                        // child has to tell the daemon WHICH ACCOUNT it just
+                        // signed in to before the daemon can start `bw serve`
+                        // for it -- and `prepare` is the only stage that runs
+                        // between the card and the vault. Reading it later,
+                        // in `build_vault`, would be reading it after the
+                        // window already needed the backend.
+                        let established = identity_for_closure.borrow().clone();
                         if let Some(work_tx) = work_tx.take() {
                             std::thread::spawn(move || {
-                                let _ = work_tx.send(prepare(produced));
+                                let _ = work_tx.send(prepare(produced, established));
                             });
                         }
                     }
