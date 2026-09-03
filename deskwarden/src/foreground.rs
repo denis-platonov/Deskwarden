@@ -1544,7 +1544,7 @@ mod tests {
             // asked for by `unlock_prompt` and `login_ui`, which own those
             // windows and are classified in their own right.
             "user_key_store",
-            // The seam trait over the twenty vault operations, plus the
+            // The seam trait over the twenty-one vault operations, plus the
             // delegating impl for `VaultBridge`. No route, no window: it
             // moves calls that already existed, unchanged, behind a name
             // that does not mention `bw`.

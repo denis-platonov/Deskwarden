@@ -635,13 +635,38 @@ impl VaultCache {
     /// see [`PopulateOutcome`].
     ///
     /// **Write-guarded too**, and for a window this one opens itself: the
-    /// `list_items` below and the `list_folders` inside are both real HTTP
-    /// round-trips, and a write can land in between. See
-    /// [`Self::populate_with`] for what happens to it.
+    /// fetch below is a real round-trip (or two, depending on the backend),
+    /// and a write can land during it. See [`Self::write_back_at_epoch`] for
+    /// what happens to it.
+    ///
+    /// # One fetch call, not two, and the backend decides what that costs
+    ///
+    /// This used to be `self.bridge.list_items()` here and a
+    /// `self.bridge.list_folders()` inside [`Self::populate_with_at_epoch`].
+    /// That spelling made the *call site* decide that the vault's two halves
+    /// are fetched separately, and on a direct-REST account they are not
+    /// separable at all: both ride one `GET /api/sync`, so asking twice
+    /// fetched every cipher on the account twice and decrypted the whole
+    /// vault twice. Measured on the owner's 1,668-item account, the second of
+    /// those was **six seconds** of a fifteen-second window open.
+    ///
+    /// [`VaultBackend::list_vault`] moves that decision to the only place
+    /// that can make it correctly. `bw serve` still issues exactly the two
+    /// loopback calls it always did, in the same order; the REST backend
+    /// takes both halves off the one sync it was already paying for.
+    ///
+    /// [`Self::populate_with`] keeps its own `list_folders` and is unchanged:
+    /// its caller has already fetched the items by itself, so there is no one
+    /// sync left to take the folders from.
     pub fn populate(&self) -> Result<PopulateOutcome, VaultError> {
+        // Captured BEFORE the fetch, which is the rule every entry point
+        // here obeys and the reason this is not simply
+        // `populate_with_vault(self.bridge.list_vault()?, self.epoch())` --
+        // argument evaluation order would take the epoch after the fetch and
+        // silently make both guards blind to anything that landed during it.
         let epoch = self.epoch();
-        let items = self.bridge.list_items()?;
-        self.populate_with_at_epoch(items, epoch)
+        let vault = self.bridge.list_vault()?;
+        Ok(self.write_back_at_epoch(vault.items, vault.folders, epoch, Source::Backend))
     }
 
     /// The snapshot's current epoch, for a caller that fetches the vault

@@ -464,6 +464,54 @@ pub fn bw_serve_is_selected() -> bool {
     selected() == VaultBackendChoice::BwServe
 }
 
+/// Whether a vault window may skip [`crate::bw_serve::wait_for_vault_ready`]
+/// before its first `populate()`.
+///
+/// # The probe is a `list_items`, and on one backend that is the whole vault
+///
+/// `wait_for_vault_ready` polls `list_items` until something answers. Against
+/// `bw serve` that is a loopback request to a process already holding the
+/// plaintext -- cheap, and worth paying, because a backend that is
+/// mid-cold-start would otherwise turn into a bogus connection-refused
+/// failure from the `populate()` a moment behind it. Against
+/// [`crate::rest::backend::RestBackend`] the same call is a `GET /api/sync`
+/// carrying every cipher on the account, plus a decryption of all of them: on
+/// the owner's 1,668-item vault, **eight seconds spent asking whether the
+/// vault could be asked**, before the fetch that actually filled the window.
+///
+/// And on that account it answers a question nobody is asking. There is no
+/// `bw serve` to be mid-cold-start: none is ever started, so there is no
+/// window of unreadiness to wait out, and the probe cannot report anything
+/// the `populate()` behind it will not report itself -- more cheaply, having
+/// done the real work on the way.
+///
+/// # This is `attachment_needs_a_backend_start`'s defect, in another process
+///
+/// The caller's observation is `backend_is_listening()`: "is something
+/// answering on `bw serve`'s port". That is the wrong question on an account
+/// that never starts one -- the answer is `false` forever, so "the backend
+/// might still be coming up" is permanently true when there is no backend,
+/// and the window pays a whole-vault sync for the probe on every single open.
+/// Same shape as the thirty-second start loop, and the same cure: take
+/// [`bw_serve_is_selected`] -- **the decision that already exists** -- above
+/// the observation, because it is the one whose `false` cannot turn `true`
+/// while the process runs.
+///
+/// # Why both inputs are parameters
+///
+/// Neither is read inside. `bw_serve_is_selected` is process-global
+/// environment and `backend_is_listening` is a TCP connect with a timeout;
+/// taking them keeps this pure, keeps it testable without installing an
+/// environment or binding a port, and leaves the two call sites in `main.rs`
+/// -- the UI process and the daemon's in-process fallback -- as the only
+/// places either is consulted. It lives **here** rather than beside them
+/// because `main.rs` is a binary: `vault_window`, which carries the flag and
+/// pins the behaviour, is in the library and could not reach it there.
+#[must_use]
+pub fn may_skip_the_readiness_probe(bw_serve_is_selected: bool, backend_is_listening: bool) -> bool {
+    !bw_serve_is_selected || backend_is_listening
+}
+
 /// The direct-REST login for the active account, for
 /// [`crate::login_ui`]'s sign-in worker.
 ///
