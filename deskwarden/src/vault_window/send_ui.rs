@@ -4765,6 +4765,36 @@ mod source_pins {
              reaches"
         );
 
+        // **And the window READS the choice exactly once**, which is the
+        // half the census above cannot see. `tasks_for` being the only route
+        // to a `BackendTasks` says nothing about a SEVENTH action written
+        // next month with its own `if selected() == DirectRest` -- which is
+        // exactly the shape all six of these had, and exactly how six defects
+        // shipped in a day. So the read itself is counted, over every file
+        // this window is made of: once, in `tasks_for`, and nowhere else.
+        //
+        // Deliberately scoped to `vault_window/`. `main.rs` legitimately
+        // reads the choice several times -- it is the process that PUBLISHES
+        // it -- and folding those into this number would make it a total that
+        // drifts for reasons this test has no opinion about.
+        let read = concat!("backend_policy::selected", "()");
+        let reads: Vec<(&str, usize)> = files
+            .iter()
+            .filter(|(path, _)| path.starts_with("vault_window/"))
+            .map(|(path, text)| {
+                (path.as_str(), sanitized(&production_region(text)).matches(read).count())
+            })
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        assert_eq!(
+            reads,
+            vec![("vault_window/mod.rs", 1)],
+            "this window reads {read:?} at {reads:?}, not once in `tasks_for`. A second read \
+             is a seventh hand-branch -- the shape all six of these actions had, and the one \
+             that put an `os error 2` on every Sends screen, export and Sync of an account \
+             with no `bw.exe` on it"
+        );
+
         // And the module exports nothing but the trait and the gate. A
         // `pub(super) fn blocking_send_list()` added inside it would keep the
         // count above unchanged and hand the frame closure a `bw` child back.
