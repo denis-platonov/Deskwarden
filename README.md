@@ -160,6 +160,34 @@ application. That is what commercial password managers do well and what this
 app is built to match — the vault you already have, reaching the windows a
 browser extension cannot see.
 
+### How this compares
+
+Deskwarden is not a password manager, and this is not a "which manager is
+best" table. It compares on the one axis this app exists for -- what reaches a
+**native Windows application** -- and on the things a Windows reader weighs
+beside it. Free tiers only.
+
+| | Fills native Windows apps | Fills web forms in a browser | Where the vault lives | Free tier | Open source | Platforms |
+| --- | --- | --- | --- | --- | --- | --- |
+| **Deskwarden** | Yes -- matched by process name, entered as keystrokes | No -- Bitwarden's browser extension does that | No vault of its own: whichever Bitwarden-compatible server your account is already on | Free and complete, but it needs a separate Bitwarden-compatible account, is unofficial and unaffiliated with Bitwarden, and is one person's project | Yes, AGPL-3.0 | Windows only |
+| **Bitwarden** | Not documented -- the autofill pages cover the browser extension and the mobile apps; the desktop app's page describes vault management, generation and biometric unlock, and no filling into other applications | Yes, browser extension | Bitwarden's servers, or a server you host | Unlimited passwords, unlimited devices, browser/mobile/desktop apps, sharing with one other user | Yes | Windows, macOS, Linux, nine browsers, iOS, Android, web vault, CLI |
+| **Apple Passwords** | No -- on Windows it is a browser extension plus an app to view passwords in | Yes on Windows, through an extension for Chrome, Edge and Firefox | iCloud Keychain, on Apple's servers | Included with the operating system at no separate charge; the Apple Account needs two-factor authentication | No | iOS 18, iPadOS 18, macOS Sequoia, visionOS 2; Windows through iCloud Passwords |
+| **Keeper** | In the paid desktop app, yes: KeeperFill for Apps fills native applications from a hotkey, with custom keystroke sequences, and works in RDP sessions. The free version does not reach it | The browser extension is not in the free version | Keeper's servers | 10 records, one mobile device, no sharing, no browser extension, no web vault, no unlimited sync | No | Desktop apps for Windows and macOS, browser extensions, mobile |
+| **KeePass 2.x** | Yes -- Auto-Type sends simulated keypresses to the window that had focus, matched on window title | The same Auto-Type mechanism; no browser extension of its own | A database file you keep and sync yourself | Free, all of it | Yes, OSI-certified | Windows 7/8/10/11; Linux, macOS and BSD under Mono |
+| **KeePassXC** | Yes -- Auto-Type, by global hotkey or per-entry window matching | The same Auto-Type mechanism | A database file you keep and sync yourself | Free, all of it | Yes, GPL-3.0 | Windows, macOS, Linux |
+
+**KeePass is not one program.** KeePass 2.x (keepass.info) and KeePassXC are
+separate projects that read the same database format, and KeePassDX is a third,
+Android-only one under GPL-3.0. They have different platforms and different
+features; the two rows above are not interchangeable.
+
+Checked 2026-09-03, against each vendor's own pages: Bitwarden's pricing and
+download pages and its desktop and autofill help; Apple's iCloud for Windows
+guide and the Passwords support article; Keeper's free-trial-versus-free-version
+comparison and the KeeperFill for Apps documentation; keepass.info's features,
+download and Auto-Type pages; keepassxc.org and its user guide. Free tiers
+change, so this rots -- if a cell is wrong now, please open an issue.
+
 ### Keeping secrets where they belong
 
 - **Windows Hello** to unlock, and to hold the key for the encrypted local
