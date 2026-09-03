@@ -148,13 +148,45 @@ const UI_LOADED_LABEL: &str = "Open the vault instantly";
 /// turns it on should not meet the memory afterwards in Task Manager.
 ///
 /// It also names what still closes the window, because "instantly" would
-/// otherwise read as a promise that a lock cannot keep -- locking,
-/// switching account and editing these settings all end the process, so
-/// that what they have to tell the app actually gets told.
+/// otherwise read as a promise that a lock cannot keep.
+///
+/// **"Changing these settings" is NOT one of them, and saying so was this
+/// row's longest-standing wrong sentence.** A preferences edit has its own
+/// way home now: [`crate::vault_window::HideHooks`] writes it to
+/// `ui-settings-<pid>.json` and rings the daemon's doorbell while this
+/// process is still alive, and `close_or_hide` delivers BEFORE it decides,
+/// so even Alt+F4 with the modal still up hands the edit over. With it
+/// delivered, [`crate::ui_process::on_close`] reads
+/// `edited_settings.is_none() || settings_delivered` and hides like any
+/// other close. The copy went on naming a process end that had stopped
+/// happening; do not put it back.
+///
+/// **What actually still ends the process, and what the sentence now says:**
+///
+/// 1. *Locking or switching account* -- with re-auth, add-account and
+///    remove-account beside them. Each is a reason the window closed whose
+///    only carrier is this process exiting, so `nothing_to_report` is false
+///    and `on_close` answers `Exit`. The copy names the two a user
+///    recognises as their own action.
+/// 2. *Turning this setting off.* [`crate::vault_window`]'s
+///    `effective_keep_ui_loaded` re-reads the value out of the modal's edit
+///    instead of remembering what the process started with, so the window it
+///    was just switched off in does not stay resident anyway.
+/// 3. *Turning this setting ON.* `main.rs` builds `HideHooks` under
+///    `settings.keep_ui_loaded.then(..)` at spawn, so a window that opened
+///    while this was off has none, and `close_or_hide` takes the `None` arm
+///    and closes unconditionally. The first close after switching it on
+///    therefore still ends the process. The owner turned it on, watched the
+///    window go, and reported it as "unloads the app" -- correct behaviour
+///    that the old sentence explained with the wrong reason. Naming both
+///    directions of the toggle in one clause covers 2 and 3 together, and
+///    tells the reader when it starts working.
 const UI_LOADED_DESCRIPTION: &str =
     "Keeps the vault window loaded and hidden after you close it, so it opens \
      immediately next time. Holds about 76 MB while the vault is unlocked. \
-     Locking, switching account or changing these settings closes it fully.";
+     Locking or switching account closes it fully. Turning this on or off \
+     closes the window that is open, so it applies from the next time you \
+     open the vault.";
 
 /// The description under [`BACKEND_LABEL`].
 ///
@@ -6098,6 +6130,75 @@ mod tests {
             UI_LOADED_DESCRIPTION.to_lowercase().contains("lock"),
             "the row promises instant opening without saying what still closes the \
              window, so a lock reads as the setting having failed"
+        );
+    }
+
+    /// **The row must not blame a settings edit for the window closing.**
+    ///
+    /// It said "changing these settings closes it fully" long after that
+    /// stopped being true: `HideHooks` delivers the edit down a live channel
+    /// and [`crate::ui_process::on_close`] reads
+    /// `edited_settings.is_none() || settings_delivered`, so a delivered edit
+    /// HIDES. The two things that do still end the process are the toggle
+    /// itself and a lock or account switch, and the copy now names those.
+    ///
+    /// Pinned because the wrong sentence was not wrong when it was written.
+    /// A reader checking it against the app would have to reproduce the
+    /// doorbell to catch it, which is how it survived several releases.
+    #[test]
+    fn the_ui_loaded_row_does_not_blame_a_settings_edit_for_the_close() {
+        let copy = UI_LOADED_DESCRIPTION.to_lowercase();
+        for stale in ["changing these settings", "these settings closes"] {
+            assert!(
+                !copy.contains(stale),
+                "the row is back on {stale:?}, which the live settings channel made \
+                 false: a delivered edit hides. See `ui_process::on_close`. \
+                 {UI_LOADED_DESCRIPTION}"
+            );
+        }
+        // **The control for the two bans above.** A `contains` over a
+        // phrase that was never in this copy would pass for the wrong
+        // reason, so a phrase that IS in it is asserted the same way, off
+        // the same lowercased string. Without this, a `to_lowercase` that
+        // silently stopped matching anything would read as the bans holding.
+        assert!(
+            copy.contains("closes it fully"),
+            "the control phrase is gone, so the two bans above prove nothing: \
+             {UI_LOADED_DESCRIPTION}"
+        );
+        // **What replaced it: the toggle is what closes the open window.**
+        // True in both directions and for different reasons -- off is
+        // `vault_window::effective_keep_ui_loaded` re-reading the modal's
+        // edit, on is `main.rs` having built no `HideHooks` for a window
+        // that opened while it was off -- and the owner met the ON case
+        // and reported it as the app unloading.
+        assert!(
+            copy.contains("turning this on or off"),
+            "the row does not say the toggle itself closes the window that is open, \
+             so the first close after switching it on reads as the setting being \
+             broken: {UI_LOADED_DESCRIPTION}"
+        );
+        assert!(
+            copy.contains("next time you"),
+            "the row does not say when the setting starts working, which is the \
+             half that turns a surprise into an instruction: {UI_LOADED_DESCRIPTION}"
+        );
+        // **No stray carriage return.** These sources are CRLF and the
+        // copy above is five continued lines; a backslash followed by CRLF
+        // that the lexer did not fold would paint as a blank and break the
+        // line in the wrong place. Spelled `char::from(13u8)` for the
+        // reason the direct-icons row gives: writing a CR literal into a
+        // CRLF source is the very hazard under test.
+        assert!(
+            !UI_LOADED_DESCRIPTION.contains(char::from(13u8)),
+            "a literal carriage return survived a line continuation into the copy"
+        );
+        // The control: the same check on the label beside it, which is a
+        // single unbroken literal and has always been clean, so a
+        // `contains` that could never be true is not what is passing.
+        assert!(
+            !UI_LOADED_LABEL.contains(char::from(13u8)),
+            "a literal carriage return reached the label, which is not even continued"
         );
     }
 
