@@ -6841,6 +6841,13 @@ impl UiWindows {
             deskwarden::ui_process::forget_edited_settings(
                 &deskwarden::ui_process::edited_settings_path(config_dir, pid),
             );
+            // **And its sign-in delivery**, for the same reason and with one
+            // of its own: a killed window's ring will never be polled, so the
+            // file behind it would sit in the user's config directory naming
+            // an account until something else happened to overwrite it.
+            deskwarden::ui_process::forget_signed_in(
+                &deskwarden::ui_process::signed_in_path(config_dir, pid),
+            );
         }
     }
 
@@ -6901,6 +6908,13 @@ impl UiWindows {
             // `forget_result`'s reason: the config directory is the user's.
             deskwarden::ui_process::forget_edited_settings(
                 &deskwarden::ui_process::edited_settings_path(config_dir, pid),
+            );
+            // **And its sign-in delivery**, for the same reason and with one
+            // of its own: a killed window's ring will never be polled, so the
+            // file behind it would sit in the user's config directory naming
+            // an account until something else happened to overwrite it.
+            deskwarden::ui_process::forget_signed_in(
+                &deskwarden::ui_process::signed_in_path(config_dir, pid),
             );
         }
     }
@@ -7173,6 +7187,16 @@ fn what_the_vault_ui_process_reported(
     // nothing will ever read that name again.
     deskwarden::ui_process::forget_edited_settings(
         &deskwarden::ui_process::edited_settings_path(config_dir, pid),
+    );
+    // **And its sign-in delivery.** Ordinarily gone already --
+    // `take_a_childs_sign_in` deletes it as it acts on it -- but a window
+    // that rang and then exited before the next pass of the loop leaves one,
+    // and the doorbell it rang died with the `OpenUiWindow` that held it. So
+    // nothing will ever read this file again; the sign-in itself is not lost,
+    // because the token is in the account's `session.bin` and the identity
+    // comes home in the result file this same reap is reading.
+    deskwarden::ui_process::forget_signed_in(
+        &deskwarden::ui_process::signed_in_path(config_dir, pid),
     );
     let crossing = ui_vault_outcome(pid, code, from_file, &UiFailureEnv::production());
     log::info!("UI process {pid} came home with {crossing:?}");
