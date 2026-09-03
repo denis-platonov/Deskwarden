@@ -889,6 +889,50 @@ pub struct Settings {
     /// a picture of which domains they hold entries for. `PRIVACY.md` names
     /// this as the request with the most privacy weight in the app.
     pub fetch_icons: bool,
+    /// Whether a site icon may be fetched **from the site itself** rather
+    /// than through the icon service, for hosts that are not on this
+    /// machine's own network.
+    ///
+    /// `false` is the default and what an older `settings.json` parses as, so
+    /// nobody's traffic changes on upgrade. Read only when
+    /// [`Self::fetch_icons`] is on: this is a child of that switch and
+    /// decides *where from*, never *whether*.
+    ///
+    /// **This flag does not govern private addresses, and that is the one
+    /// thing about it that has to be right.** `10/8`, `172.16/12`,
+    /// `192.168/16`, `127/8`, `localhost` and `169.254/16` are fetched
+    /// directly whether this is on or off -- see
+    /// [`crate::favicon::is_private_host`]. The icon service cannot reach a
+    /// `192.168.x.x` address, however it is configured, because that address
+    /// means something different on its network than on this one. So for
+    /// those hosts there is no second behaviour for a setting to select
+    /// between: off would not mean "use the proxy instead", it would mean "no
+    /// icon, ever", and a switch whose off state is a silent nothing is not a
+    /// preference. A request to an address on the user's own LAN also does
+    /// not leave that LAN, so there is nobody new for it to disclose anything
+    /// to.
+    ///
+    /// **What `true` costs, stated where it is decided rather than only in
+    /// the copy.** On, this app opens a connection to *every host it holds an
+    /// entry for*. Each of those sites learns from its own access log that
+    /// somebody looked up an icon for it -- i.e. that a vault entry for it
+    /// exists -- and roughly when, along with the IP address any request
+    /// discloses. That is a materially different posture from the default,
+    /// where every icon request goes to one service that already stores the
+    /// item the domain came out of. It is off by default for the same reason
+    /// [`Self::check_breaches`] is: a network call keyed on the user's own
+    /// vault, to parties with no prior relationship to it, is not this app's
+    /// decision to make on their behalf. `PRIVACY.md`'s sixth destination
+    /// says the same thing at length.
+    ///
+    /// **Per machine, not per account**, and so it lives here rather than on
+    /// [`crate::accounts::Account`]. What it answers is whether *this
+    /// computer* dials sites directly -- a question about this machine's
+    /// network position and its outbound connections, which is the same
+    /// answer for every account signed in on it. An account on a second
+    /// machine, behind a different network, is entitled to a different
+    /// answer, and that is exactly what a per-machine setting gives.
+    pub fetch_icons_direct: bool,
     /// Whether a card's network mark is drawn as the network's own logo, when
     /// an image for it is on disk.
     ///
@@ -1279,6 +1323,7 @@ impl Default for Settings {
             prompt_on_match: true,
             check_breaches: false,
             fetch_icons: true,
+            fetch_icons_direct: false,
             use_brand_logos: false,
             check_for_updates: true,
             reveal_totp_seed: false,
@@ -1415,6 +1460,7 @@ impl Settings {
             prompt_on_match,
             check_breaches,
             fetch_icons,
+            fetch_icons_direct,
             use_brand_logos,
             check_for_updates,
             reveal_totp_seed,
@@ -1459,6 +1505,7 @@ impl Settings {
         on_disk.prompt_on_match = *prompt_on_match;
         on_disk.check_breaches = *check_breaches;
         on_disk.fetch_icons = *fetch_icons;
+        on_disk.fetch_icons_direct = *fetch_icons_direct;
         on_disk.use_brand_logos = *use_brand_logos;
         on_disk.check_for_updates = *check_for_updates;
         on_disk.reveal_totp_seed = *reveal_totp_seed;
@@ -1730,6 +1777,11 @@ mod tests {
             // Deliberately the OPPOSITE of this field's own default
             // (`true`), for the reason the line above gives.
             fetch_icons: false,
+            // Deliberately the OPPOSITE of its own default (`false`) and of
+            // `fetch_icons` beside it: a writer that dropped this field, or
+            // that assigned it from its parent switch, would round-trip to
+            // something that still looks plausible.
+            fetch_icons_direct: true,
             // Deliberately the OPPOSITE of this field's own default
             // (`false`), for the reason the lines above give.
             use_brand_logos: true,
@@ -2013,6 +2065,11 @@ mod tests {
             prompt_on_match: false,
             check_breaches: true,
             fetch_icons: false,
+            // Deliberately the OPPOSITE of its own default (`false`) and of
+            // `fetch_icons` beside it: a writer that dropped this field, or
+            // that assigned it from its parent switch, would round-trip to
+            // something that still looks plausible.
+            fetch_icons_direct: true,
             use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
@@ -2302,6 +2359,84 @@ mod tests {
         // ...and not merely present in the in-memory default: a fresh install
         // has no file at all, and that path must land on `true` too.
         assert!(Settings::load(&temp_path("icons-absent")).fetch_icons);
+    }
+
+    /// **The direct-fetch child defaults the other way from its parent**, and
+    /// asserted beside it for the reason above: these two are one row and its
+    /// child on the preferences page, they default OPPOSITE ways, and a
+    /// change that quietly made them agree -- in either direction -- is a
+    /// change to what leaves the machine.
+    ///
+    /// `false` is the one that matters. `true` would mean every existing user
+    /// upgrading into a build that connects to every host in their vault,
+    /// having asked for nothing.
+    #[test]
+    fn direct_icon_fetching_is_off_by_default_although_icon_fetching_is_on() {
+        assert!(!Settings::default().fetch_icons_direct);
+        assert!(Settings::default().fetch_icons, "the control: its parent is on");
+        // ...and a fresh install, which has no file at all, lands on `false`
+        // too rather than on whatever `Deserialize` would invent.
+        assert!(!Settings::load(&temp_path("direct-icons-absent")).fetch_icons_direct);
+    }
+
+    /// The upgrade path for the child, which is the same direction as
+    /// `check_breaches`'s and the opposite of its own parent's: a
+    /// `settings.json` written before the field existed must read as opted
+    /// OUT, or upgrading starts connecting to every host in the vault.
+    #[test]
+    fn an_older_settings_file_without_the_direct_icon_key_loads_as_off() {
+        let path = temp_path("direct-icons-older-file");
+        let older = br#"{"keep_backend_running": false, "fetch_icons": true, "auto_lock_minutes": 9}"#;
+        // The premise, asserted rather than assumed, and asserted on the
+        // CHILD's key alone: the fixture deliberately names the parent, so a
+        // `contains("fetch_icons")` here would be satisfied by the wrong key.
+        assert!(
+            !std::str::from_utf8(older).unwrap().contains("fetch_icons_direct"),
+            "the fixture names the key, so it is not an older file"
+        );
+        std::fs::write(&path, older).unwrap();
+        let loaded = Settings::load(&path);
+        assert!(
+            !loaded.fetch_icons_direct,
+            "an older settings file read as opted IN to fetching every icon from its own site"
+        );
+        // The control: the rest of that file really was read, so the `false`
+        // above is the field's default and not a parse failure that fell back
+        // to `Settings::default()` wholesale.
+        assert!(!loaded.keep_backend_running, "the fixture was not parsed at all");
+        assert!(loaded.fetch_icons, "the fixture was not parsed at all");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `persist_preferences` really writes it, under its own name.
+    ///
+    /// The mutant this catches is the one its neighbour above documents:
+    /// `persist_preferences` destructures `Settings`, so binding the new field
+    /// and never assigning `on_disk.fetch_icons_direct` compiles, and that
+    /// mutant leaves the switch dead on disk while looking live on screen.
+    #[test]
+    fn the_direct_icon_toggle_is_written_by_persist_preferences() {
+        let path = temp_path("direct-icons-persist");
+        assert!(
+            !Settings::load(&path).fetch_icons_direct,
+            "the premise: it starts off"
+        );
+        Settings { fetch_icons_direct: true, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("fetch_icons_direct"), "not in the file at all: {text}");
+        assert!(
+            Settings::load(&path).fetch_icons_direct,
+            "the value was bound in the destructure and never assigned, so the switch is dead"
+        );
+        // And back off again, so this is not a writer that only ever writes
+        // `true`.
+        Settings { fetch_icons_direct: false, ..Settings::default() }
+            .persist_preferences(&path)
+            .unwrap();
+        assert!(!Settings::load(&path).fetch_icons_direct);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The upgrade path, which for this field is the direction that matters
@@ -2667,6 +2802,11 @@ mod tests {
             prompt_on_match: true,
             check_breaches: true,
             fetch_icons: false,
+            // Deliberately the OPPOSITE of its own default (`false`) and of
+            // `fetch_icons` beside it: a writer that dropped this field, or
+            // that assigned it from its parent switch, would round-trip to
+            // something that still looks plausible.
+            fetch_icons_direct: true,
             use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
@@ -3894,6 +4034,10 @@ mod tests {
             prompt_on_match: false,
             check_breaches: true,
             fetch_icons: false,
+            // Deliberately the OPPOSITE of its own default (`false`) and of
+            // the parent switch beside it, so a reset that reached this field
+            // could not land on a value that looks deliberate.
+            fetch_icons_direct: true,
             use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
@@ -3916,6 +4060,7 @@ mod tests {
         assert!(!reset.prompt_on_match);
         assert!(reset.check_breaches);
         assert!(!reset.fetch_icons);
+        assert!(reset.fetch_icons_direct);
         assert!(!reset.check_for_updates);
         assert!(reset.reveal_totp_seed);
         assert!(!reset.auto_lock_enabled);

@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last updated:** 2026-08-19
+**Last updated:** 2026-09-02
 
 Deskwarden is a Windows companion application for Bitwarden-compatible
 vaults. It is unofficial and unaffiliated with Bitwarden, Inc.
@@ -66,9 +66,16 @@ Deskwarden being broken.
 
 ## What leaves your machine, and to whom
 
-Deskwarden makes network requests to exactly five destinations. Four are
-third parties; one is your own vault. The fifth happens at most once, and
-only if you sign in to an official Bitwarden server.
+Deskwarden makes network requests to exactly six destinations. Five are
+fixed addresses — four third parties and your own vault. The fifth of those
+happens at most once, and only if you sign in to an official Bitwarden
+server.
+
+The sixth is different in kind from the other five and is described in full
+below: it is not one address but **the sites in your own vault**, and
+Deskwarden contacts them only for icons. For addresses on your own network
+it always does; for anything else it does so only if you switch it on, and
+that switch ships off.
 
 ### 1. Your Bitwarden server
 
@@ -108,6 +115,10 @@ default, because the icon service belongs to the same server your vault is
 already on — your own machine if you self-host — rather than to a third
 party that would otherwise learn nothing about you. With it off, no domain
 is sent and none is even worked out; items show coloured initials instead.
+
+**One kind of entry never goes through this service, whatever the settings
+say**, and it is worth stating here rather than only under destination 6: an
+entry whose address is on your own network. See that section.
 
 ### 3. Breach checking — `api.pwnedpasswords.com`
 
@@ -171,6 +182,76 @@ reveals: your IP address and the fact that a request was made. It carries
 nothing about you, your vault or your account. A self-hosted server using
 the built-in client never makes this request, and a machine that already has
 the program does not either.
+
+### 6. Site icons, fetched from the sites themselves
+
+This is the only case in which Deskwarden connects to a site you have saved a
+login for. There are two halves to it and they are governed differently, so
+they are described separately.
+
+**Half one: addresses on your own network. Always, with no setting.**
+
+If a vault entry's address is on your own network — `192.168.x.x`,
+`10.x.x.x`, `172.16`–`172.31.x.x`, `127.x.x.x`, `localhost` or
+`169.254.x.x` — Deskwarden fetches that icon from that address itself. It
+does this whether or not you have switched anything on, and it cannot be
+turned off separately.
+
+The reason is routing rather than preference. `192.168.68.95` does not name
+the same machine on two different networks, so an icon service out on the
+internet — Bitwarden's, or your own self-hosted server if it is not on your
+LAN — has no route to it and no configuration under which it would. For
+these addresses the choice is not "through the icon service or directly", it
+is "directly or no icon, at all, ever". A switch whose off position is a
+silent nothing would not be a real setting.
+
+What it discloses: the request goes to a machine on your own network and does
+not leave it. Nobody outside sees it, and the machine on the other end is one
+you already reach every time you open that service in a browser. The
+*Show site icons* switch still governs it — turning that off stops every icon
+request, including these.
+
+**Half two: everything else. Off unless you turn it on.**
+
+Preferences → General → *Fetch site icons from the sites themselves*, a row
+directly under *Show site icons*. **It ships off**, and with it off nothing
+in this half happens: public sites' icons come from the icon service, exactly
+as described under destination 2.
+
+With it on, Deskwarden fetches every icon directly from the site it belongs
+to, and the icon service is not used at all.
+
+**What that costs, plainly, because it is the whole point of the switch:**
+Deskwarden connects to every host you hold an entry for. Each of those sites
+sees a request arrive from your computer and can record it in its ordinary
+access log. What that log tells the site's operator is that **somebody at
+your IP address holds a vault entry for their site, and roughly when they
+looked at it** — because the request is made when the entry is first drawn on
+screen. Over a vault's worth of entries that is a great many sites each
+learning one such fact about you, where today a single service learns them
+all. Whether that is better or worse depends on who you would rather not tell,
+which is exactly why it is a switch and not a default.
+
+It is off by default for the same reason breach checking is: a network call
+keyed on your own vault, to parties that have no relationship with it, is not
+this program's decision to make on your behalf.
+
+**What such a request contains.** A `GET` for a fixed path — `/favicon.ico`,
+then `/favicon.png`, then `/apple-touch-icon.png` until one is an image — and
+four headers: the host, `Accept: */*`, `Accept-Encoding: gzip`, and a
+`User-Agent` of exactly `Deskwarden`. No cookies, no `Referer`, no
+authorisation, no version number, no identifier of any kind — that
+`User-Agent` is byte-identical for every user of this program. It carries no
+username, no password, no account, and nothing about any other entry. That
+list is enforced by a test that fails if any other header appears, so a header
+added later has to be added to the list deliberately.
+
+**Redirects are not followed**, and that is a privacy decision rather than a
+technical one: a redirect is the machine on the other end choosing the next
+address this program connects to, and on this path that choice has to stay
+yours. Public sites are contacted over HTTPS only and are never downgraded to
+plain HTTP. Icons fetched this way are cached on disk like any other, so a
+site is normally contacted once.
 
 ## What Deskwarden does not do
 
@@ -253,6 +334,16 @@ It collects no personal information from anyone, of any age.
   relationship you have already chosen instead of creating a new one with a
   third party. That is a weaker reason to ask first than breach checking's,
   not no reason, which is why the switch is there.
+- **Fetching icons from the sites themselves is off by default** —
+  Preferences → General → *Fetch site icons from the sites themselves*, the
+  row directly under *Show site icons*. Off rather than on because turning it
+  on makes this program connect to every host in your vault, and each of them
+  then knows that an entry for it exists and roughly when you looked at it.
+  That is the strongest reason to ask first that any switch here has.
+  **It does not govern addresses on your own network**, which are always
+  fetched directly because no icon service can reach them; the switch's own
+  description on the page says so, so this is not a limit you have to come
+  here to discover. Destination 6 above has the long version.
 - **The update check is on by default and can be turned off** —
   Preferences → Updates → *Check for updates automatically*. On rather than
   off for the
@@ -280,8 +371,11 @@ It collects no personal information from anyone, of any age.
   it.
 
 **Every network request this application makes on its own is something you
-can switch off**, and each of the three has its own row on Preferences →
-General. That is a statement about network requests specifically, not about
+can switch off**, and each has its own row in Preferences. That is still
+true of the direct icon fetch, including for addresses on your own network:
+those have no row of their own, but *Show site icons* switches off every icon
+request there is, so there is no request here that survives every switch
+being off. That is a statement about network requests specifically, not about
 every behaviour: some of what is described above is optional and some is not,
 and the clipboard section is both — when a copied secret is taken back is
 yours to set, while keeping it out of `Win+V` in the first place is not.

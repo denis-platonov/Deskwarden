@@ -526,6 +526,38 @@ const FETCH_ICONS_DESCRIPTION: &str = "On by default. Deskwarden asks the icon s
      username, the password, or which account the item is in. Off shows coloured initials \
      instead and nothing leaves your PC.";
 
+const DIRECT_ICONS_LABEL: &str = "Fetch site icons from the sites themselves";
+/// **Says what ON costs, in the sentence a user would otherwise have to work
+/// out for themselves.** This is the only switch in the app that makes it
+/// connect to hosts it has no other relationship with, and the whole reason
+/// somebody would leave it off is what those hosts get to see. Copy that said
+/// "fetches icons directly" would be describing the mechanism and hiding the
+/// consequence, which for this row is the entire content.
+///
+/// So the cost is stated as a consequence rather than as a mechanism -- each
+/// site learns that you hold an entry for it, and roughly when you looked --
+/// because "connects to each site" is a true sentence a reader can nod at
+/// without understanding what it discloses.
+///
+/// **It also names the exception, because the exception is not governed by
+/// this pill and a user reading only the label would assume it was.**
+/// Addresses on the user's own network are fetched directly whether this is
+/// on or off, and the reason is stated (the icon service cannot reach them)
+/// rather than asserted, so the behaviour reads as a fact about routing
+/// instead of as this switch leaking. `Settings::fetch_icons_direct` carries
+/// the long form of the same argument and `PRIVACY.md` carries the longest.
+///
+/// Off by default, and stated in the copy rather than left to
+/// `Settings::default`, the same way `BREACH_DESCRIPTION` and
+/// `FETCH_ICONS_DESCRIPTION` state theirs.
+const DIRECT_ICONS_DESCRIPTION: &str = "Off by default, and it decides where PUBLIC sites' icons \
+     come from. An address on your own network — 192.168.x.x, 10.x.x.x, localhost — is always \
+     fetched from that address itself, because an icon service out on the internet has no route \
+     to your network and never will. On, Deskwarden fetches every icon that way and the icon \
+     service is not asked for any of them. What that costs: each of those sites receives a \
+     request from your PC, so it learns that an entry for it exists in your vault and roughly \
+     when you looked at it.";
+
 const BRAND_LOGOS_LABEL: &str = "Show card network logos";
 /// **Says where the images come from, because that is the part a user cannot
 /// guess and the only part they have to act on.** This row is unlike every
@@ -2166,6 +2198,30 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState, hotkey: crate::hotkey::Hotk
             FETCH_ICONS_LABEL,
             FETCH_ICONS_DESCRIPTION,
             state.settings.fetch_icons,
+        );
+        row_separator(ui);
+        // **A CHILD of the row above, not a peer of it.** It answers "where
+        // from", and "where from" is not a question at all when the answer to
+        // "whether" is no -- so with site icons off this row greys out and
+        // stops sensing clicks, exactly as the clipboard children do under
+        // their master switch. It is greyed rather than removed for
+        // `child_toggle_row`'s reason: three rows going grey says what the
+        // switch above just did, three rows vanishing says nothing.
+        //
+        // **It is not the whole of the direct-fetch behaviour, deliberately.**
+        // A private address is fetched directly with this pill off, because
+        // the icon service cannot reach one; the copy says so, because a
+        // switch whose label overstates its reach is worse than no switch.
+        // See `favicon::icon_source_for` for the split and
+        // `Settings::fetch_icons_direct` for why it is not this pill's to
+        // decide.
+        let icons_on = state.settings.fetch_icons;
+        state.settings.fetch_icons_direct = child_toggle_row(
+            ui,
+            DIRECT_ICONS_LABEL,
+            DIRECT_ICONS_DESCRIPTION,
+            state.settings.fetch_icons_direct,
+            icons_on,
         );
         row_separator(ui);
         // Directly under the icon row because the two are the same question
@@ -7397,13 +7453,17 @@ mod tests {
     }
 
     #[test]
-    fn general_paints_exactly_five_toggles_and_one_stepper() {
+    fn general_paints_exactly_six_toggles_and_one_stepper() {
         let painted = paint(Section::General);
         assert_eq!(
             painted.count_of_size(Vec2::new(40.0, 22.0)),
-            5,
-            "five 40x22 pills: `prompt_on_match`, `fetch_icons`, `use_brand_logos`, \
-             `reveal_totp_seed` and `auto_lock_enabled`, and nothing else. \
+            6,
+            "six 40x22 pills: `prompt_on_match`, `fetch_icons`, its child \
+             `fetch_icons_direct`, `use_brand_logos`, `reveal_totp_seed` and \
+             `auto_lock_enabled`, and nothing else. The sixth is the direct-fetch child, \
+             and it is counted whether or not it is GHOSTED: `child_toggle_row` paints a \
+             disabled pill at the same 40x22 as an enabled one, so switching site icons \
+             off must not change this number. \
              FIVE settings are no longer here and all five left for the same reason -- to \
              sit beside the thing that governs them. `check_breaches` moved to Breaches, \
              `check_for_updates` moved to Updates, and `keep_backend_running`, \
@@ -8004,7 +8064,7 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
         // SECOND pill down now: prompt, site icons, network logos, TOTP
         // secret, auto-lock. Five rows have left this page -- the breach row
         // to Breaches, the update row to Updates, and the backend row plus
@@ -8030,6 +8090,140 @@ mod tests {
         assert!(!state.settings.reveal_totp_seed, "the wrong row's toggle moved");
     }
 
+    /// **The direct-fetch switch, driven at the pane.** Starts `false`, so
+    /// the first click turns it ON -- the direction that matters for a row
+    /// whose ON state is what discloses something.
+    #[test]
+    fn clicking_the_direct_icons_toggle_changes_the_setting_it_is_wired_to() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        assert!(
+            !state.settings.fetch_icons_direct,
+            "the default: icons come from the icon service until this is clicked"
+        );
+        assert!(state.settings.fetch_icons, "its master switch starts on, so the row is live");
+        assert!(!state.settings.use_brand_logos, "the neighbour below starts false");
+        assert!(!state.settings.reveal_totp_seed, "the neighbour starts false");
+        assert!(state.settings.prompt_on_match, "the neighbour starts true");
+        assert!(state.settings.auto_lock_enabled, "the neighbour starts true");
+
+        let first = frame(&ctx, &mut state, &[]);
+        let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        // THIRD pill down: prompt, site icons, THIS, network logos, TOTP
+        // secret, auto-lock. It sits directly under its master switch.
+        let pill = pills[2].center();
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(
+            state.settings.fetch_icons_direct,
+            "the direct-fetch toggle did not turn on -- the row is painted but its value is \
+             never written back, so the pill is decoration"
+        );
+        assert!(state.settings.fetch_icons, "the master switch above moved instead");
+        assert!(!state.settings.use_brand_logos, "the wrong row's toggle moved");
+        assert!(!state.settings.reveal_totp_seed, "the wrong row's toggle moved");
+        assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
+        assert!(!state.settings.check_breaches, "the wrong row's toggle moved");
+        assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
+
+        frame(&ctx, &mut state, &click(pill));
+        assert!(!state.settings.fetch_icons_direct, "and back off again");
+        assert!(state.settings.fetch_icons, "the wrong row's toggle moved");
+    }
+
+    /// **It is a child, and a disabled child is disabled and not merely
+    /// grey.** With site icons off, "where from" is not a question, so the
+    /// row stops sensing clicks -- and it still PAINTS ITS PILL, which is why
+    /// the count pin says six either way.
+    #[test]
+    fn with_site_icons_off_the_direct_fetch_row_is_inert_but_still_painted() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings { fetch_icons: false, ..Settings::default() });
+        assert!(!state.settings.fetch_icons_direct, "the default");
+
+        let first = frame(&ctx, &mut state, &[]);
+        let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
+        assert_eq!(
+            pills.len(),
+            6,
+            "a ghosted child row still paints a 40x22 pill, so switching the master off must \
+             not change the count -- and every index below it must not shift either"
+        );
+        frame(&ctx, &mut state, &click(pills[2].center()));
+        assert!(
+            !state.settings.fetch_icons_direct,
+            "a click on the ghosted row still edited the setting, so 'disabled' is only a \
+             colour here"
+        );
+
+        // **The positive control, and it is the whole test.** The identical
+        // click with the master switch ON does move it -- so the assertion
+        // above is about the disabled state and not about the click having
+        // landed nowhere.
+        let mut live = PrefsState::new(Settings::default());
+        let live_first = frame(&ctx, &mut live, &[]);
+        let live_pills = live_first.rects_of_size(Vec2::new(40.0, 22.0));
+        assert_eq!(live_pills.len(), 6);
+        assert_eq!(
+            live_pills[2].center(),
+            pills[2].center(),
+            "the row is at a different place in the two states, so the click above was not \
+             aimed at the same row"
+        );
+        frame(&ctx, &mut live, &click(live_pills[2].center()));
+        assert!(live.settings.fetch_icons_direct, "the control failed: the row is inert either way");
+    }
+
+    /// The copy is on screen, and it says the two things a user cannot infer
+    /// from the label: what turning it on costs them, and that addresses on
+    /// their own network are not what this pill decides.
+    #[test]
+    fn the_direct_icons_row_says_what_it_costs_and_what_it_does_not_govern() {
+        let painted = paint(Section::General);
+        assert!(painted.contains(DIRECT_ICONS_LABEL), "got {:?}", painted.strings());
+        assert!(painted.contains(DIRECT_ICONS_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(
+            DIRECT_ICONS_DESCRIPTION.contains("Off by default"),
+            "the default is stated in the copy, as every other consent row on this page states \
+             its own"
+        );
+        // The cost, as a consequence rather than as a mechanism. "connects to
+        // each site" is a true sentence a reader nods at without
+        // understanding what it discloses; this is the sentence that says it.
+        assert!(
+            DIRECT_ICONS_DESCRIPTION.contains("an entry for it exists"),
+            "the copy does not say what ON discloses to each site: {DIRECT_ICONS_DESCRIPTION:?}"
+        );
+        assert!(
+            DIRECT_ICONS_DESCRIPTION.contains("192.168"),
+            "the copy does not name the addresses this pill does NOT govern, so a user reading \
+             the label would think it did: {DIRECT_ICONS_DESCRIPTION:?}"
+        );
+        // The house rule, as a test: this page never calls anything secure.
+        assert!(
+            !DIRECT_ICONS_DESCRIPTION.to_ascii_lowercase().contains("secure"),
+            "the copy calls something secure: {DIRECT_ICONS_DESCRIPTION:?}"
+        );
+        // The instrument: an ink lookup that panics on a double paint, with a
+        // real rect, so `contains` above is not reading a zero-size ghost.
+        let ink = painted.ink_of(DIRECT_ICONS_LABEL);
+        assert!(ink.rect.height() > 0.0 && ink.rect.width() > 0.0, "the label has no box: {:?}", ink.rect);
+        assert!(ink.color.a() > 0, "the label is painted at alpha {}", ink.color.a());
+        let desc = painted.ink_of(DIRECT_ICONS_DESCRIPTION);
+        assert!(desc.rows >= 2, "a description this long should wrap; it took {} row(s)", desc.rows);
+        // And it sits under the switch it is a child of, read off the paint.
+        let master = painted.ink_of(FETCH_ICONS_LABEL).rect;
+        assert!(master.height() > 0.0 && ink.rect.height() > 0.0);
+        assert!(
+            master.top() < ink.rect.top(),
+            "the child row is painted above its master switch: master at {master:?}, child at \
+             {:?}",
+            ink.rect
+        );
+        assert!(ink.rect.top() - master.top() > 1.0, "the two labels are at the same height");
+    }
+
     /// **The network-logos switch, driven at the pane**, with the same
     /// counter-assertions its neighbours carry: a row wired to `fetch_icons`
     /// -- the row directly above it, and the one it is most likely to be
@@ -8053,10 +8247,11 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
-        // THIRD pill down: prompt, site icons, network logos, TOTP secret,
-        // auto-lock.
-        let pill = pills[2].center();
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        // FOURTH pill down: prompt, site icons, the direct-fetch child of
+        // site icons, network logos, TOTP secret, auto-lock. It was the
+        // third until that child row was inserted above it.
+        let pill = pills[3].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -8297,10 +8492,11 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
-        // FOURTH pill down now: prompt, site icons, network logos, TOTP
-        // secret, auto-lock.
-        let pill = pills[3].center();
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        // FIFTH pill down now: prompt, site icons, the direct-fetch child
+        // of site icons, network logos, TOTP secret, auto-lock. It was the
+        // fourth until that child row was inserted.
+        let pill = pills[4].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -8350,20 +8546,20 @@ mod tests {
         // and not just its text.
         //
         // **The indices are named, because they moved.** General now paints
-        // prompt(0), site icons(1), network logos(2), TOTP secret(3),
-        // auto-lock(4) -- the disk-cache pair that used to occupy 0 and 1 is
-        // on `Section::Vault`. The pill under test is 3, and its neighbours
-        // are 2 and 4.
+        // prompt(0), site icons(1), the direct-fetch child of site icons(2),
+        // network logos(3), TOTP secret(4), auto-lock(5) -- the disk-cache
+        // pair that used to occupy 0 and 1 is on `Section::Vault`. The pill
+        // under test is 4, and its neighbours are 3 and 5.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 5);
-        assert!(pills[2].top() < pills[3].top(), "the TOTP-secret pill is not below the network-logos pill");
-        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not above the auto-lock pill");
+        assert_eq!(pills.len(), 6);
+        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not below the network-logos pill");
+        assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
         assert!(
-            pills[3].top() > breach.bottom(),
+            pills[4].top() > breach.bottom(),
             "the TOTP-secret pill is level with the site-icons row's text, so the pills and the labels disagree about which row is which"
         );
         assert!(
-            pills[3].bottom() < auto_lock.top(),
+            pills[4].bottom() < auto_lock.top(),
             "the TOTP-secret pill overhangs the auto-lock row"
         );
     }
@@ -8421,7 +8617,8 @@ mod tests {
     fn clicking_the_auto_lock_toggle_turns_auto_lock_off_and_on_again() {
         // The user's actual request. `auto_lock_enabled` starts true, and it
         // is the LAST pill on the page -- `prompt_on_match`, `fetch_icons`,
-        // `use_brand_logos` and `reveal_totp_seed` sit above it. It was the
+        // its `fetch_icons_direct` child, `use_brand_logos` and
+        // `reveal_totp_seed` sit above it. It was the
         // fifth until the network-logos row was inserted, the sixth before
         // `check_breaches` moved to its own page, the seventh while the
         // encrypted disk cache sat under the backend row, and the fifth
@@ -8438,7 +8635,7 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 5, "the General card no longer paints five pills");
+        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
         let pill = pills[pills.len() - 1].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");

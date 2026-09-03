@@ -94,6 +94,198 @@ pub fn domain_from_uri(uri: &str) -> Option<String> {
     }
 }
 
+/// Extracts a login item's icon target **with its port kept** --
+/// `192.168.68.95:8080`, `vault.example.com:8443`, plain `github.com` for a
+/// URI that names no port.
+///
+/// **The port is the whole point, and it is why this is not
+/// [`domain_from_uri`].** A service on a home network is almost never on
+/// port 80 or 443: `http://192.168.68.95:8080/` is a qBittorrent web UI, and
+/// the icon it serves lives at `192.168.68.95:8080`. Drop the port and the
+/// fetch goes to whatever answers on port 80 of that address -- for a home
+/// router, the router's own admin page -- so the request is not merely less
+/// precise, it is aimed at a different service.
+///
+/// **[`domain_from_uri`] keeps dropping the port, and the two are not a
+/// duplicate of each other.** That one answers "which *domain* is this item
+/// about", which is what the icon proxy is keyed on -- `{server}/icons/
+/// {domain}/icon.png` takes a domain and always has -- and what
+/// `app_candidates` matches an executable's publisher against. This one
+/// answers "where would this app connect to, to fetch that icon itself",
+/// which stopped being the same question the moment the answer became a
+/// socket rather than a name. See [`icon_source_for`] for which of the two
+/// each path uses.
+///
+/// **Only `http://` and `https://` are stripped**, exactly as
+/// [`domain_from_uri`] strips them. A `androidapp://com.example` or
+/// `ftp://files.example.com` URI keeps its scheme text, fails the host check
+/// below, and answers `None` -- so no scheme this app does not speak can
+/// ever become a host it dials.
+///
+/// A `:` with no digits after it is **not** treated as a port: it stays part
+/// of the host and is then rejected by the same check. That is what keeps
+/// `androidapp://com.example` (whose first path-free run is `androidapp:`)
+/// from parsing as a host named `androidapp`.
+///
+/// **The dotted-host rule is [`domain_from_uri`]'s, unchanged, and a bare
+/// `localhost` is still rejected here.** Widening it was tried and undone:
+/// [`is_private_host`] does answer `true` for `localhost`, so a URI of
+/// `localhost` *could* be fetched directly and correctly, but accepting it
+/// reverses a pin (`a_login_still_reaches_the_icon_path_through_its_uri`)
+/// that says a login with no dotted host gets no icon, and it is not what the
+/// port fix is for. A `http://localhost:3000` entry keeps its monogram. That
+/// is a real gap and a deliberate one; widening it is a change to which items
+/// disclose anything and belongs in its own commit with its own argument, not
+/// as a side effect of keeping a port.
+pub fn authority_from_uri(uri: &str) -> Option<String> {
+    let stripped = uri
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let authority = stripped.split(['/', '?', '#']).next().unwrap_or(stripped);
+    let (host, _) = split_authority(authority);
+    if host.is_empty() || !host.contains('.') {
+        None
+    } else {
+        Some(authority.to_string())
+    }
+}
+
+/// Splits `host:port` into its two halves, or `(authority, None)` when there
+/// is no port. Only a run of ASCII digits after the **last** `:` counts as a
+/// port, so a bare `androidapp:` and an IPv6 literal alike keep their colons
+/// and are handled as hosts by the caller.
+fn split_authority(authority: &str) -> (&str, Option<&str>) {
+    match authority.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            (host, Some(port))
+        }
+        _ => (authority, None),
+    }
+}
+
+/// The host half of an authority, with any port dropped -- the form the icon
+/// **proxy** is keyed on.
+pub fn host_of_authority(authority: &str) -> &str {
+    split_authority(authority).0
+}
+
+/// True for an address that only this machine's own network can reach:
+/// RFC1918 private space (`10/8`, `172.16/12`, `192.168/16`), loopback
+/// (`127/8`, `localhost`, `::1`), and link-local (`169.254/16`, `fe80::/10`),
+/// plus IPv6 unique-local (`fc00::/7`).
+///
+/// **This is a routing fact, not a preference**, and everything about how the
+/// icon for such a host is fetched follows from it. An icon proxy running on
+/// the public internet -- Bitwarden's, or a self-hosted server on a Cloudflare
+/// Worker -- cannot open a connection to `192.168.68.95`. Not "should not":
+/// cannot. There is no configuration of that proxy under which it succeeds,
+/// because the address means something different on its network than on this
+/// one. So for these hosts the choice is not "proxy or direct", it is "direct
+/// or no icon, ever", which is why [`icon_source_for`] answers
+/// [`IconSource::Direct`] for them with no setting consulted.
+///
+/// The ranges are checked with `std`'s own predicates rather than by
+/// comparing octets by hand, because the boundaries are exactly where a
+/// hand-rolled check goes wrong: `172.32.0.1` is public and `172.16.0.1` is
+/// not, `192.169.0.1` is public and `192.168.0.1` is not, and a `starts_with`
+/// on the text `"172.16"` also swallows `172.160.0.1`. The tests walk the
+/// neighbour on both sides of every boundary.
+pub fn is_private_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || {
+        let lower = host.to_ascii_lowercase();
+        lower.ends_with(".localhost")
+    } {
+        return true;
+    }
+    if let Ok(v4) = host.parse::<std::net::Ipv4Addr>() {
+        return v4.is_private() || v4.is_loopback() || v4.is_link_local();
+    }
+    // An IPv6 literal arrives from a URI wrapped in brackets; strip them so
+    // `[::1]` is recognised as the loopback it is rather than failing to
+    // parse and being treated as a public name.
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(v6) = bare.parse::<std::net::Ipv6Addr>() {
+        let first = v6.segments()[0];
+        // `is_unique_local` and `is_unicast_link_local` are still unstable,
+        // so the two prefixes are spelled out: `fc00::/7` and `fe80::/10`.
+        return v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80;
+    }
+    false
+}
+
+/// Where one item's icon is fetched from, and by whom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IconSource {
+    /// Ask the icon service -- Bitwarden's, or the self-hosted server's own
+    /// `/icons` proxy -- for the icon at this one URL. The proxy makes the
+    /// outbound request; this app talks only to a host it already talks to.
+    Proxy(String),
+    /// Fetch it from the site itself, trying these URLs in order and keeping
+    /// the first that decodes. Nothing is proxied and the icon service is not
+    /// contacted at all.
+    Direct(Vec<String>),
+}
+
+/// The paths a direct fetch tries, in order.
+///
+/// `/favicon.ico` is first because it is the one location every web server
+/// answers whether or not anybody configured it -- it is where the qBittorrent
+/// web UI this feature exists for keeps its icon. The two PNG paths follow for
+/// sites that serve a modern icon and leave `/favicon.ico` as a 404.
+///
+/// **The list is short on purpose.** Each entry is a request that leaves this
+/// machine, and the honest way to find a site's declared icon -- fetch the
+/// page, parse its `<link rel="icon">` -- means fetching the page, which
+/// discloses considerably more than asking for a fixed path and is a fetch of
+/// somebody's HTML by a password manager. Three fixed paths, or nothing.
+const DIRECT_ICON_PATHS: [&str; 3] = ["favicon.ico", "favicon.png", "apple-touch-icon.png"];
+
+/// Decides where `authority`'s icon comes from.
+///
+/// **The two rules, and they are deliberately not the same rule:**
+///
+/// * A **private** address ([`is_private_host`]) is always fetched directly,
+///   with `direct_for_all_hosts` never consulted. The proxy cannot reach it,
+///   so there is no second option for a setting to choose between, and the
+///   request does not leave the network the user is already on.
+/// * Every **other** host is proxied, unless `direct_for_all_hosts`
+///   ([`crate::settings::Settings::fetch_icons_direct`]) is on, in which case
+///   it too is fetched directly and the proxy is not used at all.
+///
+/// **Scheme is chosen here rather than taken from the item's URI, and only
+/// ever `http` or `https`.** A public host is asked over `https` and is never
+/// downgraded: a plaintext request to a host on the internet announces which
+/// domain is being asked for to every hop in between, which is the disclosure
+/// the setting is already the user's decision about, and doubling it silently
+/// is not. A private host is tried over `http` first -- LAN services are
+/// overwhelmingly plain HTTP, and that traffic stays on the user's own
+/// segment -- and then over `https`, so a NAS or a router that only speaks
+/// TLS still gets an icon.
+pub fn icon_source_for(
+    authority: &str,
+    server_url: Option<&str>,
+    direct_for_all_hosts: bool,
+) -> IconSource {
+    let host = host_of_authority(authority);
+    let private = is_private_host(host);
+    if !private && !direct_for_all_hosts {
+        let base = icon_base_url(server_url);
+        return IconSource::Proxy(format!("{base}/{host}/icon.png"));
+    }
+    let schemes: &[&str] = if private { &["http", "https"] } else { &["https"] };
+    IconSource::Direct(
+        schemes
+            .iter()
+            .flat_map(|scheme| {
+                DIRECT_ICON_PATHS.iter().map(move |path| format!("{scheme}://{authority}/{path}"))
+            })
+            .collect(),
+    )
+}
+
 /// The custom field a card's bank domain is stored on.
 ///
 /// Namespaced the way `app_match::APP_MATCH_FIELD_NAME` is, and declared
@@ -147,6 +339,38 @@ pub fn icon_domain_for(item: &crate::vault_bridge::VaultItem) -> Option<String> 
     }
 }
 
+/// [`icon_domain_for`], but answering with the **authority** -- host and port
+/// -- for the one kind of item that can carry a port.
+///
+/// This is what the icon loader keys its cache on and hands to
+/// [`icon_source_for`]; [`icon_domain_for`] remains the answer for everything
+/// that wants a domain, and the proxy URL that `icon_source_for` builds drops
+/// the port back off through [`host_of_authority`]. Two answers to two
+/// questions, from one place, rather than a port that survives to one caller
+/// by accident.
+///
+/// A **login** answers with [`authority_from_uri`] of its first URI, so
+/// `http://192.168.68.95:8080/` keeps its `:8080`. Every other kind defers to
+/// [`icon_domain_for`] verbatim: a card's bank domain is typed into a field
+/// by hand and is a domain by construction, and the kinds that have no icon
+/// still have none. The arms are listed rather than caught by a `_` for the
+/// reason [`icon_domain_for`]'s own are.
+pub fn icon_authority_for(item: &crate::vault_bridge::VaultItem) -> Option<String> {
+    match crate::vault_bridge::ItemKind::of(item) {
+        crate::vault_bridge::ItemKind::Login => item
+            .login
+            .as_ref()
+            .and_then(|l| l.uris.first())
+            .and_then(|u| u.uri.as_deref())
+            .and_then(authority_from_uri),
+        crate::vault_bridge::ItemKind::Card
+        | crate::vault_bridge::ItemKind::SecureNote
+        | crate::vault_bridge::ItemKind::Identity
+        | crate::vault_bridge::ItemKind::SshKey
+        | crate::vault_bridge::ItemKind::Unknown(_) => icon_domain_for(item),
+    }
+}
+
 /// How long to wait for the icon host's TCP handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -185,6 +409,102 @@ pub fn fetch_icon_bytes(url: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// The `User-Agent` every direct icon request carries, and the only thing in
+/// that request that this app chose to put there.
+///
+/// A constant, and deliberately a **bare** one. It names the program and
+/// nothing else: not the version, not the operating system, not the HTTP
+/// library, not a build id -- so it is byte-identical for every Deskwarden
+/// user and adds no bit to what a site can tell about the person asking.
+/// ureq's default `User-Agent` names the library and its exact version, which
+/// is a fingerprint bit and an inventory of this app's dependencies, handed to
+/// every site somebody holds an entry for.
+///
+/// Naming the app at all is a choice rather than an oversight: a site's
+/// operator seeing an unexplained hit on `/favicon.ico` is owed the ability to
+/// find out what made it, and `pinned by
+/// the_direct_request_head_carries_nothing_beyond_the_allowlist` is what keeps
+/// this from growing a version number later.
+pub const DIRECT_USER_AGENT: &str = "Deskwarden";
+
+/// How long a direct icon fetch waits for a TCP handshake.
+///
+/// Shorter than [`CONNECT_TIMEOUT`], and the difference is what is on the
+/// other end. The proxy is one known, reachable host. A direct fetch dials a
+/// host that may not exist, may not be listening on the scheme being tried,
+/// and -- on the private path -- is on the user's own LAN, where a machine
+/// that is up answers in milliseconds and one that is not should not hold a
+/// thread for five seconds while [`icon_source_for`] still has candidates
+/// left to try.
+const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Total-time bound for one direct icon fetch, per candidate URL.
+///
+/// Shorter than [`REQUEST_DEADLINE`] for the same reason, and because there
+/// are up to six candidates: the bound that matters is the one on the whole
+/// walk, and six times ten seconds is a thread alive for a minute over an
+/// icon.
+const DIRECT_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Fetches `source`'s icon bytes -- from the proxy, or from the site itself.
+///
+/// The two arms are not symmetric, and the asymmetry is the point:
+///
+/// * [`IconSource::Proxy`] is one URL and the bytes are returned as they
+///   arrive, exactly as [`fetch_icon_bytes`] has always returned them. The
+///   caller's decode step is the only judge, as before.
+/// * [`IconSource::Direct`] is a **list**, and choosing between candidates is
+///   a decision only a decode can make: a web server that answers `/favicon.
+///   ico` with a `200` and an HTML error page is the ordinary case, not the
+///   exotic one, and taking those bytes would cache a page as an icon and
+///   stop the walk one candidate short of the real one. So a candidate counts
+///   only if it decodes, and the first that does wins.
+pub fn fetch_icon_for(source: &IconSource) -> Option<Vec<u8>> {
+    match source {
+        IconSource::Proxy(url) => fetch_icon_bytes(url),
+        IconSource::Direct(urls) => urls.iter().find_map(|url| {
+            let bytes = fetch_icon_direct(url)?;
+            decode_rgba_unscaled(&bytes).is_some().then_some(bytes)
+        }),
+    }
+}
+
+/// Blocking GET of one direct candidate URL. Call only from a background
+/// thread.
+///
+/// **A separate agent from [`fetch_icon_bytes`]'s, on purpose.** That one
+/// talks to a single known host and follows redirects; this one talks to
+/// whatever hosts are in the user's vault and must not -- see
+/// [`crate::http_agent::bounded_total_plain`] for both refusals. Sharing one
+/// agent would mean the icon service's connection settings governing requests
+/// to strangers, which is exactly backwards.
+///
+/// Still **one** shared agent rather than one per call, for the reason the
+/// other has: a vault's worth of icons is a burst, and several items commonly
+/// share a host.
+fn fetch_icon_direct(url: &str) -> Option<Vec<u8>> {
+    static AGENT: OnceLock<crate::http_agent::TotalBounded> = OnceLock::new();
+    let agent = AGENT.get_or_init(|| {
+        crate::http_agent::bounded_total_plain(
+            DIRECT_CONNECT_TIMEOUT,
+            DIRECT_REQUEST_DEADLINE,
+            DIRECT_USER_AGENT,
+        )
+    });
+    let response = agent.get(url).call().ok()?;
+    let mut bytes = Vec::new();
+    // Bounded by the same rule the on-disk mark reader uses: an icon is a few
+    // kilobytes, and a host that answers `/favicon.ico` with a gigabyte is a
+    // host that must not be allowed to fill this process's memory.
+    response.into_reader().take(MAX_DIRECT_ICON_BYTES).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+/// The most bytes a direct icon fetch will read from a host it does not
+/// know. A 256x256 32-bit ICO is about 270 KB, so this is comfortable room
+/// for any real favicon and no room at all for a response that is not one.
+const MAX_DIRECT_ICON_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Decodes PNG bytes to (width, height, RGBA8 pixels), normalizing whatever
 /// color type/bit depth the source used (indexed, grayscale, RGB without
 /// alpha, ...) to straight 8-bit RGBA via `png`'s built-in transformations,
@@ -217,6 +537,25 @@ pub fn decode_rgba(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
 /// not shared, because they are not the same question -- see
 /// `card_mark::MAX_MARK_BYTES`.
 pub fn decode_rgba_unscaled(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    // **ICO first, because the direct path made it reachable.** The icon
+    // proxy has always answered `icon.png` with a PNG, so until now every
+    // caller here held one. A direct fetch asks a web server for
+    // `/favicon.ico`, and what comes back is a real Windows icon file more
+    // often than not -- the qBittorrent web UI this path exists for serves
+    // one. A decoder that refused it would have made the whole direct fetch
+    // decorative: the request would succeed and the item would still wear a
+    // monogram.
+    //
+    // Dispatched on the file's own magic rather than on the URL's extension,
+    // so a `/favicon.ico` that is actually a PNG (common) and a
+    // `/favicon.png` that is actually an ICO (less common, still real) both
+    // land in the right decoder.
+    if let Some(inner) = ico_best_image(png_bytes) {
+        return match inner {
+            IcoImage::Png(bytes) => decode_rgba_unscaled(bytes),
+            IcoImage::Dib { width, height, rgba } => Some((width, height, rgba)),
+        };
+    }
     let mut decoder = png::Decoder::new(png_bytes);
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().ok()?;
@@ -248,6 +587,184 @@ pub fn decode_rgba_unscaled(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)>
     };
 
     Some((width, height, rgba))
+}
+
+/// The one image picked out of a Windows `.ico` container: either a PNG
+/// payload to hand back to the PNG decoder, or a decoded Windows DIB.
+enum IcoImage<'a> {
+    Png(&'a [u8]),
+    Dib { width: usize, height: usize, rgba: Vec<u8> },
+}
+
+fn u16le(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+fn u32le(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+}
+
+/// Reads a `.ico` container and returns its **largest** image, or `None` for
+/// bytes that are not an icon file at all.
+///
+/// `None` is the answer for anything unrecognised rather than an error,
+/// because that is what lets [`decode_rgba_unscaled`] dispatch on magic: a
+/// PNG, a JPEG, an HTML error page and a truncated download all answer `None`
+/// here and fall through to the PNG decoder, which rejects them itself.
+///
+/// **Type 1 only.** A `.cur` cursor file has the identical layout with a `2`
+/// in the type field and hotspot coordinates where the colour planes and bit
+/// count go, so decoding one as an icon reads two invented numbers. It is
+/// rejected rather than tolerated.
+///
+/// Every offset and length in the directory is bounds-checked against the
+/// buffer before it is used: this parses a file fetched from a host in
+/// somebody's vault, so a malformed directory has to be an unfetched icon and
+/// never an index out of range.
+fn ico_best_image(bytes: &[u8]) -> Option<IcoImage<'_>> {
+    if bytes.len() < 6 || u16le(bytes, 0) != 0 || u16le(bytes, 2) != 1 {
+        return None;
+    }
+    let count = u16le(bytes, 4) as usize;
+    if count == 0 || bytes.len() < 6 + count * 16 {
+        return None;
+    }
+
+    // Largest by pixel area, ties broken by colour depth: a 32x32 32-bit
+    // entry beside a 32x32 4-bit one is the one worth drawing. A width or
+    // height byte of 0 means 256, which is the format's way of fitting 256
+    // into a byte and reads as the *smallest* entry if taken literally.
+    let mut best: Option<(u64, usize, usize)> = None;
+    for i in 0..count {
+        let entry = 6 + i * 16;
+        let width = if bytes[entry] == 0 { 256u64 } else { bytes[entry] as u64 };
+        let height = if bytes[entry + 1] == 0 { 256u64 } else { bytes[entry + 1] as u64 };
+        let depth = u16le(bytes, entry + 6) as u64;
+        let len = u32le(bytes, entry + 8) as usize;
+        let offset = u32le(bytes, entry + 12) as usize;
+        if len == 0 || offset.saturating_add(len) > bytes.len() {
+            continue;
+        }
+        let score = width * height * 256 + depth;
+        if best.is_none_or(|(best_score, _, _)| score > best_score) {
+            best = Some((score, offset, len));
+        }
+    }
+
+    let (_, offset, len) = best?;
+    let payload = &bytes[offset..offset + len];
+    // A Vista-era `.ico` stores its larger sizes as whole PNG files inside
+    // the container, so this is not an exotic case -- it is the common one
+    // for anything 256x256.
+    if payload.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+        return Some(IcoImage::Png(payload));
+    }
+    decode_ico_dib(payload)
+}
+
+/// Decodes the classic (pre-PNG) icon payload: a `BITMAPINFOHEADER`, an
+/// optional palette, bottom-up XOR pixels, then a 1-bit AND transparency
+/// mask.
+///
+/// Supports 32, 24, 8, 4 and 1 bits per pixel, uncompressed. That is every
+/// depth a real favicon has ever been written at; RLE-compressed and
+/// `BITMAPV5HEADER` payloads answer `None` and the item keeps its monogram,
+/// which is the same outcome an unreachable host gets.
+///
+/// **The AND mask is not optional decoration.** A 24-bit payload has no
+/// alpha channel at all, and a 32-bit one is routinely written with every
+/// alpha byte zero by tools that expect the mask to be honoured. Ignoring it
+/// gives, respectively, an icon with an opaque rectangle of background
+/// around it and an icon that is entirely invisible.
+fn decode_ico_dib(payload: &[u8]) -> Option<IcoImage<'static>> {
+    if payload.len() < 40 || u32le(payload, 0) != 40 || u32le(payload, 16) != 0 {
+        return None;
+    }
+    let width = i32::from_le_bytes(payload[4..8].try_into().ok()?);
+    let doubled = i32::from_le_bytes(payload[8..12].try_into().ok()?);
+    let bpp = u16le(payload, 14) as usize;
+    // `biHeight` in an icon payload counts the XOR rows and the AND rows
+    // together, so it is always twice the real height and always even.
+    if width <= 0 || width > 256 || doubled <= 0 || doubled % 2 != 0 || doubled > 512 {
+        return None;
+    }
+    let (width, height) = (width as usize, (doubled / 2) as usize);
+
+    let palette_entries = match bpp {
+        1 | 4 | 8 => {
+            let declared = u32le(payload, 32) as usize;
+            if declared == 0 { 1usize << bpp } else { declared.min(1usize << bpp) }
+        }
+        24 | 32 => 0,
+        _ => return None,
+    };
+    let palette_at = 40;
+    let xor_at = palette_at + palette_entries * 4;
+    let xor_stride = (width * bpp).div_ceil(32) * 4;
+    let mask_stride = width.div_ceil(32) * 4;
+    let mask_at = xor_at + xor_stride * height;
+    if payload.len() < mask_at {
+        return None;
+    }
+    // A payload that stops before its AND mask is still usable -- the mask is
+    // then treated as all-opaque -- but one that stops inside the XOR pixels
+    // is not, which is what the check above is.
+    let mask = payload.get(mask_at..mask_at + mask_stride * height);
+
+    let mut rgba = vec![0u8; width * height * 4];
+    let mut any_alpha = false;
+    for y in 0..height {
+        // Bottom-up: the first row in the file is the bottom row on screen.
+        let row = &payload[xor_at + (height - 1 - y) * xor_stride..][..xor_stride];
+        for x in 0..width {
+            let (blue, green, red, alpha) = match bpp {
+                32 => (row[x * 4], row[x * 4 + 1], row[x * 4 + 2], row[x * 4 + 3]),
+                24 => (row[x * 3], row[x * 3 + 1], row[x * 3 + 2], 255),
+                _ => {
+                    let index = match bpp {
+                        8 => row[x] as usize,
+                        4 => (row[x / 2] >> if x % 2 == 0 { 4 } else { 0 }) as usize & 0x0f,
+                        _ => (row[x / 8] >> (7 - x % 8)) as usize & 0x01,
+                    };
+                    if index >= palette_entries {
+                        return None;
+                    }
+                    let at = palette_at + index * 4;
+                    (payload[at], payload[at + 1], payload[at + 2], 255)
+                }
+            };
+            any_alpha |= alpha != 0;
+            let out = (y * width + x) * 4;
+            rgba[out] = red;
+            rgba[out + 1] = green;
+            rgba[out + 2] = blue;
+            rgba[out + 3] = alpha;
+        }
+    }
+
+    // The mask is applied when it is the only transparency information there
+    // is (every depth but 32) and when a 32-bit payload's alpha channel is
+    // uniformly zero, which means its author left transparency to the mask.
+    if bpp != 32 || !any_alpha {
+        if let Some(mask) = mask {
+            for y in 0..height {
+                let row = &mask[(height - 1 - y) * mask_stride..][..mask_stride];
+                for x in 0..width {
+                    // A set bit means "AND the screen through", i.e. transparent.
+                    let transparent = (row[x / 8] >> (7 - x % 8)) & 1 == 1;
+                    rgba[(y * width + x) * 4 + 3] = if transparent { 0 } else { 255 };
+                }
+            }
+        } else if bpp == 32 {
+            // No mask and no alpha at all: an entirely invisible image is
+            // never what was meant, so read the payload as opaque.
+            for pixel in rgba.chunks_exact_mut(4) {
+                pixel[3] = 255;
+            }
+        }
+    }
+
+    Some(IcoImage::Dib { width, height, rgba })
 }
 
 /// The longest edge, in pixels, a decoded icon is reduced to fit inside.
@@ -732,6 +1249,550 @@ mod tests {
         assert_eq!(read_cached_icon(&dir, "never-written.example.com"), None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // The port, and where it does and does not survive
+    // -----------------------------------------------------------------
+
+    /// **The bug this whole change exists for**, as the smallest test that
+    /// shows it: the owner's qBittorrent web UI is on `192.168.68.95:8080`
+    /// and Deskwarden drew no icon for it.
+    #[test]
+    fn a_lan_uri_keeps_its_port_all_the_way_into_the_fetch_url() {
+        assert_eq!(
+            authority_from_uri("http://192.168.68.95:8080/"),
+            Some("192.168.68.95:8080".to_string())
+        );
+        let source = icon_source_for("192.168.68.95:8080", None, false);
+        let IconSource::Direct(urls) = &source else {
+            panic!("a private address must be fetched directly, got {source:?}");
+        };
+        assert!(
+            urls.iter().all(|u| u.contains("192.168.68.95:8080")),
+            "a candidate URL dropped the port, so the fetch goes to port 80 of that address \
+             -- a different service entirely: {urls:?}"
+        );
+        // The positive control for the assertion above: it is checking a
+        // non-empty list, and the port really is the thing under test rather
+        // than a substring that would be there anyway.
+        assert!(!urls.is_empty(), "no candidate URLs at all");
+        assert!(
+            !urls.iter().any(|u| u.contains("192.168.68.95/")),
+            "a candidate URL is aimed at the bare address as well: {urls:?}"
+        );
+    }
+
+    /// **And where the port must NOT survive.** The icon proxy takes a bare
+    /// domain -- `{server}/icons/{domain}/icon.png` always has -- so the
+    /// proxied path drops it again. Both halves in one test, because "kept
+    /// here, dropped there" is the claim and either half alone is half a
+    /// claim.
+    #[test]
+    fn the_proxy_is_still_asked_for_the_bare_host_with_no_port() {
+        let source = icon_source_for("vault.example.com:8443", Some("https://vault.example.eu"), false);
+        assert_eq!(
+            source,
+            IconSource::Proxy("https://vault.example.eu/icons/vault.example.com/icon.png".to_string()),
+            "the proxy URL carried a port; the icon service has never taken one"
+        );
+        // The control: the same authority, fetched directly, DOES keep it --
+        // so the assertion above is about the proxy path rather than about
+        // `host_of_authority` having eaten the port for everybody.
+        let direct = icon_source_for("vault.example.com:8443", Some("https://vault.example.eu"), true);
+        let IconSource::Direct(urls) = &direct else { panic!("expected direct, got {direct:?}") };
+        assert!(
+            urls.iter().all(|u| u.contains("vault.example.com:8443")),
+            "the direct path dropped the port too, so this test is not about the proxy: {urls:?}"
+        );
+    }
+
+    /// `host_from_url` and `domain_from_uri` are deliberately unchanged: they
+    /// answer "which domain", and their callers -- the cloud check, the
+    /// `send_link` origin comparison, `app_candidates`' executable matching --
+    /// all want a bare host. Pinned so a later "fix the port everywhere" pass
+    /// has to read this rather than discover it.
+    #[test]
+    fn the_two_domain_functions_still_drop_the_port_on_purpose() {
+        assert_eq!(host_from_url("https://vault.example.com:8443/api"), "vault.example.com");
+        assert_eq!(
+            domain_from_uri("http://192.168.68.95:8080/"),
+            Some("192.168.68.95".to_string()),
+            "`domain_from_uri` started keeping the port, which changes what the icon PROXY is \
+             asked for and what `app_candidates` matches an executable against"
+        );
+    }
+
+    #[test]
+    fn an_authority_without_a_port_is_exactly_the_domain() {
+        // The overwhelmingly common case, and the one that keeps every
+        // existing user's on-disk icon cache valid: the loader keys the cache
+        // on this string, so a `github.com` that started answering
+        // `https://github.com` would re-fetch every icon anybody has.
+        assert_eq!(authority_from_uri("https://github.com/login"), Some("github.com".to_string()));
+        assert_eq!(authority_from_uri("https://github.com/login"), domain_from_uri("https://github.com/login"));
+    }
+
+    #[test]
+    fn a_scheme_this_app_does_not_speak_never_becomes_a_host() {
+        // Only `http://` and `https://` are stripped, so the scheme text of
+        // anything else stays in the host and is rejected. An
+        // `androidapp://com.example` URI is ordinary in a real vault.
+        assert_eq!(authority_from_uri("androidapp://com.example.app"), None);
+        assert_eq!(authority_from_uri("ftp://files.example.com/x"), None);
+        assert_eq!(authority_from_uri(""), None);
+        // The dotted-host rule is `domain_from_uri`'s, kept: a bare
+        // `localhost` URI is still no icon, although `is_private_host` would
+        // route one directly if it got that far. See `authority_from_uri`'s
+        // own doc for why that gap is deliberate.
+        assert_eq!(authority_from_uri("localhost"), None);
+        assert_eq!(authority_from_uri("http://localhost:3000/"), None);
+        assert!(is_private_host("localhost"), "the control: the predicate does know it");
+        // The control: the same shape WITH a scheme this app does speak is
+        // accepted, so the rejections above are about the scheme.
+        assert_eq!(
+            authority_from_uri("https://files.example.com/x"),
+            Some("files.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn a_colon_that_is_not_a_port_is_not_treated_as_one() {
+        assert_eq!(split_authority("example.com:8080"), ("example.com", Some("8080")));
+        assert_eq!(split_authority("example.com"), ("example.com", None));
+        assert_eq!(split_authority("example.com:"), ("example.com:", None));
+        assert_eq!(split_authority("example.com:https"), ("example.com:https", None));
+        assert_eq!(host_of_authority("192.168.68.95:8080"), "192.168.68.95");
+        assert_eq!(host_of_authority("192.168.68.95"), "192.168.68.95");
+    }
+
+    // -----------------------------------------------------------------
+    // Private-address detection, at every boundary
+    // -----------------------------------------------------------------
+
+    /// **The off-by-one neighbours are the test.** Every one of these ranges
+    /// has a public address immediately outside it, and every hand-rolled
+    /// version of this check gets at least one of them wrong -- most often
+    /// `172.32.0.0`, which a `starts_with("172.")` swallows, and
+    /// `172.160.0.1`, which a `starts_with("172.16")` swallows.
+    #[test]
+    fn every_private_range_is_matched_and_its_public_neighbours_are_not() {
+        let private = [
+            // 10/8
+            "10.0.0.0", "10.255.255.255", "10.0.0.1",
+            // 172.16/12
+            "172.16.0.0", "172.31.255.255", "172.16.0.1",
+            // 192.168/16
+            "192.168.0.0", "192.168.255.255", "192.168.68.95",
+            // 127/8 and its name
+            "127.0.0.1", "127.255.255.255", "localhost", "LOCALHOST", "box.localhost",
+            // 169.254/16
+            "169.254.0.0", "169.254.255.255", "169.254.1.1",
+            // and the IPv6 spellings of the same three ideas
+            "::1", "[::1]", "fc00::1", "fe80::1",
+        ];
+        for host in private {
+            assert!(is_private_host(host), "{host} is on this machine's own network and was not matched");
+        }
+
+        let public = [
+            // The neighbour on each side of each boundary, which is what a
+            // sloppy prefix check gets wrong.
+            "9.255.255.255", "11.0.0.1",
+            "172.15.255.255", "172.32.0.1", "172.160.0.1",
+            "192.167.255.255", "192.169.0.1", "192.1680.0.1",
+            "126.255.255.255", "128.0.0.1",
+            "169.253.255.255", "169.255.0.1",
+            // and ordinary public hosts, including two whose TEXT contains a
+            // private range's text.
+            "github.com", "icons.bitwarden.net", "10.0.0.1.example.com",
+            "localhost.example.com", "notlocalhost", "192.168.0.1.nip.io",
+            "2001:4860:4860::8888",
+        ];
+        for host in public {
+            assert!(!is_private_host(host), "{host} is a public address and was matched as private");
+        }
+
+        // The instrument: both lists were non-empty and the predicate is not
+        // a constant. Without this, a function that answered `true` for
+        // everything would fail the second loop -- but one that answered
+        // nothing at all would need the first loop to have run.
+        assert!(private.len() >= 20 && public.len() >= 15);
+    }
+
+    // -----------------------------------------------------------------
+    // Which of the two paths a host takes
+    // -----------------------------------------------------------------
+
+    /// **The positive control for the whole switch.** With the switch off, a
+    /// public host must still go to the proxy -- otherwise a test that says
+    /// "private goes direct" proves nothing, because everything would.
+    #[test]
+    fn with_the_switch_off_a_public_host_still_goes_to_the_proxy() {
+        assert_eq!(
+            icon_source_for("github.com", None, false),
+            IconSource::Proxy("https://icons.bitwarden.net/github.com/icon.png".to_string()),
+            "a public host stopped being proxied with the switch OFF, which is the behaviour \
+             every existing user has and did not ask to change"
+        );
+        assert_eq!(
+            icon_source_for("github.com", Some("https://vault.example.eu/"), false),
+            IconSource::Proxy("https://vault.example.eu/icons/github.com/icon.png".to_string()),
+            "a self-hosted account stopped proxying through its own server"
+        );
+        // The control: the SAME host with the switch on does leave the proxy,
+        // so the two assertions above are about the switch and not about
+        // `icon_source_for` being unable to answer `Direct` at all.
+        assert!(matches!(
+            icon_source_for("github.com", None, true),
+            IconSource::Direct(_)
+        ));
+    }
+
+    /// A private address is fetched directly **with the switch off**, because
+    /// the proxy cannot reach it however it is configured.
+    #[test]
+    fn a_private_address_is_fetched_directly_with_the_switch_off() {
+        for authority in ["192.168.68.95:8080", "10.1.2.3", "127.0.0.1:8080", "localhost"] {
+            assert!(
+                matches!(icon_source_for(authority, None, false), IconSource::Direct(_)),
+                "{authority} was sent to the icon proxy, which has no route to it -- so the \
+                 item gets no icon, ever"
+            );
+            // ... and the switch makes no difference to it, which is the
+            // other half of the claim: this is not the switch defaulting on.
+            assert_eq!(
+                icon_source_for(authority, None, false),
+                icon_source_for(authority, None, true),
+                "the direct-fetch switch changed what happens to a private address"
+            );
+        }
+    }
+
+    /// The scheme is chosen here, not taken from the item's URI, and a public
+    /// host is never asked over plaintext.
+    #[test]
+    fn a_public_direct_fetch_is_https_only_and_a_private_one_tries_http_first() {
+        let IconSource::Direct(public) = icon_source_for("github.com", None, true) else {
+            panic!("expected direct")
+        };
+        assert!(!public.is_empty());
+        assert!(
+            public.iter().all(|u| u.starts_with("https://")),
+            "a public host was asked over plaintext, which announces the domain to every hop \
+             in between: {public:?}"
+        );
+
+        let IconSource::Direct(private) = icon_source_for("192.168.68.95:8080", None, false) else {
+            panic!("expected direct")
+        };
+        assert!(
+            private[0].starts_with("http://192.168.68.95:8080/"),
+            "a LAN service is tried over plaintext first; got {:?}",
+            private[0]
+        );
+        assert!(
+            private.iter().any(|u| u.starts_with("https://")),
+            "a LAN box that only speaks TLS gets no icon at all: {private:?}"
+        );
+        // Every candidate, on either path, is `http` or `https` and nothing
+        // else -- the blunt form of "the scheme is ours".
+        for url in public.iter().chain(private.iter()) {
+            assert!(
+                url.starts_with("http://") || url.starts_with("https://"),
+                "a candidate URL is not an http(s) URL: {url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_login_answers_with_its_port_and_a_card_answers_exactly_as_before() {
+        let lan = login_with_uri("http://192.168.68.95:8080/");
+        assert_eq!(icon_authority_for(&lan).as_deref(), Some("192.168.68.95:8080"));
+        // The card path is untouched and must stay so: a bank domain is typed
+        // into a field by hand and is a domain, not a socket.
+        let card = card_with_field(BANK_DOMAIN_FIELD, "chase.com");
+        assert_eq!(icon_authority_for(&card), icon_domain_for(&card));
+        assert_eq!(icon_authority_for(&card).as_deref(), Some("chase.com"));
+        assert_eq!(icon_authority_for(&secure_note()), None);
+        assert_eq!(icon_authority_for(&plain_card()), None);
+        // The control for the first assertion: `icon_domain_for` on the same
+        // login gives the port-less answer, so the two really are different
+        // questions and the login arm really did change.
+        assert_eq!(icon_domain_for(&lan).as_deref(), Some("192.168.68.95"));
+    }
+
+    // -----------------------------------------------------------------
+    // ICO decoding -- what a direct `/favicon.ico` actually returns
+    // -----------------------------------------------------------------
+
+    /// Wraps `payload` in a single-entry `.ico` container.
+    fn ico_of(width: u8, height: u8, bpp: u16, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        out.extend_from_slice(&1u16.to_le_bytes()); // type: icon
+        out.extend_from_slice(&1u16.to_le_bytes()); // one entry
+        out.push(width);
+        out.push(height);
+        out.push(0); // palette size
+        out.push(0); // reserved
+        out.extend_from_slice(&1u16.to_le_bytes()); // colour planes
+        out.extend_from_slice(&bpp.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&22u32.to_le_bytes()); // offset: right after this entry
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// A 2x2 32-bit uncompressed icon payload: header, bottom-up BGRA, then
+    /// an all-clear AND mask.
+    fn dib_2x2_bgra(pixels: [[u8; 4]; 4]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        out.extend_from_slice(&2i32.to_le_bytes()); // biWidth
+        out.extend_from_slice(&4i32.to_le_bytes()); // biHeight: 2x the real height
+        out.extend_from_slice(&1u16.to_le_bytes()); // planes
+        out.extend_from_slice(&32u16.to_le_bytes()); // bit count
+        out.extend_from_slice(&0u32.to_le_bytes()); // compression: none
+        out.extend_from_slice(&[0u8; 20]); // sizes, resolutions, palette counts
+        for pixel in pixels {
+            out.extend_from_slice(&pixel);
+        }
+        out.extend_from_slice(&[0u8; 8]); // AND mask: two rows, 4 bytes each
+        out
+    }
+
+    /// The direct path asks for `/favicon.ico` first, and what a web server
+    /// answers with is a Windows icon file. A decoder that took only PNGs
+    /// would have made the whole direct fetch decorative: the request would
+    /// succeed and the row would still wear a monogram.
+    #[test]
+    fn a_windows_icon_file_decodes_to_the_pixels_it_carries() {
+        // Bottom-up in the file, so the first two entries are the BOTTOM row.
+        let bytes = ico_of(
+            2,
+            2,
+            32,
+            &dib_2x2_bgra([
+                [0x00, 0x00, 0xff, 0xff], // bottom-left:  red
+                [0x00, 0xff, 0x00, 0xff], // bottom-right: green
+                [0xff, 0x00, 0x00, 0xff], // top-left:     blue
+                [0xff, 0xff, 0xff, 0xff], // top-right:    white
+            ]),
+        );
+        let (width, height, rgba) = decode_rgba_unscaled(&bytes).expect("the ICO decodes");
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(pixel_at(&rgba, 2, 0, 0), [0, 0, 255, 255], "top-left is not the blue pixel -- the rows were not flipped");
+        assert_eq!(pixel_at(&rgba, 2, 1, 0), [255, 255, 255, 255]);
+        assert_eq!(pixel_at(&rgba, 2, 0, 1), [255, 0, 0, 255], "bottom-left is not the red pixel");
+        assert_eq!(pixel_at(&rgba, 2, 1, 1), [0, 255, 0, 255]);
+    }
+
+    /// A modern `.ico` stores its larger sizes as whole PNG files inside the
+    /// container, so the container is a wrapper and the PNG decoder does the
+    /// work. Both shapes, so neither can be the only one that works.
+    #[test]
+    fn an_ico_that_wraps_a_png_decodes_as_that_png() {
+        let png = rgba_png(2, 2, &[9u8; 16]);
+        let wrapped = ico_of(2, 2, 32, &png);
+        assert_eq!(
+            decode_rgba_unscaled(&wrapped),
+            decode_rgba_unscaled(&png),
+            "an ICO wrapping a PNG did not decode to the same thing as that PNG alone"
+        );
+        // The control: the wrapper really was a wrapper and not the PNG
+        // itself, so the assertion above went through the ICO path.
+        assert_ne!(wrapped, png);
+        assert!(decode_rgba_unscaled(&png).is_some(), "the fixture PNG does not decode");
+    }
+
+    /// Everything that is not an icon file falls through to the PNG decoder
+    /// untouched, which is what lets the dispatch be on magic bytes.
+    #[test]
+    fn bytes_that_are_not_an_icon_file_are_not_taken_for_one() {
+        let png = rgba_png(4, 4, &[7u8; 64]);
+        assert!(decode_rgba_unscaled(&png).is_some(), "an ordinary PNG stopped decoding");
+        for not_an_icon in [
+            b"<!doctype html><title>404</title>".to_vec(),
+            Vec::new(),
+            vec![0u8, 0, 1, 0],           // a truncated ICO header
+            vec![0u8, 0, 2, 0, 1, 0],     // a CUR file: same layout, type 2
+            vec![0u8, 0, 1, 0, 0, 0],     // an ICO claiming zero entries
+        ] {
+            assert!(
+                decode_rgba_unscaled(&not_an_icon).is_none(),
+                "these bytes decoded to an image: {not_an_icon:?}"
+            );
+        }
+    }
+
+    /// A directory entry pointing outside the buffer is an unfetched icon,
+    /// never a panic. This parses bytes from a host in somebody's vault.
+    #[test]
+    fn a_malformed_icon_directory_answers_none_rather_than_panicking() {
+        let mut bytes = ico_of(2, 2, 32, &dib_2x2_bgra([[0xff; 4]; 4]));
+        // Point the single entry's data at an offset well past the end.
+        bytes[18..22].copy_from_slice(&9_000_000u32.to_le_bytes());
+        assert_eq!(decode_rgba_unscaled(&bytes), None);
+        // The control: the same container with its offset intact does decode,
+        // so the `None` above is the bounds check and not a broken fixture.
+        let intact = ico_of(2, 2, 32, &dib_2x2_bgra([[0xff; 4]; 4]));
+        assert!(decode_rgba_unscaled(&intact).is_some());
+    }
+
+    // -----------------------------------------------------------------
+    // What a direct request actually puts on the wire
+    // -----------------------------------------------------------------
+
+    /// **The privacy claim for the direct path, as a test**, in the shape
+    /// `breach::the_request_head_carries_nothing_beyond_the_allowlist`
+    /// established: read off the literal bytes this crate put on a socket,
+    /// and asserted as an **exact allowlist** rather than as a hunt for
+    /// something bad.
+    ///
+    /// It **fails closed**. A header that is not on the list fails this test
+    /// even if it carries nothing interesting, because this request goes to a
+    /// host the app has no other relationship with -- every byte in the head
+    /// is a byte handed to a stranger, and a new one has to be added here
+    /// deliberately by somebody reading this comment.
+    ///
+    /// The server is on `127.0.0.1`, which is a private address, so this also
+    /// pins the end-to-end claim the loopback case is about: the app fetched
+    /// the icon **itself**, with the setting off.
+    #[test]
+    fn the_direct_request_head_carries_nothing_beyond_the_allowlist() {
+        let mut server = crate::test_http::server();
+        let port = server.socket_address().port();
+        let captured: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = std::sync::Arc::clone(&captured);
+        let icon = rgba_png(2, 2, &[0x40u8; 16]);
+        let body = icon.clone();
+        let mock = server
+            .mock("GET", "/favicon.ico")
+            .with_status(200)
+            .with_body_from_request(move |request| {
+                *sink.lock().expect("the head sink") = Some(request.raw_head().to_string());
+                body.clone()
+            })
+            .expect(1)
+            .create();
+
+        // The setting is OFF, and the address is loopback: this is the
+        // private-address rule, not the switch.
+        let authority = format!("127.0.0.1:{port}");
+        let source = icon_source_for(&authority, None, false);
+        assert!(
+            matches!(source, IconSource::Direct(_)),
+            "loopback was not routed to the direct path, so nothing below is under test"
+        );
+        let fetched = fetch_icon_for(&source).expect("the direct fetch returned nothing");
+        assert_eq!(fetched, icon, "the bytes that came back are not the ones served");
+        // The request really did reach the route this test is about.
+        mock.assert();
+
+        let head = captured
+            .lock()
+            .expect("the head sink")
+            .clone()
+            .expect("the mock was never asked, so no head was captured");
+
+        // Controls first: a real, complete request head.
+        assert!(head.starts_with("GET "), "captured head is not a request head: {head:?}");
+        assert!(head.ends_with("\r\n\r\n"), "the captured head is truncated: {head:?}");
+
+        let mut lines = head.trim_end_matches("\r\n\r\n").split("\r\n");
+        assert_eq!(
+            lines.next().expect("a request head has a request line"),
+            "GET /favicon.ico HTTP/1.1",
+            "the request line is not exactly `GET /favicon.ico HTTP/1.1` -- a query string, an \
+             extra path segment or a changed method all land here"
+        );
+
+        let allowed: Vec<(&str, String)> = vec![
+            ("host", format!("127.0.0.1:{port}")),
+            ("accept", "*/*".to_string()),
+            // A fixed string, identical for every user of this app: no
+            // version, no OS, no build id, no HTTP-library name.
+            ("user-agent", DIRECT_USER_AGENT.to_string()),
+            ("accept-encoding", "gzip".to_string()),
+        ];
+
+        let mut seen: Vec<String> = Vec::new();
+        for line in lines {
+            assert!(!line.is_empty(), "a blank line inside the head: {head:?}");
+            let Some((name, value)) = line.split_once(':') else {
+                panic!("header line is not `Name: value`: {line:?}");
+            };
+            let name = name.trim().to_ascii_lowercase();
+            let Some((_, expected)) = allowed.iter().find(|(n, _)| *n == name) else {
+                panic!(
+                    "the direct icon request carried a header that is not on the allowlist: \
+                     {line:?}\nFull head: {head:?}\n\
+                     This request goes to a host in the user's vault that this app has no other \
+                     relationship with. If this header is meant to be sent, add it to the \
+                     allowlist above and say why."
+                );
+            };
+            assert_eq!(
+                value.trim(), expected,
+                "header {name:?} carried {value:?}, not the one value it is allowed to carry"
+            );
+            seen.push(name);
+        }
+
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len(), "a header name was sent twice: {seen:?}");
+        let mut expected_names: Vec<String> = allowed.iter().map(|(n, _)| (*n).to_string()).collect();
+        expected_names.sort();
+        assert_eq!(
+            sorted, expected_names,
+            "the set of headers sent is not the allowlist: {head:?}"
+        );
+
+        // Redundant and cheap: no cookie, no referer, no authorization, under
+        // any casing. The allowlist above already forbids them; this is the
+        // claim in its bluntest form.
+        let lower = head.to_ascii_lowercase();
+        for forbidden in ["cookie", "referer", "authorization", "x-"] {
+            assert!(!lower.contains(forbidden), "the head carries {forbidden:?}: {head:?}");
+        }
+    }
+
+    /// A candidate that answers `200` with something that is not an image --
+    /// a web server's HTML 404 page, which is the ordinary case rather than
+    /// the exotic one -- must not end the walk. The next candidate is tried,
+    /// and it is the one whose bytes are kept.
+    #[test]
+    fn a_candidate_that_answers_with_a_page_does_not_end_the_walk() {
+        let mut server = crate::test_http::server();
+        let port = server.socket_address().port();
+        let icon = rgba_png(2, 2, &[0x11u8; 16]);
+        let html = server
+            .mock("GET", "/favicon.ico")
+            .with_status(200)
+            .with_body("<!doctype html><title>Not found</title>")
+            .expect(1)
+            .create();
+        let png = server
+            .mock("GET", "/favicon.png")
+            .with_status(200)
+            .with_body(icon.clone())
+            .expect(1)
+            .create();
+
+        let source = icon_source_for(&format!("127.0.0.1:{port}"), None, false);
+        assert_eq!(
+            fetch_icon_for(&source),
+            Some(icon),
+            "the walk kept the HTML page's bytes, so a page would have been cached as this \
+             site's icon and the real one never asked for"
+        );
+        // Both routes were actually visited, in that order.
+        html.assert();
+        png.assert();
     }
 
     #[test]

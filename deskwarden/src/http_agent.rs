@@ -133,6 +133,38 @@ pub fn bounded_total(connect: Duration, total: Duration) -> TotalBounded {
     )
 }
 
+/// [`bounded_total`], plus two refusals: **no redirects are followed**, and
+/// the `User-Agent` is a caller-chosen constant rather than ureq's default.
+///
+/// For requests to hosts this app has no prior relationship with -- today, the
+/// direct site-icon fetch in [`crate::favicon`]. Both refusals are about what
+/// leaves the machine rather than about latency:
+///
+/// * **`redirects(0)`.** A redirect is the server on the other end choosing
+///   the next host this app connects to. On the direct icon path that is the
+///   one thing that must stay this app's choice: a `192.168.x.x` box answering
+///   `301 https://tracker.example/` would turn a request that never left the
+///   user's own network into one that tells a stranger which LAN service they
+///   hold an entry for, and it would do it under a setting the user left off.
+///   Not following one is a bounded loss (a site that only serves its icon via
+///   a redirect gets a monogram) against an unbounded one.
+/// * **A fixed `User-Agent`.** ureq's default names the HTTP library and its
+///   exact version, which is a fingerprint bit this app has no reason to hand
+///   to every site in somebody's vault. `agent` is sent verbatim to every
+///   host, so it must say nothing about the user, the machine, the version or
+///   the vault -- see `favicon::DIRECT_USER_AGENT`, and the allowlist test
+///   that pins the whole request head.
+pub fn bounded_total_plain(connect: Duration, total: Duration, agent: &str) -> TotalBounded {
+    TotalBounded(
+        ureq::AgentBuilder::new()
+            .timeout_connect(connect)
+            .timeout(total)
+            .redirects(0)
+            .user_agent(agent)
+            .build(),
+    )
+}
+
 /// An agent whose requests are bounded by **time without progress**.
 ///
 /// For streamed transfers where the legitimate duration is unknown and a total

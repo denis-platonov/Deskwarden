@@ -1259,6 +1259,18 @@ pub fn build_frame_with_search(
         .as_deref()
         .map(|path| crate::settings::Settings::load(path).fetch_icons)
         .unwrap_or(true);
+    // Whether a PUBLIC host's icon may be fetched from that host directly
+    // rather than through the icon service, read the same way and
+    // live-editable for the same reason. Off by default, and off when there
+    // is no settings path at all -- a window with nowhere to read preferences
+    // from must not start connecting to every site in the vault, which is the
+    // one default here where guessing wrong is a disclosure rather than a
+    // missing picture. Private addresses do not consult this at all; see
+    // `favicon::icon_source_for`.
+    let direct_icons_at_open = settings_path
+        .as_deref()
+        .map(|path| crate::settings::Settings::load(path).fetch_icons_direct)
+        .unwrap_or(false);
     // **The window's one breach cache**, alive exactly as long as the window
     // and holding nothing but five-character SHA-1 prefixes and counts.
     //
@@ -1571,6 +1583,10 @@ pub fn build_frame_with_search(
                 .borrow()
                 .as_ref()
                 .map_or(fetch_icons_at_open, |s| s.fetch_icons),
+            direct: edited_settings_for_closure
+                .borrow()
+                .as_ref()
+                .map_or(direct_icons_at_open, |s| s.fetch_icons_direct),
             server_url: &server_url,
         };
 
@@ -10455,6 +10471,11 @@ struct IconFetch<'a> {
     /// `false` means no icon request is made and no icon *domain* is even
     /// computed -- see the guard in [`ensure_icon_loaded`].
     enabled: bool,
+    /// `true` means a **public** host's icon is fetched from that host
+    /// instead of through the icon service. A private address is fetched
+    /// directly either way -- `favicon::icon_source_for` owns that split, and
+    /// this field is not consulted for one. `false` is the default.
+    direct: bool,
     server_url: &'a Option<String>,
 }
 
@@ -10517,7 +10538,15 @@ fn ensure_icon_loaded(
     // have no icon. That is a field lookup with no I/O, bounded by the
     // on-screen prefetch window, and the same cost the setting skip
     // already accepts.
-    let Some(domain) = crate::favicon::icon_domain_for(item) else {
+    // **`icon_authority_for`, not `icon_domain_for`, and the difference is a
+    // port.** A login on `http://192.168.68.95:8080/` answers `192.168.68.95:
+    // 8080` here. That is what the disk cache is keyed on and what
+    // `favicon::icon_source_for` is asked about; the proxy URL it builds
+    // drops the port back off, because the icon proxy has always taken a bare
+    // domain. `icon_domain_for` is still the answer everywhere a domain is
+    // what is wanted, and a card -- whose bank domain is typed into a field
+    // and carries no port -- gets exactly the same string from either.
+    let Some(domain) = crate::favicon::icon_authority_for(item) else {
         return;
     };
     favicon_requested.insert(item.id.clone());
@@ -10537,10 +10566,18 @@ fn ensure_icon_loaded(
     let item_id = item.id.clone();
     let server_url = fetch.server_url.clone();
     let cache_dir = icon_cache_dir.to_path_buf();
+    let direct = fetch.direct;
     std::thread::spawn(move || {
-        let base = crate::favicon::icon_base_url(server_url.as_deref());
-        let url = format!("{base}/{domain}/icon.png");
-        let pixels = crate::favicon::fetch_icon_bytes(&url).and_then(|bytes| {
+        // Where this icon comes from -- the icon service, or the site itself
+        // -- is decided in one place, `favicon::icon_source_for`, rather than
+        // here. This thread does not know which of the two it got, and that
+        // is deliberate: the rule (private addresses always direct, everyone
+        // else only if the user switched it on) is one the settings doc, the
+        // preferences copy and `PRIVACY.md` all describe, and a second copy
+        // of it in the loader is how those four come to disagree.
+        let source =
+            crate::favicon::icon_source_for(&domain, server_url.as_deref(), direct);
+        let pixels = crate::favicon::fetch_icon_for(&source).and_then(|bytes| {
             let decoded = crate::favicon::decode_rgba(&bytes);
             if decoded.is_some() {
                 crate::favicon::write_cached_icon(&cache_dir, &domain, &bytes);
@@ -19515,7 +19552,11 @@ mod account_details_tests {
             &ctx,
             item,
             &dir,
-            &IconFetch { enabled: fetch_icons, server_url: &None },
+            // `direct: false` -- the default. These tests are about the
+            // cache and the session marking, and every fixture domain in them
+            // is public, so with this off nothing here can reach the network
+            // by any route.
+            &IconFetch { enabled: fetch_icons, direct: false, server_url: &None },
             &tx,
             &mut requested,
             &mut icons,
@@ -19589,8 +19630,15 @@ mod account_details_tests {
     }
 
     /// The gate stands in front of the question, not merely in front of the
-    /// request: with the setting off, `icon_domain_for` is not consulted at
-    /// all, so nothing works out which domain the item would have disclosed.
+    /// request: with the setting off, `icon_authority_for` is not consulted at
+    /// all, so nothing works out which host the item would have disclosed.
+    ///
+    /// **The needle moved from `icon_domain_for` to `icon_authority_for`**
+    /// when the loader started keeping a login's port, and it is the same
+    /// assertion about the same call site rather than a weaker one -- the
+    /// function the loader asks the question with was renamed under it, and a
+    /// needle left pointing at the old name would have found nothing and
+    /// failed loudly, which is what it did.
     ///
     /// Source-level because that ordering is not observable from outside --
     /// both placements produce no network request, and only one of them
@@ -19604,12 +19652,21 @@ mod account_details_tests {
             .find("if !fetch.enabled {")
             .expect("the `fetch_icons` guard is no longer in `ensure_icon_loaded`");
         let question = code
-            .find(concat!("crate::favicon::icon_domain_", "for(item)"))
-            .expect("the loader no longer consults `icon_domain_for`");
+            .find(concat!("crate::favicon::icon_authority_", "for(item)"))
+            .expect("the loader no longer consults `icon_authority_for`");
         assert!(
             guard < question,
-            "the `fetch_icons` guard sits AFTER `icon_domain_for`, so with icons switched off \
-             the app still works out which domain each item would disclose"
+            "the `fetch_icons` guard sits AFTER `icon_authority_for`, so with icons switched \
+             off the app still works out which host each item would disclose"
+        );
+        // The needle really is a call in the production source and not a
+        // mention in a doc comment `code_only` failed to strip: the old name
+        // must be gone from the loader entirely, or `find` above could be
+        // reading a leftover.
+        assert!(
+            !code.contains(concat!("crate::favicon::icon_domain_", "for(item)")),
+            "the loader still calls `icon_domain_for` somewhere, so the port a login carries \
+             is dropped on whichever path that is"
         );
     }
 
