@@ -89,6 +89,44 @@ you closed the vault — the background process was busy being the window. It
 builds the tray first now, so the icon, the fill hotkey and autofill are all
 there while the sign-in card is still on screen.
 
+## 0.15.10 - 2026-09-03
+
+### Opening your vault is about three times faster
+
+On your own server, opening the vault window fetched and decrypted your
+whole vault three times over — once for a readiness check that is only
+meaningful for the Bitwarden CLI, once for the items, once more for the
+folders. It now takes all of it from a single request.
+
+If you turn on **Keep an encrypted copy of your vault on this PC**, the
+window paints from that copy on its first frame and fetches nothing at all.
+
+### Closing to the tray can be undone
+
+With **Open the vault instantly** on, closing the window hid it correctly but
+nothing could bring it back: the window was waiting to be raised only from a
+frame that a hidden window never runs. Deskwarden thought it had reopened it.
+The window stayed in memory, invisible and unreachable.
+
+### Icons for machines on your own network
+
+Deskwarden asked `/favicon.ico` and two other fixed paths. qBittorrent's web
+interface serves none of them — it names its icon in its page instead, as
+many self-hosted tools do. Deskwarden now reads that, for addresses on your
+own network only, following only what the page declares and only on the same
+address.
+
+The icon code also had no logging at all, so a missing icon was silent. It
+now records which address it asked and what came back.
+
+### Smaller things
+
+- The item type and folder can be selected and copied, like the title.
+- **Open the vault instantly** no longer blames a settings change for closing
+  the window; it says what actually does.
+- A vault on your own server no longer retries a backend start every 30
+  seconds for a backend it never had.
+
 ## 0.15.9 - 2026-09-03
 
 ### Unlocking your vault no longer asks which client to use
