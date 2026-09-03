@@ -89,6 +89,35 @@ you closed the vault — the background process was busy being the window. It
 builds the tray first now, so the icon, the fill hotkey and autofill are all
 there while the sign-in card is still on screen.
 
+## 0.15.11 - 2026-09-03
+
+### Unlocking a self-hosted vault actually unlocks it
+
+On a vault served by Deskwarden's built-in client, the **Unlock** button on
+the locked screen ran Bitwarden's command-line program — against a profile
+that was never signed in, on a machine that need not even have that program.
+It could not succeed, and it never gave up: it showed an error and asked
+again.
+
+Unlocking now uses whichever client actually holds your vault.
+
+### Sync, Sends and exporting no longer decide for themselves
+
+Six things — Sync, exporting, and the four Send actions — each chose
+between the two clients on their own, and each of those choices was a place
+the choice could be forgotten. Every bug fixed in the last two releases was
+one of them forgetting.
+
+They now go through one place that makes that decision once. The other
+nineteen vault operations already worked this way and have never had a bug
+of this kind.
+
+### A leftover from an old sign-in no longer wakes the CLI
+
+An account moved to the built-in client, but still carrying a session token
+from when it used the command-line program, asked that program a question at
+every startup. It no longer does.
+
 ## 0.15.10 - 2026-09-03
 
 ### Opening your vault is about three times faster
