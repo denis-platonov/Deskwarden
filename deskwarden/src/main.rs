@@ -19450,11 +19450,252 @@ mod tests {
     /// # The row that did not
     ///
     /// `child_cannot_read_the_vault` still draws here, and that is the
-    /// remaining scope line rather than an oversight: on a `bw serve` account
-    /// the sign-in produces the token the DAEMON must start the backend with,
-    /// and no carrier that arrives when the child exits can deliver it before
-    /// the window needs it. Asserted, so that "the daemon draws nothing" is
-    /// not claimed more widely than it is true.
+    /// remaining scope line rather than an oversight.
+    ///
+    /// **It is no longer the `bw serve` account.** This doc used to say it
+    /// was, on the argument that a `bw serve` sign-in produces the token the
+    /// DAEMON must start the backend with and no carrier arriving at child
+    /// exit could deliver it in time. That was true of the carrier and is no
+    /// longer true of the app: `deskwarden::ui_show::signin_name` is rung
+    /// from the middle of the child's life, so that account spawns like every
+    /// other and `why_a_ui_process_could_not_read_this_vault` answers `None`
+    /// for it.
+    ///
+    /// What is left is the direct-REST account with **no recorded server
+    /// URL**: there is nothing for a card to sign in to, so a child could
+    /// only exit, and the daemon's own host is the only thing that can carry
+    /// the user forward. Asserted, so that "the daemon draws nothing" is not
+    /// claimed more widely than it is true -- see
+    /// `every_window_the_daemon_can_still_draw_is_named_here` for the whole
+    /// list.
+    /// **EVERY window the daemon can still draw, named -- because "the
+    /// daemon draws nothing" is not true and must not be asserted as though
+    /// it were.**
+    ///
+    /// The `bw serve` sign-in was the last routine draw and it has moved out.
+    /// What that earns is a smaller list, not an empty one, and the honest
+    /// thing to pin is the list itself: every host below is a real `eframe`
+    /// window opened in the daemon's own process, and each one maps the
+    /// OpenGL driver into it for the life of the process.
+    ///
+    /// **This is a census, not a prohibition.** It fails in BOTH directions
+    /// on purpose. A new draw site added to the daemon fails it, which is the
+    /// obvious half. A draw site REMOVED also fails it, which is the half
+    /// that matters more here: this crate's standing defect class is "a test
+    /// that passes because it never reached the thing it names", and a count
+    /// that only ever ratchets down would silently become a test about
+    /// nothing.
+    ///
+    /// # The four, and why each is still here
+    ///
+    /// * **`app_window::run(`** -- the startup sign-in host, reached only
+    ///   when `the_startup_sign_in_belongs_to_a_ui_process` said no: a
+    ///   `bw serve` account with no `bw.exe`, or a direct-REST account with
+    ///   no server URL. Both are launches where a child could only exit.
+    /// * **`app_window::run_from_vault(`** -- `RealVaultOps::open_window`'s
+    ///   in-daemon host, behind the same question asked of an already-running
+    ///   app. See the test below this one.
+    /// * **`app_window::run_recovery(`** -- the error screen, and the one
+    ///   deliberate decision rather than a leftover. See
+    ///   `the_recovery_window_stays_in_the_daemon_and_here_is_why`.
+    /// * **`run_login_flow_for(`** -- the master-password prompt the lock
+    ///   recovery and the account switch put up. It is the same sign-in card,
+    ///   but reached from the middle of a running session rather than from a
+    ///   launch, and it is the input to `resettle_session` -- which tears
+    ///   `bw serve` down and rebuilds the match engine in THIS process.
+    ///
+    /// # The child's own two are excluded, by slicing rather than by naming
+    ///
+    /// `run_as_a_ui_process` is the `--ui` child's entry point, and it draws
+    /// on purpose -- that is what the child is FOR. Its body is cut out
+    /// before anything is counted, so a host moved INTO the child stops being
+    /// counted here, which is exactly the direction this whole change goes.
+    #[test]
+    fn every_window_the_daemon_can_still_draw_is_named_here() {
+        let raw = production_half_of_this_file();
+        let child = body_of(raw, "fn run_as_a_ui_process(surface: Surface) -> i32 {");
+        // The child really is the child: it opens both of its own hosts.
+        for marker in [concat!("app_window::", "run("), concat!("vault_window::", "run(")] {
+            assert!(
+                child.contains(marker),
+                "control: `run_as_a_ui_process` does not open {marker:?}, so the slice below \
+                 is cutting out the wrong function and the daemon's count is wrong"
+            );
+        }
+        // Everything that is NOT the child. `replace` rather than a split,
+        // because the daemon's code lies on both sides of that function.
+        let daemon = raw.replace(&child, "");
+        assert!(
+            daemon.len() + child.len() == raw.len(),
+            "the cut did not partition the file, so something was counted twice or dropped"
+        );
+
+        for (host, expected, why) in [
+            (
+                concat!("app_window::", "run("),
+                1usize,
+                "the startup sign-in host. One is the launch a child cannot serve -- no \
+                 `bw.exe`, or no server URL. A SECOND means a routine sign-in came back \
+                 into this process, which costs every user who signs in ~40 MB for the \
+                 life of the daemon. ZERO means the launches a child cannot serve now \
+                 reach no window at all",
+            ),
+            (
+                concat!("app_window::run_from_", "vault("),
+                1,
+                "`open_window`'s in-daemon host, for the account a child could not read",
+            ),
+            (
+                concat!("app_window::run_", "recovery("),
+                1,
+                "the error screen. ZERO here is the serious one: it is what the owner's \
+                 \"if fails - we should show the error screen\" rests on, and a vault that \
+                 cannot be reached would fail silently without it",
+            ),
+            (
+                concat!("run_login_flow_", "for("),
+                3,
+                "the master-password prompt: the lock recovery, the re-auth and the \
+                 account switch. A fourth is a new prompt site; fewer means one of those \
+                 three recoveries no longer asks for a password it needs",
+            ),
+        ] {
+            let seen = code_only_lines(&daemon).matches(host).count();
+            assert_eq!(
+                seen, expected,
+                "the daemon opens {host:?} {seen} time(s), not {expected}. {why}"
+            );
+        }
+
+        // **The two hosts that are GONE from this process stay gone**, and
+        // these are negatives with the census above as their control: the
+        // count assertions prove the needles in this file can match, so a
+        // zero here is about these hosts rather than about a slice that
+        // matches nothing.
+        for (gone, why) in [
+            (
+                concat!("loading_ui::show_", "while("),
+                "the separate 360x220 \"Setting up your vault...\" window is back -- \
+                 \"another window Setting up your vault and then actual window loads\" \
+                 verbatim",
+            ),
+            (
+                concat!("app_window::run_from_", "working("),
+                "the daemon builds the vault frame itself again, which is the ~40 MB and \
+                 the tray icon vanishing while the window is up",
+            ),
+        ] {
+            assert_eq!(
+                code_only_lines(&daemon).matches(gone).count(),
+                0,
+                "{gone:?} is open in the daemon again: {why}"
+            );
+        }
+    }
+
+    /// Production text with `//` comment lines dropped, so a census counts
+    /// what the daemon DOES and not what its prose says it used to do.
+    ///
+    /// This file argues with itself at length -- the hosts named above appear
+    /// in dozens of comments explaining why they moved -- so a raw `matches`
+    /// over it counts the argument rather than the code.
+    fn code_only_lines(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **The recovery card stays in the daemon, and this records why rather
+    /// than leaving it to be re-litigated.**
+    ///
+    /// It was examined for the same move the `bw serve` sign-in just made,
+    /// and it does not survive the examination. Two findings, both checkable
+    /// against this file:
+    ///
+    /// # 1. The daemon needs the items whoever draws
+    ///
+    /// `wait_for_the_vault` answers `VaultReadyOutcome::Ready(items)`, and
+    /// every consumer of those items writes them into state this process
+    /// owns: `MatchEngine::rebuild` and `VaultCache::populate_with`, through
+    /// `repopulate_and_refresh_after_unlock` and
+    /// `arm_autofill_and_seed_cache`. Not one of them draws with the items.
+    ///
+    /// That is the whole question, and it settles it: the daemon does not
+    /// need those items BECAUSE it hosts the window. It needs them because
+    /// autofill matches and fills in this process -- `engine.lookup` in
+    /// `process_foreground_event` is the only non-test call site there is.
+    /// Moving the window does not remove the need; it splits it.
+    ///
+    /// So a moved window is one of two things. Either the child probes and
+    /// the items come home in a file -- a decrypted vault, ~1 MB of it, in
+    /// the config directory, which `ui_process`'s module doc forbids in the
+    /// sentence that begins "It carries no secret". Or the daemon keeps
+    /// probing and the two processes hold a live duplex conversation:
+    /// `loading_ui::LocalCopy` with its changing "last synced" age and the
+    /// hotkey availability pushed EVERY FRAME, a retry handshake that resets
+    /// an `attempt_started` the window owns and a probe the daemon owns, and
+    /// `RECOVERY_ATTEMPTS` accounting split across the boundary. The sign-in
+    /// that just moved needed one ring and one bit.
+    ///
+    /// # 2. It is the error screen, so it cannot depend on a spawn
+    ///
+    /// This window's entire job is to be what works when the vault does not.
+    /// A spawned window has a failure mode a drawn one does not -- the spawn
+    /// itself -- and `open_window` already shows what the answer to that has
+    /// to be: `ask_for_the_vault_window` answering `false` leaves the user
+    /// with a message box and no window.
+    ///
+    /// That is an acceptable answer for *Open Vault*, which the user can
+    /// click again. It is not an acceptable answer for the screen that exists
+    /// to explain a failure, against the owner's "if fails - we should show
+    /// the error screen". Keeping an in-daemon fallback instead means the
+    /// draw site stays in this file anyway -- so the move would add a
+    /// protocol and remove no host.
+    ///
+    /// **This test pins the two facts the argument rests on**, so that if
+    /// either stops being true the argument gets re-opened rather than
+    /// quietly outliving its evidence.
+    #[test]
+    fn the_recovery_window_stays_in_the_daemon_and_here_is_why() {
+        let raw = production_half_of_this_file();
+        let code = code_only_lines(raw);
+
+        // FACT 1: the recovery's items land in this process's engine and
+        // cache, and nowhere else. If they ever start crossing a boundary,
+        // `signed_in_path`'s siblings are where that would be spelled -- and
+        // the identity file is deliberately the only one of its kind.
+        assert!(
+            code.contains(concat!("repopulate_and_refresh_after_", "unlock(")),
+            "the unlock recovery no longer feeds the daemon's engine and cache, so the \
+             reason this window's items must come home has changed and the decision \
+             recorded here needs re-making"
+        );
+        assert!(
+            code.contains(concat!("arm_autofill_and_seed_", "cache(")),
+            "startup no longer seeds the daemon's engine from the probe's items, same"
+        );
+        // The negative that matters: no vault item has a file of its own.
+        // The three per-pid files are a result, a settings edit and an
+        // identity; a fourth carrying items is the thing this decision
+        // forbids.
+        assert!(
+            !code.contains(concat!("vault_items_", "path(")),
+            "something now writes vault items to a file for another process to read. That \
+             is a decrypted vault in the config directory, which is exactly what the \
+             recovery card was NOT moved in order to avoid"
+        );
+
+        // FACT 2: a spawn that fails already leaves the user with no window,
+        // which is why the error screen may not depend on one.
+        assert!(
+            code.contains("if !asked {"),
+            "`open_window` no longer has an arm for a spawn that failed, so the cost this \
+             decision is weighed against is not in the file any more"
+        );
+    }
+
     #[test]
     fn the_only_route_left_that_draws_in_the_daemon_is_the_one_that_must() {
         let raw = production_half_of_this_file();
