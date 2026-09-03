@@ -3692,6 +3692,11 @@ fn main() {
         // channel to this one, and the attachment IS the channel. Without
         // this the service could keep a backend alive but never cause one.
         if attachment_needs_a_backend_start(
+            // **The decision that already exists**, asked here rather than
+            // discovered inside the thread this would otherwise spawn. See
+            // `attachment_needs_a_backend_start`'s own doc for the loop that
+            // ran every thirty seconds because this condition was missing.
+            backend_policy::bw_serve_is_selected(),
             somebody_needs_the_vault,
             &estate.task_in_progress,
             backend_is_running(&mut estate.child),
@@ -9910,13 +9915,50 @@ const ATTACHMENT_START_COOLDOWN: Duration = Duration::from_secs(30);
 ///
 /// `since_last_attempt` is a `Duration` rather than an `Instant` so this
 /// stays pure and the cooldown is testable without waiting for one.
+///
+/// # `bw_serve_is_selected` is the outermost gate, and it is the whole of
+/// why this stops
+///
+/// The predicate behind `backend_already_running` is
+/// `backend_is_running(&mut child)`: "does this process hold a live `bw
+/// serve` child". That is the wrong question on an account that never starts
+/// one -- there is no child, so the answer is `false` FOREVER, and **"the
+/// backend is down" is permanently true when there is no backend.** Every
+/// other condition here is satisfied and stays satisfied on such an account:
+/// somebody is attached for as long as a vault window is open, nothing is
+/// ever in flight because `try_start_backend` returns `NotSelected` before it
+/// does anything, and the cooldown expires every thirty seconds. So the
+/// cooldown -- which exists to slow down a start that might yet succeed --
+/// became the metronome for one that never could. Measured on the owner's
+/// v0.15.9: a start attempt and a `NotSelected` every thirty seconds from
+/// 16:47:47 onwards, for the whole life of the open window, and it would not
+/// have stopped on its own.
+///
+/// The gate is [`backend_policy::bw_serve_is_selected`] -- **the same
+/// decision `try_start_backend` itself consults as its first statement**, not
+/// a second copy of it. Asking it here rather than at the bottom of a thread
+/// this function has already decided to spawn is the difference between
+/// "start it, discover there was nothing to start, log it, repeat" and never
+/// asking again.
+///
+/// Taken as a `bool` rather than read inside, so this stays pure -- the
+/// cooldown is testable without an installed process-global environment --
+/// and so the call site remains the one place the policy is read.
 fn attachment_needs_a_backend_start(
+    bw_serve_is_selected: bool,
     anyone_else_attached: bool,
     backend_task_in_progress: &Option<(Instant, BackendOpKind)>,
     backend_already_running: bool,
     since_last_attempt: Option<Duration>,
     cooldown: Duration,
 ) -> bool {
+    // **First, and above the cooldown**, because it is the only condition
+    // here whose `false` can never turn `true` while this process runs: the
+    // backend choice is settled per account, and a switch of account ends
+    // this session. That is what makes this a stop rather than a slowdown.
+    if !bw_serve_is_selected {
+        return false;
+    }
     if !anyone_else_attached {
         return false;
     }
@@ -16310,7 +16352,7 @@ mod tests {
     #[test]
     fn an_attachment_by_somebody_else_starts_the_backend() {
         assert!(attachment_needs_a_backend_start(
-            true, &None, false, None, ATTACHMENT_START_COOLDOWN,
+            true, true, &None, false, None, ATTACHMENT_START_COOLDOWN,
         ));
     }
 
@@ -16319,7 +16361,7 @@ mod tests {
     #[test]
     fn an_idle_loop_never_starts_a_backend_on_its_own() {
         assert!(!attachment_needs_a_backend_start(
-            false, &None, false, None, ATTACHMENT_START_COOLDOWN,
+            true, false, &None, false, None, ATTACHMENT_START_COOLDOWN,
         ));
     }
 
@@ -16332,14 +16374,14 @@ mod tests {
         let just_now = Some(Duration::from_millis(200));
         assert!(
             !attachment_needs_a_backend_start(
-                true, &None, false, just_now, ATTACHMENT_START_COOLDOWN,
+                true, true, &None, false, just_now, ATTACHMENT_START_COOLDOWN,
             ),
             "a start was attempted 200ms after the last one; that is the retry storm"
         );
         // The control: once the cooldown has passed it tries again, or a
         // backend that came back would never be started at all.
         assert!(attachment_needs_a_backend_start(
-            true, &None, false, Some(ATTACHMENT_START_COOLDOWN), ATTACHMENT_START_COOLDOWN,
+            true, true, &None, false, Some(ATTACHMENT_START_COOLDOWN), ATTACHMENT_START_COOLDOWN,
         ));
     }
 
@@ -16349,11 +16391,76 @@ mod tests {
     fn a_start_is_not_stacked_on_a_running_or_pending_one() {
         let in_flight = Some((Instant::now(), BackendOpKind::EnsureRunning));
         assert!(!attachment_needs_a_backend_start(
-            true, &in_flight, false, None, ATTACHMENT_START_COOLDOWN,
+            true, true, &in_flight, false, None, ATTACHMENT_START_COOLDOWN,
         ));
         assert!(!attachment_needs_a_backend_start(
-            true, &None, true, None, ATTACHMENT_START_COOLDOWN,
+            true, true, &None, true, None, ATTACHMENT_START_COOLDOWN,
         ));
+    }
+
+    /// **The thirty-second loop that could never succeed, and it is the
+    /// ASKING that is asserted about.**
+    ///
+    /// The daemon observed "something is attached to the vault and the
+    /// backend is down", spawned a start, `try_start_backend` answered
+    /// `NotSelected` because the account is served directly over REST, and
+    /// thirty seconds later it did the whole thing again -- indefinitely, for
+    /// the whole life of the open vault window. Read off the owner's v0.15.9
+    /// log from 16:47:47 onwards, every thirty seconds to the end of the
+    /// file.
+    ///
+    /// **A test that merely checked `try_start_backend` returns
+    /// `NotSelected` on a direct-REST account would have passed on the day
+    /// the defect shipped**, because that return value was never wrong.
+    /// Asking for it again in thirty seconds was. So this drives the
+    /// predicate over an hour of its own cooldown expiries and asserts the
+    /// count of asks, which is the quantity the user was watching fill their
+    /// log.
+    #[test]
+    fn a_direct_rest_account_is_never_asked_to_start_a_backend_again() {
+        // Every other input pinned at exactly the value the defect ran at:
+        // somebody attached (a vault window was open), nothing in flight
+        // (`NotSelected` returns at once, so the flag never latches), and no
+        // backend running -- because on this account there is none to run,
+        // which is the permanently-true condition the loop hung on.
+        let ticks = |selected: bool| {
+            let mut asked = 0usize;
+            let mut since_last_attempt: Option<Duration> = None;
+            // An hour of them. The first is `None`: nothing has ever been
+            // attempted, which is the state the very first ask ran in.
+            for _ in 0..120 {
+                if attachment_needs_a_backend_start(
+                    selected,
+                    true,
+                    &None,
+                    false,
+                    since_last_attempt,
+                    ATTACHMENT_START_COOLDOWN,
+                ) {
+                    asked += 1;
+                }
+                since_last_attempt = Some(ATTACHMENT_START_COOLDOWN);
+            }
+            asked
+        };
+        assert_eq!(
+            ticks(false),
+            0,
+            "the daemon asked to start `bw serve` on an account that never starts one. \
+             \"The backend is down\" is permanently true when there is no backend, so this \
+             is not a slow retry that eventually gives up -- it is an hour of log, then a \
+             day of it"
+        );
+        // **The control, and it is what stops this test passing for the
+        // wrong reason.** On a `bw serve` account those same 120 ticks are
+        // 120 asks, so the zero above is the gate working and not the loop
+        // never running.
+        assert_eq!(
+            ticks(true),
+            120,
+            "control: the cooldown no longer lets a `bw serve` account retry at all, so the \
+             assertion above proves nothing about the gate"
+        );
     }
     #[test]
     fn a_backend_is_not_stopped_out_from_under_an_open_vault_window() {
