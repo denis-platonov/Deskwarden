@@ -1354,20 +1354,14 @@ pub fn build_frame_with_search(
         // the very process that has to act on the signal.
         if let Some(hooks) = hide_hooks.as_ref() {
             use std::sync::atomic::Ordering;
-            if hidden.get() && !waiting_for_show.get() {
-                waiting_for_show.set(true);
-                let wait = std::sync::Arc::clone(&hooks.wait_for_show);
-                let answered = std::sync::Arc::clone(&woken);
-                let ctx = ui.ctx().clone();
-                std::thread::spawn(move || {
-                    let shown = wait();
-                    answered.store(if shown { 1 } else { 2 }, Ordering::SeqCst);
-                    // Without this the answer sits in the cell until
-                    // something else happens to repaint -- and a hidden
-                    // window is exactly the state in which nothing else
-                    // does.
-                    ctx.request_repaint();
-                });
+            // **A safety net, not the start of the wait.** `close_or_hide`
+            // starts it at the moment it hides, because this closure is not
+            // guaranteed to run again once the viewport is invisible -- see
+            // `spawn_show_waiter`. This call is what re-arms the wait for a
+            // window that has been shown and hidden more than once, and it is
+            // a no-op whenever a waiter is already running.
+            if hidden.get() {
+                spawn_show_waiter(ui.ctx(), hooks, &waiting_for_show, &woken);
             }
             match woken.swap(0, Ordering::SeqCst) {
                 1 => {
@@ -1403,6 +1397,8 @@ pub fn build_frame_with_search(
                 hide_hooks.as_ref(),
                 &hidden,
                 &delivered,
+                &waiting_for_show,
+                &woken,
                 // `hide_hooks` being `Some` IS `keep_ui_loaded` having been on
                 // when this process started -- see `HideHooks`'s own doc -- so
                 // this is that startup value rather than a second copy of it.
@@ -2175,6 +2171,8 @@ pub fn build_frame_with_search(
                 hide_hooks.as_ref(),
                 &hidden,
                 &delivered,
+                &waiting_for_show,
+                &woken,
                 // `hide_hooks` being `Some` IS `keep_ui_loaded` having been on
                 // when this process started -- see `HideHooks`'s own doc -- so
                 // this is that startup value rather than a second copy of it.
@@ -5115,12 +5113,70 @@ pub type VaultFrameFn = Box<dyn FnMut(&mut egui::Ui)>;
 /// holding a switch, a re-auth or a preferences edit would be an outcome
 /// the daemon never hears about, because the only way any of them travels
 /// is this process exiting.
+/// **Starts the wait for the daemon's "show yourself" signal**, unless one
+/// is already running.
+///
+/// Lifted out of the frame closure, and the second caller
+/// ([`close_or_hide`], at the moment it hides) is the fix rather than a
+/// tidy-up.
+///
+/// **The defect it repairs.** The wait used to be started only from inside
+/// the frame closure, on the first frame that ran with `hidden` set -- and a
+/// window that has just been sent `ViewportCommand::Visible(false)` is
+/// exactly the thing that may never run another frame. Windows sends no
+/// `WM_PAINT` to a window that is not on screen, so the single
+/// `ctx.request_repaint()` the hide ends with is a request, not a guarantee.
+/// When that frame did not come, no thread ever entered
+/// `WaitForSingleObject`, and the daemon's later `SetEvent` landed on an
+/// event with **no waiter**.
+///
+/// Nothing reported that. `crate::ui_show::ask_to_show` opens the event by
+/// name and sets it; the event object exists from process startup, so
+/// `OpenEventW` succeeds whether or not anybody is waiting on it, and
+/// `ask_to_show` answered `true`. The daemon therefore believed it had
+/// raised the window and declined to spawn a replacement
+/// (`UiOpenDecision::ShowTheHiddenOne`), and the process sat in memory with
+/// no window and no way back -- which is what the owner reported: "still
+/// loaded in memory but not window shown".
+///
+/// Starting the wait at hide time makes it unconditional. The thread is
+/// inside the wait before the daemon can possibly ask, and its own
+/// `ctx.request_repaint()` on wake is what drives the frame that sends
+/// `Visible(true)`.
+fn spawn_show_waiter(
+    ctx: &egui::Context,
+    hooks: &HideHooks,
+    waiting_for_show: &std::rc::Rc<std::cell::Cell<bool>>,
+    woken: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+) {
+    if waiting_for_show.get() {
+        return;
+    }
+    waiting_for_show.set(true);
+    let wait = std::sync::Arc::clone(&hooks.wait_for_show);
+    let answered = std::sync::Arc::clone(woken);
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let shown = wait();
+        answered.store(
+            if shown { 1 } else { 2 },
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        // Without this the answer sits in the cell until something else
+        // happens to repaint -- and a hidden window is exactly the state in
+        // which nothing else does.
+        ctx.request_repaint();
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn close_or_hide(
     ctx: &egui::Context,
     hooks: Option<&HideHooks>,
     hidden: &std::rc::Rc<std::cell::Cell<bool>>,
     delivered: &std::rc::Rc<std::cell::Cell<bool>>,
+    waiting_for_show: &std::rc::Rc<std::cell::Cell<bool>>,
+    woken: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     started_keep_ui_loaded: bool,
     locked: &Rc<RefCell<bool>>,
     needs_reauth: &Rc<RefCell<bool>>,
@@ -5172,6 +5228,12 @@ fn close_or_hide(
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
     (hooks.on_hidden)();
     hidden.set(true);
+    // **Before the repaint, not after it, and not instead of it.** The wait
+    // has to be running by the time this function returns, because the
+    // repaint below is the only thing that would otherwise start it and a
+    // hidden window is not guaranteed to honour it. See `spawn_show_waiter`
+    // for the whole of that argument.
+    spawn_show_waiter(ctx, hooks, waiting_for_show, woken);
     log::info!(
         "the vault window hid itself; this process stays loaded so the next open is \
          immediate"
@@ -10550,16 +10612,23 @@ fn ensure_icon_loaded(
         return;
     };
     favicon_requested.insert(item.id.clone());
+    // **The authority, and nothing else about the item.** Not its name, not
+    // its id, not its URI -- a host:port the user chose to store, which is
+    // the one fact the icon path acts on and the one this log is for. Every
+    // other line below names the same string or a URL built from it.
+    log::debug!("icon: {domain} is this item's icon authority");
 
     if let Some(cached_bytes) = crate::favicon::read_cached_icon(icon_cache_dir, &domain) {
         if let Some((w, h, rgba)) = crate::favicon::decode_rgba(&cached_bytes) {
             let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
             let tex = ctx.load_texture(item.id.clone(), image, egui::TextureOptions::default());
             icons.textures.insert(item.id.clone(), tex);
+            log::debug!("icon: {domain} was served from the on-disk cache");
             return;
         }
         // Corrupt/unreadable cache entry -- fall through and re-fetch as if
         // it were a miss, rather than permanently failing this domain.
+        log::debug!("icon: {domain}'s cache entry did not decode; re-fetching as a miss");
     }
 
     let tx = favicon_tx.clone();
@@ -10581,9 +10650,22 @@ fn ensure_icon_loaded(
             let decoded = crate::favicon::decode_rgba(&bytes);
             if decoded.is_some() {
                 crate::favicon::write_cached_icon(&cache_dir, &domain, &bytes);
+            } else {
+                log::debug!(
+                    "icon: the {} bytes fetched for {domain} did not decode, so nothing was \
+                     cached",
+                    bytes.len()
+                );
             }
             decoded
         });
+        if pixels.is_none() {
+            // `warn`, not `debug`: this is the state the user is looking at
+            // -- an item wearing a monogram when they expected a picture --
+            // and the lines above it in the log say which candidate failed
+            // and how.
+            log::warn!("icon: nothing usable came back for {domain}; the item keeps its monogram");
+        }
         let _ = tx.send(FaviconResult { item_id, pixels });
     });
 }
@@ -11130,6 +11212,170 @@ mod hide_delivery_tests {
                 answer.get()
             }),
         }
+    }
+
+    /// **A hidden window is actually reachable again.**
+    ///
+    /// Not "a `UiOpenDecision` was computed" and not "an event was set" --
+    /// both of those already passed while the owner's window sat in memory
+    /// with nothing able to raise it. This drives `close_or_hide` and then
+    /// asserts, in order:
+    ///
+    /// 1. the wait was **entered** -- a thread is inside `wait_for_show` --
+    ///    *without any frame having run*, which is the whole fix. The frame
+    ///    closure is never called here, deliberately: a hidden window is not
+    ///    guaranteed to run another frame, and the old code started the wait
+    ///    only from inside one.
+    /// 2. releasing that wait with `true` moves the window's own `woken` cell
+    ///    to `1`, which is the value the frame closure reads to send
+    ///    `ViewportCommand::Visible(true)`. The raise reaches the window's
+    ///    state, rather than stopping at the kernel event.
+    #[test]
+    fn a_hidden_window_is_waiting_to_be_raised_before_any_frame_runs() {
+        use std::sync::atomic::Ordering;
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<bool>();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let hooks = HideHooks {
+            wait_for_show: std::sync::Arc::new(move || {
+                entered_tx.send(()).expect("the test is still listening for the wait");
+                release_rx
+                    .lock()
+                    .expect("the release channel")
+                    .recv()
+                    .expect("the test releases the wait")
+            }),
+            on_hidden: Box::new(|| {}),
+            on_shown: Box::new(|| {}),
+            // A live daemon holding the doorbell -- otherwise `on_close`
+            // would answer `Exit` and this window would never hide at all.
+            deliver_settings: Box::new(|_| true),
+        };
+
+        let ctx = egui::Context::default();
+        let hidden = std::rc::Rc::new(std::cell::Cell::new(false));
+        let delivered = std::rc::Rc::new(std::cell::Cell::new(false));
+        let waiting_for_show = std::rc::Rc::new(std::cell::Cell::new(false));
+        let woken = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        // Nothing outstanding: no lock, no re-auth, no account move. The
+        // window has no reason to exit, so `on_close` can only answer "hide".
+        let locked = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let needs_reauth = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let edited_settings: Rc<RefCell<Option<crate::settings::Settings>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let switch_to: Rc<RefCell<Option<crate::accounts::AccountId>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let add_account = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let remove_account = std::rc::Rc::new(std::cell::RefCell::new(false));
+
+        close_or_hide(
+            &ctx,
+            Some(&hooks),
+            &hidden,
+            &delivered,
+            &waiting_for_show,
+            &woken,
+            true,
+            &locked,
+            &needs_reauth,
+            &edited_settings,
+            &switch_to,
+            &add_account,
+            &remove_account,
+        );
+
+        assert!(
+            hidden.get(),
+            "the window exited instead of hiding, so there is no hidden window to raise -- \
+             every assertion below would be vacuous"
+        );
+        assert!(waiting_for_show.get(), "the hide did not mark a waiter as running");
+
+        // (1) The wait is ENTERED, with no frame ever having run.
+        entered_rx.recv_timeout(std::time::Duration::from_secs(5)).expect(
+            "no thread ever entered `wait_for_show`, so the daemon's `SetEvent` would land on \
+             an event with no waiter: `ask_to_show` still answers `true`, the daemon declines \
+             to spawn a replacement, and the process sits in memory with no window",
+        );
+
+        // (2) Releasing the wait reaches the window's own state.
+        release_tx.send(true).expect("the waiter is still there to release");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while woken.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            woken.load(Ordering::SeqCst),
+            1,
+            "the wait was released with `true` and the window's `woken` cell never reached the \
+             value its frame reads to send `ViewportCommand::Visible(true)`"
+        );
+    }
+
+    /// The control for the test above: a wait that FAILS answers `2`, which
+    /// is what makes the window close rather than stay hidden with nothing
+    /// able to bring it back. Without this, `woken == 1` above could be any
+    /// non-zero write.
+    #[test]
+    fn a_failed_wait_asks_the_hidden_window_to_close_rather_than_stay_stranded() {
+        use std::sync::atomic::Ordering;
+
+        let ctx = egui::Context::default();
+        let waiting_for_show = std::rc::Rc::new(std::cell::Cell::new(false));
+        let woken = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let hooks = HideHooks {
+            wait_for_show: std::sync::Arc::new(|| false),
+            on_hidden: Box::new(|| {}),
+            on_shown: Box::new(|| {}),
+            deliver_settings: Box::new(|_| true),
+        };
+
+        spawn_show_waiter(&ctx, &hooks, &waiting_for_show, &woken);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while woken.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            woken.load(Ordering::SeqCst),
+            2,
+            "a failed wait no longer reports itself, so the window would stay hidden forever"
+        );
+    }
+
+    /// A second call does not start a second waiter -- the frame closure
+    /// calls it on every frame a hidden window runs.
+    #[test]
+    fn the_waiter_is_started_once_however_often_it_is_asked_for() {
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&started);
+        let ctx = egui::Context::default();
+        let waiting_for_show = std::rc::Rc::new(std::cell::Cell::new(false));
+        let woken = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let hooks = HideHooks {
+            wait_for_show: std::sync::Arc::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                false
+            }),
+            on_hidden: Box::new(|| {}),
+            on_shown: Box::new(|| {}),
+            deliver_settings: Box::new(|_| true),
+        };
+
+        for _ in 0..5 {
+            spawn_show_waiter(&ctx, &hooks, &waiting_for_show, &woken);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "asking five times started more than one waiter, so a hidden window would leak a \
+             thread per frame"
+        );
     }
 
     /// **The modal's live value wins, in BOTH directions**, the way

@@ -273,9 +273,15 @@ pub fn icon_source_for(
     let private = is_private_host(host);
     if !private && !direct_for_all_hosts {
         let base = icon_base_url(server_url);
-        return IconSource::Proxy(format!("{base}/{host}/icon.png"));
+        let url = format!("{base}/{host}/icon.png");
+        log::debug!("icon: {authority} goes to the icon service");
+        return IconSource::Proxy(url);
     }
     let schemes: &[&str] = if private { &["http", "https"] } else { &["https"] };
+    log::debug!(
+        "icon: {authority} is fetched directly ({})",
+        if private { "a private address, so the proxy could not reach it either way" } else { "the direct-fetch setting is on" }
+    );
     IconSource::Direct(
         schemes
             .iter()
@@ -403,9 +409,22 @@ pub fn fetch_icon_bytes(url: &str) -> Option<Vec<u8>> {
     static AGENT: OnceLock<crate::http_agent::TotalBounded> = OnceLock::new();
     let agent =
         AGENT.get_or_init(|| crate::http_agent::bounded_total(CONNECT_TIMEOUT, REQUEST_DEADLINE));
-    let response = agent.get(url).call().ok()?;
+    let response = match agent.get(url).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, _)) => {
+            log::debug!("icon: the icon service answered {code} for {url}");
+            return None;
+        }
+        Err(err) => {
+            log::debug!("icon: the icon service could not be reached for {url}: {err}");
+            return None;
+        }
+    };
     let mut bytes = Vec::new();
-    response.into_reader().read_to_end(&mut bytes).ok()?;
+    if let Err(err) = response.into_reader().read_to_end(&mut bytes) {
+        log::debug!("icon: the icon service's body for {url} could not be read: {err}");
+        return None;
+    }
     Some(bytes)
 }
 
@@ -462,11 +481,206 @@ const DIRECT_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 pub fn fetch_icon_for(source: &IconSource) -> Option<Vec<u8>> {
     match source {
         IconSource::Proxy(url) => fetch_icon_bytes(url),
-        IconSource::Direct(urls) => urls.iter().find_map(|url| {
-            let bytes = fetch_icon_direct(url)?;
-            decode_rgba_unscaled(&bytes).is_some().then_some(bytes)
-        }),
+        IconSource::Direct(urls) => {
+            if let Some(bytes) = walk_candidates(urls) {
+                return Some(bytes);
+            }
+            let declared = declared_icon_candidates(urls);
+            if declared.is_empty() {
+                return None;
+            }
+            walk_candidates(&declared)
+        }
     }
+}
+
+/// Tries each candidate in order and keeps the first whose bytes decode.
+///
+/// Split out of [`fetch_icon_for`] because the walk is now run twice -- once
+/// over [`DIRECT_ICON_PATHS`] and, for a private host that answered none of
+/// them, once over the paths that host's own page declares. One walk, one
+/// rule about what counts as an answer.
+fn walk_candidates(urls: &[String]) -> Option<Vec<u8>> {
+    urls.iter().find_map(|url| {
+        let bytes = fetch_icon_direct(url)?;
+        if decode_rgba_unscaled(&bytes).is_some() {
+            log::debug!("icon: {url} answered with an image of {} bytes", bytes.len());
+            Some(bytes)
+        } else {
+            log::debug!(
+                "icon: {url} answered, but the {} bytes it sent are not an image this app \
+                 can decode",
+                bytes.len()
+            );
+            None
+        }
+    })
+}
+
+/// The most icons one page is allowed to send this app after.
+///
+/// A page on the user's own LAN is still a page this app did not write, and
+/// an unbounded `<link rel="icon">` list is an unbounded number of requests
+/// made on its say-so. Four is more than any real page declares.
+const MAX_DECLARED_ICONS: usize = 4;
+
+/// The icon URLs a **private** host's own root page declares, for the case
+/// where none of [`DIRECT_ICON_PATHS`] answered.
+///
+/// **This is the one place this app fetches somebody's HTML, and it is
+/// deliberately fenced to private hosts.** [`DIRECT_ICON_PATHS`]'s own doc
+/// records why the fixed-path list is short: fetching a page to parse its
+/// `<link rel="icon">` discloses considerably more than asking for a fixed
+/// path, and doing that to a host on the internet is a password manager
+/// reading somebody's HTML. That argument is about a public host and does not
+/// survive the move to a private one: [`is_private_host`]'s own doc says the
+/// traffic stays on the user's own segment, the host is a machine the user
+/// runs, and the alternative for these addresses is "no icon, ever" -- there
+/// is no proxy that could have answered instead.
+///
+/// It exists because the fixed list was wrong about the exact service it was
+/// written for. The qBittorrent web UI -- the LAN service the direct path was
+/// added for -- answers `404` for `/favicon.ico`, `/favicon.png` and
+/// `/apple-touch-icon.png` alike, and declares its icon at
+/// `images/qbittorrent32.png` from a `<link rel="icon">` on its root page.
+/// Every fixed path this app could have guessed was a miss.
+///
+/// **A declared URL is kept only if it is on the same origin.** A page is
+/// untrusted input, and an `href` of `https://somewhere-else.example/pixel`
+/// would otherwise turn a LAN device into something that can point this app
+/// at a host the user never stored -- the disclosure the whole direct path is
+/// careful about, handed away by the one fetch that reads a stranger's
+/// markup.
+fn declared_icon_candidates(tried: &[String]) -> Vec<String> {
+    let mut origins: Vec<&str> = Vec::new();
+    for url in tried {
+        if let Some((origin, host)) = split_origin(url) {
+            if is_private_host(host) && !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        }
+    }
+    if origins.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for origin in origins {
+        log::debug!("icon: no fixed path answered at {origin}; reading its page for a declared icon");
+        let Some(page) = fetch_icon_direct(origin) else { continue };
+        let html = String::from_utf8_lossy(&page);
+        for href in icon_hrefs(&html) {
+            let Some(url) = absolute_icon_url(origin, &href) else {
+                log::debug!("icon: {origin} declared an icon this app will not follow");
+                continue;
+            };
+            if !out.contains(&url) {
+                out.push(url);
+            }
+            if out.len() == MAX_DECLARED_ICONS {
+                return out;
+            }
+        }
+    }
+    if out.is_empty() {
+        log::warn!(
+            "icon: no fixed path answered and no icon was declared by any of {:?}, so this \
+             item keeps its monogram",
+            tried.iter().filter_map(|u| split_origin(u).map(|(o, _)| o)).collect::<Vec<_>>()
+        );
+    }
+    out
+}
+
+/// Splits `scheme://authority/path` into (`scheme://authority`, host).
+///
+/// Text, not a URL parser: every string this is asked about was built by
+/// [`icon_source_for`] from a scheme this app chose and an authority
+/// [`authority_from_uri`] already validated.
+fn split_origin(url: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority_len = rest.find('/').unwrap_or(rest.len());
+    let origin = &url[..scheme.len() + "://".len() + authority_len];
+    Some((origin, host_of_authority(&rest[..authority_len])))
+}
+
+/// The `href` of every `<link>` whose `rel` names an icon, in document order.
+///
+/// A scanner rather than an HTML parser, and no new dependency for it: the
+/// question is one attribute of one tag, the input is read only to build URLs
+/// that are then checked against the origin anyway, and a wrong answer here
+/// costs a request that returns something that does not decode.
+fn icon_hrefs(html: &str) -> Vec<String> {
+    let lower = html.to_ascii_lowercase();
+    let mut out: Vec<String> = Vec::new();
+    let mut at = 0usize;
+    while let Some(found) = lower[at..].find("<link") {
+        let start = at + found;
+        let Some(offset) = lower[start..].find('>') else { break };
+        let end = start + offset;
+        at = end + 1;
+        let Some(rel) = tag_attr(&lower[start..end], "rel") else { continue };
+        // `icon`, `shortcut icon`, `apple-touch-icon`, `mask-icon` -- every
+        // spelling in the wild ends in the word, so match on that rather than
+        // on a list that a real page is not on.
+        if !rel.split_ascii_whitespace().any(|word| word == "icon" || word.ends_with("-icon")) {
+            continue;
+        }
+        if let Some(href) = tag_attr(&html[start..end], "href") {
+            if !href.is_empty() && !out.contains(&href) {
+                out.push(href);
+            }
+        }
+    }
+    out
+}
+
+/// One attribute's value out of a tag's text, or `None`.
+///
+/// The name must be a whole attribute name -- preceded by whitespace and
+/// followed by `=` -- so `data-rel` is not read as `rel`.
+fn tag_attr(tag: &str, name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut at = 0usize;
+    while let Some(found) = lower[at..].find(name) {
+        let start = at + found;
+        at = start + name.len();
+        if start == 0 || !lower.as_bytes()[start - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let Some(rest) = tag[at..].trim_start().strip_prefix('=') else { continue };
+        let rest = rest.trim_start();
+        let value = match rest.as_bytes().first() {
+            Some(b'"') => rest[1..].split('"').next(),
+            Some(b'\'') => rest[1..].split('\'').next(),
+            Some(_) => rest.split(|c: char| c.is_ascii_whitespace() || c == '>').next(),
+            None => None,
+        };
+        return value.map(str::to_string);
+    }
+    None
+}
+
+/// A declared `href` as an absolute URL on `origin`, or `None` for one this
+/// app will not follow.
+///
+/// The refusals are the point; see [`declared_icon_candidates`]. An absolute
+/// URL is kept only when it is on the same origin, a protocol-relative `//`
+/// URL is refused outright (it names a host and this app has no base to judge
+/// it against), and a `data:` URL is not a fetch at all.
+fn absolute_icon_url(origin: &str, href: &str) -> Option<String> {
+    let href = href.trim();
+    if href.is_empty() || href.starts_with("//") {
+        return None;
+    }
+    if let Some((scheme, _)) = href.split_once(':') {
+        if !scheme.contains('/') {
+            // An absolute URL, or a scheme this app does not speak.
+            return (href.starts_with(&format!("{origin}/")) || href == origin)
+                .then(|| href.to_string());
+        }
+    }
+    let path = href.strip_prefix('/').unwrap_or(href);
+    Some(format!("{origin}/{path}"))
 }
 
 /// Blocking GET of one direct candidate URL. Call only from a background
@@ -491,12 +705,27 @@ fn fetch_icon_direct(url: &str) -> Option<Vec<u8>> {
             DIRECT_USER_AGENT,
         )
     });
-    let response = agent.get(url).call().ok()?;
+    let response = match agent.get(url).call() {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, _)) => {
+            log::debug!("icon: {url} answered {code}");
+            return None;
+        }
+        Err(err) => {
+            log::debug!("icon: {url} could not be reached: {err}");
+            return None;
+        }
+    };
     let mut bytes = Vec::new();
     // Bounded by the same rule the on-disk mark reader uses: an icon is a few
     // kilobytes, and a host that answers `/favicon.ico` with a gigabyte is a
     // host that must not be allowed to fill this process's memory.
-    response.into_reader().take(MAX_DIRECT_ICON_BYTES).read_to_end(&mut bytes).ok()?;
+    if let Err(err) =
+        response.into_reader().take(MAX_DIRECT_ICON_BYTES).read_to_end(&mut bytes)
+    {
+        log::debug!("icon: {url}'s body could not be read: {err}");
+        return None;
+    }
     Some(bytes)
 }
 
@@ -1793,6 +2022,189 @@ mod tests {
         // Both routes were actually visited, in that order.
         html.assert();
         png.assert();
+    }
+
+    /// **The owner's entry, end to end, against a server that behaves the way
+    /// theirs does.**
+    ///
+    /// The URI is theirs verbatim -- `http://192.168.68.95:8080/` -- and the
+    /// first half of this test proves every routing decision made from it is
+    /// right: the item answers with the authority INCLUDING the port, the
+    /// port survives into the candidate URLs, and the source is `Direct`
+    /// *with the switch off*, because the address is private and
+    /// `icon_source_for` does not consult the setting for one. That is the
+    /// evidence that `fetch_icons_direct` is not what was wrong.
+    ///
+    /// The second half drives the fetch against a real server on loopback --
+    /// also a private address, so the same route -- answering exactly as
+    /// qBittorrent-nox does: `404` for all three of [`DIRECT_ICON_PATHS`],
+    /// and a real ICO at the path its root page declares. That combination is
+    /// the whole defect. Before the declared-icon walk, every one of this
+    /// app's guesses was a miss and the item could only ever wear a monogram.
+    #[test]
+    fn the_owners_lan_entry_gets_its_icon_from_the_path_its_page_declares() {
+        // --- the routing, from the owner's URI verbatim -------------------
+        let item = login_with_uri("http://192.168.68.95:8080/");
+        assert_eq!(
+            icon_authority_for(&item).as_deref(),
+            Some("192.168.68.95:8080"),
+            "the owner's entry does not even produce an icon authority, so nothing below it \
+             could ever have run"
+        );
+        // The bare `host:port` form, with no scheme, must route identically:
+        // a URI typed without one is the same address.
+        assert_eq!(
+            icon_authority_for(&login_with_uri("192.168.68.95:8080")).as_deref(),
+            Some("192.168.68.95:8080"),
+            "a URI typed without a scheme parses differently from the same address with one"
+        );
+        // The switch is OFF here on purpose. A private address is fetched
+        // directly either way, so `fetch_icons_direct` is not the reason this
+        // icon was missing.
+        let IconSource::Direct(candidates) =
+            icon_source_for("192.168.68.95:8080", None, false)
+        else {
+            panic!("a private address was not routed to the direct path with the switch off");
+        };
+        assert_eq!(
+            candidates[0], "http://192.168.68.95:8080/favicon.ico",
+            "the port was dropped, or http is no longer tried first for a LAN address"
+        );
+
+        // --- the fetch, against a server that answers as theirs does -------
+        let mut server = crate::test_http::server();
+        let port = server.socket_address().port();
+        let icon = ico_of(2, 2, 32, &dib_2x2_bgra([[9, 8, 7, 255]; 4]));
+
+        // Every fixed path this app guesses is a miss, exactly as on
+        // qBittorrent-nox.
+        let missed: Vec<_> = DIRECT_ICON_PATHS
+            .iter()
+            .map(|path| {
+                server.mock("GET", format!("/{path}").as_str()).with_status(404).create()
+            })
+            .collect();
+        let page = server
+            .mock("GET", "/")
+            .with_status(200)
+            .with_body(
+                "<!doctype html><html><head>\
+                 <link rel=\"icon\" type=\"image/png\" href=\"images/qbittorrent32.png\">\
+                 <link rel=\"icon\" type=\"image/svg+xml\" href=\"images/qbittorrent-tray.svg\">\
+                 </head><body></body></html>",
+            )
+            .expect(1)
+            .create();
+        let declared = server
+            .mock("GET", "/images/qbittorrent32.png")
+            .with_status(200)
+            .with_body(icon.clone())
+            .expect(1)
+            .create();
+
+        let source = icon_source_for(&format!("127.0.0.1:{port}"), None, false);
+        let fetched = fetch_icon_for(&source).expect(
+            "the icon was not fetched: every fixed path 404s and the page's declared icon was \
+             never asked for -- which is exactly the owner's symptom",
+        );
+        assert_eq!(fetched, icon, "the bytes kept are not the ones the declared path served");
+
+        // The bytes really do decode -- the fetch arriving is not the claim,
+        // an icon the UI can draw is.
+        let (width, height, rgba) = decode_rgba_unscaled(&fetched)
+            .expect("the ICO the declared path served did not decode");
+        assert_eq!((width, height), (2, 2), "the ICO decoded to the wrong size");
+        assert_eq!(pixel_at(&rgba, 2, 0, 0), [7, 8, 9, 255], "the ICO's pixels are wrong");
+
+        // Every route this test names was actually visited, in order.
+        for mock in &missed {
+            mock.assert();
+        }
+        page.assert();
+        declared.assert();
+    }
+
+    /// A **public** host's page is not fetched to look for an icon, even
+    /// though the same three fixed paths missed.
+    ///
+    /// The control for the test above, and the fence
+    /// [`declared_icon_candidates`] argues for: reading somebody's HTML is
+    /// defensible on the user's own LAN segment and is not defensible against
+    /// a host on the internet.
+    #[test]
+    fn a_public_hosts_page_is_never_read_to_find_its_icon() {
+        let page_was_asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The switch ON, so a public host takes the direct path at all --
+        // otherwise this would prove nothing.
+        let IconSource::Direct(urls) = icon_source_for("example.com", None, true) else {
+            panic!("with the switch on a public host must take the direct path");
+        };
+        assert!(
+            urls.iter().all(|u| u.starts_with("https://")),
+            "a public host was going to be asked over plaintext"
+        );
+        assert!(
+            declared_icon_candidates(&urls).is_empty(),
+            "a public host's root page is on the list of things to fetch, so this app would \
+             read a stranger's HTML looking for an icon"
+        );
+        assert!(!page_was_asked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A page is untrusted input, and the two ways it could point this app
+    /// somewhere else are both refused.
+    #[test]
+    fn a_declared_icon_on_another_host_is_not_followed() {
+        let origin = "http://192.168.68.95:8080";
+        assert_eq!(
+            absolute_icon_url(origin, "images/qbittorrent32.png").as_deref(),
+            Some("http://192.168.68.95:8080/images/qbittorrent32.png"),
+            "a relative href no longer resolves against the host that served the page"
+        );
+        assert_eq!(
+            absolute_icon_url(origin, "/static/icon.png").as_deref(),
+            Some("http://192.168.68.95:8080/static/icon.png"),
+            "a root-relative href no longer resolves"
+        );
+        assert_eq!(
+            absolute_icon_url(origin, "http://192.168.68.95:8080/a.png").as_deref(),
+            Some("http://192.168.68.95:8080/a.png"),
+            "an absolute href on the SAME origin was refused"
+        );
+        for elsewhere in [
+            "https://tracker.example/pixel.png",
+            "//tracker.example/pixel.png",
+            "http://192.168.68.95:9090/a.png",
+            "http://192.168.68.96:8080/a.png",
+            "data:image/png;base64,AAAA",
+        ] {
+            assert_eq!(
+                absolute_icon_url(origin, elsewhere),
+                None,
+                "a page on the user's LAN was able to send this app to {elsewhere:?}"
+            );
+        }
+    }
+
+    /// The scanner reads the `rel`/`href` pair off a real page and is not
+    /// fooled by an attribute whose name merely ends in one of them.
+    #[test]
+    fn the_declared_icons_are_read_off_the_page_in_order() {
+        let html = "<!doctype html><html><head>\
+            <link data-rel=\"icon\" data-href=\"decoy.png\">\
+            <link rel=\"stylesheet\" href=\"style.css\">\
+            <link rel=\"shortcut icon\" href='first.ico'>\
+            <link rel=\"apple-touch-icon\" href=big.png>\
+            </head></html>";
+        assert_eq!(
+            icon_hrefs(html),
+            vec!["first.ico".to_string(), "big.png".to_string()],
+            "the scanner read the wrong set of hrefs, or lost their order"
+        );
+        assert!(
+            icon_hrefs("<html><body>no links here</body></html>").is_empty(),
+            "a page that declares nothing produced an href anyway"
+        );
     }
 
     #[test]
