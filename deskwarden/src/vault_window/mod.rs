@@ -9778,8 +9778,44 @@ fn spawn_vault_load_with_schedule(
     });
 }
 
-/// Spawns a one-shot background thread that runs `bw sync` and reports the
-/// outcome over `tx`. Shared by both the Sync button's click handler and the
+/// **What "sync" means for the backend this account is actually served by.**
+///
+/// The Sync button and the window's own auto-sync both end here, and until
+/// this function existed they both ended at `bw sync` unconditionally. On a
+/// direct-REST account there is no `bw.exe` to run, so every press logged
+/// "manual vault sync failed: failed to run bw sync: The system cannot find
+/// the path specified. (os error 3)" and painted a red "Sync failed" pill
+/// over a vault that had loaded from the server sixteen milliseconds
+/// earlier. That is the sixth instance of the gate
+/// [`crate::backend_policy::selected`] exists to make unforgettable, and the
+/// only one of them that was in the vault window's own toolbar.
+///
+/// **The direct-REST arm is `Ok(())` and that is not a stub.** `bw sync` is
+/// `bw`'s own local cache being refilled from the server; this process has no
+/// such cache to refill, because the thing that would read it --
+/// [`VaultCache`] over a [`crate::rest::backend::RestBackend`] -- goes to the
+/// server itself. The re-fetch a user means when they press Sync is the
+/// `VaultLoadRequest { force_refresh: true, .. }` the caller already spawns
+/// on `Ok(())`, and that request is the one that really talks to the server.
+/// So the honest answer here is "there is nothing to run first", and the
+/// pill's claim is still earned rather than asserted: if that forced reload
+/// fails, `apply_vault_load_result` turns this `Ok` into an `Err` and the
+/// pill says so.
+///
+/// Read here, on the sync thread, rather than captured from the frame --
+/// exactly the reason `send_fetch_thread::real_send_list` gives for reading
+/// it in the same place: an account switch replaces this between the frame
+/// and the thread.
+fn sync_the_selected_backend(session_token: &str) -> Result<(), String> {
+    if crate::backend_policy::selected() == crate::backend_policy::VaultBackendChoice::DirectRest
+    {
+        return Ok(());
+    }
+    bw_serve::run_bw_sync(session_token)
+}
+
+/// Spawns a one-shot background thread that runs the SELECTED backend's sync
+/// ([`sync_the_selected_backend`]) and reports the outcome over `tx`. Shared by both the Sync button's click handler and the
 /// window's own auto-sync-on-open (see `run`, right after the `styled`
 /// first-frame guard) so the actual thread-spawn logic exists in exactly one
 /// place instead of being duplicated between them; the caller is still
@@ -9794,7 +9830,7 @@ fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String)
     // sync, for the rest of the process's life.
     let session_token = zeroize::Zeroizing::new(session_token);
     std::thread::spawn(move || {
-        let _ = tx.send(bw_serve::run_bw_sync(&session_token));
+        let _ = tx.send(sync_the_selected_backend(&session_token));
     });
 }
 
@@ -21534,7 +21570,7 @@ mod export_wiring {
             "fn spawn_vault_", "sync(tx: mpsc::Sender<Result<(), String>>, session_token: \
              String) { let session_token = zeroize::Zeroizing::new(session_token); \
              std::thread::sp", "awn(move || { let _ = \
-             tx.send(bw_serve::run_bw_sync(&session_token)); }); }"
+             tx.send(sync_the_selected_backend(&session_token)); }); }"
         );
         assert_eq!(
             code_squashed(production()).matches(body).count(),
@@ -21543,6 +21579,32 @@ mod export_wiring {
              real sync. Anything ADDED to it runs on the frame's own thread; anything \
              REMOVED is either the token left in a freed heap block or a Sync the user asked \
              for that never runs, with the address pin over `VaultFrameEnv` still green"
+        );
+    }
+
+    /// **And what that thread now runs is the GATE, whole-bodied.**
+    ///
+    /// The pin above says `spawn_vault_sync` hands its work to
+    /// [`sync_the_selected_backend`] and nothing else; without this one that
+    /// name could be a function whose body is `bw_serve::run_bw_sync(t)` with
+    /// no gate in it at all, and the owner's red pill would be back with
+    /// every pin in this module still green. It is the same defect class the
+    /// module doc of `no_cli_on_the_direct_path_tests` names -- a pin that
+    /// asks which function is called rather than what it does -- and this is
+    /// the cheap half of closing it; the expensive half, which counts real
+    /// `CreateProcess` attempts, is
+    /// `no_cli_on_the_direct_path_tests::pressing_sync_on_a_direct_rest_account_spawns_no_cli`.
+    #[test]
+    fn the_sync_the_window_runs_is_gated_on_the_selected_backend() {
+        let body = concat!(
+            "fn sync_the_selected_",
+            "backend(session_token: &str) -> Result<(), String> { if crate::backend_policy::selected() == crate::backend_policy::VaultBackendChoice::DirectRest { return Ok(()); } bw_serve::run_bw_",
+            "sync(session_token) }"
+        );
+        assert_eq!(
+            code_squashed(production()).matches(body).count(),
+            1,
+            "the vault window's sync is no longer exactly `DirectRest` -> `Ok(())` and \n             everything else -> `bw sync`. Removing the gate is the `os error 3` the owner \n             reported on every press of Sync; removing the `bw sync` is a Sync that does \n             nothing on the backend that has one, with the whole-body pin over \n             `spawn_vault_sync` still green"
         );
     }
 
@@ -32926,6 +32988,64 @@ mod no_cli_on_the_direct_path_tests {
              so the zero counted for the direct-REST account is not evidence of anything: \
              {:?}",
             programs(&attempts)
+        );
+    }
+
+    // ---- the Sync button ---------------------------------------------------
+
+    /// **Pressing Sync on a direct-REST account starts no process, and says
+    /// it worked.**
+    ///
+    /// This is the owner's first report, counted rather than reasoned about:
+    /// three presses of Sync, three `manual vault sync failed: ... (os error
+    /// 3)` lines, and a red pill over a vault that had loaded 1,668 items
+    /// from the server fifteen milliseconds earlier. The action is driven
+    /// through [`sync_the_selected_backend`], which is what
+    /// `VaultFrameEnv::sync` really reaches: `spawn_vault_sync` is the same
+    /// call on a thread, and a thread is exactly what
+    /// `job_object::spawn_probe` cannot see (it is thread-local by design).
+    ///
+    /// **Both halves are asserted.** Zero spawns alone would be satisfied by
+    /// a sync that returned an error without running anything, which is the
+    /// red pill again with no subprocess behind it. The `Ok(())` is what the
+    /// window turns into the forced reload and the "Synced just now" pill.
+    #[test]
+    fn pressing_sync_on_a_direct_rest_account_spawns_no_cli() {
+        let mut outcome = None;
+        let attempts = spawns_under(a_direct_rest_env(), || {
+            outcome = Some(sync_the_selected_backend("session-token"));
+        });
+        assert!(
+            attempts.is_empty(),
+            "a Sync on an account whose vault is reached over REST started {} child \n             process(es) -- on a machine with no bw.exe this is the `os error 3` the owner \n             reported on every press: {:?}",
+            attempts.len(),
+            programs(&attempts)
+        );
+        assert_eq!(
+            outcome,
+            Some(Ok(())),
+            "a Sync on a direct-REST account reported failure. The window paints that as a \n             red `Sync failed` pill and skips the forced reload, so the button would do \n             nothing and say so"
+        );
+    }
+
+    /// The control that makes the zero above mean something: the same call,
+    /// the same helper, a `bw serve` account, exactly one `bw sync` child.
+    #[test]
+    fn pressing_sync_on_a_bw_serve_account_still_spawns_bw_sync_exactly_once() {
+        let attempts = spawns_under(a_bw_serve_env(), || {
+            let _ = sync_the_selected_backend("session-token");
+        });
+        assert_eq!(
+            attempts.len(),
+            1,
+            "control: a Sync on a `bw serve` account did not reach the CLI exactly once, so \n             the zero counted for the direct-REST account is not evidence of anything: {:?}",
+            programs(&attempts)
+        );
+        let args: Vec<String> =
+            attempts[0].args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(
+            args.iter().any(|a| a == "sync"),
+            "control: the one child a `bw serve` Sync started was not a `bw sync` at all, so \n             the count above is counting the wrong thing: {args:?}"
         );
     }
 

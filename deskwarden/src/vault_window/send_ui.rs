@@ -5236,16 +5236,16 @@ mod source_pins {
         let expected = squashed(&format!(
             "tx: mpsc::Sender<Result<(), String>>, session_token: String) {{ \
              let session_token = zeroize::{}(session_token); \
-             std::thread::spawn(move || {{ let _ = tx.send(bw_serve::run_bw_{}\
+             std::thread::spawn(move || {{ let _ = tx.send(sync_the_selected_{}\
              (&session_token)); }});",
             concat!("Zeroizing::", "new"),
-            "sync",
+            "backend",
         ));
         let actual = squashed(&sanitized(&body_of(concat!("spawn_vault_", "sync"), "")));
         assert_eq!(
             actual, expected,
-            "`spawn_vault_sync` is no longer exactly `wrap the session, then run `bw sync` \
-             on a thread with it`. A wrap that moved to a CALLER leaves this function \
+            "`spawn_vault_sync` is no longer exactly `wrap the session, then run the \
+             SELECTED backend's sync on a thread with it`. A wrap that moved to a CALLER leaves this function \
              taking a bare `String`, moving it into the thread and dropping it un-wiped -- \
              one freed heap block holding the vault-unlocking token per Sync, for the life \
              of the process -- while the count of that line in the file is unchanged"

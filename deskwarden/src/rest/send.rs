@@ -267,6 +267,20 @@ fn active_account() -> Result<(RestClient, crate::rest::api::Authenticated), Sen
 
 /// The user key, unwrapped from a fresh `/api/sync`.
 ///
+/// **`sync_refreshing`, and the plain `sync` here was the whole of bug 2.**
+/// The credential this runs on comes off disk through
+/// [`crate::user_key_store::UserKeyStore::load`], whose own doc says what it
+/// hands back: a [`crate::rest::api::Session`] that "holds no access token at
+/// all and is already expired by construction", so that the first
+/// authenticated request refreshes first. This was the one call in the Sends
+/// path that could not refresh -- it took `&Session` -- so it went out with an
+/// empty bearer, the server answered 401, `map_error` turned that into
+/// [`SendError::Locked`], and the screen said the vault was locked on an
+/// account whose vault was on screen behind it. Every other Send route
+/// (`create_send`, `fetch_sends`, `delete_send`) already went through
+/// `RestClient::refreshing`; this one did not, which is why a revoke worked
+/// -- it needs no key and so never comes here -- and a list never could.
+///
 /// One extra round trip per create and per list, and the reason it is paid
 /// rather than cached: [`VaultKeys::unwrap_from`] is the one place in this
 /// crate that knows how to do this, and a second copy of the key held beside
@@ -274,11 +288,12 @@ fn active_account() -> Result<(RestClient, crate::rest::api::Authenticated), Sen
 /// revoke pays nothing -- it needs no key at all.
 fn vault_keys(
     client: &RestClient,
-    authenticated: &crate::rest::api::Authenticated,
+    authenticated: &mut crate::rest::api::Authenticated,
     ambiguity: Ambiguity,
 ) -> Result<VaultKeys, SendError> {
-    let response =
-        client.sync(&authenticated.session).map_err(|e| map_error(e, ambiguity))?;
+    let response = client
+        .sync_refreshing(&mut authenticated.session)
+        .map_err(|e| map_error(e, ambiguity))?;
     let profile = response
         .profile
         .as_ref()
@@ -302,14 +317,14 @@ pub fn create_on_active_account(
     // **`Safe`, not `Ambiguous`.** This is the sync that happens BEFORE the
     // create; a failure here published nothing, and reporting it as
     // `TimedOut` would send the user to hunt for a link that cannot exist.
-    let keys = vault_keys(&client, &authenticated, Ambiguity::Safe)?;
+    let keys = vault_keys(&client, &mut authenticated, Ambiguity::Safe)?;
     create(&client, &mut authenticated.session, &keys, plan, now)
 }
 
 /// Every Send this account has, as the rows the screen shows.
 pub fn list_on_active_account() -> Result<Vec<SendSummary>, SendError> {
     let (client, mut authenticated) = active_account()?;
-    let keys = vault_keys(&client, &authenticated, Ambiguity::Safe)?;
+    let keys = vault_keys(&client, &mut authenticated, Ambiguity::Safe)?;
     list(&client, &mut authenticated.session, &keys)
 }
 
@@ -1179,5 +1194,206 @@ pub mod tests {
                 assert_ne!(left, right, "{name} and {other} say the same thing");
             }
         }
+    }
+}
+
+/// **A stored credential really lists this account's Sends.**
+///
+/// The owner's second report: `could not list this account's Sends: Locked`,
+/// one minute after 1,668 items of the same account's vault had been drawn on
+/// screen from the same server.
+///
+/// # What was wrong, and it was not the installed environment
+///
+/// The obvious suspects were `backend_policy`'s pairing -- an environment
+/// whose `direct` or `credentials` had gone missing after the sign-in. They
+/// had not. `send_fetch_thread::real_send_list` only reaches
+/// [`list_on_active_account`] at all when `backend_policy::selected()` answers
+/// `DirectRest`, and `install_env` refuses that choice unless BOTH halves are
+/// present -- so reaching this `Locked` is itself proof that the environment
+/// was intact and paired.
+///
+/// The credential was the difference. The one a Send runs on comes off disk
+/// through [`crate::user_key_store::UserKeyStore::load`], and that function's
+/// own doc says what it hands back: a session that "holds no access token at
+/// all and is already expired by construction", so that the first
+/// authenticated request refreshes first. [`vault_keys`] was the one call in
+/// the Sends path that could not refresh -- `RestClient::sync` takes
+/// `&Session` -- so it went out with an empty bearer, took a 401, and
+/// `map_error` turned that into [`SendError::Locked`]. Every other Send route
+/// already went through `RestClient::refreshing`, which is why a revoke (no
+/// key, so it never comes here) worked and a list never could.
+///
+/// # Why these use the STORE and not a hand-built session
+///
+/// Because a hand-built `Authenticated` carrying a live access token passes on
+/// both sides of the fix, which is this crate's named defect class: a test
+/// that passes because it never reached the thing it names. The bug is a
+/// property of the credential production really reads, so these write one with
+/// `UserKeyStore::save` and read it back through a
+/// `backend_policy::Credentials` closure that is the same
+/// `move || key_store.load()` that `main`'s `settle_the_vault_backend` and its
+/// `child_process_backend_env` both install. The mock server and the scratch
+/// directory are the only substitutes.
+#[cfg(test)]
+mod a_stored_credential_can_list_sends {
+    use super::tests::keys;
+    use super::*;
+    use crate::rest::crypto::{MasterKey, MASTER_KEY_LEN};
+    use crate::user_key_store::UserKeyStore;
+
+    /// The 64 bytes behind `tests::keys`, so the profile served below unwraps
+    /// to the very key the Send row was sealed under.
+    const USER_KEY_BYTES: [u8; 64] = [9u8; 64];
+
+    /// The master key the stored credential carries, and the one the profile
+    /// is sealed to.
+    fn master() -> MasterKey {
+        MasterKey::from_bytes([0xA5; MASTER_KEY_LEN])
+    }
+
+    /// A `userkey.bin` in a scratch directory, written by the store's own
+    /// `save` -- so what `load` returns is the real expired-by-construction
+    /// session and not something this test shaped.
+    fn a_stored_credential(dir: &std::path::Path) -> UserKeyStore {
+        let store = UserKeyStore::new(dir.join("userkey.bin"));
+        let saved = store
+            .save(&crate::rest::api::Authenticated {
+                session: crate::rest::api::Session::from_refresh_token(zeroize::Zeroizing::new(
+                    "a-stored-refresh-token".to_string(),
+                )),
+                master_key: master(),
+            })
+            .expect("the scratch directory is writable");
+        assert!(saved, "control: nothing was stored, so `load` would answer `None`");
+        store
+    }
+
+    /// The `profile.key` a server sends: the user key of `tests::keys`, sealed
+    /// under the stretched master key of [`master`].
+    fn protected_user_key() -> String {
+        crate::rest::crypto::tests::seal(&master().stretch(), &USER_KEY_BYTES)
+    }
+
+    /// One text Send as the server sends it, named so the assertion below can
+    /// tell a decrypted row from an absent one.
+    fn a_row(keys: &VaultKeys) -> Value {
+        let key = SendKey::from_bytes([5u8; 16]);
+        let cipher_key = key.cipher_key().expect("derives");
+        json!({
+            "id": "send-1",
+            "accessId": "acc-1",
+            "name": encrypt(&cipher_key, b"Wi-Fi password").expect("encrypts").to_string(),
+            "key": key.wrapped_under(keys.user()).expect("wraps").to_string(),
+            "deletionDate": "2026-09-06T00:43:17.148Z",
+            "type": 0,
+        })
+    }
+
+    /// Installs a `DirectRest` environment for `server_url` whose credential
+    /// reader is `store`, runs `action`, and puts the environment back.
+    fn with_the_stored_credential<T>(
+        server_url: &str,
+        store: UserKeyStore,
+        action: impl FnOnce() -> T,
+    ) -> T {
+        fn never(
+            _server_url: &str,
+            _email: &str,
+            _device_id: &str,
+            _password: &[u8],
+        ) -> Result<crate::rest::api::LoginOutcome, String> {
+            Err("this fixture never logs in".to_string())
+        }
+        let _guard = crate::backend_policy::tests::hold_the_env_lock();
+        assert!(
+            crate::backend_policy::install_env(crate::backend_policy::BackendEnv {
+                choice: crate::backend_policy::VaultBackendChoice::DirectRest,
+                credentials: Some(std::sync::Arc::new(move || store.load())),
+                direct: Some(crate::login_ui::DirectRestLogin {
+                    server_url: server_url.to_string(),
+                    email: "someone@example.com".to_string(),
+                    device_id: "00000000-0000-0000-0000-000000000000".to_string(),
+                    second_factor: crate::login_ui::SecondFactorSeam {
+                        start: never,
+                        ..crate::login_ui::PRODUCTION_SECOND_FACTOR
+                    },
+                    prompt: None,
+                    adopt: std::sync::Arc::new(|_authenticated| {}),
+                }),
+            }),
+            "the fixture environment was refused, so this test would have measured the \
+             default backend rather than the one it names"
+        );
+        let answer = action();
+        crate::backend_policy::uninstall_env();
+        answer
+    }
+
+    /// **The whole path, end to end, on a credential that came off disk.**
+    #[test]
+    fn listing_sends_on_a_stored_credential_returns_the_rows() {
+        let dir = crate::test_scratch::ScratchDir::new("sends-stored-credential");
+        let store = a_stored_credential(dir.path());
+        let mut server = crate::test_http::server();
+
+        let refresh = server
+            .mock("POST", "/identity/connect/token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"access_token":"a-fresh-access-token","expires_in":3600}"#)
+            .expect(1)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync")
+            .match_query("excludeDomains=true")
+            .match_header("authorization", "Bearer a-fresh-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "profile": { "key": protected_user_key() } }).to_string())
+            .expect(1)
+            .create();
+        let sends = server
+            .mock("GET", "/api/sends")
+            .match_header("authorization", "Bearer a-fresh-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "data": [a_row(&keys())] }).to_string())
+            .expect(1)
+            .create();
+
+        let url = server.url();
+        let listed = with_the_stored_credential(&url, store, list_on_active_account);
+
+        let rows = listed.expect("a stored credential could not list this account's Sends");
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["Wi-Fi password"],
+            "the rows came back but were not the ones the server sent, decrypted"
+        );
+        refresh.assert();
+        sync.assert();
+        sends.assert();
+    }
+
+    /// The control that says the test above is about the refresh and not about
+    /// the mock server: with nothing stored, the reader answers `None` and the
+    /// path refuses before any request at all.
+    #[test]
+    fn a_signed_out_account_is_locked_without_asking_the_server() {
+        let dir = crate::test_scratch::ScratchDir::new("sends-no-credential");
+        let store = UserKeyStore::new(dir.path().join("userkey.bin"));
+        let mut server = crate::test_http::server();
+        let nothing = server
+            .mock("POST", "/identity/connect/token")
+            .with_status(500)
+            .expect(0)
+            .create();
+
+        let url = server.url();
+        let listed = with_the_stored_credential(&url, store, list_on_active_account);
+
+        assert_eq!(listed.map(|_| ()), Err(SendError::Locked));
+        nothing.assert();
     }
 }
