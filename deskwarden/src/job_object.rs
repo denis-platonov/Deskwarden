@@ -2411,7 +2411,9 @@ mod tests {
             // for the point release. No dependency changed.
             // 16165 bytes, new hash: the crate version moved 0.15.6 -> 0.15.7
             // for the point release. No dependency changed.
-            (16165, 0x7a4e_8efd_0a90_fe34_u64),
+            // 16165 bytes, new hash: the crate version moved 0.15.7 -> 0.15.8
+            // for the point release. No dependency changed.
+            (16165, 0xd033_1cec_a25d_b851_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

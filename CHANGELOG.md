@@ -89,6 +89,30 @@ you closed the vault — the background process was busy being the window. It
 builds the tray first now, so the icon, the fill hotkey and autofill are all
 there while the sign-in card is still on screen.
 
+## 0.15.8 - 2026-09-02
+
+### The tray stays a tray
+
+Signing in used to happen in the tray process itself, and the window it drew
+held on to about 40 MB of graphics memory for as long as Deskwarden kept
+running — long after you closed it. Worse, while that window was up the tray
+menu, the fill shortcut and the app-matching all stopped: the tray was busy
+drawing.
+
+Signing in now happens in the window's own process, for both kinds of
+account. The tray keeps its own memory, the menu keeps working while the
+vault is open, and the shortcut keeps firing.
+
+**Searching your vault from the fill overlay** did the same thing and no
+longer does.
+
+If opening the vault window ever fails, Deskwarden now tells you instead of
+quietly drawing the window itself and keeping the cost forever.
+
+One screen is still drawn by the tray on purpose: the one that appears when
+the vault cannot be reached at all, which needs what it finds to stay where
+the fill shortcut can use it.
+
 ## 0.15.7 - 2026-09-02
 
 ### Your own server needs no Bitwarden CLI, in every window
