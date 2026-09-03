@@ -2976,24 +2976,26 @@ pub fn draw_detail_read(
                         // egui's default 8pt between widgets would open two
                         // gaps this line did not ask for and push the name
                         // away from the mark that introduces it.
+                        //
+                        // Both runs are selectable text rather than labels --
+                        // see [`subtitle_text`], which is where the faint
+                        // 12pt styling these used to carry as a `RichText`
+                        // now lives, unchanged.
                         let (lead, name) = header_subtitle_parts(kind, folder);
-                        let faint = |text: String| {
-                            RichText::new(text).size(SUBTITLE_SIZE).color(theme::TEXT_FAINT)
-                        };
                         match name {
                             None => {
-                                ui.label(faint(lead));
+                                subtitle_text(ui, subtitle_kind_id(&item.id), &lead);
                             }
                             Some(name) => {
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().item_spacing.x = 0.0;
-                                    ui.label(faint(lead));
+                                    subtitle_text(ui, subtitle_kind_id(&item.id), &lead);
                                     // TEXT_FAINT, the subtitle's own ink: the
                                     // mark introduces this secondary text and
                                     // must not be louder than the words it
                                     // introduces.
                                     theme::folder_mark(ui, theme::TEXT_FAINT);
-                                    ui.label(faint(name.to_string()));
+                                    subtitle_text(ui, subtitle_folder_id(&item.id), name);
                                 });
                             }
                         }
@@ -6068,6 +6070,144 @@ const TITLE_TEXT_ID_SALT: &str = "detail-header-title";
 
 fn title_text_id(item_id: &str) -> egui::Id {
     egui::Id::new((TITLE_TEXT_ID_SALT, item_id))
+}
+
+/// The galley ONE run of the header's subtitle is drawn from -- the kind on
+/// the left of the folder mark, or the folder name on its right.
+///
+/// **Built through `WidgetText::into_galley`, which is the code path
+/// `ui.label(RichText::new(..).size(..).color(..))` itself takes**, rather
+/// than through a `LayoutJob` assembled here to the same description. The
+/// description is the trap: `LayoutJob::simple_singleline` with this font and
+/// this colour produces a galley of the same size, with the same glyphs, the
+/// same advances and the same atlas rects -- and its baseline one pixel
+/// higher, because `Label` also sets `first_row_min_height` from the `Ui`'s
+/// cursor and a job written out by hand does not. Every rect assertion on
+/// this line passed with that pixel wrong in it; the preview render is what
+/// showed it. Calling what `Label` calls is the only version of "the same
+/// text as before" that cannot drift from `Label` again.
+///
+/// `TextWrapMode::Extend` and an infinite width because these two runs share
+/// one line by design and neither may wrap -- see the geometry pinned by
+/// `the_header_paints_the_folder_beside_the_kind_under_the_item_name`.
+/// `TextStyle::Body` is the fallback the size and colour are laid over, and
+/// is what a `RichText` carrying only a size resolves its family from.
+///
+/// **Used to MEASURE as well as to paint.** [`subtitle_text`] has to know the
+/// run's width before it can ask a `TextEdit` to be exactly that wide, and a
+/// width measured from anything but the painted galley is a width that clips
+/// or pads the run.
+fn subtitle_galley(ui: &egui::Ui, text: &str) -> std::sync::Arc<egui::Galley> {
+    let styled: egui::WidgetText =
+        RichText::new(text).size(SUBTITLE_SIZE).color(theme::TEXT_FAINT).into();
+    styled.into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Body,
+    )
+}
+
+/// The font the subtitle's box is SIZED for.
+///
+/// Not redundant with [`subtitle_galley`], which decides what the glyphs look
+/// like. `TextEdit` reads `row_height` off its `FontSelection` and never off
+/// the galley a `layouter` returns, so leaving `TextEdit::font` unset is not
+/// "the layouter decides" -- it is the box being sized for `TextStyle::Body`,
+/// which `theme::apply` sets to 13pt, while the text inside it is drawn at
+/// 12. This states the 12 that `RichText::size(SUBTITLE_SIZE)` states on the
+/// other side, and `FontFamily::Proportional` is the family a `RichText`
+/// carrying only a size resolves to under that same theme.
+fn subtitle_font() -> egui::FontId {
+    egui::FontId::new(SUBTITLE_SIZE, egui::FontFamily::Proportional)
+}
+
+/// One run of the header's subtitle: **the same faint words in the same
+/// place, and now selectable with the mouse.** The user, of the detail
+/// screen: "also make type and folder on details screen copieble like title".
+///
+/// A read-only [`egui::TextEdit`] for [`title_text`]'s reason and by its
+/// argument -- `&str` is a `TextBuffer` with `is_mutable() == false`, so the
+/// caret, the drag range, double-click-a-word, Ctrl+A and the Ctrl+C that
+/// copies that range are egui's, and typing is inert.
+///
+/// **What is taken from the title and what is not.** Taken: the read-only
+/// `&str`, the id salted with the item (see [`subtitle_kind_id`]), the
+/// cleared frame and zero margin, and singleline. Dropped: the title's
+/// `layouter` exists to carry an extra-bold family, negative letter spacing
+/// and a tight line height that a `FontId` cannot express, and it builds its
+/// own `LayoutJob` to do it; this run is a plain size and colour, so its
+/// layouter hands back the galley `Label` would have made and states
+/// nothing. Also dropped, as on the title: any click-to-copy gesture. These
+/// two runs were plain `ui.label`s with no click meaning to split -- the
+/// folder here is a NAME the caller already resolved, not the sidebar's
+/// folder filter and not the kebab's "Move to folder", neither of which is
+/// on this line.
+///
+/// **`desired_width` is the run's OWN width, which is the one place this
+/// departs from the title.** The title fills the column and truncates; these
+/// two runs sit in a `horizontal` with `item_spacing.x = 0` and the folder
+/// mark between them, so a `TextEdit` left at its default width -- or given
+/// `ui.available_width()` the way the title is -- would eat the rest of the
+/// line and shove the mark and the folder name to the far right of the pane.
+/// The geometry pin `the_header_paints_the_folder_beside_the_kind_under_the_
+/// item_name` would not catch that: it asks about the GALLEY's rect, which
+/// stays at the left edge, not about the box the widget allocated.
+fn subtitle_text(ui: &mut egui::Ui, id: egui::Id, text: &str) {
+    let width = subtitle_galley(ui, text).size().x;
+    let mut layouter =
+        |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| subtitle_galley(ui, buf.as_str());
+    // `&str`, so the buffer is immutable: the selection works, typing does
+    // nothing.
+    let mut source = text;
+    ui.add(
+        egui::TextEdit::singleline(&mut source)
+            .id(id)
+            // Sizes the BOX, not the glyphs -- see [`subtitle_font`], which
+            // is why this is not redundant with the layouter below.
+            .font(subtitle_font())
+            // **Centred, against `TextEdit`'s `LEFT_TOP` default.** The box
+            // this widget allocates is `row_height` tall and the galley
+            // inside it is not; a `ui.label` had no such box and was itself
+            // centred by the surrounding `Align::Center` row, so a
+            // top-aligned galley sits a fraction of a pixel above where
+            // these words have always been.
+            //
+            // Load-bearing, and measured rather than assumed: dropping this
+            // one line moves 337 pixels of `detail_login` and 356 of each
+            // card pane against the pre-change render, while every rect
+            // assertion on this line still passes. With it, all three panes
+            // are byte-identical.
+            .vertical_align(egui::Align::Center)
+            .frame(egui::Frame::NONE)
+            .margin(Margin::ZERO)
+            .desired_width(width)
+            .layouter(&mut layouter),
+    );
+}
+
+/// The ids of the subtitle's two runs: **a constant per run AND the item's
+/// own id**, for both of [`title_text_id`]'s reasons.
+///
+/// Named, because a selection lives in `TextEditState` keyed on the widget's
+/// id and the tests below would otherwise have nothing to ask. Two different
+/// salts, because one shared between the kind and the folder would make them
+/// one widget as far as egui's state is concerned -- a selection dragged
+/// across the kind would come back reported against the folder. Salted with
+/// the item, because a global id is one `TextEditState` for every item the
+/// pane ever shows, which is how a selection made in one item came up
+/// already made in the next.
+const SUBTITLE_KIND_ID_SALT: &str = "detail-header-subtitle-kind";
+
+/// See [`SUBTITLE_KIND_ID_SALT`].
+const SUBTITLE_FOLDER_ID_SALT: &str = "detail-header-subtitle-folder";
+
+fn subtitle_kind_id(item_id: &str) -> egui::Id {
+    egui::Id::new((SUBTITLE_KIND_ID_SALT, item_id))
+}
+
+fn subtitle_folder_id(item_id: &str) -> egui::Id {
+    egui::Id::new((SUBTITLE_FOLDER_ID_SALT, item_id))
 }
 
 /// [`card_text`] with a second run after the first: the same frame, the same
@@ -11416,6 +11556,179 @@ mod tests {
             typed.strings()
         );
         assert_eq!(item.name, A_LONG_NAME, "the item itself was edited");
+    }
+
+    /// The text cursor behind ONE subtitle run -- [`title_selection`]'s
+    /// counterpart, taking the widget's id rather than the item's because
+    /// there are two of these runs on the line and the whole point of
+    /// [`subtitle_kind_id`] and [`subtitle_folder_id`] being different salts
+    /// is that they answer separately.
+    fn subtitle_selection(
+        ctx: &egui::Context,
+        id: egui::Id,
+    ) -> Option<egui::text_selection::CCursorRange> {
+        egui::text_edit::TextEditState::load(ctx, id)?.cursor.char_range()
+    }
+
+    /// A folder name long enough that a drag across half of it is
+    /// unambiguously a drag and not a click, and distinctive enough that
+    /// `rect_of` cannot find it twice on the pane.
+    const A_LONG_FOLDER: &str = "Ledgerline Engineering";
+
+    /// The kind whose subtitle run is longest, so that a drag across most of
+    /// it clears `drag_across`'s threshold with room to spare. "Login · " is
+    /// barely wider than the threshold itself, which would make the ordinary
+    /// fixture's version of this test pass or fail on a font metric.
+    fn a_secure_note() -> VaultItem {
+        an_item(item_type_for(ItemKind::SecureNote))
+    }
+
+    /// **A drag across the subtitle's KIND selects part of it.** The user:
+    /// "also make type and folder on details screen copieble like title".
+    ///
+    /// **The control is what makes this a test**, exactly as in
+    /// `the_title_can_be_selected_with_a_drag`: a pane on which nothing is
+    /// ever selectable satisfies every "nothing went wrong" clause, so the
+    /// finding is a character count that must be both greater than zero and
+    /// smaller than the whole run. A selection that is neither is not a
+    /// partial selection, and a select-all would otherwise masquerade as one.
+    ///
+    /// The run being painted at all is asserted first, for
+    /// `a_notes_selection_does_not_follow_the_user_to_the_next_item`'s
+    /// reason: egui culls a shape outside the screen rect entirely, so a
+    /// subtitle that stopped painting would carry no selection either and
+    /// would pass a test that only went looking for one.
+    ///
+    /// **And the FOLDER's cursor is asserted absent.** The two runs are two
+    /// widgets, and the mistake this guards is the one salt shared between
+    /// them: with a single id egui has a single `TextEditState`, this drag
+    /// would report against both, and the assertions above would all still
+    /// hold.
+    #[test]
+    fn the_subtitles_kind_can_be_selected_with_a_drag() {
+        let item = a_secure_note();
+        let run = format!("{} · ", ItemKind::SecureNote.label());
+
+        let mut pane = Pane::new().in_folder(A_LONG_FOLDER);
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            laid_out.painted(&run),
+            "the header painted no {run:?} run, so there is nothing to select; \
+             painted: {:?}",
+            laid_out.strings()
+        );
+
+        let _ = drag_across(&mut pane, &item, laid_out.rect_of(&run), 0.8);
+
+        // THE CONTROL AND THE FINDING IN ONE: a real, partial range.
+        let range = subtitle_selection(&pane.ctx, subtitle_kind_id(&item.id))
+            .expect("the kind run carries no text cursor at all, so it is not selectable");
+        let selected = range.primary.index.0.abs_diff(range.secondary.index.0);
+        assert!(
+            selected > 0,
+            "the drag selected nothing in the kind run: the cursor sits at {range:?}"
+        );
+        assert!(
+            selected < run.chars().count(),
+            "the drag selected the whole kind run ({selected} chars), so a partial \
+             drag is not distinguishable from selecting everything"
+        );
+        assert!(
+            subtitle_selection(&pane.ctx, subtitle_folder_id(&item.id)).is_none(),
+            "dragging across the KIND also gave the FOLDER a cursor, so the two runs \
+             share one widget id and neither selection is really its own"
+        );
+    }
+
+    /// **A drag across the subtitle's FOLDER selects part of it** -- the
+    /// other half of the user's "type and folder", with
+    /// [`the_subtitles_kind_can_be_selected_with_a_drag`]'s control and its
+    /// cross-check, pointed the other way.
+    #[test]
+    fn the_subtitles_folder_can_be_selected_with_a_drag() {
+        let item = a_login();
+
+        let mut pane = Pane::new().in_folder(A_LONG_FOLDER);
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            laid_out.painted(A_LONG_FOLDER),
+            "the header painted no folder run, so there is nothing to select; \
+             painted: {:?}",
+            laid_out.strings()
+        );
+
+        let _ = drag_across(&mut pane, &item, laid_out.rect_of(A_LONG_FOLDER), 0.5);
+
+        let range = subtitle_selection(&pane.ctx, subtitle_folder_id(&item.id))
+            .expect("the folder run carries no text cursor at all, so it is not selectable");
+        let selected = range.primary.index.0.abs_diff(range.secondary.index.0);
+        assert!(
+            selected > 0,
+            "the drag selected nothing in the folder run: the cursor sits at {range:?}"
+        );
+        assert!(
+            selected < A_LONG_FOLDER.chars().count(),
+            "the drag selected the whole folder run ({selected} chars), so a partial \
+             drag is not distinguishable from selecting everything"
+        );
+        assert!(
+            subtitle_selection(&pane.ctx, subtitle_kind_id(&item.id)).is_none(),
+            "dragging across the FOLDER also gave the KIND a cursor, so the two runs \
+             share one widget id and neither selection is really its own"
+        );
+    }
+
+    /// **Read-only means read-only: neither focused subtitle run takes
+    /// typing.**
+    ///
+    /// [`typing_into_the_focused_title_does_not_change_it`]'s argument, for
+    /// two more widgets. What makes these `TextEdit`s safe on a read pane is
+    /// that their buffer is a `&str`, whose `TextBuffer` is not mutable --
+    /// a property of a TYPE, and so exactly the kind of thing a later edit
+    /// (a `String` for one frame, a clone to please the borrow checker)
+    /// undoes without looking like it changed anything. So it is asserted
+    /// through the widget rather than read off the source.
+    ///
+    /// Focus is asserted taken before anything is typed, because a frame in
+    /// which the run never took focus is a frame in which typing was never
+    /// offered to it -- the "passes because it never reached the thing it
+    /// names" case.
+    #[test]
+    fn typing_into_a_focused_subtitle_run_does_not_change_it() {
+        let item = a_login();
+        let kind_run = format!("{} · ", ItemKind::Login.label());
+
+        for (which, id, run) in [
+            ("kind", subtitle_kind_id(&item.id), kind_run.as_str()),
+            ("folder", subtitle_folder_id(&item.id), A_LONG_FOLDER),
+        ] {
+            let mut pane = Pane::new().in_folder(A_LONG_FOLDER);
+            let laid_out = pane.idle(&item, &TotpState::NoSecret);
+            assert!(
+                laid_out.painted(run),
+                "the header painted no {which} run {run:?}; painted: {:?}",
+                laid_out.strings()
+            );
+
+            pane.ctx.memory_mut(|m| m.request_focus(id));
+            let _ = pane.idle(&item, &TotpState::NoSecret);
+            assert!(
+                pane.ctx.memory(|m| m.has_focus(id)),
+                "the {which} run never took keyboard focus, so this frame is not the \
+                 case this test is named for"
+            );
+
+            let typed = pane.frame(
+                &item,
+                &TotpState::NoSecret,
+                vec![egui::Event::Text("zzz".to_string())],
+            );
+            assert!(
+                typed.painted(run),
+                "the {which} run changed under three typed characters; painted: {:?}",
+                typed.strings()
+            );
+        }
     }
 
     /// The note's text cursor for ONE item, straight out of egui's own
