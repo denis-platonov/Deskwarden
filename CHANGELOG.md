@@ -89,6 +89,46 @@ you closed the vault — the background process was busy being the window. It
 builds the tray first now, so the icon, the fill hotkey and autofill are all
 there while the sign-in card is still on screen.
 
+## 0.15.9 - 2026-09-03
+
+### Unlocking your vault no longer asks which client to use
+
+Unlocking a vault you are already signed in to put the "Which client should
+open this vault?" question in the way — and worse, the unlock never
+completed: the vault stayed locked and autofill stopped matching apps until
+you used Sync.
+
+That question belongs to a new sign-in and now only appears there.
+
+### Sync works on your own server
+
+The Sync button ran Bitwarden's command-line program even on an account that
+does not use it, so it failed on every press. It now re-fetches your vault
+from your own server, and only says it synced if that worked.
+
+### Your Sends list opens
+
+Listing Sends on a self-hosted account always failed with a lock message.
+The credential it loads from disk has to refresh before its first request,
+and this one call did not — so it asked your server with nothing and was
+turned away. Creating and revoking were unaffected.
+
+### Site icons for machines on your own network
+
+An address like `192.168.1.5:8080` never showed an icon: icons are fetched
+by your Bitwarden server, which has no route into your network. Deskwarden
+now fetches those itself — and keeps the port, which it used to drop.
+
+A new setting under **Show site icons** lets it fetch every icon that way
+instead of asking an icon service. **Off by default**, because it means each
+site you hold an entry for receives a request from your PC. `PRIVACY.md`
+describes exactly what that discloses.
+
+### Small things
+
+- An item's title can be selected and copied like ordinary text.
+- The two buttons in the client question are the same size.
+
 ## 0.15.8 - 2026-09-02
 
 ### The tray stays a tray
