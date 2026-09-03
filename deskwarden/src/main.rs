@@ -756,19 +756,27 @@ fn main() {
     // every boot. So the answer here is not a token but a question, and only
     // the `None` arm below opens `app_window`.
     let cached_session = match store.load() {
-        // **A direct-REST session, which `bw status` cannot speak for.**
+        // **A session `bw status` cannot speak for.**
         //
-        // The token is `DIRECT_REST_SESSION` because this account signed in by
-        // talking to the server; there is no CLI session behind it, and asking
-        // `bw` about one would spawn a process that is not this account's
-        // backend -- and, on a machine with no `bw.exe`, is not there at all.
-        // Either way it would answer `not unlocked` and send a perfectly good
-        // session back through the sign-in card on every launch.
+        // There is no CLI session behind this account: it signed in by talking
+        // to the server. Asking `bw` about one would spawn a process that is
+        // not this account's backend -- and, on a machine with no `bw.exe`,
+        // is not there at all. Either way it would answer `not unlocked` and
+        // send a perfectly good session back through the sign-in card on
+        // every launch.
         //
         // What speaks for this session is the store that holds the key it
         // decrypts with. A key that is present is a session; a key that is
         // gone -- cleared on a lock, or never saved -- is not.
-        Some(token) if token == login_ui::DIRECT_REST_SESSION => {
+        //
+        // **The condition used to be `token == DIRECT_REST_SESSION` and the
+        // sentinel is only half of it**; see
+        // [`the_user_key_speaks_for_this_session`]. A direct-REST account
+        // that still holds a real CLI token from an earlier life fell to the
+        // arm below and spawned `bw status` at startup.
+        Some(token)
+            if the_user_key_speaks_for_this_session(&token, active_account.as_ref()) =>
+        {
             match login.account.and_then(|(config_dir, account)| {
                 user_key_store::UserKeyStore::new(accounts::user_key_path_for(
                     config_dir,
@@ -7434,6 +7442,64 @@ fn why_a_ui_process_could_not_read_this_vault(
             deskwarden::ui_process::direct_rest_start_failure(account.server_url.is_some())
         }
     }
+}
+
+/// **Whether this account's stored session is spoken for by its master key
+/// rather than by `bw status`.**
+///
+/// `true` means: do not spawn the CLI to ask about this token. Asked once, in
+/// `fn main`, at the moment a cached `session.bin` is read and before
+/// anything has been started.
+///
+/// # The two ways in, and why the sentinel alone was not enough
+///
+/// * **The sentinel.** A direct-REST sign-in stores
+///   [`login_ui::DIRECT_REST_SESSION`] where a `bw` sign-in stores a token,
+///   and that string has never had a CLI session behind it. This is the
+///   condition that used to be the whole guard.
+/// * **The backend.** A direct-REST account that still holds a *real* CLI
+///   token from an earlier life -- signed in on `bw serve`, then switched to
+///   the built-in client, with `session.bin` never rewritten -- carries a
+///   token that is not the sentinel. It fell through to the CLI arm and
+///   spawned `bw status` on every launch: a subprocess for a backend this
+///   account does not have, whose answer decides nothing, on the startup
+///   path of exactly the machine configuration this branch exists for.
+///
+/// # It is [`backend_policy::choose`], not a fourth copy of it
+///
+/// The same pure function off the same two account fields that
+/// [`why_a_ui_process_cannot_use_the_cli`] and
+/// [`why_a_ui_process_could_not_read_this_vault`] ask, and that
+/// `settle_the_vault_backend` spends a few statements below this call --
+/// **and `backend_policy::selected()` is deliberately not asked here**,
+/// because at this point in `fn main` nothing has been installed yet, so it
+/// would answer its `BwServe` default for every account and this gate would
+/// silently never fire. `choose` needs no environment, which is why the
+/// startup gates are all written against it.
+///
+/// # The direction is the safety property
+///
+/// The set this answers `true` for is a strict SUPERSET of the sentinel test
+/// it replaced, and every account added to it is one `choose` calls
+/// `DirectRest`. No `bw serve` account changes behaviour: `choose` answers
+/// `BwServe` for an account with no server URL, for a bitwarden.com one, and
+/// for every account that has not turned the built-in client on -- which is
+/// every existing install. A launch with no account at all is
+/// `choose(None, true)`, which is `BwServe`, so a fresh install still asks
+/// the CLI about whatever it finds.
+///
+/// A pure function of a token and an account, with no `Path`, no `Settings`
+/// and no I/O in the signature, so the decision that gates a subprocess is
+/// the thing a test can drive rather than something only reachable by
+/// launching the app.
+fn the_user_key_speaks_for_this_session(token: &str, account: Option<&Account>) -> bool {
+    if token == login_ui::DIRECT_REST_SESSION {
+        return true;
+    }
+    backend_policy::choose(
+        account.and_then(|a| a.server_url.as_deref()),
+        account.is_none_or(|a| a.use_official_bw_crypto),
+    ) == backend_policy::VaultBackendChoice::DirectRest
 }
 
 /// **Whether a UI process must refuse to open a window because there is no
@@ -34863,6 +34929,69 @@ mod bw_serve_gate {
         code(include_str!("main.rs"))
     }
 
+    /// **The startup session check consults the backend before it spawns.**
+    ///
+    /// `main`'s cached-session read is a `match` whose first arm is guarded
+    /// by `the_user_key_speaks_for_this_session` and whose second asks
+    /// `bw status`. Match arms are tried in order, so the ordering asserted
+    /// here IS the gate: an account the guard speaks for never reaches the
+    /// spawn. Move the guarded arm below the CLI arm and a direct-REST
+    /// account starts a subprocess for a backend it does not have, on every
+    /// launch, with nothing at runtime to say so.
+    ///
+    /// **Read off the source rather than counted with
+    /// `job_object::spawn_probe`**, and that is forced rather than chosen:
+    /// `bw status` is finished with `BareCommand::into_jobless_command` and
+    /// run with `Command::output`, so it never reaches
+    /// `job_object::spawn_in_job` and the probe has nothing to record. A
+    /// probe armed around this path would report zero spawns whether or not
+    /// the gate existed. The decision itself is driven directly by
+    /// `vault_backend_choice_tests`; this is the other half -- that the
+    /// decision is what the spawn sits behind.
+    #[test]
+    fn the_startup_session_check_gates_its_cli_spawn_on_the_backend() {
+        let source = main_code();
+        let opener = concat!("let cached_session = match store.", "load() {");
+        let region = source
+            .split_once(opener)
+            .expect("control: `main` no longer reads a cached session at all")
+            .1
+            .split_once(concat!("no cached session token; showing the single startup ", "window"))
+            .expect("control: the cached-session match no longer ends at its `None` arm")
+            .0;
+        assert!(
+            region.len() > 200,
+            "control: the scanned region is {} bytes, which is too small to be the match -- \
+             the assertions below would be about the wrong slice",
+            region.len()
+        );
+
+        let spawn_needle = concat!("check_bw_status_with_", "session(");
+        let spawn = region.find(spawn_needle).expect(
+            "control: the cached-session read no longer asks the CLI on any arm, so the \
+             ordering asserted below is about a spawn that is not there",
+        );
+        assert_eq!(
+            region.matches(spawn_needle).count(),
+            1,
+            "the cached-session read asks the CLI on more than one arm, so the one the \
+             guard precedes is not the only way to a `bw status`"
+        );
+
+        let gate = region.find(concat!("the_user_key_speaks_for_this_", "session(")).expect(
+            "the startup session check does not consult the backend before it asks the \
+             CLI. A direct-REST account holding a real `bw` token from an earlier life \
+             spawns `bw status` on every launch -- for a backend it does not have, and on \
+             a machine that need not have a bw.exe at all",
+        );
+        assert!(
+            gate < spawn,
+            "the guarded arm no longer comes FIRST. Match arms are tried in order, so an \
+             account the guard speaks for reaches the CLI arm anyway and the gate decides \
+             nothing"
+        );
+    }
+
     /// Every mention of `bw_serve_command` in `src/`, as
     /// `(file, count)` in path order.
     ///
@@ -35350,6 +35479,114 @@ mod vault_backend_choice_tests {
             "a fresh install is `BwServe` by `choose(None, true)`, so a window over no \
              backend at all would open"
         );
+    }
+
+    /// **A real `bw` session token, as an earlier life would have left one.**
+    ///
+    /// Not the sentinel, and deliberately the length and alphabet of the
+    /// thing it stands in for -- 88 base64 characters, which
+    /// [`login_ui::DIRECT_REST_SESSION`]'s own doc names as the shape of a
+    /// real one. Nothing parses it; what matters is only that it is NOT the
+    /// sentinel, so a gate that still tested for the sentinel alone would
+    /// answer `false` for it.
+    fn a_leftover_cli_token() -> String {
+        "A".repeat(87) + "="
+    }
+
+    /// **The startup spawn this closes.**
+    ///
+    /// A direct-REST account whose `session.bin` still holds a real CLI token
+    /// -- signed in on `bw serve`, switched to the built-in client, the file
+    /// never rewritten -- fell past the sentinel guard and was asked of
+    /// `bw status` on every launch. That is a subprocess for a backend the
+    /// account does not have, whose answer decides nothing, on the startup
+    /// path of exactly the configuration this branch is for.
+    ///
+    /// Asserted on the decision that gates the spawn rather than on a spawn
+    /// count, and that is not a dodge: `bw status` is built by
+    /// `bw_path::bw_command_in` and finished with `into_jobless_command`, so
+    /// it never reaches `job_object::spawn_in_job` and
+    /// `job_object::spawn_probe` has nothing to record. A test that armed the
+    /// probe here would pass while the spawn went on happening, which is the
+    /// house defect exactly. What stands between this account and the CLI is
+    /// this function plus the arm order in `fn main`, and the second half is
+    /// pinned by
+    /// `bw_serve_gate::the_startup_session_check_gates_its_cli_spawn_on_the_backend`.
+    ///
+    /// Fails on `b2ec3a2`, where the guard read `token == DIRECT_REST_SESSION`
+    /// and this token is not that.
+    #[test]
+    fn a_direct_rest_account_with_a_leftover_cli_token_is_not_asked_of_the_cli() {
+        let account = account_on_the_built_in_client(Some("https://vault.example.com"));
+        assert_ne!(
+            a_leftover_cli_token(),
+            login_ui::DIRECT_REST_SESSION,
+            "control: the fixture IS the sentinel, so the assertion below would pass on \
+             the sentinel test this replaced"
+        );
+        assert!(
+            the_user_key_speaks_for_this_session(&a_leftover_cli_token(), Some(&account)),
+            "a direct-REST account with a stale CLI token still spawns `bw status` at \
+             startup -- for a backend it does not have, and on a machine that need not \
+             have a bw.exe at all"
+        );
+    }
+
+    /// **The control, and the one that matters most**: the same token on a
+    /// `bw serve` account is still the CLI's to speak for.
+    ///
+    /// Without this the test above passes for a gate that has stopped asking
+    /// anything and simply never spawns -- which would send every existing
+    /// install's cached session through the sign-in card unverified.
+    #[test]
+    fn a_bw_serve_account_with_a_real_token_is_still_asked_of_the_cli() {
+        for account in [
+            account_on(Some("https://vault.example.com")),
+            account_on(None),
+            account_on_the_built_in_client(None),
+        ] {
+            assert!(
+                !the_user_key_speaks_for_this_session(&a_leftover_cli_token(), Some(&account)),
+                "a `bw serve` account's cached token stopped being verified against \
+                 `bw status`: {account:?}"
+            );
+        }
+    }
+
+    /// **A fresh install is `choose(None, true)`, which is `BwServe`.**
+    ///
+    /// The launch with no account record at all, kept separate from the loop
+    /// above because `None` reaches a different arm of `is_none_or` and is
+    /// the case a gate written the other way round would invert.
+    #[test]
+    fn a_launch_with_no_account_still_asks_the_cli_about_its_token() {
+        assert!(!the_user_key_speaks_for_this_session(&a_leftover_cli_token(), None));
+    }
+
+    /// **The sentinel is spoken for whatever the account says**, which is the
+    /// half of the guard that already existed and must not be lost.
+    ///
+    /// `bw status` could never speak for this string on any account -- there
+    /// has never been a CLI session behind it -- so the sentinel arm is not
+    /// gated on the backend and deliberately answers `true` even for an
+    /// account `choose` calls `BwServe`. That combination is not expected;
+    /// it is simply not a reason to spawn.
+    #[test]
+    fn the_direct_rest_sentinel_is_spoken_for_on_every_account() {
+        for account in [
+            None,
+            Some(account_on(Some("https://vault.example.com"))),
+            Some(account_on(None)),
+            Some(account_on_the_built_in_client(Some("https://vault.example.com"))),
+        ] {
+            assert!(
+                the_user_key_speaks_for_this_session(
+                    login_ui::DIRECT_REST_SESSION,
+                    account.as_ref()
+                ),
+                "the sentinel stopped being spoken for by the user key: {account:?}"
+            );
+        }
     }
 
     /// **The control on the other input**: with the CLI on disk, neither
