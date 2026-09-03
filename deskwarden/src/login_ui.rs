@@ -748,6 +748,71 @@ pub fn missing_credential_message(
     }
 }
 
+/// **Whether this Submit is the one that gets to ask which client opens the
+/// vault.**
+///
+/// The owner's rule is "always either notify (if bw.com) or prompt which one
+/// to use (self-hosted) when login", and the word that decides this function
+/// is `login`. An UNLOCK is not a login. The account that is being unlocked
+/// signed in once already; the backend was settled then, is recorded on the
+/// [`Account`], and is the only backend that has a key for the vault about to
+/// be opened. Asking again puts a modal in front of a master-password box and
+/// offers, as one of its two answers, a client that cannot read this vault.
+///
+/// # `status` is the whole of the sign-in/unlock distinction, on both backends
+///
+/// [`build_login_frame`] reads `status` everywhere as `== Unauthenticated` or
+/// its negation -- see [`LoginCardSource`] -- and that is exactly the line
+/// wanted here:
+///
+/// * **`Unauthenticated`** draws the email box and the server dropdown and
+///   runs `bw login`. Nothing is established yet, the user is free to retype
+///   the server, and the answer to "which client" is genuinely open.
+/// * **`Locked`** is a `bw serve` account whose CLI profile is logged in and
+///   locked. `bw unlock`, no email box, no dropdown.
+/// * **`Unlocked`** is the direct-REST case, and it is the one that bit the
+///   owner. That account never reaches `bw status` at all --
+///   [`login_card_source`] routes it to [`account_details_for`], which reads
+///   `Unlocked` off a non-empty `Account::email` -- so the built-in client's
+///   own locked/unlocked notion (the stored `userkey.bin`) never enters this
+///   decision, and it does not need to: an account with a recorded address is
+///   an account that has signed in, whichever client holds the key.
+///
+/// # Re-authentication lands on the unlock side, and not by guessing
+///
+/// A session expiry or an in-window lock does not clear the record; it puts
+/// the same card back up needing the master password again. On the built-in
+/// client that reads `Unlocked` (the address is still on the account), and on
+/// `bw serve` it reads `Locked` (the CLI profile is still logged in). Both are
+/// the negation of `Unauthenticated`, so neither asks. The one way an
+/// ESTABLISHED account reads `Unauthenticated` here is a `bw logout` that
+/// really did destroy the CLI's login, and that Submit really is a `bw login`
+/// with a live email box and a live server dropdown -- a sign-in, drawn as
+/// one. So the distinction this function needs is not "re-auth versus new
+/// account", which the record alone could not settle; it is "is there a
+/// sign-in form on screen", which `status` answers exactly.
+///
+/// The other three conditions are unchanged and are not about this at all.
+/// `credentials_are_complete` and `resuming_after_setup` are the CLI gate's
+/// own circumstances, shared so the two gates cannot disagree about whether
+/// this Submit is a real one; `backend_already_chosen` makes the question once
+/// per WINDOW rather than once per Continue, so a mistyped password is not
+/// re-litigated as a backend question.
+#[must_use]
+pub fn should_ask_which_client(
+    status: BwStatus,
+    credentials_are_complete: bool,
+    resuming_after_setup: bool,
+    backend_already_chosen: bool,
+    effective_server: Option<&str>,
+) -> bool {
+    status == BwStatus::Unauthenticated
+        && credentials_are_complete
+        && !resuming_after_setup
+        && !backend_already_chosen
+        && crate::backend_policy::is_self_hosted(effective_server)
+}
+
 pub fn friendly_auth_error(stderr: &str) -> String {
     let haystack = stderr.to_ascii_lowercase();
     let mentions = |needles: &[&str]| needles.iter().any(|n| haystack.contains(n));
@@ -3743,8 +3808,17 @@ pub fn build_login_frame(
                         // PRESELECTED, by `in_use` below, so pressing through
                         // is one keystroke and lands where it already was.
                         //
-                        // The other three conditions exclude sign-ins that
-                        // are not sign-ins. `missing.is_none()` and
+                        // **But an UNLOCK is not a sign-in**, and that was
+                        // the shipped defect: a locked account, already
+                        // signed in, met this modal in front of its
+                        // master-password box and its Submit never ran. The
+                        // status test that fixes it lives in
+                        // `should_ask_which_client`, whose doc says why that
+                        // is the right line and where re-authentication
+                        // falls.
+                        //
+                        // The other conditions exclude sign-ins that are not
+                        // sign-ins. `missing.is_none()` and
                         // `!resume_submit_after_setup` are the CLI gate's own
                         // circumstances, shared so the two cannot disagree
                         // about whether this Submit is a real one; the second
@@ -3758,11 +3832,20 @@ pub fn build_login_frame(
                         // There is deliberately no "don't ask again": the
                         // silent default is the defect this replaces, and a
                         // checkbox would restore it one click later.
-                        let should_ask_which_client = missing.is_none()
-                            && !resume_submit_after_setup
-                            && chosen_backend.is_none()
-                            && crate::backend_policy::is_self_hosted(effective_server.as_deref());
-                        if should_ask_which_client {
+                        //
+                        // **And it is decided in a function, not here**, so a
+                        // test can put a status in and read the gate's own
+                        // answer out. Written inline, the only thing reachable
+                        // from a test was the modal it opens, and the modal
+                        // paints identically whichever Submit opened it.
+                        let ask_which_client = should_ask_which_client(
+                            status,
+                            missing.is_none(),
+                            resume_submit_after_setup,
+                            chosen_backend.is_some(),
+                            effective_server.as_deref(),
+                        );
+                        if ask_which_client {
                             // **No fields, so nothing about this account
                             // is read to build it.** It used to carry the
                             // client this sign-in would otherwise take and
@@ -13154,9 +13237,11 @@ mod identity_without_a_spawn_tests {
         // window spawning `bw status` for a direct-REST account. Eighteen
         // now: `cli_setup_modal_layout_tests` drives the CLI-setup modal
         // through real frames, the surface that shipped blank in 0.15.2
-        // while every test it had asserted on its strings.
+        // while every test it had asserted on its strings. Nineteen now:
+        // `unlocking_is_not_signing_in_tests` holds the choice modal off
+        // every Submit that is an unlock rather than a login.
         assert_eq!(
-            modules, 18,
+            modules, 19,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -14161,5 +14246,268 @@ mod cli_setup_modal_layout_tests {
              `theme::primary_button`, which owns the fill, the radius, the height and the \
              disabled fade together"
         );
+    }
+}
+
+/// **UNLOCKING IS NOT SIGNING IN.**
+///
+/// The shipped defect, in the owner's words: "locked account still asks for
+/// the CLI\built-in - only new login should do that". `should_ask_which_client`
+/// tested the server and three circumstances and never tested the STATUS, so
+/// an account that had signed in months ago and merely needed its master
+/// password again met the "Which client should open this vault?" modal in
+/// front of the password box. On the owner's account the Submit that would
+/// have unlocked the vault returned instead, and ten hours later the window
+/// was closed without a session token -- `nothing was authenticated, so the
+/// Bitwarden backend was not restarted`.
+///
+/// Every test here calls the real gate and reads its own answer. Asserting on
+/// the modal instead cannot work: the modal paints identically whichever
+/// Submit opened it, which is `cli_setup_modal_layout_tests`'s subject and not
+/// this one's.
+#[cfg(test)]
+mod unlocking_is_not_signing_in_tests {
+    use super::*;
+
+    /// The owner's server: self-hosted, so `is_self_hosted` answers `true`
+    /// and the status is the only remaining input.
+    const SELF_HOSTED: &str = "https://vault.example.eu";
+
+    fn account(email: &str, server: Option<&str>) -> Account {
+        Account {
+            id: AccountId::parse(&"c".repeat(32)).expect("a 32-hex test id"),
+            email: email.to_string(),
+            server_url: server.map(str::to_string),
+            use_official_bw_crypto: false,
+        }
+    }
+
+    /// A seam that PANICS if the CLI is asked, so the fixture below is proved
+    /// to be the direct-REST account it claims to be by the arm it takes and
+    /// not by assertion.
+    const A_CLI_THAT_MUST_NOT_BE_ASKED: LoginCardSeam = LoginCardSeam {
+        ask_the_cli: |_| panic!("the direct-REST fixture reached the CLI arm"),
+    };
+
+    /// The three circumstances the gate shares with the CLI gate, all set so
+    /// that only the status can decide. A real Submit with a filled-in
+    /// password, not a resume, and no answer recorded yet for this window.
+    fn a_real_first_submit(status: BwStatus) -> bool {
+        should_ask_which_client(status, true, false, false, Some(SELF_HOSTED))
+    }
+
+    /// **THE FAILING TEST.** The owner's account, reaching the sign-in
+    /// surface locked.
+    ///
+    /// The status is not handed in: it is taken from the real
+    /// `login_card_details_through`, on the real `login_card_source`
+    /// dispatch, for a direct-REST self-hosted account with a recorded
+    /// address -- which is the whole of how this window learns that this is
+    /// an unlock. A hand-written `BwStatus` here would prove the gate reads
+    /// the argument and nothing about what production puts in it.
+    #[test]
+    fn a_locked_direct_rest_account_is_not_asked_which_client() {
+        let signed_in = account("platonov@example.eu", Some(SELF_HOSTED));
+
+        // Control on the fixture BEFORE the assertion: this really is the
+        // pair that takes the account arm, so the status below is the one
+        // production computes and not the CLI's.
+        assert_eq!(
+            login_card_source(Some(&signed_in), false),
+            LoginCardSource::TheAccount,
+            "control: the fixture is not the direct-REST account the owner's is, so nothing \
+             below is about the case that shipped broken"
+        );
+
+        let details = login_card_details_through(
+            A_CLI_THAT_MUST_NOT_BE_ASKED,
+            Some(&signed_in),
+            Some(Path::new("some-profile-dir")),
+            false,
+        );
+
+        // Control on what that produced: an unlock card, which is the state
+        // the owner was in. `Unauthenticated` here would mean the fixture is
+        // a sign-in and the assertion below would pass for the wrong reason.
+        assert_ne!(
+            details.status,
+            BwStatus::Unauthenticated,
+            "control: the card this account opens is a SIGN-IN card, so it is not the unlock \
+             this test names"
+        );
+        assert!(
+            crate::backend_policy::is_self_hosted(details.server_url.as_deref()),
+            "control: the card's server is not self-hosted, so the gate would answer `false` \
+             without ever consulting the status"
+        );
+
+        assert!(
+            !should_ask_which_client(
+                details.status,
+                true,
+                false,
+                false,
+                details.server_url.as_deref(),
+            ),
+            "a locked, already-signed-in, self-hosted account was asked which client should \
+             open its vault. It answered that once, when it signed in; the backend is recorded \
+             and is the only one holding a key for this vault. This is the modal the owner met \
+             in front of a master-password box"
+        );
+    }
+
+    /// **THE POSITIVE CONTROL.** A genuinely new sign-in to a self-hosted
+    /// server still asks, so the fix above is a narrowing and not a removal.
+    #[test]
+    fn a_new_self_hosted_sign_in_is_still_asked_which_client() {
+        assert!(
+            a_real_first_submit(BwStatus::Unauthenticated),
+            "a new self-hosted sign-in stopped being asked which client opens the vault -- the \
+             silent default this modal exists to replace"
+        );
+    }
+
+    /// Both unlock statuses, named one at a time rather than as "not
+    /// `Unauthenticated`". `Locked` is the `bw serve` account whose CLI
+    /// profile is logged in; `Unlocked` is what `account_details_for` reads
+    /// off a direct-REST account with an address. They are different backends
+    /// arriving at the same card, and both must pass through.
+    #[test]
+    fn every_unlock_status_passes_the_gate_untouched() {
+        for status in [BwStatus::Locked, BwStatus::Unlocked] {
+            assert!(
+                !a_real_first_submit(status),
+                "{status:?} is an unlock -- the account is signed in and needs its master \
+                 password -- and it was asked which client should open the vault"
+            );
+        }
+    }
+
+    /// **The unlock completes**, stated as the two gates it has to get past.
+    ///
+    /// Between the Submit arm's blank-field check and `spawn_auth` there are
+    /// exactly two early returns, and both are modals: the choice gate above
+    /// and the CLI-acquisition gate below it. This asserts the owner's unlock
+    /// clears both, which is the whole of "nothing intercepts it". The log
+    /// line this makes impossible is `nothing was authenticated, so the
+    /// Bitwarden backend was not restarted`.
+    #[test]
+    fn an_unlock_reaches_the_authentication_it_was_submitted_for() {
+        let signed_in = account("platonov@example.eu", Some(SELF_HOSTED));
+        let details = login_card_details_through(
+            A_CLI_THAT_MUST_NOT_BE_ASKED,
+            Some(&signed_in),
+            Some(Path::new("some-profile-dir")),
+            false,
+        );
+
+        assert!(
+            !should_ask_which_client(
+                details.status,
+                true,
+                false,
+                false,
+                details.server_url.as_deref(),
+            ),
+            "the choice modal intercepted an unlock's Submit and returned; the password went \
+             nowhere"
+        );
+
+        // The second gate, with the same inputs the Submit arm gives it. The
+        // built-in client is this account's backend, so no `bw.exe` is wanted
+        // and no download modal may open either.
+        let cli_is_the_backend = crate::bw_acquire::this_sign_in_needs_the_cli(
+            details.server_url.as_deref(),
+            crate::accounts::official_cli_after_sign_in(
+                Some(&signed_in),
+                details.server_url.as_deref(),
+                None,
+            ),
+        );
+        assert!(
+            !cli_is_the_backend,
+            "the CLI-acquisition modal would open on an unlock served by the built-in client, \
+             which is the same interception by the other gate"
+        );
+    }
+
+    /// **Re-authentication is on the unlock side of the line, and the code
+    /// can tell.**
+    ///
+    /// A session expiry or an in-window lock leaves the record intact and
+    /// puts the same card back up wanting the master password. On the
+    /// built-in client that reads `Unlocked` off the recorded address; on `bw
+    /// serve` the CLI still holds the login and reads `Locked`. Neither is
+    /// `Unauthenticated`, so neither is asked -- which is the point: a stray
+    /// click on that modal would move a working account onto a backend that
+    /// has no key for its vault.
+    ///
+    /// The one established account that DOES read `Unauthenticated` is a `bw
+    /// logout` that really destroyed the CLI's login, and that Submit draws
+    /// an email box and a server dropdown and runs `bw login`. It is a
+    /// sign-in, and it is asked.
+    #[test]
+    fn a_re_authenticating_account_is_not_asked_which_client() {
+        // The `bw serve` half, taken from the real source dispatch rather
+        // than asserted: an established self-hosted account that prefers the
+        // official crypto is the CLI's.
+        let mut on_the_cli = account("returning@example.eu", Some(SELF_HOSTED));
+        on_the_cli.use_official_bw_crypto = true;
+        assert_eq!(
+            login_card_source(Some(&on_the_cli), true),
+            LoginCardSource::TheCli,
+            "control: the `bw serve` fixture does not reach the CLI, so the `Locked` below is \
+             not the status production would compute for it"
+        );
+        assert!(
+            !a_real_first_submit(BwStatus::Locked),
+            "a `bw serve` account re-authenticating after its session expired was asked which \
+             client opens its vault"
+        );
+
+        // The direct-REST half.
+        let on_the_built_in = account("returning@example.eu", Some(SELF_HOSTED));
+        assert_eq!(
+            account_details_for(Some(&on_the_built_in)).status,
+            BwStatus::Unlocked,
+            "control: an account with a recorded address no longer reads as signed in, so the \
+             assertion below is about a different case"
+        );
+        assert!(
+            !a_real_first_submit(BwStatus::Unlocked),
+            "a direct-REST account re-authenticating after an in-window lock was asked which \
+             client opens its vault -- the owner's case exactly"
+        );
+    }
+
+    /// The three circumstances still hold on a sign-in, so narrowing the gate
+    /// by status did not quietly widen it anywhere else.
+    #[test]
+    fn the_other_three_circumstances_still_exclude_a_sign_in() {
+        let ask = |complete, resuming, chosen| {
+            should_ask_which_client(
+                BwStatus::Unauthenticated,
+                complete,
+                resuming,
+                chosen,
+                Some(SELF_HOSTED),
+            )
+        };
+        assert!(ask(true, false, false), "control: the baseline sign-in stopped asking");
+        assert!(!ask(false, false, false), "a submit with a blank field opened the modal");
+        assert!(!ask(true, true, false), "the modal reopened over the sign-in it just released");
+        assert!(!ask(true, false, true), "the modal asked a second time in one window");
+    }
+
+    /// bitwarden.com is never asked, on any status. The choice exists because
+    /// a self-hosted server is the one case both clients can open.
+    #[test]
+    fn the_official_server_is_never_asked_which_client() {
+        for status in [BwStatus::Unauthenticated, BwStatus::Locked, BwStatus::Unlocked] {
+            assert!(
+                !should_ask_which_client(status, true, false, false, None),
+                "{status:?} on bitwarden.com was offered a choice of client"
+            );
+        }
     }
 }
