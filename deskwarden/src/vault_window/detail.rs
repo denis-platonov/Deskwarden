@@ -2963,10 +2963,7 @@ pub fn draw_detail_read(
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = TITLE_GAP;
-                        let mut title = theme::pane_title(&item.name, TITLE_SIZE, theme::INK);
-                        title.wrap =
-                            egui::text::TextWrapping::truncate_at_width(ui.available_width());
-                        ui.label(title);
+                        title_text(ui, &item.id, &item.name);
                         // The subtitle, in the two runs [`header_subtitle_parts`]
                         // splits it into with the folder mark painted between
                         // them. An unfoldered item has no second run and no
@@ -6000,6 +5997,77 @@ const NOTES_TEXT_ID_SALT: &str = "detail-notes-body";
 
 fn notes_text_id(item_id: &str) -> egui::Id {
     egui::Id::new((NOTES_TEXT_ID_SALT, item_id))
+}
+
+/// The header strip's item title: **the same words, the same weight, and now
+/// selectable with the mouse.** The user: "also make title selectable and
+/// copieble like a regular text in a browser".
+///
+/// **A read-only [`egui::TextEdit`], for [`notes_body`]'s reason and by its
+/// argument** -- egui implements `TextBuffer` for `&str` with
+/// `is_mutable() == false`, so the caret, click-drag range selection,
+/// double-click-a-word, Ctrl+A and the Ctrl+C that copies *that range* are
+/// egui's own, and typing does nothing. A `ui.label` -- what this drew before
+/// -- has none of them.
+///
+/// **What is deliberately NOT taken from the notes card.** That card is a
+/// click-to-copy-the-whole-note tile with the selectable text layered on top
+/// of it, and none of that applies here: the header has never had a click
+/// meaning of its own -- no rename, no expand, no drag -- so there is no
+/// second meaning to split a click against and no tile to sense, no hover
+/// tint to advertise one, and no copy action to raise. Adding one would be
+/// inventing a gesture the user did not ask for on the one strip whose
+/// controls are all to its right. So this is the selection half alone.
+///
+/// **The look is the label's, kept by a `layouter` rather than by `.font()`.**
+/// The title is not a plain font id: [`theme::pane_title`] is a `LayoutJob`
+/// carrying the extra-bold family, `letter-spacing: -0.02em` and the tight
+/// `1.1` line height that keeps this box under the 44px avatar's height (see
+/// that function). `TextEdit::font` takes a `FontId` and can express none of
+/// those three, so the job itself is handed to egui through the layouter --
+/// the same job, built from the same call, with the truncation the label
+/// applied set on the wrap the layouter is given. Frame and margin are
+/// cleared for the same reason the note clears them: a `TextEdit`'s default
+/// box and 4px padding would move the title off the left edge the avatar sets
+/// and paint a field where a heading belongs.
+///
+/// **Single-line, not multiline**, which is what keeps Tab a focus move
+/// rather than an inserted tab -- a multiline field would have made the
+/// header a keyboard trap -- and is also what the strip's one-line design
+/// already required of the label.
+fn title_text(ui: &mut egui::Ui, item_id: &str, name: &str) {
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
+        let mut job = theme::pane_title(buf.as_str(), TITLE_SIZE, theme::INK);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(wrap_width);
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
+    // `&str`, so the buffer is immutable: the caret and the selection work,
+    // typing does nothing.
+    let mut source = name;
+    ui.add(
+        egui::TextEdit::singleline(&mut source)
+            .id(title_text_id(item_id))
+            .frame(egui::Frame::NONE)
+            .margin(Margin::ZERO)
+            .desired_width(ui.available_width())
+            .layouter(&mut layouter),
+    );
+}
+
+/// The title `TextEdit`'s id: **this constant AND the item's own id**, for
+/// both of [`notes_text_id`]'s reasons and neither of them weakened by being
+/// the header's.
+///
+/// Named rather than left to egui's auto-id because a selection lives in
+/// `TextEditState`, which is keyed on the widget's id, so
+/// `the_title_can_be_selected_with_a_drag` would otherwise have nothing to
+/// ask. Salted with the item because a global id is one `TextEditState`
+/// shared by every item the pane ever shows -- which is how a selection made
+/// in one item's title came up already made in the next one's.
+const TITLE_TEXT_ID_SALT: &str = "detail-header-title";
+
+fn title_text_id(item_id: &str) -> egui::Id {
+    egui::Id::new((TITLE_TEXT_ID_SALT, item_id))
 }
 
 /// [`card_text`] with a second run after the first: the same frame, the same
@@ -11194,6 +11262,160 @@ mod tests {
             "a selection drag raised a copy confirmation; painted: {:?}",
             after.strings()
         );
+    }
+
+    /// Drag the pointer across `over`, from just inside its left edge to
+    /// `fraction` of the way along it, and leave the button up again.
+    ///
+    /// Four frames, because that is what egui needs to call this a drag and
+    /// not a click: the press, a move, and the release -- a press and release
+    /// in one frame never passes the drag threshold and selects nothing. The
+    /// notes tests wrote this out inline twice before there were three of
+    /// them; the length assertion travels with it because a drag shorter than
+    /// the threshold is exactly the way this gesture silently degrades into a
+    /// click and stops testing selection at all.
+    fn drag_across(
+        pane: &mut Pane,
+        item: &VaultItem,
+        over: egui::Rect,
+        fraction: f32,
+    ) -> Frame {
+        let from = egui::pos2(over.left() + 2.0, over.center().y);
+        let to = egui::pos2(over.left() + over.width() * fraction, over.center().y);
+        assert!(
+            (to.x - from.x) > 30.0,
+            "the drag is only {}pt long, which egui may still call a click",
+            to.x - from.x
+        );
+        let _ = pane.frame(
+            item,
+            &TotpState::NoSecret,
+            vec![
+                egui::Event::PointerMoved(from),
+                egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let _ = pane.frame(item, &TotpState::NoSecret, vec![egui::Event::PointerMoved(to)]);
+        pane.frame(
+            item,
+            &TotpState::NoSecret,
+            vec![
+                egui::Event::PointerMoved(to),
+                egui::Event::PointerButton {
+                    pos: to,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        pane.idle(item, &TotpState::NoSecret)
+    }
+
+    /// The title's text cursor for ONE item, out of egui's `TextEditState` --
+    /// [`notes_selection`]'s counterpart, and the only place a selection
+    /// exists at all.
+    fn title_selection(
+        ctx: &egui::Context,
+        item_id: &str,
+    ) -> Option<egui::text_selection::CCursorRange> {
+        egui::text_edit::TextEditState::load(ctx, title_text_id(item_id))?.cursor.char_range()
+    }
+
+    /// A name long enough that a drag across part of it is unambiguously a
+    /// drag, and distinctive enough that `rect_of` cannot find it twice on
+    /// the pane.
+    const A_LONG_NAME: &str = "Ledgerline Treasury Portal";
+
+    /// **A drag across the header's title selects part of it.** The user:
+    /// "also make title selectable and copieble like a regular text in a
+    /// browser".
+    ///
+    /// **The control is what makes this a test.** A pane on which nothing is
+    /// ever selectable satisfies every "nothing went wrong" clause here, so
+    /// the finding is stated as a character count that must be greater than
+    /// zero and smaller than the whole name -- a selection that is neither is
+    /// not a partial selection and would not tell a `TextEdit` apart from a
+    /// `Label` that egui happened to give a cursor to.
+    ///
+    /// The title being on screen at all is asserted first, for
+    /// `a_notes_selection_does_not_follow_the_user_to_the_next_item`'s
+    /// reason: egui culls a shape outside the screen rect entirely, so a
+    /// header that stopped painting the name would carry no selection either
+    /// and would pass a test that only looked for one.
+    #[test]
+    fn the_title_can_be_selected_with_a_drag() {
+        let mut item = a_login();
+        item.name = A_LONG_NAME.to_string();
+
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            laid_out.painted(A_LONG_NAME),
+            "the header painted no title, so there is nothing to select; painted: {:?}",
+            laid_out.strings()
+        );
+        let title = laid_out.rect_of(A_LONG_NAME);
+
+        let _ = drag_across(&mut pane, &item, title, 0.5);
+
+        // THE CONTROL AND THE FINDING IN ONE: a real, partial range.
+        let range = title_selection(&pane.ctx, &item.id)
+            .expect("the title carries no text cursor at all, so it is not selectable");
+        let selected = range.primary.index.0.abs_diff(range.secondary.index.0);
+        assert!(
+            selected > 0,
+            "the drag selected nothing in the title: the cursor sits at {range:?}"
+        );
+        assert!(
+            selected < A_LONG_NAME.chars().count(),
+            "the drag selected the whole title ({selected} chars), so a half-drag is not \
+             distinguishable from selecting everything"
+        );
+    }
+
+    /// **Read-only means read-only: the focused title does not take typing.**
+    ///
+    /// The widget under the header is a `TextEdit`, and the whole reason it
+    /// is safe there is that its buffer is a `&str`, whose `TextBuffer` is
+    /// not mutable. That is a property of a type, which is exactly the kind
+    /// of thing a later edit -- a `String` for one frame, a clone to please
+    /// the borrow checker -- undoes without looking like it changed anything.
+    /// So it is asserted through the widget: focus the title, type into it,
+    /// and the header still paints the name it was handed.
+    #[test]
+    fn typing_into_the_focused_title_does_not_change_it() {
+        let mut item = a_login();
+        item.name = A_LONG_NAME.to_string();
+
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        assert!(laid_out.painted(A_LONG_NAME), "the header painted no title");
+
+        pane.ctx.memory_mut(|m| m.request_focus(title_text_id(&item.id)));
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            pane.ctx.memory(|m| m.has_focus(title_text_id(&item.id))),
+            "the title never took keyboard focus, so this frame is not the case this \
+             test is named for"
+        );
+
+        let typed = pane.frame(
+            &item,
+            &TotpState::NoSecret,
+            vec![egui::Event::Text("zzz".to_string())],
+        );
+        assert!(
+            typed.painted(A_LONG_NAME),
+            "the title changed under three typed characters; painted: {:?}",
+            typed.strings()
+        );
+        assert_eq!(item.name, A_LONG_NAME, "the item itself was edited");
     }
 
     /// The note's text cursor for ONE item, straight out of egui's own
