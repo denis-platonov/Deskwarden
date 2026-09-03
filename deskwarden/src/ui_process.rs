@@ -799,6 +799,88 @@ pub fn forget_edited_settings(path: &Path) {
     }
 }
 
+/// **Where the daemon leaves the search term a UI process is to open with.**
+///
+/// The first channel in this module that runs DAEMON to CHILD; every other
+/// one runs the other way. It exists because the overlay's *Search vault*
+/// button is the one door into this window that carries a value, and the
+/// command line -- which every process on the machine can read -- is the one
+/// place that value may not go. That rule is why this route used to keep the
+/// window in the daemon and pay the OpenGL driver for it.
+///
+/// **Not named by pid, unlike every other file here**, and that is forced
+/// rather than chosen: the child must read this at startup, and the pid does
+/// not exist until the spawn has already happened. A pid-named file would
+/// have to be written after `CreateProcess` returned, which is a race the
+/// child would lose. One fixed name is safe because
+/// [`UiOpenDecision`](crate::ui_process::UiOpenDecision) allows exactly one
+/// vault process at a time, so there is never a second reader to confuse.
+///
+/// **The daemon writes it on EVERY vault spawn**, with an empty term when
+/// there is no search -- see [`write_initial_search`]. That is what makes a
+/// stale file impossible: the only way to leave one behind is for a child to
+/// die between the spawn and its own first read, and the next spawn
+/// overwrites it before a window exists to be seeded by it.
+///
+/// **It carries no secret.** The term is an app's display name or a vault
+/// item id -- the same class of thing `settings.json` and the disk cache
+/// already hold in the clear in this very directory. The objection was never
+/// to the value; it was to the command line, which is world-readable, and
+/// this directory is not.
+#[must_use]
+pub fn initial_search_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("ui-initial-search.json")
+}
+
+/// Leave the term for the child that is about to be spawned, **atomically**.
+///
+/// Temp-then-rename for [`write_edited_settings`]'s reason. The ordering that
+/// makes this safe with no doorbell is the spawn itself: this returns before
+/// `CreateProcess` is called, so the file is on disk before the process that
+/// reads it exists.
+///
+/// An empty term is written rather than skipped, so that the file the child
+/// finds always belongs to the child's own launch. Failure is reported, and
+/// the caller's answer is to spawn anyway: a window that opens with an empty
+/// box is the behaviour every other door already has.
+pub fn write_initial_search(path: &Path, term: &str) -> io::Result<()> {
+    let json = serde_json::to_string(term).map_err(io::Error::other)?;
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, json)?;
+    std::fs::rename(&temp, path)
+}
+
+/// Read the term, from the child, at startup -- and **delete it in the same
+/// breath**.
+///
+/// Taken rather than read, so that one write seeds one window. A `keep_ui_loaded`
+/// process outlives its first window, and a term left on disk would come back
+/// the next time that process was asked to show itself -- which is the search
+/// the user ran ten minutes ago reappearing in a box they opened for something
+/// else.
+///
+/// Empty answers `None`: "no search" and "search for nothing" are the same
+/// window, and the empty string is what [`write_initial_search`] writes when
+/// there is no term. Every failure -- absent, unreadable, unparseable -- is
+/// also `None`, which is the ordinary window.
+#[must_use]
+pub fn take_initial_search(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok();
+    // Deleted whether or not it parsed: an unreadable file left in place
+    // would be re-read by every window this process opens.
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != io::ErrorKind::NotFound {
+            log::warn!("could not delete {} after reading it: {e}", path.display());
+        }
+    }
+    let term = serde_json::from_str::<String>(&text?)
+        .map_err(|e| {
+            log::warn!("the initial search term left for this window did not parse ({e})");
+        })
+        .ok()?;
+    (!term.is_empty()).then_some(term)
+}
+
 /// Delete the result file once it has been read.
 ///
 /// Best effort. A leftover is inert -- the next UI process has a different
@@ -1193,6 +1275,121 @@ mod tests {
         assert!(
             read_edited_settings(&path).is_none(),
             "the daemon deleted the file and can still read it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The one channel that runs daemon-to-child, over real files.**
+    ///
+    /// The term the overlay's *Search vault* carries used to have nowhere to
+    /// go but a command line, which is why that door kept its window in the
+    /// daemon and paid the OpenGL driver for it. What is asserted here is the
+    /// property that makes the file a replacement rather than a second copy
+    /// of the same problem: it is TAKEN, so one write seeds exactly one
+    /// window.
+    ///
+    /// The second `take` is the whole test. A read that left the file behind
+    /// would pass a plain round trip and still put the user's ten-minute-old
+    /// search back in the box every time a `keep_ui_loaded` process was asked
+    /// to show itself.
+    #[test]
+    fn an_initial_search_seeds_one_window_and_is_then_gone() {
+        let dir = scratch("initial-search", line!());
+        let path = initial_search_path(&dir);
+
+        assert!(
+            take_initial_search(&path).is_none(),
+            "control: a term came back before anything was written, so the assertions below \
+             would be about a file that is never read"
+        );
+
+        write_initial_search(&path, "example.com").expect("the write should succeed");
+        assert_eq!(
+            take_initial_search(&path).as_deref(),
+            Some("example.com"),
+            "the term the daemon left was not the term the child read"
+        );
+        assert!(
+            take_initial_search(&path).is_none(),
+            "the term survived being taken, so every later window this process opens is \
+             seeded with a search the user ran once and did not ask for again"
+        );
+
+        // **An empty write is how a launch with no search says so**, and it
+        // is what makes a stale file impossible: the daemon writes on EVERY
+        // spawn. If empty read back as `Some("")` the next window would open
+        // filtered to nothing rather than showing the vault.
+        write_initial_search(&path, "term").expect("writable");
+        write_initial_search(&path, "").expect("writable");
+        assert!(
+            take_initial_search(&path).is_none(),
+            "an empty term read back as a search, so a spawn with nothing to look for \
+             would overwrite nothing and inherit the previous window's term"
+        );
+
+        // The rename really is the landing, asserted the way
+        // `an_edited_settings_file_lands_whole_and_leaves_no_temp_behind`
+        // asserts it.
+        write_initial_search(&path, "second").expect("writable");
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .expect("readable")
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "the write left temp files behind: {strays:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A term that did not parse is the ordinary window, and **the file is
+    /// still gone**.
+    ///
+    /// Deleting only on the success path is the tempting shape and it is the
+    /// wrong one: an unreadable file left in place is re-read, and re-fails,
+    /// for every window this process ever opens.
+    #[test]
+    fn an_unparseable_initial_search_is_ignored_and_still_consumed() {
+        let dir = scratch("initial-search-bad", line!());
+        let path = initial_search_path(&dir);
+        std::fs::write(&path, "{ not a json string").expect("writable");
+
+        assert!(
+            take_initial_search(&path).is_none(),
+            "an unparseable term was handed to a window"
+        );
+        assert!(
+            !path.exists(),
+            "the unparseable term is still on disk, so every window this process opens will \
+             read it again and fail again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **It is not named by pid, and that is forced rather than careless.**
+    ///
+    /// The child reads this as it starts, and the pid does not exist until
+    /// the spawn has already happened -- so a pid-named file would have to be
+    /// written after `CreateProcess` returned, which is a race the child
+    /// loses. Pinned because "name it by pid like the others" is exactly the
+    /// tidying reflex that would reintroduce it, and the failure it would
+    /// cause is a search box that is empty for no reason anybody could see.
+    #[test]
+    fn the_initial_search_is_not_named_by_a_process_id() {
+        let dir = scratch("initial-search-name", line!());
+        assert_eq!(
+            initial_search_path(&dir),
+            initial_search_path(&dir),
+            "the name is not stable, so the child cannot know which file to open"
+        );
+        assert_ne!(
+            initial_search_path(&dir),
+            result_path(&dir, 77),
+            "the term shares a name with the result file, which the daemon deletes after a \
+             reap -- so the delete would race the child's own read"
+        );
+        assert_ne!(
+            initial_search_path(&dir),
+            edited_settings_path(&dir, 77),
+            "the term shares a name with the settings delivery"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

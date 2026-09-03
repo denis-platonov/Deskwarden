@@ -5503,10 +5503,20 @@ pub fn run(
     // this function does not return until something happens that the daemon
     // has to hear about.
     hide: Option<HideHooks>,
+    // **What the search box starts with, in the process that now hosts the
+    // overlay's *Search vault*.**
+    //
+    // Empty from the ordinary tray click. Non-empty from the one door that
+    // carries a value: the autofill overlay's 3a card, whose term reaches
+    // this process through `ui_process::take_initial_search` -- a file in the
+    // config directory rather than a command line every process on the
+    // machine can read. That distinction is the whole reason this door used
+    // to keep its window in the daemon.
+    initial_search: String,
 ) -> VaultWindowResult {
-    // **`build_frame_with_search`, not `build_frame`**, only because this is
-    // the one caller that has hide hooks to hand in; the search starts empty
-    // exactly as `build_frame` would have left it.
+    // **`build_frame_with_search`, not `build_frame`**, because this host has
+    // hide hooks to hand in and is now also the one that can be asked to open
+    // on a search.
     let (options, mut frame_fn, handles) = build_frame_with_search(
         cache,
         fill_stats,
@@ -5520,7 +5530,7 @@ pub fn run(
         // installs the fonts, rounds the corners and raises it.
         false,
         VaultFrameEnv::production(),
-        String::new(),
+        initial_search,
         hide,
     );
 

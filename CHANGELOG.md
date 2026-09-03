@@ -10,6 +10,33 @@ things can still change between minor versions.
 
 ## Unreleased
 
+### Searching your vault from the autofill card no longer costs the tray 40 MB
+
+When autofill found nothing for an app, its card offered *Search vault* — and
+that one button opened the vault window inside the background process instead
+of in a process of its own. It was the last ordinary door that did.
+
+The reason was the search term. Everything the background process tells a
+window it starts goes on a command line, and command lines are readable by
+every program on your PC; the name of an app you are signed into does not
+belong there. The term now travels in a file in Deskwarden's own settings
+folder, which nothing else can read, so that door opens a window the same way
+every other door does.
+
+The tray keeps the roughly 19 MB it is meant to sit at, and stays clickable
+while the window is up — searching from the card used to freeze the tray icon
+for as long as the vault stayed open.
+
+### A window that fails to open now says so
+
+If Deskwarden could not start the process that draws the vault window, it drew
+one in the background process instead. That was a poor trade: it spent the
+graphics driver, permanently, on a failure that is usually momentary — and it
+froze the tray for as long as the window stayed up.
+
+Deskwarden now tells you it could not open the window and leaves the tray
+working, so *Open Vault* can simply be tried again.
+
 ### The vault window says why it did not open
 
 Opening the vault could do nothing at all — no window, no error, no dialog.

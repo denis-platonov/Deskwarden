@@ -1608,7 +1608,7 @@ fn main() {
     // already run above this branch and blocks until `bw serve` answers;
     // a `ShowTheWindow` launch is never cache-first, so it is never the
     // arm that skips it.
-    if !ui_windows.ask_for_the_vault_window() {
+    if !ui_windows.ask_for_the_vault_window(&config_dir, None) {
         // **No process, so no window, and the app lands in the tray.**
         // The old fallback was to draw here instead -- which is the thing
         // this change exists to stop, and it would be spending the
@@ -6572,7 +6572,11 @@ impl UiWindows {
     /// replaces it -- it pumps the same queue every pass
     /// (`pump_windows_messages`) and drains the hotkey, the foreground
     /// watcher and the tray besides.
-    fn ask_for_the_vault_window(&mut self) -> bool {
+    fn ask_for_the_vault_window(
+        &mut self,
+        config_dir: &Path,
+        initial_search: Option<&str>,
+    ) -> bool {
         let hidden = self.vault_is_hidden();
         match deskwarden::ui_process::open_decision(self.vault_pid(), hidden) {
             deskwarden::ui_process::UiOpenDecision::FocusTheOpenOne { pid } => {
@@ -6616,7 +6620,7 @@ impl UiWindows {
                 if let Some(mut open) = self.vault.take() {
                     let _ = open.child.kill();
                 }
-                match spawn_the_vault_window_in_its_own_process() {
+                match spawn_the_vault_window_in_its_own_process(config_dir, initial_search) {
                     Some(open) => {
                         self.vault = Some(open);
                         true
@@ -6625,7 +6629,7 @@ impl UiWindows {
                 }
             }
             deskwarden::ui_process::UiOpenDecision::Spawn => {
-                match spawn_the_vault_window_in_its_own_process() {
+                match spawn_the_vault_window_in_its_own_process(config_dir, initial_search) {
                     Some(open) => {
                         self.vault = Some(open);
                         true
@@ -6851,8 +6855,32 @@ impl UiWindows {
 /// reads `settings.json` for the active account, and has `BW_SERVE_PORT` as a
 /// constant because it is the same binary. No token, no password and no vault
 /// item crosses -- in either direction.
-fn spawn_the_vault_window_in_its_own_process() -> Option<OpenUiWindow> {
+fn spawn_the_vault_window_in_its_own_process(
+    config_dir: &Path,
+    initial_search: Option<&str>,
+) -> Option<OpenUiWindow> {
     use std::os::windows::process::CommandExt as _;
+
+    // **Written BEFORE the spawn, and on every spawn.** Before, because the
+    // child reads it as it starts and the pid this file could otherwise be
+    // named by does not exist yet. On every spawn, because writing it only
+    // when there is a term is what would leave a stale one behind: an empty
+    // write is how a launch with no search says so.
+    //
+    // Not on the command line, which is what kept this door's window in the
+    // daemon -- see `ui_process::initial_search_path`. A failure here is not
+    // a failure to spawn: the window opens with an empty box, which is the
+    // behaviour every other door already has.
+    let search_path = deskwarden::ui_process::initial_search_path(config_dir);
+    if let Err(e) =
+        deskwarden::ui_process::write_initial_search(&search_path, initial_search.unwrap_or(""))
+    {
+        log::warn!(
+            "could not leave the initial search term for the vault window at {} ({e}); it \
+             will open with an empty search box",
+            search_path.display()
+        );
+    }
 
     let program = match std::env::current_exe() {
         Ok(program) => program,
@@ -7236,14 +7264,51 @@ impl VaultOps for RealVaultOps<'_> {
                 failure.log_line()
             );
         }
-        if self.initial_search.is_none() && child_cannot_read_the_vault.is_none() {
-            if self.ui.ask_for_the_vault_window() {
-                return (est, None);
+        // **Taken once, here, so that the two hosts below cannot both claim
+        // it.** The spawn arm hands it to the child and the in-daemon arm
+        // seeds its own frame with it; a `take` at each site would give the
+        // second one an empty box on the route the first did not run.
+        let initial_search = self.initial_search.take();
+        if child_cannot_read_the_vault.is_none() {
+            // **The search term no longer keeps this window in the daemon.**
+            // It used to: the only way to hand a value to a child was the
+            // command line, which every process on the machine can read. It
+            // now travels in a file in the config directory that the child
+            // takes as it starts -- `ui_process::initial_search_path` -- so
+            // the one door that carried a value is no longer the one door
+            // that costs the daemon the OpenGL driver for the rest of its
+            // life.
+            let asked =
+                self.ui.ask_for_the_vault_window(deps.config_dir, initial_search.as_deref());
+            if !asked {
+                // **No process, so no window -- and still no window drawn
+                // HERE.** Falling through to the in-daemon host was the old
+                // answer, and it spends the OpenGL driver and the daemon's
+                // whole event loop, permanently, on a failure that is very
+                // likely transient: this app failing to spawn its own
+                // executable. The daemon stays live and says so instead,
+                // which is the same trade `main`'s startup door already
+                // makes -- except that this door was clicked by a user who
+                // is owed an answer, so it gets words and not only a log
+                // line.
+                log::error!(
+                    "no UI process could be started for the vault window; the daemon is                      staying out of the graphics driver and telling the user instead"
+                );
+                message_box(
+                    "Deskwarden",
+                    "Could not open the vault window.
+
+Deskwarden could not start the                      process that draws it. Please try Open Vault again.",
+                    MB_ICONERROR,
+                );
             }
-            log::error!(
-                "falling back to opening the vault window inside the daemon; this process now \
-                 holds the graphics driver for the rest of its life"
-            );
+            // **One jump out of this function, and it is here.** See
+            // `nothing_outside_the_two_branch_bodies_may_jump`: a second
+            // `return` below a window handoff is the shape that shipped a
+            // silent lock failure in v0.5.0. Both outcomes of the ask leave
+            // the same way -- with no session to dispatch, which is what lets
+            // the daemon's loop carry on either way.
+            return (est, None);
         }
         // Opening this window is the app's slowest visible action and the one a
         // user times with their own patience, so each stage of it says how long
@@ -7340,7 +7405,7 @@ impl VaultOps for RealVaultOps<'_> {
             // `RealVaultOps::initial_search`: every later pass of
             // `run_vault_loop` reopens the window with an empty box, which is
             // what any other route into this window has always given.
-            self.initial_search.take().unwrap_or_default(),
+            initial_search.unwrap_or_default(),
             // **This host is the DAEMON's in-process fallback**, reached only
             // when a UI process could not be spawned. It must never hide: a
             // hidden window here would keep the daemon's own event loop
@@ -11659,6 +11724,15 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                 backend_already_running,
                 accounts_state,
                 hide,
+                // **The overlay's *Search vault*, opened over here.** Taken
+                // rather than read, so the term seeds this one window and
+                // does not come back the next time a `keep_ui_loaded`
+                // process is asked to show itself. `None` -- the ordinary
+                // tray click -- is the empty box every other door gives.
+                deskwarden::ui_process::take_initial_search(
+                    &deskwarden::ui_process::initial_search_path(&config_dir),
+                )
+                .unwrap_or_default(),
             ),
             // This host has no sign-in stage at all, so there is never an
             // identity to carry.
@@ -18825,6 +18899,137 @@ mod tests {
             "control: the split really cut the test module off the end"
         );
         production
+    }
+
+    /// **Every route into the vault window, and which process draws it.**
+    ///
+    /// The sibling of
+    /// `the_daemon_draws_no_window_on_the_direct_rest_sign_in_path` for the
+    /// OTHER seam: that one is the startup sign-in's, this one is
+    /// `RealVaultOps::open_window`'s, where the tray's *Open Vault*, the
+    /// overlay's *Search vault* and every later door arrive.
+    ///
+    /// A source pin rather than a call, because the decision is four lines of
+    /// control flow inside a method that opens an `eframe` window -- there is
+    /// no pure function to drive, and a test that ran this method would draw.
+    /// The rows below are therefore claims about the TEXT of the gate, each
+    /// with the failure it would let back in.
+    ///
+    /// # The two rows that changed
+    ///
+    /// * **The search term.** `initial_search.is_some()` used to force the
+    ///   window into the daemon, because the only way to hand a value to a
+    ///   child was a command line every process on the machine can read. It
+    ///   now travels in a file the child takes as it starts, so this route
+    ///   spawns like every other.
+    /// * **A spawn that failed.** The daemon used to fall through and draw.
+    ///   That spends the OpenGL driver and the daemon's own event loop, for
+    ///   the life of the process, on a failure that is very likely transient.
+    ///   It now says so and stays out.
+    ///
+    /// # The row that did not
+    ///
+    /// `child_cannot_read_the_vault` still draws here, and that is the
+    /// remaining scope line rather than an oversight: on a `bw serve` account
+    /// the sign-in produces the token the DAEMON must start the backend with,
+    /// and no carrier that arrives when the child exits can deliver it before
+    /// the window needs it. Asserted, so that "the daemon draws nothing" is
+    /// not claimed more widely than it is true.
+    #[test]
+    fn the_only_route_left_that_draws_in_the_daemon_is_the_one_that_must() {
+        let raw = production_half_of_this_file();
+        let code = what_a_finished_vault_session_means::code_only(raw);
+        let body = vault_ops_method_body(&code, "open_window");
+        assert!(
+            body.len() > 1500,
+            "control: `open_window` sliced to {} bytes, which is not this method",
+            body.len()
+        );
+
+        // **The search no longer gates the spawn.** The needle is the whole
+        // of the old carve-out; while it is absent, no window is kept here
+        // for a search term.
+        assert!(
+            !body.contains("self.initial_search.is_none()"),
+            "the search term gates the spawn again, so the overlay's *Search vault* draws in \
+             the daemon and costs it the graphics driver for the rest of its life: {body}"
+        );
+        // Control on that negative: the search is still THREADED, so the
+        // assertion above is about a route that moved rather than a feature
+        // that was deleted. A window that opened with an empty box on this
+        // door would pass the negative and be the bug.
+        assert!(
+            body.contains("let initial_search = self.initial_search.take();"),
+            "the search term is not taken in `open_window` at all, so the assertion above is \
+             guarding nothing and the overlay's card opens an unfiltered vault: {body}"
+        );
+        assert!(
+            body.contains("initial_search.as_deref()"),
+            "the search term is not handed to the UI process, so the one door that carries a \
+             value silently stopped carrying it: {body}"
+        );
+
+        // **The spawn failure does not fall through to the window below.**
+        // The `return` is unconditional inside the spawn arm, so both
+        // outcomes of the ask leave the same way.
+        let arm = body
+            .split_once("if child_cannot_read_the_vault.is_none() {")
+            .expect("the spawn gate is not in `open_window` any more")
+            .1;
+        let eframe = arm
+            .find(concat!("app_window::run_from_", "vault("))
+            .expect("control: `open_window` opens no window at all below the gate");
+        // **UNCONDITIONAL, and that is the assertion rather than merely
+        // "there is a `return` somewhere above the window".**
+        //
+        // The weaker form passes against `if asked { return (est, None); }`,
+        // which is precisely the fall-through this branch removed -- a failed
+        // spawn would drop through to the `eframe` host below and draw. So
+        // what is pinned is the STATEMENT: a `return` alone on its line at
+        // the arm's own indentation, which a guarded one cannot produce.
+        //
+        // Verified by mutation: re-introducing the guard fails this test, and
+        // the earlier form of it passed.
+        let statement = "\n            return (est, None);";
+        let returned = arm.find(statement).unwrap_or_else(|| {
+            panic!(
+                "the spawn arm has no unconditional `return`, so a failed spawn falls through \
+                 to the in-daemon window and the daemon draws after all -- which is exactly \
+                 what this branch removed: {arm}"
+            )
+        });
+        assert!(
+            returned < eframe,
+            "the spawn arm's `return` is BELOW the in-daemon window, so a failed spawn draws \
+             here after all: {arm}"
+        );
+        // And nothing between the ask and that `return` re-introduces a
+        // branch around it. The message-box report is an `if`; a SECOND one
+        // would be a guard on the leave.
+        let before = &arm[..returned];
+        assert_eq!(
+            before.matches("if ").count(),
+            1,
+            "the spawn arm grew a second condition between asking for the window and leaving; \
+             the only `if` there may be is the one that reports a failure: {before}"
+        );
+
+        // And the user is told, rather than the failure being a log line
+        // under a window that never appeared.
+        assert!(
+            arm[..returned].contains("message_box("),
+            "a spawn that failed now opens nothing and says nothing; the user clicked *Open \
+             Vault* and got silence: {arm}"
+        );
+
+        // **The remaining draw, named.** Without this the test would pass
+        // just as well against a file that had deleted the in-daemon host
+        // entirely -- and the `bw serve` sign-in has nowhere else to go yet.
+        assert!(
+            body.contains("let child_cannot_read_the_vault ="),
+            "the one route that still draws in the daemon is gone from the gate, so a \
+             `bw serve` account with no stored key has no host for its sign-in card at all"
+        );
     }
 
     /// The body of the item whose declaration starts with `head`, matched by
@@ -32600,7 +32805,7 @@ mod startup_shape_tests {
         // OpenGL driver and the tray comes up beside it instead of after
         // it. What must not come back is this arm showing NO window.
         assert!(
-            arm.contains(concat!("ask_for_the_vault_", "window()")),
+            arm.contains(concat!("ask_for_the_vault_", "window(&config_dir, None)")),
             "the launch that already has a session asks for no window at all any more, \
              so the user watches nothing for the eight seconds `bw serve` takes: {arm:?}"
         );
@@ -33735,7 +33940,7 @@ mod bw_serve_gate {
         // is decided. A door that called the spawn directly would open a
         // second window over one already up.
         assert!(
-            region.contains(concat!("ask_for_the_vault_", "window()")),
+            region.contains(concat!("ask_for_the_vault_", "window(&config_dir, None)")),
             "the startup door does not ask the registry for a UI process"
         );
     }
