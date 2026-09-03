@@ -1896,7 +1896,7 @@ fn draw_cli_setup_modal(
                             let clicked = if *primary {
                                 theme::primary_button(ui, label, None).clicked()
                             } else {
-                                ui.button(RichText::new(*label).size(12.0)).clicked()
+                                theme::secondary_button(ui, label).clicked()
                             };
                             if clicked {
                                 action = Some(*what);
