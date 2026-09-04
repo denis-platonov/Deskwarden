@@ -954,7 +954,7 @@ fn artwork_box(tile: Rect) -> f32 {
 ///
 /// A degenerate source (either axis at or below zero) falls back to the whole
 /// tile, which is what this drew before and cannot divide by zero.
-pub fn avatar_artwork(tile: Rect, source: Vec2) -> (Rect, CornerRadius) {
+pub fn avatar_artwork(tile: Rect, source: Vec2, pixels_per_point: f32) -> (Rect, CornerRadius) {
     let full = avatar_corner_radius(tile.width());
     if source.x <= 0.0 || source.y <= 0.0 {
         return (tile, full);
@@ -963,10 +963,55 @@ pub fn avatar_artwork(tile: Rect, source: Vec2) -> (Rect, CornerRadius) {
     // a source smaller than the box is magnified into it. See the docs.
     let box_side = artwork_box(tile);
     let scale = (box_side / source.x).min(box_side / source.y);
-    let art = Rect::from_center_size(tile.center(), source * scale);
+    let art = centre_on_pixel_grid(tile, source * scale, pixels_per_point);
     let inset = (tile.width() - art.width()).min(tile.height() - art.height()) / 2.0;
     let radius = (f32::from(full.nw) - inset).max(0.0).round() as u8;
     (art, CornerRadius::same(radius))
+}
+
+/// Centres a `size`-sized rect in `tile` **counting in whole device pixels**,
+/// so the gap either side is the same whole number of them.
+///
+/// **The report this exists for, twice: "Amazon has 5 pixels to the left and
+/// 6 to the right", and the same top to bottom.** Snapping the tile to the
+/// pixel grid was the first answer and it was not enough, which is the useful
+/// part of the story: the tile can start on an exact pixel and the gap still
+/// be fractional, because the gap is `(32 - 20) / 2 = 6` POINTS, and six
+/// points is 7.5 pixels at 125% scaling and 9 at 150%. A gap of seven and a
+/// half pixels cannot be equal on both sides -- one of them gets the half.
+///
+/// So the arithmetic is done in pixels from the start: the tile's edge, its
+/// span and the artwork's span are each rounded to whole pixels, and then --
+/// the step that actually matters -- the LEFTOVER is forced even by giving
+/// the artwork one more pixel when it is odd. An even leftover splits
+/// exactly. The result is converted back to points for `egui`, which is the
+/// only place a fraction is allowed to reappear, and it reappears identically
+/// on both sides.
+///
+/// Growing the artwork rather than shrinking it is arbitrary in the same way
+/// either choice would be; it is a single pixel, and taking one is as visible
+/// as adding one. What is not arbitrary is doing it at all, because a
+/// symmetric layout of an odd leftover does not exist.
+///
+/// A non-positive `pixels_per_point` has no grid to speak of, and the plain
+/// centred rect is returned.
+fn centre_on_pixel_grid(tile: Rect, size: Vec2, pixels_per_point: f32) -> Rect {
+    if pixels_per_point <= 0.0 {
+        return Rect::from_center_size(tile.center(), size);
+    }
+    let axis = |min: f32, tile_span: f32, art_span: f32| {
+        let min_px = (min * pixels_per_point).round();
+        let tile_px = (tile_span * pixels_per_point).round();
+        let mut art_px = (art_span * pixels_per_point).round().min(tile_px);
+        if (tile_px - art_px) % 2.0 != 0.0 {
+            art_px = (art_px + 1.0).min(tile_px);
+        }
+        let start = min_px + (tile_px - art_px) / 2.0;
+        (start / pixels_per_point, art_px / pixels_per_point)
+    };
+    let (x, w) = axis(tile.left(), tile.width(), size.x);
+    let (y, h) = axis(tile.top(), tile.height(), size.y);
+    Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h))
 }
 
 /// Paints `texture` inside an [`avatar_tile`] -- centred, never magnified,
@@ -1012,7 +1057,8 @@ pub fn avatar_artwork(tile: Rect, source: Vec2) -> (Rect, CornerRadius) {
 /// above a bigger tile would no longer STRETCH to hide the shortfall, it would
 /// leave the icon sitting at 64pt in a larger square.
 pub fn avatar_image(ui: &Ui, tile: Rect, texture: &egui::TextureHandle, emphasized: bool) {
-    let (art, art_rounding) = avatar_artwork(tile, texture.size_vec2());
+    let (art, art_rounding) =
+        avatar_artwork(tile, texture.size_vec2(), ui.ctx().pixels_per_point());
     egui::Image::new((texture.id(), texture.size_vec2()))
         .corner_radius(art_rounding)
         .paint_at(ui, art);
@@ -4865,30 +4911,51 @@ mod pixel_snapping_tests {
     /// come out equal and whole.
     #[test]
     fn a_tile_at_a_fractional_coordinate_gives_its_artwork_two_equal_gaps() {
-        let allocated = Rect::from_min_size(Pos2::new(79.33, 68.4), Vec2::splat(32.0));
-        let ragged = avatar_artwork(allocated, Vec2::splat(64.0)).0;
-        assert_ne!(
-            ragged.left() - allocated.left(),
-            ragged.right().round() - allocated.right().round(),
-            "this test's premise is gone: the unsnapped tile no longer produces the \
-             uneven gaps the snapping exists to remove"
-        );
+        // THE PREMISE, asserted first: plain centring really does produce the
+        // uneven gaps this exists to remove. Without this the loop below could
+        // pass against arithmetic that never had the defect, which is exactly
+        // how the tile-snapping pass shipped believing it had fixed this.
+        {
+            let tile = Rect::from_min_size(Pos2::new(79.2, 68.0), Vec2::splat(32.0));
+            let naive = Rect::from_center_size(tile.center(), Vec2::splat(20.0));
+            let px = |v: f32| v * 1.25;
+            assert_ne!(
+                px(naive.left()) - px(tile.left()),
+                (px(tile.right()) - px(naive.right())).round(),
+                "plain centring already lands on the pixel grid at 1.25x, so this test \
+                 proves nothing about the arithmetic that replaced it"
+            );
+        }
 
-        let tile = Rect::from_min_size(snapped_min(allocated.min, 1.0), allocated.size());
-        let (art, _) = avatar_artwork(tile, Vec2::splat(64.0));
-        let (left, right) = (art.left() - tile.left(), tile.right() - art.right());
-        let (top, bottom) = (art.top() - tile.top(), tile.bottom() - art.bottom());
-        assert_eq!(
-            (left, right, top, bottom),
-            (6.0, 6.0, 6.0, 6.0),
-            "a 20pt icon in a snapped 32pt tile must leave 6pt on every side, whole"
-        );
-        assert_eq!(
-            (art.left().fract(), art.top().fract()),
-            (0.0, 0.0),
-            "the artwork's own edges are off the pixel grid, so it will be drawn with a \
-             soft fringe on one side even though its gaps measure equal"
-        );
+        // Every scale factor a Windows display offers, because the defect is
+        // invisible at 1.0 -- 6pt is 6px there and splits evenly by luck. A
+        // test that only ran at 1.0 is what let the first fix ship.
+        for ppp in [1.0f32, 1.25, 1.5, 1.75, 2.0] {
+            let allocated = Rect::from_min_size(Pos2::new(79.33, 68.4), Vec2::splat(32.0));
+            let tile = Rect::from_min_size(snapped_min(allocated.min, ppp), allocated.size());
+            let (art, _) = avatar_artwork(tile, Vec2::splat(48.0), ppp);
+
+            let px = |v: f32| (v * ppp).round();
+            let (left, right) = (px(art.left()) - px(tile.left()), px(tile.right()) - px(art.right()));
+            let (top, bottom) = (px(art.top()) - px(tile.top()), px(tile.bottom()) - px(art.bottom()));
+            assert_eq!(
+                (left, top),
+                (right, bottom),
+                "at {ppp}x the artwork sits {left}px from the left and {right}px from the \
+                 right, {top}px from the top and {bottom}px from the bottom -- which is \
+                 the report, in the units the owner counted it in"
+            );
+            for (edge, name) in
+                [(art.left(), "left"), (art.top(), "top"), (art.right(), "right"), (art.bottom(), "bottom")]
+            {
+                let pixels = edge * ppp;
+                assert!(
+                    (pixels - pixels.round()).abs() < 1e-3,
+                    "at {ppp}x the artwork's {name} edge is at {pixels} device pixels, so it \
+                     is drawn with a soft fringe on that side"
+                );
+            }
+        }
     }
 
     /// Rounded in PHYSICAL pixels, not points. At 150% scaling a whole point
