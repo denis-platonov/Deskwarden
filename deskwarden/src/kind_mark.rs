@@ -41,14 +41,18 @@ use crate::vault_bridge::ItemKind;
 
 /// The glyph's box, as a fraction of the tile it is centred in.
 ///
-/// **Set against the monogram, which is the thing it stands in for.**
-/// `theme::avatar` sets its letters at `size * 0.38` and a capital's ink is
-/// roughly seven tenths of its font size, so the monogram's ink band is about
-/// `0.27 * size` tall and rather wider. A drawn mark reads lighter than type
-/// at the same extent -- it is outline where type is solid -- so it is given
-/// a little more room than the letters take and still sits inside the tile's
-/// own padding.
-const GLYPH: f32 = 0.56;
+/// **Set against the FAVICON, not against the monogram.** It was first set at
+/// 0.56 by reasoning from `theme::avatar`'s letters (`size * 0.38`, ink about
+/// seven tenths of that) plus a little air, because a drawn outline reads
+/// lighter than type at the same extent. The owner's screenshot of a secure
+/// note's header settled it the other way: "if too small - there is that
+/// padding". The tile beside it holds a favicon that now fills the tile edge
+/// to edge (see `theme::avatar_artwork`), and a mark sitting at 0.56 in the
+/// same column reads as a different, smaller kind of tile.
+///
+/// So the glyph is sized to the favicon it stands in for, less a hair of air
+/// so the stroke's outer half is not clipped by the tile's own border.
+const GLYPH: f32 = 0.82;
 
 /// The stroke every mark is drawn with, as a fraction of the tile size.
 ///

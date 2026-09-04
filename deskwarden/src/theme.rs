@@ -889,28 +889,30 @@ pub fn initials(name: &str) -> String {
 /// is clipped with: [`avatar_image`]'s geometry, split out as a pure function
 /// so it can be asserted on directly rather than only inferred from a paint.
 ///
-/// `source` is the texture's own size in pixels, which is read as POINTS. That
-/// is the whole meaning of "a 16x16 favicon draws at 16x16": the number of
-/// pixels the artwork has is the number of points it is given, so the tile's
-/// look does not change between a 100% and a 200% monitor. `favicon::
-/// decode_rgba` is what makes that number trustworthy -- it never magnifies a
-/// source, and it letterboxes a non-square one onto a transparent square
-/// canvas, so the size handed here is the artwork's real size and not a
-/// stretched one.
+/// `source` is the texture's own size in pixels, and only its ASPECT is read:
+/// `favicon::decode_rgba` letterboxes a non-square icon onto a transparent
+/// square canvas, so in practice every icon that reaches here is square and
+/// lands full bleed.
 ///
-/// **Two rules, and the second is the one with a history.**
+/// **One rule: fit the tile, preserving aspect -- magnifying when the source
+/// is smaller than the tile.** The scale is the smaller of the two ratios, so
+/// nothing is ever stretched, and it is NOT capped at 1.0.
 ///
-/// * **Never upscale.** The scale is capped at 1.0, so a 16x16 source is
-///   drawn at 16pt inside a 32pt tile and the 8pt of margin on each side is
-///   simply what is left over. Magnifying it is what made small favicons --
-///   which is most of them -- look soft next to the crisp monogram beside
-///   them.
-/// * **Downscale only to fit, preserving aspect.** A source longer than the
-///   tile on either axis is reduced by the smaller of the two ratios, so
-///   nothing is ever stretched. A 64x64 texture in a 32pt tile therefore
-///   still lands FULL BLEED, exactly as it did before -- this rule takes
-///   nothing away from a large icon, it only stops a small one being blown
-///   up.
+/// **That cap is what this pass removes, and it is the fifth pass here.** The
+/// fourth read the owner's Keeper comparison ("keeps icons small, maybe
+/// original, inside the rounded square with visible paddings") as a rule about
+/// the artwork's own pixel size, and drew a 16x16 favicon at 16pt inside the
+/// 32pt tile. Shown that build, the owner's reply was the measurement that
+/// settles it -- Keeper's own tiles, both a small icon and a large one, with
+/// "no padding here - as should" and "if bigger - fills the whole thing". The
+/// padding Keeper leaves is the padding around the TILE, not inside it. So the
+/// artwork fills the tile at every source size, and the softness a magnified
+/// 16x16 has is accepted: it is what the reference product does.
+///
+/// The taper below therefore never fires for a square source. It is kept
+/// because it is the geometry, not a special case -- a source that arrives
+/// non-square (a caller with its own texture, bypassing `decode_rgba`) still
+/// gets a radius that matches how far its short axis sits inside the curve.
 ///
 /// **The corner radius follows the tile's curve, concentrically.** The tile is
 /// a rounded rectangle, and the original reason the artwork was ever given a
@@ -933,20 +935,20 @@ pub fn avatar_artwork(tile: Rect, source: Vec2) -> (Rect, CornerRadius) {
     if source.x <= 0.0 || source.y <= 0.0 {
         return (tile, full);
     }
-    // Cap at 1.0: shrink to fit, never grow.
-    let scale = (tile.width() / source.x).min(tile.height() / source.y).min(1.0);
+    // Fit, in both directions: a source larger than the tile shrinks into it,
+    // a smaller one grows to fill it. Deliberately uncapped -- see the docs.
+    let scale = (tile.width() / source.x).min(tile.height() / source.y);
     let art = Rect::from_center_size(tile.center(), source * scale);
     let inset = (tile.width() - art.width()).min(tile.height() - art.height()) / 2.0;
     let radius = (f32::from(full.nw) - inset).max(0.0).round() as u8;
     (art, CornerRadius::same(radius))
 }
 
-/// Paints `texture` inside an [`avatar_tile`] -- centred, never magnified,
-/// shrunk only as far as it must be to fit -- and re-draws the tile's border
-/// over it.
+/// Paints `texture` inside an [`avatar_tile`] -- scaled to fill it, aspect
+/// preserved -- and re-draws the tile's border over it.
 ///
-/// **The sizing rule and its history.** This is the fourth pass, and the next
-/// person here will be holding one of these reports and not the other three:
+/// **The sizing rule and its history.** This is the fifth pass, and the next
+/// person here will be holding one of these reports and not the other four:
 ///
 /// 1. The favicon was drawn at the full 32pt with `fit_to_exact_size`, and the
 ///    report was "the favicon fills its tile edge-to-edge and feels too big".
@@ -958,11 +960,19 @@ pub fn avatar_artwork(tile: Rect, source: Vec2) -> (Rect, CornerRadius) {
 ///    the tile should have, when the defect was RESAMPLING. A 16x16 favicon,
 ///    which is what most sites still serve, was being magnified 2x to fill a
 ///    32pt tile, and no choice of margin fixes a blown-up image.
-/// 4. So: never magnify. The margin is not a number this code picks at all --
-///    it is whatever is left over once the artwork is drawn at its own size,
-///    centred. A big icon still fills the tile; a small one sits small and
-///    sharp inside it, which is the look the report asked for ("small inside
-///    the rounded square with visible paddings ... never extrapolated").
+/// 4. So: never magnify. The margin became the leftover -- a big icon filled
+///    the tile, a small one sat small and sharp inside it. Read off Keeper:
+///    "keeps icons small (maybe original) inside the rounded square with
+///    visible paddings ... never extrapolated".
+/// 5. Which was reading the reference wrong, and the owner said so with
+///    pictures of it: two Keeper tiles, a small icon and a large one, "no
+///    padding here - as should" and "if bigger - fills the whole thing". The
+///    padding Keeper leaves is OUTSIDE the tile. So the tile is filled at
+///    every source size -- pass 3's rule, arrived at deliberately this time,
+///    with the softness of a magnified 16x16 accepted as the cost the
+///    reference product also pays. **Do not restore the cap without a report
+///    that names softness specifically**; "too big" and "not filling the
+///    rounded rectangle" have both already been tried and both reversed.
 ///
 /// [`avatar_artwork`] is the geometry, with the corner-radius reasoning.
 ///
@@ -983,8 +993,8 @@ pub fn avatar_artwork(tile: Rect, source: Vec2) -> (Rect, CornerRadius) {
 /// draw at 200% scaling. Nothing in the code links that constant to this one.
 /// It covers a 32pt draw exactly, so a tile that ever grows past 32pt needs
 /// `decode_rgba`'s constant raised with it -- and note that under the rule
-/// above a bigger tile would no longer STRETCH to hide the shortfall, it would
-/// leave the icon sitting at 64pt in a larger square.
+/// above a bigger tile would stretch a 64px texture to cover it, which is the
+/// soft draw that constant exists to avoid.
 pub fn avatar_image(ui: &Ui, tile: Rect, texture: &egui::TextureHandle, emphasized: bool) {
     let (art, art_rounding) = avatar_artwork(tile, texture.size_vec2());
     egui::Image::new((texture.id(), texture.size_vec2()))
