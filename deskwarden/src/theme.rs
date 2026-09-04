@@ -1042,12 +1042,10 @@ fn centre_on_pixel_grid(tile: Rect, size: Vec2, pixels_per_point: f32) -> Rect {
 /// **The border earns its place; the fill no longer does.** The tile behind a
 /// favicon is drawn by [`avatar_artwork_tile`], which does not fill at all --
 /// see there for the owner's "no backgound inside of tile". The BORDER is
-/// still re-drawn ON TOP of the artwork, because `StrokeKind::Middle`
-/// straddles the edge -- a full-bleed image painted over it would eat its
-/// inner half and leave a half-pixel ghost. It is drawn over unconditionally
-/// rather than only when the artwork reaches the edge, so the tile has ONE
-/// border in every case instead of two code paths that have to agree about
-/// which.
+/// still re-drawn ON TOP of the artwork, so the tile has ONE border in every
+/// case instead of two code paths that have to agree about which. It is
+/// `StrokeKind::Inside`: see [`avatar_box`] for why that word is the whole
+/// fix for "5 pixels to the left and 6 to the right".
 ///
 /// NOTE FOR WHOEVER CHANGES EITHER SIDE OF THIS: `favicon::decode_rgba`
 /// resamples every icon to a 64px longest edge, a number chosen for a 32pt
@@ -1066,7 +1064,7 @@ pub fn avatar_image(ui: &Ui, tile: Rect, texture: &egui::TextureHandle, emphasiz
         tile,
         avatar_corner_radius(tile.width()),
         avatar_tile_stroke(emphasized),
-        StrokeKind::Middle,
+        StrokeKind::Inside,
     );
 }
 
@@ -1116,6 +1114,24 @@ pub fn avatar_artwork_tile(ui: &mut Ui, size: f32, emphasized: bool) -> Rect {
 /// The shared body of [`avatar_tile`] and [`avatar_artwork_tile`]: one
 /// allocation, one rounding and one border, so the two cannot drift into
 /// different geometry while claiming to be the same tile.
+/// **`StrokeKind::Inside`, and that word is the whole fix for "Amazon has 5
+/// pixels to the left and 6 to the right".**
+///
+/// The artwork was centred correctly the entire time. A 20pt icon in a 32pt
+/// tile leaves 6pt a side, and at this display's 100% scaling that is 6 whole
+/// pixels a side. What was not centred was the EDGE the owner was measuring
+/// from. `StrokeKind::Middle` straddles the rectangle: a 1px border on a tile
+/// starting at x = 79 covers 78.5 to 79.5, so it renders as two
+/// half-covered pixels rather than one solid one, and the clear space between
+/// that smear and the artwork is 5.5px -- which resolves to 5 down one side
+/// and 6 down the other. The report was exact, and it was about the border.
+///
+/// Drawn inside, the border occupies 79 to 80 exactly, one crisp pixel, and
+/// the clear space is 5 on both sides. Nothing else moved: the tile is still
+/// 32, the artwork is still 20pt at the same coordinates, and the two earlier
+/// attempts at this -- snapping the tile, then centring in whole pixels --
+/// both stand, because they fix the same defect at the scale factors where it
+/// is real (125%, 150%) and this display is not one of them.
 fn avatar_box(ui: &mut Ui, size: f32, emphasized: bool, fill: Option<Color32>) -> Rect {
     let (allocated, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let rect = snap_to_pixels(ui, allocated);
@@ -1124,7 +1140,7 @@ fn avatar_box(ui: &mut Ui, size: f32, emphasized: bool, fill: Option<Color32>) -
         ui.painter().rect_filled(rect, rounding, bg);
     }
     ui.painter()
-        .rect_stroke(rect, rounding, avatar_tile_stroke(emphasized), StrokeKind::Middle);
+        .rect_stroke(rect, rounding, avatar_tile_stroke(emphasized), StrokeKind::Inside);
     rect
 }
 

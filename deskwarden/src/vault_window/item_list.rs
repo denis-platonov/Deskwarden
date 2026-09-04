@@ -4334,6 +4334,19 @@ mod row_tile_tests {
             tile.stroke.width > 0.0 && tile.stroke.color.a() > 0,
             "dropping the fill must not take the tile's edge with it"
         );
+        // ...and that edge is drawn INSIDE the tile, which is what makes the
+        // clear space beside the artwork a whole number of pixels. `Middle`
+        // straddles: a 1px border on a tile starting at x=79 covers 78.5 to
+        // 79.5, two half-covered pixels, leaving 5.5px of clear space that
+        // resolves to 5 down one side and 6 down the other. That was the
+        // owner's "5 pixels to the left and 6 to the right" -- the artwork was
+        // centred the whole time and the EDGE they measured from was not.
+        assert_eq!(
+            tile.stroke_kind,
+            egui::StrokeKind::Inside,
+            "the tile's border straddles its own edge, so it renders as two half-covered \
+             pixels and the gap beside the artwork cannot measure equal on both sides"
+        );
         let (at, image) = p
             .rects
             .iter()
