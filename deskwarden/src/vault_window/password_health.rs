@@ -2941,6 +2941,9 @@ mod tests {
                     &mut visible,
                     None,
                     false,
+                    // Not about the open gesture; the slide's arming is
+                    // covered where it lives.
+                    &mut false,
                 );
             });
             if frame == 2 {

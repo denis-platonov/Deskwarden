@@ -389,6 +389,19 @@ enum Surface {
     /// badges have to be tellable apart from each other, and one card in a
     /// picture cannot show that.
     VaultList,
+    /// **The item list with NO DETAIL PANE BESIDE IT**, at the width it
+    /// really gets in that state.
+    ///
+    /// A new state, and the only one this change creates: the list used to be
+    /// [LIST_WIDTH] whatever was on screen, and now it runs to the right
+    /// edge whenever nothing is selected. It is also the state the detail
+    /// pane's slide starts from and returns to, so it is the one end of that
+    /// animation a still picture CAN show -- the other end is
+    /// [Surface::VaultList], which is unchanged.
+    ///
+    /// Drawn with nothing selected, because that is the only way the window
+    /// ever reaches this width.
+    VaultListWide,
     /// **One row of every KIND, with favicons of shapes a real site serves.**
     ///
     /// Two reports live on this surface and neither is answerable from
@@ -605,6 +618,7 @@ const ALL: &[Surface] = &[
     Surface::PrefsVaultOfficialCli,
     Surface::PrefsVaultBuiltIn,
     Surface::VaultList,
+    Surface::VaultListWide,
     Surface::VaultListKinds,
     Surface::ItemKindMarks,
     Surface::LoginDetailFavicon,
@@ -674,6 +688,7 @@ impl Surface {
             Surface::PrefsVaultOfficialCli => "prefs_vault_official_cli",
             Surface::PrefsVaultBuiltIn => "prefs_vault_built_in",
             Surface::VaultList => "vault_item_list",
+            Surface::VaultListWide => "vault_item_list_wide",
             Surface::VaultListKinds => "vault_item_list_kinds",
             Surface::ItemKindMarks => "item_kind_marks",
             Surface::LoginDetailFavicon => "detail_login_favicon",
@@ -781,6 +796,11 @@ impl Surface {
             // narrow elides its titles and drops its chips, which is a picture
             // of a layout nobody ships.
             Surface::VaultList => egui::vec2(LIST_WIDTH, PANE_HEIGHT),
+            // The window minus its sidebar: what the list is given when no
+            // detail pane is on screen.
+            Surface::VaultListWide => {
+                egui::vec2(LIST_WIDTH + PANE_WIDTH, PANE_HEIGHT)
+            }
             // The list's own column, because these are list rows. Shorter
             // than [`PANE_HEIGHT`] only because the fixture is: nine rows
             // fit, and a shot with empty canvas under them wastes the
@@ -970,6 +990,9 @@ fn main() -> eframe::Result {
                 kind_icons: None,
                 detail_icon: None,
                 list_search: String::new(),
+                wide_search: String::new(),
+                wide_selected: None,
+                wide_visible: Vec::new(),
                 kinds_search: String::new(),
                 // The SSH key row, so one mark is photographed in the
                 // selected treatment on the rows themselves and not only
@@ -1071,6 +1094,9 @@ struct Preview {
     /// reason the caches above are.
     detail_icon: Option<egui::TextureHandle>,
     list_search: String,
+    wide_search: String,
+    wide_selected: Option<String>,
+    wide_visible: Vec<String>,
     kinds_search: String,
     kinds_selected: Option<String>,
     kinds_visible: Vec<String>,
@@ -1203,6 +1229,7 @@ impl eframe::App for Preview {
             }
             Surface::PrefsWindowChrome => self.draw_prefs_window(root),
             Surface::VaultList => self.draw_vault_list(root),
+            Surface::VaultListWide => self.draw_vault_list_wide(root),
             Surface::VaultListKinds => self.draw_vault_list_kinds(root),
             Surface::ItemKindMarks => draw_item_kind_marks(root),
             Surface::LoginDetailFavicon => {
@@ -1876,6 +1903,9 @@ impl Preview {
                     visible,
                     None,
                     false,
+                    // A preview draws no window, so nothing reads the open
+                    // gesture here; the slide it arms lives in ault_window::mod.
+                    &mut false,
                 );
             });
     }
@@ -1910,10 +1940,48 @@ impl Preview {
                     visible,
                     None,
                     false,
+                    // A preview draws no window, so nothing reads the open
+                    // gesture here; the slide it arms lives in ault_window::mod.
+                    &mut false,
                 );
             });
     }
 
+    /// [`draw_vault_list`], with NOTHING SELECTED, in the full-width column
+    /// the list is given when no detail pane is on screen.
+    ///
+    /// Its own fixture selection state, not [`draw_vault_list`]'s: the two
+    /// surfaces are drawn in the same process by `--all` and a shared
+    /// `list_selected` would let one shot decide what the other showed.
+    fn draw_vault_list_wide(&mut self, root: &mut egui::Ui) {
+        let icons = self.icons.get_or_insert_with(|| {
+            preview_icons(root.ctx(), &self.fixtures.list, &["Ledgerline", "Ledgerline corporate card"])
+        });
+        let fixtures = &self.fixtures;
+        let (search, selected, visible) = (
+            &mut self.wide_search,
+            &mut self.wide_selected,
+            &mut self.wide_visible,
+        );
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .show(root, |ui| {
+                let _ = item_list::draw_item_list(
+                    ui,
+                    Some(&fixtures.list),
+                    &fixtures.folders,
+                    &SidebarFilter::All,
+                    search,
+                    selected,
+                    None,
+                    icons,
+                    visible,
+                    None,
+                    false,
+                    &mut false,
+                );
+            });
+    }
     /// The vault window's **Password health** screen, drawn in the item-list
     /// column it really occupies and carrying a **pathologically long item
     /// name** -- longer than the column can be dragged to at any size.

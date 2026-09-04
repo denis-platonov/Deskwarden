@@ -1151,6 +1151,18 @@ pub fn draw_item_list(
     // list which is empty BECAUSE the fetch failed does not get a spinner that
     // can never resolve. See that function.
     fetch_failed: bool,
+    // **Set when a row was OPENED by a primary click this frame** -- the
+    // gesture, reported out so `vault_window::mod` can arm the detail pane's
+    // slide with it. An out-parameter for `visible_ids`' reason: it is a
+    // by-product of drawing, not the list's verdict, and `ItemListAction` is
+    // the verdict.
+    //
+    // NOT "the selection changed": a right-click, a keyboard move, a sync
+    // restoring a selection and `Create`'s select-what-was-just-made all
+    // change it, and none of them is this gesture. See `RowOutcome::opened`.
+    //
+    // Written only, never read here; the caller clears it.
+    row_opened: &mut bool,
 ) -> ItemListAction {
     let mut action = ItemListAction::None;
     visible_ids.clear();
@@ -1520,6 +1532,9 @@ pub fn draw_item_list(
                         if outcome.select {
                             *selected_id = Some(item.id.clone());
                         }
+                        if outcome.opened {
+                            *row_opened = true;
+                        }
                         if let Some(command) = outcome.command {
                             // Overwrites a `NewItem` from the header strip in
                             // the same frame. The two cannot both happen: an
@@ -1712,6 +1727,18 @@ struct RowOutcome {
     /// the menu and the detail pane could be showing two different items
     /// while the user chose "Delete".
     select: bool,
+    /// **A PRIMARY click on the row** -- the gesture, not the state change.
+    ///
+    /// [`select`](Self::select) cannot answer this: it is deliberately true
+    /// for a right-click too, so that the context menu and the detail pane
+    /// agree about which item they are on. The detail pane's slide-in is
+    /// armed by the user OPENING an item and by nothing else, and the owner
+    /// ruled a right-click out of that explicitly -- it selects a row on its
+    /// way to a menu, which is not the same gesture as opening one.
+    ///
+    /// Only `vault_window::mod`'s arming site reads this. Selection itself
+    /// still runs off `select`.
+    opened: bool,
     /// An entry of this row's context menu was chosen this frame.
     command: Option<RowCommand>,
 }
@@ -1993,6 +2020,8 @@ fn item_row(
     RowOutcome {
         // A right-click selects the row too -- see `RowOutcome::select`.
         select: response.clicked() || response.secondary_clicked(),
+        // ...but only the primary click OPENS it -- see `RowOutcome::opened`.
+        opened: response.clicked(),
         command,
     }
 }
@@ -3012,6 +3041,10 @@ mod row_tile_tests {
         selected: Option<String>,
         /// What `draw_item_list` returned on the measured frame.
         action: ItemListAction,
+        /// Whether the measured frame reported a row OPENED by a primary
+        /// click -- `draw_item_list`'s `row_opened` out-parameter, which is
+        /// what arms the detail pane's slide. See `RowOutcome::opened`.
+        row_opened: bool,
     }
 
     fn walk(shape: &egui::Shape, p: &mut Painted) {
@@ -3216,8 +3249,13 @@ mod row_tile_tests {
         let mut search = String::new();
         let icons = make_icons(&ctx);
         let mut action = ItemListAction::None;
+        // The gesture flag, reset at the top of EVERY frame so what survives
+        // to the assertion is the measured frame's own answer and not a
+        // click from a set-up frame that came before it.
+        let mut row_opened = false;
         let Menu { folders, delete_pending, mut frames, filter } = menu;
         let mut draw = |ctx: &egui::Context, input: egui::RawInput, visible: &mut Vec<String>| {
+            row_opened = false;
             ctx.run_ui(input, |ui| {
                 action = draw_item_list(
                     ui,
@@ -3237,6 +3275,7 @@ mod row_tile_tests {
                     // harnesses draws an empty list -- `list_placeholder` is
                     // asserted directly, by `list_placeholder_tests`.
                     false,
+                    &mut row_opened,
                 );
             })
         };
@@ -3286,6 +3325,7 @@ mod row_tile_tests {
             visible,
             selected: selected_id,
             action,
+            row_opened,
         };
         for clipped in &output.shapes {
             walk(&clipped.shape, &mut painted);
@@ -6072,6 +6112,48 @@ mod row_tile_tests {
         assert_eq!(badge_of(&unselected).corner_radius, CornerRadius::same(5));
     }
 
+    /// **The same claim at every width the detail pane's slide sweeps the
+    /// list through**, which is what makes the slide a REFLOW that a real
+    /// vault can afford.
+    ///
+    /// The list genuinely shrinks as the pane comes in -- it is not a pane
+    /// drawn over the top of it -- so every frame of the animation re-lays the
+    /// list at a new width. The owner's reasoning for accepting that was "you
+    /// usually see only a dozen on the screen", and this is that assumption
+    /// stated as an assertion rather than trusted: the row COUNT is a function
+    /// of the pane's HEIGHT, which the slide does not touch, so a 1656-item
+    /// vault lays out the same handful of rows at 390pt and at 1028pt.
+    ///
+    /// Without this, "the reflow is cheap" rests on `show_rows` staying in the
+    /// list, and a future full-width branch that bypassed it would be an O(N)
+    /// layout on every frame of an animation.
+    #[test]
+    fn the_list_stays_virtualized_at_every_width_the_slide_sweeps_it_through() {
+        let items: Vec<VaultItem> = (0..1656)
+            .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
+            .collect();
+        let ceiling = (PANE_HEIGHT / (ROW_TILE_HEIGHT + ROW_GAP)).ceil() as usize + 4;
+        // The list's resting width, the full-width state it reaches with no
+        // detail pane, and a width in between -- the animation passes through
+        // all three.
+        for width in [PANE_WIDTH, 700.0, 1028.0] {
+            let p = paint_at_width(&items, None, width);
+            assert!(
+                p.visible.len() <= ceiling,
+                "at a {width}pt list, {} of 1656 rows were laid out; at most {ceiling} fit \
+                 the {PANE_HEIGHT}pt pane. The row count must follow the pane's HEIGHT, \
+                 which the slide does not change -- if it follows the width, every frame \
+                 of the animation is an O(N) layout",
+                p.visible.len()
+            );
+            assert!(
+                !p.visible.is_empty(),
+                "at a {width}pt list nothing was laid out at all, so this width proves \
+                 nothing"
+            );
+        }
+    }
+
     #[test]
     fn a_vault_sized_list_still_lays_out_only_the_visible_rows() {
         // NON-NEGOTIABLE. The picker's list shipped un-virtualized once and
@@ -6683,6 +6765,133 @@ mod row_tile_tests {
                 "Archive",
                 DELETE_LABEL,
             ]
+        );
+    }
+
+    /// **The gesture that arms the detail pane's slide, and the three that do
+    /// not.**
+    ///
+    /// `vault_window::mod` arms the slide on `row_opened && !pane_shown_
+    /// before_click`. That first half is decided HERE, and the owner's rule
+    /// turns entirely on it being the GESTURE rather than the selection
+    /// changing: a right-click selects a row on its way to a menu, and a
+    /// keyboard move selects one without any click at all. Both change
+    /// `selected_id`; neither opens an item.
+    ///
+    /// So this is the whole of the negative claim, with the positive control
+    /// beside it in the same harness -- without the control, "a right-click
+    /// does not open" would pass just as well against a flag that was never
+    /// set by anything.
+    #[test]
+    fn only_a_primary_click_reports_a_row_as_opened() {
+        let items = [full_login("Ledgerline"), full_login("Vantage")];
+        let at = row_centre(&items, 1);
+
+        // The first TWO frames of a click -- press, then release. The
+        // harness measures the LAST frame it is given, and `row_opened` is a
+        // per-frame gesture flag (the caller reads it on the frame the click
+        // lands and clears it), so `click_frames`' third settling frame would
+        // measure a frame with no click in it and read `false` for both
+        // buttons. `selected_id` persists and would have hidden that.
+        let click = |button| {
+            let frames: Vec<Vec<egui::Event>> =
+                click_frames(at, button).into_iter().take(2).collect();
+            paint_core(
+                &items,
+                None,
+                0,
+                PANE_WIDTH,
+                |_| IconCache::default(),
+                Menu {
+                    folders: vec![],
+                    delete_pending: None,
+                    frames,
+                    filter: SidebarFilter::All,
+                },
+            )
+        };
+
+        // THE CONTROL: a primary click opens the row.
+        let primary = click(egui::PointerButton::Primary);
+        assert!(
+            primary.row_opened,
+            "a primary click on a row did not report it as opened, so nothing would ever \
+             arm the detail pane's slide"
+        );
+        assert_eq!(
+            primary.selected.as_deref(),
+            Some("Vantage"),
+            "the control did not even select the row, so it is not testing the gesture"
+        );
+
+        // THE CLAIM: a right-click selects the row -- deliberately, so the
+        // menu and the pane agree -- and does NOT open it.
+        let secondary = click(egui::PointerButton::Secondary);
+        assert_eq!(
+            secondary.selected.as_deref(),
+            Some("Vantage"),
+            "a right-click must still SELECT the row it was made on; if it does not, this \
+             test is no longer telling the gesture from the selection"
+        );
+        assert!(
+            !secondary.row_opened,
+            "a right-click reported the row as opened. It selects on its way to a menu, \
+             which the owner ruled out of the slide explicitly -- the pane would animate \
+             every time a context menu was opened from an empty pane"
+        );
+    }
+
+    /// A keyboard move is the third way `selected_id` changes inside this
+    /// function, and it is not a click either. Same rule, and the same reason
+    /// to state it separately: it takes a different code path (`next_
+    /// selection`, not `RowOutcome`) and so could break on its own.
+    #[test]
+    fn a_keyboard_move_selects_without_reporting_a_row_as_opened() {
+        let items = [full_login("Ledgerline"), full_login("Vantage")];
+        let p = paint_core(
+            &items,
+            Some("Ledgerline"),
+            0,
+            PANE_WIDTH,
+            |_| IconCache::default(),
+            Menu {
+                folders: vec![],
+                delete_pending: None,
+                frames: vec![vec![egui::Event::Key {
+                    key: egui::Key::ArrowDown,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::default(),
+                }]],
+                filter: SidebarFilter::All,
+            },
+        );
+        assert_eq!(
+            p.selected.as_deref(),
+            Some("Vantage"),
+            "the arrow key did not move the selection, so this test never reached the \
+             thing it names"
+        );
+        assert!(
+            !p.row_opened,
+            "a keyboard move reported a row as opened; the slide is armed by a click, and \
+             arrowing through a list would animate the pane on every step"
+        );
+    }
+
+    /// A frame with no gesture at all reports nothing -- the flag is not
+    /// simply stuck on. Cheap, and it is the assertion that would have caught
+    /// `row_opened` being set from `outcome.select` instead of
+    /// `outcome.opened`, since the selection is non-empty on every one of
+    /// these frames.
+    #[test]
+    fn a_frame_with_no_click_reports_no_row_opened() {
+        let p = paint(&[full_login("Ledgerline")], Some("Ledgerline"));
+        assert!(
+            !p.row_opened,
+            "a frame that drew a selected row with no click on it reported the row as \
+             opened, so the slide would re-arm on every frame"
         );
     }
 
@@ -7401,6 +7610,9 @@ mod toolbar_strip_tests {
                     &mut visible,
                     None,
                     false,
+                    // This harness is not about the open gesture; the slide's arming is
+                    // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
+                    &mut false,
                 );
             })
         };
@@ -7847,6 +8059,9 @@ mod move_error_band_tests {
                     &mut visible,
                     move_error,
                     false,
+                    // This harness is not about the open gesture; the slide's arming is
+                    // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
+                    &mut false,
                 );
             })
         };
@@ -8248,6 +8463,9 @@ mod list_placeholder_paint_tests {
                     &mut visible,
                     None,
                     fetch_failed,
+                    // This harness is not about the open gesture; the slide's arming is
+                    // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
+                    &mut false,
                 );
             })
         };
@@ -8575,6 +8793,9 @@ mod keyboard_selection_tests {
                     &mut drawn,
                     None,
                     false,
+                    // This harness is not about the open gesture; the slide's arming is
+                    // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
+                    &mut false,
                 );
                 // AFTER the pane, where the window really draws them -- so the
                 // gate is being tested through the one-frame-late

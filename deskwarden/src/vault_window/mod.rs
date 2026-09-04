@@ -7,6 +7,7 @@
 
 pub mod detail;
 pub mod detail_edit;
+pub mod detail_slide;
 pub mod folder_modal;
 pub mod item_list;
 pub mod password_health;
@@ -191,6 +192,15 @@ pub(crate) const WINDOW_TITLE: &str = "Deskwarden";
 pub(crate) const WINDOW_SIZE: [f32; 2] = [1240.0, 740.0];
 pub(crate) const SIDEBAR_WIDTH: f32 = 212.0;
 pub(crate) const LIST_WIDTH: f32 = 390.0;
+
+/// The detail pane's width once it has finished coming in: everything the
+/// window has that the sidebar and the item list do not.
+///
+/// This is what the pane is LAID OUT at for every frame of the slide, however
+/// narrow the panel it is being clipped into -- see `detail_slide::reveal`.
+/// Derived from the other three rather than written as `638`, so a window or a
+/// column that is ever resized takes this with it.
+const RESTING_PANE_WIDTH: f32 = WINDOW_SIZE[0] - SIDEBAR_WIDTH - LIST_WIDTH;
 
 /// TOTP is re-fetched from `bw serve` on this interval while an item with a
 /// code is selected -- cheap enough to poll (one local HTTP call) and far
@@ -1003,6 +1013,10 @@ pub fn build_frame_with_search(
     // block, so it cannot suppress the first-item selection on a load that
     // lands after the user has picked a row and closed nothing.
     let mut detail_dismissed = false;
+    // The detail pane's slide-in, and specifically whether the next width
+    // change animates. See `detail_slide` for the arming rule; the two calls
+    // to `arm()` below are the whole of it.
+    let mut detail_slide = detail_slide::Slide::default();
     let mut mode = DetailMode::Read;
     // Every masked value the read pane can reveal -- a login's password, a
     // card's number and its security code. It lives HERE, in `run`'s
@@ -2726,9 +2740,46 @@ pub fn build_frame_with_search(
                     );
                 });
         }
+        // The detail pane's width this frame, and therefore the list's.
+        //
+        // Computed HERE, once, above both panels: the item list is sized from
+        // it and the read pane takes what is left, so a second computation
+        // would be a second answer to how the window is divided. `full` is the
+        // width the pane has always had -- everything beside the list -- so a
+        // fully-open pane is exactly what it was before there was an
+        // animation at all.
+        //
+        // Zero while the Sends or Password health screens are up: neither has
+        // a detail pane, and both take the whole area themselves.
+        let detail_pane_width = if show_sends || on_health {
+            0.0
+        } else {
+            let full = (ui.available_width() - LIST_WIDTH).max(0.0);
+            detail_slide.width(ui.ctx(), full, selected_id.is_some())
+        };
         if !show_sends && !on_health {
+            // **Whether a detail pane is on screen RIGHT NOW**, read before
+            // the list is drawn, because the list is what changes it. This is
+            // the "with no details panel" half of the owner's second gesture:
+            // clicking a row while a pane is already open swaps the pane's
+            // contents in place and must not animate.
+            let pane_shown_before_click = selected_id.is_some();
+            // Written by `draw_item_list` when a row is opened by a primary
+            // click. Cleared here, so it is this frame's gesture and not a
+            // stale one.
+            let mut row_opened = false;
+            // The list runs to the right edge when no detail pane is shown and
+            // gives the room back as the pane comes in -- a real reflow, whose
+            // width `detail_slide` animates. See `detail_pane_width` above.
+            //
+            // The builder chain below is kept SHORT on purpose:
+            // `item_pane_frame_placement_tests` reads the 400 characters after
+            // the panel's name and requires the frame inside them, so a
+            // comment between the two lines here would break that guard
+            // without any margin having been added.
+            let list_width = ui.available_width() - detail_pane_width;
             egui::Panel::left("vault-item-list")
-                .exact_size(LIST_WIDTH)
+                .exact_size(list_width)
                 .resizable(false)
                 .frame(egui::Frame::new().fill(theme::CANVAS))
                 .show(ui, |ui| {
@@ -2767,6 +2818,7 @@ pub fn build_frame_with_search(
                         // running. `aux_error` is this row's own `AuxList::error`
                         // and is the only one of the three that does.
                         aux_error.is_some(),
+                        &mut row_opened,
                     ) {
                         // The kind the `+ New` menu was clicked on -- `empty_of`,
                         // not `empty`, which would open a login form whatever row
@@ -2806,6 +2858,20 @@ pub fn build_frame_with_search(
                         ItemListAction::None => {}
                     }
                 });
+            // ARM SITE 2 OF 2: a row opened by a primary click while no detail
+            // pane was on screen. The other of the two gestures the owner
+            // named -- see `detail_slide`'s arming rule and the pin that holds
+            // this count at two.
+            //
+            // BOTH halves are load-bearing and neither is a state test.
+            // `row_opened` is the gesture, so a right-click (which selects on
+            // its way to a menu), a keyboard move and every selection made
+            // outside this panel are already excluded; `!pane_shown_before_
+            // click` is the "with no details panel" half, so clicking from one
+            // open item to another swaps the contents in place.
+            if row_opened && !pane_shown_before_click {
+                detail_slide.arm();
+            }
         }
 
         // Only the source that was actually on screen is cleared. Clearing
@@ -3496,6 +3562,20 @@ pub fn build_frame_with_search(
                     }
                 }
 
+                // **The pane is laid out at the width it comes to REST at**,
+                // however narrow the panel is mid-slide, and the panel clips
+                // it. See `detail_slide::reveal`: without this the read pane
+                // is laid out at every width between 0 and its own on the way
+                // in, and it has no sensible layout down there -- a sweep
+                // caught it painting a header control at x = -108.
+                //
+                // At rest this is a straight call through, so the shipped
+                // layout is unchanged.
+                //
+                // The Sends screen is NOT inside this: it is drawn in the
+                // branch above and takes the panel whole, with no detail pane
+                // beside it and nothing to slide.
+                detail_slide::reveal(ui, RESTING_PANE_WIDTH, |ui| {
                 match &mut mode {
                     // AN ITEM OUTSIDE THE LIVE VAULT GETS ITS OWN PANE, not
                     // the ordinary read pane with some buttons hidden. Every
@@ -3865,6 +3945,11 @@ pub fn build_frame_with_search(
                                 DetailAction::ClosePane => {
                                     selected_id = None;
                                     detail_dismissed = true;
+                                    // ARM SITE 1 OF 2: the ✕. One of the two
+                                    // gestures the owner named -- see
+                                    // `detail_slide`'s arming rule and the pin
+                                    // that holds this count at two.
+                                    detail_slide.arm();
                                 }
                                 // **The kebab's Move to folder, landing in the
                                 // SAME function the sidebar's drag-and-drop
@@ -4034,7 +4119,32 @@ pub fn build_frame_with_search(
                             // id it recorded and leaves the toast alone. See
                             // `detail::forget_copy_toast`.
                             detail::forget_copy_toast(ui.ctx());
-                            ui.label("Select an item.");
+                            // **No "Select an item." placeholder any more**,
+                            // and its absence is the point rather than an
+                            // omission.
+                            //
+                            // With nothing selected there is no detail pane at
+                            // all now: the item list runs to the right edge of
+                            // the window, so the label had no column left to
+                            // sit in and was clipped away in every resting
+                            // frame. The one place it WOULD still have been
+                            // visible is the worst one -- the ✕'s slide-out,
+                            // where the pane spends about a fifth of a second
+                            // retracting with `selected_id` already `None`.
+                            // The user would have watched the item they just
+                            // closed replaced by an instruction to open one,
+                            // sliding away.
+                            //
+                            // The pane retracts EMPTY instead. Keeping the
+                            // closed item on screen for the length of the
+                            // animation was the prettier option and is
+                            // deliberately not taken: it means holding a
+                            // `VaultItem` -- a decrypted one -- alive past the
+                            // moment the user dismissed it, purely for an
+                            // animation, in a window that goes to some lengths
+                            // to drop exactly that (see `forget_copy_toast`
+                            // just above, and the reveal state cleared on
+                            // every selection change).
                         }
                     }
                     // The editors clear it for the same reason, by the same
@@ -4266,6 +4376,7 @@ pub fn build_frame_with_search(
                         }
                     }
                 }
+                });
                 // The Sends screen was not showing this frame. Minting
                 // this is the ONE thing `mod.rs` may do without asking
                 // `send_ui` to draw, and it carries `SendUiAction::None`
@@ -21113,7 +21224,23 @@ mod copy_toast_wiring_tests {
     const CLEARS: &str = concat!("detail::forget_copy_toast", "(ui.ctx());");
     const EDIT: &str = concat!("DetailMode::Edit", "(draft) => {");
     const CREATE: &str = concat!("DetailMode::Create", "(draft) => {");
-    const NOTHING_SELECTED: &str = concat!("ui.label(\"Select an", " item.\");");
+    /// The no-selection branch's anchor.
+    ///
+    /// **This used to be the branch's "Select an item." label statement** --
+    /// spelled out only in [`OLD_LABEL`], which is `concat!`-split so this
+    /// module does not contain the needle it searches for. It is a comment
+    /// now because that label is gone: with nothing selected
+    /// there is no detail pane to put it in (the item list runs to the right
+    /// edge), so it was clipped away in every resting frame, and the only
+    /// frames it WOULD have shown in were the ✕'s slide-out -- the closed item
+    /// replaced by an instruction to open one, sliding away. See the branch.
+    ///
+    /// A comment is a weaker anchor than a statement, so
+    /// [`the_label_that_used_to_anchor_the_no_selection_branch_stays_gone`]
+    /// carries the other half: the label must not come back.
+    const NOTHING_SELECTED: &str = concat!("// **No \"Select an item.\" placeholder", " any more**,");
+    /// The label this branch no longer draws, for the test that keeps it gone.
+    const OLD_LABEL: &str = concat!("ui.label(\"Select an", " item.\");");
 
     fn source() -> &'static str {
         include_str!("mod.rs")
@@ -21157,7 +21284,10 @@ mod copy_toast_wiring_tests {
         for (marker, what, before, after) in [
             (EDIT, "the edit pane", 0usize, 120usize),
             (CREATE, "the create pane", 0, 120),
-            (NOTHING_SELECTED, "the no-selection branch", 120, 0),
+            // The clear sits immediately BEFORE this branch's anchor
+            // comment, so the window is widened a little to hold the comment
+            // itself -- see `NOTHING_SELECTED`.
+            (NOTHING_SELECTED, "the no-selection branch", 200, 0),
         ] {
             assert_eq!(occurrences(source, marker), 1, "expected exactly one {marker:?}");
             let branch = window(source, marker, before, after);
@@ -21169,6 +21299,28 @@ mod copy_toast_wiring_tests {
                  {branch}"
             );
         }
+    }
+
+    /// **The "Select an item." label stays gone**, which is the other half of
+    /// [`NOTHING_SELECTED`] having become a comment.
+    ///
+    /// Reintroducing it would not fail any other test in this crate -- it
+    /// draws in a branch whose pane is zero points wide at rest, so nothing
+    /// that renders a resting frame can see it. The only frames it appears in
+    /// are the ~180ms of the ✕'s slide-out, which no test renders and no
+    /// screenshot can catch, and there it is actively wrong: the item the user
+    /// just closed, replaced by an instruction to open one, retracting off the
+    /// right of the window.
+    #[test]
+    fn the_label_that_used_to_anchor_the_no_selection_branch_stays_gone() {
+        assert_eq!(
+            occurrences(source(), OLD_LABEL),
+            0,
+            "{OLD_LABEL:?} is back. There is no detail pane when nothing is selected -- the \
+             item list runs to the window's right edge -- so this label is invisible at \
+             rest and visible only while the pane slides out, which is the one place it \
+             must not be"
+        );
     }
 }
 /// The two arguments the EDIT form is handed at [`build_frame`]'s seam, and
@@ -21654,9 +21806,13 @@ mod preferences_modal_wiring_tests {
             // export and its Sends actually EXECUTE on each backend, counted
             // at `job_object`'s spawn recorder rather than inferred from
             // which backend was chosen.
+            // 64 as of the detail pane's slide, which added
+            // `mod detail_slide_arming_tests` -- that the animation is armed
+            // at exactly two places, the ✕ and a row opened with no pane
+            // shown, and that the pane is drawn inside `reveal`.
             // Raised deliberately: one more module must now be a clean,
             // column-0, gated block that the walk really reaches.
-            modules, 63,
+            modules, 64,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -33820,6 +33976,160 @@ mod no_cli_on_the_direct_path_tests {
              once, so the zero counted for the direct-REST account is not evidence of \
              anything: {:?}",
             programs(&attempts)
+        );
+    }
+}
+
+/// **The detail pane's slide is armed at EXACTLY TWO places, and here they
+/// are.**
+///
+/// The owner's rule is a rule about GESTURES, not about state, and it is
+/// narrower than "the selection changed":
+///
+/// > "it only happens on close-open, if something already open and user clicks
+/// > another item - no animation, just new item data populated on the same
+/// > place"
+///
+/// > "the window opening with an item already selected - no animation, as I
+/// > said ONLY on X icon or result clicked with no details panel"
+///
+/// The value of that rule is entirely in its narrowness, and narrowness is not
+/// something a behavioural test can defend: every test in this crate would go
+/// on passing if a third call to `arm()` appeared tomorrow beside
+/// `apply_vault_load_result`'s auto-select, and the pane would then slide in
+/// at random moments while the vault refreshed in the background. So the
+/// COUNT is pinned, and both sites are named.
+///
+/// **Why the count alone settles the rest.** The two occurrences are matched
+/// to the two contexts below, so a count of two with both contexts found means
+/// there is no third call anywhere in this file -- including inside
+/// `apply_vault_load_result`, `Create`'s select-what-was-just-made, the
+/// right-click handler, and the sync paths that restore or drop a selection.
+/// None of them needs its own assertion; they are covered by there being
+/// nothing left over.
+///
+/// Needles are `concat!`-split and single-line, for this file's standing
+/// reason: `include_str!("mod.rs")` pulls in this module too, so an unsplit
+/// needle would match its own source and inflate every count here. Do NOT
+/// re-join them.
+#[cfg(test)]
+mod detail_slide_arming_tests {
+    /// The call itself. Split so this module's own text is not a third "site".
+    const ARM: &str = concat!("detail_slide.", "arm();");
+    /// Arm site 1: the header's ✕.
+    const CLOSE: &str = concat!("DetailAction::Close", "Pane => {");
+    /// Arm site 2: a row opened by a primary click with no pane on screen.
+    const ROW: &str = concat!("if row_opened && !pane_shown_", "before_click {");
+
+    /// How far back from a call to look for the context that explains it.
+    /// Generous enough to clear the comment each site carries, tight enough
+    /// that it cannot reach the other site.
+    const LOOKBACK: usize = 900;
+
+    #[test]
+    fn arm_sites_are_exactly_the_two_the_owner_named() {
+        let source = include_str!("mod.rs");
+
+        let at: Vec<usize> = source.match_indices(ARM).map(|(i, _)| i).collect();
+        assert_eq!(
+            at.len(),
+            2,
+            "the detail pane's slide is armed at {} places, and the owner's rule allows \
+             exactly two: the header's ✕, and a row opened by a primary click while no \
+             detail pane is shown. A third arming site is how the pane starts sliding on \
+             a background sync -- see `detail_slide`'s arming rule before adding one",
+            at.len()
+        );
+
+        // Each call matched to the context that explains it, by looking back
+        // from the call rather than forward from the context: the context
+        // markers are `match` arms and `if` conditions that exist whether or
+        // not they arm anything, so searching forward would happily pair a
+        // context with some LATER site.
+        let context_of = |call: usize| -> &'static str {
+            let from = call.saturating_sub(LOOKBACK);
+            let before = &source[from..call];
+            match (before.rfind(CLOSE), before.rfind(ROW)) {
+                // Both in view: the nearer one is this call's.
+                (Some(c), Some(r)) => {
+                    if c > r {
+                        "close"
+                    } else {
+                        "row"
+                    }
+                }
+                (Some(_), None) => "close",
+                (None, Some(_)) => "row",
+                (None, None) => "unexplained",
+            }
+        };
+        let mut found: Vec<&str> = at.into_iter().map(context_of).collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            vec!["close", "row"],
+            "the two arming sites are not the ✕ ({CLOSE:?}) and the row-opened-with-no-pane \
+             guard ({ROW:?}); an \"unexplained\" entry is a call to `arm()` somewhere this \
+             rule does not reach"
+        );
+    }
+
+    /// **The detail pane is drawn inside `reveal`.** Without that wrapper the
+    /// pane is laid out at every width between 0 and its own on the way in,
+    /// and it has no layout down there -- a sweep caught a header control at
+    /// x = -108, the same class as the x = -34.5 this pane has already had
+    /// once at a real window size.
+    ///
+    /// A source pin because the hazard is STRUCTURAL: `detail_slide::reveal`'s
+    /// own tests prove the function is right, and every existing pane test
+    /// draws at the resting width, where `reveal` is a call straight through.
+    /// So deleting the wrapper leaves the whole suite green and breaks only
+    /// the frames nothing renders in a test.
+    #[test]
+    fn the_detail_panes_modes_are_drawn_inside_the_slides_reveal() {
+        let source = include_str!("mod.rs");
+        let call = concat!("detail_slide::", "reveal(ui, RESTING_PANE_WIDTH, |ui| {");
+        let dispatch = concat!("match &mut ", "mode {");
+        let at = source
+            .find(call)
+            .unwrap_or_else(|| panic!("the detail pane is no longer wrapped in {call:?}"));
+        let next = source[at + call.len()..]
+            .find(dispatch)
+            .unwrap_or_else(|| panic!("no {dispatch:?} after the reveal"));
+        assert!(
+            next < 800,
+            "the pane's mode dispatch is {next} characters after the reveal that is meant \
+             to contain it -- something has been placed between them, so the modes may no \
+             longer all be inside it"
+        );
+    }
+
+    /// **The row-click site is guarded on BOTH halves of the gesture**, which
+    /// the count test above cannot see -- it would be just as happy with
+    /// `if row_opened {`, and that arms on every click including the ones that
+    /// merely swap one open item for another.
+    ///
+    /// `row_opened` is the gesture half (a primary click, so a right-click and
+    /// a keyboard move are already out -- see `item_list::RowOutcome::opened`)
+    /// and `!pane_shown_before_click` is the "with no details panel" half.
+    #[test]
+    fn the_row_click_site_requires_both_the_click_and_an_empty_pane() {
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains(ROW),
+            "the row-click arming site is no longer guarded by {ROW:?}. Dropping the \
+             `!pane_shown_before_click` half makes every row click animate, including a \
+             click from one open item to another -- which the owner ruled out explicitly"
+        );
+        // The flag really is written by the list, and by the gesture rather
+        // than by the selection. Without this the guard could be reading a
+        // variable nothing ever sets, and the animation would simply never
+        // arm on a click.
+        let sets = concat!("&mut row_", "opened,");
+        assert!(
+            source.contains(sets),
+            "`row_opened` is no longer passed to `draw_item_list`, so nothing sets the flag \
+             the row-click arming site reads"
         );
     }
 }
