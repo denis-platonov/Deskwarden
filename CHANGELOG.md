@@ -89,6 +89,37 @@ you closed the vault — the background process was busy being the window. It
 builds the tray first now, so the icon, the fill hotkey and autofill are all
 there while the sign-in card is still on screen.
 
+## 0.15.12 - 2026-09-03
+
+### "Restart to update" installs the update
+
+Pressing it did nothing at all: no new version, no error, nothing in the
+log. Deskwarden asked Windows to run the installer and Windows did — but
+setup found Deskwarden still running, and because a silent install has
+nobody to ask, it gave up without a word.
+
+The window you press the button in is not the part of Deskwarden that setup
+objects to. Deskwarden now stands the rest of itself down and waits until it
+is really gone before starting the installer, and says so if it cannot.
+
+**Every way this can fail now says why**, on the page and in the log. Before,
+three of the paths through that button ended in silence.
+
+### A downloaded update is not deleted while you are about to install it
+
+Deskwarden clears abandoned downloads when it starts. It decided what was
+abandoned from the file's name alone — so a restart while the Updates page
+sat ready would delete the very installer that page was about to run.
+
+The process that downloads one now holds a claim on it, and the clean-up
+skips anything still claimed. Genuinely abandoned downloads are still
+removed, at the same moment as before.
+
+### The Updates page names the release once
+
+It stacked the release's name three times above the notes. Now there is one
+heading: the release's own.
+
 ## 0.15.11 - 2026-09-03
 
 ### Unlocking a self-hosted vault actually unlocks it
