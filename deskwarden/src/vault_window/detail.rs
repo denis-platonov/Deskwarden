@@ -2939,18 +2939,40 @@ pub fn draw_detail_read(
             // agreeing by hand.
             let draw_avatar = |ui: &mut egui::Ui| match icon {
                 Some(tex) => {
-                    // Rounded to match `theme::avatar`'s initials-tile
-                    // treatment (same `size * 0.25` formula) -- see
-                    // `item_list.rs`'s matching fix for why an unrounded
-                    // favicon in an identical box reads as visually
-                    // heavier than the monogram fallback.
-                    ui.add(
-                        egui::Image::new((tex.id(), tex.size_vec2()))
-                            .fit_to_exact_size(egui::Vec2::splat(HEADER_AVATAR))
-                            .corner_radius(CornerRadius::same((HEADER_AVATAR * 0.25) as u8)),
-                    );
+                    // **The TILE, then the artwork in it** -- the item row's
+                    // own two calls, at this header's size.
+                    //
+                    // This used to be a bare `egui::Image`, rounded to the
+                    // same `size * 0.25` the tile is rounded to and otherwise
+                    // drawn on nothing. That is the half of the tile a rounded
+                    // corner cannot supply: `theme::avatar_tile` also paints
+                    // the FILL, which is what a favicon with transparent
+                    // margins (most of them) shows through, and the BORDER,
+                    // which is the edge every monogram and every list row's
+                    // favicon has. Without them a pale or inset icon floated
+                    // on the header's white with no boundary of its own,
+                    // while the very same icon two hundred points to its left
+                    // in the list sat in a bordered tile. `detail_login_
+                    // favicon` in `ui_preview` is the picture of that.
+                    //
+                    // `theme::avatar_image` carries the rest of the reasoning
+                    // -- full bleed, the corner radius given to the image so
+                    // it is clipped to the tile's curve, and the border
+                    // redrawn over the artwork.
+                    let tile = theme::avatar_tile(ui, HEADER_AVATAR, true);
+                    theme::avatar_image(ui, tile, tex, true);
                 }
-                None => theme::avatar(ui, &theme::initials(&item.name), HEADER_AVATAR, true),
+                // The list row's tile and this one are the same tile at two
+                // sizes, so they take the same branch from the same place:
+                // an item whose row shows a note mark must not open onto a
+                // header showing a letter pair. See `kind_mark`.
+                None => crate::kind_mark::avatar(
+                    ui,
+                    ItemKind::of(item),
+                    &item.name,
+                    HEADER_AVATAR,
+                    true,
+                ),
             };
             // The title column, in whatever it has been left. It TRUNCATES
             // rather than wrapping: the design draws one line, and a name
@@ -9023,30 +9045,58 @@ mod tests {
     /// the probe does not go blind if egui changes which of the two it emits;
     /// every caller pairs an emptiness claim with a positive control that
     /// would catch a probe that found nothing either way.
-    /// The pane's texts, plus every NETWORK MARK it painted.
+    /// The pane's texts, every NETWORK MARK it painted, and -- separately --
+    /// every blue shape it painted INSIDE THE HEADER'S AVATAR TILE.
     ///
-    /// A mark is a `theme::BLUE` ground with a word on it, so that is what this
-    /// looks for -- not "a textured rect", which is what it looked for while
-    /// the marks were PNGs. The pane paints no other blue ground on the rows
-    /// this is used against.
-    fn painted_with_marks(item: &VaultItem) -> (Vec<String>, Vec<egui::Rect>) {
-        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+    /// A network mark is a `theme::BLUE` ground with a word on it, so that is
+    /// what this looks for -- not "a textured rect", which is what it looked
+    /// for while the marks were PNGs.
+    ///
+    /// **The third return is the split this helper grew.** Its doc used to
+    /// finish "the pane paints no other blue ground on the rows this is used
+    /// against", and that stopped being true when the header's avatar tile
+    /// started carrying `kind_mark`'s glyph: a card's mark includes a FILLED
+    /// stripe, drawn in the header's emphasized ink, which is `theme::BLUE`.
+    /// Left in the first return it read as a second network badge on a pane
+    /// that had drawn none.
+    ///
+    /// It is SPLIT OUT rather than filtered away, and the callers assert on
+    /// it, so the tile cannot become a place a stray blue ground hides.
+    /// The tile locates itself: it is the one `theme::BLUE_WASH` square the
+    /// pane paints at [`HEADER_AVATAR`].
+    fn painted_with_marks(
+        item: &VaultItem,
+    ) -> (Vec<String>, Vec<egui::Rect>, Vec<egui::Rect>) {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>, tiles: &mut Vec<egui::Rect>) {
             match shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == theme::BLUE_WASH
+                        && (rect.rect.width() - HEADER_AVATAR).abs() < 0.5
+                        && (rect.rect.height() - HEADER_AVATAR).abs() < 0.5 =>
+                {
+                    tiles.push(rect.rect);
+                }
                 egui::Shape::Rect(rect) if rect.fill == theme::BLUE => out.push(rect.rect),
                 egui::Shape::Vec(shapes) => {
                     for shape in shapes {
-                        walk(shape, out);
+                        walk(shape, out, tiles);
                     }
                 }
                 _ => {}
             }
         }
         let shapes = frame_shapes(item, &TotpState::NoSecret, RevealState::default());
-        let mut marks = Vec::new();
+        let (mut marks, mut tiles) = (Vec::new(), Vec::new());
         for clipped in &shapes {
-            walk(&clipped.shape, &mut marks);
+            walk(&clipped.shape, &mut marks, &mut tiles);
         }
-        (painted(item, &TotpState::NoSecret), marks)
+        let in_tile: Vec<egui::Rect> = marks
+            .iter()
+            .copied()
+            .filter(|m| tiles.iter().any(|t| t.contains_rect(*m)))
+            .collect();
+        marks.retain(|m| !tiles.iter().any(|t| t.contains_rect(*m)));
+        (painted(item, &TotpState::NoSecret), marks, in_tile)
     }
 
     fn contains(texts: &[String], needle: &str) -> bool {
@@ -13936,10 +13986,19 @@ mod tests {
         let card = item.card.as_mut().expect("a_full_card has card data");
         card.brand = Some("Not A Network".to_string());
         card.number = Some("1234567890123".to_string().into());
-        let (texts, marks) = painted_with_marks(&item);
+        let (texts, marks, in_tile) = painted_with_marks(&item);
         assert!(
             marks.is_empty(),
             "an unrecognised brand painted a badge: {marks:?}"
+        );
+        // ...and the blue the tile DOES hold is the card KIND mark, which
+        // every card gets and which says nothing about the network. Asserted
+        // rather than merely excluded, so the split above cannot become a
+        // place a stray badge hides.
+        assert_eq!(
+            in_tile.len(),
+            1,
+            "the header tile did not draw the card mark's one filled stripe: {in_tile:?}"
         );
         assert!(
             contains(&texts, "• •••• •••• 0123"),
@@ -13948,7 +14007,7 @@ mod tests {
         // The control, and it is what makes the emptiness above mean
         // something: the SAME pane with a brand it does know paints exactly
         // one mark, at the size the pane draws it.
-        let (_, visa) = painted_with_marks(&a_full_card());
+        let (_, visa, _) = painted_with_marks(&a_full_card());
         assert_eq!(
             visa.len(),
             1,
@@ -13981,9 +14040,21 @@ mod tests {
             texts: &mut Vec<(String, egui::Rect)>,
             grounds: &mut Vec<egui::Rect>,
             images: &mut Vec<egui::Rect>,
+            tiles: &mut Vec<egui::Rect>,
         ) {
             match shape {
                 egui::Shape::Rect(rect) if rect.brush.is_some() => images.push(rect.rect),
+                // The header avatar tile's own blue-wash square, and anything
+                // blue inside it, belong to `kind_mark`'s glyph and not to a
+                // wordmark pill -- see `painted_with_marks`, which makes the
+                // same split for the same reason.
+                egui::Shape::Rect(rect)
+                    if rect.fill == theme::BLUE_WASH
+                        && (rect.rect.width() - HEADER_AVATAR).abs() < 0.5
+                        && (rect.rect.height() - HEADER_AVATAR).abs() < 0.5 =>
+                {
+                    tiles.push(rect.rect);
+                }
                 egui::Shape::Rect(rect) if rect.fill == theme::BLUE => grounds.push(rect.rect),
                 egui::Shape::Text(text) => {
                     texts.push((
@@ -13995,7 +14066,7 @@ mod tests {
                 }
                 egui::Shape::Vec(shapes) => {
                     for shape in shapes {
-                        walk(shape, texts, grounds, images);
+                        walk(shape, texts, grounds, images, tiles);
                     }
                 }
                 _ => {}
@@ -14004,9 +14075,15 @@ mod tests {
         let shapes =
             frame_shapes_with_marks(item, &TotpState::NoSecret, RevealState::default(), marks);
         let (mut texts, mut grounds, mut images) = (Vec::new(), Vec::new(), Vec::new());
+        let mut tiles = Vec::new();
         for clipped in &shapes {
-            walk(&clipped.shape, &mut texts, &mut grounds, &mut images);
+            walk(&clipped.shape, &mut texts, &mut grounds, &mut images, &mut tiles);
         }
+        grounds.retain(|g| !tiles.iter().any(|t| t.contains_rect(*g)));
+        // The tile is not optional on this pane: the header always draws one,
+        // so an empty list here means the walk missed it and every `grounds`
+        // claim below is being made about a pane nobody found.
+        assert!(!tiles.is_empty(), "no header avatar tile was painted at all");
         (texts, grounds, images)
     }
 

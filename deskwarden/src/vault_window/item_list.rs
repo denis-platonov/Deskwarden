@@ -9,6 +9,7 @@ use super::detail_edit::assignable_folders;
 use super::sidebar::{FilterSource, OutOfVault, SidebarFilter};
 use crate::card_brand::{brand_for_number, CardBrand};
 use crate::card_mark;
+use crate::kind_mark;
 use crate::theme;
 use crate::vault_bridge::{Folder, ItemKind, VaultItem};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
@@ -1781,9 +1782,19 @@ fn item_row(
                         let tile = theme::avatar_tile(ui, AVATAR_SIZE, selected);
                         theme::avatar_image(ui, tile, tex, selected);
                     }
-                    None => {
-                        theme::avatar(ui, &theme::initials(&item.name), AVATAR_SIZE, selected)
-                    }
+                    // No favicon: the item's KIND draws the tile. A login and
+                    // an unsupported kind still get the name's monogram --
+                    // `kind_mark::avatar` is the one place that branch is
+                    // made, and its module doc carries why a card's tile is
+                    // the generic card mark while `VISA` stays out on the
+                    // trailing pill.
+                    None => kind_mark::avatar(
+                        ui,
+                        ItemKind::of(item),
+                        &item.name,
+                        AVATAR_SIZE,
+                        selected,
+                    ),
                 }
                 // The design's title column is `flex: 1` with the chips
                 // trailing it. Laid out right-to-left so the chips take their
@@ -2969,6 +2980,19 @@ mod row_tile_tests {
 
     struct Painted {
         rects: Vec<RectShape>,
+        /// Every stroked circle, straight run and open path the frame drew.
+        ///
+        /// **Added for `kind_mark`.** The four kind marks are `egui` strokes
+        /// -- circles, line segments and one open path -- and this walk threw
+        /// all three away, so a test asking "WHICH mark was drawn" could only
+        /// have answered off the rects, and three of the four would have
+        /// looked alike. That is the house's own defect class: a test that
+        /// passes because it never reached the thing it names. With these
+        /// collected, `note`, `card`, `identity` and `ssh_key` are told apart
+        /// by the shapes they are actually made of.
+        circles: Vec<egui::epaint::CircleShape>,
+        segments: Vec<([egui::Pos2; 2], Stroke)>,
+        paths: Vec<egui::epaint::PathShape>,
         texts: Vec<(String, egui::Rect, egui::Color32)>,
         /// Every painted run, with the y its box was painted at.
         ///
@@ -2987,6 +3011,9 @@ mod row_tile_tests {
     fn walk(shape: &egui::Shape, p: &mut Painted) {
         match shape {
             egui::Shape::Rect(rect) => p.rects.push(rect.clone()),
+            egui::Shape::Circle(circle) => p.circles.push(*circle),
+            egui::Shape::LineSegment { points, stroke } => p.segments.push((*points, *stroke)),
+            egui::Shape::Path(path) => p.paths.push(path.clone()),
             egui::Shape::Text(text) => {
                 if let Some(section) = text.galley.job.sections.first() {
                     p.fonts
@@ -3224,6 +3251,9 @@ mod row_tile_tests {
 
         let mut painted = Painted {
             rects: Vec::new(),
+            circles: Vec::new(),
+            segments: Vec::new(),
+            paths: Vec::new(),
             texts: Vec::new(),
             galleys: Vec::new(),
             fonts: Vec::new(),
@@ -4334,6 +4364,78 @@ mod row_tile_tests {
         v
     }
 
+    /// Everything drawn INSIDE `tile` that is not the tile itself, in
+    /// TILE-RELATIVE coordinates: the smaller rects, the circles and the
+    /// straight runs, each with the ink it was drawn in.
+    ///
+    /// This is how one kind's mark is told from another's, and how two rows'
+    /// tiles are compared to each other. Relative coordinates are the whole
+    /// trick: two tiles sit at different y, so absolute geometry would differ
+    /// for two rows that drew exactly the same glyph.
+    ///
+    /// It reads `rects`, `circles` AND `segments`, because the four marks are
+    /// not made of the same shapes as each other -- a probe that looked only
+    /// at rects would find the note and the card and report the identity and
+    /// the key as identically empty.
+    fn tile_glyph_in(
+        p: &Painted,
+        tile: egui::Rect,
+    ) -> Vec<(egui::Vec2, egui::Vec2, egui::Color32)> {
+        let mut out: Vec<(egui::Vec2, egui::Vec2, egui::Color32)> = p
+            .rects
+            .iter()
+            // Not the tile's own fill or border, which are drawn at its full
+            // size; everything smaller that fits inside it is the glyph.
+            .filter(|r| r.rect.width() < tile.width() - 0.5 && tile.contains_rect(r.rect))
+            .map(|r| {
+                let ink = if r.fill == egui::Color32::TRANSPARENT { r.stroke.color } else { r.fill };
+                (r.rect.min - tile.min, r.rect.max - tile.min, ink)
+            })
+            .collect();
+        out.extend(
+            p.circles
+                .iter()
+                .filter(|c| tile.contains(c.center))
+                .map(|c| {
+                    (
+                        c.center - tile.min,
+                        egui::vec2(c.radius, c.radius),
+                        if c.fill == egui::Color32::TRANSPARENT { c.stroke.color } else { c.fill },
+                    )
+                }),
+        );
+        out.extend(
+            p.segments
+                .iter()
+                .filter(|(pts, _)| tile.contains(pts[0]) && tile.contains(pts[1]))
+                .map(|(pts, st)| (pts[0] - tile.min, pts[1] - tile.min, st.color)),
+        );
+        out
+    }
+
+    /// Whether two [`tile_glyph_in`] readings are the SAME glyph.
+    ///
+    /// Compared to a twentieth of a point rather than exactly, because two
+    /// tiles on two rows are allocated at two fractional y offsets: the same
+    /// glyph drawn twice comes back with sub-pixel differences that neither a
+    /// reader nor `Debug`'s own precision can see.
+    fn same_glyph(
+        a: &[(egui::Vec2, egui::Vec2, egui::Color32)],
+        b: &[(egui::Vec2, egui::Vec2, egui::Color32)],
+    ) -> bool {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|((a0, a1, ac), (b0, b1, bc))| {
+                (*a0 - *b0).length() < 0.05 && (*a1 - *b1).length() < 0.05 && ac == bc
+            })
+    }
+
+    /// [`tile_glyph_in`] for a frame with exactly one avatar tile on it.
+    fn tile_glyph(p: &Painted) -> Vec<(egui::Vec2, egui::Vec2, egui::Color32)> {
+        let tiles = avatar_tiles(p);
+        assert_eq!(tiles.len(), 1, "expected one avatar tile, painted {}", tiles.len());
+        tile_glyph_in(p, tiles[0])
+    }
+
     /// Every network mark painted inside `area`, with the word on it: a
     /// `theme::BLUE` ground, and whichever painted text sits inside that
     /// ground. Top to bottom.
@@ -4653,14 +4755,133 @@ mod row_tile_tests {
         );
     }
 
+
+    /// A fixture of any kind, built off [`login`] so only the type number and
+    /// the kind's own payload differ.
+    fn of_kind(name: &str, item_type: i64) -> VaultItem {
+        VaultItem { item_type: Some(item_type), login: None, ..login(name, "") }
+    }
+
+    /// **Every non-login kind draws its OWN mark, and no two are alike.**
+    ///
+    /// The house's defect class is a test that passes because it never
+    /// reached the thing it names, and "a mark was painted" is exactly that
+    /// shape: it would pass with all four glyphs identical, which is the
+    /// defect the owner reported in the first place ("we should also have
+    /// different icons for SSH, notes, IDs" -- they had four rows that all
+    /// looked the same).
+    ///
+    /// So this asserts the discriminating thing directly: each kind's tile is
+    /// compared to every OTHER kind's, and each pair must differ. It is read
+    /// through [`tile_glyph_in`], which sees the circles and the straight runs
+    /// as well as the rects -- a probe that saw only rects would report the
+    /// identity and the key as identically empty and pass.
     #[test]
-    fn a_card_with_no_bank_domain_takes_the_monogram_tile_and_still_wears_its_mark() {
-        // With the mark off the tile, a card with no issuer icon is not a
-        // special case any more: it gets the SAME monogram tile every other
-        // iconless row gets, and the network is named beside it. That is the
-        // whole simplification -- the tile answers "who issued this" and the
-        // pill answers "which network", and neither has to stand in for the
-        // other.
+    fn each_non_login_kind_draws_a_mark_of_its_own_and_no_two_are_alike() {
+        // Note, card, identity, SSH key: the four the owner named.
+        let kinds = [(2i64, "note"), (3, "card"), (4, "identity"), (5, "ssh key")];
+        let glyphs: Vec<(&str, Vec<(egui::Vec2, egui::Vec2, egui::Color32)>)> = kinds
+            .iter()
+            .map(|(item_type, label)| {
+                let p = paint(&[of_kind("Anna Novak", *item_type)], None);
+                assert!(
+                    !p.texts.iter().any(|(t, _, _)| t == "AN"),
+                    "the {label} row drew the name's monogram instead of a mark"
+                );
+                assert!(
+                    !p.rects.iter().any(|r| r.brush.is_some()),
+                    "the {label} row drew a texture -- a mark is strokes, not an image"
+                );
+                let glyph = tile_glyph(&p);
+                assert!(!glyph.is_empty(), "the {label} row drew an EMPTY tile");
+                (*label, glyph)
+            })
+            .collect();
+        for (i, (one, a)) in glyphs.iter().enumerate() {
+            for (other, b) in glyphs.iter().skip(i + 1) {
+                assert!(
+                    !same_glyph(a, b),
+                    "the {one} mark and the {other} mark are the same drawing: {a:?}"
+                );
+            }
+        }
+    }
+
+    /// **A login and an unsupported kind keep the monogram**, which is the
+    /// decision `kind_mark::has_mark` makes and the half the test above
+    /// cannot state.
+    #[test]
+    fn a_login_and_an_unknown_kind_still_wear_the_names_monogram() {
+        for item_type in [1i64, 9] {
+            let p = paint(&[of_kind("Anna Novak", item_type)], None);
+            assert!(
+                p.texts.iter().any(|(t, _, _)| t == "AN"),
+                "type {item_type} lost its monogram; painted: {:?}",
+                p.texts
+            );
+            assert!(
+                tile_glyph(&p).is_empty(),
+                "type {item_type} drew a mark in its tile as well as a monogram: {:?}",
+                tile_glyph(&p)
+            );
+        }
+    }
+
+    /// **A selected row's mark inverts with the tile, and does not vanish
+    /// into it.**
+    ///
+    /// The selected treatment paints the tile `theme::BLUE_WASH`, so a mark
+    /// that kept its unselected grey would sink into it and a mark drawn in
+    /// the wash itself would disappear entirely. Asserted for ALL FOUR kinds
+    /// and against the exact pair `theme::avatar`'s monogram uses, so a mark
+    /// cannot be "some other blue" that happens to be visible today.
+    #[test]
+    fn every_kind_mark_inverts_on_the_selected_row_the_way_the_monogram_does() {
+        for item_type in [2i64, 3, 4, 5] {
+            let name = "Anna Novak";
+            for (selected, expected) in
+                [(None, theme::TEXT_MUTED), (Some(name), theme::BLUE)]
+            {
+                let p = paint(&[of_kind(name, item_type)], selected);
+                let glyph = tile_glyph(&p);
+                assert!(!glyph.is_empty(), "type {item_type} drew nothing to colour");
+                for (_, _, ink) in &glyph {
+                    assert_eq!(
+                        *ink, expected,
+                        "type {item_type} drew part of its mark in {ink:?} on a row whose \
+                         monogram would have been {expected:?}"
+                    );
+                }
+                assert_ne!(
+                    expected,
+                    theme::BLUE_WASH,
+                    "the ink and the selected tile's ground must never be the same colour"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_with_no_bank_domain_takes_the_kind_tile_and_still_wears_its_mark() {
+        // With the network mark off the tile, a card with no issuer icon is
+        // not a special case any more: the tile answers "what kind of thing is
+        // this" and the pill answers "which network", and neither stands in
+        // for the other.
+        //
+        // **The needle moved, and it moved to assert MORE.** This test used to
+        // finish by asserting the tile drew the name's MONOGRAM. The owner has
+        // since asked for a mark per kind ("we should also have different
+        // icons for SSH, notes, IDs"), so a card's tile is now `kind_mark`'s
+        // card glyph: the monogram claim is a claim about a decision that has
+        // been reversed, and keeping it would have pinned the defect.
+        //
+        // What replaces it says more than it did. The old assertion was that
+        // ONE card drew ONE letter pair. The new one is that a Visa row and a
+        // Mastercard row draw the same tile as each other, shape for shape --
+        // which is what "the tile is not card-special" actually means, and
+        // which the monogram assertion could not have caught: two cards with
+        // different names have different monograms, so it would have passed
+        // just as happily over a tile that varied by brand.
         let p = paint(
             &[card_branded("BoA Credit", "Visa"), card_branded("MC Credit", "Mastercard")],
             None,
@@ -4690,11 +4911,32 @@ mod row_tile_tests {
                 mark.height()
             );
         }
-        // The monogram IS what the tile shows -- the rung this used to skip.
+        // No letter pair on either row: the tile is the KIND's mark now.
+        for monogram in ["BC", "MC"] {
+            assert!(
+                !p.texts.iter().any(|(t, _, _)| t == monogram),
+                "a card row still drew the {monogram:?} monogram: {:?}",
+                p.texts
+            );
+        }
+        // ...and no texture on either row: nothing in a card's tile is an
+        // image, whether or not this app can name its network.
         assert!(
-            p.texts.iter().any(|(t, _, _)| t == "BC"),
-            "the monogram was not drawn, so the tile is still card-special: {:?}",
-            p.texts
+            !p.rects.iter().any(|r| r.brush.is_some()),
+            "a card with no bank domain painted a texture"
+        );
+        let glyphs: Vec<_> = tiles.iter().map(|t| tile_glyph_in(&p, *t)).collect();
+        assert!(
+            !glyphs[0].is_empty(),
+            "nothing was drawn inside the first card's tile, so the comparison below compares \
+             two empty lists"
+        );
+        assert!(
+            same_glyph(&glyphs[0], &glyphs[1]),
+            "a Visa row and a Mastercard row drew different tiles, so the tile is still \
+             card-special: {:?} vs {:?}",
+            glyphs[0],
+            glyphs[1]
         );
     }
 
@@ -5079,20 +5321,38 @@ mod row_tile_tests {
     }
 
     #[test]
-    fn a_brand_this_app_cannot_name_falls_all_the_way_back_to_the_monogram() {
-        // No mark, no placeholder, no question mark -- the row looks
-        // exactly as it did before any of this existed. The fixture also
+    fn a_brand_this_app_cannot_name_falls_all_the_way_back_to_the_plain_card_tile() {
+        // No network mark, no placeholder, no question mark. The fixture also
         // carries a Visa NUMBER, so this pins the decision the spec makes: a
         // card the user labelled "Ledger Coin" is not quietly relabelled a
         // Visa by its leading digits.
+        //
+        // **The needle moved with the tile, and to assert more.** It read "the
+        // monogram must still be drawn", which was this test's way of saying
+        // "the tile said nothing about the network". A card's tile is now
+        // `kind_mark`'s card glyph, so there is no monogram to assert -- and
+        // the replacement says the stronger thing directly: this row's tile is
+        // drawn identically to that of a card whose brand the app DOES know,
+        // so nothing about an unnameable brand leaks into it.
         let mut item = card_branded("Bank Coin", "Ledger Coin");
         item.card.as_mut().unwrap().number =
             Some(zeroize::Zeroizing::new("4111111111111111".to_string()));
         let p = paint(&[item], None);
         assert!(
-            p.texts.iter().any(|(t, _, _)| t == "BC"),
-            "the monogram must still be drawn; painted: {:?}",
+            !p.texts.iter().any(|(t, _, _)| t == "BC"),
+            "a card row drew a monogram instead of its kind mark; painted: {:?}",
             p.texts
+        );
+        let unnameable = tile_glyph(&p);
+        assert!(
+            !unnameable.is_empty(),
+            "no glyph at all was drawn in the tile, so the comparison below is vacuous"
+        );
+        let nameable = tile_glyph(&paint(&[card_branded("Bank Coin", "Visa")], None));
+        assert!(
+            same_glyph(&unnameable, &nameable),
+            "a card whose brand this app cannot name drew a different tile from one it can: \
+             {unnameable:?} vs {nameable:?}"
         );
         let row = row_tiles(&p)[0].rect;
         assert!(

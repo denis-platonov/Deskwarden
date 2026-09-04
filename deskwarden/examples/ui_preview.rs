@@ -64,7 +64,8 @@
 use deskwarden::breach::BreachCache;
 use deskwarden::hello::HelloState;
 use deskwarden::login_ui::{self, BwStatus, LoginForm};
-use deskwarden::vault_bridge::{Folder, VaultItem};
+use deskwarden::kind_mark;
+use deskwarden::vault_bridge::{Folder, ItemKind, VaultItem};
 use deskwarden::vault_window::detail::{self, RevealState, TotpState};
 use deskwarden::vault_window::detail_edit::{self, EditDraft};
 use deskwarden::vault_window::item_list;
@@ -388,6 +389,52 @@ enum Surface {
     /// badges have to be tellable apart from each other, and one card in a
     /// picture cannot show that.
     VaultList,
+    /// **One row of every KIND, with favicons of shapes a real site serves.**
+    ///
+    /// Two reports live on this surface and neither is answerable from
+    /// [`Surface::VaultList`].
+    ///
+    /// * *"icons feels like not centered by start from top and cut of at the
+    ///   bottom"*. The list shot's stand-in favicon is a hand-built 64px
+    ///   SQUARE -- the one shape `favicon::decode_rgba` can never have to
+    ///   change, and therefore the one shape that cannot show the defect.
+    ///   These rows carry a 180x180 `apple-touch-icon`, a wide page-declared
+    ///   wordmark and a tall one, each built as a FILE and taken through the
+    ///   shipped decoder, and each drawn with a border hugging all four edges
+    ///   so a lost bottom is visible rather than deducible.
+    /// * *"we should also have different icons for SSH, notes, IDs"*. A note,
+    ///   an identity, an SSH key and a card sit here beside a login, which is
+    ///   the comparison the report is about: four marks that have to be
+    ///   tellable from each other AND from the monogram a login still gets.
+    VaultListKinds,
+    /// **The kind marks themselves, both states, side by side.**
+    ///
+    /// The row shot above shows the marks in the layout they ship in; this
+    /// one shows them against each other, and -- the part no list shot can
+    /// show, because a list has one selection -- every mark in the SELECTED
+    /// treatment as well as the unselected one. A mark that vanished into
+    /// `theme::BLUE_WASH` when its row was picked would be a defect nobody
+    /// could see in a picture of a list.
+    ///
+    /// Drawn through `kind_mark::paint_mark` and `theme::avatar_tile` -- the
+    /// same two calls the row makes -- for the reason
+    /// [`Surface::ProgressBarCycle`] is drawn through `paint_progress_bar`:
+    /// a second drawing of the marks could drift from the shipped one.
+    ItemKindMarks,
+    /// **The read pane's header WITH a favicon**, which no shot has ever
+    /// covered.
+    ///
+    /// [`Surface::LoginDetail`] draws the header's monogram fallback, and
+    /// its own comment said why: loading an image would have meant a file
+    /// to ship. [`shaped_favicon`] builds the file, so that reason is
+    /// gone -- and the owner's report said "icons", plural, so the header
+    /// has to be in a picture beside the row.
+    ///
+    /// The fixture's artwork has TRANSPARENT MARGINS, which is the shape
+    /// most real favicons have and the one this surface exists for: the
+    /// tile's fill is what a favicon shows through and its border is the
+    /// edge that makes a pale one read as a tile at all.
+    LoginDetailFavicon,
     /// **The vault window's rail**, at the exact width the window gives it.
     ///
     /// The surface the rail's own grouping is decided on: whether the three
@@ -558,6 +605,9 @@ const ALL: &[Surface] = &[
     Surface::PrefsVaultOfficialCli,
     Surface::PrefsVaultBuiltIn,
     Surface::VaultList,
+    Surface::VaultListKinds,
+    Surface::ItemKindMarks,
+    Surface::LoginDetailFavicon,
     Surface::VaultRail,
     Surface::VaultHealth,
     Surface::VaultHealthBreached,
@@ -624,6 +674,9 @@ impl Surface {
             Surface::PrefsVaultOfficialCli => "prefs_vault_official_cli",
             Surface::PrefsVaultBuiltIn => "prefs_vault_built_in",
             Surface::VaultList => "vault_item_list",
+            Surface::VaultListKinds => "vault_item_list_kinds",
+            Surface::ItemKindMarks => "item_kind_marks",
+            Surface::LoginDetailFavicon => "detail_login_favicon",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
             Surface::VaultHealthBreached => "vault_password_health_breached",
@@ -674,6 +727,7 @@ impl Surface {
             // their labels.
             Surface::ProgressBarCycle => egui::vec2(420.0, 420.0),
             Surface::LoginDetail
+            | Surface::LoginDetailFavicon
             | Surface::CardDetail
             | Surface::CardDetailRevealed
             | Surface::DiscardConfirm
@@ -727,6 +781,13 @@ impl Surface {
             // narrow elides its titles and drops its chips, which is a picture
             // of a layout nobody ships.
             Surface::VaultList => egui::vec2(LIST_WIDTH, PANE_HEIGHT),
+            // The list's own column, because these are list rows. Shorter
+            // than [`PANE_HEIGHT`] only because the fixture is: nine rows
+            // fit, and a shot with empty canvas under them wastes the
+            // reviewer's screen rather than telling them anything.
+            Surface::VaultListKinds => egui::vec2(LIST_WIDTH, 620.0),
+            // A sheet, not a pane: its size is what the sheet needs.
+            Surface::ItemKindMarks => egui::vec2(LIST_WIDTH, 360.0),
             // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
             // reason as the two above, and the shipped window's own height --
             // the rail is measured against the window's floor, so a preview
@@ -800,6 +861,9 @@ fn main() -> eframe::Result {
     let vault = arg("--vault");
     let login = signin || cli_setup || backend_choice || arg("--login");
     let list = arg("--list");
+    // The kind marks and the odd-shaped favicons, together: the two
+    // reports they answer were filed together and are looked at together.
+    let kinds = arg("--kinds");
     let rail = arg("--rail");
     let health = arg("--health");
 
@@ -817,6 +881,8 @@ fn main() -> eframe::Result {
         vec![Surface::LoginSignin]
     } else if login {
         vec![Surface::LoginUnlock]
+    } else if kinds {
+        vec![Surface::VaultListKinds, Surface::ItemKindMarks, Surface::LoginDetailFavicon]
     } else if list {
         vec![Surface::VaultList]
     } else if rail {
@@ -867,6 +933,10 @@ fn main() -> eframe::Result {
         target_dir().join("ui_preview_signin.png")
     } else if login {
         target_dir().join("ui_preview_login.png")
+    } else if kinds {
+        // A DIRECTORY: this flag renders the rows and the mark sheet, and the
+        // pair is only useful together.
+        target_dir().join("ui_preview_kinds")
     } else if list {
         target_dir().join("ui_preview_vault_item_list.png")
     } else if rail {
@@ -887,7 +957,7 @@ fn main() -> eframe::Result {
             Ok(Box::new(Preview {
                 queue,
                 at: 0,
-                directory: all || vault,
+                directory: all || vault || kinds,
                 out,
                 form: LoginForm::default(),
                 // The app name a real 3c card would have been pre-filled with,
@@ -897,7 +967,15 @@ fn main() -> eframe::Result {
                 done: false,
                 frames: 0,
                 icons: None,
+                kind_icons: None,
+                detail_icon: None,
                 list_search: String::new(),
+                kinds_search: String::new(),
+                // The SSH key row, so one mark is photographed in the
+                // selected treatment on the rows themselves and not only
+                // on the sheet beside them.
+                kinds_selected: Some("kinds-ssh".to_string()),
+                kinds_visible: Vec::new(),
                 // The first row, so the shot carries the selected treatment
                 // (blue border, blue wash behind the tile) as well as the
                 // ordinary one -- see `draw_vault_list`.
@@ -986,7 +1064,16 @@ struct Preview {
     /// rebuilding the cache per frame would upload nine images a frame for the
     /// twelve warm-up frames.
     icons: Option<item_list::IconCache>,
+    /// [`Surface::VaultListKinds`]'s own cache, built and held for the
+    /// same reason [`Preview::icons`] is.
+    kind_icons: Option<item_list::IconCache>,
+    /// [`Surface::LoginDetailFavicon`]'s header artwork, held for the same
+    /// reason the caches above are.
+    detail_icon: Option<egui::TextureHandle>,
     list_search: String,
+    kinds_search: String,
+    kinds_selected: Option<String>,
+    kinds_visible: Vec<String>,
     list_selected: Option<String>,
     list_visible: Vec<String>,
     /// The rail shot's own selection state.
@@ -1116,6 +1203,11 @@ impl eframe::App for Preview {
             }
             Surface::PrefsWindowChrome => self.draw_prefs_window(root),
             Surface::VaultList => self.draw_vault_list(root),
+            Surface::VaultListKinds => self.draw_vault_list_kinds(root),
+            Surface::ItemKindMarks => draw_item_kind_marks(root),
+            Surface::LoginDetailFavicon => {
+                self.draw_pane(root, PaneKind::Detail(DetailShot::LoginFavicon))
+            }
             Surface::VaultRail => self.draw_vault_rail(root),
             Surface::VaultHealth
             | Surface::VaultHealthBreached
@@ -1200,6 +1292,9 @@ enum PaneKind {
 enum DetailShot {
     /// The login fixture, masked -- `detail_login`.
     Login,
+    /// The same login with a favicon on its header --
+    /// `detail_login_favicon`. See [`Surface::LoginDetailFavicon`].
+    LoginFavicon,
     /// The card fixture as it opens: number and code masked -- `detail_card`.
     Card,
     /// The card fixture with the NUMBER revealed and the security code still
@@ -1755,6 +1850,36 @@ impl Preview {
         );
     }
 
+
+    /// One row of every kind, with real-shaped favicons -- see
+    /// [`Surface::VaultListKinds`]. Drawn through `draw_item_list` itself, on
+    /// the same panel the shipped list is hosted in.
+    fn draw_vault_list_kinds(&mut self, root: &mut egui::Ui) {
+        let icons = self
+            .kind_icons
+            .get_or_insert_with(|| shaped_icons(root.ctx(), &self.fixtures.kinds));
+        let fixtures = &self.fixtures;
+        let (search, selected, visible) =
+            (&mut self.kinds_search, &mut self.kinds_selected, &mut self.kinds_visible);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .show(root, |ui| {
+                let _ = item_list::draw_item_list(
+                    ui,
+                    Some(&fixtures.kinds),
+                    &fixtures.folders,
+                    &SidebarFilter::All,
+                    search,
+                    selected,
+                    None,
+                    icons,
+                    visible,
+                    None,
+                    false,
+                );
+            });
+    }
+
     /// The vault window's item list, drawn through `draw_item_list` itself on
     /// the same `theme::CANVAS` panel `vault_window::mod` hosts it in.
     ///
@@ -1904,12 +2029,22 @@ impl Preview {
     /// their own, drawn on the window's own canvas so the PNG shows them
     /// against the background they actually sit on.
     fn draw_pane(&mut self, root: &mut egui::Ui, kind: PaneKind) {
+        // Built before `fixtures` is borrowed, and built ONCE:
+        // `load_texture` allocates on every call and this pane is drawn
+        // for every warm-up frame.
+        let wants_icon = matches!(kind, PaneKind::Detail(DetailShot::LoginFavicon));
+        let header_icon = wants_icon.then(|| {
+            let ctx = root.ctx().clone();
+            self.detail_icon
+                .get_or_insert_with(|| inset_favicon(&ctx, "detail-header", 180))
+                .clone()
+        });
         let fixtures = &mut self.fixtures;
         egui::CentralPanel::default()
             .frame(pane_frame())
             .show(root, |ui| match kind {
                 PaneKind::Detail(shot) => {
-                    let card = !matches!(shot, DetailShot::Login);
+                    let card = matches!(shot, DetailShot::Card | DetailShot::CardRevealed);
                     let item = if card { &fixtures.card } else { &fixtures.login };
                     // **Set, never toggled.** One `Fixtures` is shared by the
                     // whole `--all` walk, so a reveal flag left standing would
@@ -1938,10 +2073,11 @@ impl Preview {
                         totp,
                         false,
                         &mut fixtures.reveal,
-                        // No favicon texture: the monogram fallback is what
-                        // every avatar in this app shows without one, and
-                        // loading an image here would mean a file to ship.
-                        None,
+                        // A favicon only on the shot that is ABOUT one --
+                        // every other detail shot keeps the monogram
+                        // fallback, which is what an avatar shows without
+                        // an icon and what those shots have always shown.
+                        header_icon.as_ref(),
                         &mut fixtures.apps,
                         // Breach checking OFF -- `detail::should_check` is the
                         // gate, and with it false the cache below is never
@@ -2057,6 +2193,8 @@ struct Fixtures {
     rehearsal_arrived: String,
     /// The Password health screen's items -- see [`HEALTH_JSON`].
     health: Vec<VaultItem>,
+    /// One row of every kind -- see [`KINDS_JSON`].
+    kinds: Vec<VaultItem>,
 }
 
 impl Fixtures {
@@ -2157,6 +2295,7 @@ impl Fixtures {
             })),
             rehearsal: rehearsal_view(),
             health: items(HEALTH_JSON),
+            kinds: items(KINDS_JSON),
             // What a text field really holds after the design's sequence: the
             // Tab arrived as a tab, the Enter as a Windows line ending.
             rehearsal_arrived: format!(
@@ -2231,6 +2370,69 @@ fn rehearsal_view() -> scratch_window::RehearsalView {
     }
 }
 
+
+/// **The four kind marks, in both of the tile's states.**
+///
+/// Every tile here is `theme::avatar_tile` and every mark is
+/// `kind_mark::paint_mark` -- the two calls `kind_mark::avatar` makes, which
+/// is what the item row calls. Nothing on this sheet is a second drawing that
+/// could drift from the shipped one.
+///
+/// The LOGIN column is the control, and it is why the sheet is worth taking:
+/// the question the report asks is not "is this a nice key" but "can a note,
+/// an identity, an SSH key and a card be told apart at 32pt -- from each
+/// other, and from the letters a login still shows".
+fn draw_item_kind_marks(root: &mut egui::Ui) {
+    theme::paint_window_background(root);
+    egui::Frame::new()
+        .fill(theme::CANVAS)
+        .inner_margin(Margin::same(24))
+        .show(root, |ui| {
+            ui.label(
+                theme::bold("Item-kind marks, at the list row's 32pt", 15.0).color(theme::INK),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                theme::semibold(
+                    "kind_mark::paint_mark in theme::avatar_tile -- the row's own two calls",
+                    12.0,
+                )
+                .color(theme::TEXT_FAINT),
+            );
+            ui.add_space(20.0);
+            const TILE: f32 = 32.0;
+            let columns: [(&str, Option<ItemKind>); 5] = [
+                ("Note", Some(ItemKind::SecureNote)),
+                ("Card", Some(ItemKind::Card)),
+                ("Identity", Some(ItemKind::Identity)),
+                ("SSH key", Some(ItemKind::SshKey)),
+                ("Login", None),
+            ];
+            for (label, selected) in [("Unselected row", false), ("Selected row", true)] {
+                ui.label(theme::semibold(label, 11.0).color(theme::TEXT_GHOST));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 18.0;
+                    for (name, kind) in columns {
+                        ui.vertical(|ui| {
+                            match kind {
+                                Some(kind) => {
+                                    let tile = theme::avatar_tile(ui, TILE, selected);
+                                    kind_mark::paint_mark(ui, kind, tile, selected);
+                                }
+                                // The control: what a login still shows.
+                                None => theme::avatar(ui, "LE", TILE, selected),
+                            }
+                            ui.add_space(6.0);
+                            ui.label(theme::semibold(name, 11.0).color(theme::TEXT_SECONDARY));
+                        });
+                    }
+                });
+                ui.add_space(24.0);
+            }
+        });
+}
+
 /// A stand-in favicon, built rather than downloaded.
 ///
 /// **No network, and no bundled third-party artwork.** What the favicon shot
@@ -2262,6 +2464,149 @@ fn stand_in_favicon(ctx: &egui::Context, name: &str, ground: egui::Color32) -> e
         egui::ColorImage { size: [PX, PX], pixels, source_size: egui::vec2(PX as f32, PX as f32) },
         egui::TextureOptions::LINEAR,
     )
+}
+
+
+
+/// A favicon with TRANSPARENT MARGINS, taken through the app's own decoder.
+///
+/// The shape most real favicons have, and the one the avatar tile's fill and
+/// border exist for: a mark inset inside its own canvas with nothing around
+/// it. Painted with no tile behind it, artwork like this floats on whatever
+/// the pane's background happens to be and has no edge of its own -- which is
+/// what [`Surface::LoginDetailFavicon`] is a picture of.
+fn inset_favicon(ctx: &egui::Context, name: &str, side: usize) -> egui::TextureHandle {
+    let centre = (side as f32 - 1.0) / 2.0;
+    let mut rgba = Vec::with_capacity(side * side * 4);
+    for y in 0..side {
+        for x in 0..side {
+            let d = ((x as f32 - centre).powi(2) + (y as f32 - centre).powi(2)).sqrt();
+            // A disc at 62% of the canvas, and a lighter ring inside it, so
+            // the mark is unmistakably artwork and the margin around it is
+            // unmistakably nothing.
+            let paint = if (0.20 * side as f32..0.26 * side as f32).contains(&d) {
+                [0xff, 0xff, 0xff, 0xff]
+            } else if d < 0.31 * side as f32 {
+                [0x1f, 0x6f, 0x5c, 0xff]
+            } else {
+                [0, 0, 0, 0]
+            };
+            rgba.extend_from_slice(&paint);
+        }
+    }
+    let mut file = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut file, side as u32, side as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .expect("the fixture favicon writes a PNG header")
+            .write_image_data(&rgba)
+            .expect("the fixture favicon writes its pixels");
+    }
+    let (w, h, decoded) =
+        deskwarden::favicon::decode_rgba(&file).expect("the shipped decoder reads the fixture");
+    ctx.load_texture(
+        format!("preview-inset-favicon-{name}"),
+        egui::ColorImage::from_rgba_unmultiplied([w, h], &decoded),
+        egui::TextureOptions::LINEAR,
+    )
+}
+
+/// A stand-in favicon of a REAL source SHAPE, taken through the app's own
+/// decoder.
+///
+/// **Why [`stand_in_favicon`] is not enough.** That one hands the tile a
+/// texture built by hand at exactly 64x64 -- which is one of the shapes
+/// `favicon::decode_rgba` emits, and the only one it never has to CHANGE
+/// anything to reach. A real favicon is a file: a 180x180
+/// `apple-touch-icon.png`, or the wide wordmark a page declares in its `<link
+/// rel="icon">`. Those are downscaled and then letterboxed onto a transparent
+/// square, and what the tile is finally handed is that function's output. A
+/// report about an icon sitting high in its tile is a report about that
+/// pipeline, so the picture that answers it has to run the pipeline.
+///
+/// So this builds the FILE, at `(w, h)`, and decodes it with the shipped
+/// `favicon::decode_rgba`.
+///
+/// **The artwork is a measuring stick, not a logo.** A border hugging all four
+/// edges, with a wedge pointing UP inside it and a bar along the bottom edge:
+/// an icon drawn top-anchored loses the bottom border and the bar, an icon
+/// stretched to a square shows the wedge fallen over, and an icon that is
+/// right shows an even border on all four sides. None of those three is a
+/// judgement call.
+fn shaped_favicon(
+    ctx: &egui::Context,
+    name: &str,
+    (w, h): (usize, usize),
+    ground: egui::Color32,
+) -> egui::TextureHandle {
+    let edge = (w.min(h) as f32 * 0.09).max(2.0) as usize;
+    let mut rgba = Vec::with_capacity(w * h * 4);
+    for y in 0..h {
+        for x in 0..w {
+            let border = x < edge || y < edge || x + edge >= w || y + edge >= h;
+            // A wedge pointing up, drawn in the middle band, plus a solid bar
+            // just above the bottom border.
+            let (fx, fy) = (x as f32 / w as f32, y as f32 / h as f32);
+            let wedge = (0.30..0.70).contains(&fy)
+                && ((fx - 0.5).abs() < (fy - 0.30) * 0.7)
+                && ((fx - 0.5).abs() > (fy - 0.30) * 0.7 - 0.10);
+            let bar = (0.78..0.86).contains(&fy) && (0.25..0.75).contains(&fx);
+            let paint = if border || wedge || bar {
+                [0xff, 0xff, 0xff, 0xff]
+            } else {
+                [ground.r(), ground.g(), ground.b(), 0xff]
+            };
+            rgba.extend_from_slice(&paint);
+        }
+    }
+    let mut file = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut file, w as u32, h as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .expect("the fixture favicon writes a PNG header")
+            .write_image_data(&rgba)
+            .expect("the fixture favicon writes its pixels");
+    }
+    let (dw, dh, decoded) =
+        deskwarden::favicon::decode_rgba(&file).expect("the shipped decoder reads the fixture");
+    ctx.load_texture(
+        format!("preview-shaped-favicon-{name}"),
+        egui::ColorImage::from_rgba_unmultiplied([dw, dh], &decoded),
+        egui::TextureOptions::LINEAR,
+    )
+}
+
+/// The icon cache [`Surface::VaultListKinds`] draws against: a favicon of a
+/// different SOURCE SHAPE on each of the three items whose fixture id says it
+/// wants one, and nothing on the rest -- so the kinds' marks and the shapes'
+/// geometry are one picture.
+///
+/// The shapes are read off the ids rather than a list written here, so a row
+/// added to [`KINDS_JSON`] cannot quietly go without the icon it was added
+/// for.
+fn shaped_icons(ctx: &egui::Context, items: &[VaultItem]) -> item_list::IconCache {
+    let mut cache = item_list::IconCache::default();
+    for item in items {
+        // 180x180 is `apple-touch-icon.png`'s own size, 128x44 is the shape
+        // of a page-declared wordmark, and 44x128 is that lying down -- the
+        // three shapes a real fetch comes back with that are not a square.
+        let shape = match item.id.as_str() {
+            "kinds-login-touch" => Some(((180, 180), egui::Color32::from_rgb(0x1f, 0x6f, 0x5c))),
+            "kinds-login-wide" => Some(((128, 44), egui::Color32::from_rgb(0x8a, 0x2f, 0x3c))),
+            "kinds-login-tall" => Some(((44, 128), egui::Color32::from_rgb(0x33, 0x3d, 0x8a))),
+            _ => None,
+        };
+        if let Some((size, ground)) = shape {
+            cache.textures.insert(item.id.clone(), shaped_favicon(ctx, &item.id, size, ground));
+        }
+    }
+    cache
 }
 
 /// The icon cache the list preview draws against: a stand-in favicon on the
@@ -2419,6 +2764,58 @@ const HEALTH_JSON: &str = r#"[
   {
     "id": "health-unknown", "type": 1, "name": "Cantilever Studio",
     "login": { "username": "anna@northwind.example", "password": "cantilever-single-use" }
+  }
+]"#;
+
+
+/// **One row of every kind the app knows, and one it does not** -- see
+/// [`Surface::VaultListKinds`].
+///
+/// The three logins at the top carry favicons of three different SOURCE
+/// shapes (see [`shaped_icons`]); the fourth carries none, so the monogram a
+/// login still falls back to is in the same picture as the marks. The card is
+/// branded, because a card's network stays on its trailing pill and the shot
+/// has to show the generic card mark and the `VISA` pill coexisting.
+const KINDS_JSON: &str = r#"[
+  {
+    "id": "kinds-login-touch", "type": 1, "name": "Harbourline Rail",
+    "login": { "username": "anna@harbourline.example", "password": "x",
+      "uris": [{ "uri": "https://harbourline.example" }] }
+  },
+  {
+    "id": "kinds-login-wide", "type": 1, "name": "Meridian Freight",
+    "login": { "username": "ops@meridian.example", "password": "x",
+      "uris": [{ "uri": "https://meridian.example" }] }
+  },
+  {
+    "id": "kinds-login-tall", "type": 1, "name": "Cantilever Studio",
+    "login": { "username": "anna@cantilever.example", "password": "x",
+      "uris": [{ "uri": "https://cantilever.example" }] }
+  },
+  {
+    "id": "kinds-login-plain", "type": 1, "name": "Northwind Mail",
+    "login": { "username": "anna@northwind.example", "password": "x" }
+  },
+  {
+    "id": "kinds-card", "type": 3, "name": "Ledgerline corporate card",
+    "card": { "brand": "Visa", "number": "4111111111111111", "expMonth": "11",
+      "expYear": "2029" }
+  },
+  {
+    "id": "kinds-note", "type": 2, "name": "Datacentre recovery codes",
+    "notes": "Eight one-time codes, used top to bottom."
+  },
+  {
+    "id": "kinds-identity", "type": 4, "name": "Anna Novak",
+    "identity": { "firstName": "Anna", "lastName": "Novak",
+      "email": "anna@northwind.example" }
+  },
+  {
+    "id": "kinds-ssh", "type": 5, "name": "Build server key",
+    "sshKey": { "keyFingerprint": "SHA256:3Xr0ZQ4l9tKcE2mBw7YvHn1sPd6aUqRf8gTjLxCiN0k" }
+  },
+  {
+    "id": "kinds-unknown", "type": 9, "name": "Something newer than this app"
   }
 ]"#;
 
