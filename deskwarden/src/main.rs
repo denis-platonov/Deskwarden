@@ -11107,12 +11107,22 @@ enum LaunchIntent {
     /// exit -- which is the only mechanism that gives the OpenGL driver's
     /// committed arenas back.
     ///
-    /// Nothing in production produces this yet. It is parsed, and only
-    /// parsed; the startup path that answers it is the next task, and until
-    /// that exists a `--ui` launch is a command line no part of this app
-    /// writes. See this file's report at
-    /// `.superpowers/sdd/ui-process-split-report.md` for why the spawn is not
-    /// wired yet.
+    /// **Both ends of this are live.** The daemon writes the command line --
+    /// *Open Vault* reaches [`deskwarden::ui_process::UiOpenDecision::Spawn`],
+    /// which builds a [`deskwarden::ui_process::UiSpawnPlan`] and hands it to
+    /// `spawn_the_vault_window_in_its_own_process` -- and `main` answers it at
+    /// the top of this file by handing the surface to
+    /// [`run_as_a_ui_process`], whose exit code is this process's.
+    ///
+    /// **The daemon is the only writer, and `Surface::Vault` the only surface
+    /// it asks for.** The installer writes `AUTOSTART_FLAG` and never this
+    /// one; it is held to that by
+    /// `the_ui_flag_is_the_apps_alone_and_the_installer_never_passes_it`.
+    /// The other `Surface` variants are parseable here but nothing spawns
+    /// them yet. So a `--ui` on a command line came from a Deskwarden that is
+    /// already running, and that is what makes the both-flags rule below --
+    /// `--ui` wins over `--autostart` -- a reading of intent rather than a
+    /// tie-break.
     Ui(Surface),
     /// **The local vault service, and nothing else.** No tray icon, no
     /// hotkey, no window, and no `bw serve` -- it IS the backend. It
@@ -11120,8 +11130,15 @@ enum LaunchIntent {
     /// [`deskwarden::service_host::Mode::Installed`], which is the whole
     /// difference between the two lifetimes.
     ///
-    /// Parsed here; the loop that answers it is the next task, and until
-    /// that exists this is a command line no part of this app writes.
+    /// **Answered, but not yet written -- and that is the opposite way round
+    /// from [`Ui`](Self::Ui), which is why the two are worth reading
+    /// together.** [`run_as_the_vault_service`] is a real loop: it opens its
+    /// own log, refuses to start when the owner's `service_enabled` is off,
+    /// resolves the active account and serves that account's backend. What
+    /// does not exist is a writer -- `SERVICE_FLAG` appears nowhere in this
+    /// crate outside this file's parser and its tests, and nowhere in
+    /// `installer/deskwarden.iss` -- so today the only thing that produces
+    /// this command line is a person typing it.
     Service(deskwarden::service_host::Mode),
 }
 
@@ -12497,12 +12514,15 @@ fn first_surface(intent: LaunchIntent) -> FirstSurface {
         // about stays in the tray" -- which for a spawned window is a process
         // that starts, opens nothing, and sits there holding a tray icon.
         //
-        // It is NOT reached in production, and the report says why: `main`
-        // reads this decision a thousand lines below the single-instance
-        // takeover, so a `--ui` process routed through it would first ask the
-        // daemon that spawned it to stand down. The startup path that answers
-        // `Ui` before that point is the next task; this arm is the honest
-        // total answer until it exists.
+        // It is NOT reached in production, and the reason is now the same one
+        // the `Service` arm below gives: `main` answers `Ui` at the top of
+        // this file, by handing the surface to `run_as_a_ui_process` and
+        // exiting on its status, so a UI process never reaches this function
+        // at all. That early answer is what the arm was waiting for -- it had
+        // to come before the single-instance takeover, because a `--ui`
+        // process routed past it would ask the daemon that spawned it to
+        // stand down. Showing the window stays the honest total answer for
+        // anything that somehow arrives here anyway.
         LaunchIntent::Ui(_) => FirstSurface::ShowTheWindow,
         // **The service has no first surface at all**, and this arm exists
         // so that saying so is a decision rather than a catch-all. It is not
