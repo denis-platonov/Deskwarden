@@ -4265,9 +4265,9 @@ mod row_tile_tests {
         );
     }
 
-    /// **FOUR PASSES OVER ONE ROW**, and this test has now been on three
+    /// **SEVEN PASSES OVER ONE ROW**, and this test has now been on four
     /// sides of it. The whole history, because the next person here will be
-    /// holding one of these reports and not the other three:
+    /// holding one of these reports and not the other six:
     ///
     /// 1. The favicon was drawn at the full 32pt (`fit_to_exact_size(32)`)
     ///    and the report was "the favicon fills its tile edge-to-edge and
@@ -4291,15 +4291,32 @@ mod row_tile_tests {
     ///    never magnified, shrunk only as far as it must be to fit, centred --
     ///    and the margin is not a number anyone picks, it is the leftover.
     ///
-    /// This test is renamed again for that, and it asserts BOTH sides of the
-    /// rule, because a test that only ever saw one source size could not tell
-    /// "never upscale" from "always inset by 8".
+    /// 5. Then the cap came OFF -- every source magnified to fill the tile --
+    ///    read off Keeper's tiles: "no padding here - as should", "if bigger -
+    ///    fills the whole thing".
+    /// 6. Seen running, that was rejected: "keep the frame as it was but
+    ///    change icons to 100% 16x16 - there will be padding but that's fine".
+    ///    Pass 4's rule exactly, reinstated by revert.
+    /// 7. Which left the LARGE sources still full bleed, since 4's cap only
+    ///    ever stopped growth: "icon touches the edges but should be in the
+    ///    middle with paddings", then "make icon 16px". So the artwork now
+    ///    fits a 16pt box rather than the tile -- a 16x16 at its own size, a
+    ///    64x64 reduced into it -- and the column is one size instead of
+    ///    every size between 16 and 32.
+    ///
+    /// This test is renamed again for that, and it asserts BOTH source sizes,
+    /// because a test that only ever saw the small one could not tell "fit a
+    /// 16pt box" from "never upscale" -- which is the exact pair that passes 4
+    /// and 7 turn on.
     ///
     /// **Assert the SIZE, never merely "an image was painted".** The whole
     /// claim is dimensional: a rect that is textured proves nothing about
     /// whether the artwork was magnified.
     #[test]
-    fn a_favicon_is_drawn_at_its_own_size_never_magnified_and_centred_in_its_tile() {
+    fn every_favicon_is_fitted_into_the_same_box_centred_in_its_tile() {
+        // Every favicon is fitted into this box, centred in the tile.
+        const ARTWORK_PT: f32 = AVATAR_SIZE / 2.0;
+
         // ---- The small source: 16x16, the common case, must NOT fill ----
         let p = paint_with_icons(&[login("Ledgerline", "a@b.c")], None, &["Ledgerline"]);
         let tile = square(&p, AVATAR_SIZE);
@@ -4401,10 +4418,12 @@ mod row_tile_tests {
             tile.rect
         );
 
-        // ---- The control: a source at least as big as the tile STILL fills
-        // it, edge to edge, with the tile's own radius. Without this half the
-        // test would pass just as happily against a rule that shrank every
-        // icon, or that inset everything by a fixed 8pt.
+        // ---- The control: a source BIGGER than the box is REDUCED into it,
+        // rather than being drawn at its own size or filling the tile. Without
+        // this half the test would pass just as happily against "never
+        // upscale" alone, which is the rule this replaces -- under that rule a
+        // 64x64 landed full bleed and touched the tile's edge, which is what
+        // the owner was looking at when they said "make icon 16px".
         let big = paint_with_icons_sized(&[login("Ledgerline", "a@b.c")], None, &["Ledgerline"], 64);
         let big_tile = square(&big, AVATAR_SIZE);
         let big_image = big
@@ -4414,25 +4433,25 @@ mod row_tile_tests {
             .cloned()
             .expect("the 64x64 favicon was drawn");
         assert!(
-            (big_image.rect.min - big_tile.rect.min).length() < 0.01
-                && (big_image.rect.max - big_tile.rect.max).length() < 0.01,
-            "a 64x64 source is bigger than the {AVATAR_SIZE}pt tile, so it must shrink to \
-             fill it exactly; it was painted at {:?} in a {:?} tile",
-            big_image.rect,
-            big_tile.rect
-        );
-        // ...and at full bleed the corners ARE the tile's, so the radius comes
-        // back. This is the assertion pass 3 made, kept for the case it was
-        // actually right about.
-        assert_eq!(
-            big_image.corner_radius,
-            theme::avatar_corner_radius(AVATAR_SIZE),
-            "a full-bleed favicon is not clipped to the tile's corner radius, so its \
-             corners overhang the rounded tile"
+            (big_image.rect.width() - ARTWORK_PT).abs() < 0.01
+                && (big_image.rect.height() - ARTWORK_PT).abs() < 0.01,
+            "a 64x64 source was painted {}x{} -- every favicon is fitted into the same              {ARTWORK_PT}pt box whatever its source size",
+            big_image.rect.width(),
+            big_image.rect.height()
         );
         assert!(
-            big_image.corner_radius.nw > 0,
-            "the full-bleed favicon was painted with square corners over a rounded tile"
+            (big_image.rect.center() - big_tile.rect.center()).length() < 0.01,
+            "the reduced favicon is centred at {:?} but its tile's centre is {:?}",
+            big_image.rect.center(),
+            big_tile.rect.center()
+        );
+        // ...and it reaches no corner arc either, so it keeps its own square
+        // corners exactly as the small source does. The two sizes differ only
+        // in whether the source had to be reduced to get here.
+        assert_eq!(
+            big_image.corner_radius,
+            egui::CornerRadius::ZERO,
+            "a favicon inset clear of the tile's corner arc was rounded anyway, which              clips the artwork's own corners"
         );
     }
 

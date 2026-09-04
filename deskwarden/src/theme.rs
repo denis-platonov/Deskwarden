@@ -885,6 +885,24 @@ pub fn initials(name: &str) -> String {
     }
 }
 
+/// The square every favicon is fitted into, centred in its [`avatar_tile`]:
+/// **16pt**, which is half the 32pt tile.
+///
+/// Expressed as a fraction of the tile rather than as a bare 16.0 so the two
+/// cannot drift apart -- the tile has been resized once already, and an
+/// artwork box that stayed at 16 while the tile moved would change the
+/// padding the owner asked for without anyone editing this line.
+///
+/// 16 is not an arbitrary half. It is the size most sites actually serve, so
+/// the common favicon is drawn at its own pixels and nothing is resampled;
+/// the bigger sources are the ones that give something up, and a reduction is
+/// the direction that stays sharp.
+const ARTWORK_BOX: f32 = 0.5;
+
+fn artwork_box(tile: Rect) -> f32 {
+    tile.width().min(tile.height()) * ARTWORK_BOX
+}
+
 /// Where the artwork goes inside an [`avatar_tile`], and what corner radius it
 /// is clipped with: [`avatar_image`]'s geometry, split out as a pure function
 /// so it can be asserted on directly rather than only inferred from a paint.
@@ -900,17 +918,23 @@ pub fn initials(name: &str) -> String {
 ///
 /// **Two rules, and the second is the one with a history.**
 ///
-/// * **Never upscale.** The scale is capped at 1.0, so a 16x16 source is
-///   drawn at 16pt inside a 32pt tile and the 8pt of margin on each side is
-///   simply what is left over. Magnifying it is what made small favicons --
-///   which is most of them -- look soft next to the crisp monogram beside
-///   them.
-/// * **Downscale only to fit, preserving aspect.** A source longer than the
-///   tile on either axis is reduced by the smaller of the two ratios, so
-///   nothing is ever stretched. A 64x64 texture in a 32pt tile therefore
-///   still lands FULL BLEED, exactly as it did before -- this rule takes
-///   nothing away from a large icon, it only stops a small one being blown
-///   up.
+/// * **Never upscale.** The scale is capped at 1.0, so a source smaller than
+///   the box below is drawn at its own size and the margin is simply what is
+///   left over. Magnifying is what made small favicons -- which is most of
+///   them -- look soft next to the crisp monogram beside them.
+/// * **Fit [`ARTWORK_BOX`], not the tile.** Every favicon lands in a 16pt
+///   square at the tile's centre, whatever size its source is: a 16x16 draws
+///   at 16pt because that is its own size, and a 64x64 is REDUCED to 16pt
+///   rather than filling the tile.
+///
+///   That second half is the owner's ruling, and it is the one that stops
+///   this column being ragged. Under "never upscale" alone the artwork's size
+///   was the source's size, so a row of favicons drew at every width between
+///   16 and 32 depending on what each site happened to serve -- and the big
+///   ones reached the tile's edge, which is what the owner was looking at:
+///   "icon touches the edges but should be in the middle with paddings",
+///   then "make icon 16px". One size for all of them, centred, is what makes
+///   the tiles read as one column.
 ///
 /// **The corner radius follows the tile's curve, concentrically.** The tile is
 /// a rounded rectangle, and the original reason the artwork was ever given a
@@ -933,8 +957,10 @@ pub fn avatar_artwork(tile: Rect, source: Vec2) -> (Rect, CornerRadius) {
     if source.x <= 0.0 || source.y <= 0.0 {
         return (tile, full);
     }
-    // Cap at 1.0: shrink to fit, never grow.
-    let scale = (tile.width() / source.x).min(tile.height() / source.y).min(1.0);
+    // Fit ARTWORK_BOX rather than the tile, and cap at 1.0 so a source
+    // already smaller than the box keeps its own size.
+    let box_side = artwork_box(tile);
+    let scale = (box_side / source.x).min(box_side / source.y).min(1.0);
     let art = Rect::from_center_size(tile.center(), source * scale);
     let inset = (tile.width() - art.width()).min(tile.height() - art.height()) / 2.0;
     let radius = (f32::from(full.nw) - inset).max(0.0).round() as u8;
