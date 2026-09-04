@@ -202,9 +202,139 @@ pub fn release() {
     }
 }
 
+
+/// Creates `name` and **keeps it**, so the name exists for exactly as long as
+/// the returned handle does.
+///
+/// This is [`acquire`]'s mechanism offered under a caller's own name rather
+/// than the app's. Its user is the self-update path: a process that has
+/// downloaded and verified an installer holds a claim over it, and the
+/// startup sweep that deletes abandoned installers
+/// ([`crate::updater::cleanup_stale_downloads`]) asks whether a claim is held
+/// before it deletes anything.
+///
+/// # Why a kernel object rather than a pid or a file
+///
+/// The question being answered is "is a live process still going to use
+/// this", and a named object answers it without anybody having to keep a
+/// record accurate. The name exists while a handle to it does, so a holder
+/// that exits, panics, or is killed outright stops holding it -- there is no
+/// stale claim left behind to reap, and no second cleanup pass needed for the
+/// cleanup pass. A pid written to a file has neither property: it outlives
+/// its process, and Windows recycles pids, so a reader can find a stranger
+/// wearing the number. This crate has already paid for that once.
+///
+/// Unlike [`take_if_free`], this succeeds whether or not the name already
+/// existed: the caller wants to *be a* holder, not to be the only one.
+///
+/// `None` means the name could not be created at all. The caller is expected
+/// to carry on unclaimed rather than refuse to work -- an update that cannot
+/// take a claim should still download.
+pub fn hold_claim(name: &str) -> Option<OwnedHandle> {
+    match create_named(name) {
+        Ok((handle, _)) => Some(handle),
+        Err(e) => {
+            log::warn!("could not claim {name:?} ({e}); carrying on without the claim");
+            None
+        }
+    }
+}
+
+/// True when some live process holds `name` through [`hold_claim`].
+///
+/// # The handle is dropped in BOTH branches
+///
+/// For the reason [`take_if_free`] spells out: a creation that finds the name
+/// already there still opens a handle to it, and a named object lives as long
+/// as any handle does. An asker that retained the handle would be keeping
+/// alive the very name it was asking about, so every later question about
+/// that name -- including the one guarding the file it was about to delete --
+/// would answer "held" forever, and nothing would ever be reaped again.
+///
+/// # A failure to ask answers "held"
+///
+/// This decides whether a verified installer that another process is about to
+/// launch gets deleted. An unexplained refusal from the kernel is not
+/// evidence that nobody is holding the name, so it is not read as one.
+/// Erring this way postpones a reap until the next sweep; erring the other
+/// way deletes a file out from under a live window, which is the failure this
+/// whole mechanism exists to prevent.
+pub fn claim_is_held(name: &str) -> bool {
+    match create_named(name) {
+        // Both handles dropped here, deliberately -- see above.
+        Ok((_, Acquired::AlreadyRunning)) => true,
+        Ok((_, Acquired::First)) => false,
+        Err(e) => {
+            log::warn!("could not ask whether {name:?} is claimed ({e}); assuming it is");
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A claim name nothing else in this run can be using.
+    fn unique_claim_name(tag: &str) -> String {
+        format!(
+            "Local\\Deskwarden-claim-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    /// **`claim_is_held` must not keep alive the name it asks about.**
+    ///
+    /// This is the one way the update sweep could fail catastrophically
+    /// rather than annoyingly. `create_named` opens a handle whether or not
+    /// the name already existed, and a named object lives as long as any
+    /// handle does -- so an asker that retained its handle would report
+    /// "claimed" for every name it had ever looked at, and
+    /// `updater::cleanup_stale_downloads` would stop reaping anything, for
+    /// good, while still logging that it had run.
+    ///
+    /// Asking twice about a free name is what catches it: the second answer
+    /// is only `false` if the first ask let go.
+    #[test]
+    fn asking_whether_a_claim_is_held_does_not_itself_hold_it() {
+        let name = unique_claim_name("asking");
+
+        assert!(!claim_is_held(&name), "control: a name nobody has taken is reported as held");
+        assert!(
+            !claim_is_held(&name),
+            concat!(
+                "the first ask kept its handle, so the name it asked about now exists ",
+                "because it asked. Every download would be spared forever and the update ",
+                "cache would never be reaped again"
+            )
+        );
+    }
+
+    /// The mechanism the update sweep rests on: while a handle is held the
+    /// name is reported as claimed, and when it is dropped it is not.
+    ///
+    /// The drop is what a `--ui` process exiting does, by any route including
+    /// a crash -- the kernel closes the handle either way, which is the whole
+    /// reason this is a named object and not a pid in a file.
+    #[test]
+    fn a_held_claim_reads_as_held_until_its_handle_is_dropped() {
+        let name = unique_claim_name("held");
+
+        let held = hold_claim(&name);
+        assert!(held.is_some(), "control: the claim could not be created at all");
+        assert!(claim_is_held(&name), "a claim with a live handle is not being reported as held");
+
+        drop(held);
+
+        assert!(
+            !claim_is_held(&name),
+            "the name outlived its handle, so nothing that holds a claim can ever release it"
+        );
+    }
 
     /// The `.iss`, read at compile time so that this test cannot silently
     /// pass against a file that has moved or been deleted -- a missing path

@@ -1000,6 +1000,52 @@ fn installer_file_name(version: &Version) -> String {
     format!("deskwarden-{version}-installer.exe")
 }
 
+/// Name of the kernel object a process holds while it still intends to launch
+/// the installer stored under `file_name`.
+///
+/// # Keyed by the file name, not by the version
+///
+/// The two sides have to arrive at the same string from what each of them
+/// actually has. The holder has a [`Version`] and turns it into a file name
+/// through [`installer_file_name`]; [`cleanup_stale_downloads`] has only the
+/// name it read off the directory, and deliberately never parses a version
+/// out of it -- it sweeps leftovers from *previous* builds, whose version
+/// numbers this build has no list of. The file name is the one form both can
+/// produce, so it is what the name is built from.
+///
+/// Built by extending [`crate::app_mutex::APP_MUTEX_NAME`] rather than by
+/// spelling a second `Local\` prefix and a second GUID. That constant is the
+/// one place the app's name is authored, and both of its properties are
+/// wanted here unchanged: session-local scope, because the processes that
+/// must agree are this one user's, and the GUID, because it is what stops an
+/// unrelated program that happened to pick the word "Deskwarden" from being
+/// read as one of ours.
+fn installer_claim_name(file_name: &str) -> String {
+    format!("{}-update-claim-{file_name}", crate::app_mutex::APP_MUTEX_NAME)
+}
+
+/// Claims the installer for `version`, for as long as the returned handle
+/// lives.
+///
+/// Held by the process that downloaded it, from before the download starts
+/// until that process ends. [`cleanup_stale_downloads`] skips a claimed file,
+/// which is the whole point: a Preferences window sitting on
+/// `UpdateStage::Ready` is a live process that is about to launch that exact
+/// file, and a daemon restarting underneath it must not delete it first.
+///
+/// **Taken before the download rather than after it verifies.** The window
+/// in between is real: [`download_and_verify`] renames the part-file into its
+/// final name, and from that instant the file matches
+/// [`is_downloaded_installer`] and a sweep would take it -- while the
+/// downloading process has not yet been told the download finished.
+///
+/// A `None` claim is not a failure to download. See
+/// [`crate::app_mutex::hold_claim`]: an update that cannot take a claim
+/// should still run, it just loses this protection.
+pub fn claim_installer(version: &Version) -> Option<std::os::windows::io::OwnedHandle> {
+    crate::app_mutex::hold_claim(&installer_claim_name(&installer_file_name(version)))
+}
+
 /// True for file names [`download_and_verify`] could have produced.
 ///
 /// Matched by shape rather than by an exact version, because cleanup runs at
@@ -1009,14 +1055,47 @@ fn is_downloaded_installer(file_name: &str) -> bool {
     file_name.starts_with("deskwarden-") && file_name.ends_with("-installer.exe")
 }
 
-/// Deletes installers left behind in `dir` by earlier update attempts.
+/// Deletes installers left behind in `dir` by earlier update attempts, except
+/// any that a live process still claims.
 ///
 /// Called once at startup rather than after applying an update: `apply_update`
 /// launches the installer and the app then exits immediately, so at that point
 /// the file is the image of a *running* process and cannot be deleted. By the
-/// next startup that installer has finished, so every downloaded installer
-/// still sitting here is spent -- either it was applied (and this build is its
-/// result) or the attempt failed -- and none of them are worth keeping.
+/// next startup that installer has finished.
+///
+/// # Why "spent" is no longer something startup can assume
+///
+/// This used to delete every installer it found, on the reasoning that by the
+/// next startup each one was necessarily spent: it had either been applied
+/// (and this build was its result) or its attempt had failed. That reasoning
+/// held while one process did all three jobs -- download, install, sweep.
+///
+/// It stopped holding when the UI moved into its own process. The daemon and
+/// a `--ui` process compute the same download directory
+/// (`cache_dir()/updates`, in `main.rs`, once on each side), and their
+/// lifetimes are independent: the daemon can restart -- a stand-down, a
+/// crash, a "Restart to update" for a *different* release -- while a
+/// Preferences window sits on `UpdateStage::Ready` with a verified installer
+/// it is one click away from launching. A sweep on the reasoning above
+/// deleted that file, and the click then failed with `apply_update_with`'s
+/// hash-arm refusal: loud, but still a failed update the user did nothing to
+/// deserve.
+///
+/// # What replaces the assumption
+///
+/// The process that downloads an installer holds a claim over it
+/// ([`claim_installer`]) from before the download until that process exits,
+/// and this pass deletes only what nobody claims. The claim is a named kernel
+/// object, so it needs no upkeep and cannot go stale: it exists exactly while
+/// its holder's process does. See [`crate::app_mutex::hold_claim`] for why
+/// that, rather than a pid or a lock file, and for why an unanswerable
+/// question is read as "claimed".
+///
+/// **Abandoned downloads are still reaped, and no later than before.** A
+/// `--ui` process exists to show one window and then exit, so closing
+/// Preferences drops the claim, and the very next sweep takes the file. The
+/// only files whose deletion this postpones are the ones a live process is
+/// still holding -- which is precisely the set that must not be deleted.
 ///
 /// Best-effort: a file that can't be removed (still locked by a slow
 /// installer, say) is reported and skipped, never fatal. A missing directory
@@ -1033,6 +1112,14 @@ pub fn cleanup_stale_downloads(dir: &Path) -> Result<usize, String> {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !is_downloaded_installer(name) {
+            continue;
+        }
+        // **The line that spares a live window's installer.** Asked per file
+        // rather than once for the directory: a window can be parked on one
+        // release while an older, genuinely abandoned download sits beside
+        // it, and both answers are wanted.
+        if crate::app_mutex::claim_is_held(&installer_claim_name(name)) {
+            log::info!("leaving update download {name} alone: a live process still claims it");
             continue;
         }
         match std::fs::remove_file(entry.path()) {
@@ -2896,6 +2983,114 @@ mod tests {
         // accumulate forever.
         let version = Version::parse("1.2.3").unwrap();
         assert!(is_downloaded_installer(&installer_file_name(&version)));
+    }
+
+    /// **The race this mechanism exists for, and its positive control, in one
+    /// test.**
+    ///
+    /// A Preferences window that has downloaded and verified an installer
+    /// sits on `UpdateStage::Ready` in its own `--ui` process, holding a
+    /// claim. The daemon then restarts and sweeps the directory the two of
+    /// them share. Before the claim existed the sweep deleted that file by
+    /// shape alone, and the user's next click failed on
+    /// `apply_update_with`'s hash arm with "could not open".
+    ///
+    /// The claim is taken through [`claim_installer`] -- the same production
+    /// function the panel calls -- and held in this test process. That is not
+    /// a stand-in for the real thing: a named kernel object is held by a
+    /// handle and the kernel does not care which process owns it, so this
+    /// claim is indistinguishable from a live window's.
+    ///
+    /// The sweep driven here is [`cleanup_stale_downloads`] itself, the
+    /// function `main` calls, with no substituted rule anywhere in it.
+    #[test]
+    fn the_sweep_spares_an_installer_a_live_process_still_claims() {
+        let dir = scratch_dir("claimed");
+        let parked = Version::parse("9.9.9").unwrap();
+        let abandoned = Version::parse("9.9.8").unwrap();
+        let parked_file = dir.join(installer_file_name(&parked));
+        let abandoned_file = dir.join(installer_file_name(&abandoned));
+        std::fs::write(&parked_file, b"verified, and one click from launching").unwrap();
+        std::fs::write(&abandoned_file, b"nobody is coming back for this").unwrap();
+
+        // Bound, rather than `let _ =`. A `let _ =` would drop the handle on
+        // this very line, the name would stop existing, and this test would
+        // then pass for the wrong reason on a build where the claim does
+        // nothing at all.
+        let claim = claim_installer(&parked);
+        assert!(claim.is_some(), "control: the claim could not be taken, so nothing is held");
+
+        let removed = cleanup_stale_downloads(&dir).unwrap();
+
+        assert!(
+            parked_file.exists(),
+            concat!(
+                "the sweep deleted a verified installer that a live process is holding. ",
+                "The next click on Restart fails on the hash arm with `could not open`"
+            )
+        );
+        // The control, and it is what stops the assertion above from passing
+        // on a sweep that has quietly stopped deleting anything at all.
+        assert!(
+            !abandoned_file.exists(),
+            concat!(
+                "the sweep left an unclaimed installer behind. Abandoned downloads are tens ",
+                "of megabytes each and this pass is the only thing that reaps them"
+            )
+        );
+        assert_eq!(removed, 1, "the count disagrees with the directory");
+        drop(claim);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The claim is not a leak: what it protects becomes reapable again the
+    /// moment its holder goes.**
+    ///
+    /// Dropping the handle here is what a `--ui` process exiting does -- and
+    /// a `--ui` process exists to show one surface and then exit, so this is
+    /// what closing the Preferences window amounts to. Without this, the fix
+    /// above would have traded a race for a cache directory that fills up
+    /// forever, which is the worse bug of the two.
+    #[test]
+    fn a_released_claim_lets_the_next_sweep_reap_the_download() {
+        let dir = scratch_dir("released-claim");
+        let version = Version::parse("9.9.7").unwrap();
+        let file = dir.join(installer_file_name(&version));
+        std::fs::write(&file, b"downloaded, then the window was closed").unwrap();
+
+        let claim = claim_installer(&version);
+        assert!(claim.is_some(), "control: the claim could not be taken");
+        assert_eq!(
+            cleanup_stale_downloads(&dir).unwrap(),
+            0,
+            "control: the claim is not being consulted, so the reap below would prove nothing"
+        );
+
+        drop(claim);
+
+        assert_eq!(cleanup_stale_downloads(&dir).unwrap(), 1);
+        assert!(!file.exists(), "an abandoned download survived a sweep with nothing holding it");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The two sides of the claim agree on the string, each computing it the
+    /// way it actually can: the holder from a version, the sweep from a file
+    /// name it read off the directory.
+    #[test]
+    fn the_holder_and_the_sweep_name_the_same_claim() {
+        let version = Version::parse("4.5.6").unwrap();
+        let named = installer_claim_name(&installer_file_name(&version));
+        assert!(
+            named.starts_with(crate::app_mutex::APP_MUTEX_NAME),
+            concat!(
+                "the claim no longer extends the app's own mutex name, so it no longer ",
+                "carries the GUID that keeps it from colliding with an unrelated program"
+            )
+        );
+        assert!(
+            named.ends_with("deskwarden-4.5.6-installer.exe"),
+            "the claim no longer names the file it claims: {named}"
+        );
     }
 
     #[test]

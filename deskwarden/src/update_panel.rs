@@ -189,11 +189,29 @@ pub struct UpdatePanel {
     /// finishes, which is also what makes [`UpdatePanel::is_busy`] answerable
     /// without a second flag to keep in step.
     rx: Option<Receiver<UpdateMsg>>,
+    /// The claim over the installer this panel downloaded, held so that the
+    /// daemon's startup sweep does not delete a file this page is one click
+    /// away from launching. See [`updater::cleanup_stale_downloads`].
+    ///
+    /// **Held here, in the panel, rather than in a `static`, and never
+    /// cleared.** Its lifetime is meant to be the window's, and this field
+    /// gives it exactly that for free: a `--ui` process exists to show one
+    /// surface and exit, so the panel is dropped when the window closes and
+    /// the kernel drops the name with it. Nothing has to remember to release
+    /// it -- including on the paths where nobody could, a panic or a kill.
+    ///
+    /// Not released when the stage moves off `Ready` either. Doing so would
+    /// buy a slightly earlier reap of a file that is about to be reaped
+    /// anyway, in exchange for a second place that decides when a download
+    /// stops being wanted -- and a page that has moved to `Downloading` for
+    /// the next release is a page whose previous file is still on disk with
+    /// this process still the only one that knows about it.
+    claim: Option<std::os::windows::io::OwnedHandle>,
 }
 
 impl Default for UpdatePanel {
     fn default() -> Self {
-        Self { stage: UpdateStage::Idle, rx: None }
+        Self { stage: UpdateStage::Idle, rx: None, claim: None }
     }
 }
 
@@ -205,7 +223,7 @@ impl UpdatePanel {
     /// there is no receiver, so nothing can arrive, and the states it draws
     /// are exactly the states named.
     pub fn parked(stage: UpdateStage) -> Self {
-        Self { stage, rx: None }
+        Self { stage, rx: None, claim: None }
     }
 
     pub fn stage(&self) -> &UpdateStage {
@@ -377,6 +395,17 @@ impl UpdatePanel {
             self.stage = UpdateStage::Unavailable;
             return;
         };
+        // **Before the thread, not after it reports.** `download_and_verify`
+        // renames the part-file into the name the sweep recognises, and from
+        // that instant an unclaimed file is a deletable one -- while this
+        // panel has not yet been told the download finished. Claiming here
+        // closes that window; see [`updater::claim_installer`].
+        //
+        // Overwrites any claim from an earlier download in this window. That
+        // is the intent: the file that one named is no longer the file this
+        // page is going to launch, so letting the old name go is what lets
+        // the old download be reaped.
+        self.claim = updater::claim_installer(&release.version);
         let (tx, rx) = mpsc::channel();
         let dest = env.download_dir.clone();
         let for_thread = release.clone();
@@ -931,7 +960,7 @@ mod tests {
     #[test]
     fn pump_drains_without_blocking_and_retires_a_finished_worker() {
         let (tx, rx) = mpsc::channel();
-        let mut panel = UpdatePanel { stage: UpdateStage::Checking, rx: Some(rx) };
+        let mut panel = UpdatePanel { stage: UpdateStage::Checking, rx: Some(rx), claim: None };
 
         tx.send(UpdateMsg::Checked(Ok(Some(release("9.9.9"))))).unwrap();
         assert!(panel.pump(), "the message was not drained");
@@ -951,7 +980,7 @@ mod tests {
     #[test]
     fn a_second_start_is_refused_while_something_is_in_flight() {
         let (tx, rx) = mpsc::channel::<UpdateMsg>();
-        let mut panel = UpdatePanel { stage: UpdateStage::Checking, rx: Some(rx) };
+        let mut panel = UpdatePanel { stage: UpdateStage::Checking, rx: Some(rx), claim: None };
 
         panel.begin_check();
         panel.begin_download();

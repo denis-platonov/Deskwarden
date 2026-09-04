@@ -495,12 +495,18 @@ fn main() {
     // never be the one that gets the secrets.
     deskwarden::bw_path::remember_verified_bw_exe(bw_exe);
 
-    // Any installer still sitting in the download directory is spent by now:
-    // either it was applied (and this process is the result) or its attempt
-    // failed. Deleting them here rather than after applying one is not a
-    // stylistic choice -- `apply_update` launches the installer and this
-    // process exits immediately after, so at that moment the file is a
-    // running process image and cannot be deleted.
+    // Deleting them here rather than after applying one is not a stylistic
+    // choice -- `apply_update` launches the installer and this process exits
+    // immediately after, so at that moment the file is a running process
+    // image and cannot be deleted.
+    //
+    // **Not every installer sitting here is spent, and this line runs on the
+    // daemon branch only.** A `--ui` process shares this exact directory
+    // (`cache_dir()/updates`, computed a second time in
+    // `run_as_a_ui_process`), and it can be sitting on a downloaded, verified
+    // installer while this daemon restarts underneath it. `cleanup_stale_downloads`
+    // therefore skips anything a live process claims; see its own comment for
+    // the mechanism and for why abandoned downloads are still reaped.
     match updater::cleanup_stale_downloads(&update_download_dir) {
         Ok(0) => {}
         Ok(n) => log::info!("cleaned up {n} stale update download(s)"),
