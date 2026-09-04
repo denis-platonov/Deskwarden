@@ -1071,7 +1071,8 @@ pub fn avatar_artwork_tile(ui: &mut Ui, size: f32, emphasized: bool) -> Rect {
 /// allocation, one rounding and one border, so the two cannot drift into
 /// different geometry while claiming to be the same tile.
 fn avatar_box(ui: &mut Ui, size: f32, emphasized: bool, fill: Option<Color32>) -> Rect {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let (allocated, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let rect = snap_to_pixels(ui, allocated);
     let rounding = avatar_corner_radius(size);
     if let Some(bg) = fill {
         ui.painter().rect_filled(rect, rounding, bg);
@@ -1079,6 +1080,51 @@ fn avatar_box(ui: &mut Ui, size: f32, emphasized: bool, fill: Option<Color32>) -
     ui.painter()
         .rect_stroke(rect, rounding, avatar_tile_stroke(emphasized), StrokeKind::Middle);
     rect
+}
+
+/// Moves `rect` so its top-left sits on a whole PHYSICAL pixel, keeping its
+/// size exactly.
+///
+/// **The report: "Amazon has 5 pixels to the left and 6 to the right", and
+/// the same 5/6 top to bottom.** That is a half-pixel, not a centring bug.
+/// The artwork is centred in the tile to within a hundredth of a point, but
+/// the tile itself is placed by the surrounding layout, which has no reason to
+/// land on a whole pixel -- a row's available width divided among a rail, a
+/// gap and a text column is fractional far more often than not. With the tile
+/// at x = 79.33, a symmetric 6pt gap becomes 5.67 on the left and 6.33 on the
+/// right, and the rasteriser resolves those to 5 and 6. The icon really is
+/// centred; the pixel grid is what is off.
+///
+/// So the tile is snapped before anything is drawn into it. Snapping the
+/// TILE rather than the artwork is what makes both gaps whole: move the
+/// artwork alone and the gaps stay unequal, only differently. The tile's
+/// side and the artwork's are both even numbers of points, so once the tile
+/// starts on a pixel the artwork's edges land on pixels too.
+///
+/// Rounded in PHYSICAL pixels, not points: at 125% or 150% scaling a whole
+/// point is not a whole pixel, and rounding to points there would leave
+/// exactly the fringe this removes. The allocation is deliberately left
+/// alone -- layout keeps its own fractional geometry, and only the paint is
+/// snapped, so nothing downstream shifts by up to half a pixel per row and
+/// accumulates.
+fn snap_to_pixels(ui: &Ui, rect: Rect) -> Rect {
+    Rect::from_min_size(snapped_min(rect.min, ui.ctx().pixels_per_point()), rect.size())
+}
+
+/// The arithmetic of [`snap_to_pixels`], split out so it can be asserted on
+/// directly: a `Ui` in a test harness reports whatever scaling the harness
+/// happens to use and lays its rows out wherever it likes, so a test driven
+/// through one could pass by never meeting a fractional coordinate at all --
+/// which is the shape of test this crate treats as a defect.
+///
+/// A non-positive `pixels_per_point` cannot be divided back out; the position
+/// is returned untouched, which is the same no-op the old code was.
+fn snapped_min(min: Pos2, pixels_per_point: f32) -> Pos2 {
+    if pixels_per_point <= 0.0 {
+        return min;
+    }
+    let snap = |v: f32| (v * pixels_per_point).round() / pixels_per_point;
+    Pos2::new(snap(min.x), snap(min.y))
 }
 
 /// The avatar tile's `border-radius: 8px` at the design's 32px size, as a
@@ -4805,6 +4851,79 @@ mod tests {
 /// numbers copied out of [`tune_button`]. A test that restated the control's
 /// own constants would pass against any mark at all, including the gear that
 /// prompted the note and that this control no longer draws.
+#[cfg(test)]
+mod pixel_snapping_tests {
+    use super::*;
+
+    /// **THE REPORT: "Amazon has 5 pixels to the left and 6 to the right",
+    /// and the same 5/6 top to bottom.** The artwork was centred correctly;
+    /// the TILE was at a fractional coordinate, so a symmetric 6pt gap
+    /// rasterised as 5 one side and 6 the other.
+    ///
+    /// Asserted on the geometry the report describes, end to end: a 32pt tile
+    /// at x = 79.33, a 20pt icon centred in it, and the claim that both gaps
+    /// come out equal and whole.
+    #[test]
+    fn a_tile_at_a_fractional_coordinate_gives_its_artwork_two_equal_gaps() {
+        let allocated = Rect::from_min_size(Pos2::new(79.33, 68.4), Vec2::splat(32.0));
+        let ragged = avatar_artwork(allocated, Vec2::splat(64.0)).0;
+        assert_ne!(
+            ragged.left() - allocated.left(),
+            ragged.right().round() - allocated.right().round(),
+            "this test's premise is gone: the unsnapped tile no longer produces the \
+             uneven gaps the snapping exists to remove"
+        );
+
+        let tile = Rect::from_min_size(snapped_min(allocated.min, 1.0), allocated.size());
+        let (art, _) = avatar_artwork(tile, Vec2::splat(64.0));
+        let (left, right) = (art.left() - tile.left(), tile.right() - art.right());
+        let (top, bottom) = (art.top() - tile.top(), tile.bottom() - art.bottom());
+        assert_eq!(
+            (left, right, top, bottom),
+            (6.0, 6.0, 6.0, 6.0),
+            "a 20pt icon in a snapped 32pt tile must leave 6pt on every side, whole"
+        );
+        assert_eq!(
+            (art.left().fract(), art.top().fract()),
+            (0.0, 0.0),
+            "the artwork's own edges are off the pixel grid, so it will be drawn with a \
+             soft fringe on one side even though its gaps measure equal"
+        );
+    }
+
+    /// Rounded in PHYSICAL pixels, not points. At 150% scaling a whole point
+    /// is two thirds of a pixel, so rounding to points would leave exactly the
+    /// fringe this removes -- and this is the assertion that says which of the
+    /// two is meant.
+    #[test]
+    fn snapping_lands_on_a_device_pixel_not_on_a_whole_point() {
+        let snapped = snapped_min(Pos2::new(79.33, 68.4), 1.5);
+        assert_ne!(
+            (snapped.x.fract(), snapped.y.fract()),
+            (0.0, 0.0),
+            "both axes landed on whole POINTS, which is the rounding this test rules out; \
+             at 1.5x a whole point is a pixel and a half"
+        );
+        for (v, axis) in [(snapped.x, "x"), (snapped.y, "y")] {
+            let pixels = v * 1.5;
+            assert!(
+                (pixels - pixels.round()).abs() < 1e-4,
+                "{axis} = {v} is {pixels} device pixels, which is not a whole one"
+            );
+        }
+    }
+
+    /// A degenerate scale factor cannot be divided back out. The position is
+    /// returned untouched rather than becoming NaN and taking the tile with
+    /// it.
+    #[test]
+    fn a_non_positive_scale_factor_leaves_the_position_alone() {
+        let at = Pos2::new(79.33, 68.4);
+        assert_eq!(snapped_min(at, 0.0), at);
+        assert_eq!(snapped_min(at, -1.0), at);
+    }
+}
+
 #[cfg(test)]
 mod drawn_icon_family_tests {
     use super::*;
