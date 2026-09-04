@@ -74,7 +74,7 @@ const HEADER_GAP: f32 = 14.0;
 /// equal in the meantime.
 ///
 /// The strip's height no longer follows this number -- [`HEADER_ROW`] does.
-const HEADER_AVATAR: f32 = 28.0;
+const HEADER_AVATAR: f32 = 32.0;
 
 /// **The height of the strip's content row**, and therefore the strip's own
 /// height once `padding: 20px` is added above and below it: design 2b's 44px.
