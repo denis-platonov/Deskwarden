@@ -715,14 +715,23 @@ fn draw_list_placeholder(ui: &mut egui::Ui, placeholder: ListPlaceholder) {
     }
 }
 
-/// The design's avatar/favicon tile: `width: 32px; height: 32px`.
+/// The design's avatar/favicon tile.
+///
+/// **28, down from the design's 32, and the reason is a side-by-side.** The
+/// owner put this app's row next to Keeper's and the report was "Keeper icons
+/// are smaller" -- with, in the same breath, a favicon that "doesn't feel
+/// centered and cropped". Those are one symptom: a tile this size magnifies
+/// the 16x16 favicon most sites still serve by 2x, and every artefact of that
+/// magnification -- soft edges, ink pressed against the tile's border, a round
+/// logo losing its diagonals to the corner arc -- scales with the tile. A
+/// smaller tile magnifies less and shows less of all three.
 ///
 /// `pub(crate)` only so the detail pane can PIN its own `HEADER_AVATAR` equal
 /// to it (`the_header_tile_is_the_list_row_tile`). The two panes draw one tile
 /// at one size by the owner's decision, and a number agreed by two private
 /// constants is a number that can quietly stop agreeing. Nothing outside this
 /// module lays anything out with it.
-pub(crate) const AVATAR_SIZE: f32 = 32.0;
+pub(crate) const AVATAR_SIZE: f32 = 28.0;
 
 /// The network mark's height, in points, on a list row.
 ///
@@ -4180,20 +4189,25 @@ mod row_tile_tests {
     #[test]
     fn the_avatar_tile_is_actually_filled_and_bordered_in_both_states() {
         // "the tile is actually filled rather than transparent", asserted on
-        // the 32x32 monogram box: `background: #f3f2f2; border: 1px solid
-        // #eae7e7` unselected, `#eef2fc` / `#b8c7ea` selected.
+        // the monogram box: `background: #f3f2f2; border: 1px solid #eae7e7`
+        // unselected, `#eef2fc` / `#b8c7ea` selected.
         let items = [login("Ledgerline", "a.novak@ledgerline.com")];
-        let unselected = square(&paint(&items, None), 32.0);
+        let unselected = square(&paint(&items, None), AVATAR_SIZE);
         assert_eq!(unselected.fill, theme::CANVAS);
-        let selected = square(&paint(&items, Some("Ledgerline")), 32.0);
+        let selected = square(&paint(&items, Some("Ledgerline")), AVATAR_SIZE);
         assert_eq!(selected.fill, theme::BLUE_WASH);
         assert_ne!(selected.fill, egui::Color32::TRANSPARENT);
     }
 
-    /// The vertical centre of the 32px avatar tile in the FIRST row, absolute
-    /// at this pane: the tile's top edge (68) plus its 1px border and 10px
-    /// padding (79), plus half the avatar (16).
-    const FIRST_ROW_AVATAR_CENTRE_Y: f32 = 95.0;
+    /// The vertical centre of the avatar tile in the FIRST row, absolute at
+    /// this pane: the tile's top edge (68) plus its 1px border and 10px
+    /// padding (79), plus half the avatar.
+    ///
+    /// Derived from [`AVATAR_SIZE`] rather than written out, because the tile
+    /// has now been resized twice and a literal here goes red on the next one
+    /// with a message about the harness's geometry moving -- which reads as a
+    /// broken test rather than as the deliberate change it is.
+    const FIRST_ROW_AVATAR_CENTRE_Y: f32 = 79.0 + AVATAR_SIZE / 2.0;
 
     #[test]
     fn the_title_and_email_are_centred_against_the_avatar_not_hung_from_its_top() {
