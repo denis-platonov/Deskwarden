@@ -292,6 +292,24 @@ enum Surface {
     /// The old flow's failure went to a tray tooltip, visible only to someone
     /// already hovering a 16px icon.
     PrefsUpdatesFailed,
+    /// **The stage this page opens on, and the one with no picture until
+    /// now.** Every other surface in this set shows the card after something
+    /// has happened to it; this is what a user sees the moment they click
+    /// Updates, which makes it the most-viewed state of the card and the last
+    /// one anybody was reviewing.
+    ///
+    /// It earned a surface when the card's title was removed. `Idle` is where
+    /// that removal is most visible -- the row is now a paragraph and a
+    /// button with no heading over either -- so "does a card with no title
+    /// still read as a card" is answered here or nowhere.
+    PrefsUpdatesIdle,
+    /// **Mid-check**, with the button disabled and labelled "Checking...".
+    ///
+    /// The other half of the pair above, and the reason the busy stages draw
+    /// a disabled button instead of nothing: a row whose control vanishes
+    /// reflows the card under the cursor. That is a claim about two frames,
+    /// and this is the second of them.
+    PrefsUpdatesChecking,
     /// **The Breaches page, before anything has been asked for.** The consent
     /// pill, the scan button, the sentence saying the button ignores the
     /// pill, and an empty history that says so in words rather than being a
@@ -531,6 +549,8 @@ const ALL: &[Surface] = &[
     Surface::PrefsUpdatesDownloading,
     Surface::PrefsUpdatesReady,
     Surface::PrefsUpdatesFailed,
+    Surface::PrefsUpdatesIdle,
+    Surface::PrefsUpdatesChecking,
     Surface::PrefsBreachesIdle,
     Surface::PrefsBreachesRunning,
     Surface::PrefsBreachesFailed,
@@ -595,6 +615,8 @@ impl Surface {
             Surface::PrefsUpdatesDownloading => "prefs_updates_downloading",
             Surface::PrefsUpdatesReady => "prefs_updates_ready",
             Surface::PrefsUpdatesFailed => "prefs_updates_failed",
+            Surface::PrefsUpdatesIdle => "prefs_updates_idle",
+            Surface::PrefsUpdatesChecking => "prefs_updates_checking",
             Surface::PrefsBreachesIdle => "prefs_breaches_idle",
             Surface::PrefsBreachesRunning => "prefs_breaches_running",
             Surface::PrefsBreachesFailed => "prefs_breaches_failed",
@@ -685,6 +707,8 @@ impl Surface {
             | Surface::PrefsUpdatesDownloading
             | Surface::PrefsUpdatesReady
             | Surface::PrefsUpdatesFailed
+            | Surface::PrefsUpdatesIdle
+            | Surface::PrefsUpdatesChecking
             | Surface::PrefsBreachesIdle
             | Surface::PrefsBreachesRunning
             | Surface::PrefsBreachesFailed
@@ -1080,6 +1104,8 @@ impl eframe::App for Preview {
             | Surface::PrefsUpdatesManyReleases
             | Surface::PrefsUpdatesDownloading
             | Surface::PrefsUpdatesReady
+            | Surface::PrefsUpdatesIdle
+            | Surface::PrefsUpdatesChecking
             | Surface::PrefsUpdatesFailed => self.draw_prefs_updates(root, self.current()),
             Surface::PrefsBreachesIdle
             | Surface::PrefsBreachesRunning
@@ -1589,6 +1615,8 @@ impl Preview {
                 done: 2_400_000,
                 total: Some(6_291_456),
             },
+            Surface::PrefsUpdatesIdle => UpdateStage::Idle,
+            Surface::PrefsUpdatesChecking => UpdateStage::Checking,
             Surface::PrefsUpdatesReady => UpdateStage::Ready(release),
             // **The handover refusal, not a network one.** A connection that
             // closed was already covered by the download's own error; what

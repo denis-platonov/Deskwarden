@@ -514,7 +514,18 @@ const BREACH_DESCRIPTION: &str = "Off by default. When on, Deskwarden sends the 
      characters of a SHA-1 hash of a password to Have I Been Pwned and matches the rest on this \
      machine. Your password, and the rest of its hash, never leave your PC.";
 
-/// The scan card's own heading, in `UPDATE_SECTION_LABEL`'s idiom.
+/// The scan card's own heading.
+///
+/// It keeps a title where the Updates flow card dropped one, and what
+/// separates them is not the number of headings on the page -- both pages put
+/// their name in the nav row and again over the content ([`Section::label`] is
+/// both). It is that this title says something neither of those two say. "New
+/// releases" was a third spelling of "Updates"; "Scan the whole vault" names
+/// an action the word "Breaches" does not contain, over a card whose sibling
+/// on the same page is the automatic-checking pill.
+///
+/// An imperative rather than a noun phrase because it stays true while a scan
+/// is running.
 const SCAN_SECTION_LABEL: &str = "Scan the whole vault";
 const SCAN_BUTTON: &str = "Scan all passwords now";
 const SCAN_RUNNING_BUTTON: &str = "Scanning...";
@@ -888,22 +899,29 @@ pub enum AccountStatus {
 // its own thread and channel because `run` below blocks and `main.rs`'s loop is
 // not running while this page is on screen.
 
-/// The flow card's label -- the row the description and the button sit on.
-///
-/// **It said "Updates" while this card lived on About**, where that was the
-/// only word on the page naming the subject. On [`Section::Updates`] it is
-/// also the page heading and also the nav row, so the same string was about
-/// to be painted three times in one view and `ink_of` would no longer have
-/// been able to say which one a test meant.
-///
-/// A noun phrase rather than [`SCAN_SECTION_LABEL`]'s imperative, and that is
-/// the one place these two pages deliberately differ: "Scan the whole vault"
-/// stays true while a scan is running, whereas an imperative here would be
-/// telling the user to check for a release they are already downloading. The
-/// stage is the *description's* job on both pages; this label only has to
-/// name what the card is about, at every stage.
-const UPDATE_SECTION_LABEL: &str = "New releases";
+// **The flow card has no label of its own, and that is deliberate.** It used
+// to carry `UPDATE_SECTION_LABEL = "New releases"` above its status line. On
+// `Section::Updates` that word is already the nav row and already the page
+// heading, so the card's title was the third painting of one subject in one
+// view -- and on the stages that show notes, the fourth thing stacked over a
+// release body that opens with its own `## What's new in <version>`.
+//
+// What is left is the pair that carries information: the status line, which
+// differs at every stage, and the button, which names its own action. See
+// `status_row`, which is the row shape that has no title.
 const UPDATE_CHECK_BUTTON: &str = "Check for updates";
+
+/// The flow row's status line once a release has been found and not yet
+/// fetched.
+///
+/// A function rather than an inline `format!` because the tests below have to
+/// locate this card on a page with several, and with the section label gone
+/// this line is the string they anchor on. Written once so the anchor cannot
+/// drift away from the paint while both still compile -- which is exactly how
+/// a test starts passing without reaching the thing it names.
+fn update_available_status(version: &semver::Version) -> String {
+    format!("Version {version} is available.")
+}
 const UPDATE_CHECKING_BUTTON: &str = "Checking...";
 const UPDATE_DOWNLOAD_BUTTON: &str = "Download";
 const UPDATE_DOWNLOADING_BUTTON: &str = "Downloading...";
@@ -2107,16 +2125,55 @@ fn row_text(ui: &mut Ui, label: &str, description: &str) {
 /// column, the 20px gap, then the control right-aligned and vertically centred
 /// on the text.
 ///
-/// The two columns are allocated at explicit widths rather than by wrapping the
-/// whole row in a `right_to_left` layout, and that is not a style preference.
+/// **The invariant is the measurement, not the title.** The two columns are
+/// allocated at explicit widths rather than by wrapping the whole row in a
+/// `right_to_left` layout, and that is not a style preference.
 /// A `Layout::right_to_left(Align::Center)` has to know its own height to
 /// centre anything in it, so given an unbounded one it takes *all* the height
 /// still available in the card -- the first row of a two-row card consumed
 /// every remaining point and the second row was laid out at the bottom edge of
 /// the window with zero height, painting its title and silently dropping its
 /// description. Measuring the text column first and handing the control a rect
-/// of exactly that height is what makes the centring well-defined.
+/// of exactly that height is what makes the centring well-defined. What that
+/// column *contains* is the caller's business, which is why [`status_row`] can
+/// leave the title out without touching any of the above.
 fn control_row(ui: &mut Ui, label: &str, description: &str, control: impl FnOnce(&mut Ui)) {
+    control_row_of(ui, |ui| row_text(ui, label, description), control);
+}
+
+/// A row with **no title over its text** -- the text column is a single line
+/// of state, and the control beside it names its own action.
+///
+/// The Updates flow card is the caller this exists for. It used to be a
+/// [`control_row`] titled "New releases" above "Version 0.15.11 is
+/// available.", stacked under a page heading and a nav row that both already
+/// said Updates, and over a release body whose first line is its own
+/// `## What's new in <version>`. The title was the third of four ways the
+/// same word was painted in one view, so it went; the line under it stayed,
+/// because it is not a heading at all -- it is the stage, and it says
+/// something different at every one of them.
+///
+/// **The two-column measurement is [`control_row`]'s, not a copy of it.**
+/// That layout's whole point is that the text column is measured before the
+/// control is given a rect (see the note there about the row that was laid
+/// out at the bottom edge of the window with zero height), and a second
+/// implementation of it is a second place for that bug to come back. Both
+/// row shapes call [`control_row_of`], which is the only place the
+/// arrangement is written down.
+fn status_row(ui: &mut Ui, status: &str, control: impl FnOnce(&mut Ui)) {
+    control_row_of(
+        ui,
+        |ui| {
+            ui.label(RichText::new(status).size(12.0).color(theme::TEXT_FAINT));
+        },
+        control,
+    );
+}
+
+/// The shared body of [`control_row`] and [`status_row`]: whatever `text`
+/// paints, measured, then the control right-aligned and vertically centred on
+/// exactly that height.
+fn control_row_of(ui: &mut Ui, text: impl FnOnce(&mut Ui), control: impl FnOnce(&mut Ui)) {
     card_row(ui, |ui| {
         let text_width = (ui.available_width() - CONTROL_COLUMN_WIDTH - ROW_GAP).max(1.0);
         let origin = ui.cursor().min;
@@ -2125,7 +2182,7 @@ fn control_row(ui: &mut Ui, label: &str, description: &str, control: impl FnOnce
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 ui.set_width(text_width);
-                row_text(ui, label, description);
+                text(ui);
             },
         );
         let height = text.response.rect.height().max(CONTROL_MIN_HEIGHT);
@@ -4451,7 +4508,7 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
                 (UPDATE_UP_TO_DATE_DESCRIPTION.to_string(), Some(UPDATE_CHECK_BUTTON))
             }
             UpdateStage::Available(r) => {
-                (format!("Version {} is available.", r.version), Some(UPDATE_DOWNLOAD_BUTTON))
+                (update_available_status(&r.version), Some(UPDATE_DOWNLOAD_BUTTON))
             }
             UpdateStage::Downloading { release, .. } => {
                 (format!("Downloading version {}.", release.version), None)
@@ -4483,7 +4540,13 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
         };
 
         let mut clicked = false;
-        control_row(ui, UPDATE_SECTION_LABEL, &description, |ui| {
+        // **No title over this row.** `description` above is the stage, and
+        // the button beside it says the action -- Download, Restart to
+        // install, Try again. A title here would have been the third "New
+        // releases"/"Updates" in one view, after the nav row and the page
+        // heading, and the fourth thing over notes that open with their own
+        // `## What's new in <version>`. See `status_row`.
+        status_row(ui, &description, |ui| {
             if let Some(label) = busy_label {
                 let _ = update_button(ui, label, false);
             } else if let Some(label) = button {
@@ -8513,7 +8576,10 @@ mod tests {
         // rule stated after its exception explains nothing.
         let updates = paint(Section::Updates);
         let pill = updates.ink_of(UPDATE_CHECK_LABEL).rect;
-        let flow = updates.ink_of(UPDATE_SECTION_LABEL).rect;
+        // Anchored on the flow card's BUTTON, which is what the sentence
+        // above is actually about, and what is left to anchor on now that
+        // the card has no title of its own (see `status_row`).
+        let flow = updates.ink_of(UPDATE_CHECK_BUTTON).rect;
         assert!(pill.height() > 0.0 && flow.height() > 0.0);
         assert!(
             pill.top() < flow.top(),
@@ -11278,22 +11344,28 @@ mod tests {
     /// than by index -- the Updates page has several cards and their order is
     /// not this test's business.
     ///
-    /// **Anchored on [`UPDATE_SECTION_LABEL`], which is on that same card.**
-    /// It used to be anchored on a notes heading of the app's own, and that
-    /// heading is gone: the release body brings its own (see
-    /// `updater::notes_heading`). The section label is the better anchor
-    /// anyway -- it is the one string on this card that is identical for every
-    /// stage and every release, so the two paints being compared below are
-    /// located by something that does not vary with what is being compared.
-    fn notes_card_rect(painted: &Painted) -> Rect {
-        let anchor = painted.rect_of(UPDATE_SECTION_LABEL);
+    /// **Anchored on the flow row's status line**, which is on that same
+    /// card. It was anchored first on a notes heading of the app's own and
+    /// then on the card's section label, and both of those are now gone --
+    /// the release body brings its own heading, and the card carries no title
+    /// (see `status_row`).
+    ///
+    /// What matters for an anchor here is not that it is constant across
+    /// stages but that it is constant across *the two paints being compared*.
+    /// Both callers below paint `Available` with the same version and vary
+    /// only the notes body, so [`update_available_status`] is identical in
+    /// both and cannot move with the thing under test. The version is taken
+    /// from the painted release rather than spelled here, so a change to
+    /// `a_release` cannot leave this looking for a string nothing paints.
+    fn notes_card_rect(painted: &Painted, version: &semver::Version) -> Rect {
+        let anchor = painted.rect_of(&update_available_status(version));
         painted
             .rects
             .iter()
             .map(|r| r.rect)
             .filter(|r| r.contains(anchor.center()) && r.width() > anchor.width())
             .min_by(|a, b| a.width().partial_cmp(&b.width()).unwrap())
-            .expect("the update card's own label is painted on no card at all")
+            .expect("the update card's status line is painted on no card at all")
     }
 
     /// Is a scrollbar-width rectangle painted in ink anyone can see?
@@ -11370,8 +11442,8 @@ mod tests {
             Settings::default(),
         );
 
-        let short_card = notes_card_rect(&short);
-        let long_card = notes_card_rect(&long);
+        let short_card = notes_card_rect(&short, &a_release().version);
+        let long_card = notes_card_rect(&long, &a_release().version);
         assert!(
             (short_card.width() - long_card.width()).abs() < 0.5
                 && (short_card.left() - long_card.left()).abs() < 0.5,
@@ -11418,8 +11490,8 @@ mod tests {
             Settings::default(),
         );
 
-        let short_card = notes_card_rect(&short);
-        let long_card = notes_card_rect(&long);
+        let short_card = notes_card_rect(&short, &a_release().version);
+        let long_card = notes_card_rect(&long, &a_release().version);
 
         // Down to the page's own edge, give or take the content padding the
         // column was shrunk by. Not asserted to the point, because the exact
@@ -11676,7 +11748,6 @@ mod tests {
             Settings::default(),
         );
 
-        assert!(painted.contains(UPDATE_SECTION_LABEL));
         assert!(
             painted.contains(UPDATE_UP_TO_DATE_DESCRIPTION),
             "the page must SAY there is no update, not merely fail to claim one: {:?}",
@@ -11686,6 +11757,113 @@ mod tests {
         assert!(
             !painted.strings().iter().any(|t| t.contains(concat!("Update", " available"))),
             "the tray's words are back on the page: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// **The flow card writes no title of its own, at any stage.**
+    ///
+    /// The words removed were `UPDATE_SECTION_LABEL`'s "New releases", which
+    /// was the third painting of "Updates" in one view -- nav row, page
+    /// heading, card title -- and, on the stages that show notes, the fourth
+    /// thing stacked over a body that opens with its own `## What's new in
+    /// <version>`.
+    ///
+    /// Every stage, because the removal was made in one call site that all
+    /// eight run through, and a test that checked one of them would pass just
+    /// as well against a card that grew its title back on the other seven.
+    #[test]
+    fn the_update_card_paints_no_heading_of_its_own_at_any_stage() {
+        use crate::update_panel::UpdateStage;
+
+        let stages = [
+            ("idle", UpdateStage::Idle),
+            ("checking", UpdateStage::Checking),
+            ("up to date", UpdateStage::UpToDate),
+            ("available", UpdateStage::Available(a_release())),
+            (
+                "downloading",
+                UpdateStage::Downloading {
+                    release: a_release(),
+                    done: 1,
+                    total: Some(2),
+                },
+            ),
+            ("ready", UpdateStage::Ready(a_release())),
+            (
+                "failed",
+                UpdateStage::Failed {
+                    message: "the connection closed".to_string(),
+                    release: Some(a_release()),
+                },
+            ),
+            ("unavailable", UpdateStage::Unavailable),
+        ];
+
+        for (name, stage) in stages {
+            let painted = paint_updates(stage, Settings::default());
+            for gone in [concat!("New ", "releases"), concat!("What is", " new")] {
+                assert!(
+                    !painted.any_containing(gone),
+                    "the {name} stage paints {gone:?} over the flow card again: {:?}",
+                    painted.strings()
+                );
+            }
+            // **The control.** Without it every assertion above would pass on
+            // a page that painted nothing at all -- which is exactly how a
+            // blank panel ships. `Section::label` is the heading this card's
+            // title was a third spelling of, so its presence also says the
+            // Updates page is the page under the reader's eye.
+            assert!(
+                painted.contains(Section::Updates.label()),
+                "the {name} stage painted no Updates page for the assertions above to be \
+                 about: {:?}",
+                painted.strings()
+            );
+        }
+    }
+
+    /// **One heading over the notes, and it is the release's own.**
+    ///
+    /// The end state the whole removal was for. A production body opens with
+    /// the `## What's new in <version>` that `.github/workflows/release.yml`
+    /// writes, and the app used to add two more above it. Counted rather than
+    /// merely asserted absent, because "no heading of ours" and "exactly one
+    /// heading" are different claims and the second is the one a reader sees.
+    #[test]
+    fn a_real_release_body_is_painted_under_exactly_one_whats_new_line() {
+        let painted = paint_updates(
+            crate::update_panel::UpdateStage::Available(crate::updater::ReleaseInfo {
+                body: "## What's new in 9.9.9\n- Fixed the thing\n".to_string(),
+                ..a_release()
+            }),
+            Settings::default(),
+        );
+
+        let headings = painted
+            .strings()
+            .iter()
+            .filter(|t| t.contains("What's new in"))
+            .count();
+        assert_eq!(
+            headings, 1,
+            "the notes carry {headings} \"What's new in\" headings rather than the release's \
+             own one: {:?}",
+            painted.strings()
+        );
+        // Controls: the counted line really is the release's, and the app is
+        // not simply painting no notes -- either would make the count above
+        // come out at one, or at nothing, for the wrong reason.
+        assert!(
+            painted.any_containing("What's new in 9.9.9"),
+            "got {:?}",
+            painted.strings()
+        );
+        assert!(painted.any_containing("Fixed the thing"), "got {:?}", painted.strings());
+        assert!(
+            !painted.any_containing(concat!("Deskwarden ", "9.9.9")),
+            "`updater::notes_heading` is writing over a release that headed its own notes: \
+             {:?}",
             painted.strings()
         );
     }
