@@ -2596,10 +2596,20 @@ fn shaped_icons(ctx: &egui::Context, items: &[VaultItem]) -> item_list::IconCach
         // 180x180 is `apple-touch-icon.png`'s own size, 128x44 is the shape
         // of a page-declared wordmark, and 44x128 is that lying down -- the
         // three shapes a real fetch comes back with that are not a square.
+        //
+        // **16x16 is the fourth, and it is the one the sizing rule is FOR.**
+        // It is still what most sites serve from `/favicon.ico`, and it is
+        // the only one of the four that comes out of `favicon::decode_rgba`
+        // SMALLER than the 32pt tile -- the other three are reduced to a 64px
+        // longest edge and so still fill it. Without a row like this the
+        // preview cannot show the difference between "never upscale" and
+        // "unchanged": every icon in the shot would be full bleed either way,
+        // which is exactly the picture that would have let this ship broken.
         let shape = match item.id.as_str() {
             "kinds-login-touch" => Some(((180, 180), egui::Color32::from_rgb(0x1f, 0x6f, 0x5c))),
             "kinds-login-wide" => Some(((128, 44), egui::Color32::from_rgb(0x8a, 0x2f, 0x3c))),
             "kinds-login-tall" => Some(((44, 128), egui::Color32::from_rgb(0x33, 0x3d, 0x8a))),
+            "kinds-login-small" => Some(((16, 16), egui::Color32::from_rgb(0x7a, 0x4a, 0x1f))),
             _ => None,
         };
         if let Some((size, ground)) = shape {
@@ -2791,6 +2801,11 @@ const KINDS_JSON: &str = r#"[
     "id": "kinds-login-tall", "type": 1, "name": "Cantilever Studio",
     "login": { "username": "anna@cantilever.example", "password": "x",
       "uris": [{ "uri": "https://cantilever.example" }] }
+  },
+  {
+    "id": "kinds-login-small", "type": 1, "name": "Ashgrove Books",
+    "login": { "username": "anna@ashgrove.example", "password": "x",
+      "uris": [{ "uri": "https://ashgrove.example" }] }
   },
   {
     "id": "kinds-login-plain", "type": 1, "name": "Northwind Mail",

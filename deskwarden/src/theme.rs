@@ -885,56 +885,117 @@ pub fn initials(name: &str) -> String {
     }
 }
 
-/// Paints `texture` to FILL an [`avatar_tile`], clipped to the tile's own
-/// corner radius, and re-draws the tile's border over it.
+/// Where the artwork goes inside an [`avatar_tile`], and what corner radius it
+/// is clipped with: [`avatar_image`]'s geometry, split out as a pure function
+/// so it can be asserted on directly rather than only inferred from a paint.
 ///
-/// **Full bleed, and it took three passes to get here.** The history, because
-/// the next person to look at this row will be holding one of these reports
-/// and not the other two:
+/// `source` is the texture's own size in pixels, which is read as POINTS. That
+/// is the whole meaning of "a 16x16 favicon draws at 16x16": the number of
+/// pixels the artwork has is the number of points it is given, so the tile's
+/// look does not change between a 100% and a 200% monitor. `favicon::
+/// decode_rgba` is what makes that number trustworthy -- it never magnifies a
+/// source, and it letterboxes a non-square one onto a transparent square
+/// canvas, so the size handed here is the artwork's real size and not a
+/// stretched one.
+///
+/// **Two rules, and the second is the one with a history.**
+///
+/// * **Never upscale.** The scale is capped at 1.0, so a 16x16 source is
+///   drawn at 16pt inside a 32pt tile and the 8pt of margin on each side is
+///   simply what is left over. Magnifying it is what made small favicons --
+///   which is most of them -- look soft next to the crisp monogram beside
+///   them.
+/// * **Downscale only to fit, preserving aspect.** A source longer than the
+///   tile on either axis is reduced by the smaller of the two ratios, so
+///   nothing is ever stretched. A 64x64 texture in a 32pt tile therefore
+///   still lands FULL BLEED, exactly as it did before -- this rule takes
+///   nothing away from a large icon, it only stops a small one being blown
+///   up.
+///
+/// **The corner radius follows the tile's curve, concentrically.** The tile is
+/// a rounded rectangle, and the original reason the artwork was ever given a
+/// radius stands: an image reaching the tile's bounds with square corners
+/// pokes four corners out past the rounding. But that reason only applies
+/// where the artwork actually reaches the curve. An inner rect inset by `g`
+/// from a rounded outer rect of radius `R` follows the same curve at radius
+/// `R - g`, so that is what is used: it is exactly `R` at full bleed (the old
+/// behaviour, unchanged), it tapers as the artwork pulls in, and it reaches 0
+/// once the artwork is further inside than the corner arc -- at which point
+/// square corners are correct and rounding them would be inventing a shape
+/// the artwork does not have. The inset is taken as the SMALLER of the two
+/// axes' insets, because the axis where the artwork comes closest to the edge
+/// is the one that can overhang.
+///
+/// A degenerate source (either axis at or below zero) falls back to the whole
+/// tile, which is what this drew before and cannot divide by zero.
+pub fn avatar_artwork(tile: Rect, source: Vec2) -> (Rect, CornerRadius) {
+    let full = avatar_corner_radius(tile.width());
+    if source.x <= 0.0 || source.y <= 0.0 {
+        return (tile, full);
+    }
+    // Cap at 1.0: shrink to fit, never grow.
+    let scale = (tile.width() / source.x).min(tile.height() / source.y).min(1.0);
+    let art = Rect::from_center_size(tile.center(), source * scale);
+    let inset = (tile.width() - art.width()).min(tile.height() - art.height()) / 2.0;
+    let radius = (f32::from(full.nw) - inset).max(0.0).round() as u8;
+    (art, CornerRadius::same(radius))
+}
+
+/// Paints `texture` inside an [`avatar_tile`] -- centred, never magnified,
+/// shrunk only as far as it must be to fit -- and re-draws the tile's border
+/// over it.
+///
+/// **The sizing rule and its history.** This is the fourth pass, and the next
+/// person here will be holding one of these reports and not the other three:
 ///
 /// 1. The favicon was drawn at the full 32pt with `fit_to_exact_size`, and the
 ///    report was "the favicon fills its tile edge-to-edge and feels too big".
-/// 2. So it was inset 4pt a side -- a 24pt image in a 32pt tile, set against
-///    the MONOGRAM beside it, whose letters ([`avatar`], `size * 0.38`) cover
-///    about a third of their tile. The report on THAT was "icon is not fully
-///    taking the rounded rectangle".
-/// 3. The design is the tiebreaker, and it says the image takes the tile. The
-///    spec has no favicon rule of its own to read off -- it gives the tile
-///    ("rows = 32px monogram") and the radius (the avatar radius is ~25% of
-///    the tile size), which is what [`avatar_corner_radius`] already computes
-///    -- so a favicon is that same 32pt tile with artwork in it, not a smaller
-///    box floating inside one.
+/// 2. So it was inset 4pt a side -- a 24pt image in a 32pt tile. The report on
+///    THAT was "icon is not fully taking the rounded rectangle".
+/// 3. So it went full bleed: every icon stretched to the tile whatever its
+///    size. That is what this pass overturns, and the reason is the one thing
+///    the first three passes all missed -- they argued about how much MARGIN
+///    the tile should have, when the defect was RESAMPLING. A 16x16 favicon,
+///    which is what most sites still serve, was being magnified 2x to fill a
+///    32pt tile, and no choice of margin fixes a blown-up image.
+/// 4. So: never magnify. The margin is not a number this code picks at all --
+///    it is whatever is left over once the artwork is drawn at its own size,
+///    centred. A big icon still fills the tile; a small one sits small and
+///    sharp inside it, which is the look the report asked for ("small inside
+///    the rounded square with visible paddings ... never extrapolated").
 ///
-/// **The rounding is the whole risk, and it is why this is a function and not
-/// a `0.0` constant.** The tile is a rounded rectangle. An image painted flush
-/// to its bounds with square corners would poke four corners out past the
-/// rounding, which is a worse result than any inset. The corner radius is
-/// therefore given to the image itself: egui tessellates a textured
-/// `RectShape` with a rounded, antialiased outline exactly as it does an
-/// untextured one, so the artwork is clipped to the tile's curve rather than
-/// merely placed inside its box.
+/// [`avatar_artwork`] is the geometry, with the corner-radius reasoning.
 ///
 /// **The fill and the border still earn their place, in that order.**
 /// [`avatar_tile`] paints both first: the fill is what a favicon with
 /// transparent margins (which is most of them) shows through, and it carries
 /// the selected treatment's `BLUE_WASH`. The BORDER is then re-drawn ON TOP of
-/// the artwork, because `StrokeKind::Middle` straddles the edge -- an image
-/// painted over it would eat its inner half and leave a half-pixel ghost.
-/// Drawn over, the tile keeps one visible edge against a pale favicon, which is
-/// the same edge every monogram beside it has.
+/// the artwork, because `StrokeKind::Middle` straddles the edge -- a
+/// full-bleed image painted over it would eat its inner half and leave a
+/// half-pixel ghost. Drawn over, the tile keeps one visible edge against a
+/// pale favicon, which is the same edge every monogram beside it has. It is
+/// drawn over unconditionally rather than only when the artwork reaches the
+/// edge, so the tile has ONE border in every case instead of two code paths
+/// that have to agree about which.
 ///
 /// NOTE FOR WHOEVER CHANGES EITHER SIDE OF THIS: `favicon::decode_rgba`
 /// resamples every icon to a 64px longest edge, a number chosen for a 32pt
 /// draw at 200% scaling. Nothing in the code links that constant to this one.
-/// It covers a full-bleed 32pt draw exactly, so a tile that ever grows past
-/// 32pt needs `decode_rgba`'s constant raised with it.
+/// It covers a 32pt draw exactly, so a tile that ever grows past 32pt needs
+/// `decode_rgba`'s constant raised with it -- and note that under the rule
+/// above a bigger tile would no longer STRETCH to hide the shortfall, it would
+/// leave the icon sitting at 64pt in a larger square.
 pub fn avatar_image(ui: &Ui, tile: Rect, texture: &egui::TextureHandle, emphasized: bool) {
-    let rounding = avatar_corner_radius(tile.width());
+    let (art, art_rounding) = avatar_artwork(tile, texture.size_vec2());
     egui::Image::new((texture.id(), texture.size_vec2()))
-        .corner_radius(rounding)
-        .paint_at(ui, tile);
-    ui.painter()
-        .rect_stroke(tile, rounding, avatar_tile_stroke(emphasized), StrokeKind::Middle);
+        .corner_radius(art_rounding)
+        .paint_at(ui, art);
+    ui.painter().rect_stroke(
+        tile,
+        avatar_corner_radius(tile.width()),
+        avatar_tile_stroke(emphasized),
+        StrokeKind::Middle,
+    );
 }
 
 /// The avatar tile's 1px border, in its two states.

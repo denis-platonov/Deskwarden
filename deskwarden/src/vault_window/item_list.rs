@@ -716,7 +716,13 @@ fn draw_list_placeholder(ui: &mut egui::Ui, placeholder: ListPlaceholder) {
 }
 
 /// The design's avatar/favicon tile: `width: 32px; height: 32px`.
-const AVATAR_SIZE: f32 = 32.0;
+///
+/// `pub(crate)` only so the detail pane can PIN its own `HEADER_AVATAR` equal
+/// to it (`the_header_tile_is_the_list_row_tile`). The two panes draw one tile
+/// at one size by the owner's decision, and a number agreed by two private
+/// constants is a number that can quietly stop agreeing. Nothing outside this
+/// module lays anything out with it.
+pub(crate) const AVATAR_SIZE: f32 = 32.0;
 
 /// The network mark's height, in points, on a list row.
 ///
@@ -3114,7 +3120,27 @@ mod row_tile_tests {
     /// One real frame with a favicon TEXTURE loaded for every id in `ids` --
     /// the branch `IconCache::default()` can never reach, and the one the
     /// "the favicon fills its tile" report is about.
+    /// Rows with a favicon on each named id, the icon being a 16x16 texture.
+    ///
+    /// **16x16 is not an arbitrary fixture size.** It is the size most sites
+    /// still serve, and under [`theme::avatar_image`]'s never-upscale rule it
+    /// is the case that does NOT fill the 32pt tile -- it draws at 16pt with
+    /// 8pt of margin all round. Tests that want the other case (artwork at
+    /// least as big as the tile, which still goes full bleed) ask for it
+    /// explicitly through [`paint_with_icons_sized`].
     fn paint_with_icons(items: &[VaultItem], selected: Option<&str>, ids: &[&str]) -> Painted {
+        paint_with_icons_sized(items, selected, ids, 16)
+    }
+
+    /// [`paint_with_icons`] with the texture's own size chosen by the caller,
+    /// so a test can put artwork on either side of the tile's 32pt and get the
+    /// two different behaviours the sizing rule has.
+    fn paint_with_icons_sized(
+        items: &[VaultItem],
+        selected: Option<&str>,
+        ids: &[&str],
+        side: usize,
+    ) -> Painted {
         let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
         paint_core(items, selected, 0, PANE_WIDTH, |ctx| {
             let mut icons = IconCache::default();
@@ -3123,7 +3149,7 @@ mod row_tile_tests {
                     id.clone(),
                     ctx.load_texture(
                         format!("favicon-{id}"),
-                        egui::ColorImage::filled([16, 16], egui::Color32::RED),
+                        egui::ColorImage::filled([side, side], egui::Color32::RED),
                         egui::TextureOptions::LINEAR,
                     ),
                 );
@@ -4194,36 +4220,48 @@ mod row_tile_tests {
         );
     }
 
+    /// **FOUR PASSES OVER ONE ROW**, and this test has now been on three
+    /// sides of it. The whole history, because the next person here will be
+    /// holding one of these reports and not the other three:
+    ///
+    /// 1. The favicon was drawn at the full 32pt (`fit_to_exact_size(32)`)
+    ///    and the report was "the favicon fills its tile edge-to-edge and
+    ///    feels too big" -- next to a monogram, whose letters cover about a
+    ///    third of the same tile.
+    /// 2. So it was inset 4pt a side: a 24pt image in a 32pt bordered box.
+    ///    The report on THAT was "icon is not fully taking the rounded
+    ///    rectangle" -- an icon adrift in a frame.
+    /// 3. So it went full bleed, every icon stretched to the tile. This test
+    ///    was named for that, having been renamed from
+    ///    `a_favicon_is_inset_inside_its_tile_instead_of_filling_it_edge_to_
+    ///    edge` -- deliberately reversed, not quietly dropped.
+    /// 4. **The defect was never the margin.** All three passes argued about
+    ///    how much air to leave, when what the owner was seeing was
+    ///    RESAMPLING: a 16x16 favicon -- which is what most sites still serve
+    ///    -- magnified 2x to fill a 32pt tile is soft, and no choice of inset
+    ///    makes a blown-up image sharp. Compared against Keeper: "keeps icons
+    ///    small (maybe original) inside the rounded square with visible
+    ///    paddings, so it never touches the edges and looks clear because
+    ///    never extrapolated." So the rule is now the artwork's OWN size,
+    ///    never magnified, shrunk only as far as it must be to fit, centred --
+    ///    and the margin is not a number anyone picks, it is the leftover.
+    ///
+    /// This test is renamed again for that, and it asserts BOTH sides of the
+    /// rule, because a test that only ever saw one source size could not tell
+    /// "never upscale" from "always inset by 8".
+    ///
+    /// **Assert the SIZE, never merely "an image was painted".** The whole
+    /// claim is dimensional: a rect that is textured proves nothing about
+    /// whether the artwork was magnified.
     #[test]
-    fn a_favicon_fills_its_tile_clipped_to_the_tiles_own_corner_radius() {
-        // THREE PASSES OVER ONE ROW, and this test has been on both sides of
-        // it. The whole history, because the next person here will be holding
-        // one of these and not the other two:
-        //
-        // 1. The favicon was drawn at the full 32pt (`fit_to_exact_size(32)`)
-        //    and the report was "the favicon fills its tile edge-to-edge and
-        //    feels too big" -- next to a monogram, whose letters cover about a
-        //    third of the same tile.
-        // 2. So it was inset 4pt a side: a 24pt image in a 32pt bordered box.
-        //    The report on THAT was "icon is not fully taking the rounded
-        //    rectangle" -- an icon adrift in a frame.
-        // 3. The design is the tiebreaker and it says the image takes the
-        //    tile. The inset is gone; `theme::avatar_image` is the rule now.
-        //    This test is named for that, having previously been named
-        //    `a_favicon_is_inset_inside_its_tile_instead_of_filling_it_edge_
-        //    to_edge` -- deliberately reversed, not quietly dropped.
-        //
-        // FULL BLEED IS NOT THE HARD PART; THE CORNERS ARE. The tile is a
-        // rounded rectangle, so an image painted at its bounds with square
-        // corners would poke four corners out past the rounding -- a worse
-        // result than either report. So three things are asserted, and the
-        // corner radius is the one that matters most:
+    fn a_favicon_is_drawn_at_its_own_size_never_magnified_and_centred_in_its_tile() {
+        // ---- The small source: 16x16, the common case, must NOT fill ----
         let p = paint_with_icons(&[login("Ledgerline", "a@b.c")], None, &["Ledgerline"]);
         let tile = square(&p, AVATAR_SIZE);
         assert_eq!(
             tile.fill,
             theme::CANVAS,
-            "the favicon's tile must still be drawn the way the monogram's is -- filled, so a \\r
+            "the favicon's tile must still be drawn the way the monogram's is -- filled, so a
              favicon with transparent margins has the same ground behind it"
         );
         let (at, image) = p
@@ -4239,53 +4277,61 @@ mod row_tile_tests {
                 )
             });
 
-        // 1. EXACTLY the tile. Not inside it, not a fraction of it -- the same
-        //    rect to the same corners.
+        // 1. EXACTLY 16x16 -- the source's own size, in points. Not "smaller
+        //    than the tile", which an inset of any size would also satisfy.
         assert!(
-            (image.rect.min - tile.rect.min).length() < 0.01
-                && (image.rect.max - tile.rect.max).length() < 0.01,
-            "the favicon was painted at {:?} but its tile is {:?} -- the image is meant to take \\r
-             the whole tile",
+            (image.rect.width() - 16.0).abs() < 0.01
+                && (image.rect.height() - 16.0).abs() < 0.01,
+            "a 16x16 favicon was painted {}x{} in a {}pt tile -- it is being resampled, \
+             which is the defect this rule exists to remove",
+            image.rect.width(),
+            image.rect.height(),
+            AVATAR_SIZE
+        );
+        // 2. STRICTLY INSIDE the tile, and CENTRED in it. The margin is the
+        //    leftover, so it is checked as a consequence rather than as a
+        //    number of its own: equal on both axes, and positive.
+        assert!(
+            tile.rect.contains_rect(image.rect),
+            "the favicon at {:?} is not inside its {:?} tile",
             image.rect,
             tile.rect
         );
-        // ...and the negative, so an inset creeping back in reds here rather
-        // than drifting: no shrinkage at all, in either dimension.
         assert!(
-            (image.rect.width() - tile.rect.width()).abs() < 0.01
-                && (image.rect.height() - tile.rect.height()).abs() < 0.01,
-            "the favicon is {}x{} inside a {}x{} tile -- something has re-introduced an inset",
-            image.rect.width(),
-            image.rect.height(),
-            tile.rect.width(),
-            tile.rect.height()
+            (image.rect.center() - tile.rect.center()).length() < 0.01,
+            "the favicon is centred at {:?} but its tile's centre is {:?} -- a small icon \
+             must sit in the middle of the tile, not in a corner of it",
+            image.rect.center(),
+            tile.rect.center()
+        );
+        assert!(
+            image.rect.left() - tile.rect.left() > 0.5,
+            "a 16pt image in a {AVATAR_SIZE}pt tile must leave visible padding; it left {}",
+            image.rect.left() - tile.rect.left()
         );
 
-        // 2. CLIPPED TO THE TILE'S CURVE. A full-bleed image is only right if
-        //    its corners are the tile's corners; square ones would overhang the
-        //    rounding on all four. Asserted as the tile's own radius, and
-        //    separately as non-zero, because zero is exactly the failure.
+        // 3. SQUARE CORNERS, and this is the one that reverses. While the
+        //    image reached the tile's bounds it had to carry the tile's own
+        //    radius or its four corners would poke out past the rounding.
+        //    Pulled 8pt inside a tile whose corner arc is 8pt, it reaches no
+        //    curve at all, and rounding it would be inventing a shape the
+        //    artwork does not have -- a real 16x16 logo would get its corners
+        //    shaved off. `theme::avatar_artwork` tapers the radius with the
+        //    inset for exactly this reason; here the taper has reached zero.
         assert_eq!(
             image.corner_radius,
-            theme::avatar_corner_radius(AVATAR_SIZE),
-            "the favicon is not clipped to the tile's corner radius, so its corners overhang \\r
-             the rounded tile"
-        );
-        assert_eq!(
-            image.corner_radius, tile.corner_radius,
-            "the favicon and its tile are rounded differently"
-        );
-        assert!(
-            image.corner_radius.nw > 0,
-            "the favicon was painted with square corners over a rounded tile"
+            egui::CornerRadius::ZERO,
+            "a favicon inset clear of the tile's corner arc was rounded anyway, which \
+             clips the artwork's own corners"
         );
 
-        // 3. THE BORDER SURVIVES, AND IT IS ON TOP. `StrokeKind::Middle`
-        //    straddles the tile's edge, so the border painted UNDER a
-        //    full-bleed image keeps only its outer half-pixel. The tile's edge
-        //    is what a pale favicon needs in order to read as the same tile the
-        //    monograms beside it have, so it is drawn again over the artwork --
-        //    which means a 32pt bordered rect must appear AFTER the image.
+        // 4. THE BORDER SURVIVES, AND IT IS ON TOP. `StrokeKind::Middle`
+        //    straddles the tile's edge, so a border painted UNDER a full-bleed
+        //    image keeps only its outer half-pixel. The tile's edge is what a
+        //    pale favicon needs in order to read as the same tile the
+        //    monograms beside it have, so it is drawn again over the artwork
+        //    -- unconditionally, which means a 32pt bordered rect must appear
+        //    AFTER the image even in this inset case.
         let border_over = p.rects.iter().skip(at + 1).find(|r| {
             (r.rect.width() - AVATAR_SIZE).abs() < 0.5
                 && r.stroke.width > 0.0
@@ -4293,7 +4339,7 @@ mod row_tile_tests {
         });
         let border_over = border_over.unwrap_or_else(|| {
             panic!(
-                "no bordered {AVATAR_SIZE}pt rect was painted after the favicon, so the tile's \\r
+                "no bordered {AVATAR_SIZE}pt rect was painted after the favicon, so the tile's
                  edge is buried under it; painted: {:?}",
                 p.rects.iter().map(|r| (r.rect, r.fill, r.stroke)).collect::<Vec<_>>()
             )
@@ -4308,6 +4354,40 @@ mod row_tile_tests {
             "the border over the favicon is at {:?}, not on the {:?} tile",
             border_over.rect,
             tile.rect
+        );
+
+        // ---- The control: a source at least as big as the tile STILL fills
+        // it, edge to edge, with the tile's own radius. Without this half the
+        // test would pass just as happily against a rule that shrank every
+        // icon, or that inset everything by a fixed 8pt.
+        let big = paint_with_icons_sized(&[login("Ledgerline", "a@b.c")], None, &["Ledgerline"], 64);
+        let big_tile = square(&big, AVATAR_SIZE);
+        let big_image = big
+            .rects
+            .iter()
+            .find(|r| r.brush.is_some())
+            .cloned()
+            .expect("the 64x64 favicon was drawn");
+        assert!(
+            (big_image.rect.min - big_tile.rect.min).length() < 0.01
+                && (big_image.rect.max - big_tile.rect.max).length() < 0.01,
+            "a 64x64 source is bigger than the {AVATAR_SIZE}pt tile, so it must shrink to \
+             fill it exactly; it was painted at {:?} in a {:?} tile",
+            big_image.rect,
+            big_tile.rect
+        );
+        // ...and at full bleed the corners ARE the tile's, so the radius comes
+        // back. This is the assertion pass 3 made, kept for the case it was
+        // actually right about.
+        assert_eq!(
+            big_image.corner_radius,
+            theme::avatar_corner_radius(AVATAR_SIZE),
+            "a full-bleed favicon is not clipped to the tile's corner radius, so its \
+             corners overhang the rounded tile"
+        );
+        assert!(
+            big_image.corner_radius.nw > 0,
+            "the full-bleed favicon was painted with square corners over a rounded tile"
         );
     }
 
@@ -4327,6 +4407,83 @@ mod row_tile_tests {
             "...and must fall back to the monogram; painted: {:?}",
             p.texts
         );
+    }
+
+    /// **The monogram, one letter against two**, which the owner asked about
+    /// in the same breath as the favicon: "chars that we use if no icon --
+    /// make sure same size and centered".
+    ///
+    /// `theme::avatar` paints at `Align2::CENTER_CENTER` on `rect.center()`
+    /// with a `FontId` of `size * 0.38` and neither depends on how many
+    /// letters it was handed, so this reads as correct BY CONSTRUCTION -- and
+    /// that is exactly the kind of claim that is worth one cheap assertion
+    /// rather than an argument, because "it cannot drift" is a statement about
+    /// today's code and this file is full of tiles that drifted.
+    ///
+    /// `theme::initials` returns ONE char only for a name that is a single
+    /// character, and two otherwise, so "X" and "Northwind Mail" are the two
+    /// sides of the fence.
+    #[test]
+    fn a_one_letter_monogram_is_the_same_size_and_as_centred_as_a_two_letter_one() {
+        let one = paint(&[login("X", "")], None);
+        let two = paint(&[login("Northwind Mail", "")], None);
+        assert_eq!(theme::initials("X"), "X", "the one-letter case is not one letter");
+        assert_eq!(theme::initials("Northwind Mail"), "NM", "the two-letter case is not two");
+
+        // The rect comes from `texts` and the FONT from `galleys`: `texts`
+        // keeps only the box, and the size is the whole first half of this
+        // test's claim.
+        let read = |p: &Painted, glyphs: &str| {
+            let tile = square(p, AVATAR_SIZE).rect;
+            let rect = p
+                .texts
+                .iter()
+                .find(|(t, _, _)| t == glyphs)
+                .unwrap_or_else(|| panic!("no {glyphs:?} monogram was painted: {:?}", p.texts))
+                .1;
+            let font = p
+                .galleys
+                .iter()
+                .find(|(g, _)| g.job.text == glyphs)
+                .map(|(g, _)| g.job.sections[0].format.font_id.clone())
+                .unwrap_or_else(|| panic!("no {glyphs:?} galley was laid out"));
+            (tile, rect, font)
+        };
+        let (one_tile, one_rect, one_font) = read(&one, "X");
+        let (two_tile, two_rect, two_font) = read(&two, "NM");
+
+        // SAME SIZE: the font is the tile's, not the text's.
+        assert_eq!(
+            one_font.size, two_font.size,
+            "a one-letter monogram is set at {} and a two-letter one at {} -- the monogram's \
+             size must follow the tile, not the number of letters in the name",
+            one_font.size, two_font.size
+        );
+        assert_eq!(
+            one_font.size,
+            (AVATAR_SIZE * 0.38).round(),
+            "the monogram is not `theme::avatar`'s `size * 0.38`"
+        );
+
+        // CENTRED: each on its own tile, both axes. Half a point of tolerance
+        // -- the galley's box is measured from glyph metrics, so an exact
+        // equality here would be asserting the font's bearings and not the
+        // centring.
+        for (label, tile, rect) in
+            [("one-letter", one_tile, one_rect), ("two-letter", two_tile, two_rect)]
+        {
+            assert!(
+                (rect.center() - tile.center()).length() < 0.5,
+                "the {label} monogram is painted centred at {:?} but its tile's centre is \
+                 {:?}",
+                rect.center(),
+                tile.center()
+            );
+            assert!(
+                tile.contains_rect(rect),
+                "the {label} monogram at {rect:?} spills out of its {tile:?} tile"
+            );
+        }
     }
 
     /// A card carrying a stored `brand`, the way every Bitwarden client
@@ -4683,12 +4840,23 @@ mod row_tile_tests {
         let (mark, word) = marks[0].clone();
         assert_eq!(word, CardBrand::Visa.wordmark(), "the mark names the wrong network");
 
-        // The favicon is still there and still fills the tile, so the tile
+        // The favicon is still there and still sits in the tile, so the tile
         // really is the icon's and this is not the monogram rung.
+        //
+        // INSIDE the tile and centred on it, not equal to it: this fixture's
+        // icon is 16x16 and `theme::avatar_image` no longer magnifies, so the
+        // artwork is 16pt in the middle of a 32pt tile. What this test needs
+        // from the favicon is only that it is there and that it is the TILE's
+        // -- the claim being made is about where the network mark goes -- so
+        // it asks for containment and centring, which is true under the
+        // sizing rule at every source size, rather than for a full bleed that
+        // is now true at only some of them.
+        let art = textured(&p);
         assert!(
-            textured(&p).iter().any(|r| r.rect == tile),
-            "no full-tile favicon was painted: {:?}",
-            textured(&p).iter().map(|r| r.rect).collect::<Vec<_>>()
+            art.iter().any(|r| tile.contains_rect(r.rect)
+                && (r.rect.center() - tile.center()).length() < 0.01),
+            "no favicon was painted centred inside the {tile:?} tile: {:?}",
+            art.iter().map(|r| r.rect).collect::<Vec<_>>()
         );
 
         // **Nothing is drawn inside the tile any more.** The negative half of

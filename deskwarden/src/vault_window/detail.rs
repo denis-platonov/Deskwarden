@@ -55,8 +55,56 @@ const HEADER_PAD_X: i8 = 24;
 const HEADER_PAD_Y: i8 = 20;
 /// `gap: 14px` between the strip's avatar, title column and buttons.
 const HEADER_GAP: f32 = 14.0;
-/// The strip's `width: 44px; height: 44px` avatar tile.
-const HEADER_AVATAR: f32 = 44.0;
+/// The strip's avatar tile, which is [`item_list`]'s row tile at exactly the
+/// same size.
+///
+/// **32, not the design's 44.** Design 2b draws this strip's tile at
+/// `width: 44px; height: 44px`, and that is what this was. The owner asked for
+/// the two tiles to match outright -- the tile in the list row and the tile in
+/// the header of the item that row opens are the same object seen twice, and
+/// at 44 against 32 they read as two different components. So this is the
+/// list's `AVATAR_SIZE`, deliberately overriding the spec's number rather than
+/// drifting from it by accident.
+///
+/// **Kept as its own constant, not an import of `AVATAR_SIZE`.** The two are
+/// equal by decision, not by construction: this is the detail pane's metric
+/// and that one is the list's, they are asserted separately in each module's
+/// pins, and a future decision to move one is a decision this name is here to
+/// make visible. `the_header_tile_is_the_list_row_tile` is what holds them
+/// equal in the meantime.
+///
+/// The strip's height no longer follows this number -- [`HEADER_ROW`] does.
+const HEADER_AVATAR: f32 = 32.0;
+
+/// **The height of the strip's content row**, and therefore the strip's own
+/// height once `padding: 20px` is added above and below it: design 2b's 44px.
+///
+/// This constant is the re-tuning that shrinking [`HEADER_AVATAR`] to 32
+/// required, and it exists because the strip's height used to be an ACCIDENT
+/// of its tallest child. That child was the 44pt avatar, so the strip came out
+/// at the design's 84pt without anyone stating it. Take the avatar to 32 and
+/// the tallest child becomes the title column -- 22pt at the `1.1` line height
+/// [`title_text`] documents, plus [`TITLE_GAP`], plus the 12pt subtitle, or
+/// about 40.1pt -- and the strip silently became 80.1pt tall. The design's
+/// number would have been lost to a rounding of two font metrics, which is not
+/// a number anyone chose.
+///
+/// So the row is stated instead of inferred. The avatar and the title column
+/// are laid out inside a band of exactly this height, cross-aligned centre,
+/// which buys three things at once:
+///
+/// * the strip stays 84pt, so nothing below it in the pane moved;
+/// * the 32pt tile is CENTRED against the title column rather than sitting at
+///   the top of the row -- egui's `horizontal` cannot centre its first child
+///   against siblings it has not laid out yet, so a shorter avatar in an
+///   auto-height row hangs from the top edge, which is exactly what it did;
+/// * the title column is free to change size within the band without moving
+///   the strip's bottom edge or the avatar.
+///
+/// It is deliberately NOT `HEADER_AVATAR.max(title height)`: the design gives
+/// a 44px row, and a row that quietly tracks whichever child is tallest is the
+/// thing that just went wrong.
+const HEADER_ROW: f32 = 44.0;
 /// **How many controls the header strip draws for EVERY item**, because the
 /// strip *reserves* its room before it draws anything and drift between the
 /// two is the failure mode that painted a control at x = -34.5.
@@ -2649,9 +2697,35 @@ fn header_layout(content_width: f32, controls: f32) -> HeaderLayout {
     // after it are taken -- the band the controls and the title share.
     let beside_avatar = content_width - HEADER_AVATAR - HEADER_GAP;
     // Stacked, when they do not both fit: the controls' own row is the full
-    // content width rather than `beside_avatar`, so it has 58pt more to work
-    // with than the one-line branch just rejected.
+    // content width rather than `beside_avatar`, so it has `HEADER_AVATAR +
+    // HEADER_GAP` (46pt) more to work with than the one-line branch just
+    // rejected. That was 58pt while the avatar was 44.
     HeaderLayout { stacked: controls + HEADER_GAP + TITLE_MIN > beside_avatar }
+}
+
+/// Lays `contents` out across one [`HEADER_ROW`]-high band, left to right,
+/// every child centred on the band's middle.
+///
+/// **A stated height, which `ui.horizontal` cannot give.** egui lays a
+/// horizontal row out in one pass: the first child is placed before the row
+/// knows how tall its later siblings will make it, so `Align::Center` in an
+/// auto-height row can only centre a child against what is already there --
+/// nothing, for the first one. The avatar is the first one. While it was also
+/// the TALLEST that was invisible; at [`HEADER_AVATAR`] = 32 against a ~40pt
+/// title column it left the tile hanging from the top edge of the row. Giving
+/// the band a height up front is what lets egui centre the tile against a
+/// column it has not laid out yet.
+///
+/// `item_spacing.x = 0` for the reason both call sites already had: the gaps
+/// in this strip are [`HEADER_GAP`], placed explicitly, and egui's default 8pt
+/// between widgets would open a second gap beside each of them.
+fn header_row<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let band = egui::vec2(ui.available_width(), HEADER_ROW);
+    ui.allocate_ui_with_layout(band, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        contents(ui)
+    })
+    .inner
 }
 
 /// `modifiers+key` and **nothing else held**, taken out of the event queue.
@@ -3408,8 +3482,10 @@ pub fn draw_detail_read(
                 // underneath. The controls' row is the full content width,
                 // right-aligned, which is where the room comes from that the
                 // one-line arrangement did not have.
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
+                // [`HEADER_ROW`], not `ui.horizontal`: the band's height is
+                // stated so the 32pt avatar is centred against the taller
+                // title column instead of hanging from the row's top edge.
+                header_row(ui, |ui| {
                     draw_avatar(ui);
                     ui.add_space(HEADER_GAP);
                     draw_title(ui);
@@ -3442,8 +3518,7 @@ pub fn draw_detail_read(
                 // which egui hands exactly the rect the controls did not
                 // take. That the rect is big enough to hold a name is
                 // `header_layout`'s job, not this layout's.
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
+                header_row(ui, |ui| {
                     draw_avatar(ui);
                     ui.add_space(HEADER_GAP);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -14634,34 +14709,94 @@ mod tests {
         );
     }
 
-    /// The strip's own grid: `padding: 20px 24px`, a 44px avatar, `gap: 14px`,
-    /// then a 22px/800 title over a 12px subtitle.
+    /// **One tile, one size, both screens.** The owner asked for the read
+    /// pane's header tile and the list row's tile to match outright, and this
+    /// is the whole of that claim: the header used to draw at 44 against the
+    /// row's 32, and the two read as different components rather than the same
+    /// object seen twice.
+    ///
+    /// A constant compared to a constant, which is worth stating because the
+    /// two are NOT the same constant -- see [`HEADER_AVATAR`] for why they are
+    /// kept separate. This is the only thing standing between "equal by
+    /// decision" and "equal by luck".
+    #[test]
+    fn the_header_tile_is_the_list_row_tile() {
+        assert_eq!(
+            HEADER_AVATAR,
+            crate::vault_window::item_list::AVATAR_SIZE,
+            "the read pane's header tile and the item list's row tile have drifted apart; \
+             they are meant to be the same tile at the same size on both screens"
+        );
+    }
+
+    /// The strip's own grid: `padding: 20px 24px`, a [`HEADER_ROW`]-high
+    /// content band holding a [`HEADER_AVATAR`] tile, `gap: 14px`, then a
+    /// 22px/800 title over a 12px subtitle.
+    ///
+    /// **The avatar is 32 and the row is still 44**, which is the pair this
+    /// test exists to keep apart. The tile was taken to 32 to match the list
+    /// row's; the ROW it sits in is design 2b's 44px and did not move with it.
+    /// Asserting only the tile would let the strip's height follow the tile
+    /// down (it did: 84 -> 80.1, the title column silently becoming the
+    /// tallest child), and asserting only the row would let the tile drift
+    /// back up. So both, plus the centring that relates them -- a 32pt tile
+    /// hanging from the top of a 44pt band is the third failure available
+    /// here, and it is the one `ui.horizontal` actually produced.
     #[test]
     fn the_header_strip_lays_its_avatar_and_title_out_on_the_designs_grid() {
         let item = an_item(Some(1));
         let rects = painted_rects(&item, &TotpState::NoSecret);
         let avatar = rects
             .iter()
-            .find(|(r, fill)| *fill == theme::BLUE_WASH && r.width() == 44.0 && r.height() == 44.0)
-            .unwrap_or_else(|| panic!("no 44px avatar tile in the header: {rects:?}"));
+            .find(|(r, fill)| {
+                *fill == theme::BLUE_WASH
+                    && r.width() == HEADER_AVATAR
+                    && r.height() == HEADER_AVATAR
+            })
+            .unwrap_or_else(|| {
+                panic!("no {HEADER_AVATAR}px avatar tile in the header: {rects:?}")
+            });
         assert_eq!(
             avatar.0.left(),
             24.0,
             "the avatar is not at the strip's 24px left padding"
         );
+        // Centred in the band, not hung from its top: 20px of padding plus
+        // half the slack between the row and the tile.
+        let slack = (HEADER_ROW - HEADER_AVATAR) / 2.0;
         assert_eq!(
             avatar.0.top(),
-            20.0,
-            "the avatar is not at the strip's 20px top padding -- if the title column \
-             now stands taller than 44px, the centred row has pushed it down"
+            20.0 + slack,
+            "the avatar is not centred in the strip's {HEADER_ROW}px content row -- at the \
+             strip's 20px top padding it is hanging from the row's top edge instead"
+        );
+        // The same claim from the other side, and the one that actually says
+        // "centred": the tile's middle is the row's middle. This is also the
+        // number that did NOT move when the tile went 44 -> 32.
+        assert_eq!(
+            avatar.0.center().y,
+            20.0 + HEADER_ROW / 2.0,
+            "the avatar's centre is off the content row's centre"
+        );
+        // And the row is still the design's, so the strip did not follow the
+        // tile down when the tile shrank.
+        let strip = rects
+            .iter()
+            .find(|(r, fill)| *fill == theme::CARD && r.top() == 0.0 && r.left() == 0.0)
+            .unwrap_or_else(|| panic!("no white header strip: {rects:?}"));
+        assert_eq!(
+            strip.0.height(),
+            20.0 + HEADER_ROW + 20.0,
+            "the strip is not 20px padding + a {HEADER_ROW}px row + 20px padding -- its \
+             height has gone back to being whatever its tallest child happened to be"
         );
 
         let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
         let (title, title_font) = only(&painted, "Sample");
         assert_eq!(
             title.left(),
-            82.0,
-            "the title is not 24 + 44 + 14 from the pane's left edge"
+            24.0 + HEADER_AVATAR + HEADER_GAP,
+            "the title is not 24 + {HEADER_AVATAR} + {HEADER_GAP} from the pane's left edge"
         );
         assert_eq!(title_font.size, 22.0, "the title is not the design's 22px");
         assert_eq!(
@@ -14673,7 +14808,7 @@ mod tests {
         let (subtitle, subtitle_font) = only(&painted, "Login");
         assert_eq!(
             subtitle.left(),
-            82.0,
+            24.0 + HEADER_AVATAR + HEADER_GAP,
             "the subtitle does not share the title's column"
         );
         assert_eq!(
