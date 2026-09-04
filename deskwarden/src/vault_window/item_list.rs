@@ -4315,7 +4315,7 @@ mod row_tile_tests {
     #[test]
     fn every_favicon_is_fitted_into_the_same_box_centred_in_its_tile() {
         // Every favicon is fitted into this box, centred in the tile.
-        const ARTWORK_PT: f32 = AVATAR_SIZE * 0.75;
+        const ARTWORK_PT: f32 = AVATAR_SIZE * 0.625;
 
         // ---- The small source: 16x16, the common case, must NOT fill ----
         let p = paint_with_icons(&[login("Ledgerline", "a@b.c")], None, &["Ledgerline"]);

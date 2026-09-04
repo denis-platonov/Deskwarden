@@ -1007,6 +1007,61 @@ fn decode_ico_dib(payload: &[u8]) -> Option<IcoImage<'static>> {
 /// `egui` context to read a scale factor from anyway.
 const ICON_TARGET_PX: usize = 64;
 
+/// Crops the fully-transparent border off an icon, returning the smallest
+/// rectangle that contains every pixel with any alpha at all.
+///
+/// **The report this exists for: "it is not centered - right padding looks
+/// bigger".** The draw site centres the texture in its tile exactly, so a
+/// favicon that looks off-centre is one whose own canvas is off-centre --
+/// artwork saved with more empty space down one side than the other. That is
+/// common and not a mistake by the site: nothing outside this app was ever
+/// going to notice. Once the transparent border is gone the remaining
+/// rectangle IS the artwork, so centring it centres what the eye actually
+/// sees, and `theme::ARTWORK_BOX`'s 20pt describes the ink rather than
+/// whatever canvas the ink arrived on.
+///
+/// **Alpha zero only.** A pixel with alpha 1 is very nearly invisible but it
+/// is somebody's antialiased edge, and cropping to a threshold would eat the
+/// soft outline off every rounded logo. The test is exact.
+///
+/// A fully transparent image has no such rectangle; it answers 0x0 and the
+/// caller returns early rather than indexing into nothing.
+fn trim_transparent(width: usize, height: usize, rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
+    let opaque_at = |x: usize, y: usize| rgba[(y * width + x) * 4 + 3] != 0;
+    let mut top = None;
+    let mut bottom = 0;
+    let (mut left, mut right) = (width, 0);
+    for y in 0..height {
+        let mut row_has_ink = false;
+        for x in 0..width {
+            if opaque_at(x, y) {
+                row_has_ink = true;
+                left = left.min(x);
+                right = right.max(x);
+            }
+        }
+        if row_has_ink {
+            top.get_or_insert(y);
+            bottom = y;
+        }
+    }
+    let Some(top) = top else {
+        return (0, 0, Vec::new());
+    };
+    let (w, h) = (right - left + 1, bottom - top + 1);
+    if (w, h) == (width, height) {
+        // The overwhelmingly common case -- artwork that already fills its
+        // canvas -- moved through without copying a single pixel.
+        return (width, height, rgba);
+    }
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        let from = ((y + top) * width + left) * 4;
+        out[y * w * 4..(y + 1) * w * 4].copy_from_slice(&rgba[from..from + w * 4]);
+    }
+    (w, h, out)
+}
+
 /// Brings a decoded icon close to the size it is actually drawn at, so the
 /// texture the GPU samples is not wildly larger (or smaller) than its
 /// on-screen footprint.
@@ -1034,6 +1089,13 @@ const ICON_TARGET_PX: usize = 64;
 /// Returns straight (non-premultiplied) RGBA, matching what
 /// `egui::ColorImage::from_rgba_unmultiplied` expects at every call site.
 fn resample_for_display(width: usize, height: usize, rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
+    if width == 0 || height == 0 {
+        return (width, height, rgba);
+    }
+
+    // Trim first, so every rule below measures the artwork and not the empty
+    // space a site happened to save around it. See `trim_transparent`.
+    let (width, height, rgba) = trim_transparent(width, height, rgba);
     if width == 0 || height == 0 {
         return (width, height, rgba);
     }
@@ -1177,6 +1239,105 @@ fn icon_cache_path(cache_dir: &Path, domain: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Builds an RGBA image whose opaque pixels are the rectangle
+    /// `x0..x1`/`y0..y1` and whose every other pixel is alpha zero.
+    fn ink_at(
+        width: usize,
+        height: usize,
+        (x0, x1): (usize, usize),
+        (y0, y1): (usize, usize),
+    ) -> Vec<u8> {
+        let mut px = vec![0u8; width * height * 4];
+        for y in y0..y1 {
+            for x in x0..x1 {
+                px[(y * width + x) * 4..][..4].copy_from_slice(&[10, 20, 30, 255]);
+            }
+        }
+        px
+    }
+
+    /// **THE REPORT: "it is not centered - right padding looks bigger".**
+    ///
+    /// The draw site centres the texture in its tile to within a hundredth of
+    /// a point, so an icon that looks off-centre is one whose own canvas is
+    /// off-centre. This is the fix, and it is asserted on the LOPSIDED case
+    /// specifically -- a symmetric crop would pass a test that only ever fed
+    /// it artwork already in the middle.
+    #[test]
+    fn an_icons_uneven_transparent_border_is_cropped_so_its_ink_is_centred() {
+        // 16x16 with a 3x8 block of ink hard against the left edge: 0 empty
+        // columns on the left, 13 on the right. Centring THIS texture centres
+        // an emptiness that is mostly on one side.
+        let (w, h, px) = trim_transparent(16, 16, ink_at(16, 16, (0, 3), (4, 12)));
+        assert_eq!(
+            (w, h),
+            (3, 8),
+            "the crop must be exactly the ink's own box, so that centring the result \
+             centres what the eye actually sees"
+        );
+        assert!(
+            px.chunks_exact(4).all(|p| p[3] == 255),
+            "the cropped image still carries transparent padding: {:?}",
+            px.chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>()
+        );
+    }
+
+    /// The common case, and the one that must stay cheap: artwork that already
+    /// fills its canvas is returned unchanged, not copied through a crop that
+    /// happens to select everything.
+    #[test]
+    fn an_icon_with_no_transparent_border_is_returned_untouched() {
+        let full = ink_at(8, 8, (0, 8), (0, 8));
+        let (w, h, px) = trim_transparent(8, 8, full.clone());
+        assert_eq!((w, h), (8, 8));
+        assert_eq!(px, full);
+    }
+
+    /// **Alpha 1 is not alpha 0.** An antialiased edge is nearly invisible and
+    /// is still the artwork; cropping to a threshold would shave the soft
+    /// outline off every rounded logo. This pins the test as exact.
+    #[test]
+    fn a_barely_visible_edge_pixel_is_artwork_and_is_not_cropped_away() {
+        let mut px = ink_at(4, 4, (1, 3), (1, 3));
+        px[3] = 1; // top-left corner: very nearly, but not quite, invisible.
+        let (w, h, _) = trim_transparent(4, 4, px);
+        assert_eq!(
+            (w, h),
+            (3, 3),
+            "a pixel with alpha 1 was cropped as though it were empty"
+        );
+    }
+
+    /// A fully transparent icon has no ink to centre. It answers 0x0 rather
+    /// than an underflowed size, and `resample_for_display` returns early on
+    /// that instead of indexing into an empty buffer.
+    #[test]
+    fn a_fully_transparent_icon_answers_an_empty_size_rather_than_underflowing() {
+        assert_eq!(trim_transparent(8, 8, vec![0u8; 8 * 8 * 4]), (0, 0, Vec::new()));
+        let (w, h, px) = resample_for_display(8, 8, vec![0u8; 8 * 8 * 4]);
+        assert_eq!((w, h, px), (0, 0, Vec::new()));
+    }
+
+    /// The trim runs BEFORE the letterbox, which is what makes the two agree:
+    /// cropping a lopsided canvas leaves a non-square rectangle, and the
+    /// letterbox then re-centres that on a square. Cropping afterwards would
+    /// undo the padding the letterbox had just added.
+    #[test]
+    fn a_cropped_icon_is_re_squared_with_its_ink_centred() {
+        // Ink 2 wide and 6 tall, jammed into the top-left of a 16x16 canvas.
+        let (w, h, px) = resample_for_display(16, 16, ink_at(16, 16, (0, 2), (0, 6)));
+        assert_eq!((w, h), (6, 6), "the crop's longer side becomes the square");
+        let opaque_columns: Vec<usize> = (0..w)
+            .filter(|&x| (0..h).any(|y| px[(y * w + x) * 4 + 3] != 0))
+            .collect();
+        assert_eq!(
+            opaque_columns,
+            vec![2, 3],
+            "the ink sits at {opaque_columns:?} of 0..{w}, so it is not centred -- which is \
+             the defect, one step later in the pipeline"
+        );
+    }
 
     #[test]
     fn icon_base_defaults_to_bitwardens_cloud_service() {
@@ -1434,8 +1595,13 @@ mod tests {
                 src[i + 3] = 255;
             }
         }
-        let (w, h, out) = decode_rgba(&rgba_png(128, 128, &src)).expect("decodes");
-        assert_eq!((w, h), (64, 64));
+        // Driven through `box_downscale` rather than `decode_rgba`, because
+        // the transparent half this test needs is exactly what
+        // `trim_transparent` now crops away before the reduction ever runs --
+        // and the claim here is about the AVERAGE, not about which rectangle
+        // reaches it. Feeding the reducer directly keeps the 128 -> 64 split
+        // the reasoning above depends on.
+        let out = box_downscale(&src, 128, 128, 64, 64);
 
         let interior = pixel_at(&out, 64, 0, 32);
         assert_eq!(interior, [255, 0, 0, 255], "a fully covered pixel must stay pure red");
