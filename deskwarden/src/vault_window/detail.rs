@@ -3033,7 +3033,7 @@ pub fn draw_detail_read(
                     // -- full bleed, the corner radius given to the image so
                     // it is clipped to the tile's curve, and the border
                     // redrawn over the artwork.
-                    let tile = theme::avatar_tile(ui, HEADER_AVATAR, true);
+                    let tile = theme::avatar_artwork_tile(ui, HEADER_AVATAR, true);
                     theme::avatar_image(ui, tile, tex, true);
                 }
                 // The list row's tile and this one are the same tile at two

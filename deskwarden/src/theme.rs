@@ -886,18 +886,22 @@ pub fn initials(name: &str) -> String {
 }
 
 /// The square every favicon is fitted into, centred in its [`avatar_tile`]:
-/// **16pt**, which is half the 32pt tile.
+/// **24pt**, which is three quarters of the 32pt tile.
 ///
 /// Expressed as a fraction of the tile rather than as a bare 16.0 so the two
 /// cannot drift apart -- the tile has been resized once already, and an
 /// artwork box that stayed at 16 while the tile moved would change the
 /// padding the owner asked for without anyone editing this line.
 ///
-/// 16 is not an arbitrary half. It is the size most sites actually serve, so
-/// the common favicon is drawn at its own pixels and nothing is resampled;
-/// the bigger sources are the ones that give something up, and a reduction is
-/// the direction that stays sharp.
-const ARTWORK_BOX: f32 = 0.5;
+/// The box was tried at 16 first -- the size most sites actually serve, so
+/// the common favicon would be drawn at its own pixels with nothing resampled
+/// at all. Seen running, the owner asked for 24. The trade is deliberate: a
+/// 16x16 source is now magnified 1.5x and gives up some sharpness, and what
+/// it buys is that every icon in the column reads at a usable size. A source
+/// SMALLER than the box is still never magnified past its own size (see
+/// [`avatar_artwork`], which fits the box in both directions), so the column
+/// is ONE icon size rather than every size the web happens to serve.
+const ARTWORK_BOX: f32 = 0.75;
 
 fn artwork_box(tile: Rect) -> f32 {
     tile.width().min(tile.height()) * ARTWORK_BOX
@@ -918,23 +922,21 @@ fn artwork_box(tile: Rect) -> f32 {
 ///
 /// **Two rules, and the second is the one with a history.**
 ///
-/// * **Never upscale.** The scale is capped at 1.0, so a source smaller than
-///   the box below is drawn at its own size and the margin is simply what is
-///   left over. Magnifying is what made small favicons -- which is most of
-///   them -- look soft next to the crisp monogram beside them.
-/// * **Fit [`ARTWORK_BOX`], not the tile.** Every favicon lands in a 16pt
-///   square at the tile's centre, whatever size its source is: a 16x16 draws
-///   at 16pt because that is its own size, and a 64x64 is REDUCED to 16pt
-///   rather than filling the tile.
+/// **One rule: fit [`ARTWORK_BOX`], centred -- not the tile, and not the
+/// source's own size.** Every favicon lands in the same 24pt square at the
+/// tile's centre whatever its source is: a 64x64 is reduced into it, a 16x16
+/// is magnified into it.
 ///
-///   That second half is the owner's ruling, and it is the one that stops
-///   this column being ragged. Under "never upscale" alone the artwork's size
-///   was the source's size, so a row of favicons drew at every width between
-///   16 and 32 depending on what each site happened to serve -- and the big
-///   ones reached the tile's edge, which is what the owner was looking at:
-///   "icon touches the edges but should be in the middle with paddings",
-///   then "make icon 16px". One size for all of them, centred, is what makes
-///   the tiles read as one column.
+/// **The magnifying half is deliberate and was arrived at last.** Two earlier
+/// rules capped the scale at 1.0 so a small source kept its own pixels, and
+/// both produced the same defect: the artwork's size became the SOURCE's
+/// size, so a column of favicons drew at every width the web happens to serve
+/// and the big ones reached the tile's edge. The owner, on that: "icon
+/// touches the edges but should be in the middle with paddings", then "make
+/// icon 16px", then -- seeing the column at one size and liking it -- "make
+/// it 24px". A uniform size is what makes the tiles read as a column, and it
+/// costs a 1.5x magnification on the 16x16 sources that are still the most
+/// common thing a site serves. That cost is now a decision, not an oversight.
 ///
 /// **The corner radius follows the tile's curve, concentrically.** The tile is
 /// a rounded rectangle, and the original reason the artwork was ever given a
@@ -957,10 +959,10 @@ pub fn avatar_artwork(tile: Rect, source: Vec2) -> (Rect, CornerRadius) {
     if source.x <= 0.0 || source.y <= 0.0 {
         return (tile, full);
     }
-    // Fit ARTWORK_BOX rather than the tile, and cap at 1.0 so a source
-    // already smaller than the box keeps its own size.
+    // Fit ARTWORK_BOX rather than the tile, in BOTH directions: uncapped, so
+    // a source smaller than the box is magnified into it. See the docs.
     let box_side = artwork_box(tile);
-    let scale = (box_side / source.x).min(box_side / source.y).min(1.0);
+    let scale = (box_side / source.x).min(box_side / source.y);
     let art = Rect::from_center_size(tile.center(), source * scale);
     let inset = (tile.width() - art.width()).min(tile.height() - art.height()) / 2.0;
     let radius = (f32::from(full.nw) - inset).max(0.0).round() as u8;
@@ -992,17 +994,15 @@ pub fn avatar_artwork(tile: Rect, source: Vec2) -> (Rect, CornerRadius) {
 ///
 /// [`avatar_artwork`] is the geometry, with the corner-radius reasoning.
 ///
-/// **The fill and the border still earn their place, in that order.**
-/// [`avatar_tile`] paints both first: the fill is what a favicon with
-/// transparent margins (which is most of them) shows through, and it carries
-/// the selected treatment's `BLUE_WASH`. The BORDER is then re-drawn ON TOP of
-/// the artwork, because `StrokeKind::Middle` straddles the edge -- a
-/// full-bleed image painted over it would eat its inner half and leave a
-/// half-pixel ghost. Drawn over, the tile keeps one visible edge against a
-/// pale favicon, which is the same edge every monogram beside it has. It is
-/// drawn over unconditionally rather than only when the artwork reaches the
-/// edge, so the tile has ONE border in every case instead of two code paths
-/// that have to agree about which.
+/// **The border earns its place; the fill no longer does.** The tile behind a
+/// favicon is drawn by [`avatar_artwork_tile`], which does not fill at all --
+/// see there for the owner's "no backgound inside of tile". The BORDER is
+/// still re-drawn ON TOP of the artwork, because `StrokeKind::Middle`
+/// straddles the edge -- a full-bleed image painted over it would eat its
+/// inner half and leave a half-pixel ghost. It is drawn over unconditionally
+/// rather than only when the artwork reaches the edge, so the tile has ONE
+/// border in every case instead of two code paths that have to agree about
+/// which.
 ///
 /// NOTE FOR WHOEVER CHANGES EITHER SIDE OF THIS: `favicon::decode_rgba`
 /// resamples every icon to a 64px longest edge, a number chosen for a 32pt
@@ -1044,10 +1044,38 @@ pub fn avatar_tile_stroke(emphasized: bool) -> Stroke {
 /// same edge, and only their contents differ. [`avatar_image`] is the favicon
 /// half, and it paints over what this leaves.
 pub fn avatar_tile(ui: &mut Ui, size: f32, emphasized: bool) -> Rect {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let bg = if emphasized { BLUE_WASH } else { CANVAS };
+    avatar_box(ui, size, emphasized, Some(bg))
+}
+
+/// The same box drawn for a FAVICON: allocated, bordered and rounded, with
+/// **no fill at all**.
+///
+/// **Why the fill goes when there is artwork in the box.** [`avatar_tile`]'s
+/// ground exists for the monogram -- a letter needs something to sit on, and
+/// `CANVAS` is what makes the tile read as a tile. A favicon does not: it is
+/// its own artwork, most of them carry their own background, and the ones that
+/// do not are transparent on purpose. Filling behind them put a grey square
+/// inside the tile that the icon then sat in the middle of, which is what the
+/// owner was looking at -- "no backgound inside of tile". Left unfilled, the
+/// icon sits on the pane's own white with only the tile's edge around it.
+///
+/// The border still comes from [`avatar_tile_stroke`], so a selected row's
+/// tile is still edged in blue; it is only the WASH that goes. The selection
+/// is carried by the row behind it either way.
+pub fn avatar_artwork_tile(ui: &mut Ui, size: f32, emphasized: bool) -> Rect {
+    avatar_box(ui, size, emphasized, None)
+}
+
+/// The shared body of [`avatar_tile`] and [`avatar_artwork_tile`]: one
+/// allocation, one rounding and one border, so the two cannot drift into
+/// different geometry while claiming to be the same tile.
+fn avatar_box(ui: &mut Ui, size: f32, emphasized: bool, fill: Option<Color32>) -> Rect {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
     let rounding = avatar_corner_radius(size);
-    ui.painter().rect_filled(rect, rounding, bg);
+    if let Some(bg) = fill {
+        ui.painter().rect_filled(rect, rounding, bg);
+    }
     ui.painter()
         .rect_stroke(rect, rounding, avatar_tile_stroke(emphasized), StrokeKind::Middle);
     rect
