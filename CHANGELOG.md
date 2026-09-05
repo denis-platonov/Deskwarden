@@ -11,9 +11,46 @@ things can still change between minor versions.
 ## Unreleased
 
 Builds from this section report their version with a `-dev` suffix -- see
-`Cargo.toml`. If the About line in Preferences reads `0.15.14-dev`, the build
-is from the working tree and not from a
+`Cargo.toml`. If the About line in Preferences reads a version ending in
+`-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
+
+## 0.15.14 - 2026-09-04
+
+### The first launch after installing no longer costs the tray 40 MB
+
+Signing in for the first time drew the sign-in window inside the background
+process instead of in a window process of its own. Once a process has drawn
+anything, Windows does not give the graphics memory back until it exits -- so
+the tray stayed at around 59 MB for the rest of the session, and closing the
+window to the tray reclaimed none of it.
+
+The first-run sign-in now opens in its own process like every other window,
+and the tray goes back to the roughly 19 MB it is meant to sit at once you
+close it.
+
+### Item icons are larger, and sit on nothing
+
+The tile behind an icon was filled with grey, so every icon and every pair of
+initials sat on a small square inside its own tile. The grey is gone: a tile
+is now just a thin outline, in the list and in the details panel alike.
+
+The tile itself is larger, at 40px, with website icons and item-type icons
+both drawn at 24px inside it, and initials at 16px. Website icons and drawn
+icons are the same size for the first time -- a secure note and a website now
+read at the same weight in a column of results.
+
+### The details panel fills its side of the window
+
+There was a grey band around the whole details panel, most obvious on a small
+window, where it took a noticeable share of the space the panel had. The
+panel now reaches the edges of its half of the window.
+
+### The version tells you whether it came from a release
+
+Builds made between releases now carry a `-dev` suffix -- `0.15.15-dev`, say.
+If the About line in Preferences shows one, that build is not a published
+release, and there may be a released version with the same number.
 
 ## 0.15.13 - 2026-09-04
 
