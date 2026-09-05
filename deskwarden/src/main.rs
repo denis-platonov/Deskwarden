@@ -11666,6 +11666,33 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // to the user as "the update lost my login".
     let session_path = match &active_account {
         Some(a) => {
+            // **The directory is created, not assumed**, exactly as the
+            // daemon does before its own first save. `resolve_startup` mints
+            // an account without touching the disk, and both stores are
+            // explicit that they will not create their own parent -- so on a
+            // machine where `config\accounts\<id>` does not exist yet, the
+            // first write into it fails.
+            //
+            // **The report: a clean install, a self-hosted URL, and "The
+            // system cannot find the path specified. (os error 3)" under the
+            // Continue button.** ERROR_PATH_NOT_FOUND, which is the missing
+            // DIRECTORY and not a missing file. It was unreachable while the
+            // daemon drew the first sign-in, because the daemon had already
+            // run this line for the minted account; the sign-in moving into
+            // this process is what exposed it. That makes it this branch's
+            // defect and not an old one -- see
+            // `the_ui_process_creates_the_account_directory_before_signing_in`.
+            //
+            // Logged rather than fatal, for the reason the daemon's copy is:
+            // a window that cannot create a directory can still show a card
+            // and say what went wrong, and the sign-in's own error path is a
+            // better place to learn about it than a dead process.
+            if let Err(e) = accounts::ensure_account_dir(&config_dir, &a.id) {
+                log::error!(
+                    "could not create the data directory for this window's account ({e}); a \
+                     sign-in here cannot store its master key or its session token"
+                );
+            }
             bw_path::set_active_data_dir(Some(accounts::data_dir_for(&config_dir, &a.id)));
             accounts::session_path_for(&config_dir, &a.id)
         }
@@ -35427,6 +35454,51 @@ mod vault_backend_choice_tests {
              moved into a child: the card derives the key there. Refusing the spawn keeps \
              the sign-in in the daemon, which is what loads the OpenGL driver into a \
              process that never gives it back"
+        );
+    }
+
+    /// **THE REPORT: a clean install, a self-hosted URL, and "The system
+    /// cannot find the path specified. (os error 3)" under Continue.**
+    ///
+    /// ERROR_PATH_NOT_FOUND is the missing DIRECTORY, not a missing file:
+    /// `resolve_startup` mints an account without touching the disk, and both
+    /// the key store and the session store refuse to create their own parent,
+    /// so the first write into the account's own directory fails on a machine
+    /// where that directory does not exist yet.
+    ///
+    /// **It is this branch's defect, not an old one.** The daemon has always
+    /// created the directory before its own first save, and while the daemon
+    /// drew the first sign-in that covered this window too. Moving the
+    /// sign-in into a process of its own is what left the write with no
+    /// directory under it.
+    ///
+    /// A SOURCE GUARD, because `run_as_a_ui_process` opens a window and
+    /// cannot be called from a test. It holds that the ui entry point
+    /// contains the same call the daemon makes, ahead of the store it feeds.
+    #[test]
+    fn the_ui_process_creates_the_account_directory_before_signing_in() {
+        let source = include_str!("main.rs");
+        let entry = source
+            .split_once("fn run_as_a_ui_process")
+            .expect("control: the ui entry point was renamed")
+            .1;
+        let entry = entry
+            .split_once("fn backend_is_listening(")
+            .expect("control: the item after the ui entry point was renamed")
+            .0;
+        let ensure = entry
+            .find(concat!("accounts::ensure_account", "_dir("))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the ui process never creates the account directory. On a clean                      install it does not exist yet, so the first master key written after a                      sign-in fails with os error 3 -- the card shows 'The system cannot find                      the path specified'"
+                )
+            });
+        let store = entry
+            .find(concat!("session_store::SessionStore", "::new("))
+            .expect("control: the ui process no longer builds a session store at all");
+        assert!(
+            ensure < store,
+            "the account directory is created AFTER the store that writes into it, so the              first save still lands in a directory that does not exist"
         );
     }
 
