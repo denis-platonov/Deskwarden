@@ -2273,16 +2273,13 @@ pub fn draw_login_window(
         action = Some(LoginAction::Submit);
     }
 
-    // **The escape hatch, in the flowing content rather than the footer**, so
-    // it is measured by `flow_bottom` below and the window grows for it. Only
-    // while signing in: an attached account is past the point an API key would
-    // help, and the link would be an offer to start over.
-    if status == BwStatus::Unauthenticated {
-        ui.add_space(10.0);
-        if ui.link(RichText::new(crate::api_key_ui::USE_API_KEY_LABEL).size(12.0)).clicked() {
-            action = Some(LoginAction::UseApiKey);
-        }
-    }
+    // **The escape hatch used to sit HERE, in the flowing content**, on the
+    // reasoning that `flow_bottom` would then measure it and the window would
+    // grow to fit. The owner moved it: "move to the same line as Logging in
+    // on". It is now the left half of the footer row below -- the slot "Log
+    // out" occupies once an account is attached, which is empty in exactly
+    // the state this link is shown in. One line instead of two, and the
+    // window is shorter by the space this took.
 
     // Where the flowing content ends, in window coordinates. The caller
     // resizes the window from this: the content stack varies per state
@@ -2295,6 +2292,15 @@ pub fn draw_login_window(
     // client's "Logging in on"), static text once an account is attached.
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
         ui.horizontal(|ui| {
+            // **The API key link, on the "Logging in on:" line.** The two are
+            // never shown together -- this one only while signing in, "Log
+            // out" only once an account is attached -- so they share the
+            // footer's left slot rather than competing for it.
+            if status == BwStatus::Unauthenticated
+                && ui.link(RichText::new(crate::api_key_ui::USE_API_KEY_LABEL).size(12.0)).clicked()
+            {
+                action = Some(LoginAction::UseApiKey);
+            }
             if status != BwStatus::Unauthenticated {
                 let log_out = ui.add(
                     egui::Button::new(RichText::new("Log out").size(12.0).color(theme::TEXT_FAINT))
