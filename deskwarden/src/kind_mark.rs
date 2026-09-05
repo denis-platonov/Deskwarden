@@ -39,24 +39,36 @@ use eframe::egui::{self, Color32, Pos2, Rect, Shape, Stroke, Ui, Vec2};
 use crate::theme;
 use crate::vault_bridge::ItemKind;
 
-/// The glyph's box, as a fraction of the tile it is centred in.
+/// The glyph's box, as a fraction of the tile it is centred in: **20pt in a
+/// 40pt tile**.
 ///
-/// **Set against the monogram, which is the thing it stands in for.**
-/// `theme::avatar` sets its letters at `size * 0.38` and a capital's ink is
-/// roughly seven tenths of its font size, so the monogram's ink band is about
-/// `0.27 * size` tall and rather wider. A drawn mark reads lighter than type
-/// at the same extent -- it is outline where type is solid -- so it is given
-/// a little more room than the letters take and still sits inside the tile's
-/// own padding.
-const GLYPH: f32 = 0.6;
+/// **Four points smaller than the favicon beside it, and by eye rather than
+/// by arithmetic.** It was briefly `theme::ARTWORK_BOX` exactly, on the
+/// reasoning that one size down the tile column is one design. The owner
+/// looked at it and asked for 20 -- first for the SSH key ("make ssh icons
+/// 20px"), then for the rest of the drawn set in the same breath.
+///
+/// The reason a drawn mark wants less room than an image does is that it is
+/// OUTLINE where a favicon is solid: a logo's 24pt square is 24pt of ink,
+/// while the key's 24pt square is a thin ring with air around and inside it,
+/// so it claims the space without filling it. The four points come back as
+/// margin, and the column reads even.
+///
+/// ONE constant for all four marks, deliberately. The SSH key had its own
+/// for a few minutes -- its ring-and-shank spans the box corner to corner
+/// where the note's page spans it edge to edge -- and a per-kind table is a
+/// place for four numbers to drift apart. If one mark ever reads wrong at
+/// this size, the fix belongs in that mark's own geometry, where the shape is
+/// described, and not in a second size constant here.
+const GLYPH: f32 = 0.5;
 
 /// The stroke every mark is drawn with, as a fraction of the tile size.
 ///
-/// 1/24 is 1.33pt on the list's 32pt tile. **Thinner than it looks like it
-/// should be, on purpose:** the marks are drawn at 1x on a 32pt tile, and the
-/// note's three rules sit 3pt apart there -- a 2pt stroke closes that gap into
-/// a smear. Floored at 1pt so a mark never disappears if the tile is ever
-/// drawn small.
+/// 1/24 is 1.67pt on the list's 40pt tile. **Thinner than it looks like it
+/// should be, on purpose:** the note's three rules sit about 3pt apart at
+/// this size, and a stroke much heavier closes that gap into a smear.
+/// Floored at 1pt so a mark never disappears if the tile is ever drawn
+/// small.
 fn stroke_width(size: f32) -> f32 {
     (size / 24.0).max(1.0)
 }
