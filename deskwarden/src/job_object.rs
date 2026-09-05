@@ -2438,7 +2438,9 @@ mod tests {
             // 0.15.15-dev, putting the suffix back the commit after the
             // release, which is the rule stated in `Cargo.toml`. No
             // dependency changed.
-            (16718, 0x5a19_c780_d4df_8c9f_u64),
+            // 16714 bytes, new hash: the crate version moved 0.15.15-dev ->
+            // 0.15.15 for the release. No dependency changed.
+            (16714, 0x4777_7db5_fa90_2a4d_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

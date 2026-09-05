@@ -15,6 +15,34 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.15 - 2026-09-05
+
+### Signing in really does keep the tray small this time
+
+0.15.14 said the first sign-in after installing had moved out of the
+background process. It had, but only for a machine with no account on it at
+all -- which is almost never the case by the time you sign in again. If your
+account was already known and the official Bitwarden CLI was not installed,
+the background process still drew the window, and still held on to about
+40 MB of graphics memory for the rest of the session.
+
+The window that asks for your master password now always opens in a process
+of its own. Double-clicking Deskwarden starts the tray, the tray sees that
+nobody is signed in, and the tray opens the window: measured here, 19 MB for
+the tray and everything else in the window's own process, which gives it all
+back when you close it.
+
+A missing CLI is no longer a reason to refuse the window either. It never
+needed to be -- that window is where Deskwarden offers to install the CLI for
+you, or to switch the account to the built-in client.
+
+### Item-type icons are slightly smaller than website icons
+
+The drawn icons for notes, cards, identities and SSH keys are 20px against a
+website icon's 24px. They are outlines rather than filled artwork, so at a
+matching size they took up the same room while looking heavier than the real
+icons beside them.
+
 ## 0.15.14 - 2026-09-04
 
 ### The first launch after installing no longer costs the tray 40 MB
