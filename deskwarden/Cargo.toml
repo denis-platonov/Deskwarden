@@ -24,6 +24,21 @@ repository = "https://github.com/denis-platonov/deskwarden"
 name = "deskwarden"
 path = "src/lib.rs"
 
+# **The binary is `Deskwarden.exe`, capital D, and that spelling is the whole
+# point of this section.** Without it Cargo names the executable after the
+# package, in lower case, and Task Manager's Processes tab shows `deskwarden`
+# until it has read the file's `FileDescription` and can swap in `Deskwarden`.
+# The owner watched that happen: "in Task manager it shows up as deskwarden
+# and then gets replaced with Deskwarden - make it capital from beginning."
+# The description was already right; the IMAGE NAME is what Windows shows
+# first, and the image name is this file name.
+#
+# The library keeps `deskwarden`, because that one is a Rust identifier --
+# `use deskwarden::...` -- and not a file anybody sees.
+[[bin]]
+name = "Deskwarden"
+path = "src/main.rs"
+
 [dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",

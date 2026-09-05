@@ -129,7 +129,7 @@ jobs:
       # TODO(SignPath): once the SignPath account/project is approved,
       # replace this placeholder with SignPath's GitHub Action (exact
       # name/inputs TBD from SignPath's own docs once available) to sign
-      # deskwarden/target/release/deskwarden.exe. This is the disclosed,
+      # deskwarden/target/release/Deskwarden.exe. This is the disclosed,
       # manual-prerequisite gap called out in
       # docs/superpowers/specs/2026-07-28-deskwarden-distribution-design.md,
       # not a placeholder meant to silently stand in for real signing.
@@ -371,7 +371,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            deskwarden/target/release/deskwarden.exe
+            deskwarden/target/release/Deskwarden.exe
             deskwarden/installer/deskwarden-*-installer.exe
           # `body_path`, and `generate_release_notes` deliberately OFF.
           #

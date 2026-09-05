@@ -94,13 +94,28 @@ ChangesEnvironment=yes
 ; and for the Programs-and-Features entry, so the installer, the app, the
 ; Start Menu shortcut and the uninstall entry all look like the same product.
 SetupIconFile=..\assets\deskwarden.ico
-UninstallDisplayIcon={app}\deskwarden.exe
+UninstallDisplayIcon={app}\Deskwarden.exe
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+; **Delete the old lower-case executable BEFORE installing the new one.**
+;
+; The binary is `Deskwarden.exe` now, capital D, so Task Manager shows the
+; name that way from the first frame instead of `deskwarden` until it has
+; read the file description. Windows file names are case-INSENSITIVE but
+; case-PRESERVING: copying `Deskwarden.exe` over an existing
+; `deskwarden.exe` overwrites the contents and keeps the old spelling, so
+; without this line every upgrading machine would keep the lower-case name
+; for ever while clean installs got the new one.
+;
+; Inno runs [InstallDelete] before [Files], and setup already requires the
+; app to be closed (AppMutex), so there is no running image to fight over.
+[InstallDelete]
+Type: files; Name: "{app}\deskwarden.exe"
+
 [Files]
-Source: "..\target\release\deskwarden.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\target\release\Deskwarden.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; The passphrase word list. `src/password_gen.rs` reads it from beside the
 ; executable ON DEMAND rather than carrying it in the binary, so this line is
 ; not optional decoration: without it the installed app refuses every
