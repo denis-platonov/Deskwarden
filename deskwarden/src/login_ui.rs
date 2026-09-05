@@ -798,6 +798,62 @@ pub fn missing_credential_message(
 /// this Submit is a real one; `backend_already_chosen` makes the question once
 /// per WINDOW rather than once per Continue, so a mistyped password is not
 /// re-litigated as a backend question.
+/// The footer's server picker: a button that opens a three-item popup.
+///
+/// **Hand-built rather than `egui::ComboBox`, and the reason is one word from
+/// the owner: "scroll not needed here".** `ComboBox` wraps whatever it is
+/// given in a `ScrollArea` -- unconditionally, with no way to turn it off --
+/// and hands that scroll area whatever vertical room the popup ends up with.
+/// This picker sits in the card's footer, at the bottom of the window, so
+/// the popup opens upward into a squeeze and the scroll area does what a
+/// scroll area does: it grows a bar. Three fixed items can never need one.
+///
+/// So the scroll area is simply not there. The popup is the three rows and
+/// nothing else, which is also why this cannot regress quietly --
+/// `the_server_picker_has_no_scroll_area` reads this function's source.
+///
+/// The button keeps the combo's look deliberately: the same 12pt
+/// `TEXT_MUTED` label it had, and a chevron drawn to egui's own proportions,
+/// so moving off `ComboBox` changes what the popup does and not what the
+/// footer looks like.
+fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
+    let label = RichText::new(choice.label()).size(12.0).color(theme::TEXT_MUTED);
+    let button = ui.button(label);
+    let chevron = {
+        // egui paints its combo arrow in a square the height of the button,
+        // inset to about a third of it. Same rect, same proportions.
+        let rect = button.rect;
+        let side = rect.height() * 0.35;
+        let centre = Pos2::new(rect.right() - side, rect.center().y);
+        [
+            Pos2::new(centre.x - side * 0.5, centre.y - side * 0.25),
+            Pos2::new(centre.x + side * 0.5, centre.y - side * 0.25),
+            Pos2::new(centre.x, centre.y + side * 0.35),
+        ]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        chevron.to_vec(),
+        theme::TEXT_MUTED,
+        Stroke::NONE,
+    ));
+
+    let _popup = egui::Popup::menu(&button)
+        .id(egui::Id::new("server-choice"))
+        .show(|ui| {
+            // No scrolling container of any kind here, which is the whole
+            // point of this function -- see its docs, and the guard that
+            // reads this body to keep one from coming back.
+            for option in [ServerChoice::UsCloud, ServerChoice::EuCloud, ServerChoice::SelfHosted] {
+                if ui.selectable_value(choice, option, option.label()).clicked() {
+                    ui.close();
+                }
+            }
+        });
+    // The popup's own response is not read: the picker's whole output is the
+    // `choice` it writes through, and returning the response would make every
+    // call site decide what to do with a value that says nothing.
+}
+
 #[must_use]
 pub fn should_ask_which_client(
     status: BwStatus,
@@ -2313,25 +2369,7 @@ pub fn draw_login_window(
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if status == BwStatus::Unauthenticated {
-                    egui::ComboBox::from_id_salt("server-choice")
-                        .selected_text(
-                            RichText::new(form.server_choice.label())
-                                .size(12.0)
-                                .color(theme::TEXT_MUTED),
-                        )
-                        .show_ui(ui, |ui| {
-                            for choice in [
-                                ServerChoice::UsCloud,
-                                ServerChoice::EuCloud,
-                                ServerChoice::SelfHosted,
-                            ] {
-                                ui.selectable_value(
-                                    &mut form.server_choice,
-                                    choice,
-                                    choice.label(),
-                                );
-                            }
-                        });
+                    server_choice_dropdown(ui, &mut form.server_choice);
                     ui.label(
                         RichText::new("Logging in on:")
                             .size(12.0)
@@ -5022,6 +5060,49 @@ mod draw_resize_handles_tests {
 
 #[cfg(test)]
 mod tests {
+    /// **THE REPORT: "scroll not needed here", against a three-item dropdown
+    /// wearing a scrollbar.**
+    ///
+    /// `egui::ComboBox` wraps its items in a `ScrollArea` and offers no way to
+    /// decline one. That scroll area gets whatever vertical room the popup ends
+    /// up with, and this picker sits at the bottom of the card's footer, so the
+    /// popup opens into a squeeze and grows a bar over three fixed rows.
+    ///
+    /// A SOURCE GUARD, because the popup only exists on a frame where it has been
+    /// clicked open and a test that never opens it would pass against a
+    /// `ComboBox` put straight back. It reads the picker's own body and holds
+    /// that neither a scroll area nor a combo box is in it.
+    #[test]
+    fn the_server_picker_has_no_scroll_area() {
+        let source = include_str!("login_ui.rs");
+        let body = source
+            .split_once("fn server_choice_dropdown(")
+            .expect("the server picker was renamed")
+            .1;
+        // The NEAREST following item, not the first pattern that happens to
+        // match: "\nfn " occurs far below this function, and taking it would
+        // hand the assertions half the file -- which holds scroll areas that
+        // are nobody's defect.
+        let end = ["\nfn ", "\npub fn ", "\n#[must_use]"]
+            .iter()
+            .filter_map(|needle| body.find(needle))
+            .min()
+            .expect("the picker is the last item in the file, so its end cannot be found");
+        let body = &body[..end];
+        for banned in [concat!("Scroll", "Area"), concat!("Combo", "Box")] {
+            assert!(
+                !body.contains(banned),
+                "the server picker uses `{banned}` again, which is what put a scrollbar on \
+                 a three-item list: a scroll area handed a squeezed popup grows a bar \
+                 whatever it holds"
+            );
+        }
+        assert!(
+            body.contains(concat!("Popup::", "menu(")),
+            "control: the picker no longer opens a popup at all, so the assertions above \
+             are about a widget that does not exist"
+        );
+    }
     use super::*;
 
     /// **`bw logout` has to run in the doomed account's OWN directory.**
