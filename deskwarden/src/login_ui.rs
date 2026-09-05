@@ -817,22 +817,54 @@ pub fn missing_credential_message(
 /// so moving off `ComboBox` changes what the popup does and not what the
 /// footer looks like.
 fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
-    let label = RichText::new(choice.label()).size(12.0).color(theme::TEXT_MUTED);
-    let button = ui.button(label);
-    let chevron = {
-        // egui paints its combo arrow in a square the height of the button,
-        // inset to about a third of it. Same rect, same proportions.
-        let rect = button.rect;
-        let side = rect.height() * 0.35;
-        let centre = Pos2::new(rect.right() - side, rect.center().y);
+    // **The label and the chevron are laid out, not painted on top of each
+    // other.** The first pass called `ui.button(label)` and then drew the
+    // chevron at the button's right edge, which is the report "make dropdown
+    // bigger": nothing had reserved room for the arrow, so a wide name ran
+    // straight under it. The button is measured here instead -- text, a gap,
+    // the arrow -- the way egui measures the widget this replaced.
+    const CHEVRON: f32 = 8.0;
+    const CHEVRON_GAP: f32 = 8.0;
+    const PAD_X: f32 = 10.0;
+    const PAD_Y: f32 = 5.0;
+
+    let galley = ui.painter().layout_no_wrap(
+        choice.label().to_owned(),
+        egui::FontId::proportional(12.0),
+        theme::TEXT_MUTED,
+    );
+    let size = Vec2::new(
+        PAD_X * 2.0 + galley.size().x + CHEVRON_GAP + CHEVRON,
+        PAD_Y * 2.0 + galley.size().y.max(CHEVRON),
+    );
+    let (rect, button) = ui.allocate_exact_size(size, egui::Sense::click());
+
+    // The frame egui would have drawn, asked for by the same route a real
+    // button asks: the interaction decides which of the widget visuals is
+    // used, so hover and press still read as they did.
+    let visuals = ui.style().interact(&button);
+    ui.painter().rect(
+        rect,
+        visuals.corner_radius,
+        visuals.weak_bg_fill,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().galley(
+        Pos2::new(rect.left() + PAD_X, rect.center().y - galley.size().y / 2.0),
+        galley,
+        theme::TEXT_MUTED,
+    );
+    let arrow = {
+        let centre = Pos2::new(rect.right() - PAD_X - CHEVRON / 2.0, rect.center().y);
         [
-            Pos2::new(centre.x - side * 0.5, centre.y - side * 0.25),
-            Pos2::new(centre.x + side * 0.5, centre.y - side * 0.25),
-            Pos2::new(centre.x, centre.y + side * 0.35),
+            Pos2::new(centre.x - CHEVRON / 2.0, centre.y - CHEVRON / 4.0),
+            Pos2::new(centre.x + CHEVRON / 2.0, centre.y - CHEVRON / 4.0),
+            Pos2::new(centre.x, centre.y + CHEVRON / 2.0),
         ]
     };
     ui.painter().add(egui::Shape::convex_polygon(
-        chevron.to_vec(),
+        arrow.to_vec(),
         theme::TEXT_MUTED,
         Stroke::NONE,
     ));
@@ -2347,7 +2379,13 @@ pub fn draw_login_window(
     // right, the server — a live dropdown while signing in (the native
     // client's "Logging in on"), static text once an account is attached.
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-        ui.horizontal(|ui| {
+        // `left_to_right(Align::Center)` and NOT `ui.horizontal`, which
+        // inherits this layout's `Align::Min` and hangs every child from the
+        // top of the row. The link is a line of 12pt text and the server
+        // picker is a bordered button half again as tall, so top-aligned they
+        // read as two lines -- "Sign in with API - make on exact same line".
+        // Centred, their text sits on one line whatever the button's height.
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
             // **The API key link, on the "Logging in on:" line.** The two are
             // never shown together -- this one only while signing in, "Log
             // out" only once an account is attached -- so they share the
