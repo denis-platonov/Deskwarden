@@ -827,6 +827,9 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
     const CHEVRON_GAP: f32 = 8.0;
     const PAD_X: f32 = 10.0;
     const PAD_Y: f32 = 5.0;
+    /// A popup row's height. Enough for 12pt text plus the band around it, so
+    /// the three rows read as a list rather than as three labels.
+    const ROW_HEIGHT: f32 = 24.0;
 
     let galley = ui.painter().layout_no_wrap(
         choice.label().to_owned(),
@@ -856,11 +859,18 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
         theme::TEXT_MUTED,
     );
     let arrow = {
+        // **Centred on the arrow's own BOX, not on its top edge.** The first
+        // pass put the flat side a quarter of the glyph above the button's
+        // centre and the point half a glyph below it, so the triangle's box
+        // sat a pixel low and the owner read it as "text and arrow feel on
+        // diff level". Equal halves either side of the centre line put the
+        // arrow's middle where the text's middle is.
         let centre = Pos2::new(rect.right() - PAD_X - CHEVRON / 2.0, rect.center().y);
+        let half_height = CHEVRON * 0.3;
         [
-            Pos2::new(centre.x - CHEVRON / 2.0, centre.y - CHEVRON / 4.0),
-            Pos2::new(centre.x + CHEVRON / 2.0, centre.y - CHEVRON / 4.0),
-            Pos2::new(centre.x, centre.y + CHEVRON / 2.0),
+            Pos2::new(centre.x - CHEVRON / 2.0, centre.y - half_height),
+            Pos2::new(centre.x + CHEVRON / 2.0, centre.y - half_height),
+            Pos2::new(centre.x, centre.y + half_height),
         ]
     };
     ui.painter().add(egui::Shape::convex_polygon(
@@ -875,8 +885,24 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
             // No scrolling container of any kind here, which is the whole
             // point of this function -- see its docs, and the guard that
             // reads this body to keep one from coming back.
+            // **Full width, so the selected row is a band and not a badge.**
+            // `ui.selectable_value` sizes its widget to the text it holds, so
+            // the highlight stopped where the word did -- "make selected item
+            // in dropdown full filled edge to edge in blue not just around
+            // text". Every row is given the popup's whole width instead, which
+            // also makes the three rows one column of hit targets rather than
+            // three ragged ones.
+            let width = ui.available_width();
             for option in [ServerChoice::UsCloud, ServerChoice::EuCloud, ServerChoice::SelfHosted] {
-                if ui.selectable_value(choice, option, option.label()).clicked() {
+                // `Button::selected`, which is what `Ui::selectable_label`
+                // builds for itself in this version of egui -- reached
+                // directly here only so the row can be given a size.
+                let row = ui.add_sized(
+                    [width, ROW_HEIGHT],
+                    egui::Button::new(option.label()).selected(*choice == option),
+                );
+                if row.clicked() {
+                    *choice = option;
                     ui.close();
                 }
             }
