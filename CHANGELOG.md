@@ -8,7 +8,36 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
-## Unreleased
+## 0.15.13 - 2026-09-04
+
+### Notes, cards, identities and SSH keys have icons of their own
+
+A vault is not all logins. Everything without a website used to wear the same
+grey square with two letters in it, so a page of notes, cards and identities
+all looked alike at a glance.
+
+Each kind now has its own drawn mark: a written page for a secure note, a card
+with its stripe, a head and shoulders for an identity, a key for an SSH key.
+Logins keep their letters, because a login's name is a brand and its initials
+say something. A site's real favicon still wins wherever there is one.
+
+### Website icons are one size, centred, and no longer blurry
+
+Favicons were drawn at whatever size the site happened to serve, so a list of
+them was ragged — some filling the tile edge to edge, some lost in the middle
+of it — and small ones were stretched to fit and came out soft.
+
+Every icon is now drawn at the same size in the middle of its tile, with the
+same space around it on every row. Icons that ship with empty space baked into
+them are trimmed first, so what gets centred is the artwork you can actually
+see rather than the file it arrived in.
+
+### The details panel slides in instead of appearing
+
+Opening an item from an empty panel now slides the details in from the right
+edge, and closing it slides them back out. Clicking between items while the
+panel is already open changes the contents in place, with no animation — the
+movement marks the panel opening or closing, not every click.
 
 ### Searching your vault from the autofill card no longer costs the tray 40 MB
 
