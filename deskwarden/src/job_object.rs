@@ -7406,7 +7406,15 @@ mod tests {
             // 113 -> 114: the bare `pub` token that `pub(crate) fn
             // install_bin_candidate` introduced. See the `"pub"` entry in the
             // list above for why that visibility, and not `pub fn`.
-            call_sites: 114,
+            //
+            // 114 -> 117: `bw_command_in` now refuses to build a command for
+            // a verified `bw.exe` that is no longer on disk -- the `exists`
+            // test, the `display` in the message it returns, and the `Err`
+            // that carries it. Spawning that
+            // path came back as "The system cannot find the path specified.
+            // (os error 3)", which is what the owner read under the sign-in
+            // button.
+            call_sites: 117,
             macros: BW_PATH_MACROS,
             imports: BW_PATH_IMPORTS,
             local_paths: BW_PATH_LOCAL_PATHS,

@@ -235,12 +235,42 @@ impl BareCommand {
 pub fn bw_command_in(dir: Option<&Path>) -> Result<BareCommand, String> {
     match verified_bw_exe() {
         Some(path) => {
-            let mut cmd = Command::new(path);
-            cmd.creation_flags(CREATE_NO_WINDOW);
-            if let Some(dir) = dir {
-                cmd.env(BW_DATA_DIR_ENV, dir);
+            // **Verified once is not present now, and the difference reached
+            // the owner as "The system cannot find the path specified. (os
+            // error 3)" under the sign-in button.**
+            //
+            // `verified_bw_exe` answers with the path this launch graded. The
+            // file can be gone by the time a command is built from it -- an
+            // uninstall, a cleaned directory, an antivirus quarantine, or a
+            // launch whose `bin\` was never created in the first place -- and
+            // `Command::spawn` then fails with ERROR_PATH_NOT_FOUND, whose
+            // `Display` is that sentence and nothing else. Every caller
+            // formats it into some longer message, so what the user reads is
+            // an OS error code where an explanation should be.
+            //
+            // The same message the rest of this crate gives for the same
+            // fact, said here instead, because this is the one place every
+            // spawn passes through -- see this function's own doc.
+            // Written as a positive test with an `else`, and NOT as
+            // `if !path.exists()`: `job_object`'s census reads `if !` as a
+            // macro invocation named `if`, because it cannot tell that bang
+            // from the one in `format!`. The shape is the scanner's; the
+            // meaning is the same either way.
+            if path.exists() {
+                let mut cmd = Command::new(path);
+                cmd.creation_flags(CREATE_NO_WINDOW);
+                if let Some(dir) = dir {
+                    cmd.env(BW_DATA_DIR_ENV, dir);
+                }
+                Ok(BareCommand { command: cmd })
+            } else {
+                Err(format!(
+                    "the Bitwarden CLI is not at {}, where this launch verified it. Your \
+                     vault is served by that program, so Deskwarden cannot reach it until \
+                     the CLI is back.",
+                    path.display()
+                ))
             }
-            Ok(BareCommand { command: cmd })
         }
         None => Err(
             "no verified Bitwarden CLI: the startup check that resolves bw.exe and confirms it \
@@ -574,6 +604,23 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// A real, empty file under the OS temp directory, planted so that
+    /// `bw_command_in`'s presence check -- added when a verified-then-deleted
+    /// CLI reached `Command::spawn` and came back as "The system cannot find
+    /// the path specified. (os error 3)" -- sees something to build against.
+    ///
+    /// Fixtures here used to be imaginary paths like `C:\deskwarden-test\...`.
+    /// They cannot be any more, and the verify-once slot is process-global, so
+    /// a single imaginary fixture anywhere in this module would be the one
+    /// every other test in it then reads back.
+    fn fixture_exe(which: &str) -> PathBuf {
+        let exe = std::env::temp_dir().join(format!("deskwarden-test-{which}-bw.exe"));
+        if !exe.exists() {
+            std::fs::write(&exe, b"").expect("a writable temp directory");
+        }
+        exe
+    }
+
     /// Guarantees a verified `bw.exe` is recorded, so the `bw_command*` tests
     /// exercise the `Some` arm rather than silently passing through the "no
     /// verified CLI" error.
@@ -582,7 +629,17 @@ mod tests {
     /// here is safe however the test order falls out; the path it installs is
     /// the same one the two tests below it already use.
     fn ensure_verified_exe() {
-        remember_verified_bw_exe(PathBuf::from(r"C:\deskwarden-test\first\bw.exe"));
+        // **A file that really exists**, because `bw_command_in` now refuses
+        // to build a command for a path that is gone -- a verified-then-
+        // deleted CLI used to reach `Command::spawn` and come back as "The
+        // system cannot find the path specified. (os error 3)". A fixture
+        // pointing at an imaginary path would take that refusal instead and
+        // prove nothing about the env var it is actually testing.
+        //
+        // Planted under the OS temp directory and left there: it is an empty
+        // file, these tests share one process-global slot anyway, and a
+        // fixture that deleted itself would race the tests beside it.
+        remember_verified_bw_exe(fixture_exe("first"));
         assert!(
             verified_bw_exe().is_some(),
             "a verified bw.exe was just recorded and did not stick"
@@ -1148,9 +1205,9 @@ mod tests {
         // The verify-once/resolve-many hole: `main` verifies one path, and
         // every later spawn must reuse *that* result rather than re-resolving
         // against a filesystem that may have changed since.
-        let first = PathBuf::from(r"C:\deskwarden-test\first\bw.exe");
+        let first = fixture_exe("first");
         remember_verified_bw_exe(first.clone());
-        remember_verified_bw_exe(PathBuf::from(r"C:\deskwarden-test\second\bw.exe"));
+        remember_verified_bw_exe(fixture_exe("second"));
 
         assert_eq!(verified_bw_exe(), Some(first.as_path()));
         assert!(bw_command().is_ok());
@@ -1259,7 +1316,7 @@ mod tests {
         // First-wins, so this only guarantees *some* path is recorded, which
         // is all this test needs: the assertion is agreement with the
         // production probe applied to whatever that path is.
-        remember_verified_bw_exe(PathBuf::from(r"C:\deskwarden-test\first\bw.exe"));
+        remember_verified_bw_exe(fixture_exe("first"));
         let exe = verified_bw_exe().expect("a verified path was just recorded");
 
         assert_eq!(
