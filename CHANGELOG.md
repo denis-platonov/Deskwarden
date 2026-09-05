@@ -8,6 +8,13 @@ Dates are the release date. This project follows [semantic
 versioning](https://semver.org/) loosely: the leading zero means the shape of
 things can still change between minor versions.
 
+## Unreleased
+
+Builds from this section report their version with a `-dev` suffix -- see
+`Cargo.toml`. If the About line in Preferences reads `0.15.14-dev`, the build
+is from the working tree and not from a
+[GitHub release](https://github.com/denis-platonov/deskwarden/releases).
+
 ## 0.15.13 - 2026-09-04
 
 ### Notes, cards, identities and SSH keys have icons of their own

@@ -2425,7 +2425,13 @@ mod tests {
             // 0.15.12 for the point release. No dependency changed.
             // 16166 bytes, new hash: the crate version moved 0.15.12 ->
             // 0.15.13 for the point release. No dependency changed.
-            (16166, 0x9420_d6e5_db20_05d1_u64),
+            // 16718 bytes, new hash: the crate version moved 0.15.13 ->
+            // 0.15.14-dev, which is how a build from the working tree now
+            // tells itself apart from a GitHub release, plus the seven-line
+            // comment in `Cargo.toml` that states the rule. That comment is
+            // most of the 552 bytes; the version itself is four of them. No
+            // dependency changed.
+            (16718, 0x7285_5a6d_3776_4694_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
