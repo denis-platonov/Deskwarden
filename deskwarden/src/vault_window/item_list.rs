@@ -4178,16 +4178,29 @@ mod row_tile_tests {
     }
 
     #[test]
-    fn the_avatar_tile_is_actually_filled_and_bordered_in_both_states() {
-        // "the tile is actually filled rather than transparent", asserted on
-        // the 32x32 monogram box: `background: #f3f2f2; border: 1px solid
-        // #eae7e7` unselected, `#eef2fc` / `#b8c7ea` selected.
+    fn the_avatar_tile_is_bordered_and_never_filled_in_either_state() {
+        // **Reversed, and named for it.** This used to pin design 2b's
+        // `background: #f3f2f2` on the monogram box, with `#eef2fc` when
+        // selected. The owner's ruling, on a screenshot of a monogram tile:
+        // "secnote and other icons have gray background - they should not".
+        // The tile is now an EDGE in both states, and the state is carried by
+        // that edge's colour and by the row behind it.
         let items = [login("Ledgerline", "a.novak@ledgerline.com")];
-        let unselected = square(&paint(&items, None), 32.0);
-        assert_eq!(unselected.fill, theme::CANVAS);
-        let selected = square(&paint(&items, Some("Ledgerline")), 32.0);
-        assert_eq!(selected.fill, theme::BLUE_WASH);
-        assert_ne!(selected.fill, egui::Color32::TRANSPARENT);
+        for (selected, edge, what) in [
+            (None, theme::HAIRLINE, "unselected"),
+            (Some("Ledgerline"), theme::BLUE_EDGE, "selected"),
+        ] {
+            let tile = square(&paint(&items, selected), AVATAR_SIZE);
+            assert_eq!(
+                tile.fill,
+                egui::Color32::TRANSPARENT,
+                "the {what} tile is filled, so its letter sits on a grey square inside                  its own tile"
+            );
+            assert_eq!(
+                tile.stroke.color, edge,
+                "the {what} tile lost the edge that is now the only thing distinguishing                  the two states"
+            );
+        }
     }
 
     /// The vertical centre of the avatar tile in the FIRST row, absolute at

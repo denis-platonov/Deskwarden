@@ -9144,9 +9144,13 @@ mod tests {
     ) -> (Vec<String>, Vec<egui::Rect>, Vec<egui::Rect>) {
         fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>, tiles: &mut Vec<egui::Rect>) {
             match shape {
+                // Matched by GEOMETRY, not by fill. The tile behind a drawn
+                // mark carries no fill at all any more ("secnote and other
+                // icons have gray background - they should not"), so a
+                // `BLUE_WASH` test finds nothing and every claim below is then
+                // made about a pane nobody found.
                 egui::Shape::Rect(rect)
-                    if rect.fill == theme::BLUE_WASH
-                        && (rect.rect.width() - HEADER_AVATAR).abs() < 0.5
+                    if (rect.rect.width() - HEADER_AVATAR).abs() < 0.5
                         && (rect.rect.height() - HEADER_AVATAR).abs() < 0.5 =>
                 {
                     tiles.push(rect.rect);
@@ -14123,9 +14127,13 @@ mod tests {
                 // blue inside it, belong to `kind_mark`'s glyph and not to a
                 // wordmark pill -- see `painted_with_marks`, which makes the
                 // same split for the same reason.
+                // Matched by GEOMETRY, not by fill. The tile behind a drawn
+                // mark carries no fill at all any more ("secnote and other
+                // icons have gray background - they should not"), so a
+                // `BLUE_WASH` test finds nothing and every claim below is then
+                // made about a pane nobody found.
                 egui::Shape::Rect(rect)
-                    if rect.fill == theme::BLUE_WASH
-                        && (rect.rect.width() - HEADER_AVATAR).abs() < 0.5
+                    if (rect.rect.width() - HEADER_AVATAR).abs() < 0.5
                         && (rect.rect.height() - HEADER_AVATAR).abs() < 0.5 =>
                 {
                     tiles.push(rect.rect);
@@ -14748,11 +14756,11 @@ mod tests {
         let rects = painted_rects(&item, &TotpState::NoSecret);
         let avatar = rects
             .iter()
-            .find(|(r, fill)| {
-                *fill == theme::BLUE_WASH
-                    && r.width() == HEADER_AVATAR
-                    && r.height() == HEADER_AVATAR
-            })
+            // Found by GEOMETRY. The tile carries no fill any more -- the
+            // owner's ruling on the grey square inside it -- so a
+            // `BLUE_WASH` test finds nothing and this panics on a header
+            // that is laid out perfectly well.
+            .find(|(r, _)| r.width() == HEADER_AVATAR && r.height() == HEADER_AVATAR)
             .unwrap_or_else(|| {
                 panic!("no {HEADER_AVATAR}px avatar tile in the header: {rects:?}")
             });

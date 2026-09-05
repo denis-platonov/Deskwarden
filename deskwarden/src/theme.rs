@@ -1198,7 +1198,13 @@ pub fn avatar_corner_radius(size: f32) -> CornerRadius {
 /// A rounded initials tile, `size` square. `emphasized` renders the selected
 /// treatment (blue on a blue wash) versus the neutral grey one.
 pub fn avatar(ui: &mut Ui, text: &str, size: f32, emphasized: bool) {
-    let rect = avatar_tile(ui, size, emphasized);
+    // Unfilled, like every other avatar tile now. The fill was kept here one
+    // pass longer than the others on the argument that a letter is type and
+    // type needs a ground; the owner's next screenshot was a monogram tile
+    // with the same grey square in it. One tile, one treatment -- a column
+    // where the letters sit on grey and the icons beside them do not is two
+    // designs, which is what the fill was supposed to prevent.
+    let rect = avatar_artwork_tile(ui, size, emphasized);
     let fg = if emphasized { BLUE } else { TEXT_MUTED };
     ui.painter().text(
         rect.center(),

@@ -7398,8 +7398,22 @@ fn the_startup_sign_in_belongs_to_a_ui_process(
         // signs in through `bw`, which holds its own profile and its own
         // server, and a first-install launch with no account record at all is
         // exactly the launch that card exists for.
+        //
+        // **`a_cli_is_available` is not read when there is no account**, and
+        // that exception is the fix for "first launch after install - UI
+        // window launched with login". On a fresh install there is no record,
+        // so the choice reads as the official CLI, and a PC that has never run
+        // Deskwarden has no `bw.exe` -- which sent this to `false` and left
+        // the daemon drawing the card and holding the GL driver for good.
+        //
+        // The guard is for a child that would find the CLI gone and exit
+        // without drawing. A first-install child does not: its card opens on
+        // the choice between the official CLI and the built-in client, and
+        // `bw_acquire::CliSetupState` installs the CLI from inside it. See
+        // `why_a_ui_process_cannot_use_the_cli`, which makes the same
+        // exception on the same fact and must keep agreeing with this one.
         backend_policy::VaultBackendChoice::BwServe => {
-            !a_session_token_is_already_stored && a_cli_is_available
+            !a_session_token_is_already_stored && (a_cli_is_available || account.is_none())
         }
     }
 }
@@ -7536,11 +7550,35 @@ fn the_user_key_speaks_for_this_session(token: &str, account: Option<&Account>) 
 /// the one arm that refuses, and it refuses for a reason that has not
 /// changed: on that account `bw.exe` IS the vault, so the window would be a
 /// window over nothing.
+///
+/// # No account record is not that arm, and this is the second defect
+///
+/// **The report: "first launch after install - UI window launched with login
+/// and not reclaiming after send to tray".** A fresh install has no account
+/// record, [`backend_policy::choose`] reads the absent
+/// `use_official_bw_crypto` as the official CLI, and this refused -- so the
+/// daemon drew the sign-in card itself and held the OpenGL driver's committed
+/// arenas for the rest of its life. That is the ~19 MB -> ~59 MB the whole
+/// `--ui` split exists to avoid, and closing the window cannot give it back
+/// because only process exit does.
+///
+/// The refusal was reasoning about an account that does not exist yet. There
+/// is no vault behind a first-install card and nothing for `bw.exe` to BE the
+/// vault of: what that window opens on is the choice between the official CLI
+/// and the built-in client, and `bw_acquire::CliSetupState` installs the CLI
+/// from inside it if that is what the user picks. A window that offers to
+/// install the missing binary is not a window over nothing.
+///
+/// This pairs with [`the_startup_sign_in_belongs_to_a_ui_process`], which
+/// makes the same exception on the same fact. The two must agree: this one
+/// alone would let a child start that the daemon never spawns, and that one
+/// alone would spawn a child that exits here without drawing -- a launch with
+/// no window at all, which is the failure its own docs name.
 fn why_a_ui_process_cannot_use_the_cli(
     account: Option<&Account>,
     a_cli_is_on_disk: bool,
 ) -> Option<deskwarden::ui_process::UiStartFailure> {
-    if a_cli_is_on_disk {
+    if a_cli_is_on_disk || account.is_none() {
         return None;
     }
     match backend_policy::choose(
@@ -35490,20 +35528,66 @@ mod vault_backend_choice_tests {
         );
     }
 
-    /// **And a fresh install, which is the same arm and the one that must
-    /// not be broken by widening it.**
+    /// **A fresh install is NOT that arm, and this assertion is reversed.**
     ///
-    /// No account at all: `backend_policy::choose(None, true)` is `BwServe`,
-    /// so the refusal stands here too. The remedy is the one the message now
-    /// names -- Deskwarden downloads the CLI itself -- and not the reinstall
-    /// it used to name, which has produced no `bw.exe` since 0.15.1.
+    /// It used to refuse: no account means `backend_policy::choose(None,
+    /// true)` is `BwServe`, and `BwServe` with no `bw.exe` was a window over
+    /// nothing. The report that overturned it: "first launch after install -
+    /// UI window launched with login and not reclaiming after send to tray".
+    /// The refusal is what produced that -- with the child refused, the daemon
+    /// drew the card itself, and a daemon that draws once holds the OpenGL
+    /// driver's committed arenas until it exits. Closing the window gives none
+    /// of it back.
+    ///
+    /// The refusal was reasoning about an account that does not exist yet.
+    /// There is no vault behind a first-install card for `bw.exe` to be: that
+    /// window opens on the choice between the official CLI and the built-in
+    /// client, and `bw_acquire::CliSetupState` installs the CLI from inside
+    /// it. A window offering to install the missing binary is not a window
+    /// over nothing.
+    ///
+    /// The account arm above is untouched, and that is what keeps this
+    /// honest: a `bw serve` account with a server and no CLI is still
+    /// refused, so this is an exception for "no record at all" rather than
+    /// the gate going slack.
     #[test]
-    fn a_launch_with_no_account_is_still_refused_a_window_without_the_cli() {
+    fn a_fresh_install_gets_its_window_even_with_no_cli_on_disk() {
         assert_eq!(
             why_a_ui_process_cannot_use_the_cli(None, false),
-            Some(deskwarden::ui_process::UiStartFailure::NoBwExe),
-            "a fresh install is `BwServe` by `choose(None, true)`, so a window over no \
-             backend at all would open"
+            None,
+            "a first-install launch was refused a ui process, so the daemon draws the \
+             sign-in card itself and holds the graphics driver for the life of the tray"
+        );
+    }
+
+    /// The daemon side of the same fact, asserted beside it because the two
+    /// must agree. This one alone would spawn a child that exits without
+    /// drawing; the one above alone would let a child start that is never
+    /// spawned. Either way round it is a launch with no window at all.
+    #[test]
+    fn the_daemon_hands_a_fresh_installs_sign_in_to_a_ui_process() {
+        assert!(
+            the_startup_sign_in_belongs_to_a_ui_process(
+                backend_policy::VaultBackendChoice::BwServe,
+                false,
+                None,
+                false,
+                // No `bw.exe`: every PC that has never run this app.
+                false,
+            ),
+            "a fresh install's sign-in was kept in the daemon because no CLI was on disk, \
+             which is the ~19 MB -> ~59 MB the `--ui` split exists to avoid"
+        );
+        assert!(
+            !the_startup_sign_in_belongs_to_a_ui_process(
+                backend_policy::VaultBackendChoice::BwServe,
+                false,
+                Some(&account_on(Some("https://vault.example.com"))),
+                false,
+                false,
+            ),
+            "the exception widened past a fresh install: an account WITH a record and no \
+             CLI would spawn a child that exits without drawing"
         );
     }
 

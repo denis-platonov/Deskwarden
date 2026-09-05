@@ -98,7 +98,14 @@ pub fn avatar(ui: &mut Ui, kind: ItemKind, name: &str, size: f32, emphasized: bo
         theme::avatar(ui, &theme::initials(name), size, emphasized);
         return;
     }
-    let tile = theme::avatar_tile(ui, size, emphasized);
+    // `avatar_artwork_tile`, not `avatar_tile`: no fill. The report was
+    // "secnote and other icons have gray background - they should not", and
+    // it is the same ruling that took the ground out from behind a favicon --
+    // a drawn mark is artwork too, and a grey square inside the tile is
+    // exactly what the owner asked to remove there. The MONOGRAM keeps its
+    // fill, because a letter is type and type needs a ground to sit on; that
+    // is the line `has_mark` already draws and this follows it.
+    let tile = theme::avatar_artwork_tile(ui, size, emphasized);
     paint_mark(ui, kind, tile, emphasized);
 }
 
