@@ -3355,7 +3355,20 @@ pub fn build_frame_with_search(
         );
         apply_send_action(
             egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin::symmetric(20, 18)))
+            // NO INNER MARGIN, and that is the fix for the band the owner
+            // marked out around the detail pane: "there is another band
+            // around the whole details panel when screen becomes smaller -
+            // shouldn't be", and "even color is darker of that band" -- the
+            // darker colour being this frame's own `CANVAS` showing through
+            // the margin, against the white header strip inside it.
+            //
+            // The 20/18 belonged to the SENDS screen, which is the other
+            // thing this panel hosts and which draws its content directly on
+            // the panel with no strip of its own. The detail pane does have
+            // one, and a header strip that stops 20pt short of its panel is
+            // the band. So the margin moved to the Sends branch below, where
+            // it is one screen's padding rather than the shared container's.
+            .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(ui, |ui| {
                 // The Sends screen replaces the detail pane as well as the
                 // item list, so it takes this panel whole and the read/edit
@@ -3382,7 +3395,13 @@ pub fn build_frame_with_search(
                     // blanks the whole screen, which the frame click tests
                     // fail on; a gate written here has to drop the verdict
                     // it just took, which the counter sees.
-                    return send_ui::draw_send_pane(
+                    // The panel's old `Margin::symmetric(20, 18)`, kept
+                    // here so the Sends screen is pixel-identical while the
+                    // detail pane beside it loses the band. See the frame
+                    // above.
+                    return egui::Frame::new()
+                        .inner_margin(Margin::symmetric(20, 18))
+                        .show(ui, |ui| send_ui::draw_send_pane(
                         ui,
                         state,
                         notice_message.as_deref(),
@@ -3391,7 +3410,8 @@ pub fn build_frame_with_search(
                         send_create.in_flight,
                         &crate::send::SystemClock,
                         &crate::local_time::SystemZone,
-                    );
+                        ))
+                        .inner;
                 }
                 // Resolved from the list the selection was made in, for the
                 // reason the row menu is: a row clicked under Trash or
@@ -16369,6 +16389,72 @@ mod vault_body_state_tests {
 }
 
 #[cfg(test)]
+mod detail_pane_frame_placement_tests {
+    //! The panel that hosts the DETAIL pane must carry no inner margin
+    //! either, and for the same reason one pane over.
+    //!
+    //! **The report.** "There is another band around the whole details panel
+    //! when screen becomes smaller - shouldn't be", and then the detail that
+    //! identified it: "even color is darker of that band". The darker colour
+    //! was this panel's own `theme::CANVAS` showing through a
+    //! `Margin::symmetric(20, 18)`, against the white header strip inside
+    //! it. The strip is meant to reach the panel's edges the way the item
+    //! pane's toolbar does; stopped 20pt short, it reads as a card floating
+    //! on grey, and the narrower the window the more of the pane the band is.
+    //!
+    //! **The margin was not wrong, it was in the wrong place.** This panel
+    //! hosts two screens: the detail pane, which has its own header strip and
+    //! its own `detail::BODY_PAD_X` inside it, and the Sends screen, which
+    //! draws straight onto the panel and needs the padding. It now belongs to
+    //! the Sends branch, so Sends is unchanged and the pane is flush.
+    //!
+    //! A SOURCE-TEXT GUARD, for the reason the item pane's is: every test
+    //! that draws the detail pane calls into `detail` with a pane width
+    //! directly, so a margin applied by THIS caller is invisible to all of
+    //! them. Removing it left the whole suite green -- 4464 tests -- which is
+    //! why this exists. Same split-literal rule: do not re-join these.
+    const PANEL: &str = concat!("apply_send_", "action(");
+    const MARGIN: &str = "inner_margin";
+
+    #[test]
+    fn the_detail_panes_panel_has_no_inner_margin() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find(PANEL)
+            .unwrap_or_else(|| panic!("no {PANEL:?} in this file -- the panel moved"));
+        // The `.frame(..)` call itself, found after the panel rather than
+        // measured from it: the comment explaining this decision sits between
+        // the two, so a fixed offset from `start` lands inside prose. Bounded
+        // tightly so it cannot reach the Sends branch below, which carries
+        // the margin this forbids here.
+        let frame_at = source[start..]
+            .find(".frame(")
+            .unwrap_or_else(|| panic!("no `.frame(` after {PANEL:?} -- the panel lost it"));
+        let chain = &source[start + frame_at..start + frame_at + 120];
+        assert!(
+            !chain.contains(MARGIN),
+            "the detail pane's panel has an `{MARGIN}` again, so its header strip stops              short of the panel's edges and the pane reads as a card on grey -- the band              the owner marked out. Its chain is now: {chain:?}"
+        );
+        assert!(
+            chain.contains("fill(theme::CANVAS)"),
+            "the panel's ground is no longer CANVAS; the band's colour was the tell that              identified it, so this is pinned beside the margin. Chain: {chain:?}"
+        );
+    }
+
+    /// The other half: the margin still EXISTS, on the Sends screen. Without
+    /// this, deleting it outright -- which changes a screen the report said
+    /// nothing about -- passes the test above.
+    #[test]
+    fn the_sends_screen_kept_the_margin_the_panel_gave_up() {
+        let source = include_str!("mod.rs");
+        assert!(
+            source.contains(concat!("Margin::symmetric(20,", " 18)")),
+            "the panel's old 20/18 margin was deleted rather than moved, so the Sends              screen now draws hard against the window edge"
+        );
+    }
+}
+
+#[cfg(test)]
 mod item_pane_frame_placement_tests {
     //! The item pane's panel frame must carry NO inner margin.
     //!
@@ -21812,7 +21898,11 @@ mod preferences_modal_wiring_tests {
             // shown, and that the pane is drawn inside `reveal`.
             // Raised deliberately: one more module must now be a clean,
             // column-0, gated block that the walk really reaches.
-            modules, 64,
+            // 65 as of the band around the detail pane, which added
+            // `mod detail_pane_frame_placement_tests` -- the source guard on
+            // the panel's frame, written because removing the margin that
+            // caused the band left all 4464 other tests green.
+            modules, 65,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
