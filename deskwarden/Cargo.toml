@@ -7,7 +7,7 @@ name = "deskwarden"
 # it. `Version::parse` reads it as a semver prerelease, which orders it above
 # the released version below it and below the release it is heading for -- so
 # the updater offers 0.15.14 to a 0.15.14-dev build and does not offer 0.15.13.
-version = "0.15.14"
+version = "0.15.15-dev"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 # NOT published to crates.io: this is a Windows application distributed as an
