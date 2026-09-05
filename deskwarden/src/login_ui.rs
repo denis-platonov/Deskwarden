@@ -881,6 +881,13 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
 
     let _popup = egui::Popup::menu(&button)
         .id(egui::Id::new("server-choice"))
+        // **A frame with no inner margin, which is what "edge to edge" needs.**
+        // A full-width row is only as wide as the frame lets it be, and the
+        // menu frame egui supplies pads its contents -- so the selection band
+        // stopped short of the popup's own edges however wide the row was
+        // asked to be. The frame keeps its fill, its border and its rounding
+        // and gives up only the padding.
+        .frame(egui::Frame::menu(ui.style()).inner_margin(egui::Margin::ZERO))
         .show(|ui| {
             // No scrolling container of any kind here, which is the whole
             // point of this function -- see its docs, and the guard that
@@ -892,6 +899,9 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
             // text". Every row is given the popup's whole width instead, which
             // also makes the three rows one column of hit targets rather than
             // three ragged ones.
+            // No gap between rows either: `item_spacing` leaves a stripe of
+            // frame between two bands, which is the same defect vertically.
+            ui.spacing_mut().item_spacing.y = 0.0;
             let width = ui.available_width();
             for option in [ServerChoice::UsCloud, ServerChoice::EuCloud, ServerChoice::SelfHosted] {
                 // `Button::selected`, which is what `Ui::selectable_label`
@@ -899,7 +909,14 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
                 // directly here only so the row can be given a size.
                 let row = ui.add_sized(
                     [width, ROW_HEIGHT],
-                    egui::Button::new(option.label()).selected(*choice == option),
+                    egui::Button::new(option.label())
+                        .selected(*choice == option)
+                        // Square, because the band now reaches the popup's own
+                        // rounded edge: a rounded row inside a rounded frame
+                        // leaves four crescents of frame showing at the
+                        // corners, which is "not edge to edge" one step
+                        // smaller.
+                        .corner_radius(egui::CornerRadius::ZERO),
                 );
                 if row.clicked() {
                     *choice = option;
