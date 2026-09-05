@@ -885,8 +885,18 @@ pub fn initials(name: &str) -> String {
     }
 }
 
+/// The monogram's cap height as a fraction of its tile: **16pt in a 40pt
+/// tile**, set by the owner alongside the tile and the artwork box in one
+/// breath -- "let's make those - 40, 24, 24, 16".
+///
+/// A fraction rather than a bare 16, for the same reason [`ARTWORK_BOX`] is:
+/// the tile has been resized three times, and a letter size that stayed put
+/// while the tile moved would change how the monogram sits in it without
+/// anyone editing this line.
+pub(crate) const MONOGRAM: f32 = 0.4;
+
 /// The square every favicon is fitted into, centred in its [`avatar_tile`]:
-/// **20pt**, which is five eighths of the 32pt tile.
+/// **24pt**, which is three fifths of the 40pt tile.
 ///
 /// Expressed as a fraction of the tile rather than as a bare 16.0 so the two
 /// cannot drift apart -- the tile has been resized once already, and an
@@ -901,7 +911,7 @@ pub fn initials(name: &str) -> String {
 /// SMALLER than the box is still never magnified past its own size (see
 /// [`avatar_artwork`], which fits the box in both directions), so the column
 /// is ONE icon size rather than every size the web happens to serve.
-const ARTWORK_BOX: f32 = 0.625;
+pub(crate) const ARTWORK_BOX: f32 = 0.6;
 
 fn artwork_box(tile: Rect) -> f32 {
     tile.width().min(tile.height()) * ARTWORK_BOX
@@ -1210,7 +1220,7 @@ pub fn avatar(ui: &mut Ui, text: &str, size: f32, emphasized: bool) {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         text,
-        FontId::new((size * 0.38).round(), FontFamily::Name(SEMIBOLD.into())),
+        FontId::new((size * MONOGRAM).round(), FontFamily::Name(SEMIBOLD.into())),
         fg,
     );
 }

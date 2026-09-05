@@ -722,7 +722,7 @@ fn draw_list_placeholder(ui: &mut egui::Ui, placeholder: ListPlaceholder) {
 /// at one size by the owner's decision, and a number agreed by two private
 /// constants is a number that can quietly stop agreeing. Nothing outside this
 /// module lays anything out with it.
-pub(crate) const AVATAR_SIZE: f32 = 32.0;
+pub(crate) const AVATAR_SIZE: f32 = 40.0;
 
 /// The network mark's height, in points, on a list row.
 ///
@@ -4328,7 +4328,7 @@ mod row_tile_tests {
     #[test]
     fn every_favicon_is_fitted_into_the_same_box_centred_in_its_tile() {
         // Every favicon is fitted into this box, centred in the tile.
-        const ARTWORK_PT: f32 = AVATAR_SIZE * 0.625;
+        const ARTWORK_PT: f32 = AVATAR_SIZE * theme::ARTWORK_BOX;
 
         // ---- The small source: 16x16, the common case, must NOT fill ----
         let p = paint_with_icons(&[login("Ledgerline", "a@b.c")], None, &["Ledgerline"]);
@@ -4565,8 +4565,8 @@ mod row_tile_tests {
         );
         assert_eq!(
             one_font.size,
-            (AVATAR_SIZE * 0.38).round(),
-            "the monogram is not `theme::avatar`'s `size * 0.38`"
+            (AVATAR_SIZE * theme::MONOGRAM).round(),
+            "the monogram is not `theme::avatar`'s `size * theme::MONOGRAM`"
         );
 
         // CENTRED: each on its own tile, both axes. Half a point of tolerance

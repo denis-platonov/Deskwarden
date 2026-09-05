@@ -48,7 +48,7 @@ use crate::vault_bridge::ItemKind;
 /// at the same extent -- it is outline where type is solid -- so it is given
 /// a little more room than the letters take and still sits inside the tile's
 /// own padding.
-const GLYPH: f32 = 0.56;
+const GLYPH: f32 = 0.6;
 
 /// The stroke every mark is drawn with, as a fraction of the tile size.
 ///
