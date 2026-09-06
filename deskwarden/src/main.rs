@@ -13171,8 +13171,33 @@ fn apply_edited_settings(
     edited: settings::Settings,
     accounts: Option<&mut accounts::AccountsState>,
 ) {
+    // **Only when the user actually MOVED that control in this Preferences
+    // session**, and this condition is the fix for a sign-in choice being
+    // undone by a window closing.
+    //
+    // The line below writes `Settings::use_official_bw_crypto` -- one global
+    // value -- onto the ACTIVE ACCOUNT, which has its own. It used to run on
+    // every settings round trip, whether or not the toggle had been touched.
+    // A ui process is handed the settings as they are, so a window that
+    // changed something else entirely (or nothing) still carried the global
+    // back, and the daemon then stamped it over the account.
+    //
+    // Watched: a self-hosted sign-in that chose the built-in client settled
+    // on DirectRest and was recorded correctly ("after the ui process's
+    // sign-in ... served by DirectRest"), and `settings.json` afterwards held
+    // `use_official_bw_crypto: true` for that account. The next launch read
+    // the record, chose `bw serve`, and the window sat probing
+    // `localhost:8087` until the deadline: "Your vault could not be loaded".
+    //
+    // Comparing against the settings the child was GIVEN is what distinguishes
+    // "the user chose this" from "the child handed back what it was given".
+    // The global stays the default for accounts that have never been asked --
+    // `accounts::official_cli_after_sign_in` is where that is decided, and it
+    // is not this function's business to re-decide it.
     if let Some(accounts) = accounts {
-        if accounts.set_active_backend_preference(edited.use_official_bw_crypto) {
+        if edited.use_official_bw_crypto != settings.use_official_bw_crypto
+            && accounts.set_active_backend_preference(edited.use_official_bw_crypto)
+        {
             if let Err(e) =
                 settings::Settings::persist_accounts(settings_path, accounts.all(), Some(&accounts.active().id))
             {
@@ -37322,6 +37347,82 @@ mod the_one_settings_write_back {
     /// encrypted copy, which is asserted against a real file planted at the
     /// path the cache addresses -- a populate would have put one there, and
     /// `disable_disk_persistence` has to remove whatever is there.
+    /// **THE REPORT: "Your vault could not be loaded ... connection timed out"
+    /// against `localhost:8087`, on an account that had signed in on the
+    /// built-in client.**
+    ///
+    /// The sign-in was right and was recorded right -- the log said "after the
+    /// ui process's sign-in ... served by DirectRest". `settings.json`
+    /// afterwards held `use_official_bw_crypto: true` for that account, so the
+    /// NEXT launch chose `bw serve` and sat probing a port nothing was
+    /// listening on.
+    ///
+    /// What rewrote it was this function. `Settings::use_official_bw_crypto`
+    /// is one global value; an account has its own. The write-back stamped the
+    /// global onto the active account on EVERY settings round trip, and a ui
+    /// process is handed the settings as they are -- so a window that changed
+    /// something else, or nothing at all, still carried the global home and
+    /// undid the choice the sign-in had just made.
+    ///
+    /// Both halves are asserted, because the fix is a condition and a
+    /// condition can be wrong in two directions: an untouched toggle must not
+    /// write, and a touched one must.
+    #[test]
+    fn a_window_that_did_not_touch_the_backend_toggle_does_not_rewrite_the_account() {
+        let dir = scratch("backend-toggle-write-back");
+        let settings_path = dir.join("settings.json");
+        let cache = cache_over(&dir);
+
+        // An account that signed in on the built-in client, against a global
+        // still sitting at its default of "the official CLI" -- which is
+        // exactly the state a self-hosted sign-in leaves behind.
+        let account = accounts::Account {
+            id: accounts::AccountId::generate(),
+            email: "someone@example.com".to_string(),
+            server_url: Some("https://vault.example.com".to_string()),
+            use_official_bw_crypto: false,
+        };
+        let id = account.id.clone();
+        let mut state = accounts::AccountsState::new(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![account],
+            id.clone(),
+        )
+        .expect("the fixture names an account that is in the list");
+        let mut settings =
+            settings::Settings { use_official_bw_crypto: true, ..settings::Settings::default() };
+
+        // A window that edited something else and handed the rest back
+        // unchanged, which is what every ui process does.
+        let unrelated = settings::Settings { clear_clipboard: !settings.clear_clipboard, ..settings.clone() };
+        apply_edited_settings(&cache, &mut settings, &settings_path, unrelated, Some(&mut state));
+        assert!(
+            !state.active().use_official_bw_crypto,
+            "a window that never touched the backend toggle rewrote the account with the              global, undoing the client the sign-in chose"
+        );
+
+        // And the other direction: a window that DID move it still writes.
+        let toggled =
+            settings::Settings { use_official_bw_crypto: false, ..settings.clone() };
+        let mut settings = settings::Settings { use_official_bw_crypto: true, ..settings.clone() };
+        let mut state = accounts::AccountsState::new(
+            deskwarden::bw_path::MultiAccountAvailability::Available,
+            vec![accounts::Account {
+                id: id.clone(),
+                email: "someone@example.com".to_string(),
+                server_url: Some("https://vault.example.com".to_string()),
+                use_official_bw_crypto: true,
+            }],
+            id,
+        )
+        .expect("the fixture names an account that is in the list");
+        apply_edited_settings(&cache, &mut settings, &settings_path, toggled, Some(&mut state));
+        assert!(
+            !state.active().use_official_bw_crypto,
+            "the user moved the toggle in Preferences and the account did not follow, which              is the control that stops the fix above from being 'never write at all'"
+        );
+    }
+
     #[test]
     fn applying_an_edit_turns_the_disk_cache_on_and_off_for_real() {
         let dir = scratch("on-and-off");
