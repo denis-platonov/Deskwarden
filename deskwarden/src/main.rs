@@ -11929,6 +11929,24 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // The same seam and the same function pointer the daemon installs, so two
     // processes cannot re-settle the same account differently.
     backend_policy::install_resettle(REAL_BACKEND_REPOINT);
+    // **And the settlement that seam READS, without which installing it does
+    // nothing at all.**
+    //
+    // `resettle_vault_backend_for` opens with `let Some(settlement) =
+    // SETTLEMENT.get() else { return; }`. `fn main` publishes one; a ui
+    // process never did, so the seam installed above would have been called
+    // on every sign-in and returned on its first line. That is the difference
+    // between a seam that is missing and a seam that is present and inert,
+    // and from the outside they look identical -- which is exactly how the
+    // previous attempt at this looked fixed and changed nothing.
+    //
+    // The config directory and the backend slot this process actually serves
+    // from, so a re-settle here re-points THIS window's vault rather than
+    // describing the daemon's.
+    publish_backend_settlement(BackendSettlement {
+        config_dir: config_dir.clone(),
+        slot: std::sync::Arc::clone(&vault_slot),
+    });
     // **The About page's update flow, installed HERE as well as in the
     // daemon.**
     //
@@ -35518,6 +35536,10 @@ mod vault_backend_choice_tests {
             (
                 concat!("install", "_resettle("),
                 "how the backend CHANGES when a sign-in learns a server or a client choice --                  without it the choice modal's answer is dropped and the sign-in runs on                  whatever startup settled",
+            ),
+            (
+                concat!("publish_backend_", "settlement("),
+                "the settlement that re-settle READS -- `resettle_vault_backend_for` returns                  on its first line without one, so the seam above is present and inert,                  which from outside is indistinguishable from fixed",
             ),
         ] {
             assert!(
