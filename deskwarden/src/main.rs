@@ -2628,10 +2628,8 @@ fn main() {
         estate = open_vault_window(
             estate,
             VaultDeps {
-                fill_stats: &fill_stats,
                 job: &job,
                 schedule: &schedule,
-                icon_cache_dir: &icon_cache_dir,
                 config_dir: &config_dir,
                 settings_path: &settings_path,
                 first_run_account: first_run_account.as_ref(),
@@ -2775,11 +2773,9 @@ fn main() {
             estate = open_vault_window(
                 estate,
                 VaultDeps {
-                    fill_stats: &fill_stats,
-                    job: &job,
+                        job: &job,
                     schedule: &schedule,
-                    icon_cache_dir: &icon_cache_dir,
-                    config_dir: &config_dir,
+                        config_dir: &config_dir,
                     settings_path: &settings_path,
                     first_run_account: first_run_account.as_ref(),
                     backend_op_tx: &backend_op_tx,
@@ -2817,11 +2813,9 @@ fn main() {
             estate = open_vault_window(
                 estate,
                 VaultDeps {
-                    fill_stats: &fill_stats,
-                    job: &job,
+                        job: &job,
                     schedule: &schedule,
-                    icon_cache_dir: &icon_cache_dir,
-                    config_dir: &config_dir,
+                        config_dir: &config_dir,
                     settings_path: &settings_path,
                     first_run_account: first_run_account.as_ref(),
                     backend_op_tx: &backend_op_tx,
@@ -2932,11 +2926,9 @@ fn main() {
                 estate = open_vault_window(
                     estate,
                     VaultDeps {
-                        fill_stats: &fill_stats,
-                        job: &job,
+                                job: &job,
                         schedule: &schedule,
-                        icon_cache_dir: &icon_cache_dir,
-                        config_dir: &config_dir,
+                                config_dir: &config_dir,
                         settings_path: &settings_path,
                         first_run_account: first_run_account.as_ref(),
                         backend_op_tx: &backend_op_tx,
@@ -3468,11 +3460,9 @@ fn main() {
             estate = open_vault_window(
                 estate,
                 VaultDeps {
-                    fill_stats: &fill_stats,
-                    job: &job,
+                        job: &job,
                     schedule: &schedule,
-                    icon_cache_dir: &icon_cache_dir,
-                    config_dir: &config_dir,
+                        config_dir: &config_dir,
                     settings_path: &settings_path,
                     first_run_account: first_run_account.as_ref(),
                     backend_op_tx: &backend_op_tx,
@@ -6135,15 +6125,13 @@ fn work_on_the_parked_estate(
 /// The immutable half of what a vault session runs against: borrowed, never
 /// mutated, never in the estate.
 ///
-/// Eight parameters that only ever get read and handed on. They are grouped
+/// Six parameters that only ever get read and handed on. They are grouped
 /// for the reader rather than for the borrow checker -- but the grouping is
 /// the line between the two halves, and a field that starts being written is
 /// a field that has moved to the wrong struct.
 struct VaultDeps<'a> {
-    fill_stats: &'a deskwarden::fill_stats::FillStats,
     job: &'a Arc<Option<job_object::KillOnCloseJob>>,
     schedule: &'a [Duration],
-    icon_cache_dir: &'a std::path::Path,
     config_dir: &'a std::path::Path,
     settings_path: &'a std::path::Path,
     first_run_account: Option<&'a accounts::AccountId>,
@@ -7380,12 +7368,27 @@ fn the_startup_sign_in_belongs_to_a_ui_process(
 ) -> bool {
     match backend_choice {
         backend_policy::VaultBackendChoice::DirectRest => {
+            // A stored key means no sign-in is owed at all, so there is no
+            // card to place and nothing for this to answer.
             if a_key_is_already_stored {
                 return false;
             }
-            account.is_some_and(|account| {
-                account.server_url.as_deref().is_some_and(|url| !url.trim().is_empty())
-            })
+            // **The server URL does not decide this either, and that is the
+            // last exception to go.** It used to: an account with no recorded
+            // address sent the card back into the daemon, on the reasoning
+            // that a direct-REST sign-in has nowhere to sign in TO. The card
+            // has a Server URL field -- it is the first thing on it -- so a
+            // missing address is what that field is for, not a reason to
+            // draw here.
+            //
+            // With this, no sign-in reaches the daemon by any route, which is
+            // the owner's rule with nothing left over: "any launch launches
+            // tray first ALWAYS, UI CANNOT work without it because it needs
+            // REST". The tray IS the REST backend on the built-in client, and
+            // a tray that draws once holds the graphics driver until it
+            // exits.
+            let _ = account;
+            true
         }
         // **No account-record condition on this arm**, and that is the
         // difference between the two rather than a gap in this one. The
@@ -7416,51 +7419,6 @@ fn the_startup_sign_in_belongs_to_a_ui_process(
     }
 }
 
-/// **Whether spawning a UI process for this account would produce a window.**
-///
-/// Asked by the daemon *before* the spawn, and answered off the same facts the
-/// child would read a moment later: `backend_policy::choose` over the account,
-/// and -- on the direct-REST arm only -- whether a server URL exists.
-/// `deskwarden::ui_process::direct_rest_start_failure` is the shared decision,
-/// so the two processes cannot come to different answers.
-///
-/// # It no longer reads `userkey.bin`, and that is this branch
-///
-/// It used to, and a missing key was a refusal: the daemon kept the window in
-/// its own process because the child could not ask for a master password. On
-/// a direct-REST account the child can now, so a missing key is the opening
-/// frame of that window rather than a reason to host it here -- and hosting it
-/// here was what left the daemon holding the OpenGL driver for the life of the
-/// process.
-///
-/// **The parameter therefore has no reader left, and is kept anyway.** Every
-/// caller has a `config_dir` in hand, the `bw serve` half of this decision is
-/// expected to grow one back when that sign-in moves too, and a signature
-/// churned twice is a worse diff than an underscore. It is named `_config_dir`
-/// so that the absence is something a reader trips over rather than infers.
-///
-/// `None` on the `bw serve` arm and on no-account-at-all, which is what
-/// `choose` answers for an account with no server: those windows open, and
-/// have always opened, without a stored key.
-///
-/// This is deliberately a **read**, not a probe: it does not talk to the
-/// server and it does not decrypt anything. Whether the key still works is
-/// `settle_the_vault_backend`'s probe, and it belongs to the daemon.
-fn why_a_ui_process_could_not_read_this_vault(
-    _config_dir: &Path,
-    account: Option<&Account>,
-) -> Option<deskwarden::ui_process::UiStartFailure> {
-    match backend_policy::choose(
-        account.and_then(|a| a.server_url.as_deref()),
-        account.is_none_or(|a| a.use_official_bw_crypto),
-    ) {
-        backend_policy::VaultBackendChoice::BwServe => None,
-        backend_policy::VaultBackendChoice::DirectRest => {
-            let account = account?;
-            deskwarden::ui_process::direct_rest_start_failure(account.server_url.is_some())
-        }
-    }
-}
 
 /// **Whether this account's stored session is spoken for by its master key
 /// rather than by `bw status`.**
@@ -7528,7 +7486,7 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 =
 impl VaultOps for RealVaultOps<'_> {
     fn open_window(
         &mut self,
-        mut est: SessionEstate,
+        est: SessionEstate,
         deps: &VaultDeps<'_>,
     ) -> (SessionEstate, Option<VaultWindowSession>) {
         // **The window runs over there, not here, and this call does not wait
@@ -7570,23 +7528,29 @@ impl VaultOps for RealVaultOps<'_> {
         // the stored key does not exist until a direct-REST sign-in has
         // happened, so a Preferences refusal would make the setting
         // unreachable forever.
-        let child_cannot_read_the_vault = why_a_ui_process_could_not_read_this_vault(
-            deps.config_dir,
-            est.active_account.as_ref(),
-        );
-        if let Some(failure) = child_cannot_read_the_vault {
-            log::warn!(
-                "not spawning a ui process for the vault window: {}. Opening it inside the \
-                 daemon instead, which is the only host that can sign in",
-                failure.log_line()
-            );
-        }
-        // **Taken once, here, so that the two hosts below cannot both claim
-        // it.** The spawn arm hands it to the child and the in-daemon arm
-        // seeds its own frame with it; a `take` at each site would give the
-        // second one an empty box on the route the first did not run.
+        // **The gate that used to keep this window in the daemon is gone.**
+        //
+        // It asked `why_a_ui_process_could_not_read_this_vault` and, on a
+        // `Some`, drew the window HERE -- "the only host that can sign in".
+        // That sentence stopped being true when the sign-in card moved into
+        // the `--ui` child: a child with no stored key asks for the master
+        // password and derives one, which is exactly what a first install
+        // does on every launch now.
+        //
+        // The owner's rule leaves no room for the exception either: "any
+        // launch launches tray first ALWAYS, UI CANNOT work without it
+        // because it needs REST". The tray IS the backend on the built-in
+        // client -- it holds the vault and answers CTRL+ALT+B without a
+        // window at all -- so a tray that draws is a tray that has spent the
+        // OpenGL driver for the life of the process, and it never gets it
+        // back.
+        //
+        // What follows is the spawn, unconditionally, and a failure to spawn
+        // is reported rather than drawn around. That was already true of the
+        // spawn's own failure path below; this makes it true of every route
+        // into this function.
         let initial_search = self.initial_search.take();
-        if child_cannot_read_the_vault.is_none() {
+        {
             // **The search term no longer keeps this window in the daemon.**
             // It used to: the only way to hand a value to a child was the
             // command line, which every process on the machine can read. It
@@ -7609,13 +7573,13 @@ impl VaultOps for RealVaultOps<'_> {
                 // is owed an answer, so it gets words and not only a log
                 // line.
                 log::error!(
-                    "no UI process could be started for the vault window; the daemon is                      staying out of the graphics driver and telling the user instead"
+                    "no UI process could be started for the vault window; the daemon is \
+                     staying out of the graphics driver and telling the user instead"
                 );
                 message_box(
                     "Deskwarden",
-                    "Could not open the vault window.
-
-Deskwarden could not start the                      process that draws it. Please try Open Vault again.",
+                    "Could not open the vault window.\n\nDeskwarden could not start the \
+                     process that draws it. Please try Open Vault again.",
                     MB_ICONERROR,
                 );
             }
@@ -7627,277 +7591,6 @@ Deskwarden could not start the                      process that draws it. Pleas
             // the daemon's loop carry on either way.
             return (est, None);
         }
-        // Opening this window is the app's slowest visible action and the one a
-        // user times with their own patience, so each stage of it says how long
-        // it took. Without this the only honest answer to "why did that take ten
-        // seconds" is a guess: the stages have very different costs (a `bw`
-        // spawn is seconds, a backend start is seconds, and eframe's own window
-        // and GPU setup is not free either), and which one dominates depends on
-        // what the backend was doing beforehand.
-        let opened_at = Instant::now();
-        // **Nothing is fetched and nothing is waited for.** This was a `bw
-        // status` spawn on a cache miss -- 2.39s measured on the user's
-        // machine -- run BEFORE eframe was asked for a window, so a tray click
-        // that missed the prefetch produced nothing on screen at all for that
-        // long. Then it was a spawn running BESIDE the window, which opened
-        // with an unnamed toolbar for those two seconds instead. It is now
-        // three fields read off the `Account` this process is on, so the first
-        // frame has them and there is no miss to have a path for.
-        //
-        // `est.details` is still taken -- it is what a resettle CLEARS to say
-        // "the identity you had is not the one you have" -- but it is a
-        // preference, not a cache that saves a spawn: an empty one costs
-        // nothing to refill now.
-        let details = est
-            .details
-            .take()
-            .unwrap_or_else(|| login_ui::account_details_for(est.active_account.as_ref()));
-        prefs_ui::publish_account_status(prefs_ui::account_status_of(&details));
-
-        // Read once, before the `if` below might short-circuit past it, and
-        // reused for the vault frame's own `backend_already_running`
-        // (review Minor 3): whether `bw serve` was already up at this exact
-        // moment -- before this function might kick off a start of its own --
-        // is also exactly the fact `spawn_vault_load` needs to know it can skip
-        // its readiness wait. Nothing between here and the window returning
-        // stops or restarts the backend out from under this snapshot from
-        // another thread; the in-place lock below does stop and restart it,
-        // and that is exactly why the vault frame it rebuilds below is built
-        // with a fresh answer rather than with this one.
-        let backend_already_running = backend_is_running(&mut est.child);
-        // **The same fact, asked the way the vault frame needs it.**
-        // `backend_already_running` above is the right input to
-        // `needs_backend_start` and the wrong one to hand the window on its
-        // own: on a direct-REST account there is no child and never will be,
-        // so it is `false` forever and the window pays a whole-vault sync to
-        // probe a backend that does not exist. Same decision the UI process
-        // makes, through the same function -- this host is the daemon's
-        // in-process fallback and must not answer it differently.
-        let skip_readiness_wait = backend_policy::may_skip_the_readiness_probe(
-            backend_policy::bw_serve_is_selected(),
-            backend_already_running,
-        );
-
-        // Reads don't need `bw serve` at all (the vault frame paints
-        // entirely from `cache`); writes and TOTP do. If save-memory mode tore
-        // the backend down after the last close (or it crashed -- review Minor
-        // 8: `backend_is_running` catches a `Some(dead child)` that a plain
-        // `.is_none()` check would miss), kick a start off in the background and
-        // move straight on to opening the window rather than waiting for it --
-        // see this function's doc for why waiting here used to be a real freeze.
-        if needs_backend_start(&est.task_in_progress, backend_already_running) {
-            est.task_in_progress = Some((Instant::now(), BackendOpKind::EnsureRunning));
-            spawn_backend_start(est.token.clone(), deps.job.clone(), deps.backend_op_tx.clone());
-        }
-
-        // The last thing before the window exists. Everything after this is
-        // eframe's own startup -- creating the OS window, picking a graphics
-        // backend, building the font atlas -- which this app does not control
-        // and which is invisible to any timing inside the frame closure, since
-        // the first closure call happens after all of it.
-        //
-        // The account details are not timed, because there is nothing left to
-        // time: they were read off the `Account` a few lines up. What is worth
-        // logging is whether they NAME anybody, which is the one thing that
-        // can still be missing -- an account that has never signed in.
-        log::info!(
-            "vault window: handing off to eframe after {:?} (backend was {}, the account is \
-             {})",
-            opened_at.elapsed(),
-            if backend_already_running { "already up" } else { "being started" },
-            if details.user_email.is_some() { "named" } else { "not named yet" }
-        );
-        // **The vault FRAME, not `vault_window::run`.** `run` owns an event
-        // loop, and an event loop is exactly what this window must not give up
-        // when the user locks: the whole feature is that the vault, the
-        // spinner and the sign-in card are one window. So the frame is built
-        // here and `app_window::run_from_vault` owns the loop around it.
-        let (options, vault_frame, handles) = vault_window::build_frame_with_search(
-            est.cache.clone(),
-            deps.fill_stats.clone(),
-            details,
-            est.token.clone(),
-            deps.icon_cache_dir.to_path_buf(),
-            // Read fresh on every pass, so a timeout changed in the preferences
-            // window below governs the window this loop is about to reopen.
-            est.settings.auto_lock(),
-            skip_readiness_wait,
-            // Cloned per pass, not once outside the loop: a switch below replaces
-            // the state, and the window reopened after it has to offer the account
-            // the user just left rather than the one they are now on.
-            est.accounts.clone(),
-            // This host owns its window, so its first frame installs the
-            // fonts, rounds the corners and raises it.
-            false,
-            vault_window::VaultFrameEnv::production(),
-            // **Taken, so only the first window of this session gets it.** See
-            // `RealVaultOps::initial_search`: every later pass of
-            // `run_vault_loop` reopens the window with an empty box, which is
-            // what any other route into this window has always given.
-            initial_search.unwrap_or_default(),
-            // **This host is the DAEMON's in-process fallback**, reached only
-            // when a UI process could not be spawned. It must never hide: a
-            // hidden window here would keep the daemon's own event loop
-            // standing in for a window nobody can see, and the OpenGL driver
-            // is already mapped into this process for the rest of its life.
-            None,
-        );
-
-        // **Everything the off-thread closures need, taken BEFORE the estate
-        // moves into the park.** A worker is `'static` and cannot borrow this
-        // frame. The estate itself is not copied anywhere -- it is parked, and
-        // the worker reaches it through the park.
-        let job_for_worker = deps.job.clone();
-        let drain_for_worker = Arc::clone(self.backend_op_rx);
-        let schedule_for_worker = deps.schedule.to_vec();
-        // Built through `login_context` -- the one place a `LoginContext` is
-        // built -- and then copied out as owned values, because the card is
-        // raised inside a `'static` closure long after these borrows are gone.
-        let login =
-            login_context(deps.config_dir, est.active_account.as_ref(), deps.first_run_account);
-        let sign_in_account: Option<(std::path::PathBuf, Account)> = login
-            .account
-            .map(|(config_dir, account)| (config_dir.to_path_buf(), account.clone()));
-        let sign_in_first_run = login.first_run;
-        let fill_stats_for_rebuild = deps.fill_stats.clone();
-        let icon_cache_dir_for_rebuild = deps.icon_cache_dir.to_path_buf();
-
-        // Where the lock hands the worker its two channel ends. **The worker
-        // is spawned by `park_and_work` before the window opens and blocks
-        // here**, because the estate has to be parked for the whole session: a
-        // park set up at the moment of the lock would need the estate at that
-        // moment, and at that moment it is inside eframe's frame closure. A
-        // window that never locks drops this sender when its closure is
-        // dropped, and the worker leaves without touching anything.
-        let (lock_tx, lock_rx) = mpsc::channel::<LockChannels>();
-        // What the worker publishes for the rebuild, which runs on the frame
-        // thread and must not touch the park. `None` until the teardown ends.
-        let rebuilt: Arc<Mutex<Option<RebuiltVault>>> = Arc::new(Mutex::new(None));
-        let rebuilt_for_worker = Arc::clone(&rebuilt);
-        // **This host really does leave them to the idle loop**, and that
-        // is sound HERE and only here: `main`'s tray already exists and its
-        // idle pass reconciles the Sync label as soon as this window is
-        // gone. The startup host has neither, which is why the sink exists
-        // at all -- see `run_the_in_window_teardown`.
-        let tray_effects: Arc<Mutex<Vec<TrayEffect>>> = Arc::new(Mutex::new(Vec::new()));
-        let tray_effects_for_worker = Arc::clone(&tray_effects);
-
-        // Read back after the wait returns: `wait` is `FnOnce` and hands back
-        // only an `EstateOutcome`.
-        let mut session: Option<app_window::VaultSessionOutcome> = None;
-
-        let (est, outcome) = park_and_work(
-            est,
-            // ---- THE WORKER. Off the frame thread for the reason
-            // `app_window::run`'s `prepare` is: stopping and restarting
-            // `bw serve` is seconds at best, and run on the frame thread it
-            // would freeze the window on the very frame that is supposed to
-            // start showing the spinner.
-            move |park| {
-                run_the_in_window_teardown(
-                    park,
-                    &lock_rx,
-                    &job_for_worker,
-                    &drain_for_worker,
-                    &schedule_for_worker,
-                    &rebuilt_for_worker,
-                    &tray_effects_for_worker,
-                )
-            },
-            // ---- THE WAIT, AND ITS BODY IS THE EVENT LOOP. A blocking wait
-            // here runs on THIS thread, which is the one eframe needs in order
-            // to paint the spinner for the whole teardown -- so a
-            // `recv_timeout` here would be a frozen window, which is strictly
-            // worse than the blink this feature exists to remove.
-            // `_park`: this host parks an estate that is ALREADY complete --
-            // the child, the token and the engine were all settled before the
-            // window opened -- so it has nothing to arm. The startup host,
-            // whose token and child do not exist until its own window has run,
-            // is the caller the park parameter is for.
-            |_park, done_rx| {
-                let ended = app_window::run_from_vault(
-                    (options, vault_frame, handles),
-                    SETUP_AFTER_SIGN_IN_MESSAGE,
-                    // The lock's only job on the frame thread: hand the worker
-                    // the two channel ends and get out of the way. `clone`,
-                    // because this forwarding closure's own sender is dropped
-                    // as its thread ends -- leaving the worker holding the only
-                    // live one, which is what lets the working stage hear a
-                    // dead worker as `Disconnected`.
-                    move |step_tx, token_rx| forward_lock_channels(&lock_tx, step_tx, token_rx),
-                    // The sign-in card, in the window that is already open.
-                    // `close_on_success: false`: the card reports its token
-                    // and the window stays, because the spinner is the next
-                    // thing it has to show.
-                    move || {
-                        let (_options, frame, handles) = login_ui::build_login_frame(
-                            sign_in_account
-                                .as_ref()
-                                .map(|(config_dir, account)| (config_dir.as_path(), account)),
-                            sign_in_first_run,
-                            true,
-                            false,
-                            // No second-factor stage on this host; see `build_login_frame`.
-                            None,
-                        );
-                        (frame, handles)
-                    },
-                    // The vault, rebuilt in place. Reads only what the worker
-                    // published; it must not reach the park, which the worker
-                    // may still be holding.
-                    move |edited_before_lock| {
-                        rebuild_the_vault_after_the_lock(
-                            &rebuilt,
-                            fill_stats_for_rebuild,
-                            icon_cache_dir_for_rebuild,
-                            edited_before_lock,
-                        )
-                    },
-                );
-                session = Some(ended);
-                // How the parked work ended, read off the completion signal
-                // the worker sends last. `Empty` means the window is gone and
-                // the worker is not -- the reclaim below is what then takes
-                // the estate away from it.
-                match done_rx.try_recv() {
-                    Ok(()) => EstateOutcome::Completed,
-                    Err(mpsc::TryRecvError::Disconnected) => EstateOutcome::WorkerPanicked,
-                    Err(mpsc::TryRecvError::Empty) => EstateOutcome::DeadlineExpired,
-                }
-            },
-        );
-
-        let ended = session.expect(
-            "`run_from_vault` returned without leaving its outcome behind, which is impossible: \
-             the wait writes it on the one line below the call",
-        );
-        log::info!(
-            "vault window: the session ended after {:?}; the parked estate came back {outcome:?} \
-             and the session is {}",
-            opened_at.elapsed(),
-            if ended.relocked { "torn down by this window's own lock" } else { "as it was" }
-        );
-        let result = ended.result.unwrap_or_else(|| {
-            // Unreachable in this host: the lock arm reads the outcome cells
-            // at the moment of the lock and an ordinary close reads them at
-            // the end, so some frame always leaves one. Said out loud rather
-            // than unwrapped, because "the window produced nothing" must not
-            // silently become "ask for the master password again".
-            log::error!("the vault window ended with no outcome cells at all");
-            vault_window::VaultWindowResult {
-                locked: false,
-                needs_reauth: false,
-                edited_settings: None,
-                switch_to: None,
-                add_account: false,
-                remove_account: false,
-                account_details: None,
-            }
-        });
-        // The estate goes home on the one path out of this method. Nothing
-        // above may `return` without it, which is what stops a future arm
-        // from being the one that keeps `main`'s session state.
-        (est, Some(VaultWindowSession { result, relocked: ended.relocked }))
     }
 
     fn resettle_after_lost_session(
@@ -10864,17 +10557,6 @@ fn sync_outcome_from(
 /// nothing, and the recovery's retry happens inside the recovery window -- so
 /// there is nothing left for either message to distinguish.
 const SETUP_MESSAGE: &str = "Setting up your vault...";
-
-/// What the IN-WINDOW working stage says after a lock's fresh sign-in
-/// (`app_window::run_from_vault`).
-///
-/// It survives because that stage is not a window of its own: it is the vault
-/// window the user is already looking at, showing a spinner where the item
-/// list was. From its point of view the user has just typed their master
-/// password and a backend is coming up under a new session, which is what it
-/// says. The two messages deleted beside it were captions on separate
-/// windows -- see [`SETUP_MESSAGE`].
-const SETUP_AFTER_SIGN_IN_MESSAGE: &str = "Signed in -- starting your vault...";
 
 /// Outcome of [`wait_for_the_vault`].
 ///
@@ -19412,6 +19094,553 @@ mod tests {
         }
     }
 
+    mod the_parked_estate_comes_home {
+        use super::*;
+
+        /// What the worker writes into the token. Deliberately not the value
+        /// the fixture starts with; see [`nothing_of_the_works_is_there_yet`].
+        const AFTER: &str = "the-token-the-worker-wrote";
+
+        /// The process the worker arms the engine for.
+        const ARMED: &str = "notepad.exe";
+
+        /// A scratch directory for the estate's session store. Never read or
+        /// written by these tests: `SessionStore` is a path until something
+        /// asks it to load or save, and nothing here does.
+        ///
+        /// **Removed when the returned guard drops**, panic included -- which
+        /// matters more here than in most places: three of the tests below
+        /// drive a worker that is *supposed* to panic, and the removal this
+        /// helper used to leave to the end of a test body never ran for them.
+        fn scratch(tag: &str) -> deskwarden::test_scratch::ScratchDir {
+            deskwarden::test_scratch::ScratchDir::new(&format!("parked-estate-{tag}"))
+        }
+
+        /// An estate holding none of what the worker will write.
+        ///
+        /// The bridge points at port 1, which nothing listens on, so a stray
+        /// request would fail rather than reach a real `bw serve`. Nothing
+        /// here makes one.
+        fn fresh_estate(dir: &std::path::Path) -> SessionEstate {
+            SessionEstate {
+                cache: Arc::new(VaultCache::new(VaultBridge::new(
+                    "http://127.0.0.1:1".to_string(),
+                ))),
+                engine: MatchEngine::new(),
+                child: None,
+                token: "the-token-the-session-started-with".to_string(),
+                details: None,
+                task_in_progress: None,
+                store: session_store::SessionStore::new(dir.join("session.bin")),
+                active_account: None,
+                accounts: None,
+                settings: deskwarden::settings::Settings::default(),
+            }
+        }
+
+        /// What the worker does to the estate: three fields, of three
+        /// different shapes, so a read-back that carries a `String` but not a
+        /// `MatchEngine` cannot pass.
+        fn the_work(est: &mut SessionEstate) {
+            est.token = AFTER.to_string();
+            est.engine.rebuild(&[(
+                "item-7".to_string(),
+                deskwarden::app_match::AppMatch::for_process(
+                    ARMED,
+                    deskwarden::app_match::TriggerMode::Auto,
+                ),
+            )]);
+            est.task_in_progress = Some((Instant::now(), BackendOpKind::Sync));
+        }
+
+        /// The premise: none of the three is already true. Without this, a
+        /// read-back that returned a DEFAULT estate could satisfy the
+        /// assertions below by accident.
+        fn nothing_of_the_works_is_there_yet(est: &SessionEstate) {
+            assert_ne!(est.token, AFTER, "control: the fixture already holds the worker's token");
+            assert!(
+                est.engine
+                    .lookup(&foreground(ARMED))
+                    .is_none(),
+                "control: the fixture's engine is already armed for {ARMED}, so an engine that \
+                 never reached the worker would pass the check below"
+            );
+            assert!(
+                est.task_in_progress.is_none(),
+                "control: the fixture already has a task in progress"
+            );
+        }
+
+        /// The consequence: all three of the worker's writes came home.
+        fn the_worker_reached_the_estate(est: &SessionEstate, path: &str) {
+            assert_eq!(
+                est.token, AFTER,
+                "on {path} the session token the worker wrote did not come back. What `main` \
+                 would be holding is the stale token the lock invalidated"
+            );
+            assert!(
+                est.engine.lookup(&foreground(ARMED)).is_some(),
+                "on {path} the match engine came back unarmed. That is the recorded obstacle-5 \
+                 failure exactly: autofill silently dead for the rest of the process, with no \
+                 stand-down message and nothing in the log tying it to the lock"
+            );
+            assert!(
+                est.task_in_progress.is_some(),
+                "on {path} the in-progress backend task did not come back, so the tray would \
+                 never stop saying it was working"
+            );
+        }
+
+        /// Path 1 of 3: the worker finished.
+        #[test]
+        fn the_happy_path_reads_the_estate_back() {
+            let dir = scratch("happy");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (back, outcome) =
+                work_on_the_parked_estate(est, Duration::from_secs(30), |park| {
+                    assert!(
+                        park.with(the_work).is_some(),
+                        "the worker must own the estate while it is running"
+                    );
+                });
+
+            assert_eq!(
+                outcome,
+                EstateOutcome::Completed,
+                "a worker that ran to the end inside its deadline completed"
+            );
+            the_worker_reached_the_estate(&back, "the happy path");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Path 2 of 3: the deadline expired with the worker still running.
+        ///
+        /// **This is obstacle 5's own path**, and the test is built so that
+        /// abandoning the worker cannot be confused with waiting for it: the
+        /// worker blocks on a channel the test can only send on AFTER the
+        /// call has returned, so the call demonstrably did not join it.
+        ///
+        /// It also proves the second half of the mechanism -- that the
+        /// abandoned worker is locked OUT. Once released it tries one more
+        /// write and reports whether the slot was still there; it must not
+        /// be, or a worker that wakes up ten seconds later would be writing
+        /// into state the main thread owns again.
+        #[test]
+        fn the_deadline_reads_the_estate_back_and_shuts_the_worker_out() {
+            let dir = scratch("deadline");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let (late_tx, late_rx) = mpsc::channel::<bool>();
+
+            let began = Instant::now();
+            let (back, outcome) =
+                work_on_the_parked_estate(est, Duration::from_millis(750), move |park| {
+                    assert!(park.with(the_work).is_some(), "the worker starts as the owner");
+                    // Held until the test says so -- so the deadline is the
+                    // only thing that can end the wait.
+                    release_rx.recv().expect("the test must release this worker");
+                    let late = park
+                        .with(|est| est.token = "written after the deadline".to_string())
+                        .is_some();
+                    let _ = late_tx.send(late);
+                });
+
+            assert_eq!(
+                outcome,
+                EstateOutcome::DeadlineExpired,
+                "the worker was still blocked when the deadline passed, so the wait ended on \
+                 the deadline and on nothing else"
+            );
+            assert!(
+                began.elapsed() >= Duration::from_millis(700),
+                "control: the call returned in {:?}, faster than the deadline it was given, so \
+                 it did not end on the deadline and this test is about some other path",
+                began.elapsed()
+            );
+            the_worker_reached_the_estate(&back, "the deadline path");
+
+            release_tx.send(()).expect("the worker is still alive to be released");
+            let late = late_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the released worker must answer");
+            assert!(
+                !late,
+                "the abandoned worker could still reach the estate after the deadline read it \
+                 back. Two owners of one session state is the split the estate exists to \
+                 remove, and this one would land its writes on a value the main thread has \
+                 already moved on with"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// Path 3 of 3: the worker panicked, holding the lock.
+        ///
+        /// The panic is raised INSIDE `with`, i.e. while the mutex guard is
+        /// held, so the lock is left poisoned. That is the point: a `reclaim`
+        /// that unwrapped the poison would turn a dead worker into an
+        /// unreachable session -- obstacle 5 by a second route -- so it
+        /// recovers with `PoisonError::into_inner` instead, and this test is
+        /// what says so.
+        ///
+        /// The panic message is printed by the default hook. That is noise in
+        /// the test output, not a failure; the hook is left alone because it
+        /// is process-wide and these tests run beside others.
+        #[test]
+        fn a_panicking_worker_does_not_poison_the_estate_out_of_reach() {
+            let dir = scratch("panic");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (back, outcome) =
+                work_on_the_parked_estate(est, Duration::from_secs(30), |park| {
+                    let _: Option<()> = park.with(|est| {
+                        the_work(est);
+                        panic!("a deliberate panic, raised while the estate's lock is held");
+                    });
+                });
+
+            assert_eq!(
+                outcome,
+                EstateOutcome::WorkerPanicked,
+                "the worker unwound without signalling, and that must be reported as a panic \
+                 rather than as the completion it is not: the caller's next decision -- whether \
+                 the session is settled -- turns on the difference"
+            );
+            the_worker_reached_the_estate(&back, "the panic path");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **The in-window lock's own shape: a wait that is not a
+        /// `recv_timeout`.**
+        ///
+        /// The three tests above all reach [`park_and_work`] through
+        /// `work_on_the_parked_estate`, whose wait blocks this thread. That
+        /// is exactly the wait the in-window lock may NOT use -- the calling
+        /// thread there is the one inside `eframe`'s event loop, and blocking
+        /// it is a frozen window. So the host passes a wait of its own, and
+        /// this test drives that arrangement rather than the deadline one:
+        /// the `wait` here loops on a side channel the way a frame closure
+        /// polls its step channel, and only then does the ONE short
+        /// `recv_timeout` on the done channel that turns "the window ended"
+        /// back into `Completed`.
+        ///
+        /// Without this, the `wait` parameter is a parameter only one caller
+        /// ever supplies, and the claim that a second shape of wait works is
+        /// checked by nothing.
+        #[test]
+        fn a_caller_supplied_wait_ends_the_stretch_and_the_estate_still_comes_home() {
+            let dir = scratch("caller-wait");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            // The worker's own "I am done drawing-relevant work" report --
+            // `TeardownStep::Finished`'s stand-in. It is a DIFFERENT channel
+            // from the completion signal `park_and_work` owns, which is the
+            // whole reason the trailing `recv_timeout` below is needed.
+            let (step_tx, step_rx) = mpsc::channel::<()>();
+            let mut polls = 0usize;
+
+            let (back, outcome) = park_and_work(
+                est,
+                move |park| {
+                    assert!(park.with(the_work).is_some(), "the worker owns the estate");
+                    let _ = step_tx.send(());
+                },
+                |_park, done_rx| {
+                    // The event loop's stand-in: poll, never block on the
+                    // park's own channel.
+                    loop {
+                        polls += 1;
+                        match step_rx.try_recv() {
+                            Ok(()) => break,
+                            Err(mpsc::TryRecvError::Empty) => {
+                                std::thread::sleep(Duration::from_millis(5))
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => break,
+                        }
+                    }
+                    // The beat between the worker's last report and its
+                    // return. Skipped, a completed stretch would be reported
+                    // as a deadline.
+                    match done_rx.recv_timeout(Duration::from_secs(10)) {
+                        Ok(()) => EstateOutcome::Completed,
+                        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            EstateOutcome::WorkerPanicked
+                        }
+                    }
+                },
+            );
+
+            assert!(
+                polls > 0,
+                "control: the caller's wait never ran a single poll, so this test drove the \
+                 old blocking shape and proved nothing about a wait the caller supplies"
+            );
+            assert_eq!(
+                outcome,
+                EstateOutcome::Completed,
+                "the worker ran to the end, so the stretch completed -- reported as anything \
+                 else, the host would treat a finished teardown as an abandoned one"
+            );
+            the_worker_reached_the_estate(&back, "a caller-supplied wait");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **The outcome is the wait's answer, not a guess made underneath
+        /// it -- and the estate comes home either way.**
+        ///
+        /// The host's wait is the event loop, so it is the ONLY thing that
+        /// knows how the window ended: a user who gave up on the spinner and
+        /// a teardown that finished a millisecond later are the same instant
+        /// from underneath. Here the worker really does complete and the wait
+        /// still answers `DeadlineExpired`; [`park_and_work`] must report
+        /// what it was told rather than substituting what it can observe,
+        /// and must still bring the estate home on that answer.
+        #[test]
+        fn the_outcome_is_the_waits_answer_and_not_a_guess_at_it() {
+            let dir = scratch("waits-answer");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (done_tx, done_seen_rx) = mpsc::channel::<()>();
+            let (back, outcome) = park_and_work(
+                est,
+                move |park| {
+                    assert!(park.with(the_work).is_some(), "the worker owns the estate");
+                    let _ = done_tx.send(());
+                },
+                |_park, done_rx| {
+                    // Waited for, so the worker demonstrably DID finish --
+                    // the answer below is a decision and not a race.
+                    done_seen_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("the worker must reach the end of its work");
+                    let _ = done_rx;
+                    EstateOutcome::DeadlineExpired
+                },
+            );
+
+            assert_eq!(
+                outcome,
+                EstateOutcome::DeadlineExpired,
+                "the wait's answer was overridden from underneath it. The host's wait IS the \
+                 event loop and is the only thing that knows how the window ended; a \
+                 `park_and_work` that decides for itself would report a lock the user \
+                 abandoned as one that settled"
+            );
+            the_worker_reached_the_estate(&back, "an overriding wait");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// What a `wait` appends to the token once it has the park. Distinct
+        /// from [`AFTER`] so a write that never happened cannot be mistaken
+        /// for the worker's.
+        const BY_THE_WAIT: &str = " +written-through-the-park-by-the-wait";
+
+        /// [`the_worker_reached_the_estate`] for the two tests below, whose
+        /// `wait` writes through the park as well: the token must hold BOTH
+        /// writes, in order, and the worker's other two must still be there.
+        ///
+        /// A separate helper rather than a loosened one, so the three tests
+        /// that expect the worker's token ALONE keep an exact assertion.
+        fn both_writes_came_home(est: &SessionEstate, path: &str) {
+            assert_eq!(
+                est.token,
+                format!("{AFTER}{BY_THE_WAIT}"),
+                "on {path} the estate that came home does not hold both the worker's write and \
+                 the wait's. They must be editing ONE estate: if the caller's park is a second, \
+                 detached one, step 5's `est.child = Some(child)` lands nowhere and a live \
+                 `bw serve` is left with no owner at all"
+            );
+            assert!(
+                est.engine.lookup(&foreground(ARMED)).is_some(),
+                "on {path} the match engine came back unarmed -- autofill silently dead, which \
+                 is the recorded obstacle-5 failure exactly"
+            );
+            assert!(
+                est.task_in_progress.is_some(),
+                "on {path} the in-progress backend task did not come back"
+            );
+        }
+
+        /// **Step 4's own property: the park the `wait` is handed is the park
+        /// the worker is editing, and what the `wait` writes through it comes
+        /// home.**
+        ///
+        /// This is the whole point of the signature change and it is the one
+        /// thing a signature alone does not say. `park_and_work` could hand
+        /// the caller a freshly built, empty `EstatePark` and still compile,
+        /// still return the worker's estate, and still pass every other test
+        /// in this module -- and step 5's startup host, whose `prepare` worker
+        /// arms `est.child` through exactly this handle at the moment
+        /// `bw serve` is spawned, would drop that handle into a slot nobody
+        /// ever reads. A live `bw serve` with no owner, silently, which is the
+        /// orphan the eighth stop's decision exists to make impossible.
+        ///
+        /// The control is the `is_some()`: against a detached park `with`
+        /// answers `None`, and it fails on the control line rather than on a
+        /// confusing value mismatch.
+        #[test]
+        fn the_wait_is_given_the_same_park_the_worker_edits() {
+            let dir = scratch("wait-park");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (back, outcome) = park_and_work(
+                est,
+                |park| {
+                    assert!(park.with(the_work).is_some(), "the worker owns the estate");
+                },
+                |park, done_rx| {
+                    // Sequenced deliberately: the worker's writes are all in
+                    // before the wait adds its own, so the token below is the
+                    // two of them in order and not a race.
+                    let outcome = match done_rx.recv_timeout(Duration::from_secs(10)) {
+                        Ok(()) => EstateOutcome::Completed,
+                        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            EstateOutcome::WorkerPanicked
+                        }
+                    };
+                    let reached = park
+                        .with(|est| est.token.push_str(BY_THE_WAIT))
+                        .is_some();
+                    assert!(
+                        reached,
+                        "control: the `wait` was handed a park with nothing in it. It is not \
+                         the park the worker is editing, so every write a caller makes through \
+                         it is discarded"
+                    );
+                    outcome
+                },
+            );
+
+            assert_eq!(outcome, EstateOutcome::Completed, "the worker ran to the end");
+            both_writes_came_home(&back, "a wait that holds the park");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **The one thing a `wait` may not do with the park it is now given:
+        /// take the estate out from under the read-back.**
+        ///
+        /// The park handle escaping the read-back is the hazard step 4's
+        /// signature creates, and it is the read-back's `expect` that bounds
+        /// it: a second reclaimer is a loud, named panic on the spot rather
+        /// than a session silently emptied. Without this the `expect` is a
+        /// message nothing has ever produced, and the shape it forbids is
+        /// exactly the one a host trying to "read the estate a bit early"
+        /// would reach for.
+        #[test]
+        #[should_panic(expected = "the parked session state was gone at the read-back")]
+        fn a_wait_that_reclaims_the_estate_is_caught_at_the_read_back() {
+            let dir = scratch("wait-reclaims");
+            let est = fresh_estate(&dir);
+
+            let (_back, _outcome) = park_and_work(
+                est,
+                |park| {
+                    let _ = park.with(the_work);
+                },
+                |park, done_rx| {
+                    let _ = done_rx.recv_timeout(Duration::from_secs(10));
+                    // The forbidden move: the wait empties the slot the
+                    // read-back below is about to read.
+                    let stolen = park.reclaim();
+                    assert!(
+                        stolen.is_some(),
+                        "control: the wait reclaimed nothing, so this test never set up the \
+                         double-reclaim it is about"
+                    );
+                    EstateOutcome::Completed
+                },
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **A worker that panics mid-teardown leaves the estate WRITABLE, not
+        /// merely reclaimable.**
+        ///
+        /// `a_panicking_worker_does_not_poison_the_estate_out_of_reach` above
+        /// pins [`EstatePark::reclaim`]'s poison recovery -- measured, not
+        /// assumed: replacing `reclaim`'s `unwrap_or_else(PoisonError::
+        /// into_inner)` with an `expect` fails that test. Nothing pinned
+        /// [`EstatePark::with`]'s identical recovery, and the same replacement
+        /// there passed the whole suite.
+        ///
+        /// That gap matters exactly where step 5 puts its weight. A worker
+        /// panicking mid-teardown is what poisons the slot in the first place,
+        /// and from step 5 onward the thread that must still reach the estate
+        /// after such a panic -- to arm `est.child`, or to stop a `bw serve`
+        /// nobody else can see -- reaches it through `with`. An `expect` there
+        /// turns "a worker died" into "the session is unreachable": obstacle 5
+        /// by a second route, on the one path the type exists to survive.
+        ///
+        /// **The control is asserted first and is the whole point.** A test
+        /// that "passes" because the panic never poisoned anything proves
+        /// nothing at all, so the poisoning is verified against the mutex
+        /// itself before the recovery is asked for.
+        #[test]
+        fn a_panicking_worker_leaves_the_estate_writable_not_merely_reclaimable() {
+            let dir = scratch("panic-writable");
+            let est = fresh_estate(&dir);
+            nothing_of_the_works_is_there_yet(&est);
+
+            let (back, outcome) = park_and_work(
+                est,
+                |park| {
+                    let _: Option<()> = park.with(|est| {
+                        the_work(est);
+                        panic!("a deliberate panic, raised while the estate's lock is held");
+                    });
+                },
+                |park, done_rx| {
+                    // The worker's sender is dropped as it unwinds, so this is
+                    // the panic arriving -- and it arrives AFTER the guard the
+                    // panic poisoned has been released.
+                    let outcome = match done_rx.recv_timeout(Duration::from_secs(10)) {
+                        Ok(()) => EstateOutcome::Completed,
+                        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            EstateOutcome::WorkerPanicked
+                        }
+                    };
+                    assert!(
+                        park.slot.lock().is_err(),
+                        "control: the slot's mutex is NOT poisoned, so the write below is an \
+                         ordinary one and this test says nothing about poison recovery. Every \
+                         assertion after this line would pass against an `EstatePark` that \
+                         cannot survive a panic at all"
+                    );
+                    let reached = park
+                        .with(|est| est.token.push_str(BY_THE_WAIT))
+                        .is_some();
+                    assert!(
+                        reached,
+                        "the estate was unreachable through `with` after a worker panicked \
+                         holding its lock. `with` must recover from poisoning exactly as \
+                         `reclaim` does: a dead worker is the state this type exists to \
+                         survive, and from step 5 onward the thread that has to arm the child \
+                         or stop an orphaned `bw serve` after such a panic goes through here"
+                    );
+                    outcome
+                },
+            );
+
+            assert_eq!(
+                outcome,
+                EstateOutcome::WorkerPanicked,
+                "control: the worker did not unwind, so nothing was poisoned"
+            );
+            both_writes_came_home(&back, "a panic the estate was written through");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// **WHAT THE VAULT WINDOW IS OPENED WITH, NOW THAT NOTHING IS SPAWNED
     /// TO FIND OUT.**
     ///
@@ -19611,15 +19840,27 @@ mod tests {
                 super::body_of(source, concat!("fn rebuild_the_vault_after_", "the_lock(")),
             );
             let body = body.as_str();
+            // **The landmark moved with the host.** It used to be the line
+            // the in-daemon host logged on its way into eframe; that host is
+            // gone -- the daemon draws nothing now -- so the open half is
+            // marked by what it does instead, which is ask the UI-process
+            // registry for a window.
             assert!(
-                body.contains("handing off to eframe"),
+                body.contains(concat!("ask_for_the_vault_", "window(")),
                 "the sliced body is not the window-open region: every assertion over it would \
                  be about the wrong code"
             );
+            // And the region really is a window-open region rather than a
+            // slice that happens to mention a registry: the daemon-side draw
+            // is the thing that must be absent from it, and a `body_of` that
+            // silently sliced the wrong text would report its absence just as
+            // happily. That control is the details read below, which only the
+            // rebuild half has.
             assert!(
-                body.contains(concat!("app_window::run_from_", "vault(")),
-                "the sliced body does not open a window at all, so the assertion below would \
-                 pass against a region that cannot contain the defect it forbids"
+                !body.contains(concat!("app_window::run_from_", "vault(")),
+                "the window-open region draws a vault window IN THE DAEMON again, which is \
+                 the one thing the split removed: the driver it maps is returned only at \
+                 process exit"
             );
             assert!(
                 !body.contains(concat!("impl Startup", "Work {")),
@@ -19630,14 +19871,17 @@ mod tests {
             // it, a `body_of` that silently sliced something else would leave
             // this guard reading the open alone.
             //
-            // The needle is what each half now READS instead of spawning --
-            // `account_details_for`, once at the open and once at the rebuild
-            // -- because the two `bw status` calls it used to count are gone.
+            // The needle is what the rebuild half now READS instead of
+            // spawning -- `account_details_for` -- because the two `bw status`
+            // calls this region used to count are gone. It is one and not two
+            // because the open half no longer names an account at all: it
+            // spawns a process, and the toolbar is named over there.
             assert_eq!(
                 body.matches(details_read()).count(),
-                2,
-                "the region holds {} account-details read(s), not the two it has had since \
-                 the lock rebuilt the vault in place -- one at the open, one at the rebuild",
+                1,
+                "the region holds {} account-details read(s), not the one the rebuild has \
+                 had since the lock rebuilt the vault in place -- so the rebuild half is \
+                 not in this slice and the ban below is watching the open alone",
                 body.matches(details_read()).count()
             );
             body.to_string()
@@ -19882,8 +20126,8 @@ mod tests {
             ),
             (
                 concat!("app_window::run_from_", "vault("),
-                1,
-                "`open_window`'s in-daemon host, for the account a child could not read",
+                0,
+                "**ZERO, and this is the entry that flipped.** It was `open_window`'s                  in-daemon host, drawn for an account a child was judged unable to read.                  The judgement expired when the sign-in card moved into the child -- a                  child with no stored key asks for the master password now -- and the                  owner's rule finished it: \"any launch launches tray first ALWAYS, UI                  CANNOT work without it because it needs REST\". The tray IS the backend                  on the built-in client; a tray that draws holds the graphics driver for                  the life of the session. A ONE here means that host is back",
             ),
             (
                 concat!("app_window::run_", "recovery("),
@@ -20036,15 +20280,49 @@ mod tests {
         );
     }
 
+    /// **NO ROUTE INTO THE DAEMON DRAWS A VAULT WINDOW ANY MORE.**
+    ///
+    /// This used to be the weaker claim its old name carried -- *the only
+    /// route left that draws is the one that must* -- and the route it
+    /// excepted was a `bw serve` account whose stored key did not exist yet:
+    /// the daemon drew the window itself, because a `--ui` child could not
+    /// ask for a master password.
+    ///
+    /// A child can now, so the exception has no reason left, and the owner's
+    /// rule leaves no room for one anyway: "any launch launches tray first
+    /// ALWAYS, UI CANNOT work without it because it needs REST". The tray IS
+    /// the backend on the built-in client -- it holds the vault and answers
+    /// CTRL+ALT+B with no window at all -- so a tray that draws once has
+    /// spent the OpenGL driver for the life of the process and never gets it
+    /// back. Measured, on the owner's machine: 98.6 MB resident with
+    /// `nvoglv64.dll` at 41.1 MB against 35.9 MB for a tray that never drew.
+    ///
+    /// So `open_window` is a spawn and nothing else, and what this pins is
+    /// the absence -- with controls, because an absence asserted over a slice
+    /// that came back empty is the house defect: a test that passes because
+    /// it never reached the thing it names.
     #[test]
-    fn the_only_route_left_that_draws_in_the_daemon_is_the_one_that_must() {
+    fn no_route_left_in_the_daemon_draws_a_vault_window() {
         let raw = production_half_of_this_file();
         let code = what_a_finished_vault_session_means::code_only(raw);
         let body = vault_ops_method_body(&code, "open_window");
         assert!(
-            body.len() > 1500,
+            body.len() > 900,
             "control: `open_window` sliced to {} bytes, which is not this method",
             body.len()
+        );
+
+        // **THE ABSENCE.** Both halves of it: the host itself, and the gate
+        // that used to decide when to reach it.
+        assert!(
+            !body.contains(concat!("app_window::run_from_", "vault(")),
+            "`open_window` hosts a vault window in the daemon again, which costs this \
+             process the graphics driver for the rest of its life: {body}"
+        );
+        assert!(
+            !body.contains("let child_cannot_read_the_vault ="),
+            "the gate that chose between spawning and drawing is back in `open_window`, so \
+             there is a route by which the tray draws again: {body}"
         );
 
         // **The search no longer gates the spawn.** The needle is the whole
@@ -20055,7 +20333,7 @@ mod tests {
             "the search term gates the spawn again, so the overlay's *Search vault* draws in \
              the daemon and costs it the graphics driver for the rest of its life: {body}"
         );
-        // Control on that negative: the search is still THREADED, so the
+        // Control on that negative: the search is still CARRIED, so the
         // assertion above is about a route that moved rather than a feature
         // that was deleted. A window that opened with an empty box on this
         // door would pass the negative and be the bug.
@@ -20070,66 +20348,56 @@ mod tests {
              value silently stopped carrying it: {body}"
         );
 
-        // **The spawn failure does not fall through to the window below.**
-        // The `return` is unconditional inside the spawn arm, so both
-        // outcomes of the ask leave the same way.
-        let arm = body
-            .split_once("if child_cannot_read_the_vault.is_none() {")
-            .expect("the spawn gate is not in `open_window` any more")
-            .1;
-        let eframe = arm
-            .find(concat!("app_window::run_from_", "vault("))
-            .expect("control: `open_window` opens no window at all below the gate");
-        // **UNCONDITIONAL, and that is the assertion rather than merely
-        // "there is a `return` somewhere above the window".**
-        //
-        // The weaker form passes against `if asked { return (est, None); }`,
-        // which is precisely the fall-through this branch removed -- a failed
-        // spawn would drop through to the `eframe` host below and draw. So
-        // what is pinned is the STATEMENT: a `return` alone on its line at
-        // the arm's own indentation, which a guarded one cannot produce.
-        //
-        // Verified by mutation: re-introducing the guard fails this test, and
-        // the earlier form of it passed.
-        let statement = "\n            return (est, None);";
-        let returned = arm.find(statement).unwrap_or_else(|| {
+        // **THE CONTROL ON EVERY NEGATIVE ABOVE: the method still opens a
+        // window, over there.** Without this the whole test would pass
+        // against a method that had been emptied -- no draw, and no window
+        // either.
+        let asked = body.find(concat!("ask_for_the_vault_", "window(")).unwrap_or_else(|| {
             panic!(
-                "the spawn arm has no unconditional `return`, so a failed spawn falls through \
-                 to the in-daemon window and the daemon draws after all -- which is exactly \
-                 what this branch removed: {arm}"
+                "control: `open_window` asks the UI-process registry for nothing, so it \
+                 opens no window at all and every absence asserted above is vacuous: {body}"
+            )
+        });
+
+        // **The spawn failure does not fall through to a window below.**
+        // The `return` is unconditional, so both outcomes of the ask leave
+        // the same way -- which is what makes the absence above stable under
+        // a failing spawn rather than only under a working one.
+        //
+        // The STATEMENT is what is pinned, not merely "there is a `return`
+        // somewhere": the weaker form passes against `if asked { return (est,
+        // None); }`, which is precisely the fall-through this branch removed.
+        // A `return` alone on its line at the arm's own indentation is what a
+        // guarded one cannot produce.
+        let statement = "\n            return (est, None);";
+        let returned = body.find(statement).unwrap_or_else(|| {
+            panic!(
+                "`open_window` has no unconditional `return`, so a spawn that failed falls \
+                 through to whatever follows -- and what followed, historically, was a \
+                 window drawn here: {body}"
             )
         });
         assert!(
-            returned < eframe,
-            "the spawn arm's `return` is BELOW the in-daemon window, so a failed spawn draws \
-             here after all: {arm}"
+            asked < returned,
+            "`open_window` leaves before it asks for the window: {body}"
         );
         // And nothing between the ask and that `return` re-introduces a
         // branch around it. The message-box report is an `if`; a SECOND one
         // would be a guard on the leave.
-        let before = &arm[..returned];
+        let before = &body[asked..returned];
         assert_eq!(
             before.matches("if ").count(),
             1,
-            "the spawn arm grew a second condition between asking for the window and leaving; \
+            "the method grew a second condition between asking for the window and leaving; \
              the only `if` there may be is the one that reports a failure: {before}"
         );
 
         // And the user is told, rather than the failure being a log line
         // under a window that never appeared.
         assert!(
-            arm[..returned].contains("message_box("),
+            before.contains("message_box("),
             "a spawn that failed now opens nothing and says nothing; the user clicked *Open \
-             Vault* and got silence: {arm}"
-        );
-
-        // **The remaining draw, named.** Without this the test would pass
-        // just as well against a file that had deleted the in-daemon host
-        // entirely -- and the `bw serve` sign-in has nowhere else to go yet.
-        assert!(
-            body.contains("let child_cannot_read_the_vault ="),
-            "the one route that still draws in the daemon is gone from the gate, so a \
-             `bw serve` account with no stored key has no host for its sign-in card at all"
+             Vault* and got silence: {body}"
         );
     }
 
@@ -20181,10 +20449,15 @@ mod tests {
         // so the same helper serves a caller reading the raw production half
         // and one reading `code_only`'s much shorter output.
         for marker in [
-            // `run_from_vault`, not `vault_window::run`: the window opener is
-            // the second host now, because a window that gives up its event
-            // loop on a lock is the blink this feature removes.
-            concat!("app_window::run_from_", "vault("),
+            // **`ask_for_the_vault_window`, not `app_window::run_from_vault`.**
+            // The landmark used to be the in-daemon window host, which is the
+            // right shape for a control -- it is the thing the vault loop used
+            // to hold inline -- right up until that host was deleted. The
+            // daemon does not draw at all now (the owner's rule: the tray
+            // always spawns the UI, because the tray is the REST backend), so
+            // the opener region is marked by the SPAWN instead. Same region,
+            // same three landmarks, one of them renamed to what it does today.
+            concat!("ask_for_the_vault", "_window("),
             concat!("resettle_ses", "sion("),
             concat!("switch_to", "_account("),
         ] {
@@ -20533,7 +20806,12 @@ mod tests {
             // is a four-line constructor now -- two orders of magnitude smaller
             // than the branch it used to hold.
             for (what, floor, body) in [
-                ("open_window", 1_500, super::vault_ops_method_body(&code, "open_window")),
+                // 1_500 until the in-daemon host came out of this method.
+                // What is left is the spawn and the message box that reports
+                // a spawn that failed -- 1_380 bytes of code, so the floor is
+                // set below that and above a slice that came back with the
+                // signature alone.
+                ("open_window", 900, super::vault_ops_method_body(&code, "open_window")),
                 (
                     "account_action",
                     4_000,
@@ -21334,7 +21612,7 @@ mod tests {
                 "the sliced `VaultDeps` field list is {} bytes, which is not a field list",
                 fields.len()
             );
-            for marker in ["fill_stats", "settings_path", "backend_op_tx"] {
+            for marker in ["job", "settings_path", "backend_op_tx"] {
                 assert!(
                     fields.contains(marker),
                     "control: `{marker}` is not in the sliced `VaultDeps` field list, so the \
@@ -21357,10 +21635,14 @@ mod tests {
                      estate that the estate cannot see"
                 );
             }
+            // Eight when it was introduced, six since the daemon stopped
+            // drawing: `fill_stats` and `icon_cache_dir` were read by the
+            // in-daemon vault host in `open_window` and by nothing else, so
+            // they left with it.
             assert!(
-                counted >= 8,
-                "control: only {counted} `VaultDeps` fields were checked; it has had eight since \
-                 it was introduced, so this guard is mostly vacuous"
+                counted >= 6,
+                "control: only {counted} `VaultDeps` fields were checked; it has had six since \
+                 the in-daemon host came out, so this guard is mostly vacuous"
             );
 
             // Controls, both directions, on the same line test.
@@ -21372,1128 +21654,6 @@ mod tests {
         }
     }
 
-    /// **What a finished vault session means -- the decision that used to be
-    /// scattered over `open_vault_window`'s branches, and the defect that
-    /// scattering shipped.**
-    ///
-    /// The loop's settings write-back carried a `continue` inherited from the
-    /// days when the gear closed the window to serve Preferences.
-    /// `edited_settings` is `Some` for the rest of a window's life once the
-    /// gear has been clicked ONCE -- it is written every frame the modal is up
-    /// and never reset -- so that `continue` made every branch beneath it
-    /// unreachable. Open Settings, close it, press Lock: nothing locked. The
-    /// cache stayed warm, `bw serve` kept its session, nothing re-authenticated.
-    ///
-    /// No test could see it, because the only thing that knew the answer was a
-    /// loop body inside a function that opens a real eframe window. So the
-    /// answer is a value now, and these drive it directly.
-    /// **The estate comes home on all three paths -- normal completion, the
-    /// deadline, and a worker that unwound.**
-    ///
-    /// The ledger's obstacle 5 (`progress.md:14240`) is a design in which the
-    /// deadline and the dead-worker poll each end the wait and throw the
-    /// worker's whole result away, leaving `main` with an empty
-    /// [`MatchEngine`] and a `child` of `None` beside a live `bw serve` -- and
-    /// the suite green, because nothing looked. These three tests are what
-    /// looks. Each one has the worker mutate the estate OBSERVABLY before its
-    /// path is taken, so a path that discards the state fails rather than
-    /// passing quietly, and each asserts the premise (the estate does not
-    /// already hold what the worker will write) before asserting the
-    /// consequence.
-    ///
-    /// Nothing here spawns a process, opens a window, binds a port or touches
-    /// a real config path: the estate is built over a scratch directory and a
-    /// bridge pointed at a port nothing listens on, and it is never asked to
-    /// speak to either.
-    /// **The in-window lock's production wiring, which no test in this crate
-    /// can call.**
-    ///
-    /// `RealVaultOps::open_window` opens a real `eframe` window, spawns a real
-    /// `bw serve` and raises a real master-password card, so every claim made
-    /// about it here is made by reading it. That is stated plainly rather than
-    /// left for a reader to work out, because a source scan is the weakest
-    /// thing in this file and the one most likely to be passing for free.
-    ///
-    /// Every scan runs over `code_only`'s output. This method's COMMENTS name
-    /// `vault_window::run`, `reauthenticate` and the spinner probe several
-    /// times each -- explaining why none of them is used -- so a scan over the
-    /// raw text would find all three and report the opposite of the truth.
-    mod the_in_window_lock_is_wired_to_the_one_sequence {
-        use super::production_half_of_this_file;
-        use super::the_estate_is_the_only_copy::squeeze;
-        use super::vault_ops_method_body;
-        use super::what_a_finished_vault_session_means::code_only;
-
-        /// `open_window`'s body as CODE.
-        fn opener() -> String {
-            let raw = production_half_of_this_file();
-            let code = code_only(raw);
-            assert!(
-                code.len() < raw.len(),
-                "control: `code_only` stripped nothing, so every scan below runs over prose too"
-            );
-            let body = vault_ops_method_body(&code, "open_window");
-            assert!(
-                body.len() > 1500,
-                "control: `open_window` sliced to {} bytes, which is not this method",
-                body.len()
-            );
-            body
-        }
-
-        /// The lifted teardown worker's body as CODE.
-        ///
-        /// **A slice of its own, not folded into [`wiring`], and that is the
-        /// point of splitting the helper up.** The lift moved most of the
-        /// needles below out of `open_window` and into these two functions;
-        /// re-pointing every assertion at the UNION would let a needle that
-        /// belongs to the worker be satisfied by the call site, and vice
-        /// versa -- which is this file's signature defect (a guard that, after
-        /// a lift, passes for free) reintroduced by the very edit that moved
-        /// it. Positives are asserted where the code must be; only the
-        /// negatives, which are strictly stronger over more text, run over the
-        /// union.
-        fn teardown_worker() -> String {
-            let code = code_only(production_half_of_this_file());
-            let body = super::body_of(&code, concat!("fn run_the_in_window_", "teardown("));
-            assert!(
-                body.len() > 800,
-                "control: the lifted teardown sliced to {} bytes, which is not this function",
-                body.len()
-            );
-            body
-        }
-
-        /// The lifted rebuild's body as CODE. See [`teardown_worker`].
-        fn rebuilder() -> String {
-            let code = code_only(production_half_of_this_file());
-            let body = super::body_of(&code, concat!("fn rebuild_the_vault_after_", "the_lock("));
-            assert!(
-                body.len() > 500,
-                "control: the lifted rebuild sliced to {} bytes, which is not this function",
-                body.len()
-            );
-            body
-        }
-
-        /// The whole of the in-window lock's production wiring: the call site
-        /// and the two functions the lift moved its two longest bodies into.
-        ///
-        /// This is what the NEGATIVE assertions run over, because a spinner
-        /// probe, a `reauthenticate` or a `vault_window::run` is just as fatal
-        /// in a lifted body as it was in the closure it came from -- and after
-        /// the lift, `open_window` alone would forbid them in a region that no
-        /// longer contains the code that could commit them.
-        pub(super) fn wiring() -> String {
-            let mut all = opener();
-            all.push('\n');
-            all.push_str(&teardown_worker());
-            all.push('\n');
-            all.push_str(&rebuilder());
-            all
-        }
-
-        /// The comments really do name the three things the scans below say
-        /// are absent -- so "absent" is a fact about the code and not about a
-        /// method that never mentions them at all.
-        ///
-        /// Without this, deleting every explanatory comment would make the
-        /// three negative assertions pass for a completely different reason,
-        /// and the difference would be invisible.
-        #[test]
-        fn the_prose_names_what_the_code_must_not() {
-            // The RAW union, matching [`wiring`]: the lift moved the comments
-            // that explain why the spinner probe and `reauthenticate` are not
-            // used into the two lifted functions, along with the code they
-            // explain. Read only from `open_window` this control would go
-            // silently vacuous the moment the lift happened -- which is the
-            // failure it exists to prevent, one level up.
-            let source = production_half_of_this_file();
-            let raw = format!(
-                "{}\n{}\n{}",
-                vault_ops_method_body(source, "open_window"),
-                super::body_of(source, concat!("fn run_the_in_window_", "teardown(")),
-                super::body_of(source, concat!("fn rebuild_the_vault_after_", "the_lock(")),
-            );
-            let raw = raw.as_str();
-            for named in [
-                concat!("vault_window::", "run"),
-                concat!("reauthen", "ticate"),
-                concat!("wait_for_the_", "vault"),
-            ] {
-                assert!(
-                    raw.contains(named),
-                    "control: `open_window` does not mention {named:?} even in prose, so the \
-                     matching negative assertion below is not about anything"
-                );
-            }
-        }
-
-        /// **The window is never given up, and the estate is parked rather
-        /// than moved.**
-        #[test]
-        fn the_vault_is_hosted_by_the_second_host_over_a_parked_estate() {
-            let body = opener();
-            assert!(
-                body.contains(concat!("park_and_", "work(")),
-                "the vault window no longer runs over a parked estate. The teardown's worker is \
-                 `'static` and cannot borrow this frame, so without the park the estate has to \
-                 be moved into it -- and an abandoned worker then leaves `main` with an empty \
-                 match engine and a `bw serve` nobody owns holding the port"
-            );
-            assert!(
-                body.contains(concat!("app_window::run_from_", "vault(")),
-                "the vault window is not hosted by `run_from_vault` any more, so the lock has \
-                 nowhere to go but away: the window closes, the teardown runs with nothing on \
-                 screen, and a different window opens. That is the blink"
-            );
-            assert!(
-                !wiring().contains(concat!("vault_window::", "run(")),
-                "the vault window opens its OWN event loop again. `vault_window::run` returns \
-                 only once its window is gone, so a lock caught inside it cannot keep the \
-                 window -- which is the whole feature"
-            );
-        }
-
-        /// **The worker runs the ONE sequence, with the two things a worker
-        /// thread cannot have supplied as parameters.**
-        ///
-        /// `resettle_session` is the wrapper that owns the tray and names the
-        /// spinner probe; a worker may have neither. The lifted body is what
-        /// it calls, and the two arguments it supplies are what item 8 is.
-        #[test]
-        fn the_worker_runs_the_lifted_body_with_a_windowless_probe() {
-            // **Re-pointed at the lifted worker, not at the union.** Every
-            // positive here is a claim about the code the teardown RUNS; the
-            // call site could satisfy none of them and the teardown still be
-            // wrong. The negatives run over the union, where they are strictly
-            // stronger.
-            let body = teardown_worker();
-            let everywhere = wiring();
-            assert!(
-                body.contains(concat!("resettle_session_reporting_", "tray(")),
-                "the in-window lock no longer runs the one teardown-and-repopulate sequence. \
-                 Whatever it runs instead is a second one, and this crate has exactly one"
-            );
-            assert!(
-                !everywhere.contains(concat!("wait_for_vault_ready_with_", "spinner(")),
-                "the lock's worker probes with the SPINNER probe, which opens an `eframe` \
-                 window of its own -- from a worker thread, behind a window that is already \
-                 showing a spinner of its own"
-            );
-            assert!(
-                body.contains(concat!("wait_for_vault_", "ready(")),
-                "the lock's worker no longer waits for the vault to answer at all, so the \
-                 repopulate runs against a backend that may not be up yet"
-            );
-            assert!(
-                !everywhere.contains("tray::"),
-                "the lock's worker touches the tray. `AppTray` owns a hidden Win32 window bound \
-                 to the thread that built it, and this code runs on neither that thread nor \
-                 with that tray in reach"
-            );
-        }
-
-        /// **The master password comes down the channel, not out of a second
-        /// window.**
-        #[test]
-        fn the_sign_in_is_a_round_trip_through_the_window_that_is_already_open() {
-            // Split by where each half of the round trip lives after the lift:
-            // the ASK and the WAIT are the worker's, the CARD is the call
-            // site's. Asserting all four over one union would let the card
-            // alone satisfy "the worker asks for it".
-            let worker = teardown_worker();
-            assert!(
-                !wiring().contains(concat!("reauthen", "ticate(")),
-                "the lock's worker calls `reauthenticate`, which opens a whole new `eframe` \
-                 window -- from a worker thread, while this window is on screen. That is the \
-                 blink, moved rather than removed"
-            );
-            assert!(
-                worker.contains(concat!("token_rx.", "recv()")),
-                "nothing waits for the token the sign-in card produces, so the teardown either \
-                 never authenticates or authenticates somewhere else"
-            );
-            assert!(
-                worker.contains(concat!("TeardownStep::", "NeedsSignIn")),
-                "the worker never asks for the card, so the window sits on a spinner while the \
-                 worker blocks on a password it never requested"
-            );
-            assert!(
-                opener().contains(concat!("login_ui::build_login_", "frame(")),
-                "the sign-in card is not built as a frame for the window that is already open"
-            );
-        }
-
-        /// **THE HANDOFF, driven end to end.**
-        ///
-        /// `forward_lock_channels` is one line, and it is the hinge of the
-        /// whole feature: without it the lock arm still spawns its thread and
-        /// still reports a teardown, while the worker's `lock_rx.recv()`
-        /// returns `Err` and NOTHING is drained, stopped or cleared. This
-        /// test is the only thing in the crate that can fail when that line
-        /// stops working, because the closure it used to live in is called
-        /// from inside eframe's frame closure.
-        ///
-        /// Behavioural, not a scan: every assertion is about values that
-        /// really travelled, in both directions, through the ends that were
-        /// forwarded.
-        #[test]
-        fn the_lock_handoff_really_carries_both_channel_ends() {
-            use super::super::app_window::TeardownStep;
-            use std::sync::mpsc;
-            let (lock_tx, lock_rx) = mpsc::channel::<super::super::LockChannels>();
-            let (step_tx, step_rx) = mpsc::channel::<TeardownStep>();
-            let (token_tx, token_rx) = mpsc::channel::<String>();
-
-            super::super::forward_lock_channels(&lock_tx, &step_tx, token_rx);
-
-            // `recv_timeout`, not `recv`: in production the worker blocks
-            // forever on this and that is correct -- a window that never locks
-            // simply drops the sender. A test that did the same would HANG
-            // rather than fail when the handoff stops working, which is a
-            // worse signal than a red line and blocks every suite it is in.
-            let (worker_step_tx, worker_token_rx) = lock_rx
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect(
-                    "the worker's `lock_rx.recv()` never produced the two channel ends, so the \
-                     teardown never gets them: the lock reports a teardown that drains nothing, \
-                     stops no `bw serve` and clears no cache, and `main` skips its own recovery",
-                );
-
-            worker_step_tx
-                .send(TeardownStep::NeedsSignIn)
-                .expect("the forwarded sender does not reach the window's step channel");
-            assert_eq!(
-                step_rx.try_recv(),
-                Ok(TeardownStep::NeedsSignIn),
-                "a step the worker reported does not arrive at the stage that shows the card"
-            );
-
-            token_tx
-                .send("the-master-password".to_string())
-                .expect("the card's sender does not reach the forwarded receiver");
-            assert_eq!(
-                worker_token_rx.recv().ok(),
-                Some("the-master-password".to_string()),
-                "the token the sign-in card produced does not reach the worker that \
-                 authenticates with it"
-            );
-
-            // **The clone, as behaviour.** The frame closure's own sender dies
-            // with the closure; the worker must be left holding a LIVE one, or
-            // the working stage hears `Disconnected` the moment the window
-            // stops forwarding and gives up on a teardown that is running.
-            drop(step_tx);
-            assert!(
-                worker_step_tx.send(TeardownStep::Finished).is_ok(),
-                "the worker's sender died with the frame closure's, so the working stage gives \
-                 up on a teardown that is still running"
-            );
-            assert_eq!(step_rx.try_recv(), Ok(TeardownStep::Finished));
-
-            // ...and once the WORKER's copy goes, the channel really is dead,
-            // which is what `app_window`'s watchdog reads as a dead worker.
-            drop(worker_step_tx);
-            assert_eq!(
-                step_rx.try_recv(),
-                Err(mpsc::TryRecvError::Disconnected),
-                "control: a dropped worker does not disconnect the step channel, so the \
-                 watchdog this crate relies on has nothing to see"
-            );
-        }
-
-        /// **The rebuilt vault is built with the preference edit made before
-        /// the lock, not with the estate's stale copy.**
-        ///
-        /// `published.auto_lock` is read off the PARKED estate, and `main` --
-        /// the only writer of both `settings.json` and `est.settings` -- does
-        /// not run until this window is gone. Handed straight to
-        /// `build_frame`, a user who changes the auto-lock policy and then
-        /// locks comes back to a window still running the OLD policy: commit
-        /// `c99fa40` ("the open window honours an auto-lock change at once")
-        /// undone across a lock.
-        ///
-        /// `app_window` has its own guard that the value is HANDED to the
-        /// rebuild. This is the other end: that the rebuild then USES it. The
-        /// first mutation run of this fix had the first guard and not this
-        /// one, and dropping the value on the floor here survived the whole
-        /// suite -- the "correct in isolation, reaching nothing" shape, inside
-        /// the fix for it.
-        #[test]
-        fn the_rebuilt_vault_honours_a_preference_edit_made_before_the_lock() {
-            // The rebuild's OWN body: the lift moved it out of `open_window`,
-            // and the count control below is only meaningful over the region
-            // that builds the frame.
-            let body = squeeze(&rebuilder());
-            assert!(
-                body.contains(concat!(
-                    "effective_auto_lock( edited_before_lock.as_ref(), ",
-                    "published.auto_lock, )"
-                )),
-                "the rebuilt vault does not resolve its auto-lock policy through \
-                 `effective_auto_lock` against the pre-lock gear visit, so a policy change made \
-                 just before a lock is silently reverted by the window that comes back: {body}"
-            );
-            assert_eq!(
-                body.matches(concat!("published.", "auto_lock")).count(),
-                1,
-                "control: the estate's own `auto_lock` is read somewhere else in this method \
-                 too, so the needle above no longer identifies the one value the rebuilt frame \
-                 is built with: {body}"
-            );
-        }
-
-        /// **Both call sites are the lifted call and NOTHING ELSE.**
-        ///
-        /// A lift's own failure mode, and one this file has now found by
-        /// mutation twice: the body moves out correctly and the call site
-        /// then drops what it produced. `{ rebuild_the_vault_after_the_lock(
-        /// .. ); None }` compiles, warns about nothing, leaves every guard
-        /// over the lifted body green -- and the window closes to the tray
-        /// after every lock, which is the blink this whole feature exists to
-        /// remove, restored by the refactor that was supposed to enable
-        /// removing it. The same shape on the worker side (a call whose
-        /// arguments have been reordered or replaced) is invisible to a
-        /// mention count.
-        ///
-        /// So the two closures are pinned WHOLE, by exact text: the call is
-        /// the closure's only statement and its tail expression.
-        /// Whitespace-squeezed, so rustfmt may move the line breaks; nothing
-        /// else may move.
-        #[test]
-        fn the_two_lifted_calls_are_the_whole_of_the_closures_that_make_them() {
-            let body = squeeze(&opener());
-            for (what, wanted) in [
-                (
-                    "the teardown worker",
-                    squeeze(concat!(
-                        "move |park| { run_the_in_window_teardown( park, &lock_rx, ",
-                        "&job_for_worker, &drain_for_worker, &schedule_for_worker, ",
-                        "&rebuilt_for_worker, &tray_effects_for_worker, ) },"
-                    )),
-                ),
-                (
-                    "the rebuild",
-                    squeeze(concat!(
-                        "move |edited_before_lock| { rebuild_the_vault_after_the_lock( ",
-                        "&rebuilt, fill_stats_for_rebuild, icon_cache_dir_for_rebuild, ",
-                        "edited_before_lock, ) },"
-                    )),
-                ),
-            ] {
-                assert!(
-                    body.contains(&wanted),
-                    "{what}'s closure in `open_window` is not exactly its one call to the \
-                     lifted function. Anything before or after it is work the lift was \
-                     supposed to have moved, and anything AFTER it can discard what the call \
-                     produced -- a rebuild whose frame is thrown away closes the window on \
-                     every lock.\nwanted: {wanted}\ngot: {body}"
-                );
-            }
-            // Control: the pin really rejects the discarding shape it names,
-            // rather than matching any text that merely contains the call.
-            let discarding = squeeze(concat!(
-                "move |edited_before_lock| { rebuild_the_vault_after_the_lock( ",
-                "&rebuilt, fill_stats_for_rebuild, icon_cache_dir_for_rebuild, ",
-                "edited_before_lock, ); None },"
-            ));
-            let wanted = squeeze(concat!(
-                "move |edited_before_lock| { rebuild_the_vault_after_the_lock( ",
-                "&rebuilt, fill_stats_for_rebuild, icon_cache_dir_for_rebuild, ",
-                "edited_before_lock, ) },"
-            ));
-            assert!(
-                !discarding.contains(&wanted),
-                "control: the pin matches a call site that throws the rebuilt frame away, so \
-                 it is not checking what it says it checks"
-            );
-        }
-
-        /// **The teardown is handed the PARKED ESTATE's own six mutable
-        /// fields, not values of its own.**
-        ///
-        /// Found by mutation while lifting this body, and it survives at
-        /// `dd83229` too, so it is a pre-existing hole rather than one the
-        /// lift opened -- but the lift is what made it spellable in one line.
-        /// `&est.cache` replaced by `&Arc::new(VaultCache::new(est.cache.
-        /// bridge().clone()))` compiles, warns about nothing and passed all
-        /// 1905 + 198 tests: the sequence then clears a cache that is thrown
-        /// away one line later, so the window comes back showing the vault
-        /// items of the session it just "locked". Every neighbouring guard
-        /// was satisfied -- `resettle_session_reporting_tray(` was still
-        /// named, the probe was still windowless, the tray was still
-        /// untouched. What none of them said is WHAT it is called ON.
-        ///
-        /// Six fields, by exact text, because each one is a different way for
-        /// the lock to report success and lock nothing: a detached `cache`
-        /// serves the old items, a detached `engine` leaves autofill armed
-        /// for the old vault, a detached `child` strands `bw serve` on the
-        /// port, a detached `token` leaves the estate authenticating with a
-        /// dead session.
-        #[test]
-        fn the_teardown_runs_against_the_parked_estate_itself() {
-            let body = squeeze(&teardown_worker());
-            let wanted = squeeze(concat!(
-                "resettle_session_reporting_tray( &est.cache, &mut est.engine, &mut est.child, ",
-                "job, drain, &mut est.task_in_progress, &mut est.details, &mut est.token,"
-            ));
-            assert!(
-                body.contains(&wanted),
-                "the lock's teardown is not called on the parked estate's own fields. Anything \
-                 else here is a teardown of a value that is dropped when this call returns: the \
-                 window reports a lock, `main` skips its recovery, and the vault it comes back \
-                 to is the one that was supposed to be gone.\nwanted: {wanted}\ngot: {body}"
-            );
-            // Control: the needle is exact enough to reject a single field
-            // being swapped for a value of its own.
-            assert!(
-                !squeeze("resettle_session_reporting_tray( &fresh_cache, &mut est.engine,")
-                    .contains(&wanted),
-                "control: the needle matches a call that detached the cache, so it is not \
-                 checking what it says it checks"
-            );
-        }
-
-        /// **Each lifted piece has exactly ONE definition and exactly ONE
-        /// caller, and that caller is `open_window`.**
-        ///
-        /// The lift exists so that the startup host can reach the same
-        /// teardown instead of writing a second copy of it -- which
-        /// `there_is_exactly_one_teardown_and_repopulate_path` forbids and,
-        /// as that guard's own ledger records, a second CALLER does not trip.
-        /// So the "one path" property has to be held here instead, and held
-        /// in the form that still bites while there is only one host: two
-        /// mentions each (the `fn` and the call), with the call named inside
-        /// `open_window`.
-        ///
-        /// **When step 5 wires the startup host, this guard is what forces
-        /// the decision through a test edit** rather than letting a second
-        /// call site appear silently -- and the edit it will need is to pin
-        /// BOTH positions, not to raise a number.
-        #[test]
-        fn the_lifted_teardown_pieces_have_one_definition_and_one_caller_each() {
-            let code = code_only(production_half_of_this_file());
-            let call_site = opener();
-            let startup = super::the_single_window_startup_region();
-            let mut checked = 0usize;
-            for name in [
-                concat!("run_the_in_window_", "teardown("),
-                concat!("rebuild_the_vault_after_", "the_lock("),
-            ] {
-                checked += 1;
-                // **THREE mentions now: one definition and TWO callers**, and
-                // the two are NAMED rather than the number being raised. A
-                // raised number alone would be satisfied by two calls from
-                // ONE host, which is two teardown workers against one parked
-                // estate -- the multiple-owner shape the estate exists to
-                // remove. Pinning one call in each host is what no such
-                // arrangement can satisfy, and it is also what makes
-                // deleting the startup host's call red rather than merely
-                // lowering a count that nobody reads.
-                assert_eq!(
-                    code.matches(name).count(),
-                    3,
-                    "`{name}` is mentioned {} time(s) in the production code; three is the \
-                     only count that means one definition and one caller in each of the two \
-                     hosts. Four is a second route into the one teardown-and-repopulate path \
-                     this crate has, which is what \
-                     `there_is_exactly_one_teardown_and_repopulate_path` cannot see because it \
-                     counts COPIES rather than callers. Two means one host lost its call, and \
-                     the host that loses it is the one whose lock stops working",
-                    code.matches(name).count()
-                );
-                assert_eq!(
-                    call_site.matches(name).count(),
-                    1,
-                    "`{name}` is not called exactly once inside `RealVaultOps::open_window`"
-                );
-                assert_eq!(
-                    startup.matches(name).count(),
-                    1,
-                    "`{name}` is not called exactly once inside the STARTUP window's region. \
-                     Zero is the reported bug restored: the startup window has no teardown \
-                     behind its lock, so a lock there closes the window and `main` opens a \
-                     separate sign-in window"
-                );
-            }
-            assert_eq!(checked, 2, "control: both lifted pieces were checked");
-            // Control: the counter can tell a real absence from a needle it
-            // cannot see at all.
-            assert_eq!(code.matches(concat!("run_the_in_window_", "teardowns(")).count(), 0);
-        }
-
-        /// **The production closure really calls it.**
-        ///
-        /// The test above holds `forward_lock_channels` to its job; this holds
-        /// `open_window` to calling it. Both halves are needed: a correct
-        /// function nobody calls is exactly the defect this file keeps
-        /// re-finding.
-        #[test]
-        fn the_lock_arm_hands_the_worker_its_channels_through_that_function() {
-            let body = opener();
-            assert!(
-                body.contains(concat!("forward_lock_", "channels(&lock_tx, step_tx, token_rx)")),
-                "the teardown closure does not forward the two channel ends to the worker. The \
-                 lock then reports a teardown that never ran, `main` skips its recovery, and \
-                 the vault says locked with a live `bw serve` answering out of a full cache"
-            );
-            // Positive control: the receiving end really exists, so the needle
-            // above is about a handoff that has somewhere to go. In the LIFTED
-            // worker since the lift, which is where the `recv` went.
-            assert!(
-                teardown_worker().contains(concat!("lock_rx.", "recv()")),
-                "control: the lock's worker does not wait on the lock channel at all"
-            );
-        }
-    }
-
-    mod the_parked_estate_comes_home {
-        use super::*;
-
-        /// What the worker writes into the token. Deliberately not the value
-        /// the fixture starts with; see [`nothing_of_the_works_is_there_yet`].
-        const AFTER: &str = "the-token-the-worker-wrote";
-
-        /// The process the worker arms the engine for.
-        const ARMED: &str = "notepad.exe";
-
-        /// A scratch directory for the estate's session store. Never read or
-        /// written by these tests: `SessionStore` is a path until something
-        /// asks it to load or save, and nothing here does.
-        ///
-        /// **Removed when the returned guard drops**, panic included -- which
-        /// matters more here than in most places: three of the tests below
-        /// drive a worker that is *supposed* to panic, and the removal this
-        /// helper used to leave to the end of a test body never ran for them.
-        fn scratch(tag: &str) -> deskwarden::test_scratch::ScratchDir {
-            deskwarden::test_scratch::ScratchDir::new(&format!("parked-estate-{tag}"))
-        }
-
-        /// An estate holding none of what the worker will write.
-        ///
-        /// The bridge points at port 1, which nothing listens on, so a stray
-        /// request would fail rather than reach a real `bw serve`. Nothing
-        /// here makes one.
-        fn fresh_estate(dir: &std::path::Path) -> SessionEstate {
-            SessionEstate {
-                cache: Arc::new(VaultCache::new(VaultBridge::new(
-                    "http://127.0.0.1:1".to_string(),
-                ))),
-                engine: MatchEngine::new(),
-                child: None,
-                token: "the-token-the-session-started-with".to_string(),
-                details: None,
-                task_in_progress: None,
-                store: session_store::SessionStore::new(dir.join("session.bin")),
-                active_account: None,
-                accounts: None,
-                settings: deskwarden::settings::Settings::default(),
-            }
-        }
-
-        /// What the worker does to the estate: three fields, of three
-        /// different shapes, so a read-back that carries a `String` but not a
-        /// `MatchEngine` cannot pass.
-        fn the_work(est: &mut SessionEstate) {
-            est.token = AFTER.to_string();
-            est.engine.rebuild(&[(
-                "item-7".to_string(),
-                deskwarden::app_match::AppMatch::for_process(
-                    ARMED,
-                    deskwarden::app_match::TriggerMode::Auto,
-                ),
-            )]);
-            est.task_in_progress = Some((Instant::now(), BackendOpKind::Sync));
-        }
-
-        /// The premise: none of the three is already true. Without this, a
-        /// read-back that returned a DEFAULT estate could satisfy the
-        /// assertions below by accident.
-        fn nothing_of_the_works_is_there_yet(est: &SessionEstate) {
-            assert_ne!(est.token, AFTER, "control: the fixture already holds the worker's token");
-            assert!(
-                est.engine
-                    .lookup(&foreground(ARMED))
-                    .is_none(),
-                "control: the fixture's engine is already armed for {ARMED}, so an engine that \
-                 never reached the worker would pass the check below"
-            );
-            assert!(
-                est.task_in_progress.is_none(),
-                "control: the fixture already has a task in progress"
-            );
-        }
-
-        /// The consequence: all three of the worker's writes came home.
-        fn the_worker_reached_the_estate(est: &SessionEstate, path: &str) {
-            assert_eq!(
-                est.token, AFTER,
-                "on {path} the session token the worker wrote did not come back. What `main` \
-                 would be holding is the stale token the lock invalidated"
-            );
-            assert!(
-                est.engine.lookup(&foreground(ARMED)).is_some(),
-                "on {path} the match engine came back unarmed. That is the recorded obstacle-5 \
-                 failure exactly: autofill silently dead for the rest of the process, with no \
-                 stand-down message and nothing in the log tying it to the lock"
-            );
-            assert!(
-                est.task_in_progress.is_some(),
-                "on {path} the in-progress backend task did not come back, so the tray would \
-                 never stop saying it was working"
-            );
-        }
-
-        /// Path 1 of 3: the worker finished.
-        #[test]
-        fn the_happy_path_reads_the_estate_back() {
-            let dir = scratch("happy");
-            let est = fresh_estate(&dir);
-            nothing_of_the_works_is_there_yet(&est);
-
-            let (back, outcome) =
-                work_on_the_parked_estate(est, Duration::from_secs(30), |park| {
-                    assert!(
-                        park.with(the_work).is_some(),
-                        "the worker must own the estate while it is running"
-                    );
-                });
-
-            assert_eq!(
-                outcome,
-                EstateOutcome::Completed,
-                "a worker that ran to the end inside its deadline completed"
-            );
-            the_worker_reached_the_estate(&back, "the happy path");
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// Path 2 of 3: the deadline expired with the worker still running.
-        ///
-        /// **This is obstacle 5's own path**, and the test is built so that
-        /// abandoning the worker cannot be confused with waiting for it: the
-        /// worker blocks on a channel the test can only send on AFTER the
-        /// call has returned, so the call demonstrably did not join it.
-        ///
-        /// It also proves the second half of the mechanism -- that the
-        /// abandoned worker is locked OUT. Once released it tries one more
-        /// write and reports whether the slot was still there; it must not
-        /// be, or a worker that wakes up ten seconds later would be writing
-        /// into state the main thread owns again.
-        #[test]
-        fn the_deadline_reads_the_estate_back_and_shuts_the_worker_out() {
-            let dir = scratch("deadline");
-            let est = fresh_estate(&dir);
-            nothing_of_the_works_is_there_yet(&est);
-
-            let (release_tx, release_rx) = mpsc::channel::<()>();
-            let (late_tx, late_rx) = mpsc::channel::<bool>();
-
-            let began = Instant::now();
-            let (back, outcome) =
-                work_on_the_parked_estate(est, Duration::from_millis(750), move |park| {
-                    assert!(park.with(the_work).is_some(), "the worker starts as the owner");
-                    // Held until the test says so -- so the deadline is the
-                    // only thing that can end the wait.
-                    release_rx.recv().expect("the test must release this worker");
-                    let late = park
-                        .with(|est| est.token = "written after the deadline".to_string())
-                        .is_some();
-                    let _ = late_tx.send(late);
-                });
-
-            assert_eq!(
-                outcome,
-                EstateOutcome::DeadlineExpired,
-                "the worker was still blocked when the deadline passed, so the wait ended on \
-                 the deadline and on nothing else"
-            );
-            assert!(
-                began.elapsed() >= Duration::from_millis(700),
-                "control: the call returned in {:?}, faster than the deadline it was given, so \
-                 it did not end on the deadline and this test is about some other path",
-                began.elapsed()
-            );
-            the_worker_reached_the_estate(&back, "the deadline path");
-
-            release_tx.send(()).expect("the worker is still alive to be released");
-            let late = late_rx
-                .recv_timeout(Duration::from_secs(10))
-                .expect("the released worker must answer");
-            assert!(
-                !late,
-                "the abandoned worker could still reach the estate after the deadline read it \
-                 back. Two owners of one session state is the split the estate exists to \
-                 remove, and this one would land its writes on a value the main thread has \
-                 already moved on with"
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// Path 3 of 3: the worker panicked, holding the lock.
-        ///
-        /// The panic is raised INSIDE `with`, i.e. while the mutex guard is
-        /// held, so the lock is left poisoned. That is the point: a `reclaim`
-        /// that unwrapped the poison would turn a dead worker into an
-        /// unreachable session -- obstacle 5 by a second route -- so it
-        /// recovers with `PoisonError::into_inner` instead, and this test is
-        /// what says so.
-        ///
-        /// The panic message is printed by the default hook. That is noise in
-        /// the test output, not a failure; the hook is left alone because it
-        /// is process-wide and these tests run beside others.
-        #[test]
-        fn a_panicking_worker_does_not_poison_the_estate_out_of_reach() {
-            let dir = scratch("panic");
-            let est = fresh_estate(&dir);
-            nothing_of_the_works_is_there_yet(&est);
-
-            let (back, outcome) =
-                work_on_the_parked_estate(est, Duration::from_secs(30), |park| {
-                    let _: Option<()> = park.with(|est| {
-                        the_work(est);
-                        panic!("a deliberate panic, raised while the estate's lock is held");
-                    });
-                });
-
-            assert_eq!(
-                outcome,
-                EstateOutcome::WorkerPanicked,
-                "the worker unwound without signalling, and that must be reported as a panic \
-                 rather than as the completion it is not: the caller's next decision -- whether \
-                 the session is settled -- turns on the difference"
-            );
-            the_worker_reached_the_estate(&back, "the panic path");
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// **The in-window lock's own shape: a wait that is not a
-        /// `recv_timeout`.**
-        ///
-        /// The three tests above all reach [`park_and_work`] through
-        /// `work_on_the_parked_estate`, whose wait blocks this thread. That
-        /// is exactly the wait the in-window lock may NOT use -- the calling
-        /// thread there is the one inside `eframe`'s event loop, and blocking
-        /// it is a frozen window. So the host passes a wait of its own, and
-        /// this test drives that arrangement rather than the deadline one:
-        /// the `wait` here loops on a side channel the way a frame closure
-        /// polls its step channel, and only then does the ONE short
-        /// `recv_timeout` on the done channel that turns "the window ended"
-        /// back into `Completed`.
-        ///
-        /// Without this, the `wait` parameter is a parameter only one caller
-        /// ever supplies, and the claim that a second shape of wait works is
-        /// checked by nothing.
-        #[test]
-        fn a_caller_supplied_wait_ends_the_stretch_and_the_estate_still_comes_home() {
-            let dir = scratch("caller-wait");
-            let est = fresh_estate(&dir);
-            nothing_of_the_works_is_there_yet(&est);
-
-            // The worker's own "I am done drawing-relevant work" report --
-            // `TeardownStep::Finished`'s stand-in. It is a DIFFERENT channel
-            // from the completion signal `park_and_work` owns, which is the
-            // whole reason the trailing `recv_timeout` below is needed.
-            let (step_tx, step_rx) = mpsc::channel::<()>();
-            let mut polls = 0usize;
-
-            let (back, outcome) = park_and_work(
-                est,
-                move |park| {
-                    assert!(park.with(the_work).is_some(), "the worker owns the estate");
-                    let _ = step_tx.send(());
-                },
-                |_park, done_rx| {
-                    // The event loop's stand-in: poll, never block on the
-                    // park's own channel.
-                    loop {
-                        polls += 1;
-                        match step_rx.try_recv() {
-                            Ok(()) => break,
-                            Err(mpsc::TryRecvError::Empty) => {
-                                std::thread::sleep(Duration::from_millis(5))
-                            }
-                            Err(mpsc::TryRecvError::Disconnected) => break,
-                        }
-                    }
-                    // The beat between the worker's last report and its
-                    // return. Skipped, a completed stretch would be reported
-                    // as a deadline.
-                    match done_rx.recv_timeout(Duration::from_secs(10)) {
-                        Ok(()) => EstateOutcome::Completed,
-                        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            EstateOutcome::WorkerPanicked
-                        }
-                    }
-                },
-            );
-
-            assert!(
-                polls > 0,
-                "control: the caller's wait never ran a single poll, so this test drove the \
-                 old blocking shape and proved nothing about a wait the caller supplies"
-            );
-            assert_eq!(
-                outcome,
-                EstateOutcome::Completed,
-                "the worker ran to the end, so the stretch completed -- reported as anything \
-                 else, the host would treat a finished teardown as an abandoned one"
-            );
-            the_worker_reached_the_estate(&back, "a caller-supplied wait");
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// **The outcome is the wait's answer, not a guess made underneath
-        /// it -- and the estate comes home either way.**
-        ///
-        /// The host's wait is the event loop, so it is the ONLY thing that
-        /// knows how the window ended: a user who gave up on the spinner and
-        /// a teardown that finished a millisecond later are the same instant
-        /// from underneath. Here the worker really does complete and the wait
-        /// still answers `DeadlineExpired`; [`park_and_work`] must report
-        /// what it was told rather than substituting what it can observe,
-        /// and must still bring the estate home on that answer.
-        #[test]
-        fn the_outcome_is_the_waits_answer_and_not_a_guess_at_it() {
-            let dir = scratch("waits-answer");
-            let est = fresh_estate(&dir);
-            nothing_of_the_works_is_there_yet(&est);
-
-            let (done_tx, done_seen_rx) = mpsc::channel::<()>();
-            let (back, outcome) = park_and_work(
-                est,
-                move |park| {
-                    assert!(park.with(the_work).is_some(), "the worker owns the estate");
-                    let _ = done_tx.send(());
-                },
-                |_park, done_rx| {
-                    // Waited for, so the worker demonstrably DID finish --
-                    // the answer below is a decision and not a race.
-                    done_seen_rx
-                        .recv_timeout(Duration::from_secs(10))
-                        .expect("the worker must reach the end of its work");
-                    let _ = done_rx;
-                    EstateOutcome::DeadlineExpired
-                },
-            );
-
-            assert_eq!(
-                outcome,
-                EstateOutcome::DeadlineExpired,
-                "the wait's answer was overridden from underneath it. The host's wait IS the \
-                 event loop and is the only thing that knows how the window ended; a \
-                 `park_and_work` that decides for itself would report a lock the user \
-                 abandoned as one that settled"
-            );
-            the_worker_reached_the_estate(&back, "an overriding wait");
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// What a `wait` appends to the token once it has the park. Distinct
-        /// from [`AFTER`] so a write that never happened cannot be mistaken
-        /// for the worker's.
-        const BY_THE_WAIT: &str = " +written-through-the-park-by-the-wait";
-
-        /// [`the_worker_reached_the_estate`] for the two tests below, whose
-        /// `wait` writes through the park as well: the token must hold BOTH
-        /// writes, in order, and the worker's other two must still be there.
-        ///
-        /// A separate helper rather than a loosened one, so the three tests
-        /// that expect the worker's token ALONE keep an exact assertion.
-        fn both_writes_came_home(est: &SessionEstate, path: &str) {
-            assert_eq!(
-                est.token,
-                format!("{AFTER}{BY_THE_WAIT}"),
-                "on {path} the estate that came home does not hold both the worker's write and \
-                 the wait's. They must be editing ONE estate: if the caller's park is a second, \
-                 detached one, step 5's `est.child = Some(child)` lands nowhere and a live \
-                 `bw serve` is left with no owner at all"
-            );
-            assert!(
-                est.engine.lookup(&foreground(ARMED)).is_some(),
-                "on {path} the match engine came back unarmed -- autofill silently dead, which \
-                 is the recorded obstacle-5 failure exactly"
-            );
-            assert!(
-                est.task_in_progress.is_some(),
-                "on {path} the in-progress backend task did not come back"
-            );
-        }
-
-        /// **Step 4's own property: the park the `wait` is handed is the park
-        /// the worker is editing, and what the `wait` writes through it comes
-        /// home.**
-        ///
-        /// This is the whole point of the signature change and it is the one
-        /// thing a signature alone does not say. `park_and_work` could hand
-        /// the caller a freshly built, empty `EstatePark` and still compile,
-        /// still return the worker's estate, and still pass every other test
-        /// in this module -- and step 5's startup host, whose `prepare` worker
-        /// arms `est.child` through exactly this handle at the moment
-        /// `bw serve` is spawned, would drop that handle into a slot nobody
-        /// ever reads. A live `bw serve` with no owner, silently, which is the
-        /// orphan the eighth stop's decision exists to make impossible.
-        ///
-        /// The control is the `is_some()`: against a detached park `with`
-        /// answers `None`, and it fails on the control line rather than on a
-        /// confusing value mismatch.
-        #[test]
-        fn the_wait_is_given_the_same_park_the_worker_edits() {
-            let dir = scratch("wait-park");
-            let est = fresh_estate(&dir);
-            nothing_of_the_works_is_there_yet(&est);
-
-            let (back, outcome) = park_and_work(
-                est,
-                |park| {
-                    assert!(park.with(the_work).is_some(), "the worker owns the estate");
-                },
-                |park, done_rx| {
-                    // Sequenced deliberately: the worker's writes are all in
-                    // before the wait adds its own, so the token below is the
-                    // two of them in order and not a race.
-                    let outcome = match done_rx.recv_timeout(Duration::from_secs(10)) {
-                        Ok(()) => EstateOutcome::Completed,
-                        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            EstateOutcome::WorkerPanicked
-                        }
-                    };
-                    let reached = park
-                        .with(|est| est.token.push_str(BY_THE_WAIT))
-                        .is_some();
-                    assert!(
-                        reached,
-                        "control: the `wait` was handed a park with nothing in it. It is not \
-                         the park the worker is editing, so every write a caller makes through \
-                         it is discarded"
-                    );
-                    outcome
-                },
-            );
-
-            assert_eq!(outcome, EstateOutcome::Completed, "the worker ran to the end");
-            both_writes_came_home(&back, "a wait that holds the park");
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// **The one thing a `wait` may not do with the park it is now given:
-        /// take the estate out from under the read-back.**
-        ///
-        /// The park handle escaping the read-back is the hazard step 4's
-        /// signature creates, and it is the read-back's `expect` that bounds
-        /// it: a second reclaimer is a loud, named panic on the spot rather
-        /// than a session silently emptied. Without this the `expect` is a
-        /// message nothing has ever produced, and the shape it forbids is
-        /// exactly the one a host trying to "read the estate a bit early"
-        /// would reach for.
-        #[test]
-        #[should_panic(expected = "the parked session state was gone at the read-back")]
-        fn a_wait_that_reclaims_the_estate_is_caught_at_the_read_back() {
-            let dir = scratch("wait-reclaims");
-            let est = fresh_estate(&dir);
-
-            let (_back, _outcome) = park_and_work(
-                est,
-                |park| {
-                    let _ = park.with(the_work);
-                },
-                |park, done_rx| {
-                    let _ = done_rx.recv_timeout(Duration::from_secs(10));
-                    // The forbidden move: the wait empties the slot the
-                    // read-back below is about to read.
-                    let stolen = park.reclaim();
-                    assert!(
-                        stolen.is_some(),
-                        "control: the wait reclaimed nothing, so this test never set up the \
-                         double-reclaim it is about"
-                    );
-                    EstateOutcome::Completed
-                },
-            );
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-
-        /// **A worker that panics mid-teardown leaves the estate WRITABLE, not
-        /// merely reclaimable.**
-        ///
-        /// `a_panicking_worker_does_not_poison_the_estate_out_of_reach` above
-        /// pins [`EstatePark::reclaim`]'s poison recovery -- measured, not
-        /// assumed: replacing `reclaim`'s `unwrap_or_else(PoisonError::
-        /// into_inner)` with an `expect` fails that test. Nothing pinned
-        /// [`EstatePark::with`]'s identical recovery, and the same replacement
-        /// there passed the whole suite.
-        ///
-        /// That gap matters exactly where step 5 puts its weight. A worker
-        /// panicking mid-teardown is what poisons the slot in the first place,
-        /// and from step 5 onward the thread that must still reach the estate
-        /// after such a panic -- to arm `est.child`, or to stop a `bw serve`
-        /// nobody else can see -- reaches it through `with`. An `expect` there
-        /// turns "a worker died" into "the session is unreachable": obstacle 5
-        /// by a second route, on the one path the type exists to survive.
-        ///
-        /// **The control is asserted first and is the whole point.** A test
-        /// that "passes" because the panic never poisoned anything proves
-        /// nothing at all, so the poisoning is verified against the mutex
-        /// itself before the recovery is asked for.
-        #[test]
-        fn a_panicking_worker_leaves_the_estate_writable_not_merely_reclaimable() {
-            let dir = scratch("panic-writable");
-            let est = fresh_estate(&dir);
-            nothing_of_the_works_is_there_yet(&est);
-
-            let (back, outcome) = park_and_work(
-                est,
-                |park| {
-                    let _: Option<()> = park.with(|est| {
-                        the_work(est);
-                        panic!("a deliberate panic, raised while the estate's lock is held");
-                    });
-                },
-                |park, done_rx| {
-                    // The worker's sender is dropped as it unwinds, so this is
-                    // the panic arriving -- and it arrives AFTER the guard the
-                    // panic poisoned has been released.
-                    let outcome = match done_rx.recv_timeout(Duration::from_secs(10)) {
-                        Ok(()) => EstateOutcome::Completed,
-                        Err(mpsc::RecvTimeoutError::Timeout) => EstateOutcome::DeadlineExpired,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            EstateOutcome::WorkerPanicked
-                        }
-                    };
-                    assert!(
-                        park.slot.lock().is_err(),
-                        "control: the slot's mutex is NOT poisoned, so the write below is an \
-                         ordinary one and this test says nothing about poison recovery. Every \
-                         assertion after this line would pass against an `EstatePark` that \
-                         cannot survive a panic at all"
-                    );
-                    let reached = park
-                        .with(|est| est.token.push_str(BY_THE_WAIT))
-                        .is_some();
-                    assert!(
-                        reached,
-                        "the estate was unreachable through `with` after a worker panicked \
-                         holding its lock. `with` must recover from poisoning exactly as \
-                         `reclaim` does: a dead worker is the state this type exists to \
-                         survive, and from step 5 onward the thread that has to arm the child \
-                         or stop an orphaned `bw serve` after such a panic goes through here"
-                    );
-                    outcome
-                },
-            );
-
-            assert_eq!(
-                outcome,
-                EstateOutcome::WorkerPanicked,
-                "control: the worker did not unwind, so nothing was poisoned"
-            );
-            both_writes_came_home(&back, "a panic the estate was written through");
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-    }
 
     mod what_a_finished_vault_session_means {
         use super::super::{vault_follow_up, VaultFollowUp};
@@ -23691,9 +22851,10 @@ mod tests {
                     // begun -- half a teardown, a rebuild that never ran. So
                     // the rule is not "no jump" but "no jump after anything
                     // has started", and that is exactly what is asserted: at
-                    // most one `return`, and it must appear BEFORE the window
-                    // is handed to eframe, which is the first irreversible
-                    // step this method takes.
+                    // most one `return`, and it must appear BELOW the ask
+                    // whose outcome it carries -- there is no irreversible
+                    // step left in this method for it to fall past, because
+                    // the window it used to host now runs in another process.
                     let jumps = jumps_in(&body);
                     assert!(
                         jumps.len() <= 1 && jumps.iter().all(|j| *j == "return"),
@@ -23717,19 +22878,27 @@ mod tests {
                              window, so either the daemon is paying for the OpenGL driver \
                              again or the one-window rule is being bypassed",
                         );
-                    let eframe = body.find(concat!("app_window::run_from_", "vault(")).expect(
-                        "control: the sliced body does not open a window at all",
-                    );
+                    // **There is no eframe host below the handoff to be
+                    // above of.** There was, and the ordering assertion
+                    // here was the whole of what kept the daemon out of the
+                    // graphics driver on the common path. The host is gone
+                    // -- see `no_route_left_in_the_daemon_draws_a_vault_
+                    // window` -- so what the ordering rule becomes is the
+                    // other half of the same fact: the one `return` carries
+                    // the handoff's outcome, so it is BELOW the ask, and
+                    // nothing irreversible happens after it because nothing
+                    // happens after it at all.
                     assert!(
-                        handoff < eframe,
-                        "the UI-process handoff is below the in-daemon window, so the \
-                         daemon opens one first and the split has bought nothing:\n{body}"
+                        !body.contains(concat!("app_window::run_from_", "vault(")),
+                        "`open_window` hosts a window in the daemon again, so this method \
+                         has an irreversible step for a jump to skip past once more:\n{body}"
                     );
                     if let Some(at) = body.find("return") {
                         assert!(
-                            at < eframe,
-                            "`open_window` returns after handing a window to eframe, which \
-                             is the shape that shipped a silent lock failure in \
+                            handoff < at,
+                            "`open_window` returns before it asks for the window, so the \
+                             one permitted jump skips the only work this method does -- \
+                             which is the shape that shipped a silent lock failure in \
                              v0.5.0:\n{body}"
                         );
                     }
@@ -24381,7 +23550,6 @@ mod tests {
             /// with the removal no longer restatable incorrectly.
             dir: deskwarden::test_scratch::ScratchDir,
             settings_path: PathBuf,
-            fill_stats: fill_stats::FillStats,
             job: Arc<Option<job_object::KillOnCloseJob>>,
             schedule: Vec<Duration>,
             backend_op_tx: mpsc::Sender<BackendOp>,
@@ -24396,7 +23564,6 @@ mod tests {
                 let (backend_op_tx, _backend_op_rx) = mpsc::channel();
                 Self {
                     settings_path: dir.join("settings.json"),
-                    fill_stats: fill_stats::FillStats::new(dir.join("fill-stats.json")),
                     job: Arc::new(None),
                     schedule: Vec::new(),
                     backend_op_tx,
@@ -24407,10 +23574,8 @@ mod tests {
 
             fn deps(&self) -> VaultDeps<'_> {
                 VaultDeps {
-                    fill_stats: &self.fill_stats,
                     job: &self.job,
                     schedule: &self.schedule,
-                    icon_cache_dir: &self.dir,
                     config_dir: &self.dir,
                     settings_path: &self.settings_path,
                     first_run_account: None,
@@ -35426,6 +34591,7 @@ mod bw_serve_gate {
 /// whose server URL is self-hosted, and the tests that want that arm supply a
 /// temp config directory with no key file in it, which is the arm that does
 /// no I/O beyond one `read` that fails.
+
 #[cfg(test)]
 mod vault_backend_choice_tests {
     use super::*;
@@ -35505,41 +34671,6 @@ mod vault_backend_choice_tests {
         assert!(backend_policy::direct_rest_login().is_none());
     }
 
-    /// **The shipped bug, at the moment it is made: switching the backend must
-    /// not strand the account with a window that never opens.**
-    ///
-    /// An account switched to the built-in client with no `userkey.bin` --
-    /// which is every account that made this switch, since the file is written
-    /// only by a sign-in already taken on the direct-REST path, and also every
-    /// account whose sign-in carried no refresh token (`UserKeyStore::save`
-    /// answers `Ok(false)` there, so the DAEMON reads the vault happily off an
-    /// in-memory key while nothing is on disk for a child to find).
-    ///
-    /// The UI process for such an account can do exactly one thing: exit. So
-    /// the daemon must not spawn one -- it asks this question first and keeps
-    /// the window in the process that can sign in.
-    ///
-    /// Fails on `main`, where nothing asks: the daemon spawned, the child
-    /// exited `UI_COULD_NOT_START`, and the user saw a click that did nothing.
-    #[test]
-    fn a_built_in_client_account_with_no_stored_key_is_given_a_ui_process() {
-        let config = scratch_config("no-stored-key");
-        let account = account_on_the_built_in_client(Some("https://vault.example.com"));
-        accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
-        assert!(
-            !accounts::user_key_path_for(&config, &account.id).exists(),
-            "control: this account must really have no stored key, or the assertion below \
-             passes without reaching the state it names"
-        );
-        assert_eq!(
-            why_a_ui_process_could_not_read_this_vault(&config, Some(&account)),
-            None,
-            "a direct-REST account with no stored key is exactly the window this branch \
-             moved into a child: the card derives the key there. Refusing the spawn keeps \
-             the sign-in in the daemon, which is what loads the OpenGL driver into a \
-             process that never gives it back"
-        );
-    }
 
     /// **A ui process's vault cache reads the SLOT on both arms.**
     ///
@@ -35944,12 +35075,12 @@ mod vault_backend_choice_tests {
             // and its own recovery is the only thing left.
             (
                 DirectRest,
-                false,
+                true,
                 Some(&no_server),
                 false,
                 true,
                 false,
-                "an account with no server URL has nothing for a card to sign in TO",
+                "**THE ROW THAT FLIPPED LAST.** An account with no recorded server URL used \n                 to send its card back into the daemon. The card has a Server URL field -- \n                 it is the first thing on it -- so a missing address is what that field is \n                 for. With this, no sign-in reaches the daemon by any route",
             ),
             // No sign-in is owed at all: the window opens on the vault.
             (
@@ -35962,7 +35093,7 @@ mod vault_backend_choice_tests {
                 "there is no sign-in to place when the slot is already filled",
             ),
             // No account resolved at all -- `settings.json` names none.
-            (DirectRest, false, None, false, true, false, "there is no account to sign in as"),
+            (DirectRest, false, None, false, true, true, "a launch with NO account record still opens its card in a ui process: the card \n                 mints one from the email and server typed into it, which is what a first \n                 install has always done"),
             // **THE ROW THAT FLIPPED.** A `bw serve` account with no session
             // token and a CLI to sign in with: the card opens in the child,
             // which stores the token and rings the daemon for a backend.
@@ -36097,32 +35228,6 @@ mod vault_backend_choice_tests {
         );
     }
 
-    /// **The positive control, and it is a real key.** Same account, same
-    /// directory, one file written through the very store the daemon reads --
-    /// so this is not "the function answers None for anything", it is the file
-    /// being found. The window opens in its own process again.
-    #[test]
-    fn the_same_account_with_a_stored_key_gets_its_ui_process() {
-        let config = scratch_config("stored-key");
-        let account = account_on_the_built_in_client(Some("https://vault.example.com"));
-        accounts::ensure_account_dir(&config, &account.id).expect("the account directory");
-        let store = user_key_store::UserKeyStore::new(accounts::user_key_path_for(
-            &config,
-            &account.id,
-        ));
-        assert!(store.store_a_fixture_key().expect("the fixture key was written"));
-        assert!(
-            store.load().is_some(),
-            "control: the fixture key does not load, so the assertion below would pass for a \
-             file that is not there"
-        );
-        assert_eq!(
-            why_a_ui_process_could_not_read_this_vault(&config, Some(&account)),
-            None,
-            "an account the built-in client CAN serve was refused a window of its own"
-        );
-        store.clear().expect("clear");
-    }
 
     /// The other half of the same account record. A built-in-client account
     /// with no server has nothing to read the vault from, and it is a
@@ -36150,27 +35255,6 @@ mod vault_backend_choice_tests {
         );
     }
 
-    /// **The `bw serve` account is untouched**, which is the whole install
-    /// base on the shipped default. Nothing about a stored key gates a window
-    /// there, and a guard that ghosted those windows would be a far worse bug
-    /// than the one it fixes.
-    #[test]
-    fn a_bw_serve_account_is_never_asked_about_a_stored_key() {
-        let config = scratch_config("bw-serve-window");
-        for account in [
-            account_on(Some("https://vault.example.com")),
-            account_on(None),
-            account_on_the_built_in_client(None),
-        ] {
-            assert_eq!(
-                why_a_ui_process_could_not_read_this_vault(&config, Some(&account)),
-                None,
-                "a `bw serve` account was refused its own UI process over a file it has never \
-                 needed"
-            );
-        }
-        assert_eq!(why_a_ui_process_could_not_read_this_vault(&config, None), None);
-    }
 
     /// An account with no account list at all -- `StartupAccounts::
     /// NoAccountList` -- settles the same way, and does not panic reaching for

@@ -5596,13 +5596,17 @@ mod source_pins {
                 // pinned to one, one file down -- so this is still the count
                 // of every place that could.
                 //
-                // **Four in `main.rs`.** Three of them are the daemon's, and
-                // it went from four to three when the startup door stopped
-                // drawing in the daemon: that branch built a vault frame in
-                // this process and named the type to do it, and it now asks
-                // `UiWindows` for a process instead.
+                // **Three in `main.rs`.** Two of them are the daemon's, and
+                // it went four -> three -> two as the daemon stopped drawing:
+                // first the startup door, which built a vault frame in this
+                // process and named the type to do it and now asks
+                // `UiWindows` for a process instead, and then
+                // `RealVaultOps::open_window`, whose in-daemon host came out
+                // whole -- see `no_route_left_in_the_daemon_draws_a_vault_
+                // window`. What is left on this side is the startup branch's
+                // own frame and the rebuild the in-window lock runs.
                 //
-                // **The fourth is the `--ui` child's own, and it is on the
+                // **The third is the `--ui` child's own, and it is on the
                 // other side of the boundary this pin is drawn around.** A
                 // direct-REST child that opens on a sign-in card hosts the
                 // vault stage itself, through `app_window::run`, and builds
@@ -5613,7 +5617,7 @@ mod source_pins {
                 // file down. So this is a fourth place the pointer EXISTS and
                 // not a fourth place it can be reached from, which is the
                 // property this count stands for.
-                vec![("main.rs", 4), ("vault_window/mod.rs", 5)],
+                vec![("main.rs", 3), ("vault_window/mod.rs", 5)],
             ),
         ] {
             let files = crate_sources();
@@ -5637,7 +5641,7 @@ mod source_pins {
                  the binding and its two calls (`spawn_sync` in `mod.rs`), the one read of \
                  the field (`env.sync`), the real spawner's own definition and the one \
                  place `VaultFrameEnv::production` names it, and the type itself -- which \
-                 no file but `mod.rs` and `main.rs`'s four constructions may name, so a \
+                 no file but `mod.rs` and `main.rs`'s three constructions may name, so a \
                  sibling cannot even take an `env` to read the pointer out of"
             );
         }
