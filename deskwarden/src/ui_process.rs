@@ -1205,7 +1205,9 @@ mod tests {
         assert_eq!(
             reap_step(Err(())),
             Reap::Take { code: None },
-            "a handle that can no longer be waited on means the window is gone. Kept, the              daemon believes one is open forever and the one-window rule then refuses every              later Open Vault for the life of the process"
+            "a handle that can no longer be waited on means the window is gone. Kept, the daemon \
+             believes one is open forever and the one-window rule then refuses every later Open \
+             Vault for the life of the process"
         );
     }
 
@@ -1224,7 +1226,8 @@ mod tests {
         assert_eq!(
             open_decision(Some(4242), false),
             UiOpenDecision::FocusTheOpenOne { pid: 4242 },
-            "two vault windows on one vault is two editors of the same records; the second              request brings the first window forward"
+            "two vault windows on one vault is two editors of the same records; the second request \
+             brings the first window forward"
         );
     }
 
@@ -1688,12 +1691,15 @@ mod tests {
         assert_eq!(
             farewell_to_an_open_window(WhyClose::TheUserWalkedAway, Some(4242)),
             Farewell::CloseIt { pid: 4242 },
-            "a decrypted vault rendered on screen must not survive the moment its owner              locked the workstation and left; the daemon's own cache and bw serve are torn              down in the same breath and this process is the only thing left holding one"
+            "a decrypted vault rendered on screen must not survive the moment its owner locked the \
+             workstation and left; the daemon's own cache and bw serve are torn down in the same \
+             breath and this process is the only thing left holding one"
         );
         assert_eq!(
             farewell_to_an_open_window(WhyClose::TheUserWalkedAway, None),
             Farewell::NothingOpen,
-            "no window open is nothing to close -- the ordinary tray-only state this whole              feature was originally written for"
+            "no window open is nothing to close -- the ordinary tray-only state this whole feature \
+             was originally written for"
         );
     }
 

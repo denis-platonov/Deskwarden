@@ -1250,22 +1250,38 @@ mod tests {
 
             assert!(
                 source.contains(&format!("&HSTRING::from({title})")),
-                "`{name}` does not open its window under `{title}`. The title is what keeps                  `pick`'s `find` exact while this window is up alongside the tray's and the                  hotkey listener's helper windows, and                  `only_one_window_of_this_process_can_exist_at_a_time` asserts it is unique --                  an assertion about a constant no window is actually opened under proves                  nothing."
+                "`{name}` does not open its window under `{title}`. The title is what keeps \
+                 `pick`'s `find` exact while this window is up alongside the tray's and the hotkey \
+                 listener's helper windows, and \
+                 `only_one_window_of_this_process_can_exist_at_a_time` asserts it is unique -- an \
+                 assertion about a constant no window is actually opened under proves nothing."
             );
             assert_eq!(
                 source.matches("SetForegroundWindow(").count(),
                 1,
-                "`{name}` opens a window the user has to type into and does not ask for the                  foreground exactly once. This surface is answered by typing; without the                  foreground the keystrokes go to whatever the user was in, which for a master                  password is considerably worse than a window sitting behind something."
+                "`{name}` opens a window the user has to type into and does not ask for the \
+                 foreground exactly once. This surface is answered by typing; without the \
+                 foreground the keystrokes go to whatever the user was in, which for a master \
+                 password is considerably worse than a window sitting behind something."
             );
             assert_eq!(
                 source.matches("SetWindowDisplayAffinity(").count(),
                 1,
-                "`{name}` shows something a screen recorder must not be handed -- a master                  password, or the list of which accounts this user holds for the app in front                  of them -- and does not exclude itself from screen capture exactly once. `unlock_prompt`'s own                  `the_capture_exclusion_goes_on_the_top_level_window` holds that the call is                  MADE and reaches the top-level window rather than the child `EDIT` (which                  Windows refuses with E_INVALIDARG); this holds that the call is still in the                  file at all."
+                "`{name}` shows something a screen recorder must not be handed -- a master \
+                 password, or the list of which accounts this user holds for the app in front of \
+                 them -- and does not exclude itself from screen capture exactly once. \
+                 `unlock_prompt`'s own `the_capture_exclusion_goes_on_the_top_level_window` holds \
+                 that the call is MADE and reaches the top-level window rather than the child \
+                 `EDIT` (which Windows refuses with E_INVALIDARG); this holds that the call is \
+                 still in the file at all."
             );
             assert_eq!(
                 source.matches("run_ui_native(").count(),
                 0,
-                "`{name}` has become an `eframe` window, which is the ~95 MB of unreleasable                  OpenGL driver arenas this surface exists to not spend. If that is deliberate,                  move it to `RAISING_SITES` -- and re-measure, because the daemon/UI split's                  whole premise is that this file never links a renderer."
+                "`{name}` has become an `eframe` window, which is the ~95 MB of unreleasable \
+                 OpenGL driver arenas this surface exists to not spend. If that is deliberate, \
+                 move it to `RAISING_SITES` -- and re-measure, because the daemon/UI split's whole \
+                 premise is that this file never links a renderer."
             );
         }
         // Positive controls on the four needles above, so none of them is a
@@ -1595,7 +1611,8 @@ mod tests {
         // than an empty vector every loop below would skip.
         assert!(
             declared.len() > 20,
-            "only {} modules parsed out of lib.rs -- the parse is wrong, and every check              below is vacuous: {declared:?}",
+            "only {} modules parsed out of lib.rs -- the parse is wrong, and every check below is \
+             vacuous: {declared:?}",
             declared.len()
         );
         assert!(
@@ -1606,13 +1623,19 @@ mod tests {
         for module in OPENS_WINDOWS.iter().chain(OPENS_NO_WINDOW.iter()) {
             assert!(
                 declared.contains(module),
-                "`{module}` is classified here but is not declared in lib.rs; if it was                  renamed or removed, update this list"
+                "`{module}` is classified here but is not declared in lib.rs; if it was renamed or \
+                 removed, update this list"
             );
         }
         for module in &declared {
             assert!(
                 OPENS_WINDOWS.contains(module) != OPENS_NO_WINDOW.contains(module),
-                "`{module}` is in neither list (or in both). Every module in this crate has                  to be classified: if it opens a window, add it to the `sites` table in                  `every_window_this_crate_opens_asks_to_be_brought_to_the_front` AND to                  `OPENS_WINDOWS` here, so its raise is guarded. If it does not, say so in                  `OPENS_NO_WINDOW`. A module in neither is a window nothing checks -- which                  is how `app_window` was added, unguarded, and the whole reason this test                  exists."
+                "`{module}` is in neither list (or in both). Every module in this crate has to be \
+                 classified: if it opens a window, add it to the `sites` table in \
+                 `every_window_this_crate_opens_asks_to_be_brought_to_the_front` AND to \
+                 `OPENS_WINDOWS` here, so its raise is guarded. If it does not, say so in \
+                 `OPENS_NO_WINDOW`. A module in neither is a window nothing checks -- which is how \
+                 `app_window` was added, unguarded, and the whole reason this test exists."
             );
         }
 
@@ -1635,7 +1658,8 @@ mod tests {
             RAISING_SITES.len()
                 + OPENS_A_VIEWPORT_AND_RAISES_IT.len()
                 + OPENS_A_WIN32_WINDOW_AND_RAISES_IT.len(),
-            "control: a name per raising site -- `eframe`'s loops, the viewports and the one              bare-Win32 window alike"
+            "control: a name per raising site -- `eframe`'s loops, the viewports and the one \
+             bare-Win32 window alike"
         );
         assert!(
             raises.contains(&"scratch_window"),
@@ -1875,7 +1899,8 @@ mod tests {
         assert_ne!(
             crate::picker_prompt::PICKER_PROMPT_TITLE,
             crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
-            "the account picker and the unlock prompt are both opened from the daemon and both              found by title"
+            "the account picker and the unlock prompt are both opened from the daemon and both \
+             found by title"
         );
         assert_ne!(
             crate::picker_prompt::PICKER_PROMPT_TITLE,

@@ -67,7 +67,9 @@ pub const FILE_TAG: &str = "FILE";
 ///
 /// Painted only when a file Send is present, so a list of text Sends is not
 /// told about a restriction it has not met.
-pub const FILE_SEND_EXPLANATION: &str = "Deskwarden can send text, not files. This Send holds a      file, so you can copy its link or delete it here, but it was made somewhere else.";
+pub const FILE_SEND_EXPLANATION: &str = "Deskwarden can send text, not files. This Send holds a \
+                                         file, so you can copy its link or delete it here, but it \
+                                         was made somewhere else.";
 
 /// What a Send **read from a link** needs, when reading one fails for want of
 /// the CLI.
@@ -77,7 +79,9 @@ pub const FILE_SEND_EXPLANATION: &str = "Deskwarden can send text, not files. Th
 /// "that link could not be read" goes and checks the link, which is fine.
 /// The second sentence is there because without it the first reads as "Sends
 /// are broken", which is false in three operations out of four.
-pub const RECEIVE_NEEDS_THE_CLI: &str = "Reading a Send from a link needs Bitwarden's      command-line tool. Publishing, listing and revoking your own Sends do not.";
+pub const RECEIVE_NEEDS_THE_CLI: &str = "Reading a Send from a link needs Bitwarden's command-line \
+                                         tool. Publishing, listing and revoking your own Sends do \
+                                         not.";
 
 /// What the pane says when the account genuinely has no Sends. A **claim**,
 /// and only reachable from a fetch that succeeded -- see [`pane_state`].
@@ -2527,7 +2531,8 @@ mod paint_tests {
         for kept in ["Publishing", "listing", "revoking"] {
             assert!(
                 RECEIVE_NEEDS_THE_CLI.contains(kept),
-                "{kept:?} is not named as still working, so the sentence reads as `Sends need                  the CLI`: {RECEIVE_NEEDS_THE_CLI}"
+                "{kept:?} is not named as still working, so the sentence reads as `Sends need the \
+                 CLI`: {RECEIVE_NEEDS_THE_CLI}"
             );
         }
         // The control: the two sentences are not the same sentence, so an
@@ -8764,7 +8769,9 @@ mod frame_promptness {
         );
         outcome.expect_painted(
             SEND_NAME,
-            "the Sends screen is up and the fetch answered, but the Send it answered with is              not on screen -- `draw_send_pane`'s `Ok` arm, which is the rows a user reads,              was not executed",
+            "the Sends screen is up and the fetch answered, but the Send it answered with is not \
+             on screen -- `draw_send_pane`'s `Ok` arm, which is the rows a user reads, was not \
+             executed",
         );
         assert!(
             !outcome.painted(LOGIN_NAME),

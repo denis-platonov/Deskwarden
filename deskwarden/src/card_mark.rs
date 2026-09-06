@@ -638,11 +638,13 @@ mod tests {
         let set = text_size(MARK_ROW_HEIGHT);
         assert!(
             set < SUBTITLE_SIZE,
-            "a {MARK_ROW_HEIGHT}pt mark sets its word at {set}pt, which is not below even the              row's secondary {SUBTITLE_SIZE}pt, let alone the name's {TITLE_SIZE}pt"
+            "a {MARK_ROW_HEIGHT}pt mark sets its word at {set}pt, which is not below even the \
+             row's secondary {SUBTITLE_SIZE}pt, let alone the name's {TITLE_SIZE}pt"
         );
         assert!(
             set >= OLD_BADGE_SIZE,
-            "the mark is set at {set}pt, under the {OLD_BADGE_SIZE}pt the corner badge used --              below which `MASTERCARD` stops being a word at 1x"
+            "the mark is set at {set}pt, under the {OLD_BADGE_SIZE}pt the corner badge used -- \
+             below which `MASTERCARD` stops being a word at 1x"
         );
     }
 

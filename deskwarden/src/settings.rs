@@ -2811,7 +2811,8 @@ mod tests {
         let loaded = Settings::load(&path);
         assert!(
             loaded.reveal_totp_seed,
-            "the TOTP-secret setting was dropped by persist_preferences, so turning it on              lasts only until the app is restarted"
+            "the TOTP-secret setting was dropped by persist_preferences, so turning it on lasts \
+             only until the app is restarted"
         );
         // The neighbours it is destructured beside are untouched, so this is
         // not satisfied by a writer that clobbers the file with something else.

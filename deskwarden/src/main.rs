@@ -3825,7 +3825,8 @@ fn ask_for_a_vault_search(pending: &mut Option<String>, asked: Option<String>) {
     if pending.is_some() {
         // Never the query itself: this is a log line.
         log::info!(
-            "a second door asked to search the vault before the first request opened a              window; keeping the first"
+            "a second door asked to search the vault before the first request opened a window; \
+             keeping the first"
         );
         return;
     }
@@ -5264,7 +5265,9 @@ fn restart_backend_after_unlock(
         // told the user to press "Sync" -- which was itself broken (C4).
         BackendStart::NotSelected => {
             log::info!(
-                "this account's vault is served directly over REST, so the unlock recovery has                  no `bw serve` to restart; carrying on with the vault the cache's own bridge                  answers from"
+                "this account's vault is served directly over REST, so the unlock recovery has no \
+                 `bw serve` to restart; carrying on with the vault the cache's own bridge answers \
+                 from"
             );
             BackendAfterUnlock::NoSubprocess
         }
@@ -6894,11 +6897,13 @@ impl UiWindows {
         {
             let mut open = self.vault.take().expect("a pid means the slot is occupied");
             log::info!(
-                "Windows reported the user walked away with the vault window (process {pid})                  open; closing it rather than leaving a decrypted vault on a machine its                  owner has left"
+                "Windows reported the user walked away with the vault window (process {pid}) open; \
+                 closing it rather than leaving a decrypted vault on a machine its owner has left"
             );
             if let Err(e) = open.child.kill() {
                 log::warn!(
-                    "could not close the vault window's process {pid} ({e}); the vault is                      still being locked behind it, but that process may still be showing it"
+                    "could not close the vault window's process {pid} ({e}); the vault is still \
+                     being locked behind it, but that process may still be showing it"
                 );
             }
             deskwarden::ui_process::forget_result(&deskwarden::ui_process::result_path(
@@ -8274,7 +8279,8 @@ fn run_vault_loop(
                 // behind `ops`.
                 if relocked {
                     log::info!(
-                        "the vault window tore this session down and rebuilt it in place, so                          the lock is already served and no second teardown runs"
+                        "the vault window tore this session down and rebuilt it in place, so the \
+                         lock is already served and no second teardown runs"
                     );
                 } else {
                     est = ops.resettle_after_lost_session(est, deps);
@@ -9932,7 +9938,7 @@ fn apply_backend_op(
         // idle, exactly as the started arm does.
         BackendOp::EnsureRunning(BackendStart::NotSelected) => {
             log::info!(
-                "the vault window needed no `bw serve`: this account is served directly over                  REST"
+                "the vault window needed no `bw serve`: this account is served directly over REST"
             );
             tray_effects.push(TrayEffect::SyncIdle);
         }
@@ -11557,7 +11563,8 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                         // it for an item until the vault stage, which is
                         // entered only after `adopt` has filled it.
                         log::info!(
-                            "this window has no stored master key for {server_url}; it opens on                              the sign-in card and derives one"
+                            "this window has no stored master key for {server_url}; it opens on \
+                             the sign-in card and derives one"
                         );
                         sign_in_here = true;
                         VaultCache::with_disk_cache(
@@ -13200,7 +13207,8 @@ fn device_id_for(id: &accounts::AccountId) -> String {
 /// decrypts anything would give a vault that reads as empty, which is
 /// indistinguishable -- to the user and to the log -- from a vault that is.
 /// So the only fallback is asking.
-#[must_use = "the environment this returns has to be installed, or `login_ui`'s sign-in               worker derives nothing and the slot this filled is never refilled"]
+#[must_use = "the environment this returns has to be installed, or `login_ui`'s sign-in worker \
+              derives nothing and the slot this filled is never refilled"]
 /// **Why this settlement is happening**, which decides one thing only: what a
 /// failed live probe does to the stored master key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13298,7 +13306,8 @@ fn settle_the_vault_backend_when(
                 user_key_store::UserKeyStore::new(accounts::user_key_path_for(config_dir, &account.id));
             if let Err(e) = key_store.clear() {
                 log::error!(
-                    "this account is no longer served over REST, but its stored vault key                      could not be deleted: {e}"
+                    "this account is no longer served over REST, but its stored vault key could \
+                     not be deleted: {e}"
                 );
             }
         }
@@ -14508,7 +14517,8 @@ fn the_details_this_window_opens_with(
         None => {
             if signed_in.is_some() {
                 log::info!(
-                    "the sign-in in this window describes the account it started on, not the                      one it is on now; the toolbar is named off the account instead"
+                    "the sign-in in this window describes the account it started on, not the one \
+                     it is on now; the toolbar is named off the account instead"
                 );
             }
             login_ui::account_details_for(account)
@@ -14556,7 +14566,9 @@ fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) 
         // gate is ever removed this is a bug in the launch sequence, and it
         // says so.
         BackendStart::NotSelected => unreachable!(
-            "`start_backend` was called on an account whose vault is served directly over              REST. `fn main`'s call site is gated on `backend_policy::bw_serve_is_selected()`              precisely so this cannot happen; the gate has been removed or bypassed"
+            "`start_backend` was called on an account whose vault is served directly over REST. \
+             `fn main`'s call site is gated on `backend_policy::bw_serve_is_selected()` precisely \
+             so this cannot happen; the gate has been removed or bypassed"
         ),
         // **The one arm that is no longer unconditionally fatal**, and the
         // condition is the whole of this branch.
@@ -15457,11 +15469,13 @@ mod tests {
         );
         assert!(
             body.contains("forget_result"),
-            "the child will never have written a result worth reading, and a file nobody              reads is one the user's config directory should not keep; got {body:?}"
+            "the child will never have written a result worth reading, and a file nobody reads is \
+             one the user's config directory should not keep; got {body:?}"
         );
         assert!(
             !body.contains("read_result"),
-            "reading the killed child's result file is the exact mistake this test exists              to prevent: exit code 1 is EXIT_LOCKED; got {body:?}"
+            "reading the killed child's result file is the exact mistake this test exists to \
+             prevent: exit code 1 is EXIT_LOCKED; got {body:?}"
         );
     }
 
@@ -15473,11 +15487,13 @@ mod tests {
         assert_eq!(
             deskwarden::ui_process::UiVaultResult::EXIT_LOCKED,
             1,
-            "TerminateProcess (which is what Child::kill is on Windows) sets exit code 1.              These being equal is why the away-lock kill must take the registry slot"
+            "TerminateProcess (which is what Child::kill is on Windows) sets exit code 1. These \
+             being equal is why the away-lock kill must take the registry slot"
         );
         assert!(
             deskwarden::ui_process::UiVaultResult::from_exit_code(1).locked,
-            "control: status 1 really does decode as a lock, so leaving a killed child in              the slot really would produce a spurious one"
+            "control: status 1 really does decode as a lock, so leaving a killed child in the slot \
+             really would produce a spurious one"
         );
     }
 
@@ -15508,7 +15524,8 @@ mod tests {
         let close = body
             .find(concat!("close_because_the_user_walked_", "away("))
             .expect(
-                "the away-lock path must close the vault window; without this the user                  presses Win+L and leaves a decrypted vault rendered in a second process",
+                "the away-lock path must close the vault window; without this the user presses \
+                 Win+L and leaves a decrypted vault rendered in a second process",
             );
         let clipboard = body
             .find(concat!("clear_if_still_ours_", "for("))
@@ -15519,11 +15536,13 @@ mod tests {
 
         assert!(
             clipboard < close,
-            "the clipboard clear stays first: it is microseconds and it is the one thing              that outlives this process entirely"
+            "the clipboard clear stays first: it is microseconds and it is the one thing that \
+             outlives this process entirely"
         );
         assert!(
             close < resettle,
-            "the window must be closed BEFORE resettle_session, which blocks on a              master-password prompt for as long as the user is away"
+            "the window must be closed BEFORE resettle_session, which blocks on a master-password \
+             prompt for as long as the user is away"
         );
     }
 
@@ -15539,12 +15558,14 @@ mod tests {
         assert_eq!(
             source.matches(concat!("close_because_the_user_walked_", "away(")).count(),
             2,
-            "expected exactly the definition and its one call inside              lock_after_walking_away, and no others"
+            "expected exactly the definition and its one call inside lock_after_walking_away, and \
+             no others"
         );
         assert_eq!(
             source.matches(concat!("close_on_", "quit(")).count(),
             2,
-            "control: the quit path's own killer still has exactly its definition and its              one call, so the count above is measuring what it claims to"
+            "control: the quit path's own killer still has exactly its definition and its one \
+             call, so the count above is measuring what it claims to"
         );
     }
 
@@ -16758,7 +16779,7 @@ mod tests {
         let body = after
             .split_once(concat!("fn the_details_this_window_opens", "_with("))
             .expect(
-                "`the_details_this_window_opens_with` must still be the function defined                  after it",
+                "`the_details_this_window_opens_with` must still be the function defined after it",
             )
             .0;
         assert!(
@@ -21394,27 +21415,36 @@ mod tests {
             let trait_body = super::body_of(&code, concat!("trait Vault", "Ops {"));
             assert!(
                 (200..6000).contains(&trait_body.len()),
-                "the sliced `VaultOps` declaration is {} bytes, which is not three method                  signatures",
+                "the sliced `VaultOps` declaration is {} bytes, which is not three method \
+                 signatures",
                 trait_body.len()
             );
             let squeezed = squeeze(&trait_body);
             assert_eq!(
                 squeezed.matches(concat!("est: Session", "Estate,")).count(),
                 3,
-                "`VaultOps` no longer declares all three methods with the estate BY VALUE. The                  declaration is {squeezed:?}"
+                "`VaultOps` no longer declares all three methods with the estate BY VALUE. The \
+                 declaration is {squeezed:?}"
             );
             assert!(
                 !squeezed.contains(concat!("est: &mut Session", "Estate")),
-                "a `VaultOps` method takes the estate by `&mut` again. The lock's teardown runs                  against a `'static` worker through `park_and_work`, which owns the estate; a                  borrow anywhere on that chain has to be widened with a `mem::take` or a                  `.clone()`, and both lose exactly what `SessionEstate` exists to keep"
+                "a `VaultOps` method takes the estate by `&mut` again. The lock's teardown runs \
+                 against a `'static` worker through `park_and_work`, which owns the estate; a \
+                 borrow anywhere on that chain has to be widened with a `mem::take` or a \
+                 `.clone()`, and both lose exactly what `SessionEstate` exists to keep"
             );
             assert_eq!(
                 squeezed.matches(concat!("-> Session", "Estate;")).count(),
                 2,
-                "the resettle and the account branch no longer hand the estate back. A method                  that keeps it is a method that can be the one that loses it"
+                "the resettle and the account branch no longer hand the estate back. A method that \
+                 keeps it is a method that can be the one that loses it"
             );
             assert!(
                 squeezed.contains(concat!("-> (SessionEstate, Option<VaultWindow", "Session>);")),
-                "`open_window` no longer hands the estate back alongside the result. The                  estate comes home on BOTH answers -- including the one that means the window                  is running in another process and has not finished -- because a method that                  keeps it on any arm is the method that loses it. The declaration is                  {squeezed:?}"
+                "`open_window` no longer hands the estate back alongside the result. The estate \
+                 comes home on BOTH answers -- including the one that means the window is running \
+                 in another process and has not finished -- because a method that keeps it on any \
+                 arm is the method that loses it. The declaration is {squeezed:?}"
             );
         }
 
@@ -21444,7 +21474,10 @@ mod tests {
                 );
                 assert!(
                     !mints_an_estate(&body),
-                    "`RealVaultOps::{name}` builds a `SessionEstate` of its own. Whatever it                      hands back is then not the estate `main` lent it: the match engine, the                      `bw serve` `Child` and the session token the caller had are dropped on                      the floor, autofill goes dead and the `bw serve` port stays held"
+                    "`RealVaultOps::{name}` builds a `SessionEstate` of its own. Whatever it hands \
+                     back is then not the estate `main` lent it: the match engine, the `bw serve` \
+                     `Child` and the session token the caller had are dropped on the floor, \
+                     autofill goes dead and the `bw serve` port stays held"
                 );
                 checked += 1;
             }
@@ -28811,7 +28844,8 @@ mod tests {
             .expect("the add claimed the account before switching, so the file must be there");
         assert!(
             !written.contains(minted.as_str()),
-            "the failed add is still named in settings.json, so the next launch offers an              account whose directory was deleted: {written}"
+            "the failed add is still named in settings.json, so the next launch offers an account \
+             whose directory was deleted: {written}"
         );
         assert!(
             written.contains(ACCOUNT_A),
@@ -34901,11 +34935,13 @@ mod vault_backend_choice_tests {
         let arm = &entry[arm..arm + 400];
         assert!(
             arm.contains(concat!("vault_slot.", "adopt(")),
-            "the `bw serve` arm builds a backend the slot does not hold, so a sign-in that              settles on the built-in client cannot re-point what this window reads: {arm:?}"
+            "the `bw serve` arm builds a backend the slot does not hold, so a sign-in that settles \
+             on the built-in client cannot re-point what this window reads: {arm:?}"
         );
         assert!(
             arm.contains(concat!("Arc::clone(&vault", "_slot)")),
-            "the cache on the `bw serve` arm is not reading the slot, so re-pointing the              slot moves nothing the window can see: {arm:?}"
+            "the cache on the `bw serve` arm is not reading the slot, so re-pointing the slot \
+             moves nothing the window can see: {arm:?}"
         );
     }
 
@@ -34944,15 +34980,20 @@ mod vault_backend_choice_tests {
         for (call, what) in [
             (
                 concat!("install", "_env("),
-                "what the backend IS -- without it the window serves through `bw serve` on an                  account that has no CLI",
+                "what the backend IS -- without it the window serves through `bw serve` on an \
+                 account that has no CLI",
             ),
             (
                 concat!("install", "_resettle("),
-                "how the backend CHANGES when a sign-in learns a server or a client choice --                  without it the choice modal's answer is dropped and the sign-in runs on                  whatever startup settled",
+                "how the backend CHANGES when a sign-in learns a server or a client choice -- \
+                 without it the choice modal's answer is dropped and the sign-in runs on whatever \
+                 startup settled",
             ),
             (
                 concat!("publish_backend_", "settlement("),
-                "the settlement that re-settle READS -- `resettle_vault_backend_for` returns                  on its first line without one, so the seam above is present and inert,                  which from outside is indistinguishable from fixed",
+                "the settlement that re-settle READS -- `resettle_vault_backend_for` returns on \
+                 its first line without one, so the seam above is present and inert, which from \
+                 outside is indistinguishable from fixed",
             ),
         ] {
             assert!(
@@ -34995,7 +35036,9 @@ mod vault_backend_choice_tests {
             .find(concat!("accounts::ensure_account", "_dir("))
             .unwrap_or_else(|| {
                 panic!(
-                    "the ui process never creates the account directory. On a clean                      install it does not exist yet, so the first master key written after a                      sign-in fails with os error 3 -- the card shows 'The system cannot find                      the path specified'"
+                    "the ui process never creates the account directory. On a clean install it \
+                     does not exist yet, so the first master key written after a sign-in fails \
+                     with os error 3 -- the card shows 'The system cannot find the path specified'"
                 )
             });
         let store = entry
@@ -35003,7 +35046,8 @@ mod vault_backend_choice_tests {
             .expect("control: the ui process no longer builds a session store at all");
         assert!(
             ensure < store,
-            "the account directory is created AFTER the store that writes into it, so the              first save still lands in a directory that does not exist"
+            "the account directory is created AFTER the store that writes into it, so the first \
+             save still lands in a directory that does not exist"
         );
     }
 
@@ -35036,7 +35080,8 @@ mod vault_backend_choice_tests {
                     account.as_ref(),
                     false,
                 ),
-                "{what}: the sign-in was kept in the daemon, which is the ~19 MB -> ~59 MB                  the `--ui` split exists to avoid"
+                "{what}: the sign-in was kept in the daemon, which is the ~19 MB -> ~59 MB the \
+                 `--ui` split exists to avoid"
             );
         }
     }
@@ -35053,7 +35098,8 @@ mod vault_backend_choice_tests {
                 Some(&account_on(Some("https://vault.example.com"))),
                 true,
             ),
-            "a launch whose `bw` session token is still good was routed as though it owed a              sign-in card"
+            "a launch whose `bw` session token is still good was routed as though it owed a \
+             sign-in card"
         );
     }
 
@@ -36681,7 +36727,8 @@ mod the_one_settings_write_back {
         apply_edited_settings(&cache, &mut settings, &settings_path, unknowing, Some(&mut accounts));
         assert!(
             !accounts.active().use_official_bw_crypto,
-            "a window that had no account to speak for rewrote the account anyway, which is              how a built-in sign-in came back as `bw serve` on the next launch"
+            "a window that had no account to speak for rewrote the account anyway, which is how a \
+             built-in sign-in came back as `bw serve` on the next launch"
         );
 
         // **And a window that WAS told still writes**, or the fix above would

@@ -889,7 +889,8 @@ mod spinner_body_tests {
         let painted = rendered(&frame("Setting up your vault..."));
         assert!(
             painted.contains("Setting up your vault..."),
-            "the spinner drew no message, so the only thing on screen during a multi-second              wait is an unlabelled spinner: {painted:?}"
+            "the spinner drew no message, so the only thing on screen during a multi-second wait \
+             is an unlabelled spinner: {painted:?}"
         );
         // Negative + positive control on the same renderer: a DIFFERENT
         // message really is absent, so the assertion above is about what was
@@ -939,7 +940,8 @@ mod spinner_body_tests {
         let rects = filled_rects(&output);
         assert!(
             rects.iter().any(|(_, fill)| *fill == crate::theme::CANVAS),
-            "nothing in the spinner is filled with `theme::CANVAS`, so the window behind the              spinner is whatever egui defaults to: {rects:?}"
+            "nothing in the spinner is filled with `theme::CANVAS`, so the window behind the \
+             spinner is whatever egui defaults to: {rects:?}"
         );
         // Positive control: the walker really found shapes, so the `any`
         // above is a search through something rather than through nothing.

@@ -5308,11 +5308,14 @@ mod tests {
         let body = &body[..end];
         assert!(
             !body.contains(concat!("if let Some(account)", " = account")),
-            "the backend re-settle is behind `if let Some(account)` again, so a first              install -- which has no record -- signs in on whatever startup settled and the              choice modal's answer is dropped"
+            "the backend re-settle is behind `if let Some(account)` again, so a first install -- \
+             which has no record -- signs in on whatever startup settled and the choice modal's \
+             answer is dropped"
         );
         assert!(
             body.contains(concat!("resettle", "_for(&establishing)")),
-            "control: this function no longer re-settles anything, so the assertion above              is about a branch that does not exist"
+            "control: this function no longer re-settles anything, so the assertion above is about \
+             a branch that does not exist"
         );
     }
 
@@ -9461,7 +9464,11 @@ pub(crate) mod password_lifetime_tests {
         );
         assert_eq!(
             listed, expected,
-            "`tracked_files` did not name exactly the files this repository owns. An entry              missing from the left is a file the probe scan no longer polices -- an untracked              source under `src/` is the one this round added. An extra entry is another              repository's or a build output's bytes being reported as this tree's, which is              the false positive the git bound was introduced to remove"
+            "`tracked_files` did not name exactly the files this repository owns. An entry missing \
+             from the left is a file the probe scan no longer polices -- an untracked source under \
+             `src/` is the one this round added. An extra entry is another repository's or a build \
+             output's bytes being reported as this tree's, which is the false positive the git \
+             bound was introduced to remove"
         );
         // And the nested repository is REFUSED, not dropped. This is the
         // half of the previous round's fix that was applied to the fallback
@@ -13160,7 +13167,8 @@ mod identity_without_a_spawn_tests {
         let body = &production[at..end];
         assert!(
             body.len() > 5000,
-            "the sliced window body is {} bytes, which is not the window: every assertion              over it would pass against nothing",
+            "the sliced window body is {} bytes, which is not the window: every assertion over it \
+             would pass against nothing",
             body.len()
         );
         body

@@ -6659,7 +6659,8 @@ mod fill_dispatch_tests {
         assert_eq!(typed, 1, "the confirmed fill did not type, so `asked` proves nothing");
         assert!(
             saw_secret,
-            "the surface was handed a step list with no secret in it, or a copy payload that              is not the value this fill was about to type"
+            "the surface was handed a step list with no secret in it, or a copy payload that is \
+             not the value this fill was about to type"
         );
     }
 
@@ -8198,11 +8199,13 @@ mod disposition_tests {
         // claim is about the half of the file that ships.
         let boundary = source
             .find(concat!("mod ", "tests {"))
-            .expect("app.rs's first test module is gone, so this pin no longer knows where                      the shipping half of the file ends");
+            .expect("app.rs's first test module is gone, so this pin no longer knows where the \
+                     shipping half of the file ends");
         let production = &source[..boundary];
         assert!(
             production.contains(concat!("pub fn browser", "_window(exe_name: &str)")),
-            "the boundary landed before `browser_window`, so `production` does not contain              the list this test is about"
+            "the boundary landed before `browser_window`, so `production` does not contain the \
+             list this test is about"
         );
         for name in BROWSER_IMAGE_NAMES {
             assert_eq!(

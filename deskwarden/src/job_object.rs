@@ -4598,12 +4598,17 @@ mod tests {
         );
         assert!(
             crate_paths(&bw_path_all).iter().any(|p| p.starts_with("crate::job_object")),
-            "control: bw_path.rs names nothing in `job_object` any more, so it has stopped              building the job-bearing command and RULE 8 is asserting about the wrong file"
+            "control: bw_path.rs names nothing in `job_object` any more, so it has stopped \
+             building the job-bearing command and RULE 8 is asserting about the wrong file"
         );
         for path in crate_paths(&bw_path_all) {
             assert!(
                 BW_PATH_MAY_REACH.contains(&path.as_str()),
-                "bw_path.rs names `{path}`. It is on RULE 7's REACHABLE list, so                  `vault_export.rs` and `send.rs` call into it -- and anything it calls, it                  calls on their behalf, with no rule of theirs in the way. A spawner reached                  from here starts a `bw` outside the kill-on-close job while both runners stay                  spotless. If this item is genuinely needed, adding it here is the visible                  decision that it cannot spawn"
+                "bw_path.rs names `{path}`. It is on RULE 7's REACHABLE list, so `vault_export.rs` \
+                 and `send.rs` call into it -- and anything it calls, it calls on their behalf, \
+                 with no rule of theirs in the way. A spawner reached from here starts a `bw` \
+                 outside the kill-on-close job while both runners stay spotless. If this item is \
+                 genuinely needed, adding it here is the visible decision that it cannot spawn"
             );
         }
         // Stale entries are an error, exactly as they are on DOOR_FILES and on
@@ -4621,7 +4626,9 @@ mod tests {
         assert_eq!(
             code_only(bw_path_production).matches("super::").count(),
             0,
-            "bw_path.rs writes `super::` in production code, where it names the crate root --              the same synonym for `crate::` that RULE 7b closed for the two runners, and RULE 8              above reads only `crate::`"
+            "bw_path.rs writes `super::` in production code, where it names the crate root -- the \
+             same synonym for `crate::` that RULE 7b closed for the two runners, and RULE 8 above \
+             reads only `crate::`"
         );
 
         // RULE 5 IS A "COUNT IS ZERO" RULE, so it is worth exactly nothing

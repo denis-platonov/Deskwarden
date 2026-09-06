@@ -7743,7 +7743,8 @@ mod tests {
         assert!(painted.contains(PROMPT_DESCRIPTION), "got {:?}", painted.strings());
         assert!(
             PROMPT_DESCRIPTION.contains("CTRL+ALT+B"),
-            "the description has to say what is left when the prompt is off -- otherwise the              toggle reads as \"switch autofill off\", which it never is"
+            "the description has to say what is left when the prompt is off -- otherwise the \
+             toggle reads as \"switch autofill off\", which it never is"
         );
         assert!(painted.contains(AUTO_LOCK_DESCRIPTION), "got {:?}", painted.strings());
         assert!(
@@ -7803,7 +7804,9 @@ mod tests {
                 .expect("a plain float literal");
             assert_eq!(
                 ours, value,
-                "Preferences draws an in-card section label at {ours} where the vault pane                  draws its card heading at {value}. One element, two treatments, is what                  made this page look like a different app"
+                "Preferences draws an in-card section label at {ours} where the vault pane draws \
+                 its card heading at {value}. One element, two treatments, is what made this page \
+                 look like a different app"
             );
         }
     }
@@ -7813,12 +7816,14 @@ mod tests {
         assert_eq!(
             paint(Section::General).count_of_size(Vec2::new(40.0, 22.0)),
             1,
-            "General is one pill now -- `prompt_on_match` -- beside the hotkey row, which              is not a pill. The rest of what was here is on View and Lock"
+            "General is one pill now -- `prompt_on_match` -- beside the hotkey row, which is not a \
+             pill. The rest of what was here is on View and Lock"
         );
         assert_eq!(
             paint(Section::View).count_of_size(Vec2::new(40.0, 22.0)),
             4,
-            "View is `fetch_icons`, its child `fetch_icons_direct`, `use_brand_logos` and              `reveal_totp_seed`, and nothing else"
+            "View is `fetch_icons`, its child `fetch_icons_direct`, `use_brand_logos` and \
+             `reveal_totp_seed`, and nothing else"
         );
         assert_eq!(
             paint(Section::Lock).count_of_size(Vec2::new(40.0, 22.0)),
@@ -7833,7 +7838,8 @@ mod tests {
         assert_eq!(
             paint(Section::General).count_of_size(Vec2::new(112.0, 28.0)),
             0,
-            "the stepper went to Lock with the switch that governs it; one without the              other is the arrangement this split exists to end"
+            "the stepper went to Lock with the switch that governs it; one without the other is \
+             the arrangement this split exists to end"
         );
     }
 
@@ -7963,7 +7969,8 @@ mod tests {
         frame(&ctx, &mut state, &click(pill));
         assert!(
             !state.settings.prompt_on_match,
-            "the prompt toggle did not turn off, so the one control that governs what a              matched window does is inert"
+            "the prompt toggle did not turn off, so the one control that governs what a matched \
+             window does is inert"
         );
         // What the toggle is FOR, asserted on the value the dispatch actually
         // consumes rather than on the flag alone: a field that flips without
@@ -8027,7 +8034,8 @@ mod tests {
         frame(&ctx, &mut state, &click(pill));
         assert!(
             state.settings.check_breaches,
-            "the breach toggle did not turn on -- the row is painted but its value is never              written back, so the pill is decoration"
+            "the breach toggle did not turn on -- the row is painted but its value is never \
+             written back, so the pill is decoration"
         );
         assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
@@ -8365,11 +8373,13 @@ mod tests {
             );
             assert!(
                 ink.color.a() > 0,
-                "the description is painted at alpha 0 at width {width}, so every geometry                  assertion here is reading a shape that is not on screen"
+                "the description is painted at alpha 0 at width {width}, so every geometry \
+                 assertion here is reading a shape that is not on screen"
             );
             assert!(
                 ink.rows >= 2,
-                "the long copy laid out in {} line(s) at width {width} -- either it did not                  wrap, or the copy under test is not the long one",
+                "the long copy laid out in {} line(s) at width {width} -- either it did not wrap, \
+                 or the copy under test is not the long one",
                 ink.rows
             );
             assert!(
@@ -8406,7 +8416,7 @@ mod tests {
                 let other = painted.ink_of(neighbour).rect;
                 assert!(
                     !ink.rect.intersects(other),
-                    "the description at {:?} overlaps {neighbour:?} at {other:?} at width                      {width}",
+                    "the description at {:?} overlaps {neighbour:?} at {other:?} at width {width}",
                     ink.rect
                 );
             }
@@ -8446,7 +8456,8 @@ mod tests {
         assert_eq!(
             pills.len(),
             4,
-            "the View card no longer paints its four pills: site icons, the direct-icons              child, brand logos and the TOTP secret"
+            "the View card no longer paints its four pills: site icons, the direct-icons child, \
+             brand logos and the TOTP secret"
         );
         // SECOND pill down now: prompt, site icons, network logos, TOTP
         // secret, auto-lock. Five rows have left this page -- the breach row
@@ -8499,7 +8510,8 @@ mod tests {
         assert_eq!(
             pills.len(),
             4,
-            "the View card no longer paints its four pills: site icons, the direct-icons              child, brand logos and the TOTP secret"
+            "the View card no longer paints its four pills: site icons, the direct-icons child, \
+             brand logos and the TOTP secret"
         );
         // THIRD pill down: prompt, site icons, THIS, network logos, TOTP
         // secret, auto-lock. It sits directly under its master switch.
@@ -8672,7 +8684,8 @@ mod tests {
         assert_eq!(
             pills.len(),
             4,
-            "the View card no longer paints its four pills: site icons, the direct-icons              child, brand logos and the TOTP secret"
+            "the View card no longer paints its four pills: site icons, the direct-icons child, \
+             brand logos and the TOTP secret"
         );
         // FOURTH pill down: prompt, site icons, the direct-fetch child of
         // site icons, network logos, TOTP secret, auto-lock. It was the
@@ -8933,7 +8946,8 @@ mod tests {
         assert_eq!(
             pills.len(),
             4,
-            "the View card no longer paints its four pills: site icons, the direct-icons              child, brand logos and the TOTP secret"
+            "the View card no longer paints its four pills: site icons, the direct-icons child, \
+             brand logos and the TOTP secret"
         );
         // FIFTH pill down now: prompt, site icons, the direct-fetch child
         // of site icons, network logos, TOTP secret, auto-lock. It was the
@@ -8984,7 +8998,8 @@ mod tests {
         );
         assert!(
             auto_lock.top() < secret.top(),
-            "the TOTP-secret row is not below the brand-logo row: logos at {auto_lock:?},              secret at {secret:?}"
+            "the TOTP-secret row is not below the brand-logo row: logos at {auto_lock:?}, secret \
+             at {secret:?}"
         );
         // The positive control: the tops differ by a real amount, so the
         // comparisons above are telling rows apart and not comparing one
@@ -9009,7 +9024,8 @@ mod tests {
         );
         assert!(
             pills[3].top() > breach.bottom(),
-            "the TOTP-secret pill is level with the site-icons row's text, so the pills and              the labels disagree about which row is which"
+            "the TOTP-secret pill is level with the site-icons row's text, so the pills and the \
+             labels disagree about which row is which"
         );
         assert!(
             pills[3].top() > auto_lock.bottom(),
@@ -9095,7 +9111,8 @@ mod tests {
         assert_eq!(
             pills.len(),
             1,
-            "the Lock card paints one pill -- the switch -- and the minutes stepper is not              a pill; a second one here means something else moved onto this page"
+            "the Lock card paints one pill -- the switch -- and the minutes stepper is not a pill; \
+             a second one here means something else moved onto this page"
         );
         let pill = pills[0].center();
         frame(&ctx, &mut state, &click(pill));
@@ -10362,7 +10379,8 @@ mod tests {
         assert_eq!(
             state.settings.use_official_bw_crypto,
             None,
-            "one click moved the backend with no confirmation -- and untouched is `None`,              not `Some(true)`: nothing has told this window what the account is on"
+            "one click moved the backend with no confirmation -- and untouched is `None`, not \
+             `Some(true)`: nothing has told this window what the account is on"
         );
         assert!(
             asked.any_containing("open it again yourself"),
@@ -13029,7 +13047,8 @@ mod modal_tests {
         );
         assert!(
             scrim.a() < 255,
-            "the scrim is opaque, so the vault is hidden rather than dimmed -- the whole              point is that the window the user came from stays visible where it was"
+            "the scrim is opaque, so the vault is hidden rather than dimmed -- the whole point is \
+             that the window the user came from stays visible where it was"
         );
     }
 
@@ -13074,7 +13093,8 @@ mod modal_tests {
         assert!(card.contains_rect(BEHIND));
         assert!(
             !card.intersects(BEHIND_IN_MARGIN),
-            "the margin fixture is under the card, so the scrim test below would pass              against no scrim at all"
+            "the margin fixture is under the card, so the scrim test below would pass against no \
+             scrim at all"
         );
         assert!(
             !card.intersects(BEHIND_IN_FAR_MARGIN),

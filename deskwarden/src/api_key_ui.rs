@@ -603,7 +603,8 @@ mod tests {
         form.password.push_str("   ");
         assert!(
             !form.password_ready(),
-            "whitespace is not a master password; submitting it would spend a round trip              to be told so"
+            "whitespace is not a master password; submitting it would spend a round trip to be \
+             told so"
         );
         form.password.push_str("hunter2");
         assert!(form.password_ready());
@@ -626,7 +627,8 @@ mod tests {
         assert_eq!(
             form.secret.as_str(),
             "b7d2ecc",
-            "control: the secret survives the step change too, so the 'stage 1 is not              repeated' rule is about the STEP and not about lost fields"
+            "control: the secret survives the step change too, so the 'stage 1 is not repeated' \
+             rule is about the STEP and not about lost fields"
         );
     }
     /// The three failures say three different things. A shared "That didn't
@@ -644,12 +646,14 @@ mod tests {
         );
         assert!(
             key_pair.contains("rotated") || key_pair.contains("web vault"),
-            "a rotated key is the commonest cause and the only one with a fix the user can              act on; got {key_pair:?}"
+            "a rotated key is the commonest cause and the only one with a fix the user can act on; \
+             got {key_pair:?}"
         );
         assert!(password.contains("master password"), "got {password:?}");
         assert!(
             !password.contains("API key"),
-            "the password failure must not send the user back to a key that worked;              got {password:?}"
+            "the password failure must not send the user back to a key that worked; got \
+             {password:?}"
         );
         assert!(
             unreachable.contains("reach") || unreachable.contains("connection"),
@@ -685,7 +689,8 @@ mod tests {
         assert_eq!(
             form.secret.as_str(),
             "b7d2ecc",
-            "and so is the secret -- retyping 64 characters because the id had a typo is              exactly what this design refuses to charge for"
+            "and so is the secret -- retyping 64 characters because the id had a typo is exactly \
+             what this design refuses to charge for"
         );
         assert!(!form.busy, "the buttons come back");
         assert_eq!(

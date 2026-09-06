@@ -9828,7 +9828,8 @@ mod generator_row_tests {
 
         assert!(
             !strings.contains(&"Autofill"),
-            "the row the pills sat in is still drawn, so the form still presents a per-item                  autofill setting: {strings:?}"
+            "the row the pills sat in is still drawn, so the form still presents a per-item \
+             autofill setting: {strings:?}"
         );
         let mut checked = 0;
         for mode in detail::TRIGGER_ORDER {
@@ -11576,7 +11577,8 @@ mod sequence_builder_tests {
         assert_eq!(rows.len(), 7, "the fixture changed shape");
         assert_eq!(
             tally.steps, 6,
-            "the tally is not counting the acts the user can see -- either the {{DELAY=40}} row              was counted, or the runner's burst chunking was"
+            "the tally is not counting the acts the user can see -- either the {{DELAY=40}} row \
+             was counted, or the runner's burst chunking was"
         );
         // **The control on that assertion**, and the reason the fixture types
         // at 40 ms/char: the runner really does split this password into more
@@ -14293,7 +14295,8 @@ mod edit_pane_layout_tests {
         assert_eq!(
             ctx.memory(|m| m.focused()),
             focused,
-            "the caret left the third row's name box when the FIRST row was removed --              the rows are still identified by their position"
+            "the caret left the third row's name box when the FIRST row was removed -- the rows \
+             are still identified by their position"
         );
 
         // And it survives the user typing into that same box. A row
@@ -14603,7 +14606,8 @@ mod edit_pane_layout_tests {
                 .rects_of(names.last().expect("six names"))
                 .iter()
                 .any(|r| bounds.contains_rect(*r)),
-            "the six-row form already fits a {}x{} pane, so this test is not exercising              scrolling at all",
+            "the six-row form already fits a {}x{} pane, so this test is not exercising scrolling \
+             at all",
             pane.x,
             pane.y
         );

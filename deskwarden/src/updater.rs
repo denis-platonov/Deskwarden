@@ -4186,7 +4186,8 @@ mod tests {
 
         assert!(
             launched.is_empty(),
-            "an installer whose SHA-256 is not the released one reached the launch seam              ({launched:?}); in production that is a process start"
+            "an installer whose SHA-256 is not the released one reached the launch seam \
+             ({launched:?}); in production that is a process start"
         );
         let error = result.expect_err("a wrong-digest installer must not be a success");
         assert!(
@@ -4213,7 +4214,8 @@ mod tests {
 
         assert!(
             launched.is_empty(),
-            "an installer whose SHA-256 differs from the released one in a single byte              reached the launch seam ({launched:?})"
+            "an installer whose SHA-256 differs from the released one in a single byte reached the \
+             launch seam ({launched:?})"
         );
         assert!(result.is_err());
     }
@@ -4233,7 +4235,7 @@ mod tests {
 
         assert!(
             launched.is_empty(),
-            "an installer that could not be hashed at all reached the launch seam              ({launched:?})"
+            "an installer that could not be hashed at all reached the launch seam ({launched:?})"
         );
         let error = result.expect_err("an unknown verdict is not a success");
         assert!(
@@ -4281,7 +4283,8 @@ mod tests {
         );
         assert_eq!(
             hashed, launched,
-            "the file that was HASHED is not the file that was LAUNCHED; the gap between              those two paths is exactly where a swap goes"
+            "the file that was HASHED is not the file that was LAUNCHED; the gap between those two \
+             paths is exactly where a swap goes"
         );
     }
 

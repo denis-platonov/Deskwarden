@@ -490,11 +490,13 @@ mod tests {
         let prose = prose.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
             prose.contains("its own process"),
-            "control: the module doc must actually describe the arrangement it has -- the              vault window is a separate process and this module's decision reaches it"
+            "control: the module doc must actually describe the arrangement it has -- the vault \
+             window is a separate process and this module's decision reaches it"
         );
         assert!(
             !prose.contains("the pump does not run while a vault window is up"),
-            "this sentence was true before the daemon/UI process split and is now the              reassurance that hid a security defect"
+            "this sentence was true before the daemon/UI process split and is now the reassurance \
+             that hid a security defect"
         );
     }
 }

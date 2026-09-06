@@ -2634,7 +2634,8 @@ mod tests {
         assert_eq!(
             l.mark.w,
             crate::win32_draw::mark_width(l.mark.h),
-            "the mark's box is not the design artboard's ratio, so the shield would be              letterboxed inside it and drift away from the word beside it"
+            "the mark's box is not the design artboard's ratio, so the shield would be letterboxed \
+             inside it and drift away from the word beside it"
         );
         assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
         assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");

@@ -313,7 +313,8 @@ pub fn install_env(env: BackendEnv) -> bool {
     // buttons, permanently `Locked`.
     if env.choice == VaultBackendChoice::DirectRest && env.credentials.is_none() {
         log::error!(
-            "refusing to select the direct-REST vault backend with no way to read its              credentials; staying on `bw serve`"
+            "refusing to select the direct-REST vault backend with no way to read its credentials; \
+             staying on `bw serve`"
         );
         return false;
     }

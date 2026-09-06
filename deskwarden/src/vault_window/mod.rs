@@ -12451,7 +12451,8 @@ mod write_arms_adopt_the_backends_copy_tests {
         let source = source();
         let at = source.find(assignment).unwrap_or_else(|| {
             panic!(
-                "no {assignment:?} in this file -- {what} was renamed or deleted, and this                  guard is now aimed at nothing"
+                "no {assignment:?} in this file -- {what} was renamed or deleted, and this guard \
+                 is now aimed at nothing"
             )
         });
         let selector_at = source[..at].rfind(ANY_ROW_SELECTOR).unwrap_or_else(|| {
@@ -12459,12 +12460,15 @@ mod write_arms_adopt_the_backends_copy_tests {
         });
         assert!(
             !source[selector_at..at].contains(ASSIGNMENT_HEAD),
-            "{what} has no row lookup of its own -- the nearest one above it belongs to              another arm, which this guard must not accept as proof. Between them: {:?}",
+            "{what} has no row lookup of its own -- the nearest one above it belongs to another \
+             arm, which this guard must not accept as proof. Between them: {:?}",
             &source[selector_at..at]
         );
         assert!(
             source[selector_at..].starts_with(selector),
-            "{what} adopts the backend's copy but does not pin WHICH ROW it lands on: it              resolves the row with {:?} rather than {selector:?}, so the server's copy of              the edited item is written over some other item's row",
+            "{what} adopts the backend's copy but does not pin WHICH ROW it lands on: it resolves \
+             the row with {:?} rather than {selector:?}, so the server's copy of the edited item \
+             is written over some other item's row",
             &source[selector_at..at]
         );
     }
@@ -12514,7 +12518,8 @@ mod write_arms_adopt_the_backends_copy_tests {
         assert_eq!(
             source().matches(FAVOURITE_ARM).count(),
             1,
-            "the star's arm does not adopt the cache's returned item exactly once (needle              {FAVOURITE_ARM:?})"
+            "the star's arm does not adopt the cache's returned item exactly once (needle \
+             {FAVOURITE_ARM:?})"
         );
     }
 
@@ -12636,7 +12641,8 @@ mod write_arms_adopt_the_backends_copy_tests {
         });
         assert!(
             mismatched.is_err(),
-            "arm_pins_its_row accepts a selector the arm does not use, so an arm that              resolved the wrong row would pass"
+            "arm_pins_its_row accepts a selector the arm does not use, so an arm that resolved the \
+             wrong row would pass"
         );
     }
 
@@ -14062,12 +14068,16 @@ mod app_block_wiring_tests {
         assert_eq!(
             occurrences(source(), REHEARSE_ARM),
             1,
-            "expected {REHEARSE_ARM:?} exactly once -- the edit form's Rehearse arm. Zero means              the form still reports the action and nobody acts on it, and every test of the              button keeps passing because the button really does report"
+            "expected {REHEARSE_ARM:?} exactly once -- the edit form's Rehearse arm. Zero means \
+             the form still reports the action and nobody acts on it, and every test of the button \
+             keeps passing because the button really does report"
         );
         assert_eq!(
             occurrences(source(), RUNS_IT),
             1,
-            "expected {RUNS_IT:?} exactly once. The answer has to be ASSIGNED somewhere the              user sees it: a rehearsal that could not open its window, or a sequence the              compiler refuses, is otherwise a click that does nothing at all"
+            "expected {RUNS_IT:?} exactly once. The answer has to be ASSIGNED somewhere the user \
+             sees it: a rehearsal that could not open its window, or a sequence the compiler \
+             refuses, is otherwise a click that does nothing at all"
         );
     }
 
@@ -16440,11 +16450,14 @@ mod detail_pane_frame_placement_tests {
         let chain = &source[start + frame_at..start + frame_at + 120];
         assert!(
             !chain.contains(MARGIN),
-            "the detail pane's panel has an `{MARGIN}` again, so its header strip stops              short of the panel's edges and the pane reads as a card on grey -- the band              the owner marked out. Its chain is now: {chain:?}"
+            "the detail pane's panel has an `{MARGIN}` again, so its header strip stops short of \
+             the panel's edges and the pane reads as a card on grey -- the band the owner marked \
+             out. Its chain is now: {chain:?}"
         );
         assert!(
             chain.contains("fill(theme::CANVAS)"),
-            "the panel's ground is no longer CANVAS; the band's colour was the tell that              identified it, so this is pinned beside the margin. Chain: {chain:?}"
+            "the panel's ground is no longer CANVAS; the band's colour was the tell that \
+             identified it, so this is pinned beside the margin. Chain: {chain:?}"
         );
     }
 
@@ -16456,7 +16469,8 @@ mod detail_pane_frame_placement_tests {
         let source = include_str!("mod.rs");
         assert!(
             source.contains(concat!("Margin::symmetric(20,", " 18)")),
-            "the panel's old 20/18 margin was deleted rather than moved, so the Sends              screen now draws hard against the window edge"
+            "the panel's old 20/18 margin was deleted rather than moved, so the Sends screen now \
+             draws hard against the window edge"
         );
     }
 }
@@ -22815,7 +22829,9 @@ mod export_wiring {
 
         assert!(
             returned < RETURNS_WITHIN,
-            "starting an export blocked the caller for {returned:?}; a real one blocks for as              long as the save dialog is up and the `bw` child runs, and the caller is the              eframe frame closure"
+            "starting an export blocked the caller for {returned:?}; a real one blocks for as long \
+             as the save dialog is up and the `bw` child runs, and the caller is the eframe frame \
+             closure"
         );
         let report = rx
             .recv_timeout(Duration::from_secs(30))
@@ -22824,7 +22840,9 @@ mod export_wiring {
         assert_ne!(
             ran_on.lock().expect("not poisoned").expect("the work ran"),
             caller,
-            "the export ran on the caller's own thread, so a real one would freeze the window              -- titlebar included -- for as long as the save dialog is up and the `bw export`              child runs"
+            "the export ran on the caller's own thread, so a real one would freeze the window -- \
+             titlebar included -- for as long as the save dialog is up and the `bw export` child \
+             runs"
         );
     }
 
@@ -25003,7 +25021,8 @@ mod export_wiring {
         let (_, card_text) = export_message(&ExportReport::Interrupted).expect("it renders");
         assert!(
             labels(&showing).iter().any(|(t, _)| *t == card_text),
-            "control: the window is not showing a report card, so pressing the row with one              up is not what the click below does. Painted: {:?}",
+            "control: the window is not showing a report card, so pressing the row with one up is \
+             not what the click below does. Painted: {:?}",
             labels(&showing).iter().map(|(t, _)| t.clone()).collect::<Vec<_>>()
         );
 
@@ -25014,7 +25033,10 @@ mod export_wiring {
         assert_eq!(
             with_card_up,
             vec![HARNESS_SESSION.to_string()],
-            "with a report card on screen, clicking \"Export vault...\" started              {with_card_up:?}. A previous answer is not a reason to refuse the next backup,              and a row that silently does nothing until some other control is dismissed is              the same defect as a row that never works"
+            "with a report card on screen, clicking \"Export vault...\" started {with_card_up:?}. \
+             A previous answer is not a reason to refuse the next backup, and a row that silently \
+             does nothing until some other control is dismissed is the same defect as a row that \
+             never works"
         );
     }
     // -----------------------------------------------------------------
@@ -27334,11 +27356,17 @@ mod send_delete_wiring {
                 let baseline = FRESH_SENDS_SCREEN
                     .with(|c| c.borrow().clone())
                     .expect(
-                        "`ReachableState::Fresh` has not been driven yet, so there is no                          baseline to check this variant's witness against. `Fresh` is                          first in `ReachableState::ALL` for exactly this reason.",
+                        "`ReachableState::Fresh` has not been driven yet, so there is no baseline \
+                         to check this variant's witness against. `Fresh` is first in \
+                         `ReachableState::ALL` for exactly this reason.",
                     );
                 assert!(
                     !baseline.iter().any(|t| t == needle),
-                    "control for {state:?}: {needle:?} is painted on the Sends screen in                      `Fresh` too, so it distinguishes nothing and this variant has no                      witness at all -- it is `Fresh` under another name, which is how                      `FolderSelected` and `ItemSelected` kept this test green with their                      setup deleted. Name a label only this state's Sends screen produces."
+                    "control for {state:?}: {needle:?} is painted on the Sends screen in `Fresh` \
+                     too, so it distinguishes nothing and this variant has no witness at all -- it \
+                     is `Fresh` under another name, which is how `FolderSelected` and \
+                     `ItemSelected` kept this test green with their setup deleted. Name a label \
+                     only this state's Sends screen produces."
                 );
             }
             assert!(
@@ -27449,11 +27477,18 @@ mod send_delete_wiring {
                 );
                 assert!(
                     !before.iter().any(|t| t == narrowed),
-                    "control for {state:?}: {narrowed:?} was already on screen BEFORE                          this variant's setup ran, so it cannot witness the scope narrowing."
+                    "control for {state:?}: {narrowed:?} was already on screen BEFORE this \
+                     variant's setup ran, so it cannot witness the scope narrowing."
                 );
                 assert!(
                     matrix_find(after, narrowed).is_some(),
-                    "control for {state:?}: {gone:?} went away and {kept:?} stayed, but                          the search box still does not read {narrowed:?} -- so the SCOPE did                          not narrow and something narrower than the scope did the filtering.                          `item_list::search_hint` counts `sidebar::count_for(items, filter)`,                          which is the scope and not the search results, so a search string                          picked to match {kept:?} and miss {gone:?} -- which satisfies both                          halves above, measured -- cannot move it. What was painted: {:?}",
+                    "control for {state:?}: {gone:?} went away and {kept:?} stayed, but the search \
+                     box still does not read {narrowed:?} -- so the SCOPE did not narrow and \
+                     something narrower than the scope did the filtering. `item_list::search_hint` \
+                     counts `sidebar::count_for(items, filter)`, which is the scope and not the \
+                     search results, so a search string picked to match {kept:?} and miss {gone:?} \
+                     -- which satisfies both halves above, measured -- cannot move it. What was \
+                     painted: {:?}",
                     matrix_texts(after)
                 );
                 Reached::Now(state, Seal(()))
@@ -27943,7 +27978,9 @@ mod send_delete_wiring {
         FRESH_SENDS_SCREEN.with(|c| *c.borrow_mut() = None);
         assert!(
             matches!(ReachableState::ALL[0], ReachableState::Fresh),
-            "`Fresh` is no longer the first state driven, so the baseline every              `Reached::on_the_sends_screen` witness is checked against is recorded too              late -- see `FRESH_SENDS_SCREEN`."
+            "`Fresh` is no longer the first state driven, so the baseline every \
+             `Reached::on_the_sends_screen` witness is checked against is recorded too late -- see \
+             `FRESH_SENDS_SCREEN`."
         );
         for state in ReachableState::ALL {
             drive_the_sends_screen_in(state);
@@ -28731,14 +28768,17 @@ mod send_delete_wiring {
                 let opened = matrix_click(&ctx, &mut frame_fn, new_at);
                 assert!(
                     matrix_find(&opened, send_ui::COMPOSER_HEADING).is_some(),
-                    "control: the New Send button was pressed and no composer appeared, so                      this state cannot be reached at all. What was painted: {:?}",
+                    "control: the New Send button was pressed and no composer appeared, so this \
+                     state cannot be reached at all. What was painted: {:?}",
                     matrix_texts(&opened)
                 );
                 let away = matrix_locate(state, &opened, "Frame Harness Folder");
                 output = matrix_click(&ctx, &mut frame_fn, away);
                 assert!(
                     matrix_find(&output, send_ui::COMPOSER_HEADING).is_none(),
-                    "control: the composer is painted on a screen that is not the Sends                      screen, so \"it is still open when we come back\" says nothing about                      coming back. What was painted: {:?}",
+                    "control: the composer is painted on a screen that is not the Sends screen, so \
+                     \"it is still open when we come back\" says nothing about coming back. What \
+                     was painted: {:?}",
                     matrix_texts(&output)
                 );
             }
@@ -29026,12 +29066,15 @@ mod send_delete_wiring {
             let no_matches = item_list::ListPlaceholder::NoMatches.message();
             assert!(
                 matrix_find(&back, no_matches).is_some(),
-                "after a round trip through the Sends screen the search box still says                  \"zq\" but the list is not scoped by it -- {no_matches:?} is nowhere on                  screen. The text survived and the FILTER did not, which is the same lost                  query wearing the text as a disguise. What was painted: {:?}",
+                "after a round trip through the Sends screen the search box still says \"zq\" but \
+                 the list is not scoped by it -- {no_matches:?} is nowhere on screen. The text \
+                 survived and the FILTER did not, which is the same lost query wearing the text as \
+                 a disguise. What was painted: {:?}",
                 matrix_texts(&back)
             );
             assert!(
                 matrix_find(&back, FRAME_LOOSE_ITEM_NAME).is_none(),
-                "the list says {no_matches:?} and is drawing a row anyway. What was                  painted: {:?}",
+                "the list says {no_matches:?} and is drawing a row anyway. What was painted: {:?}",
                 matrix_texts(&back)
             );
         }
@@ -31017,7 +31060,10 @@ mod frame_env_seam {
         plan: crate::send::SendPlan,
     ) {
         panic!(
-            "a test pressed Create on a `frame_env_seam::stubbed` window ({plan:?}). That              would have run a real `bw send create` against whatever account the developer              is logged into and PUBLISHED A PUBLIC LINK to whatever the test typed; build              the env with `with_send_create` and observe the spawn there instead"
+            "a test pressed Create on a `frame_env_seam::stubbed` window ({plan:?}). That would \
+             have run a real `bw send create` against whatever account the developer is logged \
+             into and PUBLISHED A PUBLIC LINK to whatever the test typed; build the env with \
+             `with_send_create` and observe the spawn there instead"
         );
     }
 
@@ -32143,7 +32189,8 @@ mod send_create_wiring {
             }
             assert!(
                 !card.text.is_empty(),
-                "the card painted no text at all, so every assertion over it would pass                  against nothing"
+                "the card painted no text at all, so every assertion over it would pass against \
+                 nothing"
             );
             card
         }
@@ -32187,7 +32234,9 @@ mod send_create_wiring {
             match tone {
                 CreateTone::Bad => assert!(
                     error_ink,
-                    "{report:?} is a failure -- or an outcome this app cannot confirm -- but                      no glyph on its card is painted in the error colour, so a Send that was                      not published reads exactly like one that was. Painted colours were {:?}",
+                    "{report:?} is a failure -- or an outcome this app cannot confirm -- but no \
+                     glyph on its card is painted in the error colour, so a Send that was not \
+                     published reads exactly like one that was. Painted colours were {:?}",
                     card.text_colours
                 ),
                 CreateTone::Good => assert!(

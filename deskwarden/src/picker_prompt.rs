@@ -3495,7 +3495,8 @@ mod card_tests {
                 ListRow::Candidate(1),
                 ListRow::SearchVault { truncated: false },
             ],
-            "a two-candidate card offered no *Search the vault* row, so a user whose two offers              are both wrong can only dismiss the card"
+            "a two-candidate card offered no *Search the vault* row, so a user whose two offers \
+             are both wrong can only dismiss the card"
         );
         // And the row tells the truth about why it is there: nothing was cut.
         assert_eq!(
@@ -3671,7 +3672,8 @@ mod card_tests {
         assert_eq!(
             l.mark.w,
             crate::win32_draw::mark_width(l.mark.h),
-            "the mark's box is not the design artboard's ratio, so the shield would be              letterboxed inside it and drift away from the word beside it"
+            "the mark's box is not the design artboard's ratio, so the shield would be letterboxed \
+             inside it and drift away from the word beside it"
         );
         assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
         assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");
@@ -4139,7 +4141,8 @@ mod card_tests {
         );
         assert!(
             code.contains("GONE.store(true, Ordering::SeqCst);"),
-            "control: the comment stripper has eaten code -- the WM_DESTROY arm's one              surviving statement is not in the text this rule scans"
+            "control: the comment stripper has eaten code -- the WM_DESTROY arm's one surviving \
+             statement is not in the text this rule scans"
         );
 
         assert!(

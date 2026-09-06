@@ -3517,7 +3517,9 @@ mod row_tile_tests {
         let tiles = row_tiles(&p);
         assert!(
             !tiles.is_empty() && tiles.len() + 1 >= p.visible.len(),
-            "the tile filter found {} rects on a frame that reported {} visible rows -- a              filter that matches nothing makes every assertion below vacuous. One fewer is              allowed: the row at the viewport's edge can be clipped out of the paint list              entirely.",
+            "the tile filter found {} rects on a frame that reported {} visible rows -- a filter \
+             that matches nothing makes every assertion below vacuous. One fewer is allowed: the \
+             row at the viewport's edge can be clipped out of the paint list entirely.",
             tiles.len(),
             p.visible.len()
         );
@@ -4194,11 +4196,13 @@ mod row_tile_tests {
             assert_eq!(
                 tile.fill,
                 egui::Color32::TRANSPARENT,
-                "the {what} tile is filled, so its letter sits on a grey square inside                  its own tile"
+                "the {what} tile is filled, so its letter sits on a grey square inside its own \
+                 tile"
             );
             assert_eq!(
                 tile.stroke.color, edge,
-                "the {what} tile lost the edge that is now the only thing distinguishing                  the two states"
+                "the {what} tile lost the edge that is now the only thing distinguishing the two \
+                 states"
             );
         }
     }
@@ -4816,7 +4820,8 @@ mod row_tile_tests {
                 let word = ink_centre_of(&p, CardBrand::Mastercard.wordmark());
                 assert!(
                     (word - title).abs() <= TOGETHER,
-                    "at a {width}pt pane with {name:?}, the pill's word sits at {word} and the                      name at {title} -- {}pt apart, over the {TOGETHER}pt one line allows",
+                    "at a {width}pt pane with {name:?}, the pill's word sits at {word} and the \
+                     name at {title} -- {}pt apart, over the {TOGETHER}pt one line allows",
                     (word - title).abs()
                 );
                 assert!(
@@ -4851,7 +4856,8 @@ mod row_tile_tests {
         for nudge in [-1.0f32, 1.0] {
             assert!(
                 (word + nudge - title).abs() > TOGETHER,
-                "a {nudge}pt nudge of the pill still reads as aligned, so the tolerance is                  meaningless"
+                "a {nudge}pt nudge of the pill still reads as aligned, so the tolerance is \
+                 meaningless"
             );
             assert!(
                 (word - (title + nudge)).abs() > TOGETHER,
@@ -4878,7 +4884,8 @@ mod row_tile_tests {
             let word = ink_centre_of(&p, brand.wordmark());
             assert!(
                 (word - ground.center().y).abs() <= 0.51,
-                "{brand:?}'s word sits at {word} in a ground centred at {} -- {}pt of the                  pill's {}pt height is padding on one side only",
+                "{brand:?}'s word sits at {word} in a ground centred at {} -- {}pt of the pill's \
+                 {}pt height is padding on one side only",
                 ground.center().y,
                 (word - ground.center().y).abs(),
                 ground.height()

@@ -2435,7 +2435,8 @@ mod no_thread_quit_pin {
         assert!(!kept.is_empty(), "the cut kept nothing at all; the pin would be vacuous");
         assert!(
             kept.len() < whole.len(),
-            "the cut discarded nothing, so the gated modules -- including this one,              which names the forbidden call -- are still being scanned"
+            "the cut discarded nothing, so the gated modules -- including this one, which names \
+             the forbidden call -- are still being scanned"
         );
         // This module's own declaration is inside the half that was cut.
         assert!(
@@ -2453,7 +2454,8 @@ mod no_thread_quit_pin {
     fn the_kept_half_still_contains_the_destroy_arm() {
         assert!(
             source().contains(DESTROY_ARM),
-            "the kept half no longer contains the `WM_DESTROY` arm, so the pin below              is not scanning the code it exists to guard"
+            "the kept half no longer contains the `WM_DESTROY` arm, so the pin below is not \
+             scanning the code it exists to guard"
         );
     }
 
@@ -2471,7 +2473,14 @@ mod no_thread_quit_pin {
     fn the_unlock_prompt_never_posts_a_thread_quit() {
         assert!(
             !source().contains(FORBIDDEN),
-            "the unlock prompt posts a thread quit. `close` destroys this window              SYNCHRONOUSLY on the calling thread, and that thread goes on to run              egui windows: `unlock_from_the_locked_card` returns into              `resume_fill_after_unlock`, which opens the autofill overlay and the              preflight window. Nothing drains the quit in between, so the next              `eframe::run_native` takes it out of `GetMessageW`, leaves its loop              BEFORE it draws, and returns its default answer -- the fill the user              just unlocked for silently does nothing. `GONE` is what `next` reads;              the quit is redundant as well as harmful."
+            "the unlock prompt posts a thread quit. `close` destroys this window SYNCHRONOUSLY on \
+             the calling thread, and that thread goes on to run egui windows: \
+             `unlock_from_the_locked_card` returns into `resume_fill_after_unlock`, which opens \
+             the autofill overlay and the preflight window. Nothing drains the quit in between, so \
+             the next `eframe::run_native` takes it out of `GetMessageW`, leaves its loop BEFORE \
+             it draws, and returns its default answer -- the fill the user just unlocked for \
+             silently does nothing. `GONE` is what `next` reads; the quit is redundant as well as \
+             harmful."
         );
     }
 }

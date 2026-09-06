@@ -752,14 +752,18 @@ mod tests {
         assert_eq!(
             source.matches(raise).count(),
             2,
-            "both prompting calls must be preceded by a raise: the create/open pair at the top of              `hello_derived_key`, and the signing call. One raise is not enough -- the create              prompt hands the foreground to the Hello broker, so the first raise is stale by the              time signing runs"
+            "both prompting calls must be preceded by a raise: the create/open pair at the top of \
+             `hello_derived_key`, and the signing call. One raise is not enough -- the create \
+             prompt hands the foreground to the Hello broker, so the first raise is stale by the \
+             time signing runs"
         );
 
         let sign_at = source.find(signing).expect("the signing call must still be here");
         let raise_before_signing = source[..sign_at].matches(raise).count();
         assert_eq!(
             raise_before_signing, 2,
-            "the raise must come BEFORE the signing call -- after it this thread is already              blocked in `op.get()` with the prompt on screen behind whatever the user was using"
+            "the raise must come BEFORE the signing call -- after it this thread is already \
+             blocked in `op.get()` with the prompt on screen behind whatever the user was using"
         );
 
         // Positive controls on the counting AND on the position arithmetic:

@@ -11117,7 +11117,8 @@ mod tests {
         for mode in TRIGGER_ORDER {
             assert!(
                 !notes.contains(&trigger_caption(mode)),
-                "the card still reports a per-item trigger caption ({mode:?}), which is a                  claim that the item's own mode decides what focusing this app does: {notes:?}"
+                "the card still reports a per-item trigger caption ({mode:?}), which is a claim \
+                 that the item's own mode decides what focusing this app does: {notes:?}"
             );
         }
         // Control: an ordinary app gets the note and NOT the Store note.
@@ -12002,7 +12003,8 @@ mod tests {
             .unwrap_or(0);
         assert!(
             selected > 0,
-            "the drag selected nothing in the first item's note, so there is no state              for the second item to inherit and this test proves nothing"
+            "the drag selected nothing in the first item's note, so there is no state for the \
+             second item to inherit and this test proves nothing"
         );
 
         // The pane is now handed a DIFFERENT item -- the list click, as far as
@@ -12014,12 +12016,14 @@ mod tests {
         // note at all would carry no selection either.
         assert!(
             switched.painted(ANOTHER_NOTE),
-            "the second item's note was never painted, so 'no selection' is not a              claim about a note; the frame painted: {:?}",
+            "the second item's note was never painted, so 'no selection' is not a claim about a \
+             note; the frame painted: {:?}",
             switched.strings()
         );
         assert!(
             !switched.painted(A_NOTE),
-            "the pane is still painting the FIRST item's note, so it was never handed              the second one"
+            "the pane is still painting the FIRST item's note, so it was never handed the second \
+             one"
         );
 
         // THE FINDING: nothing is selected in it.
@@ -12029,7 +12033,8 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(
             inherited_len, 0,
-            "the second item's note came up with {inherited_len} characters already              selected ({inherited:?}) -- the first item's selection followed the user"
+            "the second item's note came up with {inherited_len} characters already selected \
+             ({inherited:?}) -- the first item's selection followed the user"
         );
 
         // And the first item's own selection is still its own: the sharing is
@@ -12039,7 +12044,8 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(
             kept, selected,
-            "the first item's selection was destroyed rather than kept apart, so              coming back to it loses the caret"
+            "the first item's selection was destroyed rather than kept apart, so coming back to it \
+             loses the caret"
         );
     }
 
@@ -12098,7 +12104,8 @@ mod tests {
             let _ = pane.idle(&item, &TotpState::NoSecret);
             assert!(
                 pane.ctx.memory(|m| m.has_focus(notes_text_id(&item.id))),
-                "{chord}: the note never took keyboard focus, so this frame is not the                  case this test is named for"
+                "{chord}: the note never took keyboard focus, so this frame is not the case this \
+                 test is named for"
             );
 
             let after = pane.frame(&item, &TotpState::NoSecret, events);
@@ -12659,7 +12666,8 @@ mod tests {
         }
         assert!(
             !laid_out.painted("Autofill"),
-            "the row the pills sat in is still drawn, so the card still presents a per-item              autofill setting: {:?}",
+            "the row the pills sat in is still drawn, so the card still presents a per-item \
+             autofill setting: {:?}",
             laid_out.strings()
         );
 
@@ -16780,12 +16788,14 @@ mod tests {
             .expect("the website row painted no value at all");
         assert_ne!(
             shown, long,
-            "the whole URL was laid out, so nothing truncated it and the only question left              is whether it happens to be short enough today"
+            "the whole URL was laid out, so nothing truncated it and the only question left is \
+             whether it happens to be short enough today"
         );
         let value = frame.ink_of(long);
         assert!(
             value.right() <= chord.left(),
-            "the website value runs to x={} and the chord starts at x={}, so the URL is              painted under its own shortcut",
+            "the website value runs to x={} and the chord starts at x={}, so the URL is painted \
+             under its own shortcut",
             value.right(),
             chord.left()
         );
@@ -16818,11 +16828,13 @@ mod tests {
         // ellipsis means here.
         assert!(
             dots.0.chars().count() < 400,
-            "the row laid out every one of the 400 mask characters, so nothing truncated it              and the assertion below is about a row that happened to fit"
+            "the row laid out every one of the 400 mask characters, so nothing truncated it and \
+             the assertion below is about a row that happened to fit"
         );
         assert!(
             dots.1.right() <= chord.left(),
-            "the masked password runs to x={} and the chord starts at x={}, so the dots are              painted under their own shortcut",
+            "the masked password runs to x={} and the chord starts at x={}, so the dots are \
+             painted under their own shortcut",
             dots.1.right(),
             chord.left()
         );
@@ -21845,7 +21857,9 @@ mod read_pane_scroll_tests {
         for mode in TRIGGER_ORDER {
             assert!(
                 after.rect_of(trigger_label(mode)).is_none(),
-                "the {mode:?} pill is still on the MATCHED APP card. Autofill is one global                  preference now, and a per-item control that writes a field nothing reads is                  a setting that does nothing: painted {:?}",
+                "the {mode:?} pill is still on the MATCHED APP card. Autofill is one global \
+                 preference now, and a per-item control that writes a field nothing reads is a \
+                 setting that does nothing: painted {:?}",
                 after.sources()
             );
         }
@@ -22054,7 +22068,7 @@ mod read_pane_scroll_tests {
             assert_eq!(
                 (rect.left(), rect.right()),
                 (moved.left(), moved.right()),
-                "{source:?} moved sideways from x = {}..{} to {}..{} when the body was                  scrolled",
+                "{source:?} moved sideways from x = {}..{} to {}..{} when the body was scrolled",
                 rect.left(),
                 rect.right(),
                 moved.left(),
@@ -22166,7 +22180,8 @@ mod read_pane_scroll_tests {
 
         assert!(
             ink_in_the_lane(SHORT) > 0,
-            "a body that overflows a {SHORT}pt pane paints no scroll bar at all, so              nothing tells the reader there is more below"
+            "a body that overflows a {SHORT}pt pane paints no scroll bar at all, so nothing tells \
+             the reader there is more below"
         );
         assert_eq!(
             ink_in_the_lane(ROOMY),
@@ -22249,7 +22264,8 @@ mod read_pane_scroll_tests {
         );
         assert_eq!(
             scrolls, fits,
-            "the identity card spans {scrolls:?} on a pane that scrolls and {fits:?} on one              that does not -- the bar's lane is being reserved conditionally"
+            "the identity card spans {scrolls:?} on a pane that scrolls and {fits:?} on one that \
+             does not -- the bar's lane is being reserved conditionally"
         );
     }
 

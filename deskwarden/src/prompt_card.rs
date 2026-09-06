@@ -1951,7 +1951,8 @@ mod tests {
         assert_eq!(
             drawn[0].primary,
             FillChoice::Saved.label(),
-            "the empty-choice card answers `FillChoice::Saved` -- see `choice_at` -- so its one              row has to be labelled with what that will type"
+            "the empty-choice card answers `FillChoice::Saved` -- see `choice_at` -- so its one \
+             row has to be labelled with what that will type"
         );
     }
 
@@ -2037,7 +2038,8 @@ mod tests {
         assert_eq!(match_count_label(4), "4 matches");
         assert_eq!(
             MATCHES, 1,
-            "design 2a is the card for ONE matched account; the rows under the account block are              that account's fill choices and not further matches"
+            "design 2a is the card for ONE matched account; the rows under the account block are \
+             that account's fill choices and not further matches"
         );
         assert_eq!(
             match_count_label(MATCHES),
@@ -2137,7 +2139,8 @@ mod tests {
             assert_eq!(
                 l.mark.w,
                 crate::win32_draw::mark_width(l.mark.h),
-                "the mark's box is not the design artboard's ratio, so the shield would be                  letterboxed inside it and drift away from the word beside it"
+                "the mark's box is not the design artboard's ratio, so the shield would be \
+                 letterboxed inside it and drift away from the word beside it"
             );
             assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
             assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");
@@ -2175,7 +2178,8 @@ mod tests {
             assert_eq!(
                 l.account.x - l.avatar.right(),
                 AVATAR_GAP,
-                "control: the account block's text no longer sits one `AVATAR_GAP` off its tile,                  so the choice indent derived from those two columns means something else now"
+                "control: the account block's text no longer sits one `AVATAR_GAP` off its tile, \
+                 so the choice indent derived from those two columns means something else now"
             );
             assert_eq!(
                 l.list.x + CHOICE_TEXT_INSET,

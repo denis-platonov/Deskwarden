@@ -1236,7 +1236,8 @@ mod tests {
         assert_eq!(
             writers,
             vec![("breach_scan.rs".to_string(), 1)],
-            "a finding is written outside the scan that produced it. A badge with nothing              behind it is worse than no badge"
+            "a finding is written outside the scan that produced it. A badge with nothing behind \
+             it is worse than no badge"
         );
     }
 

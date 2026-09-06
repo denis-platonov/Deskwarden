@@ -1447,13 +1447,15 @@ pub(crate) mod tests {
         let original = cipher_with_unmodelled_fields();
         assert!(
             original.get("revisionDate").is_some(),
-            "control: the fixture has no `revisionDate` to drop, so this test would pass              against a mapper that sent it"
+            "control: the fixture has no `revisionDate` to drop, so this test would pass against a \
+             mapper that sent it"
         );
         let (item, keys) = round_trip_in(original);
         let written = mapped(&item, &keys);
         assert!(
             written.get("revisionDate").is_none(),
-            "the write quotes the server's own `revisionDate` back at it, which a server              can only read as a concurrency token: {written:?}"
+            "the write quotes the server's own `revisionDate` back at it, which a server can only \
+             read as a concurrency token: {written:?}"
         );
     }
 

@@ -2117,16 +2117,19 @@ mod runner_tests {
         match &outcome {
             Err(SendError::SpawnFailed(why)) => assert!(
                 why.contains(crate::job_object::spawn_probe::REFUSED),
-                "the read failed for some other reason, so its result did not come from the                  call the probe recorded: {why}"
+                "the read failed for some other reason, so its result did not come from the call \
+                 the probe recorded: {why}"
             ),
             other => panic!(
-                "the probe refused the only spawn this read may make, yet it reported                  {other:?}, so a child was started by a route the probe cannot see"
+                "the probe refused the only spawn this read may make, yet it reported {other:?}, \
+                 so a child was started by a route the probe cannot see"
             ),
         }
         assert_eq!(
             attempts.len(),
             1,
-            "the production read path did not reach `spawn_in_job` exactly once, so any              assertion about what it carried is about nothing: {attempts:?}"
+            "the production read path did not reach `spawn_in_job` exactly once, so any assertion \
+             about what it carried is about nothing: {attempts:?}"
         );
         let attempt = attempts.into_iter().next().expect("just counted one");
         assert!(
@@ -2190,23 +2193,27 @@ mod runner_tests {
         assert_eq!(
             session_values,
             vec![Some(SESSION.to_string())],
-            "`{SESSION_ENV}` did not arrive at the child set exactly once to the token the              runner was built with, so a real `bw send list` answers `locked`; the overlay              that arrived was {envs:?}"
+            "`{SESSION_ENV}` did not arrive at the child set exactly once to the token the runner \
+             was built with, so a real `bw send list` answers `locked`; the overlay that arrived \
+             was {envs:?}"
         );
 
         for arg in &args {
             assert!(
                 !arg.contains(SESSION),
-                "the session token is in argv, where any process on the machine can read it:                  {arg}"
+                "the session token is in argv, where any process on the machine can read it: {arg}"
             );
         }
         assert!(
             !SESSION.is_empty() && SESSION.len() > 8,
-            "control: the token searched for in argv is a real string, so the loop above is              not vacuous"
+            "control: the token searched for in argv is a real string, so the loop above is not \
+             vacuous"
         );
         assert_eq!(
             args,
             vec!["send".to_string(), "list".to_string()],
-            "control: the recorded spawn does not carry this list's arguments, so the argv              check above is about some other command"
+            "control: the recorded spawn does not carry this list's arguments, so the argv check \
+             above is about some other command"
         );
 
         // Control, and the mutant it kills: a runner built with no session is
@@ -2217,7 +2224,9 @@ mod runner_tests {
         let (_, jobless_envs) = the_one_spawn(|| list_sends(&jobless).map(|_| ()));
         assert!(
             jobless_envs.iter().all(|(k, _)| k != SESSION_ENV),
-            "control: a runner configured with no session still set {SESSION_ENV}, so the              assertion above cannot tell the configured token from an invented one:              {jobless_envs:?}"
+            "control: a runner configured with no session still set {SESSION_ENV}, so the \
+             assertion above cannot tell the configured token from an invented one: \
+             {jobless_envs:?}"
         );
     }
 
@@ -2460,7 +2469,8 @@ mod runner_tests {
             );
             assert!(
                 !printed.contains(SESSION),
-                "the session token -- the key to the whole vault -- is in the debug output of                  a read invocation: {printed}"
+                "the session token -- the key to the whole vault -- is in the debug output of a \
+                 read invocation: {printed}"
             );
         }
 

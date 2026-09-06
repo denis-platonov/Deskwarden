@@ -983,7 +983,8 @@ mod tests {
         assert_eq!(
             visible_rows(5, 5),
             (5, false),
-            "five candidates against a cap of five is five candidates, and a card that dropped              one of them and reported an overflow was lying about both"
+            "five candidates against a cap of five is five candidates, and a card that dropped one \
+             of them and reported an overflow was lying about both"
         );
     }
 

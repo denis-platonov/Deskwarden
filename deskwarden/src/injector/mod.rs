@@ -871,7 +871,8 @@ mod orchestration_tests {
     #[test]
     fn a_run_that_was_abandoned_counts_as_partial() {
         let abandoned = Err(
-            "auto-type stopped: window 7 is no longer in front (after 2 of 5 steps).              Nothing further was typed."
+            "auto-type stopped: window 7 is no longer in front (after 2 of 5 steps). Nothing \
+             further was typed."
                 .to_string(),
         );
         assert_eq!(outcome_of_a_run(&abandoned), FillOutcome::Partial);

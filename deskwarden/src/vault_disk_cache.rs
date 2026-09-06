@@ -1374,7 +1374,8 @@ fn seal_key_in(
                 match parse_seal_key(&plain) {
                     Some(key) => return Ok(key),
                     None => log::warn!(
-                        "the vault cache's key file at {} is not one of ours; minting a new key                          and rebuilding the cache",
+                        "the vault cache's key file at {} is not one of ours; minting a new key \
+                         and rebuilding the cache",
                         path.display()
                     ),
                 }
@@ -1385,7 +1386,8 @@ fn seal_key_in(
             // if DPAPI is genuinely unavailable it fails there with a real
             // message rather than here with a guess.
             Err(e) => log::warn!(
-                "the vault cache's key file at {} could not be unwrapped ({e}); minting a new                  key and rebuilding the cache",
+                "the vault cache's key file at {} could not be unwrapped ({e}); minting a new key \
+                 and rebuilding the cache",
                 path.display()
             ),
         },
