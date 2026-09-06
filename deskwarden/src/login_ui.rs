@@ -816,6 +816,23 @@ pub fn missing_credential_message(
 /// `TEXT_MUTED` label it had, and a chevron drawn to egui's own proportions,
 /// so moving off `ComboBox` changes what the popup does and not what the
 /// footer looks like.
+/// The height the server picker's button comes out at.
+///
+/// Named because the API key link beside it is sized to this: the two share
+/// the footer's row, and a link left to its own 12pt height hangs from the top
+/// of a row this tall. Derived from the same three numbers the button is built
+/// from rather than written out, so the two cannot drift.
+fn server_picker_height() -> f32 {
+    // 12pt text's line height, near enough for a row whose height is padding
+    // plus a line: the button takes `galley.height().max(CHEVRON)`, and at
+    // 12pt the galley is the taller of the two.
+    const LINE: f32 = 14.0;
+    PICKER_PAD_Y * 2.0 + LINE
+}
+
+/// The server picker's vertical padding, shared with [`server_picker_height`].
+const PICKER_PAD_Y: f32 = 7.0;
+
 fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
     // **The label and the chevron are laid out, not painted on top of each
     // other.** The first pass called `ui.button(label)` and then drew the
@@ -826,7 +843,7 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
     const CHEVRON: f32 = 8.0;
     const CHEVRON_GAP: f32 = 8.0;
     const PAD_X: f32 = 10.0;
-    const PAD_Y: f32 = 7.0;
+    const PAD_Y: f32 = PICKER_PAD_Y;
     /// A popup row's height.
     ///
     /// 28, up from 24: at 24 the band was barely taller than the 12pt line
@@ -938,6 +955,27 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
             // ends are pinned to the button's own width instead, so the list
             // cannot come out any other size.
             ui.set_width(field_width);
+            // **The row's own padding decides where its label sits.**
+            // `add_sized` gives the button a 28pt box, but a `Button` lays its
+            // text out at `spacing.button_padding` from its top-left and then
+            // the justified layout stretches the FRAME around that -- so the
+            // text kept egui's default 2pt top padding inside a box more than
+            // twice that tall and sat high. "Dropdown text like Self-hosted
+            // feels not centered vertically."
+            //
+            // Half the leftover, so the text is centred by construction at
+            // whatever `ROW_HEIGHT` is set to next.
+            let line = ui
+                .painter()
+                .layout_no_wrap(
+                    ServerChoice::SelfHosted.label().to_string(),
+                    egui::FontId::proportional(12.0),
+                    theme::TEXT_MUTED,
+                )
+                .size()
+                .y;
+            ui.spacing_mut().button_padding =
+                egui::vec2(PAD_X, ((ROW_HEIGHT - line) / 2.0).max(0.0));
             // No gap between rows either: `item_spacing` leaves a stripe of
             // frame between two bands, which is the same defect vertically.
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -2461,21 +2499,43 @@ pub fn draw_login_window(
     // right, the server — a live dropdown while signing in (the native
     // client's "Logging in on"), static text once an account is attached.
     ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-        // `left_to_right(Align::Center)` and NOT `ui.horizontal`, which
-        // inherits this layout's `Align::Min` and hangs every child from the
-        // top of the row. The link is a line of 12pt text and the server
-        // picker is a bordered button half again as tall, so top-aligned they
-        // read as two lines -- "Sign in with API - make on exact same line".
-        // Centred, their text sits on one line whatever the button's height.
-        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        // **`ui.horizontal`, and the vertical centring done by SIZING the
+        // link rather than by the layout.**
+        //
+        // This was `with_layout(left_to_right(Align::Center))` for one pass,
+        // to stop `ui.horizontal` inheriting the footer's `Align::Min` and
+        // hanging the link from the top of a row as tall as the server
+        // picker. It centred the text and cost the click: "Sign in with API
+        // does nothing on click". `ui.horizontal` is the shape every other
+        // control in this footer has always used and is the one known to
+        // take a click here, so the alignment is bought a different way --
+        // the link is given the picker's own height and centres itself
+        // inside it.
+        ui.horizontal(|ui| {
             // **The API key link, on the "Logging in on:" line.** The two are
             // never shown together -- this one only while signing in, "Log
             // out" only once an account is attached -- so they share the
             // footer's left slot rather than competing for it.
-            if status == BwStatus::Unauthenticated
-                && ui.link(RichText::new(crate::api_key_ui::USE_API_KEY_LABEL).size(12.0)).clicked()
-            {
-                action = Some(LoginAction::UseApiKey);
+            if status == BwStatus::Unauthenticated {
+                let text = RichText::new(crate::api_key_ui::USE_API_KEY_LABEL).size(12.0);
+                // Its own width, measured, so the picker beside it keeps the
+                // rest of the row: `available_width` here would take all of
+                // it and push the picker out of the footer.
+                let width = ui
+                    .painter()
+                    .layout_no_wrap(
+                        crate::api_key_ui::USE_API_KEY_LABEL.to_string(),
+                        egui::FontId::proportional(12.0),
+                        theme::TEXT_MUTED,
+                    )
+                    .size()
+                    .x;
+                if ui
+                    .add_sized([width, server_picker_height()], egui::Link::new(text))
+                    .clicked()
+                {
+                    action = Some(LoginAction::UseApiKey);
+                }
             }
             if status != BwStatus::Unauthenticated {
                 let log_out = ui.add(
