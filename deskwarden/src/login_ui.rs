@@ -903,6 +903,14 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
 
     let _popup = egui::Popup::menu(&button)
         .id(egui::Id::new("server-choice"))
+        // **The button's exact width, said out loud.** `Popup::menu` does not
+        // set one -- the widget this replaced was setting it, from its own
+        // button, and moving off that widget left this unset. The popup then
+        // sized itself to its content: the longest label, with none of the
+        // button's chevron or its gap, so the list and the field it drops out
+        // of were two different widths. "Make popup width same as dropdown
+        // field."
+        .width(rect.width())
         // **A frame with no inner margin, which is what "edge to edge" needs.**
         // A full-width row is only as wide as the frame lets it be, and the
         // menu frame egui supplies pads its contents -- so the selection band
