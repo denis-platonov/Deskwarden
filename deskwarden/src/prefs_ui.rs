@@ -2433,6 +2433,38 @@ fn draw_lock(ui: &mut Ui, state: &mut PrefsState) {
     });
 }
 
+/// An in-card section label, in the treatment the design specifies for one.
+///
+/// **The spec (§1.2, "Section label (in-card)") asks for 11-12px, weight 700,
+/// UPPERCASE, letter-spacing 0.06-0.1em, `TEXT_MUTED`.** These three cards --
+/// API keys, Mint a key, Scan history -- each wrote `RichText::new(LABEL)
+/// .size(13.0).color(theme::INK)` instead: sentence case, body weight, and
+/// the ink colour a row TITLE uses. The vault window has always drawn its
+/// card headings the specified way ("LOGIN CREDENTIALS", `detail.rs`'s
+/// `CARD_HEADING_SIZE`), so the two windows disagreed about the same element
+/// and the page with the most of them -- Local API, which has two -- looked
+/// least like the rest of the app. That is the "Local API screen looks off"
+/// report, read against the spec rather than against a screenshot.
+///
+/// The same numbers the vault pane uses, not a second set that happens to
+/// land in the same range: one element, one treatment.
+fn section_label(ui: &mut Ui, label: &str) {
+    ui.label(theme::letterspaced(
+        &label.to_uppercase(),
+        SECTION_LABEL_SIZE,
+        theme::BOLD,
+        SECTION_LABEL_TRACKING,
+        theme::TEXT_MUTED,
+    ));
+}
+
+/// The in-card section label's size and tracking, matching the vault pane's
+/// `CARD_HEADING_SIZE` / `CARD_HEADING_TRACKING`. Written here rather than
+/// imported because `detail`'s copies are private to that module; the pair is
+/// pinned equal by `the_section_label_matches_the_vault_panes_card_heading`.
+const SECTION_LABEL_SIZE: f32 = 12.0;
+const SECTION_LABEL_TRACKING: f32 = 0.72;
+
 /// A [`toggle_row`] that can be switched off, for a child of a master switch.
 ///
 /// **Disabled means disabled, not merely painted grey.** The pill senses no
@@ -2654,7 +2686,7 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
 
     card(ui, |ui| {
         card_row(ui, |ui| {
-            ui.label(RichText::new(SCAN_HISTORY_LABEL).size(13.0).color(theme::INK));
+            section_label(ui, SCAN_HISTORY_LABEL);
         });
         if state.scan_history.entries.is_empty() {
             row_separator(ui);
@@ -3600,7 +3632,7 @@ fn api_cards(ui: &mut Ui, state: &mut PrefsState) {
 
     card(ui, |ui| {
         card_row(ui, |ui| {
-            ui.label(RichText::new(KEYS_SECTION_LABEL).size(13.0).color(theme::INK));
+            section_label(ui, KEYS_SECTION_LABEL);
         });
         if state.keys.is_empty() {
             row_separator(ui);
@@ -3751,7 +3783,7 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         card_row(ui, |ui| {
             ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
-            ui.label(RichText::new(MINT_SECTION_LABEL).size(13.0).color(theme::INK));
+            section_label(ui, MINT_SECTION_LABEL);
             ui.label(
                 RichText::new(MINT_SECTION_DESCRIPTION).size(12.0).color(theme::TEXT_FAINT),
             );
@@ -7719,6 +7751,45 @@ mod tests {
     /// `fetch_icons_direct` is counted whether or not it is GHOSTED --
     /// `child_toggle_row` paints a disabled pill at the same 40x22 as an
     /// enabled one, so switching site icons off must not change View's number.
+    /// **The two windows draw one element the same way**, which is the whole
+    /// of the fix for "Local API screen looks off - check the design and make
+    /// sure we are 100% match elements".
+    ///
+    /// The design's §1.2 asks an in-card section label for 11-12px, weight
+    /// 700, UPPERCASE and 0.06-0.1em of tracking. The vault pane's card
+    /// headings have always been that; Preferences drew its three at 13px,
+    /// body weight, `INK` and sentence case, so the page with two of them
+    /// looked unlike every other surface in the app.
+    ///
+    /// A SOURCE PIN, and against `detail.rs`'s numbers rather than a range:
+    /// those constants are private to that module, so the pair cannot be
+    /// compared by importing one. A range would let the two drift apart
+    /// inside it, which is the state this test exists to end.
+    #[test]
+    fn the_section_label_matches_the_vault_panes_card_heading() {
+        let pane = include_str!("vault_window/detail.rs");
+        for (name, ours) in [
+            ("CARD_HEADING_SIZE", SECTION_LABEL_SIZE),
+            ("CARD_HEADING_TRACKING", SECTION_LABEL_TRACKING),
+        ] {
+            let decl = format!("const {name}: f32 = ");
+            let at = pane
+                .find(&decl)
+                .unwrap_or_else(|| panic!("`{name}` is gone from the vault pane"));
+            let value: f32 = pane[at + decl.len()..]
+                .split(';')
+                .next()
+                .expect("a terminated const")
+                .trim()
+                .parse()
+                .expect("a plain float literal");
+            assert_eq!(
+                ours, value,
+                "Preferences draws an in-card section label at {ours} where the vault pane                  draws its card heading at {value}. One element, two treatments, is what                  made this page look like a different app"
+            );
+        }
+    }
+
     #[test]
     fn each_page_paints_exactly_the_pills_it_owns() {
         assert_eq!(
@@ -7953,7 +8024,9 @@ mod tests {
         let breach = painted.ink_of(BREACH_LABEL).rect;
         let scan = painted.ink_of(SCAN_SECTION_LABEL).rect;
         let consent = painted.ink_of(crate::breach_scan::SCAN_CONSENT_NOTE).rect;
-        let history = painted.ink_of(SCAN_HISTORY_LABEL).rect;
+        // Painted uppercase now: `section_label` is the design's in-card
+        // section-label treatment, and it uppercases at the point of drawing.
+        let history = painted.ink_of(&SCAN_HISTORY_LABEL.to_uppercase()).rect;
         // The instrument first: four labels at four distinct, non-empty
         // heights, so `top()` is telling them apart rather than reading one
         // number four times.
@@ -8079,7 +8152,7 @@ mod tests {
             SCAN_IDLE_DESCRIPTION,
             SCAN_BUTTON,
             crate::breach_scan::SCAN_CONSENT_NOTE,
-            SCAN_HISTORY_LABEL,
+            &SCAN_HISTORY_LABEL.to_uppercase(),
             SCAN_NO_HISTORY,
         ] {
             assert!(painted.contains(text), "{text:?} is not on the page: {:?}", painted.strings());
@@ -9727,9 +9800,19 @@ mod tests {
         // The switch, the empty-or-not list with its heading, the form that
         // mints, and a listed key's revoke button: every control the split
         // had to carry across, and each one a separate way to lose half.
-        for label in [SERVICE_LABEL, KEYS_SECTION_LABEL, MINT_SECTION_LABEL, MINT_BUTTON] {
+        // The two section labels are painted UPPERCASE now -- the treatment
+        // the design specifies for an in-card section label, and the one the
+        // vault pane has always used. The constants stay sentence case
+        // because that is what they ARE; `section_label` uppercases at the
+        // point of drawing, so a test that reads the paint has to as well.
+        for label in [
+            SERVICE_LABEL.to_string(),
+            KEYS_SECTION_LABEL.to_uppercase(),
+            MINT_SECTION_LABEL.to_uppercase(),
+            MINT_BUTTON.to_string(),
+        ] {
             assert!(
-                api.contains(label),
+                api.contains(&label),
                 "{label:?} is not on the Local API page; got {:?}",
                 api.strings()
             );
@@ -9746,10 +9829,16 @@ mod tests {
         vault.show_service_keys(vec![stored_key("Backup script", None)]);
         let painted = tall_frame(&ctx, &mut vault, &[]);
         for label in
-            [SERVICE_LABEL, KEYS_SECTION_LABEL, MINT_SECTION_LABEL, MINT_BUTTON, REVOKE_BUTTON]
+            [
+                SERVICE_LABEL.to_string(),
+                KEYS_SECTION_LABEL.to_uppercase(),
+                MINT_SECTION_LABEL.to_uppercase(),
+                MINT_BUTTON.to_string(),
+                REVOKE_BUTTON.to_string(),
+            ]
         {
             assert!(
-                !painted.contains(label),
+                !painted.contains(&label),
                 "{label:?} is still painted on the Vault page as well as on the Local API \
                  page; got {:?}",
                 painted.strings()
