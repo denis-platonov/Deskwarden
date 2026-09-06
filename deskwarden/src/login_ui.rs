@@ -834,14 +834,32 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
     /// points are all margin around the text, which is what makes a row read
     /// as a row rather than as a label with a colour behind it.
     const ROW_HEIGHT: f32 = 28.0;
+    /// The three servers, in the order they are offered.
+    ///
+    /// Named once because the button and the popup must agree about them: the
+    /// button is sized to the widest of these, and a list holding a fourth
+    /// option the button had never measured would be wider than the control it
+    /// drops out of.
+    const SERVER_OPTIONS: [ServerChoice; 3] =
+        [ServerChoice::UsCloud, ServerChoice::EuCloud, ServerChoice::SelfHosted];
 
-    let galley = ui.painter().layout_no_wrap(
-        choice.label().to_owned(),
-        egui::FontId::proportional(12.0),
-        theme::TEXT_MUTED,
-    );
+    let font = egui::FontId::proportional(12.0);
+    let lay = |text: String| ui.painter().layout_no_wrap(text, font.clone(), theme::TEXT_MUTED);
+    let galley = lay(choice.label().to_owned());
+
+    // **Measured against the WIDEST option, not the current one**, which is
+    // what "make dropdown menu same width" asks for. `Popup::menu` takes the
+    // popup's width from the button, and the button was as wide as whatever
+    // happened to be selected -- so picking `bitwarden.eu` gave a button
+    // narrower than the list that drops out of it, and every change of
+    // selection moved the footer. Sized to the longest label, the button is
+    // one width for the life of the window and the list matches it exactly.
+    let widest = SERVER_OPTIONS
+        .iter()
+        .map(|option| lay(option.label().to_owned()).size().x)
+        .fold(galley.size().x, f32::max);
     let size = Vec2::new(
-        PAD_X * 2.0 + galley.size().x + CHEVRON_GAP + CHEVRON,
+        PAD_X * 2.0 + widest + CHEVRON_GAP + CHEVRON,
         PAD_Y * 2.0 + galley.size().y.max(CHEVRON),
     );
     let (rect, button) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -907,7 +925,7 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
             // frame between two bands, which is the same defect vertically.
             ui.spacing_mut().item_spacing.y = 0.0;
             let width = ui.available_width();
-            for option in [ServerChoice::UsCloud, ServerChoice::EuCloud, ServerChoice::SelfHosted] {
+            for option in SERVER_OPTIONS {
                 // `Button::selected`, which is what `Ui::selectable_label`
                 // builds for itself in this version of egui -- reached
                 // directly here only so the row can be given a size.
