@@ -3337,20 +3337,40 @@ pub fn direct_login_for_this_sign_in(
     // about the same account in the same second.
     chosen_this_sign_in: Option<bool>,
 ) -> Option<DirectRestLogin> {
-    if let Some(account) = account {
-        let mut establishing = account.clone();
-        crate::accounts::learn_account_details(
-            &mut establishing,
-            Some(typed_email.trim()),
-            typed_server,
-            chosen_this_sign_in,
+    // **A record is built when there is none, and that is the fix for a clean
+    // install choosing the built-in client and being told the CLI is
+    // missing.**
+    //
+    // This used to re-settle only `if let Some(account)`. A first install has
+    // no record, so nothing re-settled, and the sign-in ran on whatever the
+    // process settled at startup -- `bw serve`, because an absent
+    // `use_official_bw_crypto` reads as the official CLI. The user's answer to
+    // the choice modal reached this function and was dropped one line later,
+    // and what they saw was the CLI being spawned for a sign-in they had just
+    // told the app not to use it for.
+    //
+    // The fields below are the ones `learn_account_details` overwrites anyway
+    // -- it takes the typed email, the typed server and the modal's answer --
+    // so the only thing invented here is the id, which no part of the
+    // re-settle reads. `main` mints the real record after the sign-in
+    // succeeds.
+    let mut establishing = account.cloned().unwrap_or_else(|| crate::accounts::Account {
+        id: crate::accounts::AccountId::generate(),
+        email: typed_email.trim().to_string(),
+        server_url: typed_server.map(str::to_string),
+        use_official_bw_crypto: chosen_this_sign_in.unwrap_or(true),
+    });
+    crate::accounts::learn_account_details(
+        &mut establishing,
+        Some(typed_email.trim()),
+        typed_server,
+        chosen_this_sign_in,
+    );
+    if !crate::backend_policy::resettle_for(&establishing) {
+        log::debug!(
+            "no backend re-settle is installed in this process, so this sign-in runs on \
+             the environment startup settled"
         );
-        if !crate::backend_policy::resettle_for(&establishing) {
-            log::debug!(
-                "no backend re-settle is installed in this process, so this sign-in runs on \
-                 the environment startup settled"
-            );
-        }
     }
     crate::backend_policy::direct_rest_login()
 }
@@ -5192,6 +5212,50 @@ mod tests {
     /// clicked open and a test that never opens it would pass against a
     /// `ComboBox` put straight back. It reads the picker's own body and holds
     /// that neither a scroll area nor a combo box is in it.
+    /// **A sign-in with NO account record still re-settles the backend.**
+    ///
+    /// The report: a clean install, the choice modal, "use the built-in
+    /// client" -- and then a message saying the Bitwarden CLI is missing, for
+    /// a sign-in that had just been told not to use it.
+    ///
+    /// `direct_login_for_this_sign_in` re-settled only `if let Some(account)`.
+    /// A first install has none, so the modal's answer was carried into this
+    /// function and dropped one line later, and the sign-in ran on what
+    /// startup had settled: `bw serve`, because an absent
+    /// `use_official_bw_crypto` reads as the official CLI.
+    ///
+    /// **This is the third defect of exactly this shape** -- the ui process
+    /// gate, the daemon's sign-in routing, and now this -- all of them a
+    /// condition on "there is an account record" in a path a first install
+    /// takes. That is why this is pinned rather than left to the passing
+    /// suite.
+    ///
+    /// A source guard: the re-settle it protects writes to a process-global
+    /// backend slot that a unit test cannot observe without installing one,
+    /// and installing one would test the harness rather than the branch.
+    #[test]
+    fn a_sign_in_with_no_account_record_still_settles_its_backend() {
+        let source = include_str!("login_ui.rs");
+        let body = source
+            .split_once("pub fn direct_login_for_this_sign_in(")
+            .expect("the direct-login entry point was renamed")
+            .1;
+        let end = ["\nfn ", "\npub fn ", "\n#[must_use]"]
+            .iter()
+            .filter_map(|needle| body.find(needle))
+            .min()
+            .expect("the function is the last item in the file, so its end cannot be found");
+        let body = &body[..end];
+        assert!(
+            !body.contains(concat!("if let Some(account)", " = account")),
+            "the backend re-settle is behind `if let Some(account)` again, so a first              install -- which has no record -- signs in on whatever startup settled and the              choice modal's answer is dropped"
+        );
+        assert!(
+            body.contains(concat!("resettle", "_for(&establishing)")),
+            "control: this function no longer re-settles anything, so the assertion above              is about a branch that does not exist"
+        );
+    }
+
     #[test]
     fn the_server_picker_has_no_scroll_area() {
         let source = include_str!("login_ui.rs");
