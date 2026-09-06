@@ -901,6 +901,7 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
         Stroke::NONE,
     ));
 
+    let field_width = rect.width();
     let _popup = egui::Popup::menu(&button)
         .id(egui::Id::new("server-choice"))
         // **The button's exact width, said out loud.** `Popup::menu` does not
@@ -929,10 +930,18 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
             // text". Every row is given the popup's whole width instead, which
             // also makes the three rows one column of hit targets rather than
             // three ragged ones.
+            // **`set_width`, and rows measured from the SAME number.**
+            // `Popup::width` only feeds `Area::default_width`, which is a
+            // default: an area still grows to whatever its content asks for,
+            // and rows asking for `available_width` inside an area sized to
+            // its content is a loop that settles wider than the field. Both
+            // ends are pinned to the button's own width instead, so the list
+            // cannot come out any other size.
+            ui.set_width(field_width);
             // No gap between rows either: `item_spacing` leaves a stripe of
             // frame between two bands, which is the same defect vertically.
             ui.spacing_mut().item_spacing.y = 0.0;
-            let width = ui.available_width();
+            let width = field_width;
             for option in SERVER_OPTIONS {
                 // `Button::selected`, which is what `Ui::selectable_label`
                 // builds for itself in this version of egui -- reached
