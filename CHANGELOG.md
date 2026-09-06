@@ -15,6 +15,48 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### Locking the vault leaves Deskwarden in the tray
+
+Locking -- the Lock button, the idle timer, or Windows reporting that you
+had walked away -- used to be answered with a sign-in window drawn by the
+tray itself. Nothing appears now. Deskwarden stays in the tray with the
+vault shut, CTRL+ALT+B keeps working for the things that do not need it,
+and the sign-in card is waiting the next time you open the vault.
+
+The stored master key is deleted along with the session, which is what
+makes that next window ask for your master password rather than opening
+straight onto your items.
+
+### The vault window always opens in a window process of its own
+
+One route was left by which the tray could draw the vault itself: an
+account whose stored master key was missing was judged unable to open in a
+separate process. It can, so it does. Nothing in the tray process draws any
+more, which is where its memory goes when it does -- the graphics driver it
+maps is only given back when the process exits.
+
+### Choosing the built-in client sticks
+
+Signing in on the built-in client and then reopening the app could spend
+the whole of startup probing a port nothing was listening on, and end with
+"your vault could not be loaded". Preferences was writing a guess back onto
+the account: it carried the choice as a plain yes-or-no with no way to say
+"this window was never told", so a launch with no account list filled it in
+with the wrong answer. It can say so now, and a window that never touched
+the setting leaves the account alone.
+
+### Masked values are cut short too
+
+The previous release cut long website addresses with an ellipsis before
+they ran under their shortcut. Passwords and anything else on a stacked row
+were still painted straight through theirs. They are cut now as well.
+
+### Smaller things
+
+* 184 messages across the app had lost their line breaks in an earlier
+  edit and were being shown with runs of spaces in the middle of a
+  sentence -- including both explanations on the Sends screen.
+
 ## 0.15.16 - 2026-09-06
 
 ### Signing in on a fresh install works, whichever client you choose
