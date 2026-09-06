@@ -5854,17 +5854,27 @@ fn row_body(
                     let line = row_line_width(ui);
                     label_cell(ui, label, line, LabelFit::ToText);
                     let band = egui::vec2(line, ROW_CONTENT_HEIGHT);
+                    // **Controls first here too**, for the reason the
+                    // `Columns` branch below states at length: a value
+                    // allocated first takes the whole band and paints under
+                    // its own chord. This branch was left alone in that pass
+                    // and the owner found it -- "should cut of password and
+                    // any other field as well" -- because a masked row is a
+                    // stacked row, so the dots ran under CTRL+B on a long
+                    // enough password.
                     ui.allocate_ui_with_layout(
                         band,
-                        egui::Layout::left_to_right(egui::Align::Center),
+                        egui::Layout::right_to_left(egui::Align::Center),
                         |ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            value(ui);
+                            ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+                            controls(ui);
                             ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
+                                egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    ui.spacing_mut().item_spacing.x = CONTROL_GAP;
-                                    controls(ui);
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.style_mut().wrap_mode =
+                                        Some(egui::TextWrapMode::Truncate);
+                                    value(ui);
                                 },
                             );
                         },
@@ -16777,6 +16787,43 @@ mod tests {
             value.right() <= chord.left(),
             "the website value runs to x={} and the chord starts at x={}, so the URL is              painted under its own shortcut",
             value.right(),
+            chord.left()
+        );
+    }
+
+    /// **The same rule on a STACKED row**, which is what a masked value uses.
+    ///
+    /// "Should cut of password and any other field as well." The first pass
+    /// reordered only the `Columns` branch, so a long password's dots still
+    /// ran under CTRL+B. Asserted with a password long enough not to fit the
+    /// widest pane these tests build, for the reason the website test states.
+    #[test]
+    fn a_password_too_long_for_its_row_is_cut_before_it_reaches_the_chord() {
+        let mut item = a_login();
+        item.login.as_mut().expect("the fixture is a login").password =
+            Some("p".repeat(400).into());
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+
+        let chord = frame.ink_of(copy_shortcut_chord(CopyShortcut::Password));
+        let dots = frame
+            .rendered
+            .iter()
+            .map(|(_, glyphs, rect)| (glyphs.clone(), *rect))
+            .find(|(glyphs, _)| glyphs.starts_with('\u{2022}'))
+            .expect("the password row painted no mask at all");
+        // The control, and without it this test passes against a row that
+        // never had 400 dots to fit in the first place: the glyphs actually
+        // laid out are fewer than the mask asked for, which is what an
+        // ellipsis means here.
+        assert!(
+            dots.0.chars().count() < 400,
+            "the row laid out every one of the 400 mask characters, so nothing truncated it              and the assertion below is about a row that happened to fit"
+        );
+        assert!(
+            dots.1.right() <= chord.left(),
+            "the masked password runs to x={} and the chord starts at x={}, so the dots are              painted under their own shortcut",
+            dots.1.right(),
             chord.left()
         );
     }
