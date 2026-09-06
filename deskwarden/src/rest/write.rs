@@ -175,6 +175,28 @@ pub fn encrypt_item(
     } else {
         out.insert("id".to_string(), Value::String(item.id.clone()));
     }
+    // **`revisionDate` is dropped, and it is the ONE server-assigned field
+    // this body must not carry back.**
+    //
+    // The rule of this function is "build from the remainder, never from the
+    // model", and it is right: a field this crate does not model must survive
+    // a write rather than be deleted from the user's vault. `revisionDate` is
+    // the exception, because it is not a field of the item at all -- it is the
+    // server's record of when the item last changed, and the cipher REQUEST
+    // model has no such field. Sending it back offers the server a value it
+    // can only read as a concurrency token.
+    //
+    // Watched, on a self-hosted server, as three refusals in thirty seconds
+    // on a star being toggled: "Couldn't add ... to your favourites -- the
+    // vault backend refused the write", with the server saying "The client
+    // copy of this cipher is out of date. Resync the client and try again."
+    // The client's copy was a sync old, which is as fresh as a client gets;
+    // what was stale was a timestamp it had no business quoting.
+    //
+    // The server still answers with its own new `revisionDate`, and
+    // `RestBackend::write_through` still stores THAT rather than what it
+    // sent -- so the snapshot advances exactly as it did.
+    out.remove("revisionDate");
     put_text(&mut out, "name", Some("name"), Some(item.name.as_str()), key, retained)?;
     put_text(
         &mut out,
@@ -1404,6 +1426,37 @@ pub(crate) mod tests {
     /// the real decrypt and back out through the mapper, and every unmodelled
     /// key must come back byte-identical. If this fails, an edit in the
     /// running app deletes those fields from the user's real vault.
+    /// **THE REPORT: "Couldn't add \"Secnote\" to your favourites -- the vault
+    /// backend refused the write. It still isn't one."**
+    ///
+    /// The server's own words, from the log: "The client copy of this cipher
+    /// is out of date. Resync the client and try again." The client's copy
+    /// was one sync old, which is as fresh as a client gets. What was stale
+    /// was a timestamp it had no business quoting: `encrypt_item` builds the
+    /// body from the item's retained JSON, and that JSON carries the
+    /// `revisionDate` the server assigned. A cipher REQUEST has no such
+    /// field, so a server offered one can only read it as a concurrency
+    /// token -- and it refused the write three times in thirty seconds.
+    ///
+    /// Asserted on the body rather than on a round trip, because the round
+    /// trip's rule is "every unmodelled key survives" and this is the
+    /// exception to it: a test that only listed the exception would pass just
+    /// as well if the key were still being sent.
+    #[test]
+    fn the_written_body_does_not_quote_the_servers_own_revision_date() {
+        let original = cipher_with_unmodelled_fields();
+        assert!(
+            original.get("revisionDate").is_some(),
+            "control: the fixture has no `revisionDate` to drop, so this test would pass              against a mapper that sent it"
+        );
+        let (item, keys) = round_trip_in(original);
+        let written = mapped(&item, &keys);
+        assert!(
+            written.get("revisionDate").is_none(),
+            "the write quotes the server's own `revisionDate` back at it, which a server              can only read as a concurrency token: {written:?}"
+        );
+    }
+
     #[test]
     fn an_unmodelled_field_survives_a_decrypt_encrypt_round_trip() {
         let original = cipher_with_unmodelled_fields();
@@ -1425,9 +1478,22 @@ pub(crate) mod tests {
         // own recorded reason; they carry no information and are the one
         // documented non-survival.
         const DROPPED_NULLS: &[&str] = &["card", "identity", "sshKey", "secureNote"];
+        // **`revisionDate` is the second documented non-survival**, and it is
+        // a different kind of thing from the four above: not an empty value
+        // dropped on the way in, but a SERVER-ASSIGNED one deliberately not
+        // sent back. It is not a field of the item, the cipher request model
+        // has no such field, and a server offered it can only read it as a
+        // concurrency token -- which is what refused a favourite toggle three
+        // times in thirty seconds. `encrypt_item` states the whole reasoning;
+        // this list is where the exception is admitted rather than hidden by
+        // loosening the rule.
+        const SERVER_ASSIGNED: &[&str] = &["revisionDate"];
 
         for (name, value) in before {
-            if MODELLED.contains(&name.as_str()) || DROPPED_NULLS.contains(&name.as_str()) {
+            if MODELLED.contains(&name.as_str())
+                || DROPPED_NULLS.contains(&name.as_str())
+                || SERVER_ASSIGNED.contains(&name.as_str())
+            {
                 continue;
             }
             let kept = after.get(name).unwrap_or_else(|| {
