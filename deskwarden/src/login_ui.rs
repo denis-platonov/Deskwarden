@@ -826,10 +826,14 @@ fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
     const CHEVRON: f32 = 8.0;
     const CHEVRON_GAP: f32 = 8.0;
     const PAD_X: f32 = 10.0;
-    const PAD_Y: f32 = 5.0;
-    /// A popup row's height. Enough for 12pt text plus the band around it, so
-    /// the three rows read as a list rather than as three labels.
-    const ROW_HEIGHT: f32 = 24.0;
+    const PAD_Y: f32 = 7.0;
+    /// A popup row's height.
+    ///
+    /// 28, up from 24: at 24 the band was barely taller than the 12pt line
+    /// inside it and the owner read the list as "too skinny". The extra four
+    /// points are all margin around the text, which is what makes a row read
+    /// as a row rather than as a label with a colour behind it.
+    const ROW_HEIGHT: f32 = 28.0;
 
     let galley = ui.painter().layout_no_wrap(
         choice.label().to_owned(),
