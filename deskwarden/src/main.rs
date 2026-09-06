@@ -2861,7 +2861,6 @@ fn main() {
                 &tray,
                 &backend_op_rx,
                 &config_dir,
-                first_run_account.as_ref(),
                 &mut ui_windows,
             );
         }
@@ -7600,19 +7599,36 @@ impl VaultOps for RealVaultOps<'_> {
     ) -> SessionEstate {
         // The recovery itself is `resettle_session`, which a lock/re-auth and
         // an account switch share whole rather than each spelling out (see
-        // its doc). The only thing this caller contributes is where the new
-        // session token comes from: the master-password prompt for the
-        // account this app is already signed into.
+        // its doc). The only thing this caller contributes is the
+        // `authenticate` closure -- and what this one contributes is a
+        // refusal.
         //
-        // `reauthenticate` never returns `None` -- it exits the process
-        // rather than hand back a failure -- so the `BackendNotStarted`
-        // outcome is reached from here only by a backend that would not
-        // start, which is why the outcome is not branched on. Both outcomes
-        // leave this method the same way -- by falling off the end of it, back
-        // to the loop, which then asks `loop_step` what to do next and is told
-        // `Return`. The `BackendNotStarted` arm used to be an early `return`
-        // from inside this block, which was only ever a jump to that same
-        // answer.
+        // **It used to be `reauthenticate`, and `reauthenticate` draws.** A
+        // `--ui` vault window that locked itself came home, and the tray
+        // answered by opening "Log in to Deskwarden" in THIS process: one
+        // pid, no `--ui` on its command line, 86 MB. That was the last route
+        // by which the daemon could draw, and the owner's rule leaves no room
+        // for it -- "any launch launches tray first ALWAYS, UI CANNOT work
+        // without it because it needs REST", and "tray app is self-sufficient
+        // always because it has everything, even basic UI".
+        //
+        // So this answers `None`, which is `resettle_session_with`'s DECLINED
+        // arm -- already a first-class state, because an account switch
+        // reaches it whenever the user closes its prompt. Everything above
+        // the closure has already run by then: the cache is cleared, the
+        // encrypted disk copy is deleted, the breach findings are dropped,
+        // `bw serve` is stopped and the cached account details are gone. The
+        // arm itself clears the match engine. What is left is the app running
+        // in the tray with the vault shut, which is what a lock is.
+        //
+        // The user unlocks when they next ask: CTRL+ALT+B's bare Win32
+        // prompt, or *Open Vault*, which spawns a `--ui` child that opens on
+        // the sign-in card -- because `forget_the_stored_master_key` has just
+        // made sure there is nothing left for it to open with.
+        //
+        // Both outcomes leave this method the same way -- by falling off the
+        // end of it, back to the loop, which then asks `loop_step` what to do
+        // next and is told `Return`.
         resettle_session(
             &est.cache,
             &mut est.engine,
@@ -7624,15 +7640,22 @@ impl VaultOps for RealVaultOps<'_> {
             &mut est.task_in_progress,
             &mut est.details,
             &mut est.token,
-            // Built HERE rather than handed in, so it names whichever account
-            // this process is on at this moment -- which the switch above may
-            // have changed since the caller's own context was built.
+            // Reads the account HERE rather than being handed one, so it
+            // names whichever account this process is on at this moment --
+            // which the switch above may have changed since the caller's own
+            // context was built.
             || {
-                let login =
-                    login_context(deps.config_dir, est.active_account.as_ref(), deps.first_run_account);
-                Some(reauthenticate(&est.store, login))
+                forget_the_stored_master_key(deps.config_dir, est.active_account.as_ref());
+                None
             },
         );
+        // **The session goes with the lock.** The declined arm above leaves
+        // `token` untouched, because the account switch it was written for is
+        // about to be handed a different account's session anyway. Here there
+        // is no next session until the user signs in again, and a token left
+        // in place is one this daemon would hand to the next `bw serve` it
+        // started -- a locked vault reopening on the session the user locked.
+        est.token.clear();
         est
     }
 
@@ -8397,7 +8420,6 @@ fn lock_after_walking_away(
     tray: &tray::AppTray,
     backend_op_rx: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
     config_dir: &Path,
-    first_run_account: Option<&accounts::AccountId>,
     // **The registry, so that this path can reach the second process.** Its
     // absence from this list was the defect: the vault window has run in a
     // process of its own since the daemon/UI split, the daemon's loop pumps
@@ -8420,16 +8442,18 @@ fn lock_after_walking_away(
     }
     log::info!("Windows reported {away:?}; locking the vault rather than waiting out the idle timeout");
     deskwarden::clipboard::clear_if_still_ours_for(deskwarden::clipboard::ClearTrigger::Lock);
-    // **Before the resettle, and that ordering is the point.**
-    // `resettle_session` below blocks on a master-password prompt which can
-    // stand on screen for as long as the user is away -- the whole duration
-    // this feature exists to cover. A window closed after it is a window that
-    // survived the entire absence. See
+    // **Closed first, and that ordering used to be the point.**
+    // `resettle_session` below blocked on a master-password prompt which
+    // could stand on screen for as long as the user was away -- the whole
+    // duration this feature exists to cover -- so a window closed after it
+    // was a window that survived the entire absence. It no longer blocks on
+    // anything (see the closure below), but the order is still the right one
+    // and is still pinned by
     // `the_walked_away_lock_closes_the_window_before_it_blocks_on_the_password_prompt`.
     ui.close_because_the_user_walked_away(config_dir);
     // Field-level borrow splitting, for the reason `run_vault_loop` gives
-    // where it does the same: the closure below wants `store` and
-    // `active_account` while five other fields are held `&mut`.
+    // where it does the same: the closure below wants `active_account` while
+    // five other fields are held `&mut`.
     let SessionEstate {
         cache,
         engine,
@@ -8437,7 +8461,6 @@ fn lock_after_walking_away(
         token,
         details,
         task_in_progress,
-        store,
         active_account,
         ..
     } = est;
@@ -8451,12 +8474,28 @@ fn lock_after_walking_away(
         backend_op_rx,
         task_in_progress,
         details,
-        token,
+        &mut *token,
+        // **No window here either.** This is the walked-away lock, and it
+        // used to end in `reauthenticate` -- a login window opened in the
+        // TRAY, on a machine whose owner has just walked away from it. See
+        // `RealVaultOps::resettle_after_lost_session`, which this is now
+        // identical to: decline, forget the stored master key, and let the
+        // sign-in card open in a `--ui` child when the user comes back and
+        // asks for a window.
+        //
+        // Better on this path than on the other one, in fact: the prompt this
+        // replaces was a window left standing on an unattended screen for the
+        // length of the absence.
         || {
-            let login = login_context(config_dir, active_account.as_ref(), first_run_account);
-            Some(reauthenticate(store, login))
+            forget_the_stored_master_key(config_dir, active_account.as_ref());
+            None
         },
     );
+    // The session goes with the lock -- see the same line in
+    // `resettle_after_lost_session`. It is also what `locks_the_vault` reads
+    // on the next away event, so a vault locked once is not locked a second
+    // time on the way back.
+    token.clear();
 }
 
 /// **Unlocking because the overlay's locked card asked to.**
@@ -13053,6 +13092,46 @@ fn reauthenticate(store: &session_store::SessionStore, login: LoginContext<'_>) 
         log::error!("failed to persist session token: {e}");
     }
     token
+}
+
+/// **What a lock has to do to a direct-REST account, now that no window
+/// follows it.**
+///
+/// The two lock recoveries -- the vault window locking itself, and Windows
+/// reporting the workstation locked -- used to end in [`reauthenticate`],
+/// which opens a login window IN THE TRAY. That is the one thing this process
+/// may not do: "any launch launches tray first ALWAYS, UI CANNOT work without
+/// it because it needs REST", and a tray that draws once holds the OpenGL
+/// driver's committed arenas until it exits.
+///
+/// They go quiet instead. But quiet alone is not a lock on this backend:
+/// `userkey.bin` holds a wrapped master key that does not expire and cannot be
+/// revoked from the web vault, so a `--ui` child asked for a window a moment
+/// later would find it, decrypt the vault and open straight onto the item list
+/// -- a Lock button that locked nothing. Deleting the key is what makes the
+/// next window ask for the master password, in the child, which is where the
+/// card lives now.
+///
+/// A `bw serve` account has no such file and this is a no-op for it: its lock
+/// is the `bw serve` teardown the caller has already run.
+///
+/// A failure is logged at `error` and is not fatal -- there is nothing the
+/// user could do about a locked file, and refusing to lock over it would leave
+/// the vault OPEN, which is worse than the residue.
+fn forget_the_stored_master_key(config_dir: &std::path::Path, account: Option<&Account>) {
+    let Some(account) = account else { return };
+    let key_store =
+        user_key_store::UserKeyStore::new(accounts::user_key_path_for(config_dir, &account.id));
+    match key_store.clear() {
+        Ok(()) => log::info!(
+            "the vault is locked and this daemon draws nothing; the stored master key was \
+             deleted, so the next window opens on the sign-in card in a ui process"
+        ),
+        Err(e) => log::error!(
+            "the vault was locked but its stored master key could not be deleted, so the next \
+             window may open without asking for the master password: {e}"
+        ),
+    }
 }
 
 /// The `bw`-shaped device identifier for `id`, as a GUID.
@@ -20070,7 +20149,7 @@ mod tests {
     /// that only ever ratchets down would silently become a test about
     /// nothing.
     ///
-    /// # The four, and why each is still here
+    /// # The five, and why each is still here
     ///
     /// * **`app_window::run(`** -- the startup sign-in host, reached only
     ///   when `the_startup_sign_in_belongs_to_a_ui_process` said no: a
@@ -20082,11 +20161,19 @@ mod tests {
     /// * **`app_window::run_recovery(`** -- the error screen, and the one
     ///   deliberate decision rather than a leftover. See
     ///   `the_recovery_window_stays_in_the_daemon_and_here_is_why`.
-    /// * **`run_login_flow_for(`** -- the master-password prompt the lock
-    ///   recovery and the account switch put up. It is the same sign-in card,
-    ///   but reached from the middle of a running session rather than from a
-    ///   launch, and it is the input to `resettle_session` -- which tears
-    ///   `bw serve` down and rebuilds the match engine in THIS process.
+    /// * **`run_login_flow_for(`** -- the master-password prompt the account
+    ///   switch and the two *Add an account* doors put up. It is the same
+    ///   sign-in card, but reached from the middle of a running session
+    ///   rather than from a launch, and it is the input to `resettle_session`
+    ///   -- which tears `bw serve` down and rebuilds the match engine in THIS
+    ///   process. **These three are what is left to move**, and all three are
+    ///   a tray menu item the user clicked rather than something the app did
+    ///   to them.
+    /// * **`run_login_flow(`** -- the wrapper, which exits the process when
+    ///   the user declines and so may only be called from a launch. One
+    ///   caller: `recover_from_failed_vault_wait`. The two LOCK recoveries
+    ///   used to call it and no longer do -- see
+    ///   [`forget_the_stored_master_key`].
     ///
     /// # The child's own two are excluded, by slicing rather than by naming
     ///
@@ -20127,7 +20214,14 @@ mod tests {
             (
                 concat!("app_window::run_from_", "vault("),
                 0,
-                "**ZERO, and this is the entry that flipped.** It was `open_window`'s                  in-daemon host, drawn for an account a child was judged unable to read.                  The judgement expired when the sign-in card moved into the child -- a                  child with no stored key asks for the master password now -- and the                  owner's rule finished it: \"any launch launches tray first ALWAYS, UI                  CANNOT work without it because it needs REST\". The tray IS the backend                  on the built-in client; a tray that draws holds the graphics driver for                  the life of the session. A ONE here means that host is back",
+                "**ZERO, and this is the entry that flipped.** It was `open_window`'s \
+                 in-daemon host, drawn for an account a child was judged unable to read. \
+                 The judgement expired when the sign-in card moved into the child -- a \
+                 child with no stored key asks for the master password now -- and the \
+                 owner's rule finished it: \"any launch launches tray first ALWAYS, UI \
+                 CANNOT work without it because it needs REST\". The tray IS the backend \
+                 on the built-in client; a tray that draws holds the graphics driver for \
+                 the life of the session. A ONE here means that host is back",
             ),
             (
                 concat!("app_window::run_", "recovery("),
@@ -20139,9 +20233,26 @@ mod tests {
             (
                 concat!("run_login_flow_", "for("),
                 3,
-                "the master-password prompt: the lock recovery, the re-auth and the \
-                 account switch. A fourth is a new prompt site; fewer means one of those \
-                 three recoveries no longer asks for a password it needs",
+                "the master-password prompt: the account switch and the two `add an \
+                 account` doors. All three are a tray menu item the user clicked, and \
+                 all three are still draws in this process. A fourth is a new prompt \
+                 site; fewer means one of them no longer asks for a password it needs",
+            ),
+            (
+                // The wrapper, and a DIFFERENT needle: `run_login_flow(` does
+                // not match `run_login_flow_for(`, and the entry above does
+                // not match this one. It exits the process when the user
+                // declines, which is why only a launch may call it.
+                concat!("run_login_", "flow("),
+                1,
+                "**ONE, and it is `reauthenticate`'s, whose only caller left is \
+                 `recover_from_failed_vault_wait` -- a launch whose vault never became \
+                 ready.** It was THREE. The two that went are the lock recoveries: a \
+                 vault window that locked itself, and Windows reporting the workstation \
+                 locked. Both answered a lock by opening \"Log in to Deskwarden\" in the \
+                 tray -- one pid, no `--ui` on its command line, 86 MB -- and both now \
+                 decline instead, forget the stored master key and leave the app running \
+                 in the tray with the vault shut. A TWO here means a lock draws again",
             ),
         ] {
             let seen = code_only_lines(&daemon).matches(host).count();
@@ -20175,6 +20286,88 @@ mod tests {
                 "{gone:?} is open in the daemon again: {why}"
             );
         }
+    }
+
+    /// **BOTH LOCK RECOVERIES GO QUIET, AND NEITHER LEAVES THE VAULT
+    /// READABLE.**
+    ///
+    /// The census above counts draw sites. This is the other half: what the
+    /// two lock paths do INSTEAD, which is the part that can rot without any
+    /// count changing.
+    ///
+    /// # What the owner saw
+    ///
+    /// A `--ui` vault window locked itself and came home. The daemon answered
+    /// by opening "Log in to Deskwarden" in its own process -- one pid, no
+    /// `--ui` on its command line, 86 MB -- against the rule that "any launch
+    /// launches tray first ALWAYS" and "tray app is self-sufficient always
+    /// because it has everything, even basic UI".
+    ///
+    /// # Quiet alone would not be a lock
+    ///
+    /// `userkey.bin` holds a wrapped master key that does not expire and
+    /// cannot be revoked from the web vault. A recovery that merely declined
+    /// would leave it on disk, and the `--ui` child asked for a window a
+    /// moment later would find it, decrypt the vault and open straight onto
+    /// the item list. That is a Lock button that locks nothing, which is
+    /// worse than the window it replaced -- so the decline and the delete are
+    /// pinned TOGETHER, in both bodies, and neither half is allowed to stand
+    /// here without the other.
+    #[test]
+    fn neither_lock_recovery_draws_and_both_forget_the_key() {
+        let raw = production_half_of_this_file();
+        let forget = concat!("forget_the_stored_master", "_key(");
+        let draw = concat!("reauthen", "ticate(");
+
+        for (what, body) in [
+            (
+                "RealVaultOps::resettle_after_lost_session",
+                vault_ops_method_body(raw, "resettle_after_lost_session"),
+            ),
+            ("lock_after_walking_away", body_of(raw, concat!("fn lock_after_walking_", "away("))),
+        ] {
+            assert!(
+                body.len() > 400,
+                "control: `{what}` sliced to {} bytes, which is not its body",
+                body.len()
+            );
+            // Control on both assertions below: the slice really is a lock
+            // recovery, which is the one thing a slice that grabbed the wrong
+            // text could not fake.
+            assert!(
+                body.contains(concat!("resettle_", "session(")),
+                "control: `{what}` no longer runs the resettle, so it is not the lock \
+                 recovery this test names and everything below is vacuous:\n{body}"
+            );
+            assert!(
+                !body.contains(draw),
+                "`{what}` answers a lock by opening a login window IN THE TRAY again. That \
+                 is the 86 MB the owner screenshotted, and it maps the OpenGL driver into \
+                 this process for the rest of its life:\n{body}"
+            );
+            assert!(
+                body.contains(forget),
+                "`{what}` goes quiet without deleting the stored master key, so the next \
+                 `--ui` window finds `userkey.bin`, decrypts the vault and opens on the \
+                 item list -- a lock that locked nothing:\n{body}"
+            );
+            // And the session goes too, which is what `away_lock::locks_the_vault`
+            // reads to decide whether there is anything left to lock.
+            assert!(
+                body.contains("token.clear();"),
+                "`{what}` leaves the session token in the estate, so the next `bw serve` \
+                 this daemon starts is handed the session the user just locked:\n{body}"
+            );
+        }
+
+        // The needle for the draw really does match the thing it bans -- so
+        // the negatives above are about an absence rather than about a
+        // spelling that could never have been found anywhere.
+        assert!(
+            body_of(raw, concat!("fn recover_from_failed_vault_", "wait(")).contains(draw),
+            "control: {draw:?} matches nothing in the one function that still calls it, so \
+             the ban above is unfalsifiable"
+        );
     }
 
     /// Production text with `//` comment lines dropped, so a census counts
