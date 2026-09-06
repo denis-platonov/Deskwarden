@@ -11845,12 +11845,33 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                     }
                 }
             }
-            backend_policy::VaultBackendChoice::BwServe => VaultCache::with_disk_cache(
-                VaultBridge::new(BW_SERVE_URL),
-                disk,
-                fingerprint,
-                to_disk,
-            ),
+            // **Through the SLOT, not straight at `bw serve`.**
+            //
+            // This arm used to hand the cache a `VaultBridge::new(BW_SERVE_URL)`
+            // directly, which is a backend that can never be re-pointed. A
+            // clean install starts here -- an account with no record reads as
+            // the official CLI -- and the sign-in that follows can settle on
+            // the built-in client, as the choice modal exists to let it. The
+            // re-settle then re-pointed the slot, the cache went on holding
+            // its own fixed bridge, and the window asked
+            // `http://localhost:8087` for a vault the daemon had already
+            // fetched over REST: "Your vault could not be loaded ... the
+            // vault could not be read from the local backend", with 1669
+            // items sitting in the log two lines above it.
+            //
+            // The slot is seeded with the same bridge, so a launch that
+            // really is on `bw serve` behaves exactly as before -- what
+            // changes is that a sign-in can now replace it. This is what the
+            // daemon has always done with its own slot.
+            backend_policy::VaultBackendChoice::BwServe => {
+                vault_slot.adopt(Box::new(VaultBridge::new(BW_SERVE_URL)));
+                VaultCache::with_disk_cache(
+                    Arc::clone(&vault_slot),
+                    disk,
+                    fingerprint,
+                    to_disk,
+                )
+            }
         },
     );
     // **And the backend policy itself, which the cache above reads and this
@@ -35493,6 +35514,50 @@ mod vault_backend_choice_tests {
              moved into a child: the card derives the key there. Refusing the spawn keeps \
              the sign-in in the daemon, which is what loads the OpenGL driver into a \
              process that never gives it back"
+        );
+    }
+
+    /// **A ui process's vault cache reads the SLOT on both arms.**
+    ///
+    /// The `bw serve` arm used to hand the cache a fixed
+    /// `VaultBridge::new(BW_SERVE_URL)` -- a backend that can never be
+    /// re-pointed. A clean install starts on that arm, because an account
+    /// with no record reads as the official CLI, and the sign-in that
+    /// follows can settle on the built-in client. The re-settle then moved
+    /// the slot, the cache went on holding its own bridge, and the window
+    /// asked `localhost:8087` for a vault that had already been fetched over
+    /// REST: "Your vault could not be loaded", with 1669 items in the log two
+    /// lines above.
+    ///
+    /// **Fourth in the same family**, and the last one standing: the ui
+    /// process's own gate, the daemon's routing, the re-settle seam and its
+    /// settlement, and now the thing the re-settle was supposed to move. Each
+    /// was a startup decision left holding a window that outlived it.
+    ///
+    /// A source guard: the arm is chosen at startup from a process-global
+    /// policy, and `run_as_a_ui_process` opens a window.
+    #[test]
+    fn a_ui_process_serves_both_backends_through_the_late_bound_slot() {
+        let source = include_str!("main.rs");
+        let entry = source
+            .split_once("fn run_as_a_ui_process")
+            .expect("control: the ui entry point was renamed")
+            .1;
+        let entry = entry
+            .split_once("fn backend_is_listening(")
+            .expect("control: the item after the ui entry point was renamed")
+            .0;
+        let arm = entry
+            .find(concat!("VaultBackendChoice::", "BwServe =>"))
+            .expect("control: the ui process no longer branches on the backend choice");
+        let arm = &entry[arm..arm + 400];
+        assert!(
+            arm.contains(concat!("vault_slot.", "adopt(")),
+            "the `bw serve` arm builds a backend the slot does not hold, so a sign-in that              settles on the built-in client cannot re-point what this window reads: {arm:?}"
+        );
+        assert!(
+            arm.contains(concat!("Arc::clone(&vault", "_slot)")),
+            "the cache on the `bw serve` arm is not reading the slot, so re-pointing the              slot moves nothing the window can see: {arm:?}"
         );
     }
 
