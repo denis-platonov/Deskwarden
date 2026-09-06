@@ -5217,6 +5217,14 @@ fn app_card_footer(
     let draw_notes = |ui: &mut egui::Ui| {
         ui.vertical(|ui| {
             ui.set_max_width(notes_width);
+            // **Notes WRAP, and say so, because the row they sit in
+            // truncates.** `row_body` sets `TextWrapMode::Truncate` on its
+            // value box so a long URL is cut with an ellipsis instead of
+            // running under its own shortcut; a note inheriting that came out
+            // as "Press CTRL..." on a narrow pane. The two want opposite
+            // things -- one line that must not overflow, and a paragraph that
+            // must be readable -- so the paragraph states its own.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
             ui.spacing_mut().item_spacing.y = 2.0;
             for note in notes {
                 ui.label(
@@ -5878,14 +5886,41 @@ fn row_body(
                 band,
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    label_cell(ui, label, ROW_LABEL_WIDTH, LabelFit::ToColumn);
-                    ui.add_space(ROW_GAP);
-                    value(ui);
+                    // **The CONTROLS are allocated first, and that is the fix
+                    // for a long value running under its own shortcut.**
+                    //
+                    // The order used to be label, value, then a right-to-left
+                    // group for the controls -- which reads correctly and
+                    // allocates backwards. `value(ui)` took whatever width it
+                    // wanted, and the control group was left with whatever was
+                    // over; for a URL longer than the row it was nothing, so
+                    // the chord painted on top of the link. The owner: "if
+                    // website or any other value too long - it should cut off
+                    // with ... before overlapping the shortcut".
+                    //
+                    // Allocating right-to-left FIRST gives the chord and the
+                    // eye their width off the top. What is left is a definite
+                    // box, and the label and the value are laid out inside it
+                    // left-to-right exactly as before -- the painted order is
+                    // unchanged, only the order in which the two groups claim
+                    // their space.
+                    ui.spacing_mut().item_spacing.x = CONTROL_GAP;
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // `gap: 8px`, within the control group only.
                         ui.spacing_mut().item_spacing.x = CONTROL_GAP;
                         controls(ui);
+                        // The rest of the row, in the space the controls did
+                        // not take. `TextWrapMode::Truncate` is what puts the
+                        // ellipsis in: a value that still does not fit is cut
+                        // with one rather than wrapped onto a second line or
+                        // painted past its box.
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                            label_cell(ui, label, ROW_LABEL_WIDTH, LabelFit::ToColumn);
+                            ui.add_space(ROW_GAP);
+                            value(ui);
+                        });
                     });
                 },
             );
@@ -16691,6 +16726,61 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// A login carrying the design's own sample values.
+    /// **THE REPORT: "if website or any other value too long - it should cut
+    /// off with ... before overlapping the shortcut".**
+    ///
+    /// A row lays out its label, its value and its controls in one band. The
+    /// value used to be allocated BEFORE the control group, so a URL longer
+    /// than the row took the whole band and CTRL+SHIFT+U painted on top of
+    /// it. The controls are allocated first now, and the value is truncated
+    /// into what is left.
+    ///
+    /// Asserted on the INK, not on the laid-out rects: a run in a
+    /// right-to-left layout is positioned by its right edge, so a rect-based
+    /// overlap test reports collisions where the pane is clean and misses the
+    /// ones beside them. See `Painted::ink_of`, which says so at length.
+    #[test]
+    fn a_website_too_long_for_its_row_is_cut_before_it_reaches_the_chord() {
+        let mut item = a_login();
+        // Long enough that it cannot fit even the widest pane these tests
+        // build: the point is the rule, and a URL that happens to fit today
+        // would make this test a measurement of the fixture instead.
+        let long = concat!(
+            "https://airbnb-wyze-lockcode.autobis.workers.dev/login/with/a/very/long/path",
+            "/that/keeps/going/well/past/anything/a/row/could/hold/even/on/a/wide/window",
+            "/and/then/some/more/for/good/measure"
+        );
+        item.login.as_mut().expect("the fixture is a login").uris =
+            vec![crate::vault_bridge::UriEntry {
+                uri: Some(long.to_string()),
+                other: serde_json::Map::new(),
+            }];
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+
+        let chord = frame.ink_of(copy_shortcut_chord(CopyShortcut::Url));
+        // The GLYPHS, not the source string: `Galley::text()` still reports
+        // the whole URL after egui has elided it, which is the blindness
+        // `Frame::rendered` exists for.
+        let shown = frame
+            .rendered
+            .iter()
+            .map(|(_, glyphs, _)| glyphs.clone())
+            .find(|glyphs| glyphs.starts_with("https://airbnb-wyze"))
+            .expect("the website row painted no value at all");
+        assert_ne!(
+            shown, long,
+            "the whole URL was laid out, so nothing truncated it and the only question left              is whether it happens to be short enough today"
+        );
+        let value = frame.ink_of(long);
+        assert!(
+            value.right() <= chord.left(),
+            "the website value runs to x={} and the chord starts at x={}, so the URL is              painted under its own shortcut",
+            value.right(),
+            chord.left()
+        );
+    }
+
     fn a_login() -> VaultItem {
         let mut item = an_item(Some(1));
         item.login = Some(crate::vault_bridge::LoginData {
