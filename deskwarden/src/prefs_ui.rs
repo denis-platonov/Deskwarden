@@ -1060,6 +1060,20 @@ const SCAN_BUTTON_WIDTH: f32 = 184.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     General,
+    /// **What the vault window LOOKS like**: item icons and where they come
+    /// from, brand marks on cards, and whether a TOTP secret can be revealed.
+    ///
+    /// Split out of General on the owner's reading: "General screen is too big
+    /// in settings - split into View and Lock or something". Directly after
+    /// General, because that is where these rows were.
+    View,
+    /// **When the vault locks itself**: the switch and the idle minutes it
+    /// counts.
+    ///
+    /// Split out of General with [`Section::View`] and placed after it for the
+    /// same reason -- a reader who knew these settings knew them as the bottom
+    /// of General, so the two pages appear in the order the rows did.
+    Lock,
     /// **Everything about checking passwords against known breaches**: the
     /// consent pill, the scan button, and what previous scans counted.
     ///
@@ -1166,8 +1180,10 @@ pub enum Section {
 
 impl Section {
     /// The nav, top to bottom.
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 9] = [
         Section::General,
+        Section::View,
+        Section::Lock,
         Section::Breaches,
         Section::Vault,
         Section::Api,
@@ -1181,6 +1197,8 @@ impl Section {
     pub fn label(self) -> &'static str {
         match self {
             Section::General => "General",
+            Section::View => "View",
+            Section::Lock => "Lock",
             Section::Breaches => "Breaches",
             Section::Vault => "Vault",
             Section::Api => "Local API",
@@ -1210,9 +1228,12 @@ impl Section {
             // CTRL+ALT+B reads straight past, on the one page that tells them
             // what it is and whether it is working.
             Section::General => {
-                "How Deskwarden runs in the background, the shortcut it answers, and when it \
-                 locks itself."
+                "Whether a matched window is offered a fill, and the shortcut that offers it."
             }
+            Section::View => {
+                "What the vault window shows: item icons, brand marks, and TOTP secrets."
+            }
+            Section::Lock => "When Deskwarden locks itself, and after how long.",
             Section::Breaches => {
                 "Whether your saved passwords are checked against public breach lists, and \
                  what the last checks found."
@@ -2032,6 +2053,8 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
         // used to be read for `Section::Shortcuts`; that page was one
         // read-only chip and is gone, and the chip is a row on General now.
         Section::General => draw_general(ui, state, crate::hotkey::availability()),
+        Section::View => draw_view(ui, state),
+        Section::Lock => draw_lock(ui, state),
         Section::Breaches => draw_breaches(ui, state),
         Section::Vault => draw_vault(ui, state),
         Section::Api => draw_api(ui, state),
@@ -2268,6 +2291,41 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState, hotkey: crate::hotkey::Hotk
         // page could never be beside.
         fill_hotkey_row(ui, hotkey);
         row_separator(ui);
+        // **The icon, logo and TOTP rows are not here any more, and the
+        // auto-lock pair is not either.** They are `Section::View` and
+        // `Section::Lock`, which is what General was split into: "General
+        // screen is too big in settings - split into View and Lock or
+        // something". What stays is the pair a reader comes to General for --
+        // whether a matched window is offered a fill, and the chord that
+        // offers it -- and those two are one subject with one answer.
+        // **The update row is not here any more either**, and it left for
+        // the same reason the breach row did. It used to sit last on this
+        // card, deliberately apart from the two vault-keyed network rows
+        // above -- that request is keyed on nothing but the app's own
+        // version, and grouping it with them would have suggested it
+        // discloses the same kind of thing. It is now on
+        // `Section::Updates`, directly above the check button it does not
+        // govern; see `draw_updates`.
+    });
+}
+
+
+/// **What the vault LOOKS like**: the icons beside items, where they are
+/// fetched from, whether a card shows a brand mark, and whether a TOTP secret
+/// can be revealed.
+///
+/// Split out of General, with [`Section::Lock`], on the owner's reading of it:
+/// "General screen is too big in settings - split into View and Lock or
+/// something". The four rows here answered one question already -- what is
+/// drawn in the vault window -- and sat under two rows about filling and above
+/// two about locking, which is three subjects on one page.
+///
+/// **The pairing that must not be broken is `fetch_icons` and its child**, and
+/// it is not: `fetch_icons_direct` is a child row of the switch above it and
+/// moved with it. See `Settings::fetch_icons_direct` for why the child greys
+/// rather than vanishes.
+fn draw_view(ui: &mut Ui, state: &mut PrefsState) {
+    card(ui, |ui| {
         // **The breach row is not here any more.** It moved, whole, to
         // `Section::Breaches`, which owns the scan button and the history as
         // well: a consent pill on one page and the control it governs on
@@ -2337,7 +2395,21 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState, hotkey: crate::hotkey::Hotk
             TOTP_SECRET_DESCRIPTION,
             state.settings.reveal_totp_seed,
         );
-        row_separator(ui);
+    });
+}
+
+/// **When Deskwarden locks itself**: the switch, and the number of idle
+/// minutes it counts.
+///
+/// Split out of General with [`Section::View`]. It is two rows, and a page of
+/// two rows is deliberate here: they are the only settings in this window that
+/// decide when the vault stops being readable, and a reader looking for
+/// "why did it lock" or "stop locking so fast" has one place to go.
+///
+/// The toggle sits above the number it governs and the number stays put when
+/// the toggle is off -- greyed, not removed -- for the reason stated inside.
+fn draw_lock(ui: &mut Ui, state: &mut PrefsState) {
+    card(ui, |ui| {
         // The toggle sits above the number it governs, in 3e's own 40x22
         // pill, and the number's row stays put below it -- greyed, not
         // removed. A row that vanished would reflow the card on every click
@@ -2358,17 +2430,8 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState, hotkey: crate::hotkey::Hotk
                 enabled,
             );
         });
-        // **The update row is not here any more either**, and it left for
-        // the same reason the breach row did. It used to sit last on this
-        // card, deliberately apart from the two vault-keyed network rows
-        // above -- that request is keyed on nothing but the app's own
-        // version, and grouping it with them would have suggested it
-        // discloses the same kind of thing. It is now on
-        // `Section::Updates`, directly above the check button it does not
-        // govern; see `draw_updates`.
     });
 }
-
 
 /// A [`toggle_row`] that can be switched off, for a child of a master switch.
 ///
@@ -5563,6 +5626,20 @@ mod tests {
         rects: Vec<RectShape>,
     }
 
+    impl Painted {
+        /// Two pages read as one, for the census that asks whether a setting
+        /// is reachable ANYWHERE rather than which page it is on. Splitting
+        /// General into View and Lock is what made that distinction matter;
+        /// `each_page_paints_exactly_the_pills_it_owns` is the test that
+        /// still cares about the page.
+        fn plus(mut self, other: Painted) -> Painted {
+            self.texts.extend(other.texts);
+            self.ink.extend(other.ink);
+            self.rects.extend(other.rects);
+            self
+        }
+    }
+
     /// One painted text run, with everything a geometry assertion needs that a
     /// `(String, Rect)` cannot carry: what egui actually laid out (an elided
     /// string is not the string that was asked for), how many lines it wrapped
@@ -7471,6 +7548,8 @@ mod tests {
         // loop is structurally blind to.
         let expected = [
             "General",
+            "View",
+            "Lock",
             // Breaches sits directly after General because that is where its
             // one pill used to be, and where a reader will look for it.
             "Breaches",
@@ -7587,6 +7666,12 @@ mod tests {
     #[test]
     fn general_paints_every_setting_that_actually_exists() {
         let painted = paint(Section::General);
+        // **Two more pages to read, since General was split.** Every assertion
+        // below is about a setting EXISTING somewhere a reader can reach; the
+        // page each one lives on is `each_page_paints_exactly_the_pills_it_owns`'s
+        // subject. Reading all three here keeps this a census of what is
+        // reachable and not a second, weaker copy of that test.
+        let painted = painted.plus(paint(Section::View)).plus(paint(Section::Lock));
         // **Not the backend row.** It is a child of the crypto switch on
         // `Section::Vault` now (it passed through Sync & account on the way,
         // and that page has since been removed for having nothing left on it);
@@ -7622,29 +7707,44 @@ mod tests {
         );
     }
 
+    /// **One pill per page, counted per page, since General was split.**
+    ///
+    /// It used to be six pills and one stepper on General. The owner's reading
+    /// -- "General screen is too big in settings - split into View and Lock or
+    /// something" -- moved four of them to `Section::View` and the last plus
+    /// the stepper to `Section::Lock`. The counts are asserted per page rather
+    /// than added up, because the point of the split is which page a row is
+    /// on: a row that drifted from View to Lock would keep any total intact.
+    ///
+    /// `fetch_icons_direct` is counted whether or not it is GHOSTED --
+    /// `child_toggle_row` paints a disabled pill at the same 40x22 as an
+    /// enabled one, so switching site icons off must not change View's number.
     #[test]
-    fn general_paints_exactly_six_toggles_and_one_stepper() {
-        let painted = paint(Section::General);
+    fn each_page_paints_exactly_the_pills_it_owns() {
         assert_eq!(
-            painted.count_of_size(Vec2::new(40.0, 22.0)),
-            6,
-            "six 40x22 pills: `prompt_on_match`, `fetch_icons`, its child \
-             `fetch_icons_direct`, `use_brand_logos`, `reveal_totp_seed` and \
-             `auto_lock_enabled`, and nothing else. The sixth is the direct-fetch child, \
-             and it is counted whether or not it is GHOSTED: `child_toggle_row` paints a \
-             disabled pill at the same 40x22 as an enabled one, so switching site icons \
-             off must not change this number. \
-             FIVE settings are no longer here and all five left for the same reason -- to \
-             sit beside the thing that governs them. `check_breaches` moved to Breaches, \
-             `check_for_updates` moved to Updates, and `keep_backend_running`, \
-             `cache_vault_to_disk` and `read_through_cache` are now on `Section::Vault` with \
-             the backend choice, which is the one page where all of them can be weighed \
-             against each other; see `draw_breaches`, `draw_updates` and `Section::Vault`"
+            paint(Section::General).count_of_size(Vec2::new(40.0, 22.0)),
+            1,
+            "General is one pill now -- `prompt_on_match` -- beside the hotkey row, which              is not a pill. The rest of what was here is on View and Lock"
         );
         assert_eq!(
-            painted.count_of_size(Vec2::new(112.0, 28.0)),
+            paint(Section::View).count_of_size(Vec2::new(40.0, 22.0)),
+            4,
+            "View is `fetch_icons`, its child `fetch_icons_direct`, `use_brand_logos` and              `reveal_totp_seed`, and nothing else"
+        );
+        assert_eq!(
+            paint(Section::Lock).count_of_size(Vec2::new(40.0, 22.0)),
             1,
-            "one 112x28 stepper box: `auto_lock_minutes`"
+            "Lock is `auto_lock_enabled` and nothing else"
+        );
+        assert_eq!(
+            paint(Section::Lock).count_of_size(Vec2::new(112.0, 28.0)),
+            1,
+            "one 112x28 stepper box, `auto_lock_minutes`, on the page its switch is on"
+        );
+        assert_eq!(
+            paint(Section::General).count_of_size(Vec2::new(112.0, 28.0)),
+            0,
+            "the stepper went to Lock with the switch that governs it; one without the              other is the arrangement this split exists to end"
         );
     }
 
@@ -7655,7 +7755,7 @@ mod tests {
         // here would be a control displaying a number that is not the number
         // in force.
         let painted =
-            paint_settings(Section::General, Settings { auto_lock_minutes: 0, ..Settings::default() });
+            paint_settings(Section::Lock, Settings { auto_lock_minutes: 0, ..Settings::default() });
         assert!(painted.contains("1"), "got {:?}", painted.strings());
         assert!(!painted.contains("0"), "got {:?}", painted.strings());
     }
@@ -7679,6 +7779,10 @@ mod tests {
         // that matters, and this test is where it is made.
         let ctx = tall_context();
         let mut state = PrefsState::new(Settings::default());
+        // The rows this test drives moved to `Section::Lock` when General was
+        // split; the page is selected here rather than the test being pointed
+        // at whatever General happens to draw now.
+        state.section = Section::Lock;
         state.section = Section::Vault;
         // A signed-in account on Bitwarden's own cloud, so `choose` answers
         // `BwServe` and the child is LIVE. Ghosted, `child_toggle_row` hands
@@ -8222,6 +8326,10 @@ mod tests {
     fn clicking_the_site_icons_toggle_changes_the_setting_it_is_wired_to() {
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
+        // The rows this test drives moved to `Section::View` when General was
+        // split; the page is selected here rather than the test being pointed
+        // at whatever General happens to draw now.
+        state.section = Section::View;
         assert!(
             state.settings.fetch_icons,
             "the default: icons are shown until this is clicked"
@@ -8234,13 +8342,17 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        assert_eq!(
+            pills.len(),
+            4,
+            "the View card no longer paints its four pills: site icons, the direct-icons              child, brand logos and the TOTP secret"
+        );
         // SECOND pill down now: prompt, site icons, network logos, TOTP
         // secret, auto-lock. Five rows have left this page -- the breach row
         // to Breaches, the update row to Updates, and the backend row plus
         // the disk-cache pair to `Section::Vault`, where they are read
         // together with the service switch.
-        let pill = pills[1].center();
+        let pill = pills[0].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -8267,6 +8379,10 @@ mod tests {
     fn clicking_the_direct_icons_toggle_changes_the_setting_it_is_wired_to() {
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
+        // The rows this test drives moved to `Section::View` when General was
+        // split; the page is selected here rather than the test being pointed
+        // at whatever General happens to draw now.
+        state.section = Section::View;
         assert!(
             !state.settings.fetch_icons_direct,
             "the default: icons come from the icon service until this is clicked"
@@ -8279,10 +8395,14 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        assert_eq!(
+            pills.len(),
+            4,
+            "the View card no longer paints its four pills: site icons, the direct-icons              child, brand logos and the TOTP secret"
+        );
         // THIRD pill down: prompt, site icons, THIS, network logos, TOTP
         // secret, auto-lock. It sits directly under its master switch.
-        let pill = pills[2].center();
+        let pill = pills[1].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -8310,17 +8430,19 @@ mod tests {
     fn with_site_icons_off_the_direct_fetch_row_is_inert_but_still_painted() {
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings { fetch_icons: false, ..Settings::default() });
+        // These rows are `Section::View` since General was split.
+        state.section = Section::View;
         assert!(!state.settings.fetch_icons_direct, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
         assert_eq!(
             pills.len(),
-            6,
+            4,
             "a ghosted child row still paints a 40x22 pill, so switching the master off must \
-             not change the count -- and every index below it must not shift either"
+             not change View's count -- and every index below it must not shift either"
         );
-        frame(&ctx, &mut state, &click(pills[2].center()));
+        frame(&ctx, &mut state, &click(pills[1].center()));
         assert!(
             !state.settings.fetch_icons_direct,
             "a click on the ghosted row still edited the setting, so 'disabled' is only a \
@@ -8332,16 +8454,17 @@ mod tests {
         // above is about the disabled state and not about the click having
         // landed nowhere.
         let mut live = PrefsState::new(Settings::default());
+        live.section = Section::View;
         let live_first = frame(&ctx, &mut live, &[]);
         let live_pills = live_first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(live_pills.len(), 6);
+        assert_eq!(live_pills.len(), 4);
         assert_eq!(
-            live_pills[2].center(),
-            pills[2].center(),
+            live_pills[1].center(),
+            pills[1].center(),
             "the row is at a different place in the two states, so the click above was not \
              aimed at the same row"
         );
-        frame(&ctx, &mut live, &click(live_pills[2].center()));
+        frame(&ctx, &mut live, &click(live_pills[1].center()));
         assert!(live.settings.fetch_icons_direct, "the control failed: the row is inert either way");
     }
 
@@ -8350,7 +8473,7 @@ mod tests {
     /// their own network are not what this pill decides.
     #[test]
     fn the_direct_icons_row_says_what_it_costs_and_what_it_does_not_govern() {
-        let painted = paint(Section::General);
+        let painted = paint(Section::View);
         assert!(painted.contains(DIRECT_ICONS_LABEL), "got {:?}", painted.strings());
         assert!(painted.contains(DIRECT_ICONS_DESCRIPTION), "got {:?}", painted.strings());
         assert!(
@@ -8429,6 +8552,10 @@ mod tests {
     fn clicking_the_network_logos_toggle_changes_the_setting_it_is_wired_to() {
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
+        // The rows this test drives moved to `Section::View` when General was
+        // split; the page is selected here rather than the test being pointed
+        // at whatever General happens to draw now.
+        state.section = Section::View;
         assert!(
             !state.settings.use_brand_logos,
             "the default: cards wear their printed network name until this is clicked"
@@ -8441,11 +8568,15 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        assert_eq!(
+            pills.len(),
+            4,
+            "the View card no longer paints its four pills: site icons, the direct-icons              child, brand logos and the TOTP secret"
+        );
         // FOURTH pill down: prompt, site icons, the direct-fetch child of
         // site icons, network logos, TOTP secret, auto-lock. It was the
         // third until that child row was inserted above it.
-        let pill = pills[3].center();
+        let pill = pills[2].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -8469,7 +8600,7 @@ mod tests {
     /// a brand with no image is not a blank -- it keeps its word.
     #[test]
     fn the_network_logos_row_says_where_the_images_come_from_and_what_happens_without_them() {
-        let painted = paint(Section::General);
+        let painted = paint(Section::View);
         assert!(painted.contains(BRAND_LOGOS_LABEL), "got {:?}", painted.strings());
         assert!(painted.contains(BRAND_LOGOS_DESCRIPTION), "got {:?}", painted.strings());
         assert!(
@@ -8568,8 +8699,13 @@ mod tests {
         );
         // The rows that stayed, so this cannot pass by General having been
         // emptied.
-        assert!(general.contains(AUTO_LOCK_LABEL));
-        assert!(general.contains(FETCH_ICONS_LABEL));
+        // The rows that stayed on their own pages, so this cannot pass by
+        // those pages having been emptied. Neither is on General any more --
+        // they are Lock and View since the split -- and the point of the
+        // control is unchanged: the update row is somewhere else, and these
+        // two are still somewhere.
+        assert!(paint(Section::Lock).contains(AUTO_LOCK_LABEL));
+        assert!(paint(Section::View).contains(FETCH_ICONS_LABEL));
 
         // And it is on Updates, above the check button rather than below it:
         // the pill is the rule and the button is the exception to it, and a
@@ -8636,7 +8772,7 @@ mod tests {
     /// (the credential).
     #[test]
     fn the_site_icons_row_says_the_domain_is_what_is_sent() {
-        let painted = paint(Section::General);
+        let painted = paint(Section::View);
         assert!(painted.contains(FETCH_ICONS_LABEL), "got {:?}", painted.strings());
         assert!(painted.contains(FETCH_ICONS_DESCRIPTION), "got {:?}", painted.strings());
         assert!(
@@ -8678,6 +8814,10 @@ mod tests {
     fn clicking_the_totp_secret_toggle_changes_the_setting_it_is_wired_to() {
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
+        // The rows this test drives moved to `Section::View` when General was
+        // split; the page is selected here rather than the test being pointed
+        // at whatever General happens to draw now.
+        state.section = Section::View;
         assert!(
             !state.settings.reveal_totp_seed,
             "the default: no TOTP seed is offered on the details screen until this is clicked"
@@ -8689,11 +8829,15 @@ mod tests {
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
+        assert_eq!(
+            pills.len(),
+            4,
+            "the View card no longer paints its four pills: site icons, the direct-icons              child, brand logos and the TOTP secret"
+        );
         // FIFTH pill down now: prompt, site icons, the direct-fetch child
         // of site icons, network logos, TOTP secret, auto-lock. It was the
         // fourth until that child row was inserted.
-        let pill = pills[4].center();
+        let pill = pills[3].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -8715,12 +8859,20 @@ mod tests {
 
     /// Where the row is, read off the paint rather than off the source order,
     /// for the reason `the_breach_row_sits_under_the_prompt_row` gives.
+    ///
+    /// **It used to be "between the icon row and the auto-lock row", and on
+    /// View it is neither.** Auto-lock went to `Section::Lock`, so the row
+    /// that followed this one is on another page and the TOTP secret is now
+    /// LAST on View -- under the icons and under the brand logos. The claim
+    /// is re-pinned to that rather than loosened: it is still an assertion
+    /// about where the row sits, read off the paint, and it would still fail
+    /// if the row moved.
     #[test]
-    fn the_totp_secret_row_sits_between_the_icon_row_and_the_auto_lock_row() {
-        let painted = paint(Section::General);
+    fn the_totp_secret_row_sits_last_on_view_under_the_icon_and_logo_rows() {
+        let painted = paint(Section::View);
         let breach = painted.ink_of(FETCH_ICONS_LABEL).rect;
         let secret = painted.ink_of(TOTP_SECRET_LABEL).rect;
-        let auto_lock = painted.ink_of(AUTO_LOCK_ENABLED_LABEL).rect;
+        let auto_lock = painted.ink_of(BRAND_LOGOS_LABEL).rect;
         // The instrument first: three labels at three distinct, non-empty
         // heights, so `top()` is telling them apart rather than reading one
         // number three times.
@@ -8730,34 +8882,37 @@ mod tests {
             "the TOTP-secret row is not under the site-icons row: icons at {breach:?}, secret at {secret:?}"
         );
         assert!(
-            secret.top() < auto_lock.top(),
-            "the TOTP-secret row is not above the auto-lock row"
+            auto_lock.top() < secret.top(),
+            "the TOTP-secret row is not below the brand-logo row: logos at {auto_lock:?},              secret at {secret:?}"
         );
         // The positive control: the tops differ by a real amount, so the
         // comparisons above are telling rows apart and not comparing one
         // number with itself.
         assert!(secret.top() - breach.top() > 1.0);
-        assert!(auto_lock.top() - secret.top() > 1.0);
+        assert!(secret.top() - auto_lock.top() > 1.0);
 
         // ... and the pills follow the labels, so it is the ROW that moved
         // and not just its text.
         //
-        // **The indices are named, because they moved.** General now paints
-        // prompt(0), site icons(1), the direct-fetch child of site icons(2),
-        // network logos(3), TOTP secret(4), auto-lock(5) -- the disk-cache
-        // pair that used to occupy 0 and 1 is on `Section::Vault`. The pill
-        // under test is 4, and its neighbours are 3 and 5.
+        // **The indices are named, because they moved again.** View paints
+        // site icons(0), the direct-fetch child of site icons(1), network
+        // logos(2) and the TOTP secret(3). They were 1, 2, 3 and 4 on
+        // General, behind the prompt pill; General was split and the prompt
+        // stayed there. The pill under test is the LAST one, and its
+        // neighbour above is 2.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6);
-        assert!(pills[3].top() < pills[4].top(), "the TOTP-secret pill is not below the network-logos pill");
-        assert!(pills[4].top() < pills[5].top(), "the TOTP-secret pill is not above the auto-lock pill");
+        assert_eq!(pills.len(), 4);
         assert!(
-            pills[4].top() > breach.bottom(),
-            "the TOTP-secret pill is level with the site-icons row's text, so the pills and the labels disagree about which row is which"
+            pills[2].top() < pills[3].top(),
+            "the TOTP-secret pill is not below the network-logos pill"
         );
         assert!(
-            pills[4].bottom() < auto_lock.top(),
-            "the TOTP-secret pill overhangs the auto-lock row"
+            pills[3].top() > breach.bottom(),
+            "the TOTP-secret pill is level with the site-icons row's text, so the pills and              the labels disagree about which row is which"
+        );
+        assert!(
+            pills[3].top() > auto_lock.bottom(),
+            "the TOTP-secret pill overhangs the network-logos row"
         );
     }
 
@@ -8767,7 +8922,7 @@ mod tests {
     /// painted in the clear.
     #[test]
     fn the_totp_secret_row_says_what_it_turns_on_and_that_it_is_off_by_default() {
-        let painted = paint(Section::General);
+        let painted = paint(Section::View);
         assert!(painted.contains(TOTP_SECRET_LABEL), "got {:?}", painted.strings());
         assert!(painted.contains(TOTP_SECRET_DESCRIPTION), "got {:?}", painted.strings());
         assert!(
@@ -8828,12 +8983,20 @@ mod tests {
         // asked directly.
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
+        // The rows this test drives moved to `Section::Lock` when General was
+        // split; the page is selected here rather than the test being pointed
+        // at whatever General happens to draw now.
+        state.section = Section::Lock;
         assert!(state.settings.auto_lock_enabled, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 6, "the General card no longer paints six pills");
-        let pill = pills[pills.len() - 1].center();
+        assert_eq!(
+            pills.len(),
+            1,
+            "the Lock card paints one pill -- the switch -- and the minutes stepper is not              a pill; a second one here means something else moved onto this page"
+        );
+        let pill = pills[0].center();
         frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.auto_lock_enabled, "the auto-lock toggle did not turn off");
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
@@ -8863,10 +9026,10 @@ mod tests {
         // enabled case as the positive control -- without it, a stepper that
         // painted `HAIRLINE` in both states would pass.
         let off = paint_settings(
-            Section::General,
+            Section::Lock,
             Settings { auto_lock_enabled: false, ..Settings::default() },
         );
-        let on = paint_settings(Section::General, Settings::default());
+        let on = paint_settings(Section::Lock, Settings::default());
         let stepper = Vec2::new(112.0, 28.0);
         assert_eq!(
             on.stroke_of_only_rect_of_size(stepper),
@@ -8895,11 +9058,11 @@ mod tests {
     fn the_minutes_number_is_centred_in_its_cell_in_both_states() {
         let minutes = clamp_auto_lock_minutes(Settings::default().auto_lock_minutes).to_string();
         for (state, painted) in [
-            ("live", paint_settings(Section::General, Settings::default())),
+            ("live", paint_settings(Section::Lock, Settings::default())),
             (
                 "greyed",
                 paint_settings(
-                    Section::General,
+                    Section::Lock,
                     Settings { auto_lock_enabled: false, ..Settings::default() },
                 ),
             ),
@@ -8942,7 +9105,7 @@ mod tests {
         // Greyed, not hidden: the number the toggle will restore has to stay
         // legible, so this is not satisfied by a row that disappears.
         let painted = paint_settings(
-            Section::General,
+            Section::Lock,
             Settings { auto_lock_enabled: false, auto_lock_minutes: 42, ..Settings::default() },
         );
         assert!(painted.contains("Lock the vault after"), "got {:?}", painted.strings());
@@ -8963,6 +9126,8 @@ mod tests {
         let ctx = styled_context();
         let mut off =
             PrefsState::new(Settings { auto_lock_enabled: false, ..Settings::default() });
+        // The minutes stepper lives on `Section::Lock` since General was split.
+        off.section = Section::Lock;
         let painted = frame(&ctx, &mut off, &[]);
         let plus = painted.rect_of("+").center();
         let minus = painted.rect_of("-").center();
@@ -8973,6 +9138,8 @@ mod tests {
         assert_eq!(off.settings.auto_lock_minutes, 15, "the disabled - stepped the value");
 
         let mut on = PrefsState::new(Settings::default());
+        // The stepper lives on `Section::Lock` since General was split.
+        on.section = Section::Lock;
         let painted = frame(&ctx, &mut on, &[]);
         assert_eq!(
             (painted.rect_of("+").center(), painted.rect_of("-").center()),
@@ -8994,6 +9161,8 @@ mod tests {
         let ctx = styled_context();
         let mut off =
             PrefsState::new(Settings { auto_lock_enabled: false, ..Settings::default() });
+        // The minutes field lives on `Section::Lock` since General was split.
+        off.section = Section::Lock;
         let painted = frame(&ctx, &mut off, &[]);
         // The middle cell of the 112x28 box, i.e. where the value sits.
         let field = painted.only_rect_of_size(Vec2::new(112.0, 28.0)).center();
@@ -9004,6 +9173,8 @@ mod tests {
         assert_eq!(off.auto_lock_text, "15", "and its buffer must not drift either");
 
         let mut on = PrefsState::new(Settings::default());
+        // The positive control needs the same page as the case above it.
+        on.section = Section::Lock;
         let painted = frame(&ctx, &mut on, &[]);
         let field = painted.only_rect_of_size(Vec2::new(112.0, 28.0)).center();
         frame(&ctx, &mut on, &click(field));
@@ -9022,6 +9193,8 @@ mod tests {
     fn the_steppers_buttons_move_the_stored_timeout() {
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings::default());
+        // The stepper lives on `Section::Lock` since General was split.
+        state.section = Section::Lock;
         assert_eq!(state.settings.auto_lock_minutes, 15, "the default");
 
         let first = frame(&ctx, &mut state, &[]);
@@ -9046,6 +9219,8 @@ mod tests {
         // same lie as a switch that does nothing.
         let ctx = styled_context();
         let mut state = PrefsState::new(Settings { auto_lock_minutes: 1, ..Settings::default() });
+        // The stepper lives on `Section::Lock` since General was split.
+        state.section = Section::Lock;
         let first = frame(&ctx, &mut state, &[]);
         let minus = first.rect_of("-").center();
         frame(&ctx, &mut state, &click(minus));
@@ -12642,8 +12817,13 @@ mod modal_tests {
         assert_visible(&shot, MODAL_TITLE, card);
         // And the form inside it, not just the shell.
         assert_visible(&shot, Section::General.label(), card);
+        // A row that General still owns. It used to be `AUTO_LOCK_LABEL`,
+        // which was the bottom of this page until General was split and
+        // auto-lock moved to `Section::Lock`; the claim is unchanged -- the
+        // FORM is drawn on the first frame and not only the shell -- so it
+        // is made against a row that is still here.
         assert!(
-            shot.find(AUTO_LOCK_LABEL).is_some(),
+            shot.find(PROMPT_LABEL).is_some(),
             "the first frame drew the shell but not the settings form; got {:?}",
             shot.sources()
         );
