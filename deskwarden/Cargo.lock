@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "deskwarden"
-version = "0.15.16-dev"
+version = "0.15.16"
 dependencies = [
  "aes",
  "aes-gcm",

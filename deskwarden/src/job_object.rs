@@ -2450,7 +2450,10 @@ mod tests {
             // comment explaining it are the 766 new bytes. No dependency
             // changed, and the `[lib]` name is untouched -- that one is a Rust
             // identifier, not a file anybody sees.
-            (17484, 0x6e7c_5aa7_e27d_5567_u64),
+            // 17480 bytes, new hash: the crate version moved 0.15.16-dev ->
+            // 0.15.16 for the release, dropping the four-byte suffix. No
+            // dependency changed.
+            (17480, 0x49d4_4d7d_7c9d_2cb9_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

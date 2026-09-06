@@ -15,6 +15,50 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.16 - 2026-09-06
+
+### Signing in on a fresh install works, whichever client you choose
+
+Choosing "use the built-in client" on a new install still tried to run the
+official Bitwarden CLI, and said it was missing. Four separate things had to
+line up for that choice to reach the sign-in, and none of them did on a
+machine with no account on it yet. They do now: picking either client signs
+you in, and the vault loads afterwards instead of reporting that it could not
+be read.
+
+### Adding to favourites no longer fails on a self-hosted server
+
+Starring an item could be refused with "the vault backend refused the write",
+and the server's reason was that the client's copy was out of date -- when it
+was not. Deskwarden was quoting the server's own change timestamp back at it,
+which a server can only read as "I have seen this version". It no longer
+sends it, and the server keeps the authority it always had.
+
+### Long values are cut with an ellipsis instead of running under their shortcut
+
+A website address longer than the row it sits in was painted straight through
+the CTRL+SHIFT+U beside it. Values are now cut short with an ellipsis before
+they reach the shortcut, on every row of the details panel.
+
+### General has become General, View and Lock
+
+The General page had grown to cover three separate subjects. It keeps
+autofill prompts and the fill shortcut; what the vault window draws (item
+icons, brand marks, TOTP secrets) is now **View**, and when Deskwarden locks
+itself is **Lock**, with the switch and the timeout finally on the same page.
+
+### Smaller things
+
+* The server picker on the sign-in card is a proper dropdown: the list is the
+  width of the field, the selected row is highlighted edge to edge, and the
+  rows have room to breathe.
+* "Sign in with an API key" sits on the same line as the server picker, and
+  responds to a click again.
+* Preferences draws its in-card section headings the way the rest of the app
+  does -- Local API was the page where that was most obvious.
+* Deskwarden appears as `Deskwarden` in Task Manager from the moment it
+  starts, rather than switching from lowercase a second later.
+
 ## 0.15.15 - 2026-09-05
 
 ### Signing in really does keep the tray small this time
