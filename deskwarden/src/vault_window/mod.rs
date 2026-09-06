@@ -5818,7 +5818,14 @@ pub fn prefs_seed(
     }
     let on_disk = settings_path.map(crate::settings::Settings::load).unwrap_or_default();
     crate::settings::Settings {
-        use_official_bw_crypto: accounts.is_none_or(|a| a.active().use_official_bw_crypto),
+        // **`map`, not `is_none_or`, and that one word is the defect.** With
+        // no account list this used to answer `true` -- "the official CLI" --
+        // because the field was a plain `bool` and had no way to say "this
+        // window was never told". `main` then wrote that guess onto an
+        // account that had signed in on the built-in client, and the next
+        // launch chose `bw serve` and sat probing a port nothing was
+        // listening on. `None` says what is actually known.
+        use_official_bw_crypto: accounts.map(|a| a.active().use_official_bw_crypto),
         ..on_disk
     }
 }
@@ -17805,14 +17812,19 @@ mod the_gears_seed {
 
         // Control: the file really does still say the opposite, so the
         // assertion below is telling the two sources apart.
-        assert!(
+        // The file's own copy of the key, which the seed must NOT be reading.
+        // It loads as `Some(true)` from a `settings.json` written before this
+        // field was nullable, so it is still the opposite of the account and
+        // still tells the two sources apart.
+        assert_eq!(
             crate::settings::Settings::load(&path).use_official_bw_crypto,
+            Some(true),
             "control: the stale key did not survive the load"
         );
 
         let seed = prefs_seed(None, Some(&path), Some(&accounts));
         assert!(
-            !seed.use_official_bw_crypto,
+            seed.use_official_bw_crypto == Some(false),
             "the modal opened saying this account is on `bw serve`; it is not, and closing the \
              modal would write that answer into the account"
         );
@@ -17826,8 +17838,9 @@ mod the_gears_seed {
         // The same file, the OTHER account active: the seed follows the
         // account rather than reporting one constant twice.
         let seed = prefs_seed(None, Some(&path), Some(&two_accounts(CLI)));
-        assert!(
+        assert_eq!(
             seed.use_official_bw_crypto,
+            Some(true),
             "control: the seed says `bw serve` for neither account, so the answer above is not \
              being read from the account at all"
         );
@@ -17846,7 +17859,7 @@ mod the_gears_seed {
         let accounts = two_accounts(CLI);
 
         let in_flight = crate::settings::Settings {
-            use_official_bw_crypto: false,
+            use_official_bw_crypto: Some(false),
             check_breaches: true,
             ..crate::settings::Settings::default()
         };
@@ -17873,8 +17886,8 @@ mod the_gears_seed {
     fn no_account_list_seeds_the_official_backend() {
         let dir = crate::test_scratch::ScratchDir::new("gear-seed-no-accounts");
         let path = upgraded_file(&dir);
-        assert!(prefs_seed(None, Some(&path), None).use_official_bw_crypto);
-        assert!(prefs_seed(None, None, None).use_official_bw_crypto);
+        assert_eq!(prefs_seed(None, Some(&path), None).use_official_bw_crypto, None);
+        assert_eq!(prefs_seed(None, None, None).use_official_bw_crypto, None);
     }
 }
 

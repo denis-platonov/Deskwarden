@@ -953,7 +953,14 @@ pub mod tests {
     /// the setting it would need is on.
     #[test]
     fn the_shipped_default_never_selects_rest() {
-        let default_setting = crate::settings::Settings::default().use_official_bw_crypto;
+        // The carrier is nullable now -- see `Settings::use_official_bw_crypto`
+        // -- and `None` means "no account said". What this test is about is
+        // the shipped default an account with no answer yet gets, which is the
+        // official CLI, so the `None` is resolved here the way
+        // `accounts::official_cli_after_sign_in` resolves it.
+        let default_setting = crate::settings::Settings::default()
+            .use_official_bw_crypto
+            .unwrap_or(true);
         assert!(default_setting);
         assert_eq!(
             choose(Some("https://vault.example.com"), default_setting),

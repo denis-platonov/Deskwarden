@@ -3436,7 +3436,13 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
         // visibly stays where it was, and the way to be sure of that is never
         // to have moved it: the click is a proposal, and nothing but
         // `Confirm` below writes the field.
-        let stored = state.settings.use_official_bw_crypto;
+        // `None` is "this window was never told which client the account is
+        // on", which `prefs_seed` now says honestly rather than guessing. It
+        // is drawn as the official CLI because that is what an account with
+        // no answer yet gets (`accounts::official_cli_after_sign_in`), and it
+        // is written back only if the user actually moves the control -- the
+        // `Some` below is what says they did.
+        let stored = state.settings.use_official_bw_crypto.unwrap_or(true);
         let clicked = backend_choice_row(
             ui,
             official_crypto_description(self_hosted),
@@ -3462,7 +3468,7 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
                     // two facts, and collapsing them is how one of them gets
                     // changed by an edit to the other.
                     state.settings.use_official_bw_crypto =
-                        matches!(switch, BackendSwitch::ToOfficial);
+                        Some(matches!(switch, BackendSwitch::ToOfficial));
                 }
                 Some(RowAction::Cancel) => state.pending_backend_switch = None,
                 Some(RowAction::Ask) | None => {}
@@ -3476,7 +3482,7 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
         // promise that the row comes back. This row has no remedy to offer: on
         // the built-in client there is no subprocess, and the only sentence a
         // ghost could carry is a confession about how the app is built.
-        if cli_rows_are_shown(server, state.settings.use_official_bw_crypto) {
+        if cli_rows_are_shown(server, state.settings.use_official_bw_crypto.unwrap_or(true)) {
             row_separator(ui);
             state.settings.keep_backend_running = toggle_row(
                 ui,
@@ -6739,7 +6745,13 @@ mod tests {
              back, so the pill is decoration"
         );
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
-        assert!(state.settings.use_official_bw_crypto, "the wrong row's toggle moved");
+        // Untouched is `None` for this field: the state was built from
+        // `Settings::default()`, which carries no account answer, and a
+        // neighbouring click must not invent one.
+        assert_eq!(
+            state.settings.use_official_bw_crypto, None,
+            "the wrong row's toggle moved"
+        );
         assert!(!state.settings.cache_vault_to_disk, "the wrong row's toggle moved");
         assert!(state.settings.read_through_cache, "the wrong row's toggle moved");
 
@@ -7458,7 +7470,13 @@ mod tests {
              never written back, so the pill is decoration"
         );
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
-        assert!(state.settings.use_official_bw_crypto, "the wrong row's toggle moved");
+        // Untouched is `None` for this field: the state was built from
+        // `Settings::default()`, which carries no account answer, and a
+        // neighbouring click must not invent one.
+        assert_eq!(
+            state.settings.use_official_bw_crypto, None,
+            "the wrong row's toggle moved"
+        );
         assert!(!state.settings.service_enabled, "the wrong row's toggle moved");
         assert!(state.settings.prompt_on_match, "the wrong row's toggle moved");
         assert!(state.settings.auto_lock_enabled, "the wrong row's toggle moved");
@@ -7875,13 +7893,23 @@ mod tests {
         let pill = first.rects_of_size(TOGGLE_SIZE)[0].center();
         tall_frame(&ctx, &mut state, &click(pill));
         assert!(!state.settings.keep_backend_running);
-        assert!(state.settings.use_official_bw_crypto, "the parent's toggle moved");
+        // Untouched is `None`: this state was built from a `Settings` that
+        // carries no account answer, and a click elsewhere must not invent one.
+        assert_eq!(
+            state.settings.use_official_bw_crypto, None,
+            "the parent's toggle moved"
+        );
         assert!(!state.settings.cache_vault_to_disk, "a neighbouring card's toggle moved");
         assert!(!state.settings.service_enabled, "a neighbouring card's toggle moved");
 
         tall_frame(&ctx, &mut state, &click(pill));
         assert!(state.settings.keep_backend_running, "and back again");
-        assert!(state.settings.use_official_bw_crypto, "the parent's toggle moved");
+        // Untouched is `None`: this state was built from a `Settings` that
+        // carries no account answer, and a click elsewhere must not invent one.
+        assert_eq!(
+            state.settings.use_official_bw_crypto, None,
+            "the parent's toggle moved"
+        );
     }
 
     /// The ghosted child is inert, not merely grey.
@@ -7895,7 +7923,7 @@ mod tests {
     fn the_ghosted_backend_pill_does_not_change_the_setting_when_clicked() {
         let ctx = tall_context();
         let mut settings = Settings::default();
-        settings.use_official_bw_crypto = false;
+        settings.use_official_bw_crypto = Some(false);
         let mut state = PrefsState::new(settings);
         state.section = Section::Vault;
         state.show_account_source(|| {
@@ -9872,7 +9900,7 @@ mod tests {
     fn paint_vault_for(server: Option<&'static str>, use_official: bool) -> Painted {
         let ctx = tall_context();
         let mut settings = Settings::default();
-        settings.use_official_bw_crypto = use_official;
+        settings.use_official_bw_crypto = Some(use_official);
         let mut state = PrefsState::new(settings);
         state.section = Section::Vault;
         state.show_account_source(match server {
@@ -10258,7 +10286,7 @@ mod tests {
     fn paint_vault_copy(hello: bool, self_hosted: bool, use_official: bool) -> Painted {
         let ctx = tall_context();
         let mut settings = Settings::default();
-        settings.use_official_bw_crypto = use_official;
+        settings.use_official_bw_crypto = Some(use_official);
         let mut state = PrefsState::new(settings);
         state.section = Section::Vault;
         state.show_hello_available(if hello { || true } else { || false });
@@ -10321,15 +10349,20 @@ mod tests {
     fn switching_the_backend_asks_before_it_takes_effect() {
         let ctx = tall_context();
         let mut state = on_a_self_hosted_server();
-        assert!(state.settings.use_official_bw_crypto, "the shipped default");
+        // `None` -- "no account has told this window" -- which is what a
+        // bare `Settings::default()` now carries. The page DRAWS it as the
+        // official CLI, which is the shipped default for an account with no
+        // answer yet; the field itself no longer pretends to know.
+        assert_eq!(state.settings.use_official_bw_crypto, None, "the shipped default");
 
         let first = tall_frame(&ctx, &mut state, &[]);
         let other_client = first.rect_of(BUILT_IN_CHOICE).center();
         let asked = tall_click(&ctx, &mut state, other_client);
 
-        assert!(
+        assert_eq!(
             state.settings.use_official_bw_crypto,
-            "one click moved the backend with no confirmation"
+            None,
+            "one click moved the backend with no confirmation -- and untouched is `None`,              not `Some(true)`: nothing has told this window what the account is on"
         );
         assert!(
             asked.any_containing("open it again yourself"),
@@ -10365,7 +10398,13 @@ mod tests {
 
         let no = asked.ink_of(BACKEND_SWITCH_CANCEL_BUTTON).rect.center();
         let left = tall_click(&ctx, &mut state, no);
-        assert!(state.settings.use_official_bw_crypto, "saying no switched the backend anyway");
+        // Still untouched, and untouched is `None`: declining the switch must
+        // leave the field exactly as the window received it, which for a
+        // state built from `Settings::default()` is "no account has said".
+        assert_eq!(
+            state.settings.use_official_bw_crypto, None,
+            "saying no switched the backend anyway"
+        );
         assert_eq!(
             left.fill_behind(OFFICIAL_CHOICE),
             theme::BLUE_WASH,
@@ -10411,7 +10450,8 @@ mod tests {
              change nobody asked for: {:?}",
             same_client.strings()
         );
-        assert!(state.settings.use_official_bw_crypto, "and it changed nothing");
+        // Untouched is `None` here too -- see the assertions above.
+        assert_eq!(state.settings.use_official_bw_crypto, None, "and it changed nothing");
     }
 
     /// Saying yes really does switch -- the control for the test above, which
@@ -10428,7 +10468,7 @@ mod tests {
         let ctx = tall_context();
         let mut state = on_a_self_hosted_server();
         assert_eq!(
-            choose(SERVER, state.settings.use_official_bw_crypto),
+            choose(SERVER, state.settings.use_official_bw_crypto.unwrap_or(true)),
             VaultBackendChoice::BwServe,
             "control: the page did not start on the official CLI, so a change to the built-in \
              client would prove nothing"
@@ -10440,7 +10480,7 @@ mod tests {
         let after = tall_click(&ctx, &mut state, yes);
 
         assert_eq!(
-            choose(SERVER, state.settings.use_official_bw_crypto),
+            choose(SERVER, state.settings.use_official_bw_crypto.unwrap_or(true)),
             VaultBackendChoice::DirectRest,
             "the confirmation did not take the switch"
         );
@@ -10572,7 +10612,11 @@ mod tests {
     fn the_backend_row_is_disabled_and_inert_on_an_official_cloud() {
         let ctx = tall_context();
         let mut state = on_an_official_cloud();
-        assert!(state.settings.use_official_bw_crypto, "the shipped default");
+        // `None` -- "no account has told this window" -- which is what a
+        // bare `Settings::default()` now carries. The page DRAWS it as the
+        // official CLI, which is the shipped default for an account with no
+        // answer yet; the field itself no longer pretends to know.
+        assert_eq!(state.settings.use_official_bw_crypto, None, "the shipped default");
 
         let first = tall_frame(&ctx, &mut state, &[]);
         // **Both cells, pressed by name.** The ghosted picker still paints
@@ -10580,8 +10624,9 @@ mod tests {
         // would miss a control that had gone live on the selected side.
         for cell in [BUILT_IN_CHOICE, OFFICIAL_CHOICE] {
             tall_frame(&ctx, &mut state, &click(first.rect_of(cell).center()));
-            assert!(
+            assert_eq!(
                 state.settings.use_official_bw_crypto,
+                None,
                 "a click on the ghosted {cell:?} changed the setting anyway"
             );
         }
@@ -10622,7 +10667,7 @@ mod tests {
 
         take_the_backend_switch(&ctx, &mut state, BUILT_IN_CHOICE);
         assert!(
-            !state.settings.use_official_bw_crypto,
+            state.settings.use_official_bw_crypto == Some(false),
             "the row did not move to the built-in client on a self-hosted server"
         );
         assert!(state.settings.keep_backend_running, "the wrong row's toggle moved");
@@ -10630,7 +10675,7 @@ mod tests {
         assert!(!state.settings.service_enabled, "the wrong row's toggle moved");
 
         take_the_backend_switch(&ctx, &mut state, OFFICIAL_CHOICE);
-        assert!(state.settings.use_official_bw_crypto, "and back to the official CLI again");
+        assert_eq!(state.settings.use_official_bw_crypto, Some(true), "and back to the official CLI again");
     }
 
     /// **The one guarantee on this page that cannot be seen by looking: the
@@ -10674,9 +10719,13 @@ mod tests {
         // The shipped default: the pill is ON, and `bw serve` is what the
         // policy answers for it. Both halves, because either alone is
         // satisfied by an inversion of the other.
-        assert!(state.settings.use_official_bw_crypto, "the shipped default");
+        // `None` -- "no account has told this window" -- which is what a
+        // bare `Settings::default()` now carries. The page DRAWS it as the
+        // official CLI, which is the shipped default for an account with no
+        // answer yet; the field itself no longer pretends to know.
+        assert_eq!(state.settings.use_official_bw_crypto, None, "the shipped default");
         assert_eq!(
-            choose(SERVER, state.settings.use_official_bw_crypto),
+            choose(SERVER, state.settings.use_official_bw_crypto.unwrap_or(true)),
             VaultBackendChoice::BwServe,
             "the default configuration does not select the official `bw` CLI"
         );
@@ -10696,9 +10745,9 @@ mod tests {
         // Pressing the other cell moves to the built-in direct-REST client --
         // the state whose whole cost is the copy under this row.
         take_the_backend_switch(&ctx, &mut state, BUILT_IN_CHOICE);
-        assert!(!state.settings.use_official_bw_crypto);
+        assert!(state.settings.use_official_bw_crypto == Some(false));
         assert_eq!(
-            choose(SERVER, state.settings.use_official_bw_crypto),
+            choose(SERVER, state.settings.use_official_bw_crypto.unwrap_or(true)),
             VaultBackendChoice::DirectRest,
             "pressing the built-in client's cell did not select the built-in client, so the \
              two cells do not mean what they say they mean"
@@ -10718,9 +10767,9 @@ mod tests {
         // ...and back, so the two paints above are telling the states apart
         // rather than reporting one constant twice.
         take_the_backend_switch(&ctx, &mut state, OFFICIAL_CHOICE);
-        assert!(state.settings.use_official_bw_crypto);
+        assert_eq!(state.settings.use_official_bw_crypto, Some(true));
         assert_eq!(
-            choose(SERVER, state.settings.use_official_bw_crypto),
+            choose(SERVER, state.settings.use_official_bw_crypto.unwrap_or(true)),
             VaultBackendChoice::BwServe
         );
 

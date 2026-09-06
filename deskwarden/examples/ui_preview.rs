@@ -1495,7 +1495,7 @@ impl Preview {
 
         theme::paint_window_background(root);
         let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings {
-            use_official_bw_crypto: matches!(surface, Surface::PrefsVaultOfficialCli),
+            use_official_bw_crypto: Some(matches!(surface, Surface::PrefsVaultOfficialCli)),
             ..deskwarden::settings::Settings::default()
         });
         state.show(prefs_ui::Section::Vault);

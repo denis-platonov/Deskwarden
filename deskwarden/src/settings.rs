@@ -1259,7 +1259,26 @@ pub struct Settings {
     /// (see `prefs_ui::official_crypto_description`), says so in the row
     /// itself, and ghosts it with an explanation on an account that is not
     /// self-hosted.
-    pub use_official_bw_crypto: bool,
+    /// # Nullable, because it is an ACCOUNT's value and this is only its
+    /// carrier
+    ///
+    /// This is not a setting. `Account::use_official_bw_crypto` is where the
+    /// backend choice lives -- per account, because a machine can hold one
+    /// account on the official CLI and one on the built-in client -- and this
+    /// field exists solely to carry the ACTIVE account's copy of it into
+    /// Preferences and back out again.
+    ///
+    /// It used to be a plain `bool`, and the difference is a defect the owner
+    /// watched: `vault_window::prefs_seed` had no account list to read on some
+    /// launches and filled it with `true`, "the official CLI", because a
+    /// `bool` has no way to say "this window was never told". The daemon then
+    /// wrote that guess onto an account that had signed in on the built-in
+    /// client, and the NEXT launch chose `bw serve` and sat probing
+    /// `localhost:8087` until the deadline.
+    ///
+    /// `None` means exactly "this window had no account to speak for", and
+    /// `main`'s `apply_edited_settings` writes nothing on it.
+    pub use_official_bw_crypto: Option<bool>,
     /// Whether `deskwarden.exe --service` may serve the vault on loopback.
     ///
     /// **`false` (the default, and what an older `settings.json` without this
@@ -1380,7 +1399,10 @@ impl Default for Settings {
             clear_clipboard_seconds: DEFAULT_CLIPBOARD_SECONDS,
             cache_vault_to_disk: false,
             read_through_cache: true,
-            use_official_bw_crypto: true,
+            // `None`, not `true`: a `Settings` nobody has told about an
+            // account has no backend answer to give, and answering "the
+            // official CLI" is the guess this field was made nullable to stop.
+            use_official_bw_crypto: None,
             service_enabled: false,
             never_save_for_apps: Vec::new(),
             vault_window: None,
@@ -1846,7 +1868,7 @@ mod tests {
             // The OPPOSITE of its own default (`false`), for the reason the
             // fields above give.
             cache_vault_to_disk: true,
-            use_official_bw_crypto: false,
+            use_official_bw_crypto: Some(false),
             never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: None,
             // Listed rather than `..Settings::default()` so this test keeps
@@ -1923,16 +1945,21 @@ mod tests {
 
     #[test]
     fn official_bw_crypto_is_trusted_by_default() {
-        assert!(Settings::default().use_official_bw_crypto);
+        assert_eq!(Settings::default().use_official_bw_crypto, None);
     }
 
     #[test]
     fn an_older_settings_file_parses_trusting_official_bw_crypto() {
         // Same guarantee as `an_older_settings_file_parses_with_the_disk_cache_off`,
         // for the field this pass added: a settings.json written before
-        // `use_official_bw_crypto` existed has no such key, and must load as
-        // `true` -- today's behaviour, unconditionally -- not as `false`,
-        // which `bool`'s own `Default` would otherwise silently give it.
+        // `use_official_bw_crypto` existed has no such key, and loads as
+        // `None` -- "this file says nothing about which client an account is
+        // on", which is the truth about such a file. It used to load as
+        // `true`, because the field was a `bool` and `true` was the only way
+        // to avoid `bool::default()` quietly meaning "the built-in client".
+        // Nullable removes that dilemma: the ACCOUNT's own field is where the
+        // answer lives, and `accounts::official_cli_after_sign_in` is where an
+        // account with no answer yet is given one.
         let path = temp_path("partial-official-bw-crypto");
         std::fs::write(
             &path,
@@ -1940,7 +1967,7 @@ mod tests {
         )
         .unwrap();
         let loaded = Settings::load(&path);
-        assert!(loaded.use_official_bw_crypto);
+        assert_eq!(loaded.use_official_bw_crypto, None);
         assert!(!loaded.keep_backend_running);
         assert_eq!(loaded.auto_lock_minutes, 5);
         let _ = std::fs::remove_file(&path);
@@ -2130,7 +2157,7 @@ mod tests {
             clear_clipboard_on_quit: false,
             clear_clipboard_seconds: 150,
             cache_vault_to_disk: true,
-            use_official_bw_crypto: false,
+            use_official_bw_crypto: Some(false),
             never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: None,
             accounts: Vec::new(),
@@ -2867,7 +2894,7 @@ mod tests {
             clear_clipboard_on_quit: false,
             clear_clipboard_seconds: 150,
             cache_vault_to_disk: true,
-            use_official_bw_crypto: false,
+            use_official_bw_crypto: Some(false),
             never_save_for_apps: vec!["silenced.exe".to_string()],
             vault_window: Some(WindowGeometry { x: 100, y: 60, width: 1400, height: 900 }),
             accounts: Vec::new(),
