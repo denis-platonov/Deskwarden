@@ -11908,6 +11908,27 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
             "a ui process could not publish its backend policy; this window stays on `bw serve`"
         );
     }
+    // **And the RE-SETTLE seam beside it, which this process never installed.**
+    //
+    // `install_env` publishes what the backend is NOW. `install_resettle`
+    // publishes how it CHANGES when a sign-in learns something the launch did
+    // not know -- a server typed into the card, or the client the choice modal
+    // was answered with. The daemon installs both in `fn main`; a ui process
+    // is dispatched from the top of `main`, long before that line, so it had
+    // the first and not the second and `backend_policy::resettle_for`
+    // answered `false` for every sign-in a window ran.
+    //
+    // What that looked like: a clean install, the choice modal, "use the
+    // built-in client", and then a message saying the Bitwarden CLI is
+    // missing. The answer reached `login_ui::direct_login_for_this_sign_in`,
+    // which asked for a re-settle, was told none was installed, and fell back
+    // to what startup had settled -- `bw serve`, because an account with no
+    // record reads as the official CLI. The sign-in then spawned the CLI the
+    // user had just declined, and the message was the honest report of it.
+    //
+    // The same seam and the same function pointer the daemon installs, so two
+    // processes cannot re-settle the same account differently.
+    backend_policy::install_resettle(REAL_BACKEND_REPOINT);
     // **The About page's update flow, installed HERE as well as in the
     // daemon.**
     //
@@ -35455,6 +35476,55 @@ mod vault_backend_choice_tests {
              the sign-in in the daemon, which is what loads the OpenGL driver into a \
              process that never gives it back"
         );
+    }
+
+    /// **A ui process installs the re-settle seam, not just the environment.**
+    ///
+    /// The report: a clean install, the choice modal, "use the built-in
+    /// client", and then a message saying the Bitwarden CLI is missing --
+    /// for a sign-in the user had just told the app not to use it for.
+    ///
+    /// `install_env` publishes what the backend is now; `install_resettle`
+    /// publishes how it changes when a sign-in learns something the launch did
+    /// not know. `fn main` installs both, but a ui process is dispatched from
+    /// the top of `main` and never reaches that line, so it had the first and
+    /// not the second. Every sign-in a window ran asked
+    /// `backend_policy::resettle_for` to apply the answer, was told no
+    /// re-settle was installed, and fell back to what startup had settled.
+    ///
+    /// **Same class as the `install_env` line beside it**, which was added for
+    /// the same reason one branch earlier: a process split that moved a
+    /// surface without moving what the surface writes to. That is why both are
+    /// pinned here rather than one.
+    ///
+    /// A source guard, because the seam is a process-global function pointer
+    /// and `run_as_a_ui_process` opens a window.
+    #[test]
+    fn a_ui_process_installs_both_halves_of_the_backend_policy() {
+        let source = include_str!("main.rs");
+        let entry = source
+            .split_once("fn run_as_a_ui_process")
+            .expect("control: the ui entry point was renamed")
+            .1;
+        let entry = entry
+            .split_once("fn backend_is_listening(")
+            .expect("control: the item after the ui entry point was renamed")
+            .0;
+        for (call, what) in [
+            (
+                concat!("install", "_env("),
+                "what the backend IS -- without it the window serves through `bw serve` on an                  account that has no CLI",
+            ),
+            (
+                concat!("install", "_resettle("),
+                "how the backend CHANGES when a sign-in learns a server or a client choice --                  without it the choice modal's answer is dropped and the sign-in runs on                  whatever startup settled",
+            ),
+        ] {
+            assert!(
+                entry.contains(call),
+                "a ui process no longer calls `{call}`, which publishes {what}"
+            );
+        }
     }
 
     /// **THE REPORT: a clean install, a self-hosted URL, and "The system
