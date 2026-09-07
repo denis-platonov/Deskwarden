@@ -1,8 +1,29 @@
 # .github/workflows/release.yml
 #
-# Builds deskwarden, packages it with Inno Setup, and publishes both the
-# bare executable and the installer as GitHub Release assets whenever a
-# "vX.Y.Z" tag is pushed.
+# Builds deskwarden, packages it with Inno Setup, and publishes the Inno
+# Setup installer -- and nothing else -- as the release's single GitHub
+# Release asset whenever a "vX.Y.Z" tag is pushed.
+#
+# ONE ASSET, AND WHY THE BARE EXECUTABLE IS NO LONGER ONE. Until 0.15.18 this
+# workflow uploaded `Deskwarden.exe` beside the installer. Nothing ever read
+# it. The self-updater picks its asset BY NAME -- the first asset whose name
+# ends in `-installer.exe` (`updater::installer_from`), with the digest read
+# out of that same asset object -- so the bare exe was never downloaded and
+# never referenced; there is a test in updater.rs
+# (`selects_the_installer_asset_even_when_a_bare_exe_is_also_present`) that
+# pinned exactly that. Nothing in README.md offered it either: the download
+# link there has always been the per-user installer. So the second asset's
+# only effect was to put a choice on the release page whose wrong branch is a
+# loose executable with no Start Menu entry, no autostart task, no
+# uninstaller, and no version the updater can replace in place. Only the
+# installer is needed, so only the installer is published.
+#
+# Dropping it is safe for users on older builds for the same reason: every
+# shipped updater has selected by the `-installer.exe` suffix rather than by
+# position or by asset count, so a release carrying one asset satisfies them
+# unchanged. The binary is still built and still passes through the signing
+# step below -- the installer wraps it -- it simply stops being an asset of
+# its own.
 #
 # The release BODY is composed here rather than written by hand, because the
 # app renders it: `updater::release_notes_blocks` reads it straight onto the
@@ -133,6 +154,12 @@ jobs:
       # manual-prerequisite gap called out in
       # docs/superpowers/specs/2026-07-28-deskwarden-distribution-design.md,
       # not a placeholder meant to silently stand in for real signing.
+      #
+      # This step stays even though the bare exe is no longer published as a
+      # release asset. It is not signing an asset -- it is signing the binary
+      # the installer is about to bundle, which is the file that ends up on a
+      # user's disk and is the one Windows prompts about when it runs. Only
+      # the upload went away.
       - name: Sign binary (SignPath) [TODO - pending SignPath account approval]
         run: |
           echo "TODO: wire SignPath signing once the account is approved -- see docs/superpowers/specs/2026-07-28-deskwarden-distribution-design.md. This build is UNSIGNED. The updater's SHA-256 digest check is not a substitute; see docs/code-signing-policy.md."
@@ -370,8 +397,12 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
+          # The installer, and only the installer -- see the note at the head
+          # of this file for why the bare `Deskwarden.exe` is no longer
+          # uploaded here. The glob is kept rather than being spelled out
+          # with `$env:APP_VERSION` because the file name ISCC produced is
+          # what must be published, whatever the version in it.
           files: |
-            deskwarden/target/release/Deskwarden.exe
             deskwarden/installer/deskwarden-*-installer.exe
           # `body_path`, and `generate_release_notes` deliberately OFF.
           #
