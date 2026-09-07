@@ -127,6 +127,25 @@ impl MappedCipher {
     pub(crate) fn body(&self) -> &Value {
         &self.body
     }
+
+    /// The body's top-level field NAMES, sorted. **Never a value.**
+    ///
+    /// The one thing about a mapped cipher that is safe to write down, and the
+    /// only thing that makes a refused write diagnosable. A server that
+    /// answers "The client copy of this cipher is out of date" is reading some
+    /// field of this body as a concurrency token, and which field that is
+    /// cannot be worked out from the message: it names none. The names are
+    /// the API's own -- `id`, `name`, `notes`, `login`, `fields` -- and are
+    /// the same for every user of this app.
+    ///
+    /// This type has no `Debug` on purpose (see above), and this is not one:
+    /// it cannot reach a value, because it only ever reads the map's keys.
+    pub(crate) fn field_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> =
+            self.body.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
+        names.sort_unstable();
+        names
+    }
 }
 
 /// One [`VaultItem`], as a server-ready cipher body.
@@ -175,28 +194,31 @@ pub fn encrypt_item(
     } else {
         out.insert("id".to_string(), Value::String(item.id.clone()));
     }
-    // **`revisionDate` is dropped, and it is the ONE server-assigned field
-    // this body must not carry back.**
+    // **`revisionDate` RIDES, and it must be the one the caller just
+    // fetched.**
     //
-    // The rule of this function is "build from the remainder, never from the
-    // model", and it is right: a field this crate does not model must survive
-    // a write rather than be deleted from the user's vault. `revisionDate` is
-    // the exception, because it is not a field of the item at all -- it is the
-    // server's record of when the item last changed, and the cipher REQUEST
-    // model has no such field. Sending it back offers the server a value it
-    // can only read as a concurrency token.
+    // It was dropped here for one release, and dropping it was the wrong
+    // reading of the right evidence. The evidence: a star toggled three times
+    // in thirty seconds, refused every time with "The client copy of this
+    // cipher is out of date. Resync the client and try again." The reading
+    // was "a cipher REQUEST has no such field, so a server offered one can
+    // only read it as a concurrency token" -- true -- "therefore do not offer
+    // one" -- false. A server that reads it as a token needs one, and needs
+    // it CURRENT; the app was quoting the value from the fetch the window
+    // opened with, which the first write had already superseded.
     //
-    // Watched, on a self-hosted server, as three refusals in thirty seconds
-    // on a star being toggled: "Couldn't add ... to your favourites -- the
-    // vault backend refused the write", with the server saying "The client
-    // copy of this cipher is out of date. Resync the client and try again."
-    // The client's copy was a sync old, which is as fresh as a client gets;
-    // what was stale was a timestamp it had no business quoting.
+    // What proved it: the same refusal came back on an ordinary Save, on a
+    // build with this line removing the key. Save and the star are the same
+    // call -- `VaultCache::update_item` and `set_favorite` both reach
+    // `RestBackend::update_item` -- so the body they send is the same body,
+    // and it was refused with no token at all in it.
     //
-    // The server still answers with its own new `revisionDate`, and
-    // `RestBackend::write_through` still stores THAT rather than what it
-    // sent -- so the snapshot advances exactly as it did.
-    out.remove("revisionDate");
+    // **Freshness is `write_through`'s job, not this function's.** It syncs
+    // immediately before every write and therefore holds a token milliseconds
+    // old; it lays that one over the caller's item with
+    // `vault_bridge::with_revision_date_from` before this runs. This function
+    // goes back to having no exception at all: build from the remainder,
+    // never from the model.
     put_text(&mut out, "name", Some("name"), Some(item.name.as_str()), key, retained)?;
     put_text(
         &mut out,
@@ -1426,36 +1448,41 @@ pub(crate) mod tests {
     /// the real decrypt and back out through the mapper, and every unmodelled
     /// key must come back byte-identical. If this fails, an edit in the
     /// running app deletes those fields from the user's real vault.
-    /// **THE REPORT: "Couldn't add \"Secnote\" to your favourites -- the vault
-    /// backend refused the write. It still isn't one."**
+    /// **THE SECOND REPORT: "Couldn't save your changes to \"Secnote\" -- the
+    /// vault backend refused the write."**
     ///
-    /// The server's own words, from the log: "The client copy of this cipher
-    /// is out of date. Resync the client and try again." The client's copy
-    /// was one sync old, which is as fresh as a client gets. What was stale
-    /// was a timestamp it had no business quoting: `encrypt_item` builds the
-    /// body from the item's retained JSON, and that JSON carries the
-    /// `revisionDate` the server assigned. A cipher REQUEST has no such
-    /// field, so a server offered one can only read it as a concurrency
-    /// token -- and it refused the write three times in thirty seconds.
+    /// The same server, the same message -- "The client copy of this cipher
+    /// is out of date. Resync the client and try again." -- on a build whose
+    /// mapper had stopped sending `revisionDate` at all. Save and the star
+    /// are one call (`VaultCache::update_item` and `set_favorite` both reach
+    /// `RestBackend::update_item`), so that refusal was of a body with no
+    /// token in it, which settles what the first report could not: the server
+    /// wants a token, and wants a CURRENT one.
     ///
-    /// Asserted on the body rather than on a round trip, because the round
-    /// trip's rule is "every unmodelled key survives" and this is the
-    /// exception to it: a test that only listed the exception would pass just
-    /// as well if the key were still being sent.
+    /// So the key rides again, and this pins that it does -- the inverse of
+    /// what stood here for one release. Which token it is, is
+    /// `RestBackend::write_through`'s to decide, and it uses the sync it made
+    /// milliseconds earlier; that half is pinned over there, where the sync
+    /// is.
+    ///
+    /// Asserted on the body rather than folded into the round-trip rule
+    /// because it is the field most likely to be special-cased again: the
+    /// round trip would go on passing if a future `remove` put it back to
+    /// where it was.
     #[test]
-    fn the_written_body_does_not_quote_the_servers_own_revision_date() {
+    fn the_written_body_still_carries_the_revision_date_the_item_holds() {
         let original = cipher_with_unmodelled_fields();
-        assert!(
-            original.get("revisionDate").is_some(),
-            "control: the fixture has no `revisionDate` to drop, so this test would pass against a \
-             mapper that sent it"
-        );
+        let sent = original
+            .get("revisionDate")
+            .cloned()
+            .expect("control: the fixture has no `revisionDate`, so this test proves nothing");
         let (item, keys) = round_trip_in(original);
         let written = mapped(&item, &keys);
-        assert!(
-            written.get("revisionDate").is_none(),
-            "the write quotes the server's own `revisionDate` back at it, which a server can only \
-             read as a concurrency token: {written:?}"
+        assert_eq!(
+            written.get("revisionDate"),
+            Some(&sent),
+            "the write no longer quotes a `revisionDate`, so a server that reads one as a \
+             concurrency token has nothing to check and refuses every edit: {written:?}"
         );
     }
 
@@ -1489,13 +1516,13 @@ pub(crate) mod tests {
         // times in thirty seconds. `encrypt_item` states the whole reasoning;
         // this list is where the exception is admitted rather than hidden by
         // loosening the rule.
-        const SERVER_ASSIGNED: &[&str] = &["revisionDate"];
-
+        // **No server-assigned exception any more.** `revisionDate` was on
+        // this list for one release, while the mapper dropped it; it rides
+        // like every other unmodelled key again, so the rule below is once
+        // more the whole rule. See
+        // `the_written_body_still_carries_the_revision_date_the_item_holds`.
         for (name, value) in before {
-            if MODELLED.contains(&name.as_str())
-                || DROPPED_NULLS.contains(&name.as_str())
-                || SERVER_ASSIGNED.contains(&name.as_str())
-            {
+            if MODELLED.contains(&name.as_str()) || DROPPED_NULLS.contains(&name.as_str()) {
                 continue;
             }
             let kept = after.get(name).unwrap_or_else(|| {

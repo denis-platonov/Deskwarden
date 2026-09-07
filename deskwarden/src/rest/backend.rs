@@ -283,10 +283,54 @@ impl RestBackend {
             &crate::rest::write::MappedCipher,
         ) -> Result<serde_json::Value, RestError>,
     ) -> Result<VaultItem, VaultError> {
-        let cipher = encrypt_item(&record.carrying(item), keys).map_err(crypto_error)?;
+        // **The concurrency token comes from the sync this write just did,
+        // not from the caller's copy.**
+        //
+        // Every caller of this function has already synced -- `update_item`,
+        // `set_favorite`, `move_item_to_folder` all go through `synced()` one
+        // statement earlier -- so `record` is milliseconds old and the item in
+        // the caller's hand can be a whole window session old. `revisionDate`
+        // is the field where that difference is fatal: a server reads it as
+        // "the version you think you are editing", and a superseded one is
+        // refused with "The client copy of this cipher is out of date. Resync
+        // the client and try again." A star toggled twice met that first,
+        // because the second toggle quoted what the first one had already
+        // superseded.
+        //
+        // Dropping the key was tried for one release and is what this
+        // replaces: the same refusal came back on an ordinary Save with no
+        // token in the body at all. See `crate::rest::write::encrypt_item`.
+        //
+        // One field and not the whole base, for `with_revision_date_from`'s
+        // own reason: callers deliberately shape `other` (an app match, a
+        // `deletedDate` kept out of the live snapshot), and the token is the
+        // one key where the server's answer is right whatever the caller
+        // meant.
+        let fresh = crate::vault_bridge::with_revision_date_from(&item, &record.item);
+        let cipher = encrypt_item(&record.carrying(fresh), keys).map_err(crypto_error)?;
         let mut state = self.locked();
-        let answer = send(&self.client, &mut state, &cipher).map_err(rest_error)?;
+        let sent = send(&self.client, &mut state, &cipher);
         drop(state);
+        // **A refused write says what the body CARRIED, by field name.**
+        //
+        // The refusal this exists for is "The client copy of this cipher is
+        // out of date. Resync the client and try again.", which a server
+        // answers when it reads one of these fields as a concurrency token --
+        // and which names no field, so the same message has now been chased
+        // twice from the message alone. `revisionDate` was the first and is
+        // dropped by the mapper; a second refusal after that means a second
+        // field, and this is the line that says which fields there were to
+        // choose from.
+        //
+        // Names only. See `MappedCipher::field_names`: this cannot reach a
+        // value, and the names are the Bitwarden API's own.
+        let answer = sent.map_err(|e| {
+            log::warn!(
+                "the vault backend refused this write; the body carried the field(s) {:?}",
+                cipher.field_names()
+            );
+            rest_error(e)
+        })?;
         // The server's own copy, decrypted: the only source of a created
         // item's id and of a non-stale `revisionDate` after an edit.
         let (written, failures) = decrypt_cipher(&answer, keys).ok_or_else(|| {
@@ -1878,6 +1922,61 @@ pub mod tests {
             answered.other.get("revisionDate").and_then(serde_json::Value::as_str),
             Some("2030-01-01T00:00:00.000000Z")
         );
+    }
+
+    /// **The write quotes the sync it just made, not the copy in the caller's
+    /// hand.**
+    ///
+    /// Two bug reports, one cause. "Couldn't add \"Secnote\" to your
+    /// favourites" and then "Couldn't save your changes to \"Secnote\"", both
+    /// answered by the server with "The client copy of this cipher is out of
+    /// date. Resync the client and try again."
+    ///
+    /// The first was read as "do not send the token" and the mapper stopped
+    /// sending it. That is what the second report disproves: Save and the
+    /// star are one call, so the body refused the second time had no token in
+    /// it at all. The token is wanted; what was wrong was its AGE. The item a
+    /// window hands back can be a whole session old, while `write_through`'s
+    /// own `synced()` ran milliseconds ago.
+    ///
+    /// The stale value here is deliberately far in the past, so a body
+    /// carrying it could not be mistaken for the fresh one by a matcher
+    /// comparing loosely.
+    #[test]
+    fn a_write_quotes_the_revision_date_of_the_sync_and_not_the_callers_stale_one() {
+        let (mut server, backend) = logged_in();
+        let mut item = backend.get_item("live-1").expect("the item");
+        assert_eq!(
+            item.other.get("revisionDate").and_then(serde_json::Value::as_str),
+            Some("2021-01-01T00:00:00.000000Z"),
+            "control: the fixture sync carries no `revisionDate`, so there is no fresh value \
+             for the write to prefer and this test proves nothing"
+        );
+        // A caller holding a copy from an earlier fetch -- which is every
+        // caller: the vault window's item list is as old as the window.
+        item.other
+            .insert("revisionDate".to_string(), serde_json::json!("1999-01-01T00:00:00.000000Z"));
+        item.name = "Renamed".to_string();
+
+        let answer = cipher(
+            "live-1",
+            "Renamed",
+            &serde_json::json!({ "revisionDate": "2030-01-01T00:00:00.000000Z" }),
+        )
+        .to_string();
+        let put = server
+            .mock("PUT", "/api/ciphers/live-1")
+            .match_body(crate::test_http::Matcher::PartialJson(
+                serde_json::json!({ "revisionDate": "2021-01-01T00:00:00.000000Z" }),
+            ))
+            .with_body(answer)
+            .create();
+
+        backend.update_item(&item).expect(
+            "the edit must land: a body carrying the caller's 1999 token matches no route here, \
+             which is what a real server answers with a 400 refusal",
+        );
+        put.assert();
     }
 
     /// An id this vault does not hold is refused rather than created: `PUT`
