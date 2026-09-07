@@ -6573,6 +6573,43 @@ fn paint_digits(ui: &mut egui::Ui, text: &str, room: f32) {
     // egui breaks at word boundaries, and neither a bullet run nor a card
     // number has any.
     job.wrap.break_anywhere = true;
+    // **ONE row, with `…` where the rest of it was -- the third and last
+    // instalment of "it should cut off with ... before overlapping the
+    // shortcut".**
+    //
+    // THE REPORT, on the PREVIOUS PASSWORDS card: a value too long for the
+    // card "wraps onto a second line instead of being cut short with an
+    // ellipsis". It did. `wrap.max_rows` defaults to `usize::MAX`, so
+    // `break_anywhere` above meant FOLD-anywhere: a revealed previous
+    // password became a paragraph of characters and its row grew a line per
+    // fold, which is the one row on this pane that still behaved that way
+    // after 0.15.16 reordered `row_body`'s `Columns` branch and `c8aa221`
+    // reordered its `Stacked` one. Neither of those could reach it. Both work
+    // by putting `TextWrapMode::Truncate` on the value `Ui`'s STYLE, and a
+    // style wrap mode is what `Label` consults when it lays a run out for
+    // itself; this function hands egui a `LayoutJob` it has already laid, so
+    // the style never applied to it and the run kept folding inside a row
+    // that had been repaired around it.
+    //
+    // **Folding was the right answer once, and it is worth saying why it
+    // stopped being one.** It arrived in `a9dad37` against a run that painted
+    // straight past the card and pushed its own reveal eye into the scroll
+    // lane; between "fold" and "overhang" the fold is plainly better, and
+    // truncation was not on the table because the row had no honest width to
+    // truncate AT -- `available_width` inside a row that had already
+    // overflowed reported the overflowed width back. It has one now: the
+    // controls are allocated first, and `row_content_width` reads the clip
+    // rect rather than the stretched `Ui`. So `room` is the room, and a value
+    // that does not fit it is cut exactly as the website and the username
+    // beside it are.
+    //
+    // **A MASK never reaches the cut**, and that is load-bearing rather than
+    // incidental: `fit_mask` has already shortened it to `room`, so its
+    // galley fills one row exactly and egui appends no overflow character.
+    // Three tests here find a mask by its FACE -- every character a `•` --
+    // and an ellipsis on the end of one would make it invisible to all three
+    // while they went on passing for the wrong reason.
+    job.wrap.max_rows = 1;
     paint_on_the_value_baseline(ui, job, theme::INK);
 }
 
@@ -6608,12 +6645,18 @@ fn paint_on_the_value_baseline(
 /// **Truncation, not wrapping, and the difference is the whole of the
 /// "unless cuts off if window is too small" half of the request.** A mask is
 /// a `LayoutJob` and [`paint_digits`] gives it `break_anywhere`, so a run
-/// that does not fit currently FOLDS -- which is right for a revealed
-/// password, where every character matters and the row is allowed to grow,
-/// and wrong for a mask, where the characters carry nothing individually and
-/// a long secret would turn one row into a paragraph of bullets. A hundred
-/// and forty bullets over four lines is not a longer mask; it is a broken
-/// pane.
+/// that does not fit used to FOLD -- which turned one row into a paragraph of
+/// bullets, and a hundred and forty bullets over four lines is not a longer
+/// mask, it is a broken pane.
+///
+/// **This is no longer the only thing standing between the pane and that
+/// paragraph, and it is still not redundant.** `paint_digits` cuts with an
+/// ellipsis now (`max_rows = 1`), so a run that reached it too long would be
+/// elided rather than folded. What this function buys is the FACE: a mask
+/// shortened here is still nothing but bullets, and a mask left to egui would
+/// end in a `…` that says "there is more of this password" about a run of
+/// dots that never said anything about length in the first place. Three tests
+/// find a mask by that face; the design asked for it before they did.
 ///
 /// **Measured against the same job the row paints**, so the two cannot
 /// disagree about what fits: a mask cut by a width this function guessed and
@@ -6817,16 +6860,18 @@ struct MaskedFace<'a> {
 /// Neither half of the repair is optional:
 ///
 /// * **[`RowShape::Stacked`] when the columns do not fit**, which buys the
-///   whole content box (218pt at 298) instead of 44. Not elision: this row's
-///   value IS the point of the row, and `\u{2026}` where a password was is a
-///   row that has stopped doing its job. Not a shorter mask either -- the
-///   mask is short already, and a revealed password is longer than any of
-///   them.
+///   whole content box (218pt at 298) instead of 44. Elision is the LAST
+///   resort here and not the first: this row's value is the point of the row,
+///   so the row is made as wide as the pane allows before a single character
+///   of it is given up. Not a shorter mask either -- the mask is short
+///   already, and a revealed password is longer than any of them.
 /// * **A wrap width on the value, always.** The masked run is a
 ///   `LayoutJob`, and a `LayoutJob`'s `wrap.max_width` defaults to infinity
-///   -- which is why the run above ran past the card instead of folding. A
-///   revealed 40-character password overflows even the stacked line, so the
-///   line it is on is the width it wraps at.
+///   -- which is why the run above ran past the card instead of stopping at
+///   it. A revealed 40-character password overflows even the stacked line, so
+///   the line it is on is the width it is cut at; see [`paint_digits`], which
+///   folded there until the owner reported the fold and cuts with `\u{2026}`
+///   now.
 ///
 /// **The two halves are pinned by different tests, and for one release they
 /// were not.** `a9dad37`'s message says "Neither half of the repair is
@@ -6891,6 +6936,22 @@ fn masked_row(
     // cannot leave this measurement behind -- and the mark is in the sum
     // because `digits_fit` decides the shape from what is left over, and a
     // mark left out of it is a mark that pushes the eye off a narrow pane.
+    //
+    // **The gap egui itself puts between the control group and the value is
+    // NOT in this sum, and that is deliberate.** `row_body` lays the two out
+    // as children of one band whose `item_spacing.x` is [`CONTROL_GAP`], so
+    // the value really is handed eight points less than `room` says. Adding
+    // the eight here was tried and taken out again: it moves `room` by less
+    // than the width of one character in this face, so `fit_mask` rounds it
+    // straight back off and nothing on the pane moves -- an unobservable
+    // change to a number two other rows read, which is worse than an
+    // eight-point overstatement that cannot hurt. It cannot, because the
+    // widest a value laid to `room` can reach is the LEFT EDGE OF THE EYE'S
+    // ALLOCATION, and the eye paints an 18.4pt mark centred in a 28pt box --
+    // so even a value that used every point of `room` stops 4.8pt short of
+    // the ink the user sees, which is what
+    // `a_previous_password_too_long_for_its_row_is_cut_before_it_reaches_the_
+    // eye` measures.
     let controls_width = theme::EYE_TOGGLE_SIZE
         + hint.map_or(0.0, |which| {
             CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(which))
@@ -6904,12 +6965,16 @@ fn masked_row(
     // The same decision, in the same words, as the expiry beside it makes --
     // see [`digits_fit`].
     let (shape, room) = digits_fit(ui, natural, controls_width);
-    // **A mask is cut to the room; a revealed value is not.** `digits_fit`
+    // **A mask is cut HERE; a revealed value is cut by egui.** `digits_fit`
     // has already bought the widest line this row can have -- stacking when
     // the two columns cannot hold it -- so `room` is the real limit and not a
-    // guess. What overflows it is handled differently by design: a revealed
-    // value WRAPS, because every character of it is the point of the row, and
-    // a mask TRUNCATES, because none of them are. See [`fit_mask`].
+    // guess, and both faces now stop at it on one line. What differs is what
+    // the cut LOOKS like, and it is a decision about meaning rather than
+    // about layout: a mask is shortened silently, because a run of dots that
+    // ended in `…` would be claiming there is more of a password to see when
+    // the dots never said anything about its length; a revealed value is
+    // elided with `…`, because there really is more of it and the reader has
+    // to be told. See [`fit_mask`] and [`paint_digits`].
     let shown = if *revealed { shown } else { fit_mask(ui, &shown, room) };
     copy_row(
         ui,
@@ -16840,6 +16905,98 @@ mod tests {
         );
     }
 
+    /// **The same rule on the PREVIOUS PASSWORDS card**, whose rows are the
+    /// last ones on this pane that answered "too long" by folding.
+    ///
+    /// THE REPORT, with a screenshot of the card: the value "wraps onto a
+    /// second line instead of being cut short with an ellipsis. It should
+    /// truncate with `…` like every other value row does." It did wrap. The
+    /// two tests above pin the two branches of [`row_body`], and both of
+    /// those repairs work by putting `TextWrapMode::Truncate` on the value
+    /// `Ui`'s STYLE -- which is what a `Label` consults when it lays a run
+    /// out for itself, and is therefore invisible to a history row: its value
+    /// is a `LayoutJob` [`paint_digits`] has already laid, so the row was
+    /// reordered around a run that went on folding inside it. See
+    /// `paint_digits`, where `max_rows = 1` is the fix.
+    ///
+    /// **REVEALED, because a mask is not what was reported and could not
+    /// measure this.** [`fit_mask`] shortens a bullet run to the row *before*
+    /// the row is opened, so a masked history value fits its line by
+    /// construction at every width the window has -- it lays out one line and
+    /// no ellipsis whatever the secret's length, which is exactly the row
+    /// "that happened to fit" the sibling tests warn about. The value that
+    /// overflows is the plaintext behind the eye. The flag is set on the pane
+    /// rather than driven through a click, for the reason
+    /// `settled_revealing_the_history` gives: a click is a second thing that
+    /// can go wrong, and the reveal is not what this is measuring.
+    ///
+    /// Two assertions, and the first is what stops the second being vacuous
+    /// -- a row that never had 400 characters to fit would satisfy "the value
+    /// ends before the eye" while folding, overhanging or drawing nothing at
+    /// all. Asserted on the INK for the reason `Frame::ink_of` gives at
+    /// length: a rect-based overlap test on this pane answers about a
+    /// rectangle nobody can see.
+    #[test]
+    fn a_previous_password_too_long_for_its_row_is_cut_before_it_reaches_the_eye() {
+        // 400 characters, so it cannot fit even the widest pane these tests
+        // build: the point is the rule, and a password that happens to fit
+        // today would make this a measurement of the fixture instead.
+        let secret = "p".repeat(400);
+        let mut item = a_login();
+        item.other.insert(
+            "passwordHistory".to_string(),
+            serde_json::Value::Array(vec![serde_json::json!({
+                "lastUsedDate": super::test_clock::days_ago(super::test_clock::HISTORY_AGE_DAYS),
+                "password": secret.clone(),
+            })]),
+        );
+        let mut pane = Pane::new();
+        pane.reveal.password_history[0] = true;
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+
+        // The GLYPHS, not the source string: `Galley::text()` still reports
+        // the whole password after egui has elided it, which is the blindness
+        // `Frame::rendered` exists for.
+        let (drawn, box_) = frame
+            .rendered
+            .iter()
+            .find(|(source, ..)| source == &secret)
+            .map(|(_, glyphs, rect)| (glyphs.clone(), *rect))
+            .expect("the previous-password row painted no revealed value at all");
+        assert!(
+            drawn.chars().count() < secret.chars().count(),
+            "the row laid out every one of the {} characters, so nothing cut it -- it folded \
+             onto as many lines as it needed, and the assertion below is about a run that \
+             was allowed to fit",
+            secret.chars().count()
+        );
+
+        // The eye on THIS row, found by the band it shares with the value:
+        // the login's own password row has one too, and an absolute index
+        // into `Frame::eyes` would be pinning the order the pane happens to
+        // draw its cards in.
+        let eyes: Vec<&egui::Rect> = frame
+            .eyes
+            .iter()
+            .filter(|eye| box_.y_range().contains(eye.center().y))
+            .collect();
+        assert_eq!(
+            eyes.len(),
+            1,
+            "the previous-password row shares its band with {} reveal eyes, not the one it \
+             draws -- the measurement below would be against another row's control",
+            eyes.len()
+        );
+        let ink = frame.ink_of(&secret);
+        assert!(
+            ink.right() <= eyes[0].left(),
+            "the revealed previous password runs to x={} and its reveal eye starts at x={}, \
+             so the value is painted under its own control",
+            ink.right(),
+            eyes[0].left()
+        );
+    }
+
     fn a_login() -> VaultItem {
         let mut item = an_item(Some(1));
         item.login = Some(crate::vault_bridge::LoginData {
@@ -23068,11 +23225,20 @@ mod read_pane_scroll_tests {
     /// sibling gives: a control that has merely stopped being clipped is
     /// still one the user finds under the scroll bar.
     ///
+    /// **The width is still the whole of it; what happens AT the width has
+    /// changed.** The run used to fold there and is cut with `…` there now --
+    /// see [`paint_digits`], which sets `max_rows = 1` because a previous
+    /// password that wrapped onto a second line was the last row on this pane
+    /// still answering "too long" with a paragraph. Either way it is
+    /// `job.wrap.max_width = room` that decides where, so this test is still
+    /// the one that would notice that line going missing.
+    ///
     /// The vacuity controls come first, and there are two kinds. "No ink past
     /// the cards" is also what a pane that drew no history reports, so the
     /// five revealed runs are counted. And a revealed value that happened to
-    /// fit its line would measure the wrap no more than the mask does, so the
-    /// runs are shown to have really wrapped.
+    /// fit its line would measure the cut no more than the mask does, so the
+    /// runs are shown to have really been shortened -- and to have stayed on
+    /// one line while being shortened, which is the reported defect itself.
     #[test]
     fn a_revealed_previous_password_fits_the_narrowest_pane_too() {
         let pane = egui::vec2(NARROW, ROOMY);
@@ -23131,10 +23297,49 @@ mod read_pane_scroll_tests {
              -- a reveal eye pushed off the card by a value that did not fold: {past:?}"
         );
 
-        // ... and the runs really did fold, so the assertion above is about a
-        // wrap and not about a value that happened to fit. Measured against
-        // the height of the masked run on the same pane, which is one line by
-        // construction.
+        // ... and the runs really were SHORTENED, so the assertion above is
+        // about a value the row had to cut and not about one that happened to
+        // fit. This control used to measure a FOLD -- the revealed run stood
+        // two lines tall against the masked run's one -- and the run does not
+        // fold any more: [`paint_digits`] gives its job `max_rows = 1`, so a
+        // value too long for its line is cut with `…` the way the website and
+        // the username on the same pane are. The question the control asks
+        // moves with it, to the one the two `..._is_cut_before_it_reaches_
+        // the_chord` tests ask: were fewer glyphs laid out than the password
+        // has characters?
+        //
+        // Read off `Shot::runs`, whose second field is what egui really
+        // placed, and NOT off `Shot::glyphs`, which is keyed by the layout
+        // job's source string -- `Galley::text()` still reports the whole
+        // password after the elision, so a source-side count could never see
+        // a cut at all.
+        let cut: Vec<&(String, String, egui::Rect)> = shot
+            .runs
+            .iter()
+            .filter(|(source, ..)| source.starts_with(LONG_HISTORY_PASSWORD))
+            .collect();
+        assert_eq!(
+            cut.len(),
+            5,
+            "the pane laid out {} runs sourced from a previous password, not the five this \
+             item carries -- the cut assertion below would be vacuous: {:?}",
+            cut.len(),
+            shot.sources()
+        );
+        for (source, drawn, _) in &cut {
+            assert!(
+                drawn.chars().count() < source.chars().count(),
+                "the revealed run {source:?} laid out all {} of its characters, so nothing \
+                 cut it and the emptiness above is about a value that happened to fit -- \
+                 lengthen LONG_HISTORY_PASSWORD",
+                source.chars().count()
+            );
+        }
+
+        // ... and it was cut rather than folded, which is the reported defect
+        // itself: "it wraps onto a second line instead of being cut short
+        // with an ellipsis". Measured against the height of the masked run on
+        // the same pane, which is one line by construction.
         // Found by its face rather than by a length: a mask is one bullet per
         // character and `fit_mask` cuts it to the row, so how many bullets
         // land here is the layout's answer and not a number to write down.
@@ -23153,10 +23358,9 @@ mod read_pane_scroll_tests {
         );
         for (label, ink) in &revealed {
             assert!(
-                ink.height() > one_line * 1.5,
+                ink.height() <= one_line * 1.5,
                 "the revealed run {label:?} is {}pt tall against a {one_line}pt line, so it \
-                 fitted on one line and this test measures the wrap no better than the \
-                 masked fixtures do -- lengthen LONG_HISTORY_PASSWORD",
+                 folded onto a second line instead of being cut with an ellipsis",
                 ink.height()
             );
         }
