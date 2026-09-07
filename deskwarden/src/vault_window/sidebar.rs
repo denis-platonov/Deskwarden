@@ -613,11 +613,19 @@ pub fn draw_sidebar(
         // `the_screen_rows_survive_a_vault_with_a_folder_for_every_letter` is
         // that measurement, kept.
         //
-        // The bar is egui's floating default rather than
-        // `theme::scrollbar_in_gutter`: that helper reserves a lane by
-        // narrowing the content, and every row inset, the glyph column and the
-        // countdown's own x are pinned against this panel's current width. A
-        // floating bar allocates no width, so nothing in the rail moves.
+        // The bar floats rather than taking `theme::scrollbar_in_gutter`:
+        // that helper reserves a lane by narrowing the content, and every row
+        // inset, the glyph column and the countdown's own x are pinned against
+        // this panel's current width. A floating bar allocates no width, so
+        // nothing in the rail moves.
+        //
+        // **But not egui's floating DEFAULT, which is a second size.** That
+        // is `ScrollStyle::floating()` -- `bar_width: 10.0`, in the text
+        // colour -- against the item list's 6pt, on two panes a few hundred
+        // points apart. Reported as "make scroll same small as result have".
+        // `theme::floating_scrollbar` is the width half of
+        // `scrollbar_in_gutter` with the lane half left out.
+        theme::floating_scrollbar(ui);
         //
         // `max_height` leaves the countdown its band, and `auto_shrink` is off
         // vertically so the band stays put whether the rows overflow or not --
@@ -3537,5 +3545,54 @@ mod tests {
             SECTION_LABEL_INSET, 8.0,
             "design 4.8 block 2b: section header `padding: 0 8px 8px`"
         );
+    }
+
+    /// **The rail asks for the app's bar width, and asks BEFORE it opens the
+    /// scroll area.**
+    ///
+    /// `theme::floating_scrollbar` writes into `ui.spacing_mut()`, which an
+    /// `egui::ScrollArea` reads when it is built -- so the same call moved
+    /// one line down, inside the `show` closure, would set the width of
+    /// whatever the rail's CONTENT scrolls and leave the rail's own bar at
+    /// egui's 10pt default. That is a mistake with no symptom in the source
+    /// and the original symptom on screen, which is why the ORDER is pinned
+    /// and not merely the presence.
+    ///
+    /// A source pin because driving the rail needs the lists, the selection,
+    /// the screen set and a lock countdown, and because what is being checked
+    /// is which line comes first rather than anything a frame reports. The
+    /// needle is split with `concat!` so this pin cannot match itself.
+    #[test]
+    fn the_rail_takes_the_apps_scrollbar_width_before_it_builds_its_scroll_area() {
+        let source = include_str!("sidebar.rs");
+        let width = concat!("theme::floating_", "scrollbar(ui);");
+        let area = concat!("egui::ScrollArea::", "vertical()");
+
+        let at_width = source.find(width).unwrap_or_else(|| {
+            panic!(
+                "the rail no longer sets the app's scroll bar width, so it is back to egui's \
+                 `ScrollStyle::floating()` default -- a 10pt bar in the text colour beside the \
+                 item list's 6pt one, which is the report this fixed"
+            )
+        });
+        let at_area = source
+            .find(area)
+            .expect("control: the rail has no scroll area at all, so this pin guards nothing");
+        assert!(
+            at_width < at_area,
+            "the width is set BELOW the scroll area, so it applies to the rail's contents and \
+             the rail's own bar keeps egui's default"
+        );
+        // Control on the ordering: both needles are really found in the rail,
+        // not somewhere else that happens to spell them. There is one scroll
+        // area in this file and one width call, and a second of either would
+        // make `find` answer about whichever came first.
+        assert_eq!(
+            source.matches(area).count(),
+            1,
+            "a second scroll area appeared in the rail; the assertion above is now about \
+             whichever one is written first, which may not be the one that scrolls"
+        );
+        assert_eq!(source.matches(width).count(), 1, "the width is set twice in the rail");
     }
 }

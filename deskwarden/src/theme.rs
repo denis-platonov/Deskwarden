@@ -3457,6 +3457,31 @@ pub fn hide_scrollbar(ui: &mut Ui) {
     scroll.interact_handle_opacity = 0.0;
 }
 
+/// [`SCROLLBAR_WIDTH`] for a bar that must allocate NO lane.
+///
+/// The width half of [`scrollbar_in_gutter`] without the placement half.
+/// That function reserves `gutter` points by narrowing the content, which
+/// suits a list whose padding can hold the bar; the sidebar rail cannot pay
+/// it -- every row inset, the glyph column and the lock countdown's x are
+/// pinned against the panel's current width, so a reserved lane would move
+/// all of them.
+///
+/// **Without this the rail gets egui's own default**, which is
+/// `ScrollStyle::floating()`: `bar_width: 10.0` and `foreground_color: true`.
+/// That is a 10pt bar in the text colour against the item list's 6pt one, on
+/// two panes a few hundred points apart -- reported as "make scroll same
+/// small as result have".
+///
+/// `floating_width` is raised to match for [`scrollbar_in_gutter`]'s reason:
+/// egui's default grows a floating bar from `floating_width` to `bar_width`
+/// under the pointer, and a bar that changed width on hover would be a
+/// second size rather than one.
+pub fn floating_scrollbar(ui: &mut Ui) {
+    let scroll = &mut ui.spacing_mut().scroll;
+    scroll.bar_width = SCROLLBAR_WIDTH;
+    scroll.floating_width = SCROLLBAR_WIDTH;
+}
+
 /// A muted field label ("User name", "Master password").
 pub fn field_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(TEXT_MUTED));
@@ -3956,6 +3981,49 @@ fn rule(ui: &mut Ui, color: Color32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **One scroll bar width in this app, and the rail was not using it.**
+    ///
+    /// The report: "make scroll same small as result have". egui's own
+    /// default `ScrollStyle` is `floating()`, whose `bar_width` is 10.0 and
+    /// whose handle takes the FOREGROUND colour -- so a pane that sets
+    /// nothing gets a 10pt bar in the text colour, beside an item list whose
+    /// `scrollbar_in_gutter` makes a 6pt one. Two sizes, a few hundred points
+    /// apart.
+    ///
+    /// The control is the assertion that egui's default really is wider. A
+    /// helper that happened to agree with the default would pass the two
+    /// assertions above it while fixing nothing, and would go on passing if
+    /// this crate's `SCROLLBAR_WIDTH` were ever changed to 10.
+    #[test]
+    fn the_floating_bar_is_the_same_width_as_every_other_bar_and_takes_no_lane() {
+        let ctx = egui::Context::default();
+        let mut default_width = None;
+        let mut set = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            default_width = Some(ui.spacing().scroll.bar_width);
+            floating_scrollbar(ui);
+            set = Some(ui.spacing().scroll.clone());
+        });
+        let set = set.expect("the ui ran");
+        assert_eq!(set.bar_width, SCROLLBAR_WIDTH);
+        // The hover width too: egui grows a floating bar from `floating_width`
+        // to `bar_width` under the pointer, and a bar that changed width on
+        // hover would be a second size rather than one.
+        assert_eq!(set.floating_width, SCROLLBAR_WIDTH);
+        // And no lane, which is the whole reason this is not
+        // `scrollbar_in_gutter`: the sidebar rail pins every row inset and the
+        // countdown's x against the panel width, so a reserved lane moves all
+        // of them.
+        assert_eq!(
+            set.floating_allocated_width, 0.0,
+            "`floating_scrollbar` reserved a lane, so the rail it is for narrows and every              row inset in it moves"
+        );
+        assert!(
+            default_width.expect("the ui ran") > SCROLLBAR_WIDTH,
+            "control: egui's default bar is already {SCROLLBAR_WIDTH}pt wide, so this helper              changes nothing and the two panes agreed all along"
+        );
+    }
 
     /// **Every field mark stays inside its own artboard**, ink included.
     ///
