@@ -2460,7 +2460,10 @@ mod tests {
             // 17480 bytes, new hash: the crate version moved 0.15.17-dev ->
             // 0.15.17 for the release, dropping the four-byte suffix. No
             // dependency changed.
-            (17480, 0x48f3_46b1_b352_fc0a_u64),
+            //
+            // 17484 bytes, new hash: and on to 0.15.18-dev the commit after,
+            // per `Cargo.toml`'s rule. No dependency changed.
+            (17484, 0x5cd3_3ab4_95dd_d565_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
