@@ -15,6 +15,28 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### A server that could not be reached no longer reads as one that refused
+
+When your vault server was briefly unavailable, Deskwarden said your
+change had been "refused" -- which reads as "there is something wrong with
+what you typed" rather than "try again in a minute". It now says the
+backend couldn't be reached, and keeps saying that nothing was written and
+your edits are still in the form.
+
+### Previous passwords are cut short like every other value
+
+A long entry in PREVIOUS PASSWORDS wrapped onto a second line underneath
+its own reveal button instead of ending in an ellipsis. Every value in the
+details panel is cut short now.
+
+### Smaller things
+
+* The sidebar's scroll bar is the same width as the item list's, instead
+  of the wider one it was getting by default.
+* A release carries the installer and nothing else. The bare
+  `Deskwarden.exe` beside it had no Start Menu entry, no autostart, no
+  uninstaller and no version the updater could move forward.
+
 ## 0.15.17 - 2026-09-06
 
 ### Locking the vault leaves Deskwarden in the tray
