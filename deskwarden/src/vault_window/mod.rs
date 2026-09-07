@@ -6300,7 +6300,10 @@ fn move_item_into_folder(
     }
 }
 
-/// The inline message a refused write shows, per failure.
+/// The inline message a failed write shows, per failure.
+///
+/// "Failed", not "refused": one of the four arms is a backend that could not
+/// be reached, which refused nothing. See [`VaultError::Unreachable`].
 ///
 /// Exhaustively matched with no catch-all: a new `VaultError` variant must be
 /// given its own wording rather than silently inheriting someone else's.
@@ -6314,6 +6317,13 @@ fn move_failure_message(name: &str, e: &VaultError) -> String {
     let because = match e {
         VaultError::Unauthorized => "the vault backend no longer accepts this session",
         VaultError::Http(_) => "the vault backend refused the write",
+        // **Not "refused".** A dead connection, a timeout and a 5xx are a
+        // server that did not answer for this item, not a server that looked
+        // at it and said no -- and telling a user their write was refused
+        // sends them looking for what is wrong with data that is fine. The
+        // classification is [`VaultError::from_status`]'s, made where the
+        // status was still a number; this arm only words it.
+        VaultError::Unreachable(_) => "the vault backend couldn't be reached",
         VaultError::Parse(_) => "the vault backend's answer couldn't be read",
         // A refusal, not a failure: nothing was sent, so nothing can be
         // retried. The wording says "this vault backend" because the whole
@@ -6376,11 +6386,14 @@ enum ListCommand {
 /// Restore and seeing the row unchanged is "did it half-work?", and the answer
 /// is always no.
 fn list_command_failure_message(command: ListCommand, name: &str, e: &VaultError) -> String {
-    // The same three, worded the same way as `move_failure_message`'s: one
+    // The same four, worded the same way as `move_failure_message`'s: one
     // vocabulary for "the backend said no" across this window, not two.
     let because = match e {
         VaultError::Unauthorized => "the vault backend no longer accepts this session",
         VaultError::Http(_) => "the vault backend refused the write",
+        // See `move_failure_message`'s arm: a server that could not be
+        // reached refused nothing.
+        VaultError::Unreachable(_) => "the vault backend couldn't be reached",
         VaultError::Parse(_) => "the vault backend's answer couldn't be read",
         // A refusal, not a failure: nothing was sent, so nothing can be
         // retried. The wording says "this vault backend" because the whole
@@ -6451,9 +6464,13 @@ enum ItemWrite {
     AppUnmatch,
 }
 
-/// What a refused detail-pane write shows in the inline band.
+/// What a failed detail-pane write shows in the inline band.
 ///
-/// Same three `because` clauses, worded the same way as
+/// "Failed", not "refused", for [`move_failure_message`]'s reason: a 5xx, a
+/// timeout and a dead connection are a backend that could not be reached, and
+/// this is the function the 503 report's sentence came out of.
+///
+/// Same four `because` clauses, worded the same way as
 /// [`list_command_failure_message`]'s and [`move_failure_message`]'s: one
 /// vocabulary for "the backend said no" across this window, not three. And
 /// like both of those, every sentence ends by naming the state the item or the
@@ -6463,6 +6480,12 @@ fn item_write_failure_message(write: ItemWrite, name: &str, e: &VaultError) -> S
     let because = match e {
         VaultError::Unauthorized => "the vault backend no longer accepts this session",
         VaultError::Http(_) => "the vault backend refused the write",
+        // **The arm the 503 report came in on.** Save reaches
+        // `RestBackend::update_item`, which syncs BEFORE it sends anything --
+        // so a 5xx there fails this write with no `PUT` ever made, and the
+        // old wording named a refusal of a request that was never issued.
+        // See `move_failure_message`'s arm and `VaultError::Unreachable`.
+        VaultError::Unreachable(_) => "the vault backend couldn't be reached",
         VaultError::Parse(_) => "the vault backend's answer couldn't be read",
         // A refusal, not a failure: nothing was sent, so nothing can be
         // retried. The wording says "this vault backend" because the whole
@@ -6547,6 +6570,10 @@ fn generate_failure(e: &VaultError) -> GenerateFailure {
     let because = match e {
         VaultError::Unauthorized => "the vault backend no longer accepts this session",
         VaultError::Http(_) => "the vault backend refused the request",
+        // "the request", not "the write", for this function's own reason:
+        // Generate writes nothing. The reachability half is the same one the
+        // three write messages draw -- see `move_failure_message`'s arm.
+        VaultError::Unreachable(_) => "the vault backend couldn't be reached",
         VaultError::Parse(_) => "the vault backend's answer couldn't be read",
         // A refusal, not a failure: nothing was sent, so nothing can be
         // retried. The wording says "this vault backend" because the whole
@@ -6557,7 +6584,13 @@ fn generate_failure(e: &VaultError) -> GenerateFailure {
         // The only variant that has something further to ask of the user: the
         // draft is intact but nothing will save until the session is renewed.
         VaultError::Unauthorized => " You'll need to sign in again before saving.",
-        VaultError::Http(_) | VaultError::Parse(_) | VaultError::Unsupported { .. } => "",
+        // An unreachable backend joins the silent three: the session is fine,
+        // so asking the user to sign in again would send them to re-enter a
+        // master password that would not have helped.
+        VaultError::Http(_)
+        | VaultError::Unreachable(_)
+        | VaultError::Parse(_)
+        | VaultError::Unsupported { .. } => "",
     };
     GenerateFailure {
         message: format!(
@@ -13188,7 +13221,8 @@ mod folder_drop_tests {
         // sentence has to answer the question the user actually has.
         let messages = [
             move_failure_message("Ledgerline", &VaultError::Unauthorized),
-            move_failure_message("Ledgerline", &VaultError::Http("500".into())),
+            move_failure_message("Ledgerline", &VaultError::Http("400".into())),
+            move_failure_message("Ledgerline", &VaultError::Unreachable("503".into())),
             move_failure_message("Ledgerline", &VaultError::Parse("bad json".into())),
         ];
         for message in &messages {
@@ -13201,8 +13235,38 @@ mod folder_drop_tests {
         let unique: std::collections::BTreeSet<&String> = messages.iter().collect();
         assert_eq!(unique.len(), messages.len(), "two failures share one wording: {messages:?}");
         // The developer-facing payload stays in the log, not in the band.
-        assert!(!messages[1].contains("500"));
-        assert!(!messages[2].contains("bad json"));
+        assert!(!messages[1].contains("400"));
+        assert!(!messages[2].contains("503"));
+        assert!(!messages[3].contains("bad json"));
+    }
+
+    /// **A server that could not be reached refused nothing.**
+    ///
+    /// The 503 report, at the wording. A user told their write was *refused*
+    /// concludes the server looked at their data and rejected it, and goes
+    /// looking for what is wrong with an item that is fine; the true sentence
+    /// is that their server could not be reached and the thing to do is try
+    /// again.
+    ///
+    /// Both arms, and the inequality between them, deliberately: a classifier
+    /// that answered "refused" for everything -- which is what this window did
+    /// before [`VaultError::from_status`] -- passes the refusal half alone,
+    /// and one that answered "couldn't be reached" for everything passes the
+    /// unreachable half alone. Only the pair, plus the `assert_ne!`, fails
+    /// both mutants.
+    #[test]
+    fn an_unreachable_backend_and_a_refusing_one_do_not_get_the_same_sentence() {
+        let said = |e: &VaultError| move_failure_message("Ledgerline", e);
+        let refused = said(&VaultError::Http("400 Bad Request".into()));
+        let unreachable = said(&VaultError::Unreachable("the server answered 503".into()));
+
+        assert!(refused.contains("refused the write"), "{refused}");
+        assert!(unreachable.contains("couldn't be reached"), "{unreachable}");
+        assert!(
+            !unreachable.contains("refused"),
+            "a server that never answered is still being called a refusal: {unreachable}"
+        );
+        assert_ne!(refused, unreachable, "the two failures share one sentence");
     }
 }
 
@@ -13234,6 +13298,7 @@ mod item_write_failure_tests {
             for e in [
                 VaultError::Unauthorized,
                 VaultError::Http("400 Bad Request".into()),
+                VaultError::Unreachable("the server answered 503".into()),
                 VaultError::Parse("expected value at line 1".into()),
             ] {
                 out.push(item_write_failure_message(write, "Ledgerline", &e));
@@ -13307,7 +13372,7 @@ mod item_write_failure_tests {
     }
 
     #[test]
-    fn no_two_of_the_twelve_share_a_wording() {
+    fn no_two_of_the_twenty_share_a_wording() {
         // The same property `move_failure_message` and
         // `list_command_failure_message` are held to, and for the same reason:
         // a band that reads identically for four different clicks cannot tell
@@ -13328,8 +13393,55 @@ mod item_write_failure_tests {
         // developer's, not a user's.
         for message in all() {
             assert!(!message.contains("400 Bad Request"), "{message}");
+            assert!(!message.contains("the server answered"), "{message}");
             assert!(!message.contains("expected value"), "{message}");
         }
+    }
+
+    /// **THE REPORTED SENTENCE.** A self-hosted server answered `503` for a
+    /// few seconds and Save said:
+    ///
+    /// > Couldn't save your changes to "Toshiba Laptop" -- the vault backend
+    /// > refused the write. Nothing has been written, and your edits are
+    /// > still in the form.
+    ///
+    /// Wrong twice. The server refused nothing; and it was not even the write
+    /// that failed -- `RestBackend::update_item` calls `synced()` before it
+    /// sends anything, so a 5xx there kills the operation with no `PUT` ever
+    /// made. The reassurance in the second sentence is true on both arms and
+    /// stays on both, which is why this asserts it here rather than leaving
+    /// it to `every_refusal_says_the_thing_the_user_cannot_see_is_unchanged`:
+    /// the tail is the half a user needs most from an outage they did not
+    /// cause.
+    ///
+    /// Both arms and the inequality, for the reason
+    /// `move_failure_tests`' own pair records: either mutant -- a classifier
+    /// stuck on "refused", a classifier stuck on "couldn't be reached" --
+    /// passes exactly one half of this test, and the `assert_ne!` is what
+    /// makes a classifier that collapses them fail even if some future
+    /// wording made both halves true at once.
+    #[test]
+    fn a_503_save_says_the_backend_could_not_be_reached_and_a_400_says_refused() {
+        let said =
+            |e: &VaultError| item_write_failure_message(ItemWrite::Save, "Toshiba Laptop", e);
+        let refused = said(&VaultError::Http("400 Bad Request".into()));
+        let unreachable = said(&VaultError::Unreachable("the server answered 503".into()));
+
+        assert_eq!(
+            refused,
+            "Couldn't save your changes to \"Toshiba Laptop\" -- the vault backend refused the \
+             write. Nothing has been written, and your edits are still in the form."
+        );
+        assert_eq!(
+            unreachable,
+            "Couldn't save your changes to \"Toshiba Laptop\" -- the vault backend couldn't be \
+             reached. Nothing has been written, and your edits are still in the form."
+        );
+        assert!(
+            !unreachable.contains("refused"),
+            "the reported sentence is back: {unreachable}"
+        );
+        assert_ne!(refused, unreachable, "one sentence for two different failures");
     }
 }
 
@@ -13347,11 +13459,14 @@ mod generate_failure_tests {
     /// Every variant, spelled out rather than iterated: `generate_failure`
     /// has no catch-all, so a new `VaultError` must be brought here
     /// deliberately.
-    fn all() -> [super::GenerateFailure; 3] {
+    fn all() -> [super::GenerateFailure; 4] {
         [
             generate_failure(&VaultError::Unauthorized),
-            generate_failure(&VaultError::Http("500 Internal Server Error".into())),
+            generate_failure(&VaultError::Http("400 Bad Request".into())),
             generate_failure(&VaultError::Parse("expected value at line 1".into())),
+            // Appended rather than inserted, so the index every assertion
+            // below already uses still names the failure it was written for.
+            generate_failure(&VaultError::Unreachable("the server answered 503".into())),
         ]
     }
 
@@ -13384,14 +13499,42 @@ mod generate_failure_tests {
     fn the_backend_s_own_error_payload_stays_in_the_log() {
         let failures = all();
         assert!(
-            !failures[1].message.contains("500"),
-            "{:?} puts a transport string in a user's sentence",
+            !failures[1].message.contains("400"),
+            "{:?} puts a status line in a user's sentence",
             failures[1].message
         );
         assert!(
             !failures[2].message.contains("line 1"),
             "{:?} puts a serde message in a user's sentence",
             failures[2].message
+        );
+        assert!(
+            !failures[3].message.contains("503"),
+            "{:?} puts a transport string in a user's sentence",
+            failures[3].message
+        );
+    }
+
+    /// Generate says "the request", not "the write" -- it writes nothing --
+    /// but it draws the same reachability line the three write messages do,
+    /// and for the same reason: a server that never answered refused nothing.
+    ///
+    /// The inequality is the control. A `generate_failure` that answered
+    /// "refused the request" for both, which is what it did before
+    /// [`VaultError::from_status`], passes the first assertion alone.
+    #[test]
+    fn an_unreachable_generate_is_not_worded_as_a_refusal() {
+        let failures = all();
+        assert!(failures[1].message.contains("refused the request"), "{:?}", failures[1].message);
+        assert!(
+            failures[3].message.contains("couldn't be reached"),
+            "{:?}",
+            failures[3].message
+        );
+        assert!(!failures[3].message.contains("refused"), "{:?}", failures[3].message);
+        assert_ne!(
+            failures[1].message, failures[3].message,
+            "a refusal and an unreachable server share one sentence"
         );
     }
 
@@ -13406,10 +13549,15 @@ mod generate_failure_tests {
              backend really has stopped accepting it, and the window's caller is what \
              recovers"
         );
-        assert!(!failures[1].needs_reauth, "a 500 is not an expired session");
+        assert!(!failures[1].needs_reauth, "a 400 is not an expired session");
         assert!(
             !failures[2].needs_reauth,
             "an unreadable answer is not an expired session"
+        );
+        assert!(
+            !failures[3].needs_reauth,
+            "a server that could not be reached is not an expired session -- a master password \
+             would not have helped, and the session is still good when the server comes back"
         );
     }
 
@@ -13423,6 +13571,7 @@ mod generate_failure_tests {
         );
         assert!(!failures[1].message.contains("sign in"));
         assert!(!failures[2].message.contains("sign in"));
+        assert!(!failures[3].message.contains("sign in"));
     }
 }
 
@@ -13450,10 +13599,11 @@ mod list_command_failure_message_tests {
         ListCommand::Delete,
     ];
 
-    fn every_error() -> [VaultError; 3] {
+    fn every_error() -> [VaultError; 4] {
         [
             VaultError::Unauthorized,
             VaultError::Http("400 Bad Request".into()),
+            VaultError::Unreachable("the server answered 503".into()),
             VaultError::Parse("expected value at line 1".into()),
         ]
     }
@@ -13528,13 +13678,31 @@ mod list_command_failure_message_tests {
 
     #[test]
     fn each_error_says_why_in_the_windows_one_vocabulary() {
-        // The same three reasons `move_failure_message` gives, worded
+        // The same four reasons `move_failure_message` gives, worded
         // identically: one vocabulary for "the backend said no" across this
         // window, not two that drift.
         for command in EVERY_COMMAND {
             let named = |e: &VaultError| list_command_failure_message(command, "L", e);
             assert!(named(&VaultError::Unauthorized).contains("no longer accepts this session"));
             assert!(named(&VaultError::Http("400".into())).contains("refused the write"));
+            // A 4xx is the server judging the request; a 5xx, a timeout or a
+            // dead connection is no judgement at all, and telling a user
+            // their write was refused sends them looking for what is wrong
+            // with data that is fine.
+            let unreachable = named(&VaultError::Unreachable("503".into()));
+            assert!(unreachable.contains("couldn't be reached"), "{unreachable}");
+            assert!(
+                !unreachable.contains("refused"),
+                "{command:?} still calls an unanswered request a refusal: {unreachable}"
+            );
+            // The control: without it, a classifier answering the same thing
+            // for both would satisfy the two `contains` above the moment the
+            // refusal wording happened to include either phrase.
+            assert_ne!(
+                named(&VaultError::Http("400".into())),
+                unreachable,
+                "{command:?} gives one sentence to two different failures"
+            );
             assert!(named(&VaultError::Parse("x".into())).contains("answer couldn't be read"));
         }
     }

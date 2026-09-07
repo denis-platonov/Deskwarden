@@ -1038,7 +1038,51 @@ pub fn without_app_match(item: &VaultItem) -> VaultItem {
 
 #[derive(Debug)]
 pub enum VaultError {
+    /// **The backend answered, and the answer was no.** A 4xx from a server
+    /// that is up and reading requests, or a failure this crate raises in the
+    /// backend's place (an id it will not put in a URL, a key that would not
+    /// unwrap) where retrying the same call unchanged achieves nothing.
+    ///
+    /// Every user-facing rendering of this variant words it as *refused*, and
+    /// that is what [`Self::Unreachable`] had to be split out of it for; see
+    /// that variant's doc for the report that forced the split.
     Http(String),
+    /// **Nothing said no -- there was nobody to say it.** The connection
+    /// failed, the request timed out, or the server answered `5xx`: it is
+    /// running but not serving, and what it did not serve may never have
+    /// reached the vault at all.
+    ///
+    /// Split out of [`Self::Http`] by the same argument that split
+    /// [`Self::Unauthorized`] out of it, except that the argument here is
+    /// about a *user's* sentence rather than a caller's control flow. A
+    /// self-hosted server that blinked `503` for a few seconds made the item
+    /// editor say "the vault backend refused the write", and a user who reads
+    /// that reasonably concludes the server looked at their data and rejected
+    /// it -- so they go hunting for what is wrong with an item that is
+    /// perfectly fine, when the true and actionable sentence is "your server
+    /// could not be reached just now; try again". `RestBackend::update_item`
+    /// makes the point sharper still: it calls `synced()` **before** it sends
+    /// anything, so a `503` from that sync fails the operation with no `PUT`
+    /// ever made. There was no write to refuse.
+    ///
+    /// **The classification happens where the status is still a number** --
+    /// [`Self::from_status`], [`map_http_err`], `bw serve`'s `get_totp`, and
+    /// `rest::backend`'s `rest_error` -- never where the message is written.
+    /// The alternative was weighed and rejected: keep one `Http(String)` and
+    /// let `vault_window`'s three message functions sniff the payload for
+    /// "503" or "could not be reached". That puts one rule in three places
+    /// that must agree, makes it depend on the exact English of `Display`
+    /// impls -- one of them `ureq`'s, which is free to reword in a patch
+    /// release -- and hands the same chore to every future caller that comes
+    /// to care. It is also the mistake [`Self::Unauthorized`]'s doc already
+    /// records in one line, three variants down: a plain `Http(String)` gives
+    /// callers no clean way to detect this without parsing the message.
+    ///
+    /// Carries the developer-facing sentence its refusing sibling would have
+    /// carried. Nothing user-facing interpolates it, for the reason
+    /// `vault_window::move_failure_message` records; it is what the log line
+    /// at the call site prints.
+    Unreachable(String),
     Parse(String),
     /// `bw serve` answered with `401 Unauthorized`: the session token it was
     /// started with (or handed per-request) is no longer valid. Distinct
@@ -1078,13 +1122,55 @@ pub enum VaultError {
     Unsupported { backend: &'static str, operation: &'static str, why: &'static str },
 }
 
+impl VaultError {
+    /// What a non-2xx HTTP **status** means: a refusal ([`Self::Http`]) or a
+    /// server that is not serving ([`Self::Unreachable`]).
+    ///
+    /// The whole rule lives in this one function so the call sites that hold
+    /// a status code -- [`map_http_err`] and `VaultBridge::get_totp` for
+    /// `bw serve`, `rest::backend`'s `rest_error` for the direct REST client
+    /// -- cannot drift into two rules that disagree about, say, `502`.
+    ///
+    /// **`5xx` is unreachable; everything else is a refusal.** A `5xx` is the
+    /// server failing to serve the request rather than judging it, and the
+    /// two ask opposite things of the user: "try again in a moment" against
+    /// "something about this item or this session has to be fixed first".
+    /// `401` never arrives here -- every caller maps it to
+    /// [`Self::Unauthorized`] before asking -- and a `3xx` cannot, because
+    /// both HTTP clients in this crate follow redirects themselves.
+    ///
+    /// A mock server's `501` for an unmatched route lands in `Unreachable`
+    /// too, and that is correct rather than merely tolerated: a route the
+    /// server does not implement is not a judgement on what was sent.
+    ///
+    /// `what` is the developer-facing sentence the caller had already built.
+    /// Nothing in here reads it -- the classification is the *number's*, and
+    /// making it the string's is exactly what this function exists to avoid.
+    pub fn from_status(status: u16, what: String) -> Self {
+        if status >= 500 {
+            Self::Unreachable(what)
+        } else {
+            Self::Http(what)
+        }
+    }
+}
+
 /// Turns a failed `ureq` call into a [`VaultError`], distinguishing a
-/// `401 Unauthorized` response (see `VaultError::Unauthorized`'s doc) from
-/// every other transport/status failure.
+/// `401 Unauthorized` response (see `VaultError::Unauthorized`'s doc) from a
+/// server that could not be reached (see [`VaultError::Unreachable`]'s) from
+/// every other status.
+///
+/// Matched on `&e` rather than on `e`: the transport arm and the status arm
+/// both want `e.to_string()`, which a by-value `ureq::Error::Status(code, _)`
+/// pattern would be free to have moved out from under.
 fn map_http_err(e: ureq::Error) -> VaultError {
-    match e {
+    match &e {
         ureq::Error::Status(401, _) => VaultError::Unauthorized,
-        e => VaultError::Http(e.to_string()),
+        ureq::Error::Status(status, _) => VaultError::from_status(*status, e.to_string()),
+        // No status at all: DNS, a refused connection, a TLS failure, or the
+        // agent's own timeout. `bw serve` dying while the window is open is
+        // the everyday shape of this one.
+        ureq::Error::Transport(_) => VaultError::Unreachable(e.to_string()),
     }
 }
 
@@ -2156,6 +2242,14 @@ impl VaultBridge {
     /// line was logged, and a failure-streak flag elsewhere reset as if the
     /// poll had actually succeeded, so a backend flapping between refused
     /// and 5xx could log a false "recovered".
+    ///
+    /// Which of the two error variants such a status becomes is
+    /// [`VaultError::from_status`]'s call, not this route's: a 5xx and a
+    /// transport failure are [`VaultError::Unreachable`], everything else is
+    /// [`VaultError::Http`]. Nothing about *this* function's behaviour turns
+    /// on it -- the poll site treats both as the same failure -- but the
+    /// window's band words them differently, and a `bw serve` that has fallen
+    /// over has refused nothing.
     pub fn get_totp(&self, id: &str) -> Result<Option<String>, VaultError> {
         let url = format!("{}/object/totp/{}", self.base_url, id);
         match self.read_agent.get(&url).call() {
@@ -2167,10 +2261,13 @@ impl VaultBridge {
             }
             Err(ureq::Error::Status(401, _)) => Err(VaultError::Unauthorized),
             Err(ureq::Error::Status(400, _)) => Ok(None),
-            Err(ureq::Error::Status(status, _)) => {
-                Err(VaultError::Http(format!("bw serve returned {status} fetching a TOTP code")))
-            }
-            Err(e) => Err(VaultError::Http(e.to_string())),
+            Err(ureq::Error::Status(status, _)) => Err(VaultError::from_status(
+                status,
+                format!("bw serve returned {status} fetching a TOTP code"),
+            )),
+            // Transport, so no status to classify by: `bw serve` was not
+            // there. See [`VaultError::Unreachable`].
+            Err(e) => Err(VaultError::Unreachable(e.to_string())),
         }
     }
 
@@ -3534,16 +3631,71 @@ mod tests {
     }
 
     #[test]
-    fn a_non_401_status_stays_a_plain_http_error() {
-        // Only 401 means "re-authenticate"; every other status (a 500, a
-        // 404, ...) must keep surfacing as the catch-all `Http` variant so
-        // callers don't mistake an unrelated server error for a stale
-        // session.
+    fn a_non_401_status_is_not_a_stale_session() {
+        // Only 401 means "re-authenticate"; every other status must surface
+        // as something else so callers don't mistake an unrelated server
+        // error for a stale session.
+        //
+        // **It used to say `Http` for both of these**, and the name of this
+        // test used to say "stays a plain http error". The 5xx half moved to
+        // `Unreachable` when `VaultError::from_status` split the two, because
+        // the window's band was telling a user whose server had blinked 503
+        // that their write had been refused. The 404 half is the control
+        // that the split did not simply rename `Http`.
         let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/list/object/items").with_status(500).create();
 
         let bridge = VaultBridge::new(server.url());
+        assert!(matches!(bridge.list_items(), Err(VaultError::Unreachable(_))));
+
+        let mut server = crate::test_http::server();
+        let _m = server.mock("GET", "/list/object/items").with_status(404).create();
+
+        let bridge = VaultBridge::new(server.url());
         assert!(matches!(bridge.list_items(), Err(VaultError::Http(_))));
+    }
+
+    /// **The one rule, at the one place that decides it.**
+    ///
+    /// `VaultError::from_status` is what keeps `vault_window`'s bands from
+    /// telling a user that a server which never answered "refused" their
+    /// write. Asserted directly, on the number, because that is the whole of
+    /// the decision -- and asserted in both directions, since a classifier
+    /// that answered `Unreachable` for everything would satisfy the half of
+    /// this that the 503 report was about while making a genuine 400 read as
+    /// a server outage.
+    #[test]
+    fn a_5xx_status_is_unreachable_and_a_4xx_is_a_refusal() {
+        for status in [500, 502, 503, 504] {
+            assert!(
+                matches!(VaultError::from_status(status, "x".into()), VaultError::Unreachable(_)),
+                "{status} is a server that is not serving, not a refusal"
+            );
+        }
+        for status in [400, 403, 404, 409, 429] {
+            assert!(
+                matches!(VaultError::from_status(status, "x".into()), VaultError::Http(_)),
+                "{status} is the server judging the request, and the band must say refused"
+            );
+        }
+    }
+
+    /// The other half of the same rule: a failure with **no status at all**.
+    ///
+    /// `map_http_err`'s transport arm is not reachable through
+    /// `test_http::server()` -- a mock server answers everything -- so this
+    /// drives a real request at a port nothing listens on. Without it, the
+    /// arm that covers the everyday shape of this (a `bw serve` that has
+    /// died, a dropped VPN) is pinned by nothing.
+    #[test]
+    fn a_backend_that_does_not_answer_at_all_is_unreachable() {
+        let bridge = VaultBridge::new(crate::test_vault::UNREACHABLE_URL);
+        let failed = bridge.list_items().expect_err("nothing listens on port 9");
+        assert!(
+            matches!(failed, VaultError::Unreachable(_)),
+            "a refused connection reached the window as {failed:?}, which the band words as a \
+             refusal of a request that was never answered"
+        );
     }
 
     #[test]
@@ -4547,7 +4699,11 @@ mod tests {
         let mut server = crate::test_http::server();
         let _m = server.mock("GET", "/object/totp/4").with_status(500).create();
         let bridge = VaultBridge::new(server.url());
-        assert!(matches!(bridge.get_totp("4"), Err(VaultError::Http(_))));
+        // `Unreachable` rather than `Http` since `VaultError::from_status`
+        // split the two: a struggling `bw serve` is not a refusal. What this
+        // test is about is unchanged -- it is still `Err`, and still not the
+        // `Ok(None)` that made a 5xx look like an item with no TOTP secret.
+        assert!(matches!(bridge.get_totp("4"), Err(VaultError::Unreachable(_))));
     }
 
     // --- Trash -------------------------------------------------------------
@@ -4805,11 +4961,14 @@ mod tests {
     }
 
     #[test]
-    fn a_non_401_failure_on_a_trash_call_stays_a_plain_http_error() {
+    fn a_non_401_failure_on_a_trash_call_is_still_an_error() {
+        // A 5xx here is `Unreachable`, not `Http`, since
+        // `VaultError::from_status` split the two; what this test pins is
+        // that a non-401 failure is not swallowed, which is unchanged.
         let mut server = crate::test_http::server();
         let _restore = server.mock("POST", "/restore/item/t1").with_status(500).create();
         let bridge = VaultBridge::new(server.url());
-        assert!(matches!(bridge.restore_item("t1"), Err(VaultError::Http(_))));
+        assert!(matches!(bridge.restore_item("t1"), Err(VaultError::Unreachable(_))));
     }
 
     #[test]
@@ -5279,7 +5438,7 @@ mod tests {
     }
 
     #[test]
-    fn a_non_401_generator_failure_stays_a_plain_http_error() {
+    fn a_non_401_generator_failure_is_still_an_error() {
         let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/generate")
@@ -5287,9 +5446,12 @@ mod tests {
             .with_status(500)
             .create();
         let bridge = VaultBridge::new(server.url());
+        // `Unreachable` since `VaultError::from_status` split a 5xx off the
+        // catch-all; the point of the test -- a non-401 failure reaches the
+        // caller as an error -- is what it always was.
         assert!(matches!(
             bridge.generate(&GenerateRequest::Password(PasswordRecipe::default())),
-            Err(VaultError::Http(_))
+            Err(VaultError::Unreachable(_))
         ));
     }
 

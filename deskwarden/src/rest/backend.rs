@@ -1024,11 +1024,25 @@ fn read_seed(stored: &Zeroizing<String>) -> Option<OtpAuth> {
 ///   [`VaultError::Unauthorized`] exists.
 /// * `Parse` becomes `Parse` -- the server answered, and the answer was not
 ///   the shape this client reads.
-/// * Everything else, transport and status and crypto alike, becomes `Http`,
-///   whose user-facing wording is "the backend refused". A crypto failure is
-///   not literally HTTP; it is put here rather than in `Parse` because "the
+/// * `Transport`, and any `Status` in the `5xx` range, becomes `Unreachable`
+///   -- the server did not serve the request rather than refusing it, so the
+///   user is told to try again instead of being sent to look for what is
+///   wrong with data that is fine. **This is the arm the 503 report was
+///   about**, and it is this backend's own shape that made the old wording
+///   worst here: [`RestBackend::update_item`] calls `synced()` before it
+///   sends anything, so a `503` out of that sync fails the write with no
+///   `PUT` ever made -- "the vault backend refused the write" named a request
+///   that did not exist. See [`VaultError::Unreachable`].
+/// * Everything else, `4xx` status and crypto alike, becomes `Http`, whose
+///   user-facing wording is "the backend refused". A crypto failure is not
+///   literally HTTP; it is put here rather than in `Parse` because "the
 ///   answer couldn't be read" would send a reader looking at JSON when the
-///   problem is a key.
+///   problem is a key, and it is a refusal rather than an unreachable server
+///   because a retry of the same call cannot fix it.
+///
+/// The `5xx`/`4xx` line itself is drawn in [`VaultError::from_status`] and
+/// not here, so this backend and the `bw serve` bridge cannot come to
+/// disagree about what a `502` means.
 ///
 /// **No arm carries a secret.** [`RestError`]'s own doc asserts that of every
 /// one of its variants, and this only formats them.
@@ -1036,6 +1050,10 @@ fn rest_error(e: RestError) -> VaultError {
     match e {
         RestError::Unauthorized => VaultError::Unauthorized,
         RestError::Parse(what) => VaultError::Parse(format!("the server's answer was missing {what}")),
+        // Neither arm binds anything out of `e`, so `e` is still whole for
+        // its own `Display` -- which is the sentence that reaches the log.
+        RestError::Transport(_) => VaultError::Unreachable(e.to_string()),
+        RestError::Status(code) => VaultError::from_status(code, e.to_string()),
         other => VaultError::Http(other.to_string()),
     }
 }
@@ -1992,6 +2010,50 @@ pub mod tests {
         never.assert();
     }
 
+    /// **The 503 report, end to end.**
+    ///
+    /// A self-hosted server answered `503` for a few seconds and the item
+    /// editor said "the vault backend refused the write", which is wrong
+    /// twice: the server refused nothing, and there was no write to refuse --
+    /// [`RestBackend::update_item`] calls `synced()` **before** it sends
+    /// anything, so the operation dies on the sync with no `PUT` ever issued.
+    /// Both halves are asserted here, at the only place that can see them
+    /// both: the variant that decides the band's sentence, and the `PUT` that
+    /// never happens.
+    ///
+    /// `signed_in_with_no_sync_route` rather than `logged_in`, so the failing
+    /// sync is the ONLY sync route declared -- which mockito mock answers an
+    /// overlapping pair is a property of the mocking library, and a test
+    /// whose 503 was quietly out-ranked by a healthy fixture would pass while
+    /// asserting nothing.
+    #[test]
+    fn a_sync_that_answers_503_is_unreachable_and_never_reaches_the_put() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_status(503)
+            .expect_at_least(1)
+            .create();
+        let never = server.mock("PUT", crate::test_http::Matcher::Any).expect(0).create();
+        // Deserialized rather than hand-built: every other field of
+        // `VaultItem` has a serde default, and none of them can matter to a
+        // write that dies before the body is mapped.
+        let item: VaultItem = serde_json::from_value(serde_json::json!({
+            "id": "live-1",
+            "name": "Toshiba Laptop",
+        }))
+        .expect("the two fields without a default");
+
+        let failed = backend.update_item(&item).expect_err("the sync answered 503");
+
+        assert!(
+            matches!(failed, VaultError::Unreachable(_)),
+            "a 503 reached the vault window as {failed:?}, whose band words it as a refusal of a \
+             write that was never sent"
+        );
+        never.assert();
+    }
+
     /// The name and the notes really are re-encrypted rather than sent in the
     /// clear. A test that only checked the round trip would pass on a body
     /// that wrote every secret as plaintext.
@@ -2287,6 +2349,46 @@ pub mod tests {
         let (_server, backend) = logged_in();
         let shared: std::sync::Arc<dyn VaultBackend> = std::sync::Arc::new(backend);
         assert_eq!(shared.list_items().expect("through the trait object").len(), 1);
+    }
+
+    /// **Which failures this backend calls a refusal, and which it calls an
+    /// unreachable server.**
+    ///
+    /// [`rest_error`] is the fan-in where every `RestError` becomes the type
+    /// the vault window words for a user, so it is where "the vault backend
+    /// refused the write" was being said about a server that had answered
+    /// `503` -- or had not answered at all. Both directions are asserted:
+    /// a classifier that called everything unreachable would fix the report
+    /// and make a genuine `400` (a stale revision token, a concurrent edit)
+    /// read as an outage, sending the user to check their network instead of
+    /// re-opening the item.
+    #[test]
+    fn a_server_that_did_not_serve_is_not_reported_as_one_that_refused() {
+        for unreachable in [
+            RestError::Transport("dns error".to_string()),
+            RestError::Status(500),
+            RestError::Status(503),
+        ] {
+            let mapped = rest_error(unreachable);
+            assert!(
+                matches!(mapped, VaultError::Unreachable(_)),
+                "a server that never served the request became {mapped:?}"
+            );
+        }
+        for refusal in [
+            RestError::Status(400),
+            RestError::Status(404),
+            RestError::Rejected {
+                error: "invalid_request".to_string(),
+                description: "the client copy of this cipher is out of date".to_string(),
+            },
+        ] {
+            let mapped = rest_error(refusal);
+            assert!(
+                matches!(mapped, VaultError::Http(_)),
+                "a refusal the user has to act on became {mapped:?}"
+            );
+        }
     }
 
     /// No error this backend produces may carry a secret.
