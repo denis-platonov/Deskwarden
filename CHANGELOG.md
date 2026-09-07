@@ -15,6 +15,8 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.17 - 2026-09-06
+
 ### Locking the vault leaves Deskwarden in the tray
 
 Locking -- the Lock button, the idle timer, or Windows reporting that you
