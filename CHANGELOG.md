@@ -45,6 +45,22 @@ the account: it carried the choice as a plain yes-or-no with no way to say
 with the wrong answer. It can say so now, and a window that never touched
 the setting leaves the account alone.
 
+### Saving an item works again, and so does starring one
+
+"Couldn't save your changes to ... -- the vault backend refused the write",
+with the server saying your copy was out of date. It was not: Deskwarden
+re-reads the item from the server immediately before every write, and was
+then quoting a version stamp from whenever the window happened to open
+rather than the one it had just fetched. It quotes the fresh one now.
+
+The previous release answered the same refusal on the star by not quoting
+a stamp at all. That was the wrong half of the fix -- the server wants
+one, it just has to be current -- and it is what made saving fail.
+
+A refused write now records which fields the request carried, by name, so
+this class of refusal does not have to be diagnosed from the message
+alone a third time.
+
 ### Masked values are cut short too
 
 The previous release cut long website addresses with an ellipsis before
