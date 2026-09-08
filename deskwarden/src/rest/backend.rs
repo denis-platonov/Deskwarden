@@ -27,11 +27,26 @@
 //!
 //! # What one call costs
 //!
-//! **Every operation here begins with `GET /api/sync` and a decryption of the
-//! whole vault.** On `bw serve` a `list_items` is one loopback request against
-//! a process that already holds the plaintext; here it is a WAN round trip
-//! carrying every cipher the account has, followed by an AES-CBC decrypt and
-//! an HMAC verification of every field of every one of them.
+//! **Every operation that reads a LIST begins with `GET /api/sync` and a
+//! decryption of the whole vault.** On `bw serve` a `list_items` is one
+//! loopback request against a process that already holds the plaintext; here
+//! it is a WAN round trip carrying every cipher the account has, followed by
+//! an AES-CBC decrypt and an HMAC verification of every field of every one of
+//! them.
+//!
+//! **The per-item operations no longer do.** `get_item` and `update_item` --
+//! and therefore `move_item_to_folder` and `set_app_match`, and every star the
+//! window toggles, which are all `update_item` with one field changed -- read
+//! `GET
+//! /api/ciphers/{id}`, one record. That sentence used to be "there is no
+//! per-item endpoint", which was false; see [`RestBackend::get_item`] for the
+//! correction and for what believing it cost. In rows on the owner's
+//! Cloudflare D1 server, measured with `wrangler d1 insights`: a sync is about
+//! **3,374** rows and the free tier's day is five million, so starring an item
+//! used to cost the same as loading the whole vault. Six methods still sync,
+//! and every one of them is a genuine whole-vault question -- `list_items`,
+//! `list_folders`, `list_vault`, `list_trash`, `list_archive`, and `get_totp`'s
+//! seed fallback.
 //!
 //! That is not hidden behind a cache in this file, deliberately.
 //! [`crate::vault_cache::VaultCache`] **is** the cache this app has, it is the
@@ -39,6 +54,14 @@
 //! how two caches come to disagree about a vault. The cost is stated instead,
 //! per operation, in each method's doc, so a caller choosing between two ways
 //! to ask the same question can see which one is cheaper.
+//!
+//! The **one** thing this file does hold on to is the account's unwrapped
+//! [`crate::rest::sync::VaultKeys`], and that is not the cache the paragraph
+//! above refuses: no item, no folder and no plaintext is kept, and a key is
+//! not a thing that changes on every write the way a vault is. It is there
+//! because a single-cipher response carries no `profile` and so has nothing to
+//! unwrap a key from. [`RestBackend::keys`] argues the invalidation case by
+//! case.
 //!
 //! The call sites worth knowing about, because they are the ones that were
 //! free before:
@@ -55,8 +78,9 @@
 //!   before the probe is spawned. It was the largest of the three costs, and
 //!   the only one nothing logged.
 //! * `VaultCache`'s restore/unarchive path reads the item back with
-//!   `get_item` to refresh its `revisionDate` -- one full sync per gesture.
-//!   Still true, and still the price of a gesture rather than of a window.
+//!   `get_item` to refresh its `revisionDate` -- **one full sync per gesture,
+//!   and no longer.** It is one `GET /api/ciphers/{id}` now, which is what
+//!   that line always should have described.
 //!
 //! Together those two changes are the difference between three full syncs and
 //! one on a cold vault window; on the owner's 1,668-item account that was
@@ -111,7 +135,7 @@
 //! success. Both sides of it are argued in
 //! [`crate::rest::api::RestClient::delete_folder`].
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use zeroize::Zeroizing;
 
@@ -160,6 +184,69 @@ pub struct RestBackend {
     /// refreshing one session concurrently is how a refresh token gets spent
     /// twice.
     state: Mutex<Authenticated>,
+    /// The vault keys the last `GET /api/sync` produced, so that reading
+    /// **one** record need not fetch the whole vault to learn them.
+    ///
+    /// # This is not the cache the module docs refuse
+    ///
+    /// The paragraph above says a second cache under
+    /// [`crate::vault_cache::VaultCache`] is how two caches come to disagree
+    /// about a vault, and that stands: **no item, no folder and no plaintext
+    /// is held here.** What is held is the answer to
+    /// `VaultKeys::unwrap_from(master_key, profile)`, which is a pure function
+    /// of two things -- the master key this object owns, and the account's
+    /// wrapped keys. Two caches can disagree about a vault because a vault
+    /// changes on every write; a key does not change at all except by the
+    /// events enumerated below, and every one of them is arranged to be
+    /// unable to leave a stale value here.
+    ///
+    /// # Why it is safe, event by event
+    ///
+    /// * **A re-login, and an account switch.** The master key is a field of
+    ///   [`Authenticated`], `Authenticated` is only ever built by a login in
+    ///   [`crate::rest::api`], and nothing in this file writes
+    ///   `state.master_key` -- so a different master key is a different
+    ///   `Authenticated`, which is a different `RestBackend`, which is a
+    ///   different `Mutex` holding `None`. The cache cannot outlive the
+    ///   session it was taken under because it is *inside* the object that
+    ///   holds that session. There is no static, no global and no keying by
+    ///   account id to get wrong.
+    /// * **A master-password change.** Bitwarden re-wraps the *same* user key
+    ///   under the new master key; the user key itself is untouched, so this
+    ///   cache is still correct. The old master key stops opening
+    ///   `profile.key`, so the uncached path would in fact fail where this one
+    ///   succeeds -- but the security stamp moves too, so the session dies and
+    ///   the next request is a `401` either way.
+    /// * **An account key rotation** -- the one event that really does change
+    ///   the user key. It rotates the security stamp, which invalidates the
+    ///   access token *and* the refresh token, so the very next request this
+    ///   backend makes is [`RestError::Unauthorized`] and the app signs in
+    ///   again into a fresh `RestBackend`. A stale key here never reaches a
+    ///   decrypt, let alone a write.
+    /// * **An organisation joined since the last sync**, which is the case
+    ///   that is *not* covered by any of the above: the user key is unchanged
+    ///   and the session is perfectly valid, but the cached [`VaultKeys`] has
+    ///   no entry for the new organisation, so a cipher belonging to it does
+    ///   not decrypt at all.
+    ///
+    /// The last one is why the cache is not merely trusted.
+    /// [`RestBackend::one_record`] re-derives the keys from a fresh sync and
+    /// decrypts again whenever a **cached** key fails to open the record
+    /// cleanly, which covers that case and would also cover a rotation on a
+    /// hypothetical server that did not invalidate the session. The cost of
+    /// that retry is one sync -- exactly what the old code paid
+    /// unconditionally -- so the self-healing path can never be worse than
+    /// what it replaces, and the healthy path pays nothing.
+    ///
+    /// **An `Arc` and a second `Mutex`, rather than a field of the state.**
+    /// The two locks are never held at once: `remembered_keys` clones the
+    /// `Arc` and releases, and `remember_keys` stores and releases. There is
+    /// therefore no lock order to get wrong, and no network call happens with
+    /// this lock held. Putting the keys inside `state` was the alternative and
+    /// was rejected: `write_through`'s closure takes `&mut Authenticated`, so
+    /// the state guard is already borrowed mutably across the send, and a
+    /// reader wanting only the keys would have queued behind every write.
+    keys: Mutex<Option<Arc<VaultKeys>>>,
 }
 
 /// Hand-written, and it must be: [`Authenticated`] hand-writes its own for
@@ -183,7 +270,10 @@ impl RestBackend {
     /// not operations on this trait.
     #[must_use]
     pub fn new(client: RestClient, authenticated: Authenticated) -> Self {
-        Self { client, state: Mutex::new(authenticated) }
+        // `None`, and it must be: a constructor that pre-warmed the key cache
+        // would be a constructor that fetches, which is exactly what
+        // `signed_in_with_no_sync_route`'s doc relies on not happening.
+        Self { client, state: Mutex::new(authenticated), keys: Mutex::new(None) }
     }
 
     // ---- the two things every method starts with ---------------------------
@@ -200,24 +290,8 @@ impl RestBackend {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// **One `GET /api/sync`, decrypted**: every item, every folder, and the
-    /// keys the write path needs to put anything back.
-    ///
-    /// The keys are unwrapped a second time here, beside
-    /// [`decrypt_vault`]'s own unwrap. That is one AES-CBC decrypt and one
-    /// HMAC over sixty-four bytes -- next to nothing against the sync that
-    /// just happened -- and it buys keeping [`decrypt_vault`]'s signature as
-    /// it is rather than widening the read path's return type for the sake of
-    /// the write path.
-    ///
-    /// Decryption failures are logged, not returned. A vault with one corrupt
-    /// field is still a vault, which is [`crate::rest::sync`]'s own decision;
-    /// what this adds is that the fact reaches a log line instead of being
-    /// dropped on the floor. The log carries **counts and field names only**
-    /// -- [`crate::rest::sync::DecryptFailure`] holds nothing else by
-    /// construction.
-    /// **The keys alone**, from the same `GET /api/sync` and without
-    /// decrypting a single cipher.
+    /// **The keys alone**, from a `GET /api/sync` and without decrypting a
+    /// single cipher.
     ///
     /// [`VaultKeys::unwrap_from`] needs `response.profile` and nothing else,
     /// so the three write paths that want a key and no items -- a folder
@@ -227,9 +301,14 @@ impl RestBackend {
     /// what this saves is the CPU and the plaintexts that were briefly built
     /// for nobody.
     ///
-    /// [`Self::synced`] is still what an *edit* needs: it wants the item's
-    /// decryption record as well as the keys.
-    fn keys_only(&self) -> Result<VaultKeys, VaultError> {
+    /// [`Self::synced`] is still what a *vault load* needs; an **edit** wants
+    /// neither, and goes through [`Self::one_record`].
+    ///
+    /// Every sync that unwraps a key stores it in [`Self::keys`] on the way
+    /// past, which is what makes the one-record path free after a vault has
+    /// been listed once. See that field for why a stored key cannot go stale
+    /// unnoticed.
+    fn keys_only(&self) -> Result<Arc<VaultKeys>, VaultError> {
         let mut state = self.locked();
         let response = self.client.sync_refreshing(&mut state.session).map_err(rest_error)?;
         let profile = response
@@ -244,10 +323,28 @@ impl RestBackend {
                 failures.len()
             );
         }
-        Ok(keys)
+        // The state guard is dropped before the second lock is taken. The two
+        // are never held together anywhere in this file; see `Self::keys`.
+        drop(state);
+        Ok(self.remember_keys(keys))
     }
 
-    fn synced(&self) -> Result<(DecryptedVault, VaultKeys), VaultError> {
+    /// **One `GET /api/sync`, decrypted**: every item, every folder, and the
+    /// keys the write path needs to put anything back.
+    ///
+    /// The keys are unwrapped a second time here, beside [`decrypt_vault`]'s
+    /// own unwrap. That is one AES-CBC decrypt and one HMAC over sixty-four
+    /// bytes -- next to nothing against the sync that just happened -- and it
+    /// buys keeping [`decrypt_vault`]'s signature as it is rather than
+    /// widening the read path's return type for the sake of the write path.
+    ///
+    /// Decryption failures are logged, not returned. A vault with one corrupt
+    /// field is still a vault, which is [`crate::rest::sync`]'s own decision;
+    /// what this adds is that the fact reaches a log line instead of being
+    /// dropped on the floor. The log carries **counts and field names only**
+    /// -- [`crate::rest::sync::DecryptFailure`] holds nothing else by
+    /// construction.
+    fn synced(&self) -> Result<(DecryptedVault, Arc<VaultKeys>), VaultError> {
         let mut state = self.locked();
         let response = self.client.sync_refreshing(&mut state.session).map_err(rest_error)?;
         let vault = decrypt_vault(&response, &state.master_key).map_err(crypto_error)?;
@@ -264,7 +361,107 @@ impl RestBackend {
                 vault.failures
             );
         }
-        Ok((vault, keys))
+        drop(state);
+        Ok((vault, self.remember_keys(keys)))
+    }
+
+    /// Stores `keys` as the account's current ones and hands back the shared
+    /// handle the caller should go on to use.
+    ///
+    /// It returns what it stored rather than being a `set` followed by a `get`
+    /// so that there is no window in which another thread's store could make
+    /// a caller use keys it did not derive.
+    fn remember_keys(&self, keys: VaultKeys) -> Arc<VaultKeys> {
+        let keys = Arc::new(keys);
+        let mut slot = self.keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(Arc::clone(&keys));
+        keys
+    }
+
+    /// The keys a previous sync left behind, if there was one.
+    fn remembered_keys(&self) -> Option<Arc<VaultKeys>> {
+        self.keys.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// **One `GET /api/ciphers/{id}`, decrypted, and no sync at all once a
+    /// vault has been listed** -- the read behind [`VaultBackend::get_item`]
+    /// and behind every edit.
+    ///
+    /// # The record, and why it is the same record a sync produces
+    ///
+    /// [`decrypt_cipher`] is the mapper, which is [`decrypt_vault`]'s own
+    /// `map_cipher` reached by its other door. So the [`DecryptedItem`] this
+    /// returns carries the identical `retained` account of which in-place
+    /// values are still the server's ciphertext -- the thing
+    /// [`Self::write_through`] lays the modelled fields *over*. A second
+    /// mapper here would be how an unmodelled field comes to be rewritten;
+    /// there is no second mapper.
+    ///
+    /// It is also **fresher** than the sync it replaces for the one field
+    /// that has to be: `revisionDate` comes off this record, and this record
+    /// is the server's copy of exactly the cipher about to be written.
+    ///
+    /// # The keys, and the one retry
+    ///
+    /// A single-cipher response carries no `profile`, so there is nothing in
+    /// it to unwrap a key from; the keys come from [`Self::keys`] -- see that
+    /// field for the whole argument that a stored one cannot be stale.
+    ///
+    /// The one case that argument does not close by construction is an
+    /// organisation joined since the last sync: the session is valid, the user
+    /// key is right, and the cached [`VaultKeys`] simply has no entry for the
+    /// new organisation, so its ciphers do not decrypt. That is what the retry
+    /// below is for. **It fires only when the keys that failed were cached**
+    /// -- keys just derived from a sync are as fresh as anything can be, and
+    /// retrying them would be an infinite appetite for syncs over a genuinely
+    /// corrupt field.
+    ///
+    /// A retry costs one sync, which is precisely what this whole path used to
+    /// cost every time, so the unhappy case is no worse than the code it
+    /// replaces and the happy case is free.
+    fn one_record(&self, id: &str) -> Result<(DecryptedItem, Arc<VaultKeys>), VaultError> {
+        let raw = {
+            let mut state = self.locked();
+            self.client.fetch_cipher(&mut state.session, id).map_err(|e| match e {
+                // The one status worth translating. A server that has no such
+                // cipher and `Self::find` failing to see one in a sync are the
+                // same fact about the same vault, so they say the same
+                // sentence -- and it is the sentence that names the id, which
+                // "the server answered 404" does not.
+                RestError::Status(404) => no_such_item(id),
+                other => rest_error(other),
+            })?
+        };
+
+        let warm = self.remembered_keys();
+        let cached = warm.is_some();
+        let keys = match warm {
+            Some(keys) => keys,
+            None => self.keys_only()?,
+        };
+
+        match decrypt_cipher(&raw, &keys) {
+            Some((record, failures)) if failures.is_empty() => return Ok((record, keys)),
+            // Freshly-derived keys: whatever went wrong is not staleness, and
+            // this is the same "a vault with one corrupt field is still a
+            // vault" tolerance `synced` applies.
+            Some((record, failures)) if !cached => {
+                log_record_failures(id, &failures);
+                return Ok((record, keys));
+            }
+            None if !cached => return Err(unreadable_record(id)),
+            _ => {}
+        }
+
+        log::info!(
+            "the cached vault keys did not open item {id} cleanly, so they are being re-derived \
+             from a fresh sync; an organisation joined since the last one reads exactly like this"
+        );
+        let fresh = self.keys_only()?;
+        let (record, failures) =
+            decrypt_cipher(&raw, &fresh).ok_or_else(|| unreadable_record(id))?;
+        log_record_failures(id, &failures);
+        Ok((record, fresh))
     }
 
     /// Encrypts `item` under this vault's keys, carrying `record`'s account of
@@ -290,10 +487,21 @@ impl RestBackend {
         // **The concurrency token comes from the sync this write just did,
         // not from the caller's copy.**
         //
-        // Every caller of this function has already synced -- `update_item`,
-        // `set_favorite`, `move_item_to_folder` all go through `synced()` one
-        // statement earlier -- so `record` is milliseconds old and the item in
-        // the caller's hand can be a whole window session old. `revisionDate`
+        // Every caller of this function has already read the server's own copy
+        // one statement earlier -- `update_item`, and therefore
+        // `move_item_to_folder`, `set_app_match` and every star the window
+        // toggles, through `one_record`'s `GET /api/ciphers/{id}`;
+        // `create_item` from a record
+        // it composed itself -- so `record` is milliseconds old and the item in
+        // the caller's hand can be a whole window session old.
+        //
+        // **That read used to be a whole `/api/sync`, and this comment is the
+        // reason the cheap one had to answer with the cipher rather than just
+        // its id.** A per-id `GET` returns the record complete with its current
+        // `revisionDate`, so the token below is the same value the sync carried
+        // and is read one round trip closer to the `PUT`.
+        //
+        // `revisionDate`
         // is the field where that difference is fatal: a server reads it as
         // "the version you think you are editing", and a superseded one is
         // refused with "The client copy of this cipher is out of date. Resync
@@ -373,12 +581,7 @@ impl RestBackend {
     /// the operation *is* supported, the server simply has no such record --
     /// which on `bw serve` arrives as a 404 through the same variant.
     fn find<'v>(vault: &'v DecryptedVault, id: &str) -> Result<&'v DecryptedItem, VaultError> {
-        vault.items.iter().find(|d| d.item.id == id).ok_or_else(|| {
-            // The id is a server-assigned GUID and appears in URLs, so it is
-            // not a secret; it is also the only thing that makes this message
-            // actionable.
-            VaultError::Http(format!("this vault holds no item with the id {id}"))
-        })
+        vault.items.iter().find(|d| d.item.id == id).ok_or_else(|| no_such_item(id))
     }
 }
 
@@ -392,20 +595,36 @@ impl VaultBackend for RestBackend {
         Ok(Self::live(&vault))
     }
 
-    /// **Cost: one full sync**, for one item.
+    /// **Cost: one `GET /api/ciphers/{id}`. No sync**, once any vault load has
+    /// happened.
     ///
-    /// This is the operation whose cost differs most from `bw serve`'s, where
-    /// it is a `GET /object/item/{id}` that exists precisely so the fill path
-    /// need not pull the whole vault. There is no per-item endpoint on the
-    /// sync payload, so pulling the whole vault is what asking for one item
-    /// *is* here. `app::fill_from_vault` reaches this only on a cache miss.
+    /// # This was one full sync, and the measurement is why it is not
     ///
-    /// Searches trashed and archived items too, as `GET /object/item/{id}`
-    /// does: an id the caller holds is an id it may legitimately ask about
-    /// whichever list the item is currently in.
+    /// This doc used to say there is no per-item endpoint on the Bitwarden
+    /// API and that pulling the whole vault is what asking for one item *is*
+    /// here. **That was simply wrong**, and it is corrected rather than
+    /// quietly deleted because it is what justified the cost. `GET
+    /// /api/ciphers/{id}` is the same URL [`crate::rest::api`] already `PUT`s
+    /// an edit to; only the verb was missing.
+    ///
+    /// What the mistake cost is on the record. On the owner's self-hosted
+    /// server -- Cloudflare D1, which caps **rows read** -- `wrangler d1
+    /// insights` put one `/api/sync` at about 3,374 rows, and the day it hit
+    /// the five-million-row limit the server began answering `500 Database not
+    /// initialized` to everything. Reading one line per click is the rule;
+    /// this method now obeys it.
+    ///
+    /// So it is `bw serve`'s `GET /object/item/{id}` after all, and the two
+    /// backends' costs no longer differ here. `app::fill_from_vault` reaches
+    /// this only on a cache miss, and that miss is now one row.
+    ///
+    /// Trashed and archived items answer too, as `GET /object/item/{id}` does
+    /// and as the old sync-and-filter did: the route is by id and knows
+    /// nothing of the three lists, so an id the caller holds is an id it may
+    /// legitimately ask about whichever list the item is currently in.
     fn get_item(&self, id: &str) -> Result<VaultItem, VaultError> {
-        let (vault, _) = self.synced()?;
-        Ok(Self::find(&vault, id)?.item.clone())
+        let (record, _) = self.one_record(id)?;
+        Ok(record.item)
     }
 
     /// **Cost: one full sync.** The folder names ride the same payload as the
@@ -580,29 +799,56 @@ impl VaultBackend for RestBackend {
         })
     }
 
-    /// **Cost: one full sync, then one `PUT /api/ciphers/{id}`.**
+    /// **Cost: one `GET /api/ciphers/{id}`, then one `PUT` to the same URL. No
+    /// sync**, once any vault load has happened.
     ///
-    /// The sync is not optional and it is not a cache miss: it supplies the
-    /// keys *and* the item's decryption record, which the trait's signature
+    /// # This was the expensive one, and it was the commonest
+    ///
+    /// It began with a full `/api/sync`, and so did every gesture that goes
+    /// through it: [`Self::move_item_to_folder`], [`Self::set_app_match`] and
+    /// the window's star are all this method with one field changed. On
+    /// the owner's Cloudflare D1 server that made **starring an item** cost
+    /// about 3,374 rows read, and a day of ordinary editing is what took that
+    /// account past the five-million-row cap into `500 Database not
+    /// initialized`.
+    ///
+    /// The read is still not optional and is still not a cache miss -- it
+    /// supplies the item's decryption record, which the trait's signature
     /// cannot carry (see [`DecryptedItem::carrying`]). An edit sent without
     /// the record would either bury a field that never decrypted or, worse in
     /// the other direction, write one in the clear -- the failure
-    /// [`crate::rest::write`]'s module docs are mostly about.
+    /// [`crate::rest::write`]'s module docs are mostly about. What changed is
+    /// that the record is fetched **by id** instead of being filtered out of
+    /// the whole account, through [`Self::one_record`], which also carries the
+    /// answer to where the keys come from when the response has no `profile`.
+    ///
+    /// # The concurrency token is strictly better, not merely preserved
+    ///
+    /// [`Self::write_through`] lays the freshly-read `revisionDate` over the
+    /// caller's item, and that is what stops the server refusing the write
+    /// with "The client copy of this cipher is out of date." A single-cipher
+    /// `GET` answers with *this* cipher's current `revisionDate`, which is the
+    /// same value the sync carried for it and is read closer to the `PUT` --
+    /// so the token is at least as fresh as before and 3,374 rows cheaper.
+    /// `a_write_quotes_the_revision_date_of_the_read_and_not_the_callers_stale_one`
+    /// is the pin.
     ///
     /// **An id this vault does not hold is refused rather than created.**
     /// `PUT` on Bitwarden is not an upsert, and a create dressed as an edit
     /// would be an item with no `revisionDate` history and a caller that
-    /// believes it edited something.
+    /// believes it edited something. The refusal now comes from the server's
+    /// own `404` on the `GET` rather than from a miss in a downloaded vault,
+    /// which is the same answer arrived at one round trip earlier -- and it
+    /// still happens **before** anything is sent.
     ///
     /// Returns the server's copy, for the reason
     /// [`crate::vault_bridge::VaultBridge::update_item`] gives at length: the
     /// `revisionDate` in the caller's hand is stale from the moment the write
     /// lands, and the next edit of the item is refused if it is kept.
     fn update_item(&self, item: &VaultItem) -> Result<VaultItem, VaultError> {
-        let (vault, keys) = self.synced()?;
-        let record = Self::find(&vault, &item.id)?;
+        let (record, keys) = self.one_record(&item.id)?;
         let id = item.id.clone();
-        self.write_through(record, item.clone(), &keys, move |client, state, cipher| {
+        self.write_through(&record, item.clone(), &keys, move |client, state, cipher| {
             client.update_cipher(&mut state.session, &id, cipher)
         })
     }
@@ -793,11 +1039,24 @@ impl VaultBackend for RestBackend {
     /// for a seed [`read_seed`] will not read, which on this backend answers
     /// `Ok(None)` **once** and stops the polling.
     ///
-    /// The sync stays. This is still the answer for `app::fill_from_vault`'s
-    /// on-demand fill, which asks for one code once, and cheapening it by
-    /// caching what `synced()` returns would be exactly the change
-    /// [`Self::update_item`] must not have: a write quotes the `revisionDate`
-    /// of the sync it just made, and a stale one is refused by the server.
+    /// **The sync stays, and it is now the only per-id read in this file that
+    /// is still a whole vault.** That is a deliberate line rather than an
+    /// omission. What this method wants is the item's *seed*, which
+    /// [`Self::one_record`] would answer for one row -- but the seed is
+    /// plaintext the caller is about to compute a code from, and the fallback
+    /// exists precisely for items whose seed the snapshot could not supply. It
+    /// is reached once per item, answers `Ok(None)` for the malformed case and
+    /// stops the polling, so the cost is bounded by a user's clicks in a way
+    /// an edit's was not.
+    ///
+    /// The paragraph this replaces said that cheapening it "by caching what
+    /// `synced()` returns" would be the change [`Self::update_item`] must not
+    /// have, because a write quotes the `revisionDate` of the sync it just
+    /// made. That reasoning was about caching the *vault*, and it still holds
+    /// -- but the keys are not the vault. [`Self::keys`] caches only the
+    /// unwrapped keys, and the record an edit quotes is fetched fresh by id
+    /// every time, which is why `update_item` could be made cheap without
+    /// touching the property that comment was protecting.
     fn get_totp(&self, id: &str) -> Result<Option<String>, VaultError> {
         let (vault, _) = self.synced()?;
         let item = Self::find(&vault, id)?;
@@ -1046,6 +1305,49 @@ fn rest_error(e: RestError) -> VaultError {
     }
 }
 
+/// "There is no such item here", said once so that the two places that can
+/// discover it say the same thing.
+///
+/// The two are [`RestBackend::find`], which looks for an id in a sync it
+/// already has, and [`RestBackend::one_record`], which asks the server for one
+/// and is answered `404`. They are the same fact about the same vault, and a
+/// caller that matched on the sentence -- or a user reading it -- should not
+/// be able to tell which route the question took.
+///
+/// [`VaultError::Http`] and not [`VaultError::Unsupported`]: the operation
+/// *is* supported, the server simply has no such record.
+///
+/// The id is a server-assigned GUID and appears in URLs, so it is not a
+/// secret; it is also the only thing that makes this message actionable.
+fn no_such_item(id: &str) -> VaultError {
+    VaultError::Http(format!("this vault holds no item with the id {id}"))
+}
+
+/// The refusal for a cipher the server returned and this crate could not make
+/// an item out of at all -- not a JSON object, or carrying no `id`.
+///
+/// [`VaultError::Parse`] rather than [`no_such_item`], and the difference
+/// matters: the server *has* this record and answered about it, so telling the
+/// caller it does not exist would send it looking in the wrong place.
+fn unreadable_record(id: &str) -> VaultError {
+    VaultError::Parse(format!("the server's copy of the item {id}: it is not a cipher record"))
+}
+
+/// The one-record path's half of the rule [`RestBackend::synced`] follows for
+/// a whole vault: a field that did not decrypt is **logged**, not fatal.
+///
+/// Counts and field names only, which is all a
+/// [`crate::rest::sync::DecryptFailure`] can hold by construction.
+fn log_record_failures(id: &str, failures: &[crate::rest::sync::DecryptFailure]) {
+    if !failures.is_empty() {
+        log::warn!(
+            "{} field(s) of item {id} could not be decrypted and are missing from the record \
+             this read produced: {failures:?}",
+            failures.len()
+        );
+    }
+}
+
 /// A [`CryptoError`] as a [`VaultError`]. See [`rest_error`] on why `Http`.
 ///
 /// [`CryptoError`]'s own rule is that it never carries a plaintext, a
@@ -1200,6 +1502,103 @@ pub mod tests {
         .to_string()
     }
 
+    /// The organisation key OpenSSL's fixture ciphertext actually contains --
+    /// the 64 bytes `00 01 .. 3f`.
+    ///
+    /// Not transcribed here as a value: it is the plaintext of
+    /// [`crate::rest::crypto::tests::ORG_KEY_WRAPPED_OAEP_SHA1`], which
+    /// `rest::sync` asserts against, so this function and that constant have
+    /// to agree or the RSA unwrap in
+    /// `an_organisation_joined_since_the_last_sync_re_derives_the_keys_rather_than_failing`
+    /// produces something else and the cipher below does not decrypt.
+    fn org_key() -> SymmetricKey {
+        let mut bytes = [0u8; 64];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = u8::try_from(i).expect("under 64");
+        }
+        key_from_64(&bytes)
+    }
+
+    /// [`sync_body`]'s account after it has joined one organisation.
+    ///
+    /// The same `profile.key` -- the user key does not change when a user
+    /// joins an organisation, which is exactly why the cached [`VaultKeys`]
+    /// stays *plausible* while being wrong. What is added is the RSA private
+    /// key and the wrapped organisation key, both OpenSSL's.
+    fn sync_body_with_the_organisation() -> String {
+        let user = user_key();
+        serde_json::json!({
+            "object": "sync",
+            "profile": {
+                "key": protected_user_key(),
+                "privateKey": seal(
+                    &user,
+                    &crate::rest::crypto::tests::hex(
+                        crate::rest::crypto::tests::ORG_KEY_PRIVATE_PKCS8_DER
+                    )
+                ),
+                "organizations": [{
+                    "id": "org1",
+                    "key": format!(
+                        "4.{}",
+                        crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::hex(
+                            crate::rest::crypto::tests::ORG_KEY_WRAPPED_OAEP_SHA1
+                        ))
+                    )
+                }]
+            },
+            "folders": [],
+            "ciphers": []
+        })
+        .to_string()
+    }
+
+    /// The organisation's cipher, as `GET /api/ciphers/org-1` answers it:
+    /// every field under [`org_key`] and **not** under the user key, so a
+    /// cached key set that has never heard of `org1` cannot open any of it.
+    fn organisation_cipher() -> String {
+        let key = org_key();
+        serde_json::json!({
+            "object": "cipherDetails",
+            "id": "org-1",
+            "type": 1,
+            "organizationId": "org1",
+            "key": null,
+            "creationDate": "2024-01-01T00:00:00.000000Z",
+            "revisionDate": "2024-01-01T00:00:00.000000Z",
+            "deletedDate": null,
+            "archivedDate": null,
+            "favorite": false,
+            "name": seal(&key, b"Shared login"),
+            "login": { "password": seal(&key, b"shared") }
+        })
+        .to_string()
+    }
+
+    /// The live cipher with **one** field this vault's user key cannot open.
+    ///
+    /// The password is sealed under [`org_key`] -- a real key, and the wrong
+    /// one -- so it fails its HMAC and is recorded as a
+    /// [`crate::rest::sync::DecryptFailure`] while every other field of the
+    /// record decrypts normally.
+    ///
+    /// That is `map_cipher` answering `Some(item, failures)`, which is a
+    /// **different branch** from [`organisation_cipher`]'s `None` and needs
+    /// its own fixture: a mutation that neutralised only one of the two would
+    /// otherwise survive. It is also the shape [`crate::rest::sync::Retained`]
+    /// exists for -- the value stays ciphertext in the model, and a write must
+    /// put that exact ciphertext back.
+    /// **Called once per test and the result threaded through**, never twice:
+    /// `seal` draws a fresh IV, so two calls produce two different
+    /// ciphertexts and a test comparing one against the other would be
+    /// comparing two encryptions of the same words. Read the value back out
+    /// of the returned JSON.
+    fn cipher_with_one_unreadable_field() -> serde_json::Value {
+        let mut value = cipher("live-1", "A live item", &serde_json::json!({}));
+        value["login"]["password"] = serde_json::json!(seal(&org_key(), b"under the wrong key"));
+        value
+    }
+
     /// A folder as a folder endpoint answers it: the id the server assigned
     /// and the name **encrypted under the fixture user key**, which is the
     /// only shape `confirmed_folder` can accept and the reason these tests
@@ -1249,7 +1648,71 @@ pub mod tests {
             .with_body(sync_body())
             .expect_at_least(1)
             .create();
+        declare_the_per_id_cipher_route(&mut server);
         (server, backend)
+    }
+
+    /// `GET /api/ciphers/{id}` for the three ciphers [`sync_body`] holds, and
+    /// a `404` for every other id -- so the fixture server answers about the
+    /// **same vault** whichever way it is asked, which is the only way a test
+    /// can move a method from the sync to the per-id route and still be
+    /// comparing like with like.
+    ///
+    /// # Two mocks, and the registration order is load-bearing
+    ///
+    /// [`crate::test_http`] copies `mockito`'s selection verbatim: among the
+    /// mocks that match, the first still owing hits, else **the last
+    /// registered**. Both of these are `expect_at_least(0)`, which owes
+    /// nothing from the start, so for an id they both match the later one
+    /// wins. That is why the catch-all `404` is registered *first* and the
+    /// three real ids *second*: the other order answers `404` for `live-1`.
+    ///
+    /// It also means a test may lay down its own `GET /api/ciphers/{id}` after
+    /// calling this and have it win, which is what the key-staleness tests
+    /// below do.
+    ///
+    /// Uncounted, for [`logged_in`]'s reason: most tests here are about some
+    /// other route and would otherwise be asserting about a number they do not
+    /// care about. A test that *is* about the number declares the route itself
+    /// on a server from [`signed_in_with_no_sync_route`].
+    pub fn declare_the_per_id_cipher_route(server: &mut crate::test_http::MockServer) {
+        server
+            .mock("GET", crate::test_http::Matcher::Regex("^/api/ciphers/[^/?]+$".to_string()))
+            .with_status(404)
+            .expect_at_least(0)
+            .create();
+        server
+            .mock(
+                "GET",
+                crate::test_http::Matcher::Regex(
+                    "^/api/ciphers/(live-1|trash-1|arch-1)$".to_string(),
+                ),
+            )
+            .with_body_from_request(|request| fixture_cipher_for(request.path()).into_bytes())
+            .expect_at_least(0)
+            .create();
+    }
+
+    /// The one of [`sync_body`]'s three ciphers that `path` names, as JSON.
+    ///
+    /// **Built from the same [`cipher`] the sync payload is built from**, with
+    /// the same `extra` for the trashed and archived ones -- so the record a
+    /// per-id read produces is byte-identical to the record the sync produces
+    /// for the same id. A second fixture here would let the two paths drift
+    /// apart in exactly the way these tests exist to detect.
+    fn fixture_cipher_for(path: &str) -> String {
+        let id = path.rsplit('/').next().unwrap_or_default();
+        let extra = match id {
+            "trash-1" => serde_json::json!({ "deletedDate": "2022-01-01T00:00:00.000000Z" }),
+            "arch-1" => serde_json::json!({ "archivedDate": "2022-02-01T00:00:00.000000Z" }),
+            _ => serde_json::json!({}),
+        };
+        let name = match id {
+            "trash-1" => "A trashed item",
+            "arch-1" => "An archived item",
+            _ => "A live item",
+        };
+        cipher(id, name, &extra).to_string()
     }
 
     /// [`logged_in`] with **the sync route not declared at all**, for a caller
@@ -1899,9 +2362,34 @@ pub mod tests {
     /// crate models: a mapper that built the body from the model alone would
     /// delete it -- and every attachment and passkey beside it -- from the
     /// user's real vault on the first edit.
+    ///
+    /// # The unmodelled value is given a value only the per-id read has
+    ///
+    /// `retained` -- [`DecryptedItem`]'s account of which in-place values are
+    /// still the server's ciphertext, and the JSON they are laid over -- used
+    /// to come off `/api/sync` and now comes off `GET /api/ciphers/{id}`. Both
+    /// go through [`decrypt_cipher`]'s `map_cipher`, so they *should* be the
+    /// same record; this test refuses to take that on trust. The per-id route
+    /// answers `keep me from the per-id read` where the sync fixture says
+    /// `keep me`, and the body must carry the former -- so a `retained` that
+    /// had quietly come from anywhere else fails here rather than passing on a
+    /// value both sources happened to share.
     #[test]
     fn an_edit_carries_the_fields_this_crate_does_not_model_back_to_the_server() {
         let (mut server, backend) = logged_in();
+        server
+            .mock("GET", "/api/ciphers/live-1")
+            .with_body(
+                cipher(
+                    "live-1",
+                    "A live item",
+                    &serde_json::json!({ "aKeyNoClientModels": "keep me from the per-id read" }),
+                )
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create();
+
         let answer = cipher(
             "live-1",
             "A live item",
@@ -1910,9 +2398,10 @@ pub mod tests {
         .to_string();
         let put = server
             .mock("PUT", "/api/ciphers/live-1")
-            .match_body(crate::test_http::Matcher::PartialJson(
-                serde_json::json!({ "aKeyNoClientModels": "keep me", "id": "live-1" }),
-            ))
+            .match_body(crate::test_http::Matcher::PartialJson(serde_json::json!({
+                "aKeyNoClientModels": "keep me from the per-id read",
+                "id": "live-1"
+            })))
             .with_body(answer)
             .create();
 
@@ -1948,16 +2437,55 @@ pub mod tests {
     /// The stale value here is deliberately far in the past, so a body
     /// carrying it could not be mistaken for the fresh one by a matcher
     /// comparing loosely.
+    ///
+    /// # Three dates, because the read moved
+    ///
+    /// This was `..._of_the_sync_and_not_the_callers_stale_one` and had two
+    /// dates in it, which was enough while the fresh one could only have come
+    /// from `/api/sync`. It cannot any more: `update_item` reads `GET
+    /// /api/ciphers/{id}`, and a test with two dates would pass on a body that
+    /// quoted the **sync's** token -- the very thing this change was supposed
+    /// to stop being fetched.
+    ///
+    /// So the three sources are given three distinct values and the body must
+    /// carry the middle one:
+    ///
+    /// * `1999` -- the caller's copy, a whole window session old.
+    /// * `2021` -- what the sync fixture says, which nothing should now read.
+    /// * `2025` -- what the per-id read answers, which is the server's current
+    ///   copy of the cipher about to be written and is the only right answer.
     #[test]
-    fn a_write_quotes_the_revision_date_of_the_sync_and_not_the_callers_stale_one() {
+    fn a_write_quotes_the_revision_date_of_the_read_and_not_the_callers_stale_one() {
         let (mut server, backend) = logged_in();
+
+        // The per-id route, overriding the fixture's: registered later, so it
+        // wins. See `declare_the_per_id_cipher_route` on the ordering rule.
+        server
+            .mock("GET", "/api/ciphers/live-1")
+            .with_body(
+                cipher(
+                    "live-1",
+                    "A live item",
+                    &serde_json::json!({ "revisionDate": "2025-05-05T00:00:00.000000Z" }),
+                )
+                .to_string(),
+            )
+            .expect_at_least(1)
+            .create();
+
         let mut item = backend.get_item("live-1").expect("the item");
         assert_eq!(
             item.other.get("revisionDate").and_then(serde_json::Value::as_str),
-            Some("2021-01-01T00:00:00.000000Z"),
-            "control: the fixture sync carries no `revisionDate`, so there is no fresh value \
-             for the write to prefer and this test proves nothing"
+            Some("2025-05-05T00:00:00.000000Z"),
+            "control: the per-id read is not answering the date this test is about, so the \
+             assertion below could be satisfied by the sync's token instead"
         );
+        assert!(
+            sync_payload().contains("2021-01-01T00:00:00.000000Z"),
+            "control: the sync fixture no longer carries a DIFFERENT date, so a body quoting \
+             the sync would pass this test"
+        );
+
         // A caller holding a copy from an earlier fetch -- which is every
         // caller: the vault window's item list is as old as the window.
         item.other
@@ -1973,16 +2501,385 @@ pub mod tests {
         let put = server
             .mock("PUT", "/api/ciphers/live-1")
             .match_body(crate::test_http::Matcher::PartialJson(
-                serde_json::json!({ "revisionDate": "2021-01-01T00:00:00.000000Z" }),
+                serde_json::json!({ "revisionDate": "2025-05-05T00:00:00.000000Z" }),
             ))
             .with_body(answer)
             .create();
 
         backend.update_item(&item).expect(
-            "the edit must land: a body carrying the caller's 1999 token matches no route here, \
-             which is what a real server answers with a 400 refusal",
+            "the edit must land: a body carrying the caller's 1999 token, or the sync's 2021 \
+             one, matches no route here -- which is what a real server answers with a 400 \
+             refusal",
         );
         put.assert();
+    }
+
+    /// **The measurement this whole change exists for: an edit issues ZERO
+    /// `GET /api/sync` requests.**
+    ///
+    /// # Why a count, and why this count
+    ///
+    /// The owner's self-hosted server keeps its ciphers in Cloudflare D1,
+    /// which caps **rows read** per day. `wrangler d1 insights` for the day it
+    /// began answering `500 Database not initialized`: 3,558 runs of the
+    /// per-user cipher select at 1,687 rows each, and 3,190 runs of the
+    /// attachments join at 1,687 -- about **3,374 rows for one `/api/sync`**,
+    /// against a five-million-row day. Starring an item cost that. Renaming
+    /// one cost that. Dragging one into a folder cost that.
+    ///
+    /// No assertion about latency, bytes or method calls can see that: the
+    /// quantity is HTTP requests to one route, so the assertion is a count of
+    /// them, exactly as `the_totp_poll_reads_the_snapshot` had to be.
+    ///
+    /// `signed_in_with_no_sync_route` and not `logged_in`, so the sync route
+    /// declared here is the **only** one that can answer and the number it
+    /// reports is the number of syncs the backend performed. See that
+    /// function's doc for why an overlapping second mock would quietly measure
+    /// the wrong one.
+    ///
+    /// # The one sync is the vault load, and it is the control
+    ///
+    /// `expect(1)` rather than `expect(0)`, because a vault window does open
+    /// with a `list_vault` and that sync is the right price for it. It is also
+    /// what makes the zero meaningful: a `0` on a route nothing ever reaches
+    /// would pass on a backend that could not sync at all. One load, then four
+    /// gestures, and the number does not move.
+    #[test]
+    fn an_edit_issues_no_sync_at_all_and_reads_only_the_record_it_is_about() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+        declare_the_per_id_cipher_route(&mut server);
+        let put = server
+            .mock("PUT", "/api/ciphers/live-1")
+            .with_body(cipher("live-1", "A live item", &serde_json::json!({})).to_string())
+            .expect(3)
+            .create();
+
+        // The one sync the whole gesture is allowed: the load a vault window
+        // does when it opens. Everything after this line is a click.
+        let vault = backend.list_vault().expect("the vault load");
+        let item = vault.items.first().expect("the live item").clone();
+
+        // A rename.
+        let mut renamed = item.clone();
+        renamed.name = "Renamed".to_string();
+        backend.update_item(&renamed).expect("the rename lands");
+
+        // A star. There is no `set_favorite` on the trait -- the window flips
+        // the field and edits, which is the gesture the owner's report named
+        // and the one that used to cost a whole vault.
+        let mut starred = item.clone();
+        starred.favorite = true;
+        backend.update_item(&starred).expect("the star lands");
+
+        // A move out of every folder, which goes through `update_item` too.
+        backend.move_item_to_folder(&item, None).expect("the move lands");
+
+        // And a plain read, which is the fill path on a cache miss.
+        backend.get_item("live-1").expect("the read");
+
+        sync.assert();
+        put.assert();
+    }
+
+    /// A backend that has never synced still answers one record for one sync
+    /// -- and every record after it for none.
+    ///
+    /// This is `app::fill_from_vault` on a cold process: nothing has loaded a
+    /// vault, so nothing has unwrapped a key, and a single-cipher response
+    /// carries no `profile` to unwrap one from. The first read therefore pays
+    /// for a sync it cannot avoid. **The assertion is that it pays exactly
+    /// once**, which is what says the keys were kept rather than re-fetched
+    /// per record -- the defect that would make this change worthless while
+    /// looking like it worked.
+    ///
+    /// The trashed and the archived cipher are read too. The per-id route
+    /// knows nothing of the three lists, so an id is answerable whichever list
+    /// its item is in, exactly as the old sync-and-filter was.
+    #[test]
+    fn a_cold_backend_pays_for_the_keys_once_and_every_record_after_that_is_free() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+        declare_the_per_id_cipher_route(&mut server);
+
+        assert_eq!(backend.get_item("live-1").expect("the first read").name, "A live item");
+        assert_eq!(backend.get_item("trash-1").expect("the trashed one").name, "A trashed item");
+        assert_eq!(backend.get_item("arch-1").expect("the archived one").name, "An archived item");
+        assert_eq!(backend.get_item("live-1").expect("again").name, "A live item");
+
+        sync.assert();
+    }
+
+    /// The item a per-id read produces and the item the sync produces are the
+    /// **same item**, field for field.
+    ///
+    /// Both go through [`decrypt_cipher`]'s `map_cipher`, so this should be
+    /// true by construction -- and it is asserted anyway, because "by
+    /// construction" is what was believed about the two folder mappers before
+    /// one of them started answering an empty name. A `get_item` that dropped
+    /// `other`, or filtered a field the list keeps, would be a per-item read
+    /// that quietly disagreed with every list in the app.
+    #[test]
+    fn the_record_a_per_id_read_produces_is_the_one_the_sync_produces() {
+        let (_server, backend) = logged_in();
+        let by_id = backend.get_item("live-1").expect("by id");
+        let listed = backend.list_items().expect("the list").remove(0);
+        assert_eq!(
+            serde_json::to_value(&by_id).expect("a value"),
+            serde_json::to_value(&listed).expect("a value"),
+            "the two reads of one cipher disagree about its contents"
+        );
+    }
+
+    /// **The invalidation case the cache cannot rule out by construction: an
+    /// organisation joined since the last sync.**
+    ///
+    /// [`RestBackend::keys`] argues that a re-login, an account switch, a
+    /// master-password change and a key rotation all either leave the cached
+    /// keys correct or destroy the object holding them. This is the one event
+    /// that does neither: the session stays valid, the user key is unchanged,
+    /// and the cached [`VaultKeys`] simply has no entry for `org1` -- so the
+    /// organisation's cipher does not decrypt at all, and would come back as
+    /// an item with no name rather than as an error.
+    ///
+    /// So a **cached** key that fails to open a record is re-derived once from
+    /// a fresh sync, and the record decrypted again. The two sync mocks make
+    /// that visible: the first answers an account with no organisations and is
+    /// what warms the cache; the second, registered after it, answers the same
+    /// account in `org1`. `test_http` gives a request to the first mock still
+    /// owing hits, so the order of the two answers is the order of the two
+    /// registrations.
+    ///
+    /// The organisation key here is **OpenSSL's**, through
+    /// `rest::crypto`'s transcribed fixture -- the same chain
+    /// `rest::sync::an_organisation_cipher_decrypts_through_the_rsa_wrapped_org_key`
+    /// checks against ground truth -- so a pass here is a real RSA unwrap and
+    /// not a fixture agreeing with itself.
+    #[test]
+    fn an_organisation_joined_since_the_last_sync_re_derives_the_keys_rather_than_failing() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let before = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+        let after = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_body_with_the_organisation())
+            .expect(1)
+            .create();
+        let fetch = server
+            .mock("GET", "/api/ciphers/org-1")
+            .with_body(organisation_cipher())
+            .expect(1)
+            .create();
+
+        // The vault load that warms the cache with keys holding no
+        // organisation at all.
+        backend.list_vault().expect("the vault load");
+
+        let item = backend.get_item("org-1").expect("the organisation's item");
+        assert_eq!(item.name, "Shared login");
+        assert_eq!(
+            item.login.as_ref().and_then(|l| l.password.as_deref()).map(String::as_str),
+            Some("shared"),
+            "the record decrypted its name but not its password, so only half of it went \
+             through the re-derived organisation key"
+        );
+
+        // One warm-up sync and one re-derivation, and the record was fetched
+        // once -- the retry re-decrypts the body it already has rather than
+        // asking the server for it twice.
+        before.assert();
+        after.assert();
+        fetch.assert();
+    }
+
+    /// **The retry happens once, and a record that still will not decrypt is
+    /// an error rather than a loop.**
+    ///
+    /// The control for the test above, and the pin on the one way a
+    /// self-healing path can be worse than the one it replaces. Here the
+    /// second sync answers the same organisation-less account as the first, so
+    /// the fresh keys are exactly as useless as the cached ones. The
+    /// requirement is that the call ends -- with a refusal, and after
+    /// **exactly two** syncs: the warm-up and the single retry.
+    ///
+    /// `expect(2)` is the whole assertion. A retry that re-fetched keys until
+    /// they worked would answer this fixture with an unbounded number of
+    /// syncs against the very server the row cap was hit on.
+    #[test]
+    fn a_record_that_will_not_decrypt_on_fresh_keys_either_is_refused_after_one_retry() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(2)
+            .create();
+        server
+            .mock("GET", "/api/ciphers/org-1")
+            .with_body(organisation_cipher())
+            .expect(1)
+            .create();
+
+        backend.list_vault().expect("the vault load");
+        let refused = backend.get_item("org-1").expect_err("no key for that organisation");
+        assert!(
+            matches!(refused, VaultError::Parse(ref m) if m.contains("org-1")),
+            "the refusal must name the record it is about, and must not claim the server has \
+             no such item -- the server answered about it: {refused:?}"
+        );
+
+        sync.assert();
+    }
+
+    /// **`retained` survives the move to the per-id read: a field that would
+    /// not decrypt is written back as the very bytes the server sent.**
+    ///
+    /// This is the failure [`crate::rest::write`]'s module docs are mostly
+    /// about, and the one the task of moving this read had to not
+    /// reintroduce. [`DecryptedItem`] carries which of an item's in-place
+    /// values are still ciphertext; the model's copy of such a value is
+    /// **empty**, so a write built from the model alone would replace a
+    /// password the user still has with an encryption of the empty string.
+    ///
+    /// The fixture's password is sealed under the wrong key, so it comes back
+    /// as a `DecryptFailure` and stays ciphertext -- and the `PUT` must carry
+    /// that exact string, character for character. Anything else is either a
+    /// re-encryption (a different IV, so a different string) or a blank.
+    ///
+    /// `an_edit_carries_the_fields_this_crate_does_not_model_back_to_the_server`
+    /// is the neighbouring rule and is **not** this one: that is about keys
+    /// the model has never heard of, which ride `VaultItem::other`. This is
+    /// about a key the model knows and could not read.
+    #[test]
+    fn an_edit_writes_back_verbatim_a_value_that_would_not_decrypt() {
+        let (mut server, backend) = logged_in();
+        let fixture = cipher_with_one_unreadable_field();
+        let ciphertext = fixture["login"]["password"]
+            .as_str()
+            .expect("the fixture's unreadable password")
+            .to_string();
+        server
+            .mock("GET", "/api/ciphers/live-1")
+            .with_body(fixture.to_string())
+            .expect_at_least(1)
+            .create();
+
+        let mut item = backend.get_item("live-1").expect("the item");
+        assert_eq!(
+            item.login.as_ref().and_then(|l| l.password.as_deref()).map(String::as_str),
+            None,
+            "control: the fixture's password decrypted after all, so nothing here is retained \
+             and the assertion below would pass on a plain round trip"
+        );
+        item.name = "Renamed".to_string();
+
+        let put = server
+            .mock("PUT", "/api/ciphers/live-1")
+            .match_body(crate::test_http::Matcher::PartialJson(serde_json::json!({
+                "login": { "password": ciphertext }
+            })))
+            .with_body(cipher("live-1", "Renamed", &serde_json::json!({})).to_string())
+            .create();
+
+        backend.update_item(&item).expect("the edit lands");
+        put.assert();
+    }
+
+    /// One unreadable field on **freshly derived** keys is not a reason to
+    /// derive them again.
+    ///
+    /// The `Some(record, failures)` half of the no-retry rule, where
+    /// `a_record_that_will_not_decrypt_on_keys_just_derived_is_not_retried`
+    /// below is the `None` half. The two are separate arms of one `match` and
+    /// a mutation neutralising either one alone survives the other's test, so
+    /// both are pinned.
+    ///
+    /// The record still comes back -- "a vault with one corrupt field is still
+    /// a vault" is [`crate::rest::sync`]'s decision and this path does not
+    /// overrule it -- and the sync count is **one**: the cold read's own.
+    #[test]
+    fn one_unreadable_field_on_keys_just_derived_is_not_retried() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/api/ciphers/live-1")
+            .with_body(cipher_with_one_unreadable_field().to_string())
+            .expect(1)
+            .create();
+
+        let item = backend.get_item("live-1").expect("the item, corrupt field and all");
+        assert_eq!(item.name, "A live item");
+        sync.assert();
+    }
+
+    /// The same record read with a **cached** key does pay for one retry, and
+    /// exactly one.
+    ///
+    /// The honest cost of the self-healing rule, written down rather than
+    /// hidden: a genuinely corrupt field is indistinguishable from a stale key
+    /// at the point the decrypt fails, so a warm backend re-derives once
+    /// before believing it. That is one sync -- what this whole path used to
+    /// cost every single time -- and it must not become two.
+    #[test]
+    fn one_unreadable_field_on_a_cached_key_costs_one_retry_and_no_more() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(2)
+            .create();
+        server
+            .mock("GET", "/api/ciphers/live-1")
+            .with_body(cipher_with_one_unreadable_field().to_string())
+            .expect(1)
+            .create();
+
+        backend.list_vault().expect("the vault load that warms the keys");
+        let item = backend.get_item("live-1").expect("the item, corrupt field and all");
+        assert_eq!(item.name, "A live item");
+        sync.assert();
+    }
+
+    /// A **fresh** key that does not open a record is not retried at all.
+    ///
+    /// The mirror of the two tests above, and the reason the retry is
+    /// conditioned on the keys having been cached rather than on the failure
+    /// alone. A cold backend derives its keys from a sync it has just made;
+    /// those keys are as fresh as anything can be, and re-deriving them
+    /// because a genuinely corrupt record would not open is how a vault with
+    /// one bad cipher comes to issue a sync per click for ever.
+    ///
+    /// One sync, and one only: the cold read's own.
+    #[test]
+    fn a_record_that_will_not_decrypt_on_keys_just_derived_is_not_retried() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/api/ciphers/org-1")
+            .with_body(organisation_cipher())
+            .expect(1)
+            .create();
+
+        backend.get_item("org-1").expect_err("no key for that organisation");
+        sync.assert();
     }
 
     /// An id this vault does not hold is refused rather than created: `PUT`

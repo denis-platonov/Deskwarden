@@ -1284,6 +1284,58 @@ impl RestClient {
         self.refreshing(session, |session| self.sync(session))
     }
 
+    // ---- reading one cipher -------------------------------------------------
+
+    /// `GET /api/ciphers/{id}` -- **one** cipher, still encrypted.
+    ///
+    /// # Why this exists, in rows
+    ///
+    /// The owner's self-hosted server stores its ciphers in Cloudflare D1,
+    /// which bills and caps **rows read**, not requests. `wrangler d1
+    /// insights` for the day the server started answering `500 Database not
+    /// initialized` said what one `GET /api/sync` costs there: 1,687 rows out
+    /// of `ciphers` plus 1,687 out of the `attachments`/`ciphers` join, so
+    /// about **3,374 rows for one sync** -- and 6,748 syncs is the free tier's
+    /// whole 5,000,000-row day.
+    ///
+    /// A sync is the right price for loading a vault. It is the wrong price
+    /// for reading the one record behind a click, and it was the price
+    /// [`crate::rest::backend::RestBackend::get_item`] and, far worse,
+    /// `update_item` paid: starring an item, renaming one or dropping one into
+    /// a folder each read the account twice over before the `PUT` went out.
+    /// This route is the same record for **one** row.
+    ///
+    /// # Nothing new in the URL
+    ///
+    /// It is [`Self::cipher_url`] with an empty suffix -- byte for byte the
+    /// URL [`Self::update_cipher`] `PUT`s to, from the same id check. A `GET`
+    /// beside the writers rather than a route of its own is the whole of the
+    /// change here, and it is why there is no second opinion anywhere about
+    /// what a cipher's address is.
+    ///
+    /// # The agent, and why it is the sync one
+    ///
+    /// `sync_agent`, as [`Self::fetch_sends`] uses for the same reason: this
+    /// is a read, and the read deadline is the one written for a server
+    /// answering with vault data. The write agent's shorter deadline exists
+    /// for requests that change something, and a read borrowing it would time
+    /// out sooner than the sync whose place it is taking.
+    ///
+    /// Returns the raw JSON, exactly as the writers do:
+    /// [`crate::rest::sync::decrypt_cipher`] is the one mapper for a
+    /// standalone cipher, so a fetched record and a written one cannot be
+    /// decrypted two different ways.
+    pub fn fetch_cipher(
+        &self,
+        session: &mut Session,
+        id: &str,
+    ) -> Result<serde_json::Value, RestError> {
+        let url = self.cipher_url(id, "")?;
+        self.refreshing(session, |session| {
+            self.value_from(self.bearer(self.sync_agent.get(&url), session).call())
+        })
+    }
+
     // ---- writing one cipher -------------------------------------------------
 
     /// `POST /api/ciphers` -- a new item.
