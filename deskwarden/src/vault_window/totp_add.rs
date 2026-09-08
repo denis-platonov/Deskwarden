@@ -869,6 +869,66 @@ pub fn grouped_code(code: &str) -> Zeroizing<String> {
     out
 }
 
+/// A saved `login.totp` value as an [`OtpAuth`], however it was stored, or
+/// `None` if this app cannot read it.
+///
+/// Bitwarden's `totp` field holds **either** a whole `otpauth://totp` URI or a
+/// bare base32 seed, and both are common: the URI is what a scanned QR code
+/// produces, the bare seed is what a user typing from a website's setup page
+/// produces. `bw serve` accepts both, so this must too, or half the user's
+/// TOTP items go blank on a backend switch.
+///
+/// **The bare seed is handled by making it a URI and re-parsing**, rather than
+/// by constructing an [`OtpAuth`] here. That is deliberate: every rule about
+/// what a seed may contain -- the base32 alphabet, the padding, the case, the
+/// length bound -- then has exactly one implementation, in
+/// [`crate::otpauth`], and a seed this crate would refuse to import is a seed
+/// it also refuses to compute from. The RFC 6238 defaults a bare seed implies
+/// (SHA-1, six digits, thirty seconds) are applied by that same parser, so
+/// they are not restated here either.
+///
+/// `Zeroizing` throughout: the intermediate URI is a seed with twenty-odd
+/// characters in front of it.
+///
+/// # Why this lives here rather than in the REST backend, where it was written
+///
+/// It was `rest::backend`'s private helper, because that backend is where the
+/// discovery was made that a saved seed has two spellings. It has a **second**
+/// caller now: [`super::totp_poll_plan`], the vault window's per-poll decision
+/// about whether the selected item's code can be computed from the snapshot
+/// already on screen. Copying it there would have been two readers of the same
+/// field that could come to disagree about which seeds this app can read --
+/// and "can this app read this seed?" is exactly the question that decides
+/// whether the window answers locally or asks the backend, so a disagreement
+/// would show as a code appearing on one path and not the other.
+///
+/// **`None` here is never "show no code".** It is "this app cannot answer, so
+/// ask the backend", which on `bw serve` means asking the CLI, which reads
+/// seed shapes this crate deliberately refuses ([`crate::otpauth`] rejects an
+/// unknown parameter rather than guessing at it, and `steam://` is not base32
+/// at all). See [`super::TotpPoll`].
+pub fn read_seed(stored: &Zeroizing<String>) -> Option<OtpAuth> {
+    match parse_otpauth(stored) {
+        Ok(auth) => return Some(auth),
+        // Anything that *is* an `otpauth://` URI and was still refused is
+        // refused for a reason -- an `hotp` counter this app cannot advance,
+        // an unknown parameter, a bad seed -- and re-reading it as a bare
+        // seed would be reinterpreting a value whose meaning is already
+        // known.
+        Err(refusal) if refusal != OtpRefusal::NotOtpAuth => return None,
+        Err(_) => {}
+    }
+    // Whitespace only: a seed copied off a setup page arrives in groups of
+    // four. Everything else about the value is the parser's business.
+    let mut bare = Zeroizing::new(String::with_capacity(stored.len()));
+    bare.extend(stored.chars().filter(|c| !c.is_whitespace()));
+    if bare.is_empty() {
+        return None;
+    }
+    let uri = Zeroizing::new(format!("otpauth://totp/?secret={}", bare.as_str()));
+    parse_otpauth(&uri).ok()
+}
+
 // ---------------------------------------------------------------------------
 // What gets written
 // ---------------------------------------------------------------------------

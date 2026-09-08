@@ -116,7 +116,6 @@ use std::sync::Mutex;
 use zeroize::Zeroizing;
 
 use crate::app_match::AppMatch;
-use crate::otpauth::{self, OtpAuth};
 use crate::rest::api::{Authenticated, RestClient, RestError};
 use crate::rest::crypto::CryptoError;
 use crate::rest::sync::{
@@ -128,6 +127,11 @@ use crate::password_gen::PasswordGenError;
 use crate::vault_bridge::{
     Folder, GenerateRequest, NewItem, VaultError, VaultItem, with_app_match,
 };
+// The seed reader and the arithmetic it feeds both live beside the Add-a-TOTP
+// screen, which is the one surface in this app that computes a code without a
+// vault to ask. This backend is the second caller and the vault window's poll
+// is the third; see `read_seed`'s own doc.
+use crate::vault_window::totp_add::read_seed;
 
 /// The name every refusal in this file signs itself with.
 ///
@@ -776,6 +780,24 @@ impl VaultBackend for RestBackend {
     /// trace anywhere. It is not an `Err`, because an error here reads to
     /// every call site as "the backend is unwell" and would put a poll into a
     /// failure streak over one malformed item.
+    ///
+    /// # The sync is why the vault window stopped calling this every second
+    ///
+    /// It used to be called once per second for as long as a TOTP item stayed
+    /// selected, and one full sync per second on a 1,669-item vault is what
+    /// made the reporting user's server answer `503` after a few minutes --
+    /// with the code being computed locally at the end of it anyway, from a
+    /// seed the window already held decrypted. That poll now reads the seed
+    /// out of the snapshot it is already rendering
+    /// ([`crate::vault_window::totp_poll_plan`]) and reaches this method only
+    /// for a seed [`read_seed`] will not read, which on this backend answers
+    /// `Ok(None)` **once** and stops the polling.
+    ///
+    /// The sync stays. This is still the answer for `app::fill_from_vault`'s
+    /// on-demand fill, which asks for one code once, and cheapening it by
+    /// caching what `synced()` returns would be exactly the change
+    /// [`Self::update_item`] must not have: a write quotes the `revisionDate`
+    /// of the sync it just made, and a stale one is refused by the server.
     fn get_totp(&self, id: &str) -> Result<Option<String>, VaultError> {
         let (vault, _) = self.synced()?;
         let item = Self::find(&vault, id)?;
@@ -974,46 +996,12 @@ fn is_archived(item: &VaultItem) -> bool {
     stamped(item, "archivedDate")
 }
 
-/// A `login.totp` value as an [`OtpAuth`], however it was stored.
-///
-/// Bitwarden's `totp` field holds **either** a whole `otpauth://totp` URI or a
-/// bare base32 seed, and both are common: the URI is what a scanned QR code
-/// produces, the bare seed is what a user typing from a website's setup page
-/// produces. `bw serve` accepts both, so this must too, or half the user's
-/// TOTP items go blank on a backend switch.
-///
-/// **The bare seed is handled by making it a URI and re-parsing**, rather than
-/// by constructing an [`OtpAuth`] here. That is deliberate: every rule about
-/// what a seed may contain -- the base32 alphabet, the padding, the case, the
-/// length bound -- then has exactly one implementation, in
-/// [`crate::otpauth`], and a seed this crate would refuse to import is a seed
-/// it also refuses to compute from. The RFC 6238 defaults a bare seed implies
-/// (SHA-1, six digits, thirty seconds) are applied by that same parser, so
-/// they are not restated here either.
-///
-/// `Zeroizing` throughout: the intermediate URI is a seed with twenty-odd
-/// characters in front of it.
-fn read_seed(stored: &Zeroizing<String>) -> Option<OtpAuth> {
-    match otpauth::parse_otpauth(stored) {
-        Ok(auth) => return Some(auth),
-        // Anything that *is* an `otpauth://` URI and was still refused is
-        // refused for a reason -- an `hotp` counter this app cannot advance,
-        // an unknown parameter, a bad seed -- and re-reading it as a bare
-        // seed would be reinterpreting a value whose meaning is already
-        // known.
-        Err(refusal) if refusal != otpauth::OtpRefusal::NotOtpAuth => return None,
-        Err(_) => {}
-    }
-    // Whitespace only: a seed copied off a setup page arrives in groups of
-    // four. Everything else about the value is the parser's business.
-    let mut bare = Zeroizing::new(String::with_capacity(stored.len()));
-    bare.extend(stored.chars().filter(|c| !c.is_whitespace()));
-    if bare.is_empty() {
-        return None;
-    }
-    let uri = Zeroizing::new(format!("otpauth://totp/?secret={}", bare.as_str()));
-    otpauth::parse_otpauth(&uri).ok()
-}
+// `read_seed` -- the reader for a saved `login.totp`, in either of its two
+// spellings -- used to live here, and its move is not a tidy-up. The vault
+// window's per-poll fast path needs the same answer to the same question
+// ("can this app read this seed?"), so the function now sits beside
+// `code_at`, the arithmetic it feeds, in `crate::vault_window::totp_add`.
+// See that function's doc for why one reader and not two.
 
 /// A [`RestError`] as the error type the rest of the app already handles.
 ///
