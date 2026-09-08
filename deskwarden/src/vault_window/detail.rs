@@ -6539,7 +6539,58 @@ fn ordinary_value_galley(ui: &egui::Ui) -> std::sync::Arc<egui::Galley> {
 fn digits_fit(ui: &egui::Ui, natural: f32, controls_width: f32) -> (RowShape, f32) {
     let content = row_content_width(ui);
     let beside_the_label = content - ROW_LABEL_WIDTH - ROW_GAP - controls_width;
-    let shape = if natural <= beside_the_label {
+    // **A value too long for the two-column line is ELIDED on it, and stacks
+    // only when that line is too narrow to elide into -- the fourth and last
+    // instalment of "it should cut off with ... before overlapping the
+    // shortcut", and the one the reporter came back about.**
+    //
+    // THE REPORT, twice: a long value on the PREVIOUS PASSWORDS card "wraps
+    // onto a second line instead of being cut short with an ellipsis. It
+    // should truncate with `\u{2026}` like every other value row does." The
+    // second line is REAL and it is this decision, not a fold: `46ac71b`
+    // gave [`paint_digits`] `max_rows = 1`, and measured afterwards every
+    // galley on this pane lays out exactly one row at every width -- and the
+    // reporter still saw two lines, because a [`RowShape::Stacked`] row puts
+    // the label on one line and the value on the next by construction. What
+    // reads as "the value wrapped" is the ROW having been given a second
+    // line to put it on.
+    //
+    // **`natural > beside_the_label` was the wrong question, and it was the
+    // right one when it was asked.** It arrived in `a9dad37`, whose argument
+    // is quoted in [`masked_row`]'s doc: "Elision is the LAST resort here
+    // and not the first: this row's value is the point of the row, so the
+    // row is made as wide as the pane allows before a single character of it
+    // is given up." At the time elision was not on the table at all -- the
+    // row had no honest width to truncate at, and a value that overflowed
+    // ran straight past the card and pushed its own eye into the scroll
+    // lane. Stacking was the only way to give the run more room, so "does it
+    // fit?" was the only question worth asking. Three fixes later the row
+    // truncates properly on both branches, and a secret is longer than the
+    // value column nearly always -- so that question answered "stack" for
+    // almost every masked row on the pane, while the `Username` and
+    // `Website` rows beside them elided on one line. That difference is the
+    // whole of what was reported: two rows on one card obeying two rules.
+    //
+    // **So the question is now about the LINE, not the value**: is the
+    // two-column line wide enough to be worth eliding into? A row whose
+    // value fits keeps its columns exactly as before, and one whose value
+    // does not is elided there rather than stacked -- unless the line is
+    // narrower than [`legible_digits_line`], which is `a9dad37`'s own
+    // measurement (a 44pt value column against a 94.2pt ten-bullet mask) put
+    // as a rule instead of applied to one case. At the app's own minimum the
+    // value column is 42pt, well under the mask, so the narrowest pane keeps
+    // the stacked row and every pin on it -- `the_previous_password_rows_fit
+    // _the_narrowest_pane`, `a_revealed_previous_password_fits_the_narrowest
+    // _pane_too` and the narrow half of `a_long_secrets_mask_is_cut_to_the_
+    // row_at_every_width` all measure that width and all stay green. By the
+    // 900pt pane the column is 644pt and the row cuts on it instead, which
+    // is what the report asks for.
+    //
+    // **Strictly a narrowing of the stacked case**, which is why this is
+    // safe to change under a suite this size: every row that was `Columns`
+    // is still `Columns` (the first arm is untouched), and only rows that
+    // used to stack can move.
+    let shape = if natural <= beside_the_label || beside_the_label >= legible_digits_line(ui) {
         RowShape::Columns
     } else {
         RowShape::Stacked
@@ -6553,6 +6604,37 @@ fn digits_fit(ui: &egui::Ui, natural: f32, controls_width: f32) -> (RowShape, f3
     }
     .max(1.0);
     (shape, room)
+}
+
+/// **The narrowest two-column value line worth eliding into**: the width of
+/// the pane's own minimum mask, [`MASKED_BULLETS`] bullets in the digits
+/// face.
+///
+/// [`digits_fit`] stacks a row whose value does not fit and whose line is
+/// below this, and elides on the line otherwise. The number is `a9dad37`'s
+/// own measurement rather than a new one: that commit found the value column
+/// at the app's minimum window to be 44pt against a ten-bullet mask of
+/// 94.2pt and concluded the row could not stay in columns there. That is
+/// still true and still the reason the narrow pane stacks; what has changed
+/// is that it is now the RULE rather than a fact about one width.
+///
+/// **[`MASKED_BULLETS`] rather than a width of its own**, because that
+/// constant already means "the shortest bullet run this pane will show and
+/// still call a masked secret" -- the SSH private key's whole row is one --
+/// so a line that cannot hold it cannot hold anything this pane would call a
+/// value either.
+///
+/// **Measured, not written down.** The bullet is 9.42pt in this face at this
+/// size with this tracking, and a 94.2 in the source would go stale the
+/// moment [`MASKED_SIZE`] or [`MASKED_TRACKING`] moved -- and would then be
+/// stacking or not stacking at a width nobody chose. It is laid out through
+/// [`digits_job`], the same job the row paints, for the reason [`fit_mask`]
+/// gives: two measurements of one run that disagree are worse than either.
+fn legible_digits_line(ui: &egui::Ui) -> f32 {
+    ui.painter()
+        .layout_job(digits_job(&"\u{2022}".repeat(MASKED_BULLETS)))
+        .size()
+        .x
 }
 
 /// Paint a digits value into the row's value slot, on the baseline
@@ -6859,12 +6941,22 @@ struct MaskedFace<'a> {
 ///
 /// Neither half of the repair is optional:
 ///
-/// * **[`RowShape::Stacked`] when the columns do not fit**, which buys the
-///   whole content box (218pt at 298) instead of 44. Elision is the LAST
-///   resort here and not the first: this row's value is the point of the row,
-///   so the row is made as wide as the pane allows before a single character
-///   of it is given up. Not a shorter mask either -- the mask is short
-///   already, and a revealed password is longer than any of them.
+/// * **[`RowShape::Stacked`] when the columns are too narrow to cut into**,
+///   which buys the whole content box (218pt at 298) instead of 44. Not a
+///   shorter mask either -- the mask is short already, and a revealed
+///   password is longer than any of them.
+///
+///   **The condition is not the one `a9dad37` wrote, and the change is
+///   `digits_fit`'s to explain**, at length and with the report that caused
+///   it. Briefly: this bullet used to read "when the columns do not fit",
+///   and argued that "elision is the LAST resort here and not the first"
+///   because at the time there was no elision to resort to. There is now,
+///   and a secret does not fit its value column nearly ever, so that
+///   condition stacked almost every masked row on the pane while the rows
+///   beside them elided on one line. The reporter saw the second line and
+///   called it a wrap. Stacking is kept for the width it was measured at --
+///   the 44pt value column of the narrowest pane, which cannot hold even
+///   [`MASKED_BULLETS`] bullets -- and nothing wider.
 /// * **A wrap width on the value, always.** The masked run is a
 ///   `LayoutJob`, and a `LayoutJob`'s `wrap.max_width` defaults to infinity
 ///   -- which is why the run above ran past the card instead of stopping at
@@ -6952,6 +7044,19 @@ fn masked_row(
     // the ink the user sees, which is what
     // `a_previous_password_too_long_for_its_row_is_cut_before_it_reaches_the_
     // eye` measures.
+    //
+    // **Re-derived when [`digits_fit`] stopped stacking**, because that
+    // changed what is REACHABLE rather than what is true. Until then this
+    // row only ever kept its two columns for a value that already fit them,
+    // so an overstated limit could not be hit at all; it can now, on every
+    // elided row. Adding the eight was tried again for that reason and
+    // reverted again: the arithmetic above does not depend on how the row
+    // got here. `room` still ends at the eye's box, the mark still starts
+    // 4.85pt inside it, and a value that spends every point of `room` still
+    // stops short of the ink -- it overhangs into the eight-point spacing
+    // lane and nothing else. Two mutation runs agree: with the eight added,
+    // all 597 tests in this module pass unchanged, which is the definition
+    // of a change nobody can see.
     let controls_width = theme::EYE_TOGGLE_SIZE
         + hint.map_or(0.0, |which| {
             CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(which))
@@ -16995,6 +17100,154 @@ mod tests {
             ink.right(),
             eyes[0].left()
         );
+    }
+
+    /// **The same report again, and the half the test above could not see:
+    /// the second line the reporter is looking at is the ROW's, not the
+    /// run's.**
+    ///
+    /// After `46ac71b` the reporter ran the build and said "passwords same".
+    /// They were right, and the fix was not wrong: measured on a real frame,
+    /// every galley this pane lays out is exactly one row at every width
+    /// from the app's minimum (298pt) to 900 -- masked and revealed alike,
+    /// at 12, 24, 41, 60 and 400 characters. Nothing wraps. What still put a
+    /// previous password on a line of its own is [`RowShape::Stacked`],
+    /// which [`digits_fit`] chose for any value wider than the two-column
+    /// line -- which is nearly every secret, since a secret is longer than a
+    /// value column by design. At a 638pt pane the card read
+    ///
+    /// ```text
+    /// 21d ago
+    /// ••••••••••••••••••••••••••••••••••••••••••
+    /// ```
+    ///
+    /// while `Username` and `Website` two cards up stayed on one line and
+    /// elided. "Wraps onto a second line instead of being cut short with an
+    /// ellipsis... like every other value row does" describes that exactly,
+    /// and no amount of `max_rows` reaches it.
+    ///
+    /// **So this pins the SHAPE, which is what changed.** The date and the
+    /// value share a line, and the value is cut on it.
+    ///
+    /// **MASKED first, and that is the point of running both.** The sibling
+    /// above had to reveal its row, because a mask fits by construction
+    /// ([`fit_mask`]) and so could never measure a text wrap. It measures
+    /// this perfectly well: `fit_mask` cuts a mask to `room`, and `room`
+    /// belongs to whichever line `digits_fit` put the row on -- so a masked
+    /// row that stacks is a masked row on a second line, which is the state
+    /// the reporter was looking at with the eye untouched.
+    ///
+    /// Three assertions, and the first two are what stop the third being
+    /// vacuous:
+    ///
+    /// * the run really was cut, so this is not a value that happened to
+    ///   fit and would have satisfied "one line" without being tested;
+    /// * the value's band contains its date's centre -- the row did NOT take
+    ///   a second line;
+    /// * the ink stops before the reveal eye, so "kept on one line" was not
+    ///   bought by painting through the control.
+    #[test]
+    fn a_long_previous_password_is_cut_beside_its_date_rather_than_dropped_below_it() {
+        // 90 characters. Long enough that it cannot fit the two-column value
+        // line at [`PANE`] -- 636pt there, which holds 67 bullets -- and
+        // short enough to be a password somebody really has, which a
+        // 400-character one is not: the sibling above uses 400 to put the
+        // rule beyond any width, and this one is deliberately a length the
+        // reporter could be looking at.
+        let secret = "q".repeat(90);
+        let mut item = a_login();
+        item.other.insert(
+            "passwordHistory".to_string(),
+            serde_json::Value::Array(vec![serde_json::json!({
+                "lastUsedDate": super::test_clock::days_ago(super::test_clock::HISTORY_AGE_DAYS),
+                "password": secret.clone(),
+            })]),
+        );
+        // The row's label, off the very function that writes it -- a
+        // hardcoded "21d ago" would be pinning `relative_time`'s wording in
+        // a test about geometry.
+        let stamp = super::test_clock::days_ago(super::test_clock::HISTORY_AGE_DAYS);
+        let date = history_label(Some(stamp.as_str()));
+
+        for revealed in [false, true] {
+            let mut pane = Pane::new();
+            pane.reveal.password_history[0] = revealed;
+            let frame = pane.idle(&item, &TotpState::NoSecret);
+            let label = frame.rect_of(&date);
+
+            // The value, found by its FACE rather than by a length: masked it
+            // is a bullet run `fit_mask` has already shortened to a number
+            // that belongs to the layout. `> 7` excludes the login's own
+            // password row, whose fixture is `hunter2`; nothing else on this
+            // pane paints bullets at all.
+            let runs: Vec<&(String, String, egui::Rect)> = frame
+                .rendered
+                .iter()
+                .filter(|(source, ..)| {
+                    if revealed {
+                        source == &secret
+                    } else {
+                        source.chars().count() > 7 && source.chars().all(|c| c == '\u{2022}')
+                    }
+                })
+                .collect();
+            assert_eq!(
+                runs.len(),
+                1,
+                "revealed={revealed}: the pane painted {} candidate previous-password runs, \
+                 not the one this item carries -- everything below would be vacuous",
+                runs.len()
+            );
+            let (source, glyphs, box_) = runs[0];
+
+            assert!(
+                glyphs.chars().count() < secret.chars().count(),
+                "revealed={revealed}: the row laid out {} characters for a {}-character \
+                 entry, so nothing cut it and the line assertions below are about a value \
+                 that never had to give anything up",
+                glyphs.chars().count(),
+                secret.chars().count()
+            );
+
+            // **The row, not the run.** Without the shape fix the value is a
+            // whole band below its date and this is the assertion that says
+            // so; the run itself is one galley row either way, which is why
+            // `46ac71b`'s test stayed green while the report stayed open.
+            assert!(
+                box_.y_range().contains(label.center().y),
+                "revealed={revealed}: the date sits at y={:.1} and its value at \
+                 y={:.1}..{:.1}, so the row gave the value a line of its own instead of \
+                 cutting it beside the date",
+                label.center().y,
+                box_.top(),
+                box_.bottom()
+            );
+
+            // The eye on THIS row, found by the band it shares with the
+            // value: the login's password row has one too, and an absolute
+            // index into `Frame::eyes` would pin the order the pane happens
+            // to draw its cards in.
+            let eyes: Vec<&egui::Rect> = frame
+                .eyes
+                .iter()
+                .filter(|eye| box_.y_range().contains(eye.center().y))
+                .collect();
+            assert_eq!(
+                eyes.len(),
+                1,
+                "revealed={revealed}: the previous-password row shares its band with {} \
+                 reveal eyes, not the one it draws",
+                eyes.len()
+            );
+            let ink = frame.ink_of(source);
+            assert!(
+                ink.right() <= eyes[0].left(),
+                "revealed={revealed}: the value runs to x={} and its reveal eye starts at \
+                 x={}, so keeping it on one line put it under its own control",
+                ink.right(),
+                eyes[0].left()
+            );
+        }
     }
 
     fn a_login() -> VaultItem {
