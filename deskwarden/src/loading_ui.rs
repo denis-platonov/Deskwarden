@@ -133,7 +133,29 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
             ui.vertical_centered(|ui| {
                 theme::progress_bar(ui, NARROW_BAR);
                 ui.add_space(BAR_TO_LABEL);
-                ui.label(theme::semibold(message, LABEL_SIZE).color(theme::TEXT_SECONDARY));
+                // **Body weight, not the 600 cut.** Reported twice, as
+                // "Setting up your vcault text is wrong font" and then
+                // "Setting up your vault is bold for some reason".
+                //
+                // It was `theme::semibold`, which `theme` reserves for
+                // "buttons, row titles, field emphasis" -- and this is none of
+                // those. It is a status line: one sentence in
+                // `TEXT_SECONDARY`, at `LABEL_SIZE`, which is 13.0 and
+                // therefore exactly the size `TextStyle::Body` already
+                // resolves to. Plain text lands on `FontFamily::Proportional`,
+                // whose stack IS Archivo Regular (see `theme::REGULAR`), so
+                // asking for nothing is asking for the right thing.
+                //
+                // The weight was never specified: no design covers this
+                // screen. It came from this module setting every string it
+                // owns in SemiBold, headings and body copy alike -- see the
+                // other call sites, whose titles are correctly emphasised and
+                // whose sub-lines have the same defect this fixes here.
+                ui.label(
+                    egui::RichText::new(message)
+                        .size(LABEL_SIZE)
+                        .color(theme::TEXT_SECONDARY),
+                );
             });
         });
     action
@@ -882,6 +904,76 @@ mod spinner_body_tests {
             walk(&clipped.shape, &mut out);
         }
         out
+    }
+
+    /// **The status line is set in body weight, not the design's 600 cut.**
+    ///
+    /// Reported twice by the owner -- "wrong font", then "bold for some
+    /// reason" -- about the same sentence, because nothing pinned it. The
+    /// weight is not decorative here: `theme` reserves SemiBold for "buttons,
+    /// row titles, field emphasis", and a one-sentence status line in
+    /// `TEXT_SECONDARY` is none of those.
+    ///
+    /// Read off the galley's own `font_id`, which is what the renderer was
+    /// actually asked for, rather than off the source text -- the same reason
+    /// `rendered` walks glyphs instead of trusting `Galley::text()`.
+    #[test]
+    fn the_spinner_message_is_drawn_in_the_body_family_and_not_a_named_weight() {
+        fn families(output: &egui::FullOutput, wanted: &str) -> Vec<egui::FontFamily> {
+            fn walk(shape: &egui::Shape, wanted: &str, out: &mut Vec<egui::FontFamily>) {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        let drawn: String = text
+                            .galley
+                            .rows
+                            .iter()
+                            .flat_map(|row| row.glyphs.iter().map(|g| g.chr))
+                            .collect();
+                        if drawn.contains(wanted) {
+                            for section in &text.galley.job.sections {
+                                out.push(section.format.font_id.family.clone());
+                            }
+                        }
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            walk(shape, wanted, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in &output.shapes {
+                walk(&clipped.shape, wanted, &mut out);
+            }
+            out
+        }
+
+        let message = "Setting up your vault...";
+        let seen = families(&frame(message), message);
+        assert!(
+            !seen.is_empty(),
+            "control: the message was not found on any galley, so this test is reading nothing"
+        );
+        for family in &seen {
+            assert_eq!(
+                *family,
+                egui::FontFamily::Proportional,
+                "the status line is drawn in {family:?}. `Proportional` is Archivo Regular -- \
+                 see `theme::REGULAR` -- and a named family here is one of the emphasis cuts, \
+                 which is what the owner reads as bold"
+            );
+        }
+        // Control on the reader itself: the window's own TITLE, drawn by the
+        // chrome one call above, IS deliberately a named weight. Without this
+        // a reader that answered `Proportional` for everything would pass.
+        let heading = families(&frame(message), WINDOW_TITLE);
+        assert!(
+            heading.iter().any(|f| *f != egui::FontFamily::Proportional),
+            "control: nothing on this window is drawn in a named family, so the assertion \
+             above cannot tell a body weight from an emphasis one: {heading:?}"
+        );
     }
 
     #[test]
