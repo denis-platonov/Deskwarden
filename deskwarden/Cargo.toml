@@ -173,6 +173,73 @@ getrandom = "0.2"
 # Decodes fetched favicons to RGBA (src/favicon.rs); also used by the
 # ui_preview example's --screenshot mode to save the rendered overlay card
 # as a PNG for visual review.
+#
+# **It is also half of the ICO decoding in `favicon.rs`, whose other half is
+# HAND-WRITTEN -- and this block is the argument for that, because it is not
+# the argument `rqrr` makes below and must not be mistaken for it.**
+#
+# The problem first: `/favicon.ico` is the one icon path every web server
+# answers whether or not anybody configured it, so a large share of what both
+# the icon service and a direct fetch hand back is a Windows icon file rather
+# than a PNG. Measured against the owner's own vault rather than assumed:
+# `play.google.com` (4286 bytes, `image/x-icon`), `adobe.com` (15086 bytes,
+# `image/x-icon`) and `clients.amazonworkspaces.com` (15086 bytes,
+# `image/vnd.microsoft.icon`) all answered 200 with a real icon. Note the two
+# different MIME types for one format, which is why `favicon.rs` sniffs magic
+# bytes and never a `Content-Type`.
+#
+# **The obvious answer was `image` with its `ico` feature, and the honest
+# measurement is that it would have been CHEAPER than it looks.** `image
+# 0.25.10` is ALREADY in this tree -- `cargo tree -i image` -- pulled by
+# `arboard` for `egui-winit`'s clipboard image data, with exactly its `bmp`
+# and `png` features on. `image`'s `ico = ["bmp", "png"]`, both of which are
+# therefore already enabled, so turning it on would have added ZERO crates
+# and zero new feature-gated dependencies. **The "large transitive tree"
+# sentence under `rqrr` below does NOT apply here**, and borrowing it would
+# have been a rationalisation rather than a reason.
+#
+# It was still refused, on three narrower grounds:
+#
+#  * It would make this crate a DIRECT dependent of `image`, whose version is
+#    currently chosen entirely by `eframe`. A second constraint on a name this
+#    app does not otherwise talk to means an `eframe` bump that moves `image`
+#    forward either duplicates it in the tree or forces a coordinated edit
+#    here -- recurring cost, for a container format with no compression in it.
+#  * Cargo features are additive and unified, so `image/ico` would be on for
+#    `arboard` too: clipboard image data would start accepting ICO. That is a
+#    different untrusted-input path, widened to fix a favicon.
+#  * The part that actually needed writing is not the container. `favicon.rs`
+#    picks the entry closest ABOVE its own display target and breaks ties on
+#    colour depth, because its resampler never upscales; a general-purpose
+#    decoder returns one image on its own rule, so the directory walk would
+#    have been written here regardless. What delegation would have saved is
+#    the ~90-line bottom-up DIB row walk, and nothing else.
+#
+# A dedicated `ico` crate was the third candidate, refused on the smallest
+# margin of all: one more registry name to pin, review and re-audit at every
+# bump, for those same ~90 lines.
+#
+# **Hand-parsing an untrusted format is normally the wrong call, so the
+# argument that it is acceptable here is specifically about THIS format's
+# shape.** An ICO container is a fixed 6-byte header, a table of fixed
+# 16-byte entries, and a payload that is either a whole PNG -- handed
+# straight back to this crate, because `favicon.rs` writes no second PNG
+# decoder -- or an uncompressed `BITMAPINFOHEADER` bitmap. No compression to
+# implement, no back-references, no state machine, no variable-length
+# encoding, no recursion: every field is a fixed-width integer at a fixed
+# offset, and the decoder is bounds checks plus a row walk. It allocates
+# exactly one buffer, sized `width * height * 4` with both dimensions refused
+# above 256, so no header field ever sizes an allocation. Compressed
+# (`biCompression != 0`) and non-`BITMAPINFOHEADER` payloads are refused
+# outright rather than guessed at, and every malformed shape answers `None`,
+# which the caller already treats as "this item keeps its monogram".
+#
+# That last claim is held up by tests rather than by this paragraph. The
+# `favicon` test module builds the malformed containers itself -- truncated
+# headers, a zero entry count, offsets past the end, byte sizes larger than
+# the file, absurd dimensions, a payload that is neither PNG nor DIB, and a
+# cursor wearing an icon's layout -- and asserts `None` rather than a panic
+# for each. No test in this crate fetches anything over the network.
 png = "0.17"
 # Reads a QR code out of a captured region or an image file (src/qr.rs), so a
 # user can add a one-time code by dragging a box around the QR already on

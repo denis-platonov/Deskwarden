@@ -833,8 +833,9 @@ fn u32le(bytes: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
 }
 
-/// Reads a `.ico` container and returns its **largest** image, or `None` for
-/// bytes that are not an icon file at all.
+/// Reads a `.ico` container and returns the one image best suited to being
+/// drawn at [`ICON_TARGET_PX`], or `None` for bytes that are not an icon file
+/// at all. The rule is spelled out at the loop below.
 ///
 /// `None` is the answer for anything unrecognised rather than an error,
 /// because that is what lets [`decode_rgba_unscaled`] dispatch on magic: a
@@ -859,11 +860,35 @@ fn ico_best_image(bytes: &[u8]) -> Option<IcoImage<'_>> {
         return None;
     }
 
-    // Largest by pixel area, ties broken by colour depth: a 32x32 32-bit
-    // entry beside a 32x32 4-bit one is the one worth drawing. A width or
-    // height byte of 0 means 256, which is the format's way of fitting 256
-    // into a byte and reads as the *smallest* entry if taken literally.
-    let mut best: Option<(u64, usize, usize)> = None;
+    // **THE SELECTION RULE, stated once: the SMALLEST entry whose longest
+    // edge still reaches [`ICON_TARGET_PX`], or -- when no entry reaches it
+    // -- the LARGEST one there is. Ties on size go to the greater colour
+    // depth.**
+    //
+    // "Largest wins" is what stood here first, and it is wrong in the
+    // ordinary case rather than an exotic one. A modern `.ico` carries a
+    // 256x256 PNG beside its 16/32/48 bitmaps, so "largest" means decoding a
+    // 65,536-pixel image on the icon thread and then discarding 94% of it in
+    // [`resample_for_display`] -- per item, to paint 64 physical pixels. The
+    // smallest entry that still needs no magnification produces a
+    // byte-identical result on screen for a fraction of the work.
+    //
+    // The floor is at-or-above rather than nearest **because
+    // [`resample_for_display`] never upscales**: an entry below the target is
+    // not stretched up to fill the tile, it is simply drawn smaller than the
+    // tile allows. Rounding down to a "closer" 48 when a 64 is sitting in the
+    // same file would therefore lose real detail that was already paid for,
+    // which is not a trade the target size is asking for.
+    //
+    // Depth breaks a size tie because a 32x32 32-bit entry beside a 32x32
+    // 4-bit one is the one worth drawing, and containers written for Windows
+    // XP really do carry both.
+    //
+    // A width or height byte of 0 means 256 -- the format's way of fitting
+    // 256 into a byte -- and reads as the *smallest* entry if taken
+    // literally, which would make the 256x256 PNG the entry this rule always
+    // fell back to whenever nothing reached the target.
+    let mut best: Option<((u64, u64, u64), usize, usize)> = None;
     for i in 0..count {
         let entry = 6 + i * 16;
         let width = if bytes[entry] == 0 { 256u64 } else { bytes[entry] as u64 };
@@ -874,9 +899,19 @@ fn ico_best_image(bytes: &[u8]) -> Option<IcoImage<'_>> {
         if len == 0 || offset.saturating_add(len) > bytes.len() {
             continue;
         }
-        let score = width * height * 256 + depth;
-        if best.is_none_or(|(best_score, _, _)| score > best_score) {
-            best = Some((score, offset, len));
+        // Ranked left to right, greater wins. Both dimensions come out of a
+        // single byte whose 0 has already been read as 256, so `edge` is in
+        // `1..=256` and `256 - edge` cannot underflow -- the subtraction is
+        // what turns "smaller is better" into "greater wins" inside the tier
+        // that already clears the target.
+        let edge = width.max(height);
+        let rank = if edge >= ICON_TARGET_PX as u64 {
+            (1, 256 - edge, depth)
+        } else {
+            (0, edge, depth)
+        };
+        if best.is_none_or(|(best_rank, _, _)| rank > best_rank) {
+            best = Some((rank, offset, len));
         }
     }
 
@@ -1921,39 +1956,117 @@ mod tests {
     // ICO decoding -- what a direct `/favicon.ico` actually returns
     // -----------------------------------------------------------------
 
-    /// Wraps `payload` in a single-entry `.ico` container.
-    fn ico_of(width: u8, height: u8, bpp: u16, payload: &[u8]) -> Vec<u8> {
+    /// Assembles an `.ico`/`.cur` container: `kind` is the `ICONDIR` type
+    /// field (1 = icon, 2 = cursor) and each entry is
+    /// `(width, height, bit count, payload)`, with a stored dimension of 0
+    /// meaning 256 exactly as the format says.
+    ///
+    /// **One builder, deliberately.** Every ICO fixture below differs only in
+    /// its table, and a second hand-written header is how two fixtures come to
+    /// disagree about the format they are both supposed to be exercising --
+    /// at which point a test failure says nothing about the decoder. Payloads
+    /// are laid down after the whole directory, in table order, which is what
+    /// a real writer does.
+    fn ico_container(kind: u16, entries: &[(u8, u8, u16, Vec<u8>)]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&0u16.to_le_bytes()); // reserved
-        out.extend_from_slice(&1u16.to_le_bytes()); // type: icon
-        out.extend_from_slice(&1u16.to_le_bytes()); // one entry
-        out.push(width);
-        out.push(height);
-        out.push(0); // palette size
-        out.push(0); // reserved
-        out.extend_from_slice(&1u16.to_le_bytes()); // colour planes
-        out.extend_from_slice(&bpp.to_le_bytes());
-        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        out.extend_from_slice(&22u32.to_le_bytes()); // offset: right after this entry
-        out.extend_from_slice(payload);
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        let mut offset = 6 + entries.len() * 16;
+        for (width, height, bpp, payload) in entries {
+            out.push(*width);
+            out.push(*height);
+            out.push(0); // colour count: 0 = "not stated in the directory"
+            out.push(0); // reserved
+            out.extend_from_slice(&1u16.to_le_bytes()); // colour planes
+            out.extend_from_slice(&bpp.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(offset as u32).to_le_bytes());
+            offset += payload.len();
+        }
+        for (_, _, _, payload) in entries {
+            out.extend_from_slice(payload);
+        }
+        out
+    }
+
+    /// The single-entry container, which most of these fixtures are. Its
+    /// payload therefore always begins at byte 22 (6 + one 16-byte entry),
+    /// which the patching helpers below rely on.
+    fn ico_of(width: u8, height: u8, bpp: u16, payload: &[u8]) -> Vec<u8> {
+        ico_container(1, &[(width, height, bpp, payload.to_vec())])
+    }
+
+    /// Assembles a `BITMAPINFOHEADER` icon payload out of already-padded,
+    /// already-bottom-up rows: header, palette, XOR colour rows, and -- when
+    /// `mask_rows` is `Some` -- the 1-bit AND mask.
+    ///
+    /// `biHeight` is written **doubled**, which is the one thing about this
+    /// header that is peculiar to icons rather than to bitmaps: the field
+    /// counts the colour rows and the mask rows together.
+    fn dib_payload(
+        width: usize,
+        height: usize,
+        bpp: u16,
+        palette: &[[u8; 4]],
+        xor_rows: &[u8],
+        mask_rows: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&40u32.to_le_bytes()); // biSize
+        out.extend_from_slice(&(width as i32).to_le_bytes()); // biWidth
+        out.extend_from_slice(&((height * 2) as i32).to_le_bytes()); // biHeight, doubled
+        out.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+        out.extend_from_slice(&bpp.to_le_bytes()); // biBitCount
+        out.extend_from_slice(&0u32.to_le_bytes()); // biCompression: BI_RGB
+        out.extend_from_slice(&0u32.to_le_bytes()); // biSizeImage
+        out.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+        out.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+        out.extend_from_slice(&(palette.len() as u32).to_le_bytes()); // biClrUsed
+        out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+        for entry in palette {
+            out.extend_from_slice(entry);
+        }
+        out.extend_from_slice(xor_rows);
+        if let Some(mask) = mask_rows {
+            out.extend_from_slice(mask);
+        }
         out
     }
 
     /// A 2x2 32-bit uncompressed icon payload: header, bottom-up BGRA, then
-    /// an all-clear AND mask.
+    /// an all-clear AND mask. At 32bpp a row is exactly `width * 4` bytes, so
+    /// no padding is involved and the four quads are the whole image.
     fn dib_2x2_bgra(pixels: [[u8; 4]; 4]) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&40u32.to_le_bytes()); // biSize
-        out.extend_from_slice(&2i32.to_le_bytes()); // biWidth
-        out.extend_from_slice(&4i32.to_le_bytes()); // biHeight: 2x the real height
-        out.extend_from_slice(&1u16.to_le_bytes()); // planes
-        out.extend_from_slice(&32u16.to_le_bytes()); // bit count
-        out.extend_from_slice(&0u32.to_le_bytes()); // compression: none
-        out.extend_from_slice(&[0u8; 20]); // sizes, resolutions, palette counts
-        for pixel in pixels {
-            out.extend_from_slice(&pixel);
+        let xor: Vec<u8> = pixels.iter().flatten().copied().collect();
+        dib_payload(2, 2, 32, &[], &xor, Some(&[0u8; 8]))
+    }
+
+    /// A `size`x`size` fully opaque 32-bit payload in one flat colour, for
+    /// the tests that care about the size that comes out rather than about
+    /// which pixel went where.
+    fn solid_dib(size: usize, [red, green, blue]: [u8; 3]) -> Vec<u8> {
+        let mut xor = Vec::with_capacity(size * size * 4);
+        for _ in 0..size * size {
+            xor.extend_from_slice(&[blue, green, red, 0xff]);
         }
-        out.extend_from_slice(&[0u8; 8]); // AND mask: two rows, 4 bytes each
+        let mask = vec![0u8; size.div_ceil(32) * 4 * size];
+        dib_payload(size, size, 32, &[], &xor, Some(&mask))
+    }
+
+    /// A single-entry container with one field of its **directory entry**
+    /// overwritten in place; `at` is an offset into the 16-byte entry.
+    fn ico_with_entry_patch(at: usize, value: &[u8]) -> Vec<u8> {
+        let mut out = ico_of(2, 2, 32, &dib_2x2_bgra([[0xff; 4]; 4]));
+        out[6 + at..6 + at + value.len()].copy_from_slice(value);
+        out
+    }
+
+    /// A single-entry container with one field of its **DIB payload**
+    /// overwritten in place; `at` is an offset into the payload.
+    fn ico_with_payload_patch(at: usize, value: &[u8]) -> Vec<u8> {
+        let mut out = ico_of(2, 2, 32, &dib_2x2_bgra([[0xff; 4]; 4]));
+        out[22 + at..22 + at + value.len()].copy_from_slice(value);
         out
     }
 
@@ -2033,6 +2146,398 @@ mod tests {
         // so the `None` above is the bounds check and not a broken fixture.
         let intact = ico_of(2, 2, 32, &dib_2x2_bgra([[0xff; 4]; 4]));
         assert!(decode_rgba_unscaled(&intact).is_some());
+    }
+
+    /// **24bpp, and the AND mask that is the only transparency it has.**
+    ///
+    /// A 24-bit payload carries no alpha channel at all, so ignoring the mask
+    /// draws the icon inside an opaque rectangle of whatever the artist left
+    /// in the background -- the failure the mask exists to prevent, and one
+    /// that looks like a bug in this app rather than in the icon.
+    ///
+    /// This fixture also carries **row padding**: at 24bpp a 2-pixel row is 6
+    /// bytes of colour and a DIB row is padded to a 4-byte boundary, so each
+    /// row is 8 bytes with two bytes that must be skipped. The padding is
+    /// deliberately `0xAA` rather than zero, so reading it as a pixel would
+    /// show up as a colour rather than as black.
+    #[test]
+    fn a_24bpp_payload_takes_its_transparency_from_the_and_mask() {
+        let xor: Vec<u8> = vec![
+            // Bottom row first: blue, white, then two bytes of padding.
+            0xff, 0x00, 0x00,  0xff, 0xff, 0xff,  0xaa, 0xaa,
+            // Top row: red, green, padding.
+            0x00, 0x00, 0xff,  0x00, 0xff, 0x00,  0xaa, 0xaa,
+        ];
+        // The mask is bottom-up too. A SET bit means "AND the screen
+        // through", i.e. transparent: 0x40 is bit 1 of the top row, which is
+        // the top-RIGHT pixel.
+        let mask: Vec<u8> = vec![0x00, 0, 0, 0, 0x40, 0, 0, 0];
+        let bytes = ico_of(2, 2, 24, &dib_payload(2, 2, 24, &[], &xor, Some(&mask)));
+
+        let (width, height, rgba) = decode_rgba_unscaled(&bytes).expect("a 24bpp ICO decodes");
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(pixel_at(&rgba, 2, 0, 0), [255, 0, 0, 255], "top-left is not red");
+        assert_eq!(
+            pixel_at(&rgba, 2, 1, 0),
+            [0, 255, 0, 0],
+            "the top-right pixel is not transparent, so the AND mask was ignored"
+        );
+        assert_eq!(pixel_at(&rgba, 2, 0, 1), [0, 0, 255, 255], "bottom-left is not blue");
+        assert_eq!(pixel_at(&rgba, 2, 1, 1), [255, 255, 255, 255], "bottom-right is not white");
+    }
+
+    /// **A 32bpp payload whose alpha channel is uniformly zero is not an
+    /// invisible icon**, it is one whose author left transparency to the mask
+    /// -- which real tools do. Honouring the alpha literally would draw
+    /// nothing at all, so the mask decides, and with no mask present the
+    /// payload is read as opaque rather than as absent.
+    #[test]
+    fn a_32bpp_payload_with_no_alpha_at_all_falls_back_to_the_mask() {
+        // Every quad alpha 0; only the top-left is marked transparent by the
+        // mask, so the other three must come back opaque.
+        let flat = dib_2x2_bgra([
+            [0x00, 0x00, 0xff, 0x00],
+            [0x00, 0xff, 0x00, 0x00],
+            [0xff, 0x00, 0x00, 0x00],
+            [0xff, 0xff, 0xff, 0x00],
+        ]);
+        let mut masked = flat.clone();
+        // The mask is the last 8 bytes; 0x80 is bit 0 of the top row.
+        let mask_at = masked.len() - 8;
+        masked[mask_at + 4] = 0x80;
+        let (_, _, rgba) =
+            decode_rgba_unscaled(&ico_of(2, 2, 32, &masked)).expect("decodes");
+        assert_eq!(pixel_at(&rgba, 2, 0, 0)[3], 0, "the mask did not make the top-left clear");
+        assert_eq!(pixel_at(&rgba, 2, 1, 0)[3], 255, "the top-right was not made opaque");
+        assert_eq!(pixel_at(&rgba, 2, 1, 1)[3], 255, "the bottom-right was not made opaque");
+
+        // And with the mask cut off entirely, every pixel is opaque rather
+        // than the whole icon vanishing.
+        let no_mask = &flat[..flat.len() - 8];
+        let (_, _, rgba) = decode_rgba_unscaled(&ico_of(2, 2, 32, no_mask)).expect("decodes");
+        assert!(
+            rgba.chunks_exact(4).all(|p| p[3] == 255),
+            "a 32bpp payload with no alpha and no mask decoded to an invisible image"
+        );
+    }
+
+    /// **Palettised depths are SUPPORTED, not refused**, and this is the
+    /// evidence. 8/4/1bpp icons are rarer than 32bpp but they are what a
+    /// favicon written for Windows XP looks like, and the palette walk is the
+    /// part of this decoder most likely to be quietly dropped as "nobody uses
+    /// that" -- at which point those sites lose their icon with no error
+    /// anywhere.
+    ///
+    /// The palette is BGRA quads, so a swapped channel shows up as the wrong
+    /// primary rather than as a near-miss.
+    #[test]
+    fn an_8bpp_palettised_payload_resolves_its_indices_through_the_palette() {
+        let palette = [
+            [0x00, 0x00, 0xff, 0x00], // 0: red
+            [0x00, 0xff, 0x00, 0x00], // 1: green
+            [0xff, 0x00, 0x00, 0x00], // 2: blue
+            [0xff, 0xff, 0xff, 0x00], // 3: white
+        ];
+        // 4 bytes a row (one index per pixel, padded to 4), bottom-up.
+        let xor: Vec<u8> = vec![2, 3, 0xaa, 0xaa, 0, 1, 0xaa, 0xaa];
+        let bytes = ico_of(2, 2, 8, &dib_payload(2, 2, 8, &palette, &xor, Some(&[0u8; 8])));
+
+        let (width, height, rgba) = decode_rgba_unscaled(&bytes).expect("an 8bpp ICO decodes");
+        assert_eq!((width, height), (2, 2));
+        assert_eq!(pixel_at(&rgba, 2, 0, 0), [255, 0, 0, 255], "top-left is not red");
+        assert_eq!(pixel_at(&rgba, 2, 1, 0), [0, 255, 0, 255], "top-right is not green");
+        assert_eq!(pixel_at(&rgba, 2, 0, 1), [0, 0, 255, 255], "bottom-left is not blue");
+        assert_eq!(pixel_at(&rgba, 2, 1, 1), [255, 255, 255, 255], "bottom-right is not white");
+    }
+
+    /// **The selection rule, on a container that punishes every simpler
+    /// rule.** A real `.ico` carries several sizes and the entry that should
+    /// be drawn is neither the first in the table nor the biggest in the file:
+    /// it is the smallest one that still reaches `ICON_TARGET_PX`, because
+    /// `resample_for_display` never magnifies and everything above the target
+    /// is decoded only to be thrown away.
+    ///
+    /// The table is deliberately out of order, so "take the first" and "take
+    /// the last" both fail, and it carries a 256x256 PNG stored with a 0 in
+    /// the width byte -- which is how the format writes 256, and which reads
+    /// as the SMALLEST entry to anything that takes the byte literally.
+    #[test]
+    fn the_entry_drawn_is_the_smallest_one_that_still_reaches_the_target() {
+        let big_png = rgba_png(256, 256, &vec![0xff; 256 * 256 * 4]);
+        let bytes = ico_container(
+            1,
+            &[
+                (16, 16, 32, solid_dib(16, [0xff, 0x00, 0x00])), // red
+                (0, 0, 32, big_png),                             // 0 means 256
+                (64, 64, 32, solid_dib(64, [0x00, 0x00, 0xff])), // blue
+                (32, 32, 32, solid_dib(32, [0x00, 0xff, 0x00])), // green
+            ],
+        );
+        let (width, height, rgba) = decode_rgba_unscaled(&bytes).expect("decodes");
+        assert_eq!(
+            (width, height),
+            (64, 64),
+            "the 64x64 entry is the smallest that reaches the 64px target; a 256 here means \
+             'largest wins' and a 16 means 'first wins'"
+        );
+        assert_eq!(pixel_at(&rgba, 64, 0, 0), [0, 0, 255, 255], "that is not the blue entry");
+
+        // Nothing reaches the target: the largest available wins, because
+        // there is nothing better to have.
+        let small = ico_container(
+            1,
+            &[
+                (16, 16, 32, solid_dib(16, [0xff, 0x00, 0x00])),
+                (32, 32, 32, solid_dib(32, [0x00, 0xff, 0x00])),
+            ],
+        );
+        let (width, height, rgba) = decode_rgba_unscaled(&small).expect("decodes");
+        assert_eq!((width, height), (32, 32), "with nothing at the target, the largest wins");
+        assert_eq!(pixel_at(&rgba, 32, 0, 0), [0, 255, 0, 255], "that is not the green entry");
+
+        // Two above the target: the smaller of the two, not the larger.
+        let above = ico_container(
+            1,
+            &[
+                (96, 96, 32, solid_dib(96, [0xff, 0x00, 0xff])),
+                (64, 64, 32, solid_dib(64, [0x00, 0x00, 0xff])),
+            ],
+        );
+        let (width, height, _) = decode_rgba_unscaled(&above).expect("decodes");
+        assert_eq!((width, height), (64, 64), "96 was picked over 64, both of which clear 64");
+    }
+
+    /// The tie-break: same size, greater colour depth wins. Containers
+    /// written for Windows XP really do carry a 4-bit entry beside a 32-bit
+    /// one at the same dimensions, and the 4-bit one is not the one to draw.
+    ///
+    /// Both payloads are VALID, so a wrong answer here is a wrong choice and
+    /// never a fallback -- the control at the end decodes the 4-bit entry on
+    /// its own to prove it.
+    #[test]
+    fn a_size_tie_is_broken_by_colour_depth() {
+        // 4bpp, 2x2: one index per nibble, rows padded to 4 bytes. Both
+        // palette entries are the same dark red, so any pixel identifies it.
+        let dark = [[0x00, 0x00, 0x80, 0x00], [0x00, 0x00, 0x80, 0x00]];
+        let four_bit = dib_payload(2, 2, 4, &dark, &[0x00, 0, 0, 0, 0x00, 0, 0, 0], Some(&[0u8; 8]));
+        let full = dib_2x2_bgra([[0x00, 0xff, 0x00, 0xff]; 4]); // bright green
+
+        // The 4-bit entry is FIRST in the table, so "take the first" cannot
+        // explain a pass here either.
+        let bytes = ico_container(1, &[(2, 2, 4, four_bit.clone()), (2, 2, 32, full)]);
+        let (_, _, rgba) = decode_rgba_unscaled(&bytes).expect("decodes");
+        assert_eq!(
+            pixel_at(&rgba, 2, 0, 0),
+            [0, 255, 0, 255],
+            "the 4-bit entry was drawn in preference to the 32-bit one at the same size"
+        );
+
+        // Control: the losing entry is a perfectly good icon on its own, so
+        // the assertion above is about the CHOICE and not about a decode
+        // that failed.
+        let alone = decode_rgba_unscaled(&ico_of(2, 2, 4, &four_bit)).expect("the 4bpp decodes");
+        assert_eq!(pixel_at(&alone.2, 2, 0, 0), [128, 0, 0, 255]);
+    }
+
+    /// **A cursor is refused, and it has to be refused explicitly.** A `.cur`
+    /// file has byte-for-byte the icon layout with a 2 in the type field, and
+    /// puts HOTSPOT COORDINATES where an icon puts its colour planes and bit
+    /// count -- so a decoder that shrugs at the type field is not being
+    /// lenient, it is ranking entries by two invented numbers.
+    #[test]
+    fn a_cursor_is_not_decoded_as_an_icon() {
+        let payload = dib_2x2_bgra([[0xff; 4]; 4]);
+        let cursor = ico_container(2, &[(2, 2, 32, payload.clone())]);
+        assert_eq!(decode_rgba_unscaled(&cursor), None, "a type-2 cursor decoded as an icon");
+        // The control: the identical table with a 1 in the type field does
+        // decode, so the refusal above is the type check and nothing else.
+        let icon = ico_container(1, &[(2, 2, 32, payload)]);
+        assert!(
+            decode_rgba_unscaled(&icon).is_some(),
+            "the control container does not decode, so the cursor assertion proves nothing"
+        );
+    }
+
+    /// **Every malformed shape, asserted as `None` rather than as a panic.**
+    ///
+    /// These bytes arrive from a host named in somebody's vault, on the icon
+    /// thread, with no `catch_unwind` anywhere above them. So the assertion
+    /// is "no image", and the fact that the process is still alive to make it
+    /// is the other half of what is being tested: an index out of range here
+    /// is a crash reached from a favicon.
+    ///
+    /// Listed with a label each, because a bare table of byte vectors that
+    /// goes red tells whoever reads it nothing about which shape regressed.
+    #[test]
+    fn every_malformed_icon_shape_answers_none_rather_than_panicking() {
+        let good = dib_2x2_bgra([[0xff; 4]; 4]);
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("no bytes at all", Vec::new()),
+            ("an ICONDIR truncated mid-field", vec![0u8, 0, 1, 0, 1]),
+            ("an ICONDIRENTRY truncated mid-entry", {
+                let mut bytes = ico_of(2, 2, 32, &good);
+                bytes.truncate(6 + 9);
+                bytes
+            }),
+            ("an image count of zero", vec![0u8, 0, 1, 0, 0, 0]),
+            ("an image count far larger than the file", {
+                let mut bytes = ico_of(2, 2, 32, &good);
+                bytes[4..6].copy_from_slice(&4000u16.to_le_bytes());
+                bytes
+            }),
+            ("a reserved field that is not zero", {
+                let mut bytes = ico_of(2, 2, 32, &good);
+                bytes[0..2].copy_from_slice(&1u16.to_le_bytes());
+                bytes
+            }),
+            (
+                "an entry offset past the end of the file",
+                ico_with_entry_patch(12, &9_000_000u32.to_le_bytes()),
+            ),
+            (
+                "a byte size larger than the file",
+                ico_with_entry_patch(8, &9_000_000u32.to_le_bytes()),
+            ),
+            ("a byte size of zero", ico_with_entry_patch(8, &0u32.to_le_bytes())),
+            (
+                "a payload that is neither PNG nor a DIB",
+                ico_of(2, 2, 32, b"not an image, just some bytes"),
+            ),
+            (
+                "a DIB header that is not a BITMAPINFOHEADER",
+                ico_with_payload_patch(0, &124u32.to_le_bytes()),
+            ),
+            ("an RLE-compressed DIB", ico_with_payload_patch(16, &1u32.to_le_bytes())),
+            ("a DIB width of zero", ico_with_payload_patch(4, &0i32.to_le_bytes())),
+            ("a negative DIB width", ico_with_payload_patch(4, &(-2i32).to_le_bytes())),
+            ("a negative DIB height", ico_with_payload_patch(8, &(-4i32).to_le_bytes())),
+            (
+                "an odd DIB height, which cannot be XOR rows plus AND rows",
+                ico_with_payload_patch(8, &3i32.to_le_bytes()),
+            ),
+            (
+                "a colour depth this decoder does not speak",
+                ico_with_payload_patch(14, &2u16.to_le_bytes()),
+            ),
+            (
+                "absurd dimensions",
+                ico_of(2, 2, 32, &dib_payload(100_000, 100_000, 32, &[], &[0u8; 16], None)),
+            ),
+            // The allocation guard specifically: the header claims 65,536
+            // pixels and the file carries twelve bytes. The bounds check has
+            // to come BEFORE the `width * height * 4` buffer, or this is a
+            // megabyte allocated on a stranger's say-so and then an index
+            // straight off the end of the payload.
+            (
+                "a DIB claiming 256x256 with twelve bytes of pixels",
+                ico_of(0, 0, 32, &dib_payload(256, 256, 32, &[], &[0u8; 12], None)),
+            ),
+            ("a DIB that stops inside its colour rows", {
+                let mut payload = good.clone();
+                payload.truncate(40 + 4);
+                ico_of(2, 2, 32, &payload)
+            }),
+            ("a palette index past the end of the palette", {
+                let palette = [[0x00, 0x00, 0xff, 0x00], [0x00, 0xff, 0x00, 0x00]];
+                let xor = vec![9u8, 9, 0, 0, 9, 9, 0, 0];
+                ico_of(2, 2, 8, &dib_payload(2, 2, 8, &palette, &xor, Some(&[0u8; 8])))
+            }),
+        ];
+
+        for (what_is_wrong, bytes) in cases {
+            assert_eq!(
+                decode_rgba_unscaled(&bytes),
+                None,
+                "{what_is_wrong}: these bytes decoded to an image"
+            );
+        }
+
+        // The control for the whole table: the fixture every case above was
+        // damaged from is itself a working icon, so none of those `None`s is
+        // a builder that never produced anything.
+        assert!(
+            decode_rgba_unscaled(&ico_of(2, 2, 32, &good)).is_some(),
+            "the undamaged fixture does not decode, so the table proves nothing"
+        );
+    }
+
+    /// **The whole pipeline, end to end: an ICO in, and the pixels the
+    /// renderer is handed out.** Asserting `is_some()` would pass for a
+    /// decoder that returned a single grey pixel, so this asserts the size
+    /// the sizing rules promise AND the colour that proves the BGRA order and
+    /// the premultiplied average both survived the reduction.
+    #[test]
+    fn an_ico_lands_on_the_display_target_with_its_colours_intact() {
+        // Above the target, so this walks decode -> trim -> box downscale.
+        let big = ico_of(96, 96, 32, &solid_dib(96, [0x20, 0x90, 0xd0]));
+        let (width, height, rgba) = decode_rgba(&big).expect("a 96x96 ICO decodes");
+        assert_eq!(
+            (width, height),
+            (64, 64),
+            "an oversized ICO did not arrive at the display target"
+        );
+        assert_eq!(rgba.len(), 64 * 64 * 4);
+        assert_eq!(
+            pixel_at(&rgba, 64, 32, 32),
+            [0x20, 0x90, 0xd0, 0xff],
+            "the reduction moved the colour, so either the BGRA order or the premultiplied \
+             average is wrong"
+        );
+
+        // Below the target, so this walks the never-upscale rule instead.
+        let small = ico_of(32, 32, 32, &solid_dib(32, [0x11, 0x22, 0x33]));
+        let (width, height, rgba) = decode_rgba(&small).expect("a 32x32 ICO decodes");
+        assert_eq!((width, height), (32, 32), "a source below the target was magnified");
+        assert_eq!(pixel_at(&rgba, 32, 0, 0), [0x11, 0x22, 0x33, 0xff]);
+    }
+
+    /// **What must NOT start decoding just because a second container format
+    /// did.**
+    ///
+    /// Two of the owner's seven failing domains answered `200` with something
+    /// that is not an icon: a generic "Globe icon" SVG placeholder, and a
+    /// 128x128 PNG whose every pixel is transparent. Both are correctly
+    /// unusable today and both must stay that way -- the item's monogram is a
+    /// better answer than a blank square, and "we added a format, so accept
+    /// anything" is exactly the change this test is here to redden.
+    ///
+    /// The blank PNG is asserted as **no drawable pixels** rather than as a
+    /// specific shape, because `decode_rgba` currently answers
+    /// `Some((0, 0, vec![]))` for it (the transparent-border trim consumes the
+    /// whole image) rather than `None`. Either is a refusal; pinning the
+    /// weaker of the two keeps this test true if that is ever tightened.
+    #[test]
+    fn a_placeholder_svg_and_a_blank_png_still_yield_no_icon() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+             <title>Globe icon</title><circle cx="12" cy="12" r="10"/></svg>"#;
+        assert_eq!(decode_rgba_unscaled(svg), None, "an SVG body decoded as an image");
+        assert_eq!(decode_rgba(svg), None, "an SVG body decoded as an image");
+
+        let has_no_pixels = |decoded: &Option<(usize, usize, Vec<u8>)>| {
+            decoded.as_ref().is_none_or(|(w, h, px)| *w == 0 || *h == 0 || px.is_empty())
+        };
+        let blank = rgba_png(128, 128, &vec![0u8; 128 * 128 * 4]);
+        let decoded = decode_rgba(&blank);
+        assert!(
+            has_no_pixels(&decoded),
+            "a fully transparent PNG came back as a drawable icon: {:?}",
+            decoded.as_ref().map(|(w, h, px)| (*w, *h, px.len()))
+        );
+
+        // And the ICO wrapper is not a way around either answer: the same
+        // blank PNG inside a container is still nothing to draw.
+        let wrapped = decode_rgba(&ico_of(128, 128, 32, &blank));
+        assert!(
+            has_no_pixels(&wrapped),
+            "wrapping a blank PNG in an ICO turned it into an icon: {:?}",
+            wrapped.as_ref().map(|(w, h, px)| (*w, *h, px.len()))
+        );
+
+        // The control: an opaque PNG of the same size is still accepted, so
+        // the assertions above are about blankness and not about a decoder
+        // that stopped working.
+        let opaque = rgba_png(128, 128, &vec![0x7fu8; 128 * 128 * 4]);
+        assert!(!has_no_pixels(&decode_rgba(&opaque)), "an ordinary PNG stopped decoding");
     }
 
     // -----------------------------------------------------------------

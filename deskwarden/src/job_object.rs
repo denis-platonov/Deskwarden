@@ -2470,7 +2470,34 @@ mod tests {
             //
             // 17484 bytes, new hash: and on to 0.15.19-dev the commit after,
             // per `Cargo.toml`'s rule. No dependency changed.
-            (17484, 0x8fea_7c18_c6c9_0d5e_u64),
+            //
+            // **21763 bytes, new hash: NOT A DEPENDENCY EDIT AT ALL -- this
+            // hop is comment only, and this ledger is worth nothing if it
+            // does not say so out loud.** The `png` entry grew the argument
+            // for why the ICO decoding in `src/favicon.rs` is HAND-WRITTEN
+            // rather than delegated to `image`'s `ico` feature or to a
+            // dedicated `ico` crate. That argument is recorded there rather
+            // than here because it includes a measurement worth not losing:
+            // `image` is ALREADY in this tree via `arboard`, with `bmp` and
+            // `png` on, and `image`'s `ico = ["bmp", "png"]` -- so the
+            // delegated route would have added no crate at all, and the
+            // "large transitive tree" reasoning that `rqrr` rests on does not
+            // transfer to it.
+            //
+            // Nothing this pin exists to notice moved: no name added, removed
+            // or re-pointed, no `[patch]`, `[replace]` or
+            // `[workspace.dependencies]` table, no path or fork, not one
+            // feature list touched, and `[build-dependencies]` still reads
+            // exactly `winresource = "0.1"`. 17484 -> 21763 bytes, every one
+            // of the 4279 new bytes a `#` comment.
+            //
+            // The hash was recomputed independently -- FNV-1a/64 over the
+            // file with CRLF normalised to LF, in a separate implementation
+            // outside this crate -- rather than copied out of the failure
+            // message. That implementation was first run against the PREVIOUS
+            // pinned pair and reproduced (17484, 0x8fea_7c18_c6c9_0d5e)
+            // exactly, so it is measuring what this test measures.
+            (21763, 0xb612_6058_b89a_c276_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
