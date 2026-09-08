@@ -151,11 +151,7 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
                 // owns in SemiBold, headings and body copy alike -- see the
                 // other call sites, whose titles are correctly emphasised and
                 // whose sub-lines have the same defect this fixes here.
-                ui.label(
-                    egui::RichText::new(message)
-                        .size(LABEL_SIZE)
-                        .color(theme::TEXT_SECONDARY),
-                );
+                ui.label(theme::regular(message, LABEL_SIZE).color(theme::TEXT_SECONDARY));
             });
         });
     action
@@ -629,7 +625,7 @@ pub fn draw_first_window_body(
                     ui.label(theme::semibold("Loading your vault", TITLE_SIZE).color(theme::INK));
                     ui.add_space(TITLE_TO_SUB);
                     ui.label(
-                        theme::semibold("This stays on your machine", SUB_SIZE)
+                        theme::regular("This stays on your machine", SUB_SIZE)
                             .color(theme::TEXT_FAINT),
                     );
                 }
@@ -641,14 +637,14 @@ pub fn draw_first_window_body(
                             .color(theme::INK),
                     );
                     ui.add_space(TITLE_TO_SUB);
-                    ui.label(theme::semibold(slow_line(seconds), SUB_SIZE).color(theme::TEXT_FAINT));
+                    ui.label(theme::regular(slow_line(seconds), SUB_SIZE).color(theme::TEXT_FAINT));
                     // **Secondary here and primary on the failure body**, and
                     // that is the whole difference: this wait can still
                     // succeed on its own, so leaving it is an option and not
                     // the thing to do. The bar above is still moving.
                     if let LocalCopy::Here { synced } = local {
                         ui.add_space(TITLE_TO_SUB);
-                        ui.label(theme::semibold(offline_line(synced), SUB_SIZE).color(theme::TEXT_GHOST));
+                        ui.label(theme::regular(offline_line(synced), SUB_SIZE).color(theme::TEXT_GHOST));
                         ui.add_space(BLOCK_GAP);
                         open_local_copy |= theme::secondary_button(ui, OPEN_LOCAL_LABEL).clicked();
                     }
@@ -669,13 +665,13 @@ pub fn draw_first_window_body(
                         egui::vec2(COPY_WIDTH, 0.0),
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
-                            ui.label(theme::semibold(copy, SUB_SIZE).color(theme::TEXT_FAINT));
+                            ui.label(theme::regular(copy, SUB_SIZE).color(theme::TEXT_FAINT));
                         },
                     );
                     if let LocalCopy::Here { synced } = local {
                         ui.add_space(TITLE_TO_SUB);
                         ui.label(
-                            theme::semibold(offline_line(synced), SUB_SIZE)
+                            theme::regular(offline_line(synced), SUB_SIZE)
                                 .color(theme::TEXT_GHOST),
                         );
                     }
@@ -804,7 +800,7 @@ fn draw_footer(ui: &mut egui::Ui, full: egui::Rect, footer: &FirstWindowFooter<'
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         left.label(
-            theme::semibold(format!("Signed in as {account}"), FOOT_SIZE).color(theme::TEXT_FAINT),
+            theme::regular(format!("Signed in as {account}"), FOOT_SIZE).color(theme::TEXT_FAINT),
         );
     }
 
@@ -813,7 +809,7 @@ fn draw_footer(ui: &mut egui::Ui, full: egui::Rect, footer: &FirstWindowFooter<'
             .max_rect(inner)
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
-    right.label(theme::semibold(hotkey_footnote(footer.hotkey), FOOT_SIZE).color(theme::TEXT_GHOST));
+    right.label(theme::regular(hotkey_footnote(footer.hotkey), FOOT_SIZE).color(theme::TEXT_GHOST));
 }
 
 /// The one part of this window a headless `egui::Context` can reach.
@@ -904,6 +900,61 @@ mod spinner_body_tests {
             walk(&clipped.shape, &mut out);
         }
         out
+    }
+
+    /// **Every sentence this module owns is body weight; only its headings
+    /// are emphasised.**
+    ///
+    /// The rule, rather than the case. This module set EVERY string it owned
+    /// in SemiBold -- headings and body copy alike -- and the case-by-case
+    /// pin below caught only the one sentence that was reported. The other
+    /// screens had the same defect and nothing was watching them.
+    ///
+    /// A source pin because the sub-lines live on states this module's frame
+    /// harness reaches one at a time, and because what is being checked is a
+    /// property of every call site at once: which helper each one names. That
+    /// is exactly what `theme::regular` exists to make visible -- body weight
+    /// used to be an absence, and an absence cannot be counted.
+    ///
+    /// The needles are split with `concat!` so this pin cannot match itself.
+    #[test]
+    fn the_body_copy_on_every_loading_screen_is_body_weight() {
+        let source = include_str!("loading_ui.rs");
+        let production = source.split_once("\n#[cfg(test)]").map_or(source, |(p, _)| p);
+        let semibold = concat!("theme::semi", "bold(");
+
+        // Only the three headings, and each is named so a fourth has to be
+        // argued for here rather than added quietly.
+        let emphasised: Vec<&str> = production
+            .lines()
+            .filter(|line| line.contains(semibold))
+            .collect();
+        assert_eq!(
+            emphasised.len(),
+            3,
+            "this module has {} emphasised string(s), not the three headings. Anything else \
+             set in the 600 cut is body copy wearing a heading's weight, which is the report \
+             this fixed: {emphasised:?}",
+            emphasised.len()
+        );
+        for line in &emphasised {
+            assert!(
+                line.contains("TITLE_SIZE"),
+                "`{}` is emphasised but is not a heading -- `theme` reserves SemiBold for \
+                 buttons, row titles and field emphasis, and a sentence is none of those",
+                line.trim()
+            );
+        }
+
+        // The other direction, so the count above cannot be satisfied by
+        // deleting call sites: the body copy is really here, and really says
+        // so.
+        let body = production.matches(concat!("theme::reg", "ular(")).count();
+        assert!(
+            body >= 7,
+            "only {body} body-weight string(s) in this module; the sub-lines, the footnotes \
+             and the spinner's own status line are all body copy and there were seven"
+        );
     }
 
     /// **The status line is set in body weight, not the design's 600 cut.**

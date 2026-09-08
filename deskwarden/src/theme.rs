@@ -299,6 +299,24 @@ fn font_definitions() -> egui::FontDefinitions {
 }
 
 /// `RichText` in Archivo SemiBold — the design's 600 weight.
+/// `RichText` in Archivo Regular — the design's 400 weight, and the one every
+/// sentence in this app is meant to be set in.
+///
+/// **Spelled out even though it is the default.** [`FontFamily::Proportional`]
+/// already resolves to [`REGULAR`], so `RichText::new(..).size(..)` produces
+/// exactly this and the function adds nothing the compiler can see.
+///
+/// What it adds is to the reader. Body weight was previously an ABSENCE --
+/// the one call in a run of `semibold(..)` that did not say a family -- and an
+/// absence is not something a reviewer notices missing. `loading_ui` set every
+/// string it owned in SemiBold, headings and body copy alike, and it took two
+/// reports about one sentence ("wrong font", then "bold for some reason") to
+/// find it. Written down, the odd one out is the one that says `semibold`, and
+/// `the_body_copy_on_every_loading_screen_is_body_weight` can hold the rule.
+pub fn regular(text: impl Into<String>, size: f32) -> RichText {
+    RichText::new(text.into()).size(size).family(FontFamily::Proportional)
+}
+
 pub fn semibold(text: impl Into<String>, size: f32) -> RichText {
     RichText::new(text.into())
         .size(size)
