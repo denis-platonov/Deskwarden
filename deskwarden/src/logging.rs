@@ -94,6 +94,7 @@ pub fn init(config_dir: &Path) -> Result<PathBuf, String> {
             // already installed a logger, and a double-install shouldn't be
             // fatal for a background app.
             let _ = builder.try_init();
+            log_panics_instead_of_losing_them();
             Ok(path)
         }
         Err(e) => {
@@ -103,9 +104,97 @@ pub fn init(config_dir: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// **A panic in this app is invisible, and this is what makes it visible.**
+///
+/// The module doc above says why every log line goes to a file: a tray app has
+/// no console, so `env_logger`'s stderr target reaches nobody. The default
+/// panic handler writes to that same stderr. So a panic anywhere in the daemon
+/// -- on the loop that answers the tray, on a worker, on the frame thread of a
+/// UI process -- ends the process and leaves NOTHING: no line, no dialog, no
+/// exit code anybody sees. The app is simply gone from the tray.
+///
+/// That is not a hypothetical. The log for one session ends mid-stride after a
+/// lock stood the vault down, with no quit line -- and a quit does write one
+/// ("quit requested from tray"). So the process did not quit; it stopped. What
+/// stopped it cannot be recovered, because nothing recorded it, and every
+/// future "it disappeared" report is unfalsifiable in exactly the same way.
+///
+/// The hook runs IN ADDITION to the default one, which is kept and called
+/// afterwards: it produces the backtrace when `RUST_BACKTRACE` is set and a
+/// developer is watching a console, and replacing it would trade one audience
+/// for another. `log::error!` is the addition, not the substitute.
+///
+/// **It does not catch anything.** A panic still ends the process, which is
+/// the right outcome: this app holds a decrypted vault in memory, and carrying
+/// on through an unknown broken invariant is how that leaks. The only thing
+/// this changes is whether the next reader can tell what happened.
+///
+/// Installed here rather than in `fn main` because both entry points come
+/// through `init` -- the daemon and the `--ui` child -- and a hook installed
+/// on one of them would leave the other silent. Panic hooks are process-wide,
+/// so the last install wins; `init` runs once per process.
+fn log_panics_instead_of_losing_them() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // The location and the message, which is all a `PanicHookInfo` can
+        // offer without a backtrace. `info` already formats both -- and its
+        // `Display` is what the default hook prints -- so this is the same
+        // text the console would have shown, put where it can be read.
+        log::error!("PANIC, and this process is ending: {info}");
+        default(info);
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Every process that logs also installs the panic hook.**
+    ///
+    /// A source pin, and the reason is the thing being pinned: a panic hook
+    /// is process-wide and a panic ends the process, so a test that fired one
+    /// would take the test runner with it. `catch_unwind` does not help --
+    /// the hook runs before the unwind is caught, and what it writes goes
+    /// through the global `log` facade, which `env_logger` owns for the whole
+    /// test binary. Nothing here can read it back.
+    ///
+    /// What CAN be checked is the wiring, and the wiring is the whole of the
+    /// defect: `init` is the one function both entry points call -- the
+    /// daemon and the `--ui` child -- so a hook installed anywhere else
+    /// leaves one of them silent, and a hook installed nowhere leaves both.
+    ///
+    /// The needles are split with `concat!` so this pin cannot match itself.
+    #[test]
+    fn init_installs_the_panic_hook_on_the_arm_that_has_a_log_to_write_to() {
+        let source = include_str!("logging.rs");
+        let installer = concat!("fn log_panics_instead_of_", "losing_them()");
+        let call = concat!("log_panics_instead_of_", "losing_them();");
+
+        assert!(
+            source.contains(installer),
+            "the panic hook installer is gone, so a panic in the daemon leaves no trace \
+             again -- see its doc for the session that lost one"
+        );
+        assert!(
+            source.contains(call),
+            "`init` no longer installs the panic hook, so every process that logs is back to \
+             writing its last words to a stderr nobody is attached to"
+        );
+        // **Chained, not replaced.** The default hook is what produces a
+        // backtrace under `RUST_BACKTRACE` for a developer at a console;
+        // dropping it would trade one audience for another rather than
+        // serving both.
+        assert!(
+            source.contains(concat!("std::panic::take", "_hook()")),
+            "the hook no longer keeps the default one, so `RUST_BACKTRACE` stopped producing \
+             a backtrace and this became a downgrade for whoever runs the app from a shell"
+        );
+        assert!(
+            source.contains("default(info);"),
+            "the default hook is kept but never called, which is the same loss with an \
+             unused binding to hide it"
+        );
+    }
 
     #[test]
     fn log_file_path_lives_in_the_config_dir() {
