@@ -15,6 +15,26 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### Editing one item no longer downloads the whole vault
+
+Renaming an item, starring one, or dragging one into a folder made
+Deskwarden fetch **every item in the account** first, and so did reading a
+single item the window did not already have. On a self-hosted server
+billed by rows read, one such gesture cost about as much as opening the
+vault -- roughly 3,400 rows -- and a day of ordinary editing was enough to
+exhaust the account's daily allowance, after which the server answered
+every request with an error.
+
+Deskwarden now asks for the one record it is about to change, which is one
+row, and asks for it from an address it was already writing to. Loading a
+vault, a folder list, the trash and the archive are still whole-vault
+questions and still cost one fetch each; nothing else does.
+
+Saving is also slightly safer than it was: the copy an edit is checked
+against is now read immediately before the write instead of coming out of
+a whole-vault snapshot, so "the client copy of this item is out of date"
+has one less way to happen.
+
 ### One-time codes no longer wear the server out to say what they already knew
 
 "Unavailable right now -- couldn't reach the vault to get the current
@@ -30,6 +50,21 @@ the copy it is already showing, with no request at all. Seeds it cannot
 read on its own -- Steam's, and anything using a setting this app does not
 understand -- are still asked for, so nothing that showed a code before
 stops showing one.
+
+Those remaining seeds are now asked for **once per code**, at the moment
+the code actually changes, instead of once a second: an hour of one on
+screen is 120 requests where it used to be 3,600. Deskwarden also stops
+asking entirely while its window is minimised or completely covered by
+another window -- but not merely because you clicked into your browser to
+type the code, which is the whole point of having one. And when the server
+does start failing, it is asked progressively less often, down to once
+every four minutes, rather than being hammered at full speed for as long
+as it stays down; the first answer that works puts it straight back to
+normal.
+
+Cards set to a sixty-second code no longer count down from thirty twice.
+The countdown, and the refresh behind it, now follow the card's own
+period.
 
 ### Site icons that were being thrown away
 
