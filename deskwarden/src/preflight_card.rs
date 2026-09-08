@@ -741,7 +741,7 @@ mod win32 {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
+        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject,
         EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
         SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DT_CENTER, DT_END_ELLIPSIS,
         DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FW_BOLD, FW_NORMAL,
@@ -760,7 +760,7 @@ mod win32 {
         WS_POPUP, WS_TABSTOP, WS_VISIBLE,
     };
 
-    use crate::win32_draw::{draw_button, draw_card_lockup, rgb, ButtonSkin};
+    use crate::win32_draw::{draw_button, draw_card_lockup, draw_text, rgb, ButtonSkin};
 
     const ID_DISMISS: usize = 101;
     const ID_COPY: usize = 102;
@@ -1613,19 +1613,13 @@ mod win32 {
         unsafe {
             let old = SelectObject(hdc, font);
             SetTextColor(hdc, rgb(crate::theme::BLUE));
-            let mut chars: Vec<u16> = HOLD_HINT.encode_utf16().collect();
             let mut rc = RECT {
                 left: scale(at.x),
                 top: scale(at.y),
                 right: scale(at.right()),
                 bottom: scale(at.bottom()),
             };
-            DrawTextW(
-                hdc,
-                &mut chars,
-                &mut rc,
-                DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
-            );
+            draw_text(hdc, HOLD_HINT, &mut rc, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
             SelectObject(hdc, old);
         }
     }
@@ -1803,19 +1797,23 @@ mod win32 {
         unsafe {
             let old = SelectObject(hdc, font);
             SetTextColor(hdc, rgb(colour));
-            let mut chars: Vec<u16> = text.encode_utf16().collect();
             let mut rc = RECT {
                 left: scale(at.x),
                 top: scale(at.y),
                 right: scale(at.right()),
                 bottom: scale(at.bottom()),
             };
+            // `win32_draw::draw_text`, not `DrawTextW`: an empty run through
+            // the raw call is an access violation at address 0x2 that kills
+            // the whole daemon without a log line. Live here, because a
+            // foreground window with no title at all reaches this as `""`.
+            //
             // `DT_NOPREFIX`: these are window titles and process names, in
             // which an `&` is an ampersand and never a mnemonic that would be
             // drawn as an underscore.
-            DrawTextW(
+            draw_text(
                 hdc,
-                &mut chars,
+                text,
                 &mut rc,
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
@@ -1832,14 +1830,13 @@ mod win32 {
         unsafe {
             let old = SelectObject(hdc, font);
             SetTextColor(hdc, rgb(colour));
-            let mut chars: Vec<u16> = text.encode_utf16().collect();
             let mut rc = RECT {
                 left: scale(at.x),
                 top: scale(at.y),
                 right: scale(at.right()),
                 bottom: scale(at.bottom()),
             };
-            DrawTextW(hdc, &mut chars, &mut rc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            draw_text(hdc, text, &mut rc, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
             SelectObject(hdc, old);
         }
     }

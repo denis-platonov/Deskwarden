@@ -688,7 +688,7 @@ mod win32 {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
+        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject,
         EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
         SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DRAW_TEXT_FORMAT, DT_CENTER,
         DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FW_BOLD,
@@ -707,7 +707,7 @@ mod win32 {
         WNDCLASSW, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
     };
 
-    use crate::win32_draw::{draw_card_lockup, draw_hint_chip, rgb};
+    use crate::win32_draw::{draw_card_lockup, draw_hint_chip, draw_text, rgb};
 
     /// Row `i` is control `ID_ROW + i`.
     const ID_ROW: usize = 100;
@@ -1561,16 +1561,15 @@ mod win32 {
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, rgb(crate::theme::INK));
             let old_font = SelectObject(hdc, fonts.name);
-            let mut chars: Vec<u16> = label.encode_utf16().collect();
             let mut rc = RECT {
                 left: rect.left + scale(CHOICE_TEXT_INSET),
                 top: rect.top,
                 right: rect.right - crate::theme::TEXT_CLIP_INSET as i32 - lane,
                 bottom: rect.bottom,
             };
-            DrawTextW(
+            draw_text(
                 hdc,
-                &mut chars,
+                label,
                 &mut rc,
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
@@ -1604,15 +1603,15 @@ mod win32 {
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, rgb(ink));
             let old_font = SelectObject(hdc, font);
-            let mut chars: Vec<u16> =
-                crate::theme::initials(name).encode_utf16().collect();
+            // **`initials` can legitimately answer an empty string** -- it
+            // takes the first letters of a name's words, and a name made
+            // entirely of punctuation has none. That is a live path to the
+            // empty run, so the tile is drawn through `win32_draw::draw_text`
+            // like everything else; it simply comes out blank instead of
+            // taking the daemon down with an access violation at address 0x2.
+            let initials = crate::theme::initials(name);
             let mut rc = RECT { left: x, top: y, right: x + side, bottom: y + side };
-            DrawTextW(
-                hdc,
-                &mut chars,
-                &mut rc,
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            );
+            draw_text(hdc, &initials, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
             SelectObject(hdc, old_font);
         }
     }
@@ -1684,19 +1683,24 @@ mod win32 {
         unsafe {
             let old = SelectObject(hdc, font);
             SetTextColor(hdc, rgb(colour));
-            let mut chars: Vec<u16> = run.encode_utf16().collect();
             let mut rc = RECT {
                 left: scale(at.x),
                 top: scale(at.y),
                 right: scale(at.right()),
                 bottom: scale(at.bottom()),
             };
+            // `win32_draw::draw_text`, not `DrawTextW`: an empty run through
+            // the raw call is an access violation at address 0x2 that kills
+            // the whole daemon without a log line, and this card is where the
+            // second occurrence was found -- the account line and the context
+            // under it are the user's own strings and either can be empty.
+            //
             // `DT_NOPREFIX`: these are the app's own words and a user's own
             // account name, in which an `&` is an ampersand and never a
             // mnemonic that would be drawn as an underscore.
-            DrawTextW(
+            draw_text(
                 hdc,
-                &mut chars,
+                run,
                 &mut rc,
                 align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
             );

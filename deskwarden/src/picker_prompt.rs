@@ -1423,7 +1423,7 @@ mod win32 {
     use windows::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap,
         CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreatePen, CreateSolidBrush,
-        DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetDeviceCaps,
+        DeleteDC, DeleteObject, EndPaint, FillRect, GetDC, GetDeviceCaps,
         InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA,
         AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY,
         DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL,
@@ -1454,7 +1454,7 @@ mod win32 {
     const EN_CHANGE: u32 = 0x0300;
 
     use crate::win32_draw::{
-        draw_button_with_shortcut, draw_row, rgb, ButtonSkin, RowState,
+        draw_button_with_shortcut, draw_row, draw_text, rgb, ButtonSkin, RowState,
     };
 
     /// Row `i` is control `ID_ROW + i`; the footer's two ids sit below them
@@ -3407,28 +3407,16 @@ mod win32 {
                 right: scale(at.right()),
                 bottom: scale(at.bottom()),
             };
-            // **Nothing to draw, and drawing nothing would crash.**
+            // `win32_draw::draw_text`, not `DrawTextW`: an empty run through
+            // the raw call is an access violation at address 0x2 that kills
+            // the whole daemon without a log line. The guard that used to be
+            // written out here now lives in that wrapper, which is the only
+            // place in the crate that calls `DrawTextW` -- see the block
+            // comment above it for the full account of both occurrences.
             //
-            // An empty `Vec<u16>` has no allocation, so `as_mut_ptr` gives
-            // Rust's dangling sentinel -- the type's alignment, which for
-            // `u16` is the literal address 2. `DrawTextW` reads through that
-            // pointer even when it is told the length is zero, so an empty
-            // string here is an access violation at address 0x2 inside
-            // `DrawTextExWorker`.
-            //
-            // It kills the whole app rather than the card: the fault happens
-            // inside a window procedure, so Windows raises
-            // STATUS_FATAL_USER_CALLBACK_EXCEPTION and terminates the process
-            // without unwinding -- the panic hook never runs and nothing
-            // reaches the log. The owner met it as the tray, the vault window
-            // and an unlocked session vanishing on one CTRL+ALT+B.
-            if run.is_empty() {
-            return;
-            }
-            let mut chars: Vec<u16> = run.encode_utf16().collect();
             // `DT_NOPREFIX`: these are the app's own words, and an `&` in one
             // of them is an ampersand rather than a mnemonic.
-            DrawTextW(hdc, &mut chars, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+            draw_text(hdc, run, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
             SelectObject(hdc, old);
         }
     }

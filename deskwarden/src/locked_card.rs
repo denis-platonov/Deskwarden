@@ -473,7 +473,7 @@ mod win32 {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
+        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject,
         EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
         SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DT_END_ELLIPSIS, DT_LEFT,
         DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW,
@@ -491,7 +491,9 @@ mod win32 {
         WNDCLASSW, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
     };
 
-    use crate::win32_draw::{draw_button, draw_card_lockup, draw_hint_chip, rgb, ButtonSkin};
+    use crate::win32_draw::{
+        draw_button, draw_card_lockup, draw_hint_chip, draw_text, rgb, ButtonSkin,
+    };
 
     const ID_UNLOCK: usize = 101;
     const CLASS_NAME: PCWSTR = w!("DeskwardenVaultLockedCard");
@@ -1298,36 +1300,24 @@ mod win32 {
         unsafe {
             let old = SelectObject(hdc, font);
             SetTextColor(hdc, rgb(colour));
-            // **Nothing to draw, and drawing nothing would crash.**
-            //
-            // An empty `Vec<u16>` has no allocation, so `as_mut_ptr` gives
-            // Rust's dangling sentinel -- the type's alignment, which for
-            // `u16` is the literal address 2. `DrawTextW` reads through that
-            // pointer even when it is told the length is zero, so an empty
-            // string here is an access violation at address 0x2 inside
-            // `DrawTextExWorker`.
-            //
-            // It kills the whole app rather than the card: the fault happens
-            // inside a window procedure, so Windows raises
-            // STATUS_FATAL_USER_CALLBACK_EXCEPTION and terminates the process
-            // without unwinding -- the panic hook never runs and nothing
-            // reaches the log. The owner met it as the tray, the vault window
-            // and an unlocked session vanishing on one CTRL+ALT+B.
-            if run.is_empty() {
-            return;
-            }
-            let mut chars: Vec<u16> = run.encode_utf16().collect();
             let mut rc = RECT {
                 left: scale(at.x),
                 top: scale(at.y),
                 right: scale(at.right()),
                 bottom: scale(at.bottom()),
             };
+            // `win32_draw::draw_text`, not `DrawTextW`: an empty run through
+            // the raw call is an access violation at address 0x2 that kills
+            // the whole daemon without a log line. The guard that used to be
+            // written out here now lives in that wrapper, which is the only
+            // place in the crate that calls `DrawTextW` -- see the block
+            // comment above it for the full account of both occurrences.
+            //
             // `DT_NOPREFIX`: these are the app's own words and a user's app
             // name, in which an `&` is an ampersand and never a mnemonic.
-            DrawTextW(
+            draw_text(
                 hdc,
-                &mut chars,
+                run,
                 &mut rc,
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
@@ -1891,7 +1881,14 @@ mod tests {
         let (production, discarded) = production();
         assert!(discarded > 0, "control: nothing was cut out of the file");
         let code = code(&production);
-        let drawn = code.matches(concat!("Draw", "TextW(")).count();
+        // The needle is `draw_text(` and no longer `DrawTextW(`: this card's
+        // one painter now goes through `win32_draw::draw_text`, which is the
+        // crate's only caller of the raw API. See
+        // `win32_draw::tests::the_crate_calls_draw_text_w_in_exactly_one_place`
+        // for why that indirection exists -- an empty run through the raw call
+        // is an access violation that kills the daemon with no log line, and
+        // this card carried one of the two hand-written guards it replaced.
+        let drawn = code.matches(concat!("draw_", "text(")).count();
         assert_eq!(
             drawn, 1,
             "control: locked_card.rs draws text in one place -- its `text` helper, which every \

@@ -642,7 +642,7 @@ mod win32 {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
+        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject,
         EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
         SelectObject, SetBkColor, SetBkMode, SetTextCharacterExtra, SetTextColor,
         CLEARTYPE_QUALITY, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
@@ -1821,14 +1821,18 @@ mod win32 {
                 right: scale(at.right()),
                 bottom: scale(at.bottom()),
             };
-            let mut chars: Vec<u16> = run.encode_utf16().collect();
+            // `win32_draw::draw_text`, not `DrawTextW`: an empty run through
+            // the raw call is an access violation at address 0x2 that kills
+            // the whole daemon without a log line. See the block comment above
+            // that wrapper, which is the crate's only `DrawTextW`.
+            //
             // `DT_NOPREFIX`: the labels here are the app's own words, and an
             // `&` in one of them is an ampersand, not a mnemonic. The buttons
             // are the only place a mnemonic is meant, and they are drawn by
             // `paint_button` with their own literal.
-            DrawTextW(
+            crate::win32_draw::draw_text(
                 hdc,
-                &mut chars,
+                run,
                 &mut rc,
                 align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
             );

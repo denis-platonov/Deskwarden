@@ -14,7 +14,8 @@ use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, S
 use windows::Win32::Graphics::Gdi::{
     CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, GetStockObject,
     GetTextExtentPoint32W, HBRUSH, NULL_BRUSH, Polygon, Polyline, RoundRect,
-    ScreenToClient, SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, DT_CENTER,
+    ScreenToClient, SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, DRAW_TEXT_FORMAT,
+    DT_CENTER,
     DT_END_ELLIPSIS,
     DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, PS_SOLID,
     TRANSPARENT,
@@ -28,6 +29,98 @@ use windows::Win32::UI::WindowsAndMessaging::{HTCAPTION, HTCLIENT};
 /// `win32` module, which had the only copy.
 pub(crate) fn rgb(c: eframe::egui::Color32) -> COLORREF {
     COLORREF((c.r() as u32) | ((c.g() as u32) << 8) | ((c.b() as u32) << 16))
+}
+
+// ---------------------------------------------------------------------------
+// The one `DrawTextW` in the crate.
+//
+// **An empty run is an access violation, and it takes the whole process with
+// it.** This is written out once, here, because it has now happened TWICE.
+//
+// An empty `Vec<u16>` never allocates, so `as_mut_ptr()` hands back Rust's
+// dangling sentinel: the type's own alignment, which for `u16` is the literal
+// address **2**. `DrawTextW` dereferences that pointer even when it is told
+// the length is zero -- `DrawTextExWorker` reads the first character before it
+// looks at the count -- so an empty string reaches GDI as a read of address
+// 0x2 and faults.
+//
+// **It kills the daemon rather than the card.** The fault happens inside a
+// window procedure, on a stack Windows entered through
+// `UserCallWinProcCheckWow`. A structured exception raised there is turned
+// into STATUS_FATAL_USER_CALLBACK_EXCEPTION (0xc000041d) and the process is
+// terminated WITHOUT unwinding: the panic hook never runs, `catch_unwind`
+// never sees it, and nothing at all reaches the log. What the owner sees is
+// the tray, the vault window and an unlocked session vanishing at once, with
+// an empty log and a Windows Error Reporting entry naming `user32.dll` and
+// 0xc0000005 -- which is exactly how both occurrences were found, the second
+// one only from a minidump whose `.ecxr; k` showed `rdi = 0x2`.
+//
+// **Why a function and not a comment.** The first occurrence was fixed at the
+// two cards that had met it (`picker_prompt` and `locked_card`), each with its
+// own `if run.is_empty() { return; }` under a copy of this explanation. The
+// knowledge then lived in prose at two call sites, and seven other cards drew
+// text without it -- so the eighth card to be written reintroduced the crash
+// verbatim. A comment cannot be a precondition; a function can. Every text run
+// this crate paints now goes through [`draw_text`] or [`draw_text_utf16`], and
+// the pins in this file's test module assert that no tenth card can call
+// `DrawTextW` directly.
+// ---------------------------------------------------------------------------
+
+/// **Paint one run of text.** The crate's only route to `DrawTextW`.
+///
+/// Returns `DrawTextW`'s own answer -- the height of the drawn text in logical
+/// units, or, with `DT_CALCRECT`, the height it would take -- and **0 for an
+/// empty run**, which is the honest answer for text that occupies no lines. No
+/// caller in this crate reads it today and none passes `DT_CALCRECT`; it is
+/// returned rather than swallowed so that a caller which one day needs to
+/// measure does not have to reach around this function to do it.
+///
+/// `rect` is `&mut` because `DrawTextW` writes into it under `DT_CALCRECT`.
+/// **An empty run leaves it untouched** -- there is no measurement to report --
+/// so a future `DT_CALCRECT` caller must treat the rect it passed in as the
+/// answer for empty text, exactly as it would for a run of zero lines.
+///
+/// See the block comment above for why the empty case is a crash rather than a
+/// no-op, and why that crash takes the whole daemon down without a log line.
+pub fn draw_text(hdc: HDC, text: &str, rect: &mut RECT, format: DRAW_TEXT_FORMAT) -> i32 {
+    // BEFORE the encode, so no buffer -- and therefore no pointer -- exists on
+    // the empty path at all. Guarding after `collect()` would work too, but
+    // this way the thing that must not happen cannot be reached rather than
+    // merely being skipped.
+    if text.is_empty() {
+        return 0;
+    }
+    let mut chars: Vec<u16> = text.encode_utf16().collect();
+    draw_text_utf16(hdc, &mut chars, rect, format)
+}
+
+/// [`draw_text`] for a caller that already holds the UTF-16 buffer.
+///
+/// **This exists for the generated password**, and for nothing else. That run
+/// is held as a `Zeroizing<Vec<u16>>` so the buffer GDI rasterises the glyphs
+/// out of is wiped when the paint ends rather than left on the stack. Routing
+/// it through [`draw_text`] would mean turning it back into a `&str` and
+/// re-encoding -- a second, plain `Vec<u16>` copy of the secret with no
+/// `Drop` that clears it, sitting in the heap until that page is reused. So
+/// the buffer is borrowed here instead and the secret is never copied.
+///
+/// The slice is `&mut` because `DrawTextW` takes it that way: it may modify
+/// the buffer in place (it is the same argument `DT_MODIFYSTRING` writes the
+/// ellipsis into).
+pub fn draw_text_utf16(
+    hdc: HDC,
+    chars: &mut [u16],
+    rect: &mut RECT,
+    format: DRAW_TEXT_FORMAT,
+) -> i32 {
+    // The guard, again, on the buffer itself: this entry point is reachable
+    // without going through `draw_text`, and an empty `Zeroizing<Vec<u16>>` --
+    // a generated password of zero length -- has the same dangling `2` as any
+    // other empty `Vec<u16>`.
+    if chars.is_empty() {
+        return 0;
+    }
+    unsafe { DrawTextW(hdc, chars, rect, format) }
 }
 
 /// How one button is painted. Three colours and a radius, so a new kind of
@@ -149,14 +242,8 @@ pub fn draw_button_with_shortcut(
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, skin.text);
         let old_font = SelectObject(hdc, font);
-        let mut chars: Vec<u16> = label.encode_utf16().collect();
         let mut rc = RECT { right: rect.right - hint_lane, ..rect };
-        DrawTextW(
-            hdc,
-            &mut chars,
-            &mut rc,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
+        draw_text(hdc, label, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, old_font);
     }
 }
@@ -271,9 +358,8 @@ pub fn draw_hint_chip(hdc: HDC, rect: RECT, hint: &str, font: HFONT, scale: i32)
 
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
-        let mut chars = chars;
         let mut rc = RECT { left, top, right, bottom: top + h };
-        DrawTextW(hdc, &mut chars, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        draw_text(hdc, hint, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, old_font);
         lane
     }
@@ -411,9 +497,13 @@ pub fn draw_card_lockup(hdc: HDC, mark: RECT, word: RECT, font: HFONT, tracking:
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, rgb(crate::theme::TEXT_SECONDARY));
         SetTextCharacterExtra(hdc, tracking);
-        let mut chars: Vec<u16> = crate::theme::WORDMARK_CAPS.encode_utf16().collect();
         let mut rc = word;
-        DrawTextW(hdc, &mut chars, &mut rc, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        draw_text(
+            hdc,
+            crate::theme::WORDMARK_CAPS,
+            &mut rc,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
         SetTextCharacterExtra(hdc, 0);
         SelectObject(hdc, old);
     }
@@ -649,16 +739,15 @@ pub fn draw_row(
 
         SetTextColor(hdc, rgb(crate::theme::INK));
         let old_font = SelectObject(hdc, name_font);
-        let mut name_chars: Vec<u16> = candidate.name.encode_utf16().collect();
         let mut name_rc = RECT {
             left: text_left,
             top: rect.top,
             right: text_right,
             bottom: rect.top + gutter / 2,
         };
-        DrawTextW(
+        draw_text(
             hdc,
-            &mut name_chars,
+            &candidate.name,
             &mut name_rc,
             DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
@@ -666,16 +755,15 @@ pub fn draw_row(
 
         SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
         let old_font = SelectObject(hdc, user_font);
-        let mut user_chars: Vec<u16> = candidate.username.encode_utf16().collect();
         let mut user_rc = RECT {
             left: text_left,
             top: rect.top + gutter / 2,
             right: text_right,
             bottom: rect.bottom,
         };
-        DrawTextW(
+        draw_text(
             hdc,
-            &mut user_chars,
+            &candidate.username,
             &mut user_rc,
             DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS,
         );
@@ -929,10 +1017,14 @@ mod tests {
             "control: the production cut of win32_draw.rs does not contain `draw_row`, so the \r
              cut is in the wrong place and this pin is scanning the wrong text"
         );
-        let drawn = code.matches(concat!("Draw", "TextW(")).count();
+        // The needle is `draw_text(` and no longer `DrawTextW(`: this file's
+        // five runs now go through the wrapper, and the raw call survives in
+        // exactly one place -- inside that wrapper -- which is what
+        // `the_crate_calls_draw_text_w_in_exactly_one_place` pins.
+        let drawn = code.matches(concat!("draw_", "text(")).count();
         assert_eq!(
-            drawn, 5,
-            "control: win32_draw.rs draws text in five places -- a button label, a keyboard-hint chip, a row's two lines, and the brand lockup's wordmark. It now draws it in {drawn}, so the counts below no longer mean what this pin says they mean"
+            drawn, 6,
+            "control: win32_draw.rs draws text in five places -- a button label, a keyboard-hint chip, a row's two lines, and the brand lockup's wordmark -- and declares the wrapper itself, which is the sixth match. It now has {drawn}, so the counts below no longer mean what this pin says they mean"
         );
 
         assert_eq!(
@@ -962,6 +1054,198 @@ mod tests {
             code.contains("let text_left = rect.left + gutter;"),
             "the row's left gutter is gone. It is the square the favicon is drawn into, and the \r
              text starting at `rect.left` would run underneath it"
+        );
+    }
+
+    /// **The empty-run guard comes BEFORE the pointer is taken.**
+    ///
+    /// The property that makes [`draw_text`] safe, stated the only way it can
+    /// be from a test: as an ordering in the source. It cannot be exercised,
+    /// because exercising it means a real `HDC` and a real window procedure,
+    /// and the failure mode is not a panic a test could catch -- it is
+    /// STATUS_FATAL_USER_CALLBACK_EXCEPTION, which terminates the test runner
+    /// without unwinding. A test that *called* the unguarded function would
+    /// not fail; it would take `cargo test` down with it and report nothing.
+    /// So the assertion is the source order, which is exactly the register
+    /// this crate uses for untestable Win32 wiring -- see the pins in
+    /// `foreground.rs` and `unlock_prompt.rs`.
+    ///
+    /// Both entry points are checked, and both directions of the ordering
+    /// matter: in [`draw_text`] the `return` must precede `encode_utf16`, so
+    /// that on the empty path no buffer and therefore no dangling pointer ever
+    /// comes into existence; in [`draw_text_utf16`] it must precede the
+    /// `DrawTextW` call itself, because that entry point is reachable with a
+    /// caller's own empty buffer.
+    #[test]
+    fn the_empty_run_guard_precedes_the_pointer_in_both_text_wrappers() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let raw =
+            std::fs::read_to_string(src.join("win32_draw.rs")).unwrap().replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        // Comments stripped: the long block comment above the wrappers spells
+        // out `if text.is_empty()` and `DrawTextW` in prose, and prose must not
+        // be able to satisfy a rule about the ORDER OF CODE.
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // CONTROL: the cut threw something away, and what it kept is the half
+        // holding both wrappers. Without this a mis-placed cut marker would
+        // make every `find` below return `None` and the test would fail
+        // loudly rather than pass vacuously -- but it would fail for the wrong
+        // reason, and the message would send the reader to the wrong place.
+        assert!(
+            production.len() < raw.len(),
+            "control: the `#[cfg(test)]` cut marker was not found in win32_draw.rs, so this pin \
+             is reading its own test module as production"
+        );
+
+        // `draw_text`: the early return, then the encode.
+        let guard = code
+            .find("if text.is_empty() {")
+            .expect("`draw_text` no longer guards on an empty `&str` at all -- an empty run now \
+                     reaches `DrawTextW` through a dangling pointer at address 0x2 and kills the \
+                     daemon inside its window procedure, with no panic and no log line");
+        let encode = code
+            .find(concat!("text.encode_", "utf16()"))
+            .expect("control: `draw_text` no longer encodes its `&str` to UTF-16, so this pin is \
+                     not reading the function it names");
+        assert!(
+            guard < encode,
+            "`draw_text` encodes before it checks for the empty run. The `Vec<u16>` an empty \
+             string collects into never allocates, so it carries Rust's dangling sentinel -- the \
+             `u16` alignment, literally address 2 -- and the guard must run before that value \
+             exists rather than after it"
+        );
+
+        // `draw_text_utf16`: the early return, then the one real call.
+        let slice_guard = code
+            .find("if chars.is_empty() {")
+            .expect("`draw_text_utf16` no longer guards on an empty buffer. It is reachable \
+                     directly -- `generate_prompt` passes its `Zeroizing<Vec<u16>>` straight in \
+                     -- so a zero-length password would reach `DrawTextW` at address 0x2");
+        let call = code
+            .find(concat!("Draw", "TextW("))
+            .expect("control: win32_draw.rs no longer calls `DrawTextW` at all, so this pin is \
+                     asserting an ordering between two things that are not both there");
+        assert!(
+            slice_guard < call,
+            "`draw_text_utf16` calls `DrawTextW` before it checks whether the slice is empty. \
+             That is the crash, verbatim: `DrawTextExWorker` dereferences the buffer pointer \
+             before it consults the length, so a zero-length slice faults on its first read"
+        );
+
+        // CONTROL: the guards return rather than falling through. A rewrite
+        // that kept `if text.is_empty()` but dropped the `return` would
+        // satisfy every ordering above and still crash.
+        for (needle, which) in
+            [("if text.is_empty() {\n        return 0;", "draw_text"),
+             ("if chars.is_empty() {\n        return 0;", "draw_text_utf16")]
+        {
+            assert!(
+                code.contains(needle),
+                "control: {which}'s empty-run check no longer returns immediately, so the guard \
+                 is present in the source but does not actually stop the call"
+            );
+        }
+    }
+
+    /// **`DrawTextW` is called in exactly ONE place in this crate.**
+    ///
+    /// The assertion that actually prevents the recurrence. The crash --
+    /// an empty `Vec<u16>`'s dangling `2` read by `DrawTextExWorker`, faulting
+    /// inside a window procedure and taking the whole daemon with it, with no
+    /// panic and no log -- was fixed once at the two cards that had met it,
+    /// each under its own copy of the explanation. Seven other cards were
+    /// still drawing text without the guard, and the next one written brought
+    /// the crash straight back. Fixing the eight remaining sites one at a time
+    /// would leave the ninth free to do it again; what closes the class is
+    /// that the raw call has exactly one home.
+    ///
+    /// **A census, and it fails in BOTH directions**, modelled on
+    /// `main.rs`'s `every_window_the_daemon_can_still_draw_is_named_here`. A
+    /// tenth card calling `DrawTextW` directly fails it, which is the obvious
+    /// half. The wrapper's own call disappearing ALSO fails it, which is the
+    /// half that matters here: this crate's standing defect class is "a test
+    /// that passes because it never reached the thing it names", and a rule
+    /// that only ever counted down would quietly become a rule about nothing.
+    ///
+    /// Every needle is split with `concat!` so this pin cannot match itself,
+    /// and every file's production half is cut at its own `#[cfg(test)]` --
+    /// a test may name the API freely.
+    #[test]
+    fn the_crate_calls_draw_text_w_in_exactly_one_place() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let needle = concat!("Draw", "TextW(");
+        let import = concat!("Draw", "TextW,");
+
+        let mut calls: Vec<(String, usize)> = Vec::new();
+        let mut imports: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            // Normalised for the CRLF checkout before anything is sliced: a
+            // scan matching against `\r\n`-terminated lines finds nothing and
+            // would report the whole crate clean.
+            let raw = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+            let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+            let code: String = production
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            scanned += 1;
+            let n = code.matches(needle).count();
+            if n > 0 {
+                calls.push((name.clone(), n));
+            }
+            if code.contains(import) {
+                imports.push(name);
+            }
+        }
+
+        // CONTROL: the scan reached the crate. A `read_dir` that found nothing
+        // -- a wrong `CARGO_MANIFEST_DIR`, a moved `src` -- would otherwise
+        // make every assertion below pass on an empty set.
+        assert!(
+            scanned > 20,
+            "control: only {scanned} `.rs` files were scanned under {}, so this census is not \
+             reading the crate and could not fail",
+            src.display()
+        );
+
+        assert_eq!(
+            calls,
+            vec![("win32_draw.rs".to_string(), 1usize)],
+            "`{needle}` must appear exactly once in production across `src/`, inside \
+             `win32_draw::draw_text_utf16`. Found: {calls:?}.\n\
+             \n\
+             MORE than one, or one somewhere else: a card is calling `DrawTextW` directly again. \
+             An empty run through the raw call reads Rust's dangling `Vec<u16>` sentinel -- \
+             address 2 -- inside `DrawTextExWorker`, faults in a window procedure, and Windows \
+             kills the process with STATUS_FATAL_USER_CALLBACK_EXCEPTION: no panic hook, no log \
+             line, the tray and the vault window simply gone. That has now happened twice, and \
+             the second time only a minidump found it.\n\
+             \n\
+             NONE, or the wrapper's own call gone: the daemon draws no text at all, or the \
+             wrapper has been hollowed out and every card is silently blank."
+        );
+
+        // The import follows the call: a module that still pulls `DrawTextW`
+        // into scope is a module one line away from using it, and the unused
+        // import would not even warn if the module names it in a doc link.
+        assert_eq!(
+            imports,
+            vec!["win32_draw.rs".to_string()],
+            "`{import}` is imported outside `win32_draw.rs`, by: {imports:?}. Every card's text \
+             now goes through `win32_draw::draw_text`, so no other module needs the raw call in \
+             scope -- and leaving it imported is an invitation to the crash above"
         );
     }
 

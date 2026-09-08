@@ -916,7 +916,7 @@ mod win32 {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW,
+        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject,
         EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
         SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DT_END_ELLIPSIS, DT_LEFT,
         DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW,
@@ -935,7 +935,8 @@ mod win32 {
     };
 
     use crate::win32_draw::{
-        draw_button_with_shortcut, draw_card_lockup, draw_hint_chip, rgb, ButtonSkin,
+        draw_button_with_shortcut, draw_card_lockup, draw_hint_chip, draw_text_utf16, rgb,
+        ButtonSkin,
     };
 
     const ID_NEW: usize = 101;
@@ -2106,24 +2107,12 @@ mod win32 {
 
     /// One run of text, left-aligned and vertically centred in `at`.
     fn text(hdc: HDC, font: HFONT, at: Box2, run: &str, colour: eframe::egui::Color32) {
-        // **Nothing to draw, and drawing nothing would crash.**
-        //
-        // An empty `Vec<u16>` has no allocation, so `as_mut_ptr` gives
-        // Rust's dangling sentinel -- the type's alignment, which for
-        // `u16` is the literal address 2. `DrawTextW` reads through that
-        // pointer even when it is told the length is zero, so an empty
-        // string here is an access violation at address 0x2 inside
-        // `DrawTextExWorker`.
-        //
-        // It kills the whole app rather than the card: the fault happens
-        // inside a window procedure, so Windows raises
-        // STATUS_FATAL_USER_CALLBACK_EXCEPTION and terminates the process
-        // without unwinding -- the panic hook never runs and nothing
-        // reaches the log. The owner met it as the tray, the vault window
-        // and an unlocked session vanishing on one CTRL+ALT+B.
-        if run.is_empty() {
-        return;
-        }
+        // The empty-run guard is NOT here any more. It is in
+        // `win32_draw::draw_text_utf16`, which `text_utf16` below calls and
+        // which is the crate's only `DrawTextW` -- see the block comment above
+        // it for why an empty run is an access violation at address 0x2 that
+        // takes the whole daemon down with no log line. Written out at a call
+        // site it was a comment; there it is a precondition.
         let mut chars: Vec<u16> = run.encode_utf16().collect();
         text_utf16(hdc, font, at, &mut chars, colour);
     }
@@ -2134,24 +2123,8 @@ mod win32 {
     /// resize, so a sentence that ran past the value box would simply be
     /// unreadable.
     fn text_clipped(hdc: HDC, font: HFONT, at: Box2, run: &str, colour: eframe::egui::Color32) {
-        // **Nothing to draw, and drawing nothing would crash.**
-        //
-        // An empty `Vec<u16>` has no allocation, so `as_mut_ptr` gives
-        // Rust's dangling sentinel -- the type's alignment, which for
-        // `u16` is the literal address 2. `DrawTextW` reads through that
-        // pointer even when it is told the length is zero, so an empty
-        // string here is an access violation at address 0x2 inside
-        // `DrawTextExWorker`.
-        //
-        // It kills the whole app rather than the card: the fault happens
-        // inside a window procedure, so Windows raises
-        // STATUS_FATAL_USER_CALLBACK_EXCEPTION and terminates the process
-        // without unwinding -- the panic hook never runs and nothing
-        // reaches the log. The owner met it as the tray, the vault window
-        // and an unlocked session vanishing on one CTRL+ALT+B.
-        if run.is_empty() {
-        return;
-        }
+        // As in [`text`]: the empty-run guard lives in
+        // `win32_draw::draw_text_utf16`, one function down the call chain.
         let mut chars: Vec<u16> = run.encode_utf16().collect();
         text_utf16(hdc, font, at, &mut chars, colour);
     }
@@ -2159,6 +2132,14 @@ mod win32 {
     /// The one text painter. Takes the UTF-16 buffer by `&mut` because
     /// `DrawTextW` writes into it -- and because the password's buffer is a
     /// `Zeroizing<Vec<u16>>` its caller owns and wipes.
+    ///
+    /// **This card is why `win32_draw::draw_text_utf16` exists.** The generated
+    /// password reaches here as that `Zeroizing` buffer, and the `&str`-taking
+    /// [`crate::win32_draw::draw_text`] would have meant decoding it back to a
+    /// `String` and re-encoding -- a second, plain copy of the secret in a
+    /// buffer with no `Drop` that clears it. So the buffer is passed straight
+    /// through, and the empty-run guard that keeps `DrawTextW` off a dangling
+    /// pointer sits on the slice rather than on a string.
     fn text_utf16(
         hdc: HDC,
         font: HFONT,
@@ -2178,7 +2159,7 @@ mod win32 {
             // `DT_NOPREFIX`: these are the app's own words -- and one of them is
             // a generated password, in which an `&` is an ampersand and never a
             // mnemonic that would be drawn as an underscore.
-            DrawTextW(
+            draw_text_utf16(
                 hdc,
                 chars,
                 &mut rc,
