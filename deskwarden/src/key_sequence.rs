@@ -770,7 +770,7 @@ mod tests {
     }
 
     fn live_code() -> TotpState {
-        TotpState::Code { code: TOTP_CODE.to_string(), seconds_left: 18 }
+        TotpState::Code { code: TOTP_CODE.to_string(), seconds_left: 18, period: 30 }
     }
 
     // -- round trip ---------------------------------------------------------
@@ -1139,7 +1139,7 @@ mod tests {
     fn every_totp_state_previews_distinctly() {
         let item = item();
         let states = [
-            TotpState::Code { code: TOTP_CODE.to_string(), seconds_left: 4 },
+            TotpState::Code { code: TOTP_CODE.to_string(), seconds_left: 4, period: 30 },
             TotpState::Fetching,
             TotpState::NoSecret,
             TotpState::NoCodeReported,

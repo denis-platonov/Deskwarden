@@ -345,10 +345,35 @@ pub enum TotpState {
     /// hasn't arrived yet.
     Fetching,
     /// A live code, fetched from `bw serve` on the last successful poll.
-    /// `seconds_left` is derived from the wall clock (the 30s TOTP window),
-    /// not from the fetch, and is refreshed every frame regardless of
-    /// whether a poll happened this tick.
-    Code { code: String, seconds_left: u8 },
+    /// `seconds_left` is derived from the wall clock (the item's own TOTP
+    /// window), not from the fetch, and is refreshed every frame regardless
+    /// of whether a poll happened this tick.
+    ///
+    /// `period` is that window's length in seconds, and it is carried here
+    /// rather than assumed **because the row draws a progress bar and a bar
+    /// needs a whole to be a fraction of**. `seconds_left` alone cannot say
+    /// how full the track should be: 30 seconds left is a full bar on a
+    /// 30-second card and a half-full one on a 60-second card, and
+    /// `totp_add::PERIOD_CHOICES` offers both while a saved `otpauth://` URI
+    /// carries its own `period=`. Before this field the bar divided by a
+    /// literal 30, so a 60-second card's bar emptied in the first half of the
+    /// code's life and then sat at zero while the code was still perfectly
+    /// good -- the same class of lie 9276c7a took out of the countdown beside
+    /// it, one layer further along.
+    ///
+    /// **Both numbers are written by the same site from the same read**, in
+    /// `vault_window::mod`: `totp_period_for(item)` yields the period, and
+    /// `current_totp_seconds_left` of that same period yields the seconds. So
+    /// there is exactly one place that decides what an item's period is,
+    /// including for a seed this app cannot parse -- see `totp_period_for`,
+    /// which is where the [`totp_add::DEFAULT_PERIOD`] fallback for those
+    /// lives and where the reasoning for it is written down. Nothing
+    /// downstream of here may default a period of its own; a second answer to
+    /// "how long is this card's window" is exactly what
+    /// `totp_add::seconds_left_in_period` was extracted to prevent.
+    ///
+    /// [`totp_add::DEFAULT_PERIOD`]: super::totp_add::DEFAULT_PERIOD
+    Code { code: String, seconds_left: u8, period: u16 },
     /// This item *does* have a TOTP secret configured, but the last poll
     /// could not reach `bw serve` (or it answered with an error other than
     /// "no TOTP configured") to fetch the current code. Distinct from
@@ -411,8 +436,10 @@ pub enum TotpState {
 pub enum TotpRow<'a> {
     /// [`TotpState::Fetching`].
     Fetching,
-    /// [`TotpState::Code`].
-    Code { code: &'a str, seconds_left: u8 },
+    /// [`TotpState::Code`]. `period` is carried through unchanged for the
+    /// progress bar; see the state variant's doc for why the bar cannot work
+    /// it out for itself.
+    Code { code: &'a str, seconds_left: u8, period: u16 },
     /// [`TotpState::Unavailable`].
     Unavailable,
     /// [`TotpState::NoCodeReported`].
@@ -438,9 +465,10 @@ pub fn totp_row_for(totp: &TotpState) -> Option<TotpRow<'_>> {
     match totp {
         TotpState::NoSecret => None,
         TotpState::Fetching => Some(TotpRow::Fetching),
-        TotpState::Code { code, seconds_left } => Some(TotpRow::Code {
+        TotpState::Code { code, seconds_left, period } => Some(TotpRow::Code {
             code: code.as_str(),
             seconds_left: *seconds_left,
+            period: *period,
         }),
         TotpState::Unavailable => Some(TotpRow::Unavailable),
         TotpState::NoCodeReported => Some(TotpRow::NoCode),
@@ -3653,7 +3681,9 @@ pub fn draw_detail_read(
                     theme::row_rule(ui);
                     match row {
                         TotpRow::Fetching => totp_fetching_row(ui),
-                        TotpRow::Code { code, seconds_left } => totp_code_row(ui, code, seconds_left, &mut action),
+                        TotpRow::Code { code, seconds_left, period } => {
+                            totp_code_row(ui, code, seconds_left, period, &mut action)
+                        }
                         TotpRow::Unavailable => totp_unavailable_row(ui),
                         TotpRow::NoCode => totp_no_code_row(ui),
                     }
@@ -7877,7 +7907,49 @@ fn totp_countdown_text(seconds_left: u8) -> String {
     format!("{seconds_left}s")
 }
 
-fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut DetailAction) {
+/// How full the TOTP track should be: the share of this card's own window
+/// that is still to run, in `0.0..=1.0`.
+///
+/// **A pure function rather than the expression it replaced inside the paint
+/// closure, for this file's standing reason** -- arithmetic reachable only
+/// through an `egui` closure is arithmetic no test can call directly -- and
+/// because the whole of the fix is the divisor. What stood here was
+/// `seconds_left as f32 / 30.0`, with the 30 written in, which is right for
+/// exactly the cards whose period is 30. On a 60-second card
+/// (`totp_add::PERIOD_CHOICES` offers 60, and a saved `otpauth://` URI can
+/// carry any `period=`) the bar reached zero with a full half of the code's
+/// life still to run and then sat there, empty, under six digits that were
+/// still perfectly good -- and the `clamp` is what made it sit rather than
+/// visibly overflow, so the defect had no tell. This is the same bug 9276c7a
+/// took out of the countdown text; the bar was the half of it left standing.
+///
+/// The period is NOT re-derived here and must not be: it arrives from
+/// [`TotpState::Code`], written by the one site that reads it off the item's
+/// seed. See that variant's doc.
+///
+/// `period.max(1)`, matching `totp_add::seconds_left_in_period`'s own guard
+/// and for its reason: `crate::otpauth` refuses `period=0` at the parser, so
+/// a zero can only come from a caller that made one up, and a full bar is a
+/// better answer to that than an `inf` fraction (which `clamp` would flatten
+/// to a full bar anyway, but by accident rather than on purpose -- and a NaN
+/// from `0.0 / 0.0` would survive `clamp` and paint a rect of width NaN).
+///
+/// The `clamp` outlives the fix and is not redundant: `seconds_left` is a
+/// separate wall-clock read from the one the period came from, and a
+/// mid-session seed edit (30 -> 60 or back) can leave the two one frame out
+/// of step. A fraction above one for a single frame is a bar drawn past the
+/// end of its own track.
+fn totp_bar_fraction(seconds_left: u8, period: u16) -> f32 {
+    (f32::from(seconds_left) / f32::from(period.max(1))).clamp(0.0, 1.0)
+}
+
+fn totp_code_row(
+    ui: &mut egui::Ui,
+    code: &str,
+    seconds_left: u8,
+    period: u16,
+    action: &mut DetailAction,
+) {
     copy_row(
         ui,
         // See `copy_shortcut_label`: one string for the row and its toast.
@@ -7917,7 +7989,7 @@ fn totp_code_row(ui: &mut egui::Ui, code: &str, seconds_left: u8, action: &mut D
             );
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(2), theme::HAIRLINE);
-            let fraction = (seconds_left as f32 / 30.0).clamp(0.0, 1.0);
+            let fraction = totp_bar_fraction(seconds_left, period);
             let filled = egui::Rect::from_min_size(
                 rect.min,
                 egui::vec2(rect.width() * fraction, rect.height()),
@@ -10761,7 +10833,7 @@ mod tests {
             }
             for totp in [
                 TotpState::Fetching,
-                TotpState::Code { code: "123456".to_string(), seconds_left: 12 },
+                TotpState::Code { code: "123456".to_string(), seconds_left: 12, period: 30 },
                 TotpState::Unavailable,
                 TotpState::NoCodeReported,
             ] {
@@ -10793,7 +10865,10 @@ mod tests {
 
         for (totp, needle) in [
             (TotpState::Fetching, "Fetching"),
-            (TotpState::Code { code: "123456".to_string(), seconds_left: 12 }, "123456"),
+            (
+                TotpState::Code { code: "123456".to_string(), seconds_left: 12, period: 30 },
+                "123456",
+            ),
             (TotpState::Unavailable, "Unavailable right now"),
             (TotpState::NoCodeReported, "No code available for this item"),
         ] {
@@ -10821,7 +10896,7 @@ mod tests {
 
         for state in [
             TotpState::Fetching,
-            TotpState::Code { code: "123456".to_string(), seconds_left: 12 },
+            TotpState::Code { code: "123456".to_string(), seconds_left: 12, period: 30 },
             TotpState::Unavailable,
             TotpState::NoCodeReported,
         ] {
@@ -13360,7 +13435,8 @@ mod tests {
             // copied an empty string and raised "One-time code copied" over
             // it. Asked here through the same live-code state the pane
             // draws, so a variant test cannot satisfy it.
-            let live = TotpState::Code { code: value.to_string(), seconds_left: 17 };
+            let live =
+                TotpState::Code { code: value.to_string(), seconds_left: 17, period: 30 };
             let chord_takes_totp =
                 copy_shortcut_action(CopyShortcut::Totp, "x", "x", &live, "", None).is_some();
             assert_eq!(
@@ -13401,7 +13477,7 @@ mod tests {
                 CopyShortcut::Totp,
                 "x",
                 "x",
-                &TotpState::Code { code: "123456".to_string(), seconds_left: 9 },
+                &TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 },
                 "",
                 None
             ),
@@ -13735,6 +13811,7 @@ mod tests {
         let totp = TotpState::Code {
             code: "123456".to_string(),
             seconds_left: 21,
+            period: 30,
         };
         let mut pane = Pane::new();
         let laid_out = pane.idle(&item, &totp);
@@ -15860,6 +15937,7 @@ mod tests {
         let code = TotpState::Code {
             code: "123456".to_string(),
             seconds_left: 9,
+            period: 30,
         };
         assert_eq!(
             copy_shortcut_action(CopyShortcut::Password, "u", "p", &code, "w", None),
@@ -15890,6 +15968,7 @@ mod tests {
         let code = TotpState::Code {
             code: "123456".to_string(),
             seconds_left: 9,
+            period: 30,
         };
         assert_eq!(
             copy_shortcut_action(CopyShortcut::Username, "", "p", &code, "w", None),
@@ -15975,6 +16054,7 @@ mod tests {
             TotpState::Code {
                 code: "123456".to_string(),
                 seconds_left: 9,
+                period: 30,
             },
         )
     }
@@ -16192,6 +16272,7 @@ mod tests {
         let totp = TotpState::Code {
             code: "123456".to_string(),
             seconds_left: 9,
+            period: 30,
         };
         for (key, want) in [
             (egui::Key::B, DetailAction::CopyPassword),
@@ -17330,7 +17411,7 @@ mod tests {
     /// A live code, so the pane draws the One-time code row the secret row
     /// goes under. The digits are deliberately not a prefix of [`SEED`].
     fn a_live_code() -> TotpState {
-        TotpState::Code { code: "418902".to_string(), seconds_left: 19 }
+        TotpState::Code { code: "418902".to_string(), seconds_left: 19, period: 30 }
     }
 
     /// The bullets `masked_row` paints over `secret`, as a whole string.
@@ -19003,6 +19084,17 @@ mod tests {
     const SHOWN_CODE: &str = "418902";
     const SHOWN_SECONDS: u8 = 19;
 
+    /// The window this fixture's code belongs to, in seconds.
+    ///
+    /// Named rather than written as a bare `30` at each of these fixtures for
+    /// the reason the bar bug existed at all: a `30` that appears in more than
+    /// one place is a `30` that can be right in one of them and stale in the
+    /// rest. The typography tests do not care what it is -- they measure
+    /// baselines -- but `the_track_is_a_fraction_of_the_cards_own_window`
+    /// does, and it must be able to say "the same window the other TOTP tests
+    /// draw" and be believed.
+    const SHOWN_PERIOD: u16 = 30;
+
     /// **The live code sits on the pane's line, exactly as a card number
     /// does.**
     ///
@@ -19035,6 +19127,7 @@ mod tests {
             &TotpState::Code {
                 code: SHOWN_CODE.to_string(),
                 seconds_left: SHOWN_SECONDS,
+                period: SHOWN_PERIOD,
             },
             RevealState::default(),
         );
@@ -19073,6 +19166,7 @@ mod tests {
         let totp = TotpState::Code {
             code: SHOWN_CODE.to_string(),
             seconds_left: SHOWN_SECONDS,
+            period: SHOWN_PERIOD,
         };
         let painted = painted_ink_showing(&item, &totp, RevealState::default());
         let drop = |label: &str, value: &str| {
@@ -19094,7 +19188,42 @@ mod tests {
         // The track: the one filled rect on this row that is
         // `TOTP_BAR_HEIGHT` tall, found by its own measurements rather than
         // by position, and checked against the middle of the code's ink.
-        let mut bars: Vec<egui::Rect> = Vec::new();
+        // Both of them: the groove and the fill over it are equally the
+        // track.
+        let (groove, filled) = totp_track(&item, &totp);
+        let (.., code_ink) = one_run(&painted, SHOWN_CODE);
+        for bar in &[groove, filled] {
+            assert!(
+                (bar.center().y - code_ink.center().y).abs() <= 1.5,
+                "the track's middle is {}pt off the middle of the code's ink: {bar:?} \
+                 against {code_ink:?}",
+                bar.center().y - code_ink.center().y
+            );
+        }
+    }
+
+    /// **The TOTP row's progress track as two painted rects: the full-width
+    /// groove, then the filled portion drawn over it.**
+    ///
+    /// Found by measurement rather than by position -- the one pair of rects
+    /// on the whole pane that are [`TOTP_BAR_HEIGHT`] tall -- so no assertion
+    /// here depends on where in the shape list the row happens to land, and a
+    /// row that moved up or down the pane still names itself.
+    ///
+    /// Returned in PAINT ORDER, and the caller gets the groove first because
+    /// `totp_code_row` paints it first. The order is not merely assumed: the
+    /// groove is the one that is always the full [`TOTP_BAR_WIDTH`], and that
+    /// is asserted here, so a row that started painting the fill first would
+    /// fail in this function with a sentence about it rather than silently
+    /// swap two numbers in somebody else's assertion. (They cannot be told
+    /// apart by width alone: on a full window the fill IS the whole track.)
+    ///
+    /// `width() > 1.0` keeps hairlines and zero-width artefacts out. It is
+    /// inherited from the test this was extracted from and it constrains
+    /// callers: a fixture whose fill rounds to nothing would come back as one
+    /// bar and panic here, which is the honest outcome -- every caller below
+    /// draws a fill of tens of points.
+    fn totp_track(item: &VaultItem, totp: &TotpState) -> (egui::Rect, egui::Rect) {
         fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
             match shape {
                 egui::Shape::Rect(r)
@@ -19111,21 +19240,161 @@ mod tests {
                 _ => {}
             }
         }
-        for clipped in &frame_shapes(&item, &totp, RevealState::default()) {
+        let mut bars: Vec<egui::Rect> = Vec::new();
+        for clipped in &frame_shapes(item, totp, RevealState::default()) {
             walk(&clipped.shape, &mut bars);
         }
-        // Two: the full-width groove and the filled portion over it. Both
-        // are the track, so both are checked.
         assert_eq!(bars.len(), 2, "the TOTP track is not two bars: {bars:?}");
-        let (.., code_ink) = one_run(&painted, SHOWN_CODE);
-        for bar in &bars {
+        let (groove, filled) = (bars[0], bars[1]);
+        assert!(
+            (groove.width() - TOTP_BAR_WIDTH).abs() < 0.01,
+            "the first of the two track rects is {}pt wide, not the groove's whole \
+             {TOTP_BAR_WIDTH}pt -- the row is painting them in the other order and every \
+             measurement taken from this pair is the wrong way round",
+            groove.width()
+        );
+        (groove, filled)
+    }
+
+    /// A login carrying `seed` verbatim in its `login.totp`, so the period
+    /// under test is the one the production reader gets out of a real stored
+    /// value rather than a number a test handed it.
+    fn a_login_with_seed(seed: &str) -> VaultItem {
+        let mut item = a_login_showing_a_code();
+        item.login.as_mut().expect("a_login has login data").totp =
+            Some(seed.to_string().into());
+        item
+    }
+
+    /// RFC 6238's published seed, in the base32 form a user pastes. Its own
+    /// period is the default 30.
+    const THIRTY_SECOND_SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    /// **The track is a fraction of the CARD's window, not of a 30 written
+    /// into the row.**
+    ///
+    /// The bug: `totp_code_row` divided `seconds_left` by a literal `30.0`.
+    /// On a card whose period is 60 -- `totp_add::PERIOD_CHOICES` offers it,
+    /// and a scanned `otpauth://` URI can carry any `period=` -- the bar was
+    /// therefore full for the first half of the code's life and pinned at
+    /// zero for the second, under six digits that stayed valid the whole
+    /// time. `9276c7a` had already moved the COUNTDOWN onto the item's own
+    /// period; the bar was the half of that fix deliberately left standing,
+    /// because carrying the period to it meant touching every
+    /// `TotpState::Code` in the crate.
+    ///
+    /// **All three cases are read at ONE instant, unix second 30, and that is
+    /// the whole design of this test.** At that moment
+    /// `totp_add::seconds_left_in_period` answers 30 for a 30-second card
+    /// (a window has just begun) and 30 for a 60-second card (a window is
+    /// exactly half run). So `seconds_left` is the SAME NUMBER in every row
+    /// here, and the only thing that can make the bars differ is the period
+    /// the row divides by. A version that reads `seconds_left` and guesses
+    /// the rest cannot pass this; the old one drew all three full.
+    ///
+    /// The period and the seconds are both produced by the production
+    /// functions -- `vault_window::mod`'s `totp_period_for` and
+    /// `totp_seconds_left_at`, reachable here because this module is a
+    /// descendant of the one they live in -- rather than written into the
+    /// fixture. That is what makes the third case worth anything: it asserts
+    /// what the app really does with a seed it cannot read, not what this
+    /// test would like it to do.
+    #[test]
+    fn the_track_is_a_fraction_of_the_cards_own_window() {
+        // The clock. `30 % 30 == 0` and `30 % 60 == 30`, so both periods
+        // report 30 seconds left and the two rows differ only in their whole.
+        const AT: u64 = 30;
+        for (label, seed, want_period, want_fill) in [
+            (
+                "a 30-second card, a whole window still to run",
+                THIRTY_SECOND_SEED.to_string(),
+                30u16,
+                1.0f32,
+            ),
+            (
+                "a 60-second card, exactly half its window run",
+                format!("otpauth://totp/RFC:u?secret={THIRTY_SECOND_SEED}&period=60"),
+                60,
+                0.5,
+            ),
+            // **The fallback, and it is a real case rather than an edge
+            // one.** `crate::otpauth` refuses `otpauth://hotp/` by name, so
+            // this seed's `period=60` is a value this crate has DECLINED to
+            // interpret -- and the row must not go fishing it back out of the
+            // string. `totp_period_for` answers `totp_add::DEFAULT_PERIOD`
+            // for exactly this, erring short, and it is the only place that
+            // decision is made; the bar inherits it through
+            // `TotpState::Code` and expresses no opinion of its own. So this
+            // row draws at 30's cadence -- a full bar at second 30 -- even
+            // though the string says 60. A bar that came out half-filled here
+            // would mean somebody had taught it to read a seed the parser
+            // rejected.
+            (
+                "a seed the parser refuses, whose own period= is not read back out",
+                format!("otpauth://hotp/RFC:u?secret={THIRTY_SECOND_SEED}&period=60"),
+                30,
+                1.0,
+            ),
+        ] {
+            let item = a_login_with_seed(&seed);
+            let period = crate::vault_window::totp_period_for(&item);
+            assert_eq!(period, want_period, "{label}: the period read off the seed");
+            let seconds_left = crate::vault_window::totp_seconds_left_at(period, Some(AT));
+            assert_eq!(
+                seconds_left, 30,
+                "{label}: this test's whole argument is that all three rows show the same \
+                 seconds left and differ only in their period"
+            );
+
+            let totp = TotpState::Code {
+                code: SHOWN_CODE.to_string(),
+                seconds_left,
+                period,
+            };
+            let (groove, filled) = totp_track(&item, &totp);
+            let want = want_fill * TOTP_BAR_WIDTH;
             assert!(
-                (bar.center().y - code_ink.center().y).abs() <= 1.5,
-                "the track's middle is {}pt off the middle of the code's ink: {bar:?} \
-                 against {code_ink:?}",
-                bar.center().y - code_ink.center().y
+                (filled.width() - want).abs() <= 0.01,
+                "{label}: the filled part of the track is {}pt of a {}pt groove, where \
+                 {seconds_left}s of a {period}s window is {want}pt",
+                filled.width(),
+                groove.width()
+            );
+            // The fill starts where the groove does, so its width is the
+            // whole of what a reader sees. A fill that were centred, or
+            // right-aligned, would satisfy the width assertion above and
+            // still draw a bar that empties from the wrong end.
+            assert_eq!(
+                filled.min, groove.min,
+                "{label}: the fill does not start at the groove's own left edge"
             );
         }
+    }
+
+    /// The bar's arithmetic on its own, at the ends and at the one value that
+    /// cannot be trusted to arrive well-formed.
+    ///
+    /// The geometry test above is the one that would have caught the shipped
+    /// bug; this one is here for the cases a painted frame is a clumsy way to
+    /// reach. A full window and an expired one are the two ends of every
+    /// card, and `period: 0` is the value `totp_add::seconds_left_in_period`
+    /// guards against for the reason given there -- `crate::otpauth` refuses
+    /// it at the parser, so it can only arrive from a caller that invented
+    /// it, and a full bar is a better answer than a `NaN`-wide rect.
+    #[test]
+    fn the_bar_fraction_holds_at_both_ends_of_a_window_of_any_length() {
+        assert_eq!(totp_bar_fraction(30, 30), 1.0, "a 30s card with its whole window left");
+        assert_eq!(totp_bar_fraction(60, 60), 1.0, "a 60s card with its whole window left");
+        assert_eq!(totp_bar_fraction(30, 60), 0.5, "a 60s card, half run");
+        assert_eq!(totp_bar_fraction(15, 60), 0.25, "a 60s card, three quarters run");
+        assert_eq!(totp_bar_fraction(0, 60), 0.0, "an expired 60s card is empty, not half");
+        assert_eq!(totp_bar_fraction(0, 30), 0.0, "an expired 30s card is empty");
+        // Not a NaN and not an overflowing rect: a made-up period draws full.
+        assert_eq!(totp_bar_fraction(1, 0), 1.0, "a period of zero cannot divide");
+        // A frame in which the seconds and the period disagree -- possible
+        // for one frame while a seed edit lands -- is clamped rather than
+        // drawn past the end of its own track.
+        assert_eq!(totp_bar_fraction(60, 30), 1.0, "a stale 60s count under a 30s period");
     }
 
     /// The one-line TOTP status, as `totp_fetching_row` paints it. A literal
@@ -19209,6 +19478,7 @@ mod tests {
         let live = TotpState::Code {
             code: SHOWN_CODE.to_string(),
             seconds_left: SHOWN_SECONDS,
+            period: SHOWN_PERIOD,
         };
         let showing_code = painted_ink_showing(&item, &live, RevealState::default());
         let fetching = painted_ink_showing(&item, &TotpState::Fetching, RevealState::default());
@@ -19781,6 +20051,7 @@ mod tests {
         let totp = TotpState::Code {
             code: "123456".to_string(),
             seconds_left: 9,
+            period: 30,
         };
         let mut pane = Pane::new();
         let laid_out = pane.idle(&item, &totp);
@@ -20028,6 +20299,7 @@ mod tests {
         let totp = TotpState::Code {
             code: "123456".to_string(),
             seconds_left: 9,
+            period: 30,
         };
         let shift_ctrl = egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT);
         for (modifiers, key, want) in [
@@ -20268,6 +20540,7 @@ mod tests {
         let live = TotpState::Code {
             code: "123456".to_string(),
             seconds_left: 21,
+            period: 30,
         };
         for (modifiers, key, want) in chords {
             let mut pane = Pane::new();
@@ -20316,6 +20589,7 @@ mod tests {
                 TotpState::Code {
                     code: String::new(),
                     seconds_left: 9,
+                    period: 30,
                 },
             ] {
                 for (modifiers, key, message) in chords {

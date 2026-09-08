@@ -63,8 +63,10 @@ as it stays down; the first answer that works puts it straight back to
 normal.
 
 Cards set to a sixty-second code no longer count down from thirty twice.
-The countdown, and the refresh behind it, now follow the card's own
-period.
+The countdown, the bar beside it, and the refresh behind both now follow
+the card's own period: the bar on a sixty-second card used to empty
+halfway through the code's life and then sit at nothing while the code was
+still perfectly good.
 
 ### Site icons that were being thrown away
 

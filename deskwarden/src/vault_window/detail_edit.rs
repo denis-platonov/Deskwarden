@@ -10166,7 +10166,7 @@ mod sequence_builder_tests {
     }
 
     fn live_code() -> detail::TotpState {
-        detail::TotpState::Code { code: TOTP_CODE.to_string(), seconds_left: 21 }
+        detail::TotpState::Code { code: TOTP_CODE.to_string(), seconds_left: 21, period: 30 }
     }
 
     // -- the view and the default ------------------------------------------
@@ -13787,7 +13787,7 @@ mod edit_pane_layout_tests {
     /// The live one-time code the tall form is drawn against. Different from
     /// every other value in `palette_item`, deliberately.
     fn live_code() -> detail::TotpState {
-        detail::TotpState::Code { code: "776699".to_string(), seconds_left: 21 }
+        detail::TotpState::Code { code: "776699".to_string(), seconds_left: 21, period: 30 }
     }
 
     /// **Nothing the tallest form paints is outside the pane it is painted

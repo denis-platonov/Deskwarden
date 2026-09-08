@@ -1931,7 +1931,8 @@ pub fn build_frame_with_search(
                     .unwrap_or(totp_add::DEFAULT_PERIOD);
                 let seconds_left = current_totp_seconds_left(period);
                 let before = totp_state.clone();
-                let error = apply_totp_poll_result(poll_result, seconds_left, &mut totp_state);
+                let error =
+                    apply_totp_poll_result(poll_result, seconds_left, period, &mut totp_state);
                 // `Ok(None)` is not a quiet success: at this call site it can
                 // only mean the item we hold says it has a TOTP seed and
                 // `bw serve` will not produce a code for it (review 14's
@@ -3700,6 +3701,7 @@ pub fn build_frame_with_search(
                                     let error = apply_totp_poll_result(
                                         Ok(Some(code)),
                                         totp_seconds_left_at(period, now_unix),
+                                        period,
                                         &mut totp_state,
                                     );
                                     debug_assert!(
@@ -3833,9 +3835,30 @@ pub fn build_frame_with_search(
                         // it is a parse of a short string the frame is
                         // already holding, next to the layout of a whole
                         // detail pane.
-                        let seconds_left = current_totp_seconds_left(totp_period_for(item));
-                        if let TotpState::Code { seconds_left: code_seconds_left, .. } = &mut totp_state {
+                        //
+                        // The period is written back alongside the seconds
+                        // and from the SAME read of it, not left at whatever
+                        // the poll that produced the code stored. A seed can
+                        // change under a running window -- a sync reload
+                        // landing mid-session is the ordinary case, and is
+                        // why `totp_period_for` re-derives rather than caches
+                        // -- and a 30 left behind under a card that is now 60
+                        // would draw the progress bar as a fraction of the
+                        // wrong whole: full at half-time, then empty for the
+                        // rest of a live code. Keeping the pair in step here
+                        // is also what lets `totp_bar_fraction`'s clamp be
+                        // about a single frame's skew rather than a state
+                        // that stays wrong.
+                        let period = totp_period_for(item);
+                        let seconds_left = current_totp_seconds_left(period);
+                        if let TotpState::Code {
+                            seconds_left: code_seconds_left,
+                            period: code_period,
+                            ..
+                        } = &mut totp_state
+                        {
                             *code_seconds_left = seconds_left;
+                            *code_period = period;
                         }
                     }
                 }
@@ -7395,7 +7418,9 @@ fn totp_state_wants_poll(state: &TotpState) -> bool {
 /// Exhaustive, no catch-all, like every other decision over `TotpState`.
 fn totp_state_after_reload(previous: TotpState) -> TotpState {
     match previous {
-        TotpState::Code { code, seconds_left } => TotpState::Code { code, seconds_left },
+        TotpState::Code { code, seconds_left, period } => {
+            TotpState::Code { code, seconds_left, period }
+        }
         TotpState::NoSecret | TotpState::Fetching | TotpState::NoCodeReported | TotpState::Unavailable => {
             TotpState::NoSecret
         }
@@ -7478,14 +7503,24 @@ fn entered_no_code_reported(before: &TotpState, after: &TotpState) -> bool {
 /// (review 13's Important). `NoCodeReported` exists so that this arm's
 /// answer is a state neither the derivation nor the poll gate can undo. See
 /// its doc.
+///
+/// `seconds_left` and `period` arrive together, and every caller derives them
+/// from ONE read of the item's period (`totp_period_for`) and one read of the
+/// clock: `seconds_left` is how much of this card's window is left, `period`
+/// is how long that window is. The row needs both -- the countdown is the
+/// first number, the progress bar is their ratio -- and deriving either of
+/// them here instead would be the second opinion about a card's period that
+/// `totp_add::seconds_left_in_period` exists to rule out. See
+/// `TotpState::Code`'s doc.
 fn apply_totp_poll_result(
     result: Result<Option<String>, VaultError>,
     seconds_left: u8,
+    period: u16,
     totp_state: &mut TotpState,
 ) -> Option<VaultError> {
     match result {
         Ok(Some(code)) => {
-            *totp_state = TotpState::Code { code, seconds_left };
+            *totp_state = TotpState::Code { code, seconds_left, period };
             None
         }
         Ok(None) => {
@@ -12595,11 +12630,16 @@ mod apply_totp_poll_result_tests {
 
     #[test]
     fn a_successful_fetch_becomes_a_live_code() {
-        let mut totp_state = TotpState::Code { code: "111111".to_string(), seconds_left: 20 };
+        let mut totp_state =
+            TotpState::Code { code: "111111".to_string(), seconds_left: 20, period: 30 };
 
-        let error = apply_totp_poll_result(Ok(Some("222222".to_string())), 15, &mut totp_state);
+        let error =
+            apply_totp_poll_result(Ok(Some("222222".to_string())), 15, 30, &mut totp_state);
 
-        assert_eq!(totp_state, TotpState::Code { code: "222222".to_string(), seconds_left: 15 });
+        assert_eq!(
+            totp_state,
+            TotpState::Code { code: "222222".to_string(), seconds_left: 15, period: 30 }
+        );
         assert!(error.is_none());
     }
 
@@ -12610,9 +12650,10 @@ mod apply_totp_poll_result_tests {
         // back to `Fetching`, which is what made this arm invisible in the
         // live composition (review 13's Important). See
         // `a_backend_reported_absence_is_never_promoted_back_to_fetching`.
-        let mut totp_state = TotpState::Code { code: "111111".to_string(), seconds_left: 20 };
+        let mut totp_state =
+            TotpState::Code { code: "111111".to_string(), seconds_left: 20, period: 30 };
 
-        let error = apply_totp_poll_result(Ok(None), 15, &mut totp_state);
+        let error = apply_totp_poll_result(Ok(None), 15, 30, &mut totp_state);
 
         assert_eq!(totp_state, TotpState::NoCodeReported);
         assert!(error.is_none());
@@ -12625,9 +12666,15 @@ mod apply_totp_poll_result_tests {
         // latest poll happened to fail on a dropped connection rather than
         // a 401. It also must not silently become `NoSecret` -- that would
         // read as "this item was never set up for TOTP", which is false.
-        let mut totp_state = TotpState::Code { code: "111111".to_string(), seconds_left: 20 };
+        let mut totp_state =
+            TotpState::Code { code: "111111".to_string(), seconds_left: 20, period: 30 };
 
-        let error = apply_totp_poll_result(Err(VaultError::Http("connection reset".to_string())), 15, &mut totp_state);
+        let error = apply_totp_poll_result(
+            Err(VaultError::Http("connection reset".to_string())),
+            15,
+            30,
+            &mut totp_state,
+        );
 
         assert_eq!(
             totp_state,
@@ -12639,9 +12686,10 @@ mod apply_totp_poll_result_tests {
 
     #[test]
     fn an_unauthorized_error_also_becomes_unavailable_and_is_returned() {
-        let mut totp_state = TotpState::Code { code: "111111".to_string(), seconds_left: 20 };
+        let mut totp_state =
+            TotpState::Code { code: "111111".to_string(), seconds_left: 20, period: 30 };
 
-        let error = apply_totp_poll_result(Err(VaultError::Unauthorized), 15, &mut totp_state);
+        let error = apply_totp_poll_result(Err(VaultError::Unauthorized), 15, 30, &mut totp_state);
 
         assert_eq!(totp_state, TotpState::Unavailable);
         assert!(matches!(error, Some(VaultError::Unauthorized)));
@@ -12680,7 +12728,7 @@ mod apply_totp_poll_result_tests {
             assert!(totp_row_for(&totp_state).is_some(), "{label}: no row while fetching");
 
             // The poll lands.
-            let _ = apply_totp_poll_result(poll_result, 15, &mut totp_state);
+            let _ = apply_totp_poll_result(poll_result, 15, 30, &mut totp_state);
             assert!(
                 totp_row_for(&totp_state).is_some(),
                 "{label}: the One-time code row vanished for an item whose own login data \
@@ -12711,7 +12759,7 @@ mod apply_totp_poll_result_tests {
 
         for previous in [
             TotpState::Fetching,
-            TotpState::Code { code: "123456".to_string(), seconds_left: 9 },
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 },
             TotpState::Unavailable,
             TotpState::NoCodeReported,
         ] {
@@ -12878,7 +12926,7 @@ mod totp_poll_plan_tests {
                     ask(&item.id)
                 }
             };
-            let _ = apply_totp_poll_result(answer, 15, &mut state);
+            let _ = apply_totp_poll_result(answer, 15, 30, &mut state);
         }
         (state, asked)
     }
@@ -12907,7 +12955,10 @@ mod totp_poll_plan_tests {
         assert_eq!(asked, 0, "the backend was asked for a code the snapshot already answers");
         // RFC 6238's published TOTP for T = 59 on this seed is 94287082; six
         // digits of it is what a default card shows.
-        assert_eq!(state, TotpState::Code { code: "287082".to_string(), seconds_left: 15 });
+        assert_eq!(
+            state,
+            TotpState::Code { code: "287082".to_string(), seconds_left: 15, period: 30 }
+        );
     }
 
     /// **The fallback is real, and it is the same wire it always was.**
@@ -12960,7 +13011,15 @@ mod totp_poll_plan_tests {
         });
 
         assert_eq!(asked, POLLS);
-        assert_eq!(state, TotpState::Code { code: "777777".to_string(), seconds_left: 15 });
+        // `period: 30` is the FALLBACK's period, not a parsed one: this seed
+        // is `steam://`, which `crate::otpauth` refuses, so `totp_period_for`
+        // answers `totp_add::DEFAULT_PERIOD` and that is what the row draws
+        // its bar against. See `totp_period_for` for why guessing at the
+        // refused seed's own `period=` is not on offer.
+        assert_eq!(
+            state,
+            TotpState::Code { code: "777777".to_string(), seconds_left: 15, period: 30 }
+        );
     }
 
     /// On this backend a seed it cannot read costs **one** sync, not thirty:
@@ -13182,6 +13241,7 @@ mod totp_backend_cadence_tests {
                     let _ = apply_totp_poll_result(
                         Ok(Some(code)),
                         totp_seconds_left_at(period, Some(now)),
+                        period,
                         &mut state,
                     );
                     failures = 0;
@@ -13215,6 +13275,7 @@ mod totp_backend_cadence_tests {
                     let error = apply_totp_poll_result(
                         answer,
                         totp_seconds_left_at(period, Some(now)),
+                        period,
                         &mut state,
                     );
                     // The `totp_rx` drain's own bookkeeping, verbatim: count
@@ -13454,7 +13515,11 @@ mod totp_backend_cadence_tests {
         };
         assert_eq!(
             frames.state,
-            TotpState::Code { code: at_99, seconds_left: totp_seconds_left_at(30, Some(99)) }
+            TotpState::Code {
+                code: at_99,
+                seconds_left: totp_seconds_left_at(30, Some(99)),
+                period: 30,
+            }
         );
     }
 
@@ -13547,7 +13612,10 @@ mod totp_backend_cadence_tests {
             "the first successful poll (at 660, after a 240s backed-off wait) did not restore \
              the once-a-period cadence"
         );
-        assert_eq!(frames.state, TotpState::Code { code: "777777".to_string(), seconds_left: 30 });
+        assert_eq!(
+            frames.state,
+            TotpState::Code { code: "777777".to_string(), seconds_left: 30, period: 30 }
+        );
     }
 
     /// A definitive "no code for this item" still stops the polling outright,
@@ -13798,6 +13866,70 @@ mod totp_poll_wiring_tests {
         let plan = source.find(PLANS).expect("the plan call");
         assert!(read < plan, "the plan is given a clock read that has not happened yet");
     }
+
+    /// **The per-frame refresh writes the PERIOD as well as the seconds, from
+    /// one read of it.**
+    ///
+    /// The row's progress bar is `seconds_left / period` (see
+    /// `detail::totp_bar_fraction`), so the two numbers are only meaningful
+    /// together. The refresh runs every frame; the poll that first produced
+    /// the code may have run a second ago and, if a sync landed in between,
+    /// against a seed that has since changed its `period=`. Refreshing only
+    /// the seconds would leave the bar dividing this frame's count by last
+    /// frame's whole -- a bar that is full at half-time and then empty under
+    /// a live code, which is the exact defect this pair of fields was
+    /// introduced to end.
+    ///
+    /// Pinned in the source because the refresh lives inside `run`'s `eframe`
+    /// closure, which no test in this crate can call -- the same reason every
+    /// other test in this module reads the source. The window is generous
+    /// (the two writes sit in one `if let` body) and the assertions are about
+    /// what is in it, not about its exact spelling, so ordinary reformatting
+    /// does not red this.
+    ///
+    /// Needles split with `concat!` so none of them matches its own
+    /// definition.
+    #[test]
+    fn the_per_frame_refresh_keeps_the_period_beside_the_seconds() {
+        const SECONDS_WRITE: &str = concat!("*code_seconds_", "left = seconds_left;");
+        const PERIOD_WRITE: &str = concat!("*code_", "period = period;");
+        const PERIOD_READ: &str = concat!("let period = totp_period_", "for(item);");
+        const SECONDS_FROM_PERIOD: &str = concat!("current_totp_seconds_", "left(period)");
+
+        let source = source();
+        assert_eq!(
+            source.matches(SECONDS_WRITE).count(),
+            1,
+            "{SECONDS_WRITE} is not the one per-frame countdown refresh"
+        );
+        assert_eq!(
+            source.matches(PERIOD_WRITE).count(),
+            1,
+            "{PERIOD_WRITE} is not the one per-frame period refresh -- the bar's divisor is \
+             either never refreshed or refreshed in two places"
+        );
+        let seconds = source.find(SECONDS_WRITE).expect("the countdown refresh");
+        let period = source.find(PERIOD_WRITE).expect("the period refresh");
+        assert!(
+            period > seconds && period - seconds < 200,
+            "the two halves of the refresh are {} bytes apart, so they are no longer the \
+             one write of one pair",
+            period.abs_diff(seconds)
+        );
+
+        // And the pair is derived from ONE read of the item's period, not
+        // from two -- the same discipline `the_frame_reads_the_wall_clock_\
+        // once_and_shares_it` imposes on the clock, for the same reason.
+        let preamble = &source[seconds.saturating_sub(1_200)..seconds];
+        assert!(
+            preamble.contains(PERIOD_READ),
+            "the refresh does not read the item's own period just above itself"
+        );
+        assert!(
+            preamble.contains(SECONDS_FROM_PERIOD),
+            "the refreshed countdown is not computed from the period the refresh writes"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -13824,7 +13956,8 @@ mod totp_state_wants_poll_tests {
     fn a_live_code_keeps_polling_so_it_can_be_refreshed_before_its_window_closes() {
         assert!(totp_state_wants_poll(&TotpState::Code {
             code: "111111".to_string(),
-            seconds_left: 4
+            seconds_left: 4,
+            period: 30
         }));
     }
 
@@ -13895,7 +14028,7 @@ mod totp_state_for_secret_presence_tests {
 
     #[test]
     fn a_live_code_is_cleared_the_moment_the_secret_is_gone() {
-        let previous = TotpState::Code { code: "111111".to_string(), seconds_left: 12 };
+        let previous = TotpState::Code { code: "111111".to_string(), seconds_left: 12, period: 30 };
 
         let next = totp_state_for_secret_presence(false, previous);
 
@@ -13944,7 +14077,7 @@ mod totp_state_for_secret_presence_tests {
     fn a_live_code_is_left_untouched_while_the_secret_is_still_present() {
         // The presence check must not itself clobber a code that's still
         // valid -- only the poll (a separate step) replaces it.
-        let previous = TotpState::Code { code: "111111".to_string(), seconds_left: 12 };
+        let previous = TotpState::Code { code: "111111".to_string(), seconds_left: 12, period: 30 };
 
         let next = totp_state_for_secret_presence(true, previous.clone());
 
@@ -13968,7 +14101,7 @@ mod totp_state_for_secret_presence_tests {
         // individually correct, and together they looped forever.
         use super::apply_totp_poll_result;
         let mut state = TotpState::Fetching;
-        apply_totp_poll_result(Ok(None), 15, &mut state);
+        apply_totp_poll_result(Ok(None), 15, 30, &mut state);
 
         let next = totp_state_for_secret_presence(true, state);
 
@@ -17592,7 +17725,8 @@ mod apply_vault_load_result_tests {
         let mut vault_load_error = None;
         let mut selected_id = Some("2".to_string());
         let mut sync_status = Some(Ok(()));
-        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+        let mut totp_state =
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 };
 
         apply_vault_load_result(
             1, // this result's generation
@@ -17627,7 +17761,8 @@ mod apply_vault_load_result_tests {
         let mut vault_load_error = None;
         let mut selected_id = Some("stale".to_string());
         let mut sync_status = Some(Err("bw serve never became ready".to_string()));
-        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+        let mut totp_state =
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 };
 
         apply_vault_load_result(
             1,
@@ -17664,7 +17799,8 @@ mod apply_vault_load_result_tests {
         let mut vault_load_error = None;
         let mut selected_id = Some("pre-sync".to_string());
         let mut sync_status = Some(Ok(()));
-        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+        let mut totp_state =
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 };
 
         apply_vault_load_result(
             2,
@@ -17691,7 +17827,8 @@ mod apply_vault_load_result_tests {
         let mut vault_load_error = None;
         let mut selected_id = None;
         let mut sync_status = None;
-        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+        let mut totp_state =
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 };
 
         apply_vault_load_result(
             1,
@@ -17843,7 +17980,8 @@ mod apply_vault_load_result_tests {
         let mut vault_load_error = None;
         let mut selected_id = Some("a".to_string());
         let mut sync_status = None;
-        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+        let mut totp_state =
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 };
 
         apply_vault_load_result(
             1,
@@ -17861,7 +17999,7 @@ mod apply_vault_load_result_tests {
 
         assert_eq!(
             totp_state,
-            TotpState::Code { code: "123456".to_string(), seconds_left: 9 },
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 },
             "a reload must not replace a displayed code with \"Fetching...\" -- a live Code is \
              already polling, so there is no latch here for the re-arm to break"
         );
@@ -17878,7 +18016,8 @@ mod apply_vault_load_result_tests {
         let mut vault_load_error = None;
         let mut selected_id = Some("a".to_string());
         let mut sync_status = None;
-        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+        let mut totp_state =
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 };
 
         apply_vault_load_result(
             1,
@@ -17894,7 +18033,10 @@ mod apply_vault_load_result_tests {
             &mut totp_state,
         );
 
-        assert_eq!(totp_state, TotpState::Code { code: "123456".to_string(), seconds_left: 9 });
+        assert_eq!(
+            totp_state,
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 }
+        );
     }
 
     /// A *failed* reload leaves the last known snapshot on screen (see the
@@ -17908,7 +18050,8 @@ mod apply_vault_load_result_tests {
         let mut vault_load_error = None;
         let mut selected_id = Some("a".to_string());
         let mut sync_status = None;
-        let mut totp_state = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+        let mut totp_state =
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 };
 
         apply_vault_load_result(
             1,
@@ -17924,7 +18067,10 @@ mod apply_vault_load_result_tests {
             &mut totp_state,
         );
 
-        assert_eq!(totp_state, TotpState::Code { code: "123456".to_string(), seconds_left: 9 });
+        assert_eq!(
+            totp_state,
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 }
+        );
     }
 
     /// Review 29's Minor 3, first half. A `Superseded` give-up at the INITIAL
@@ -18750,7 +18896,7 @@ mod poll_success_is_a_recovery_tests {
     #[test]
     fn a_fetched_code_ends_the_failure_streak() {
         let mut state = TotpState::Unavailable;
-        let error = apply_totp_poll_result(Ok(Some("123456".to_string())), 12, &mut state);
+        let error = apply_totp_poll_result(Ok(Some("123456".to_string())), 12, 30, &mut state);
         assert!(error.is_none());
         assert!(poll_success_is_a_recovery(&state));
     }
@@ -18761,7 +18907,7 @@ mod poll_success_is_a_recovery_tests {
         // away, so "TOTP fetch recovered" directly contradicts the warning
         // logged one line above it about the same poll.
         let mut state = TotpState::Unavailable;
-        let error = apply_totp_poll_result(Ok(None), 12, &mut state);
+        let error = apply_totp_poll_result(Ok(None), 12, 30, &mut state);
         assert!(error.is_none(), "Ok(None) carries no error -- which is how it reached the log");
         assert!(!poll_success_is_a_recovery(&state));
     }
@@ -18793,7 +18939,7 @@ mod totp_state_after_reload_tests {
         // is true for it), so there is no latch here for the re-arm to
         // break -- and blanking it is a visible flicker plus a layout shift
         // on the window's own first-frame auto-sync.
-        let code = TotpState::Code { code: "123456".to_string(), seconds_left: 9 };
+        let code = TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 };
         assert_eq!(totp_state_after_reload(code.clone()), code);
     }
 
@@ -18807,6 +18953,7 @@ mod totp_state_after_reload_tests {
         let kept = totp_state_after_reload(TotpState::Code {
             code: "123456".to_string(),
             seconds_left: 9,
+            period: 30,
         });
         assert_eq!(super::totp_state_for_secret_presence(false, kept), TotpState::NoSecret);
     }
@@ -18980,7 +19127,7 @@ mod entered_no_code_reported_tests {
     fn entering_the_state_is_logged() {
         assert!(entered_no_code_reported(&TotpState::Fetching, &TotpState::NoCodeReported));
         assert!(entered_no_code_reported(
-            &TotpState::Code { code: "123456".to_string(), seconds_left: 9 },
+            &TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 },
             &TotpState::NoCodeReported
         ));
         assert!(entered_no_code_reported(&TotpState::Unavailable, &TotpState::NoCodeReported));
@@ -18999,7 +19146,7 @@ mod entered_no_code_reported_tests {
         for after in [
             TotpState::NoSecret,
             TotpState::Fetching,
-            TotpState::Code { code: "123456".to_string(), seconds_left: 9 },
+            TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 },
             TotpState::Unavailable,
         ] {
             assert!(!entered_no_code_reported(&TotpState::Fetching, &after), "{after:?}");

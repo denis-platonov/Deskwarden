@@ -2319,7 +2319,7 @@ impl Fixtures {
             14,
             "the sparse shot has nothing behind its Add control"
         );
-        let totp = TotpState::Code { code: "418902".to_string(), seconds_left: 19 };
+        let totp = TotpState::Code { code: "418902".to_string(), seconds_left: 19, period: 30 };
         // The seed's tick on, so the composer's seed warning -- the sentence
         // that decides whether that tick was a mistake -- is in the picture.
         let mut record = RecordDraft { open: true, ..Default::default() };
