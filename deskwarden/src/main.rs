@@ -2718,44 +2718,16 @@ fn main() {
                 &mut estate.active_account,
                 Some(&signed_in),
             );
-            // **The token, read back out of the store the child wrote it
-            // to** -- and this is the line that keeps the secret off the
-            // boundary. The child put it in this account's DPAPI
-            // `session.bin`; nothing about it travelled in the file that
-            // just rang, in an argument or in an environment variable.
-            //
-            // Re-read AFTER the adoption above, because that adoption can
-            // re-point which account is active and therefore which
-            // `session.bin` is the right one.
-            match estate.store.load() {
-                Some(token) => {
-                    estate.token = token.clone();
-                    estate.task_in_progress = Some((Instant::now(), BackendOpKind::Sync));
-                    spawn_sync(
-                        token,
-                        job.clone(),
-                        Arc::clone(&estate.cache),
-                        // Nothing is running: this launch deliberately did
-                        // not start one, because until this ring there was
-                        // no token to start it with.
-                        false,
-                        Some(pid),
-                        backend_op_tx.clone(),
-                    );
-                }
-                // **The second mid-sign-in failure**: the child rang but the
-                // store has nothing in it, so its `save` failed or was
-                // undone. Nothing is started and the child is not answered;
-                // it gives up on its own deadline with a screen that says
-                // so, which is honest. Starting `bw serve` with the empty
-                // string instead would bind the port to a backend
-                // authenticated as nobody.
-                None => log::error!(
-                    "the vault window (process {pid}) rang to say it had signed in, but this \
-                     account's session store is empty -- so there is no token to start \
-                     `bw serve` with and that window will report the vault as unreachable"
-                ),
-            }
+            // The token, the cache and the match engine -- see
+            // `restore_the_session_a_child_established`, which this door and
+            // the child's exit now share. `Some(pid)`: that child is still on
+            // screen waiting to be told its backend is up.
+            restore_the_session_a_child_established(
+                &mut estate,
+                &job,
+                &backend_op_tx,
+                Some(pid),
+            );
         }
         if let Some((result, signed_in)) = ui_windows.poll_the_vault_window(&config_dir) {
             // **Before the follow-up, because the follow-up may switch
@@ -2770,6 +2742,34 @@ fn main() {
                 &mut estate.active_account,
                 signed_in.as_ref(),
             );
+            // **And the half the adoption does not do**, which on this door
+            // had no other route: see
+            // `restore_the_session_a_child_established`. `None` for the
+            // waiting child, because this one has exited -- that is what
+            // being on this door means.
+            //
+            // **NOT when the same window also locked**, and that guard is
+            // the whole of what keeps a lock a lock. A window can carry both:
+            // it opened on the sign-in card, showed the vault, and the user
+            // pressed Lock before closing it. The restore below spawns a sync
+            // whose answer lands a second or two later and rebuilds the match
+            // engine -- so on a locked result it would re-arm autofill over a
+            // vault the user has just shut, from a background thread, after
+            // `open_vault_window` below had already stood it down. The lock
+            // would appear to work and then quietly undo itself.
+            //
+            // `needs_reauth` goes with it for the same reason: that is a
+            // session the server has already rejected, and the token this
+            // would read back is the one it rejected.
+            let locked_on_the_way_out = result.locked || result.needs_reauth;
+            if signed_in.is_some() && !locked_on_the_way_out {
+                restore_the_session_a_child_established(
+                    &mut estate,
+                    &job,
+                    &backend_op_tx,
+                    None,
+                );
+            }
             estate = open_vault_window(
                 estate,
                 VaultDeps {
@@ -4086,6 +4086,87 @@ fn adopt_startup_prefetch(
 /// processes -- and the app would answer it by throwing away the sign-in the
 /// user has just completed, then asking them to do it again. See
 /// `the_daemon_keeps_a_key_a_child_just_wrote_when_the_probe_blinks`.
+/// **What a child's sign-in owes the DAEMON, over and above the record.**
+///
+/// [`adopt_a_childs_sign_in`] writes the account and re-settles the backend
+/// slot -- so the vault becomes READABLE again. That is everything the child
+/// needs and about half of what this process does: the item cache is still
+/// empty, the match engine is still cleared, and `estate.token` is still the
+/// empty string. CTRL+ALT+B and autofill both read those, so the tray stays
+/// dead while the window works.
+///
+/// The report: "when user locks UI and then unlock UI - tray still stays
+/// locked."
+///
+/// **Why it only bit now.** There are two doors a child's sign-in comes
+/// through. The doorbell -- [`UiWindows::take_a_childs_sign_in`], rung
+/// mid-life so the daemon can start `bw serve` for the token it has just
+/// established -- has always done all of this, inline. The other door is the
+/// child's EXIT, and it only ever adopted the record, because until the lock
+/// recovery stopped drawing there was nothing for it to restore: a lock was
+/// answered by `resettle_session` in this process, which restarted the
+/// backend, repopulated the cache and rebuilt the engine on its way through.
+/// Going quiet removed that, and a direct-REST child never rings the doorbell
+/// -- it needs nothing started -- so on that account the restore had no
+/// remaining route at all.
+///
+/// So the two doors share this, and the doorbell's own copy is gone.
+///
+/// **`tell_when_ready` is the difference between them**, and it is the
+/// doorbell's: a child that rang is still on screen waiting to be told its
+/// backend is up. A child reporting at exit has gone, so nobody is waiting
+/// and the answer is `None`.
+///
+/// **`currently_running` is asked rather than asserted.** The doorbell passed
+/// a hardcoded `false` on the grounds that its launch had deliberately
+/// started nothing; that is still true there and `backend_is_running` answers
+/// the same, while the exit door has no such guarantee -- a window that closed
+/// without locking leaves `bw serve` exactly as it found it.
+fn restore_the_session_a_child_established(
+    estate: &mut SessionEstate,
+    job: &Arc<Option<job_object::KillOnCloseJob>>,
+    backend_op_tx: &mpsc::Sender<BackendOp>,
+    tell_when_ready: Option<u32>,
+) {
+    // **The token, read back out of the store the child wrote it to** -- and
+    // this is the line that keeps the secret off the boundary. The child put
+    // it in this account's DPAPI `session.bin`; nothing about it travelled in
+    // the file that rang, in an argument or in an environment variable.
+    //
+    // Read AFTER `adopt_a_childs_sign_in`, which every caller runs first,
+    // because that adoption can re-point which account is active and
+    // therefore which `session.bin` is the right one.
+    let Some(token) = estate.store.load() else {
+        // **A mid-sign-in failure**: the child says it signed in but the store
+        // has nothing in it, so its `save` failed or was undone. Nothing is
+        // started. Starting `bw serve` with the empty string instead would
+        // bind the port to a backend authenticated as nobody.
+        log::error!(
+            "a ui process reported a sign-in, but this account's session store is empty -- so \
+             there is no token to start a backend with, and the tray stays locked until the \
+             next successful sign-in"
+        );
+        return;
+    };
+    estate.token = token.clone();
+    estate.task_in_progress = Some((Instant::now(), BackendOpKind::Sync));
+    let currently_running = backend_is_running(&mut estate.child);
+    // `spawn_sync` and not `spawn_backend_start`: the point is the
+    // RECONCILIATION. It starts the backend, syncs it and repopulates the
+    // cache through the same `write_back_at_epoch` every other populate uses,
+    // and `apply_backend_op` then rebuilds the match engine from the settled
+    // items -- which is the half that was missing, and the half the tray
+    // reads.
+    spawn_sync(
+        token,
+        job.clone(),
+        Arc::clone(&estate.cache),
+        currently_running,
+        tell_when_ready,
+        backend_op_tx.clone(),
+    );
+}
+
 fn adopt_a_childs_sign_in(
     settings_path: &Path,
     accounts_state: &mut Option<accounts::AccountsState>,
@@ -20388,6 +20469,80 @@ mod tests {
             body_of(raw, concat!("fn recover_from_failed_vault_", "wait(")).contains(draw),
             "control: {draw:?} matches nothing in the one function that still calls it, so \
              the ban above is unfalsifiable"
+        );
+    }
+
+    /// **BOTH DOORS A CHILD'S SIGN-IN COMES THROUGH RESTORE THE SESSION, AND
+    /// THE ONE THAT CAN CARRY A LOCK REFUSES TO.**
+    ///
+    /// The report: "when user locks UI and then unlock UI - tray still stays
+    /// locked." `adopt_a_childs_sign_in` writes the record and re-settles the
+    /// backend slot, which is everything the WINDOW needs; the item cache,
+    /// the match engine and `estate.token` are what the TRAY reads, and
+    /// nothing on the exit door touched them. The doorbell door always had
+    /// that code inline, and a direct-REST child never rings it -- it needs
+    /// nothing started -- so on that account there was no route left at all.
+    ///
+    /// Both halves are pinned because each fails differently and silently.
+    /// A missing restore is a tray that never comes back. A restore that is
+    /// NOT refused on a locked result is worse: the sync it spawns lands a
+    /// second later, on a background thread, and rebuilds the match engine
+    /// over a vault the user has just shut -- a lock that appears to work and
+    /// then undoes itself with nothing on screen to say so.
+    ///
+    /// A source pin because both call sites are inside `fn main`'s loop,
+    /// which needs a tray, a hotkey and a live `UiWindows` and cannot be
+    /// entered from a test in this crate. The needles are split with
+    /// `concat!` so this pin cannot match itself.
+    #[test]
+    fn a_childs_sign_in_restores_the_session_on_both_doors_and_never_over_a_lock() {
+        let code = code_only_lines(production_half_of_this_file());
+        let restore = concat!("restore_the_session_a_child_", "established(");
+
+        // Once as a definition, twice as a call. A fourth is a third door and
+        // wants reading; a second means one of the two doors lost it.
+        assert_eq!(
+            code.matches(restore).count(),
+            3,
+            "`{restore}` is written {} time(s), not the definition plus the two doors -- the \
+             doorbell and the child's exit",
+            code.matches(restore).count()
+        );
+
+        // The doorbell answers the child that is still on screen; the exit
+        // door has nobody to answer. Getting these the wrong way round leaves
+        // a live window waiting on a message that never comes.
+        assert!(
+            code.contains("Some(pid),"),
+            "the doorbell no longer tells the waiting child its backend is up, so that window \
+             sits on its own deadline and then reports the vault unreachable"
+        );
+
+        // **THE GUARD.** Asserted on the binding rather than on the `if`, so
+        // that a reader renaming it has to come here and a reader deleting it
+        // fails immediately.
+        assert!(
+            code.contains("let locked_on_the_way_out = result.locked || result.needs_reauth;"),
+            "the exit door no longer works out whether the window it is restoring for also \
+             locked, so the restore below it is unconditional"
+        );
+        let at_guard = code
+            .find("if signed_in.is_some() && !locked_on_the_way_out {")
+            .expect(
+                "the exit door restores a session without refusing a locked one: the sync it \
+                 spawns rebuilds the match engine a second later, re-arming autofill over a \
+                 vault the user has just shut",
+            );
+        let at_call = code[at_guard..].find(restore).unwrap_or_else(|| {
+            panic!("the guard is there but nothing is guarded by it, so the restore moved out")
+        });
+        // Nothing between the guard and the call: an `else`, or a second
+        // statement, is a route past it.
+        let between = &code[at_guard..at_guard + at_call];
+        assert!(
+            !between.contains("else"),
+            "there is an `else` between the lock guard and the restore, so a locked window \
+             reaches it by the other arm: {between}"
         );
     }
 
