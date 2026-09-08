@@ -3351,17 +3351,30 @@ pub const TEXT_CLIP_INSET: f32 = 3.0;
 /// OUTERMOST [`SCROLLBAR_WIDTH`] of that lane, instead of over the content's
 /// own right edge.
 ///
-/// The caller MUST pair this with
-/// `.scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)` and with a
-/// container whose right padding is ZERO -- the lane replaces that padding.
-/// Both halves are load-bearing:
+/// The caller MUST give it a container whose right padding is ZERO -- the
+/// lane replaces that padding -- and MUST make the reservation unconditional,
+/// one of the two ways below. Both requirements are load-bearing:
 ///
 /// * The lane is reserved by `floating_allocated_width`, which egui only
 ///   applies on the axes it is showing a bar for. Under the default
 ///   `VisibleWhenNeeded` the lane would therefore appear and disappear as the
 ///   content crossed the overflow threshold, and the content's right edge --
-///   the row tiles' -- would jump 10pt sideways with it. `AlwaysVisible`
-///   makes the reservation unconditional, so the content keeps one width.
+///   the row tiles' -- would jump 10pt sideways with it. There are two cures
+///   and this app ships both, because they suit different panes:
+///   - `.scroll_bar_visibility(ScrollBarVisibility::AlwaysVisible)`, which
+///     makes egui reserve on every frame, paired with [`hide_scrollbar`] on
+///     the frames the content FITS so the always-shown bar is not painted
+///     down a pane that cannot move. The item list, the edit form and the
+///     read pane take this: each of them knows from its own geometry whether
+///     it fits.
+///   - capping the scroll area's CONTENT at the width the lane leaves
+///     (`ui.set_max_width` as the first thing inside the `show` closure),
+///     which reserves it from the other side and leaves the mode alone. The
+///     sidebar rail takes this, because "does it fit" is not a question it
+///     can answer before it has drawn itself -- its height is the sum of two
+///     sections, two dividers, a header and a user-owned folder list. It
+///     keeps `VisibleWhenNeeded` and so shows a bar only when there is
+///     something to scroll.
 /// * The bar stays FLOATING (egui's default), not `solid()`. Only the
 ///   floating branch fades the bar out when the pointer is away from the
 ///   area, which is the behaviour this list already had; `solid()` pins both
@@ -3437,7 +3450,9 @@ pub fn scrollbar_in_gutter(ui: &mut Ui, gutter: f32) {
 /// track and handle colours by, rather than by changing the visibility mode
 /// or any width. Nothing about the layout moves, so the bar can be turned
 /// back on the moment the content overflows without the tiles resizing --
-/// which is the whole reason [`scrollbar_in_gutter`] demands `AlwaysVisible`.
+/// which is the whole reason [`scrollbar_in_gutter`]'s `AlwaysVisible` half
+/// exists. (The sidebar rail reaches the same end by capping its content
+/// instead and never calls this; see that function.)
 /// All SIX, and not just the pair that happens to matter today. egui picks
 /// one of the three pairs per frame from how close the pointer is (dormant /
 /// pointer-in-the-area / pointer-on-the-bar), and its floating defaults
@@ -3455,31 +3470,6 @@ pub fn hide_scrollbar(ui: &mut Ui) {
     scroll.dormant_handle_opacity = 0.0;
     scroll.active_handle_opacity = 0.0;
     scroll.interact_handle_opacity = 0.0;
-}
-
-/// [`SCROLLBAR_WIDTH`] for a bar that must allocate NO lane.
-///
-/// The width half of [`scrollbar_in_gutter`] without the placement half.
-/// That function reserves `gutter` points by narrowing the content, which
-/// suits a list whose padding can hold the bar; the sidebar rail cannot pay
-/// it -- every row inset, the glyph column and the lock countdown's x are
-/// pinned against the panel's current width, so a reserved lane would move
-/// all of them.
-///
-/// **Without this the rail gets egui's own default**, which is
-/// `ScrollStyle::floating()`: `bar_width: 10.0` and `foreground_color: true`.
-/// That is a 10pt bar in the text colour against the item list's 6pt one, on
-/// two panes a few hundred points apart -- reported as "make scroll same
-/// small as result have".
-///
-/// `floating_width` is raised to match for [`scrollbar_in_gutter`]'s reason:
-/// egui's default grows a floating bar from `floating_width` to `bar_width`
-/// under the pointer, and a bar that changed width on hover would be a
-/// second size rather than one.
-pub fn floating_scrollbar(ui: &mut Ui) {
-    let scroll = &mut ui.spacing_mut().scroll;
-    scroll.bar_width = SCROLLBAR_WIDTH;
-    scroll.floating_width = SCROLLBAR_WIDTH;
 }
 
 /// A muted field label ("User name", "Master password").
@@ -3982,46 +3972,210 @@ fn rule(ui: &mut Ui, color: Color32) {
 mod tests {
     use super::*;
 
-    /// **One scroll bar width in this app, and the rail was not using it.**
+    /// **The two scroll bars in this app are ONE scroll bar, field by field,
+    /// and there is no longer an exception.**
     ///
-    /// The report: "make scroll same small as result have". egui's own
-    /// default `ScrollStyle` is `floating()`, whose `bar_width` is 10.0 and
-    /// whose handle takes the FOREGROUND colour -- so a pane that sets
-    /// nothing gets a 10pt bar in the text colour, beside an item list whose
-    /// `scrollbar_in_gutter` makes a 6pt one. Two sizes, a few hundred points
-    /// apart.
+    /// The report this began as: "make scroll same small as result have".
+    /// egui's own default `ScrollStyle` is `floating()`, whose `bar_width` is
+    /// 10.0 -- so the sidebar rail, which set nothing, drew a 10pt bar beside
+    /// an item list whose `scrollbar_in_gutter` drew a 6pt one. Two sizes, a
+    /// few hundred points apart.
     ///
-    /// The control is the assertion that egui's default really is wider. A
-    /// helper that happened to agree with the default would pass the two
-    /// assertions above it while fixing nothing, and would go on passing if
-    /// this crate's `SCROLLBAR_WIDTH` were ever changed to 10.
+    /// Fixing the WIDTH did not settle it: "Sidebar scroll bar - doesn't match
+    /// the results", on the build that had the width fix in it. So this test
+    /// stopped being about `bar_width` and became about the whole struct.
+    ///
+    /// **And the second report was not about the struct at all**, which is why
+    /// this test's shape changed too. It used to compare
+    /// [`scrollbar_in_gutter`] against a second helper, `floating_scrollbar`,
+    /// which set the two widths and deliberately reserved NO lane -- the rail
+    /// could not afford one while every row inset in it was pinned against the
+    /// panel's width. That is exactly what a reader was seeing: the rail's bar
+    /// painted on its rows (x=196..202 in a 212pt panel) against the list's
+    /// beside its tiles (x=384..390 on a 390pt pane). The fix gave the rail a
+    /// lane out of its panel frame's right margin, `floating_scrollbar` lost
+    /// its only caller, and it was deleted rather than left as a helper nobody
+    /// calls -- which would have made every line below a comparison against
+    /// something no pane on screen uses.
+    ///
+    /// So the two `Ui`s here are both [`scrollbar_in_gutter`], each with **its
+    /// real caller's gutter**: `sidebar::PANEL_PAD_X` and
+    /// `item_list::LIST_PADDING`, read from those modules rather than written
+    /// out again. Every field must agree, the lane included, so the next
+    /// divergence -- in an opacity, in a margin, in the handle's minimum
+    /// length, or in one pane's padding drifting from the other's -- fails
+    /// here instead of being reported from a screenshot.
+    ///
+    /// **Exhaustively destructured on purpose.** There is no `..` in the
+    /// pattern below, so a field added to egui's `ScrollStyle` in a future
+    /// version breaks this file's compile rather than quietly joining the set
+    /// of things nobody compared. That is the whole reason the comparison is
+    /// written out field by field instead of as one `assert_eq!` on the two
+    /// structs, which would have been shorter and would have said nothing
+    /// about a new field either way.
+    ///
+    /// # Controls
+    ///
+    /// Two, because "every field agrees" is a claim two calls that both did
+    /// NOTHING would also satisfy. egui's untouched default is read from the
+    /// same `Ui` and required to differ from the pair on both widths -- so a
+    /// day when `SCROLLBAR_WIDTH` is edited to 10, or when the helper stops
+    /// writing, is a day this test is red.
     #[test]
-    fn the_floating_bar_is_the_same_width_as_every_other_bar_and_takes_no_lane() {
+    fn the_two_panes_scroll_bars_are_one_bar_field_for_field() {
+        // The REAL gutters, from the two modules that pass them, so this
+        // cannot agree with itself while the panes disagree on screen. They
+        // are the same number today -- design 4.8 gives the sidebar panel and
+        // the item list the same 10pt padding -- and the assertion on the lane
+        // below is what says so.
+        let rail_gutter = f32::from(crate::vault_window::sidebar::PANEL_PAD_X);
+        let list_gutter = crate::vault_window::item_list::LIST_PADDING;
         let ctx = egui::Context::default();
-        let mut default_width = None;
-        let mut set = None;
+        let mut untouched = None;
+        let mut list = None;
+        let mut rail = None;
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            default_width = Some(ui.spacing().scroll.bar_width);
-            floating_scrollbar(ui);
-            set = Some(ui.spacing().scroll.clone());
+            untouched = Some(ui.spacing().scroll);
+            // Each in its own scope, so neither call is reading the other's
+            // leftovers: `ui.scope` hands the closure a child `Ui` with a
+            // cloned style, and the parent's is put back afterwards.
+            ui.scope(|ui| {
+                scrollbar_in_gutter(ui, list_gutter);
+                list = Some(ui.spacing().scroll);
+            });
+            ui.scope(|ui| {
+                scrollbar_in_gutter(ui, rail_gutter);
+                rail = Some(ui.spacing().scroll);
+            });
         });
-        let set = set.expect("the ui ran");
-        assert_eq!(set.bar_width, SCROLLBAR_WIDTH);
-        // The hover width too: egui grows a floating bar from `floating_width`
-        // to `bar_width` under the pointer, and a bar that changed width on
-        // hover would be a second size rather than one.
-        assert_eq!(set.floating_width, SCROLLBAR_WIDTH);
-        // And no lane, which is the whole reason this is not
-        // `scrollbar_in_gutter`: the sidebar rail pins every row inset and the
-        // countdown's x against the panel width, so a reserved lane moves all
-        // of them.
+        let untouched = untouched.expect("the ui ran");
+        let list = list.expect("the ui ran");
+        let egui::style::ScrollStyle {
+            floating,
+            content_margin,
+            bar_width,
+            handle_min_length,
+            bar_inner_margin,
+            bar_outer_margin,
+            floating_width,
+            floating_allocated_width,
+            foreground_color,
+            dormant_background_opacity,
+            active_background_opacity,
+            interact_background_opacity,
+            dormant_handle_opacity,
+            active_handle_opacity,
+            interact_handle_opacity,
+            fade,
+        } = rail.expect("the ui ran");
+
+        // The bar's own shape and colour. A difference in any of these is a
+        // difference a reader can see with both panes on screen at once,
+        // which is the report.
+        assert_eq!(floating, list.floating, "one bar floats and the other takes space");
         assert_eq!(
-            set.floating_allocated_width, 0.0,
-            "`floating_scrollbar` reserved a lane, so the rail it is for narrows and every              row inset in it moves"
+            content_margin, list.content_margin,
+            "the two areas inset their content differently"
+        );
+        assert_eq!(
+            bar_width, list.bar_width,
+            "the two bars are different widths -- the original report"
+        );
+        assert_eq!(
+            floating_width, list.floating_width,
+            "the two bars are different widths while the pointer is away from them"
+        );
+        assert_eq!(
+            bar_width, SCROLLBAR_WIDTH,
+            "the pair agree, but on a width this app does not use"
+        );
+        assert_eq!(
+            floating_width, SCROLLBAR_WIDTH,
+            "a bar that grows under the pointer is a second size, not one"
+        );
+        assert_eq!(
+            handle_min_length, list.handle_min_length,
+            "a short rail and a short list would stop at different handle lengths"
+        );
+        assert_eq!(
+            bar_inner_margin, list.bar_inner_margin,
+            "different gaps between bar and content"
+        );
+        assert_eq!(
+            bar_outer_margin, list.bar_outer_margin,
+            "the two bars stand off their pane's outer edge by different amounts"
+        );
+        assert_eq!(
+            foreground_color, list.foreground_color,
+            "one handle is drawn in the text colour and the other in a widget fill"
+        );
+
+        // All six opacities, and not just the pair that happens to matter on
+        // a given frame: egui picks one of the three pairs per frame from how
+        // close the pointer is (dormant / pointer-in-the-area / pointer-on-
+        // the-bar), so a divergence in any of them is a divergence a reader
+        // reaches by moving the mouse. See [`hide_scrollbar`], which zeroes
+        // the same six for the same reason.
+        let paler = "the rail's bar and the list's are different strengths of the same colour";
+        assert_eq!(
+            dormant_background_opacity, list.dormant_background_opacity,
+            "{paler}, dormant track"
+        );
+        assert_eq!(
+            active_background_opacity, list.active_background_opacity,
+            "{paler}, hovered track"
+        );
+        assert_eq!(
+            interact_background_opacity, list.interact_background_opacity,
+            "{paler}, grabbed track"
+        );
+        assert_eq!(dormant_handle_opacity, list.dormant_handle_opacity, "{paler}, dormant handle");
+        assert_eq!(active_handle_opacity, list.active_handle_opacity, "{paler}, hovered handle");
+        assert_eq!(interact_handle_opacity, list.interact_handle_opacity, "{paler}, grabbed handle");
+
+        // The content fade at the scroll area's own ends, which is not the
+        // bar but is the other thing scrolling looks like.
+        assert_eq!(fade, list.fade, "the two panes fade their scrolled content differently");
+
+        // THE LANE, which used to be the one field allowed to differ and is
+        // now the last one to join. Both panes reserve their own padding, both
+        // paddings are design 4.8's 10pt, so both bars stand the same
+        // `gutter - SCROLLBAR_WIDTH` clear of their content and the same 0
+        // from their pane's outer edge. If a future design really does give
+        // the two panes different paddings, this is the line to change -- and
+        // changing it is a decision about what the reader sees, not a
+        // formality, which is why it fails rather than being skipped.
+        assert_eq!(
+            floating_allocated_width, list.floating_allocated_width,
+            "the rail's lane is {floating_allocated_width}pt and the item list's is {}pt, so \
+             the two bars stand off their content by different amounts",
+            list.floating_allocated_width
+        );
+        assert_eq!(
+            floating_allocated_width, rail_gutter,
+            "`scrollbar_in_gutter` stopped reserving its caller's gutter, so the rail's bar is \
+             back over its rows -- the second report"
+        );
+        assert_eq!(
+            list.floating_allocated_width, list_gutter,
+            "`scrollbar_in_gutter` stopped reserving its caller's gutter, so the item list's \
+             bar is back over its tiles"
         );
         assert!(
-            default_width.expect("the ui ran") > SCROLLBAR_WIDTH,
-            "control: egui's default bar is already {SCROLLBAR_WIDTH}pt wide, so this helper              changes nothing and the two panes agreed all along"
+            rail_gutter > SCROLLBAR_WIDTH,
+            "control: the rail's {rail_gutter}pt gutter does not even fit the {SCROLLBAR_WIDTH}pt \
+             bar, so there is no lane to be flush to the outer edge of"
+        );
+
+        assert!(
+            untouched.bar_width > SCROLLBAR_WIDTH,
+            "control: egui's default bar is already {SCROLLBAR_WIDTH}pt wide, so the helper \
+             changes nothing and the two panes agreed all along"
+        );
+        assert!(
+            untouched.floating_width < SCROLLBAR_WIDTH,
+            "control: egui's default dormant bar is already {SCROLLBAR_WIDTH}pt wide, so the \
+             helper's `floating_width` line is doing nothing"
         );
     }
 

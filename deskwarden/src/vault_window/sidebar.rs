@@ -513,6 +513,73 @@ fn is_muted(filter: &SidebarFilter) -> bool {
 /// VAULT rows despite both using the same `sidebar_row` allocation.
 const FOLDER_EDIT_BUTTON_WIDTH: f32 = 24.0;
 
+/// Design 4.8's horizontal padding on the sidebar panel itself
+/// (`padding: 14px 10px`), and therefore the width of the lane the rail's
+/// scroll bar lives in.
+///
+/// **One constant for two things that MUST be the same number**, which is
+/// the whole point of it existing. The panel frame `vault_window` builds
+/// keeps this as its LEFT inner margin and sets its RIGHT one to zero; the
+/// rail then hands the same value to [`theme::scrollbar_in_gutter`], which
+/// reserves it back as a lane down the rail's right-hand edge. The two
+/// cancel, so the rows span exactly the width they spanned when the frame
+/// held both margins -- 192pt on this 212pt panel -- and the bar is drawn in
+/// the lane instead of on top of them. Written as two agreeing literals
+/// (one in `mod.rs`, one here) they would be one edit away from a rail whose
+/// rows moved 10pt sideways, which is what every inset in this file is
+/// pinned against.
+///
+/// `i8` because that is what `egui::Margin`'s fields are; the scroll helper
+/// takes the `f32`.
+pub(crate) const PANEL_PAD_X: i8 = 10;
+
+/// The frame the vault window wraps [`draw_sidebar`] in: design 4.8's
+/// `padding: 14px 10px` on a [`theme::CARD`] fill, with the RIGHT 10 given
+/// up to the rail's scroll bar.
+///
+/// # Why the right margin is zero, and why the padding is not gone
+///
+/// THE REPORT, twice: "Sidebar scroll bar - doesn't match the results". The
+/// first answer made every `ScrollStyle` field agree between the rail and
+/// the item list (see
+/// `theme::tests::the_two_panes_scroll_bars_are_one_bar_field_for_field`)
+/// and did not settle it, because what a reader was comparing is PLACEMENT.
+/// Measured inside this frame when it still held both margins: the rail's
+/// rows spanned x=10..202 and its bar x=196..202 -- the bar painted ON the
+/// rows' right edge and stopped 10pt short of the panel's own edge. The item
+/// list's tiles end at 380 on a 390pt pane with its bar at 384..390: outside
+/// the tiles, flush to the pane's edge, 4pt of clear space between.
+///
+/// A floating egui bar is pinned to its `Ui`'s right edge, so the only way
+/// to move it off the rows is to give the rail a lane -- which is what
+/// [`theme::scrollbar_in_gutter`] reserves and what this margin pays for.
+/// The rail's ui now runs to x=212, the lane runs 202..212, and the bar is
+/// drawn in its outermost [`theme::SCROLLBAR_WIDTH`]: x=206..212, beside
+/// rows that still span 10..202. The 10pt of padding did not disappear; it
+/// moved from the frame into the rail, which is the only place that can
+/// spend it on the bar. `tests::the_rail_lays_its_rows_bar_and_countdown_out\
+/// _like_the_item_list` is those numbers, kept.
+///
+/// # Why it is a function
+///
+/// Because it is drawn in two places and they must be the same frame. Every
+/// sidebar harness that predates this drew [`draw_sidebar`] onto the bare
+/// root `Ui`, where the rail's ui is the whole 212pt screen and the bar
+/// cannot be seen to land anywhere in particular -- so the bug this fixes
+/// was invisible to all of them. The first harness that did wrap the rail in
+/// a frame spelled the margins out again, kept honest only by a comment
+/// saying it must match `vault_window`'s. That is exactly this crate's
+/// recurring defect: two copies obliged to agree. There is now one.
+pub(crate) fn panel_frame() -> egui::Frame {
+    egui::Frame::new().fill(theme::CARD).inner_margin(egui::Margin {
+        left: PANEL_PAD_X,
+        // The lane. See this function's doc, and `PANEL_PAD_X`.
+        right: 0,
+        top: 14,
+        bottom: 14,
+    })
+}
+
 /// Row height and horizontal text inset, from design 4.8's exact CSS for
 /// each sidebar row: `padding: 8px 10px` on a single 13px text line (line
 /// box ~16px at this size) -- 8 + 16 + 8 rounds to 32px tall, and both the
@@ -613,19 +680,84 @@ pub fn draw_sidebar(
         // `the_screen_rows_survive_a_vault_with_a_folder_for_every_letter` is
         // that measurement, kept.
         //
-        // The bar floats rather than taking `theme::scrollbar_in_gutter`:
-        // that helper reserves a lane by narrowing the content, and every row
-        // inset, the glyph column and the countdown's own x are pinned against
-        // this panel's current width. A floating bar allocates no width, so
-        // nothing in the rail moves.
+        // **THE BAR HAS A LANE, and until this it did not.** THE REPORT,
+        // twice: "Sidebar scroll bar - doesn't match the results". The first
+        // answer made every `ScrollStyle` field agree with the item list's --
+        // width, margins, opacities, the lot -- and the report came back on
+        // that build, because what a reader is comparing is PLACEMENT.
         //
-        // **But not egui's floating DEFAULT, which is a second size.** That
-        // is `ScrollStyle::floating()` -- `bar_width: 10.0`, in the text
-        // colour -- against the item list's 6pt, on two panes a few hundred
-        // points apart. Reported as "make scroll same small as result have".
-        // `theme::floating_scrollbar` is the width half of
-        // `scrollbar_in_gutter` with the lane half left out.
-        theme::floating_scrollbar(ui);
+        // Measured before the fix, inside the real panel frame: the rail's
+        // rows spanned x=10..202 and its bar x=196..202. A floating egui bar
+        // is pinned to its `Ui`'s right edge, so with no lane to sit in it
+        // painted ON the rows' right edge and stopped 10pt short of the
+        // panel's own edge. The item list, whose tiles end at 380 on a 390pt
+        // pane with the bar at 384..390, puts it OUTSIDE the tiles and flush
+        // to the pane's edge. Two arrangements, side by side.
+        //
+        // Now the same as the list's, and by the same helper:
+        // `theme::scrollbar_in_gutter` reserves `PANEL_PAD_X` down this ui's
+        // right edge and draws the bar in the outermost
+        // `theme::SCROLLBAR_WIDTH` of it. The panel frame pays for the lane
+        // by dropping its right inner margin (see `panel_frame`), so this
+        // ui now runs to the panel's own edge at x=212, the lane is 202..212,
+        // and the bar lands at 206..212 -- beside rows that still span
+        // 10..202. Nothing in the rail moves: the frame gave up exactly what
+        // the lane takes.
+        //
+        // **Which of those two edits moved the bar, precisely.** The FRAME
+        // did: egui pins a floating bar to `outer_rect.right()`, which is
+        // this ui's right edge, and dropping the margin is what moved that
+        // edge from 202 to 212. The gutter's own job is to keep the rows off
+        // it -- and the cap below does that on the frames egui does not apply
+        // the reservation to, which is why passing a WRONG gutter here paints
+        // an identical frame and is pinned in the source instead
+        // (`the_rail_takes_the_apps_scrollbar_width_before_it_builds_its_scroll_area`).
+        // It is the real number anyway: a rail that asked for a lane it had
+        // not been given would be a false statement about the panel.
+        //
+        // The rejected alternative was a negative `bar_outer_margin`, which
+        // paints the bar in the right place without either edit;
+        // `item_list.rs` measured it and rejected it, because egui derives
+        // the bar's hit rect from `outer_rect.with_min_x` and it comes out
+        // inverted -- a bar nobody can grab.
+        theme::scrollbar_in_gutter(ui, f32::from(PANEL_PAD_X));
+        // The width the rows are to keep, read BEFORE the scroll area and
+        // re-imposed on its content below. See that call for why it is not
+        // simply `ui.available_width()` inside.
+        let rail_width = (ui.available_width() - f32::from(PANEL_PAD_X)).max(0.0);
+        // **`VisibleWhenNeeded` is kept, and the lane is held open anyway.**
+        //
+        // `scrollbar_in_gutter`'s reservation is `floating_allocated_width`,
+        // which egui only applies on an axis it is SHOWING a bar for. Under
+        // `VisibleWhenNeeded` that makes the lane come and go with the folder
+        // count: measured, a rail with one folder laid its rows out 10..212
+        // and a rail with twenty-six laid them 10..202, so adding a folder
+        // slid every row's right edge, its count and the glyph column the
+        // "+" and the folder pencils share 10pt sideways. That is why the
+        // item list pairs this helper with `AlwaysVisible` and hides the bar
+        // it does not need with `theme::hide_scrollbar`.
+        //
+        // The rail cannot copy that pairing: `hide_scrollbar` has to be
+        // applied only on the frames the rail FITS, and the item list knows
+        // whether it fits from its own row count and pane height, while the
+        // rail's height is the sum of two sections, two dividers, a header
+        // and a folder list -- a number this function does not have until it
+        // has drawn them. So the reservation is made unconditional the other
+        // way, by capping the content at the width the lane leaves. Both
+        // states then lay out identically and the bar still appears only when
+        // there is something to scroll, which is the behaviour the rail
+        // already had.
+        //
+        // **The mode is also no longer load-bearing for clicks.** It was:
+        // with the bar's hit rect over the rows (x=196..202, above), egui
+        // registering it on every `AlwaysVisible` frame made the right 6pt of
+        // every row dead to the mouse -- `hide_scrollbar` zeroes the six
+        // opacities and does NOT give the rect back. The lane moved that rect
+        // to 206..212, off the rows entirely, so that cost is gone; see
+        // `a_rail_row_is_clickable_to_its_right_edge_with_the_bar_showing_or_not`,
+        // which now passes in BOTH states. The mode is kept
+        // because a bar shown only when it is needed is what this rail wants,
+        // not because it is the only mode that works.
         //
         // `max_height` leaves the countdown its band, and `auto_shrink` is off
         // vertically so the band stays put whether the rows overflow or not --
@@ -637,6 +769,16 @@ pub fn draw_sidebar(
             .max_height((ui.available_height() - countdown_band).max(0.0))
             .auto_shrink([false; 2])
             .show(ui, |ui| {
+            // **The lane, held open on a frame that is not showing a bar.**
+            // `ui.available_width()` here is the rail's full 202 whenever
+            // egui has decided no bar is needed, and 192 when it has -- see
+            // the `VisibleWhenNeeded` note above. Capping it at the width
+            // measured outside makes the two frames lay out the same, so a
+            // vault that grows past the fold does not slide every row, badge
+            // and glyph 10pt sideways. `set_max_width` rather than
+            // `set_width`: it only ever takes width away, so a rail that has
+            // already been narrowed by the reservation is left alone.
+            ui.set_max_width(rail_width);
             // Zeroed for this whole block: egui inserts `item_spacing` between
             // every pair of sequential widgets automatically, including
             // `add_space` calls, so leaving the ambient 8px default in place
@@ -862,6 +1004,11 @@ pub fn draw_sidebar(
         // `countdown_label` takes its horizontal inset from. Not folded into
         // `ROW_INSET_X`: that constant names a *horizontal* text inset, and the
         // two only coincide because this one element's padding is uniform.
+        //
+        // The band's own right edge is `countdown_label`'s business, not this
+        // layout's: it is the one element outside the scroll area, so it is
+        // the one element the bar's lane is not already reserved out of. See
+        // that function.
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(COUNTDOWN_PAD_BELOW);
             countdown_label(ui, lock_countdown);
@@ -980,10 +1127,33 @@ fn section_label(ui: &mut egui::Ui, text: &str) -> egui::Rect {
 /// content edge and has nowhere to take a horizontal inset from, which is
 /// precisely how the countdown came to sit 10px left of every label above
 /// it.
-fn countdown_label(ui: &mut egui::Ui, text: &str) {
+///
+/// # The right-hand [`PANEL_PAD_X`], given back explicitly
+///
+/// This is the one thing in the rail drawn OUTSIDE the scroll area, so it
+/// is the one thing the scroll bar's lane does not reserve for. The panel
+/// frame dropped its right inner margin to pay for that lane (see
+/// [`panel_frame`]), and everything above gets it back from
+/// [`theme::scrollbar_in_gutter`]; this band would otherwise be the only
+/// element in the rail running all the way to the panel's own edge, 10pt
+/// wider than every row above it.
+///
+/// It is subtracted from the BAND rather than added to the text's x on
+/// purpose, and the difference is invisible today: the text is painted
+/// left-anchored at `rect.left() + ROW_INSET_X`, so its own position does
+/// not depend on where the band ends. What depends on it is anything that
+/// ever reads the band -- a right-aligned or centred element in it, a hover
+/// rect, a second line -- and a band that silently ended 10pt right of every
+/// row would put all of them 10pt out. Returned for the same reason
+/// [`section_label`] returns its rect: so a test can assert where it ends
+/// rather than infer it from the one glyph that happens not to care.
+fn countdown_label(ui: &mut egui::Ui, text: &str) -> egui::Rect {
     let galley = ui.painter().layout_no_wrap(text.to_owned(), countdown_font(), theme::TEXT_GHOST);
     let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), galley.size().y),
+        egui::vec2(
+            (ui.available_width() - f32::from(PANEL_PAD_X)).max(0.0),
+            galley.size().y,
+        ),
         egui::Sense::hover(),
     );
     ui.painter().galley(
@@ -991,6 +1161,7 @@ fn countdown_label(ui: &mut egui::Ui, text: &str) {
         galley,
         theme::TEXT_GHOST,
     );
+    rect
 }
 
 /// The rail's own SCREENS -- Sends and Password health -- behind a divider of
@@ -2532,6 +2703,23 @@ mod tests {
         );
     }
 
+    /// Where the rail's rows END inside a `Ui` bounded by `bounds`, which is
+    /// [`PANEL_PAD_X`] short of that ui's own right edge.
+    ///
+    /// **The rail gives that lane up wherever it is drawn**, harness or
+    /// production: `theme::scrollbar_in_gutter` reserves it out of whatever
+    /// width the rail is handed, and the rail caps its content at the
+    /// remainder so the reservation does not come and go with the folder
+    /// count. In production the panel frame pays for it by dropping its right
+    /// inner margin, so the rows land where they always did (10..202 on a
+    /// 212pt panel); the bare-root harnesses in this module have no frame to
+    /// pay with, so their rail is simply 10pt narrower than the window. Every
+    /// expectation those harnesses derive from the rail's right edge goes
+    /// through here rather than through `bounds.right()`.
+    fn rail_right(bounds: egui::Rect) -> f32 {
+        bounds.right() - f32::from(PANEL_PAD_X)
+    }
+
     /// The user-reported defect: "Folder + should be aligned with pencil
     /// icons". The FOLDERS header's "+" was placed by its own arithmetic
     /// (`header_rect.right() - SECTION_LABEL_INSET - 8.0`, centre at
@@ -2549,13 +2737,13 @@ mod tests {
             .find(|(text, _)| text == "+")
             .map(|(_, rect)| *rect)
             .unwrap_or_else(|| panic!("the sidebar painted no \"+\": {painted:?}"));
-        let expected = glyph_column_center_x(bounds.right());
+        let expected = glyph_column_center_x(rail_right(bounds));
         assert!(
             (plus.center().x - expected).abs() < 0.5,
             "the \"+\" is centred at x={}, expected {expected} \
-             (the glyph column for a sidebar whose right edge is {})",
+             (the glyph column for a rail whose rows end at {})",
             plus.center().x,
-            bounds.right()
+            rail_right(bounds)
         );
     }
 
@@ -2582,10 +2770,10 @@ mod tests {
             .unwrap_or_else(|| panic!("the sidebar painted no \"+\": {painted:?}"));
 
         assert!(
-            (pencil.center().x - glyph_column_center_x(bounds.right())).abs() < 0.5,
+            (pencil.center().x - glyph_column_center_x(rail_right(bounds))).abs() < 0.5,
             "the pencil is centred at x={}, expected {}",
             pencil.center().x,
-            glyph_column_center_x(bounds.right())
+            glyph_column_center_x(rail_right(bounds))
         );
         assert!(
             (pencil.center().x - plus.center().x).abs() < 0.5,
@@ -3547,16 +3735,29 @@ mod tests {
         );
     }
 
-    /// **The rail asks for the app's bar width, and asks BEFORE it opens the
-    /// scroll area.**
+    /// **The rail asks for the app's bar -- width, lane and all -- and asks
+    /// BEFORE it opens the scroll area.**
     ///
-    /// `theme::floating_scrollbar` writes into `ui.spacing_mut()`, which an
-    /// `egui::ScrollArea` reads when it is built -- so the same call moved
-    /// one line down, inside the `show` closure, would set the width of
-    /// whatever the rail's CONTENT scrolls and leave the rail's own bar at
-    /// egui's 10pt default. That is a mistake with no symptom in the source
-    /// and the original symptom on screen, which is why the ORDER is pinned
-    /// and not merely the presence.
+    /// `theme::scrollbar_in_gutter` writes into `ui.spacing_mut()`, which an
+    /// `egui::ScrollArea` reads when it is BUILT -- so the same call moved
+    /// one line down, inside the `show` closure, would style whatever the
+    /// rail's CONTENT scrolls and leave the rail's own bar at egui's default:
+    /// 10pt, in the text colour, and with no lane, i.e. back on the rows.
+    /// That is a mistake with no symptom in the source and the whole symptom
+    /// on screen, which is why the ORDER is pinned and not merely the
+    /// presence.
+    ///
+    /// **The needle is the whole call, ARGUMENT INCLUDED, and that is the
+    /// only thing guarding the argument.** Measured: with the panel frame's
+    /// right margin already at zero and the scroll area's content already
+    /// capped at `rail_width`, passing a gutter of `0.0` here paints an
+    /// identical frame -- rows 10..202, bar 206..212. egui pins a floating
+    /// bar to `outer_rect.right()`, which is the panel's own edge either way,
+    /// and the cap is what holds the rows off it; the reserved lane only
+    /// duplicates the cap on the frames that show a bar. So no painted-frame
+    /// test in this module can tell the rail's real gutter from a wrong one,
+    /// and asking for one that is not the padding the frame gave up would be
+    /// a claim in the source that nothing checks. It is checked here.
     ///
     /// A source pin because driving the rail needs the lists, the selection,
     /// the screen set and a lock countdown, and because what is being checked
@@ -3565,34 +3766,552 @@ mod tests {
     #[test]
     fn the_rail_takes_the_apps_scrollbar_width_before_it_builds_its_scroll_area() {
         let source = include_str!("sidebar.rs");
-        let width = concat!("theme::floating_", "scrollbar(ui);");
+        let bar = concat!("theme::scrollbar_in_", "gutter(ui, f32::from(PANEL_PAD_X));");
         let area = concat!("egui::ScrollArea::", "vertical()");
 
-        let at_width = source.find(width).unwrap_or_else(|| {
+        let at_bar = source.find(bar).unwrap_or_else(|| {
             panic!(
-                "the rail no longer sets the app's scroll bar width, so it is back to egui's \
-                 `ScrollStyle::floating()` default -- a 10pt bar in the text colour beside the \
-                 item list's 6pt one, which is the report this fixed"
+                "the rail no longer takes the app's scroll bar with the panel's own padding as \
+                 its gutter. Either it is back to egui's `ScrollStyle::floating()` default -- a \
+                 10pt bar in the text colour beside the item list's 6pt one, which is the first \
+                 report -- or it is asking for a lane that is not the one `panel_frame` gave \
+                 up, which no painted frame in this module can see"
             )
         });
         let at_area = source
             .find(area)
             .expect("control: the rail has no scroll area at all, so this pin guards nothing");
         assert!(
-            at_width < at_area,
-            "the width is set BELOW the scroll area, so it applies to the rail's contents and \
+            at_bar < at_area,
+            "the bar is styled BELOW the scroll area, so it applies to the rail's contents and \
              the rail's own bar keeps egui's default"
         );
         // Control on the ordering: both needles are really found in the rail,
         // not somewhere else that happens to spell them. There is one scroll
-        // area in this file and one width call, and a second of either would
-        // make `find` answer about whichever came first.
+        // area in this file and one call, and a second of either would make
+        // `find` answer about whichever came first.
         assert_eq!(
             source.matches(area).count(),
             1,
             "a second scroll area appeared in the rail; the assertion above is now about \
              whichever one is written first, which may not be the one that scrolls"
         );
-        assert_eq!(source.matches(width).count(), 1, "the width is set twice in the rail");
+        assert_eq!(source.matches(bar).count(), 1, "the bar is styled twice in the rail");
+    }
+
+    /// The rail INSIDE the panel frame `vault_window` really gives it, clicked
+    /// once at `click_x` on the "Cards" row, with `folder_count` folders under
+    /// it. Answers which filter the rail was left on.
+    ///
+    /// **The frame is the point.** Every other harness in this module draws
+    /// `draw_sidebar` straight onto the root ui, so the rail's ui is the whole
+    /// 212pt screen; production wraps it in [`panel_frame`], which insets it
+    /// by `PANEL_PAD_X` on the left and hands the same width on the right to
+    /// the scroll bar's lane. A floating scroll bar is pinned to the ui's
+    /// right edge, so the frame is what decides whether the bar lands on the
+    /// rows or beside them -- a harness without it cannot see the bar at all.
+    /// The frame is called rather than spelled out again: it used to be
+    /// copied here and kept honest by a comment, which is the two-copies-
+    /// obliged-to-agree defect this crate keeps finding.
+    ///
+    /// The pointer is moved onto the row before the press, because egui only
+    /// routes a click to a widget the pointer is already over.
+    fn rail_click_selects(click_x: f32, folder_count: usize, height: f32) -> SidebarFilter {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(crate::vault_window::SIDEBAR_WIDTH, height),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let items = vec![item(Some(1), false, Some("f0"))];
+        let folders: Vec<Folder> = (0..folder_count)
+            .map(|i| Folder {
+                id: format!("f{i}"),
+                name: format!("Folder {i}"),
+                other: serde_json::Map::new(),
+            })
+            .collect();
+        let mut selected = SidebarFilter::All;
+        let (mut sends, mut health) = (false, false);
+        // Where the row actually is, re-read every frame off the frame just
+        // painted rather than computed: the rail's rows move with the folder
+        // count, and a hard-coded y would silently click empty space.
+        let mut cards_y = 0.0_f32;
+        // Eight frames to settle -- `theme::apply`'s fonts land on the next
+        // frame, and egui fades a floating bar in over several more, so a
+        // press on frame 1 would be a press on a bar that is not there yet.
+        const PRESS: usize = 8;
+        for frame in 0..=PRESS + 1 {
+            let mut raw = input();
+            let at = egui::pos2(click_x, cards_y);
+            if frame == PRESS {
+                raw.events.push(egui::Event::PointerMoved(at));
+                raw.events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                });
+            }
+            if frame == PRESS + 1 {
+                raw.events.push(egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                });
+            }
+            let output = ctx.run_ui(raw, |ui| {
+                egui::Panel::left("vault-sidebar")
+                    .exact_size(crate::vault_window::SIDEBAR_WIDTH)
+                    .resizable(false)
+                    .frame(panel_frame())
+                    .show(ui, |ui| {
+                        draw_sidebar(
+                            ui,
+                            VaultLists::live_only(&items),
+                            &folders,
+                            &mut selected,
+                            Screens { sends: &mut sends, health: &mut health },
+                            "Locks in 11:42",
+                        );
+                    });
+            });
+            let mut texts = Vec::new();
+            for clipped in &output.shapes {
+                collect_text_rects(&clipped.shape, &mut texts);
+            }
+            if let Some((_, rect)) = texts.iter().find(|(text, _)| text == "Cards") {
+                cards_y = rect.center().y;
+            }
+        }
+        selected
+    }
+
+    /// **A rail row is clickable to its right edge whether or not the bar is
+    /// showing -- which it was NOT before the bar got its lane.**
+    ///
+    /// The two panes' scroll bars are one bar, field for field
+    /// (`theme::tests::the_two_panes_scroll_bars_are_one_bar_field_for_field`),
+    /// and now in placement too. This is the measurement of what the placement
+    /// buys the mouse.
+    ///
+    /// Before: the rail reserved no lane, so a floating bar pinned to the ui's
+    /// right edge painted -- and registered its hit rect -- over the rows'
+    /// rightmost `theme::SCROLLBAR_WIDTH`. Measured inside the real panel
+    /// frame, rows x=10..202 and bar x=196..202. That rect is registered after
+    /// the rows, so it wins the hit test, and a click at x=199 on a 900pt rail
+    /// with 26 folders (overflowing, bar showing) selected NOTHING while the
+    /// same click on a rail with one folder (fitting, no bar) selected Cards.
+    /// Only the fitting case could be asserted, and it was.
+    ///
+    /// After: the panel frame's right margin is the bar's lane, so the rows
+    /// still span x=10..202 and the bar has moved to x=206..212 -- beside
+    /// them, not on them. **The click coordinate below did not move**, because
+    /// the rows did not move; what moved is that the SAME coordinate now works
+    /// in both states, which is what this test asserts.
+    ///
+    /// **This is also what makes the visibility mode a free choice again.**
+    /// `VisibleWhenNeeded` was load-bearing: `AlwaysVisible` registers the
+    /// bar's rect on every frame and `theme::hide_scrollbar` only zeroes the
+    /// six opacities without giving the rect back, so copying the item list's
+    /// mode would have made the right 6pt of every rail row dead to the mouse
+    /// on a rail with nothing to scroll. With the rect off the rows entirely
+    /// that cost is gone -- see the note at the `scrollbar_in_gutter` call for
+    /// why the mode is nonetheless kept.
+    #[test]
+    fn a_rail_row_is_clickable_to_its_right_edge_with_the_bar_showing_or_not() {
+        const TALL: f32 = 900.0;
+        // 3pt clear of the rows' right edge at x=202, and inside the 6pt
+        // column the bar used to occupy when it was showing (196..202). It is
+        // now 7pt left of the bar's lane, which starts at 202.
+        const AT_THE_ROWS_EDGE: f32 = 199.0;
+        // One folder fits in a 900pt rail and 26 do not, so this pair is the
+        // bar hidden and the bar showing -- the two states the old placement
+        // answered differently.
+        for folders in [1, 26] {
+            assert_eq!(
+                rail_click_selects(AT_THE_ROWS_EDGE, folders, TALL),
+                SidebarFilter::Cards,
+                "a click {AT_THE_ROWS_EDGE}pt across a rail with {folders} folder(s) did not \
+                 reach the row under it -- the scroll bar is holding a hit rect over the rows \
+                 again, so its lane is gone or the rows have grown into it"
+            );
+            // Control, so the assertion above cannot pass because this harness
+            // never selects anything: the same click well left of the bar's
+            // column works, in both states.
+            assert_eq!(
+                rail_click_selects(100.0, folders, TALL),
+                SidebarFilter::Cards,
+                "control: a click in the MIDDLE of the Cards row did not select it with \
+                 {folders} folder(s), so this harness cannot select a row at all and the \
+                 assertion above proves nothing"
+            );
+        }
+    }
+
+    /// Every rect the frame painted, fill and stroke kept, so a caller can
+    /// tell ink from egui's transparent layout rects.
+    fn collect_rect_shapes(shape: &egui::Shape, out: &mut Vec<egui::epaint::RectShape>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push(rect.clone()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_rect_shapes(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Where the four things the panel frame's right margin could have moved
+    /// actually landed, on one settled frame of the rail.
+    struct RailGeometry {
+        /// The selected row's own wash: a full-width `sidebar_row` band, and
+        /// therefore the x-span every VAULT row occupies.
+        row: egui::Rect,
+        /// Everything VISIBLE painted right of the rows -- the scroll bar's
+        /// track and handle, or nothing at all when the rail fits. Keyed on
+        /// position rather than on colour, exactly like `item_list.rs`'s
+        /// `gutter_marks`, so the two panes' tests mean the same thing by
+        /// "the bar is on screen".
+        bar: Vec<egui::Rect>,
+        /// The lock countdown's painted text box.
+        countdown: egui::Rect,
+        /// The union of every folder pencil's polygons: the right-hand glyph
+        /// column the FOLDERS "+" shares, which `glyph_column_center_x`
+        /// derives from the rail's width and which therefore moves whenever
+        /// the rows do.
+        pencil: egui::Rect,
+    }
+
+    /// One settled frame of the rail inside the REAL [`panel_frame`], with
+    /// `folder_count` folders in a `height`-tall window.
+    ///
+    /// **Settled, and with the pointer parked in the rail.** egui's floating
+    /// bar has `dormant_*_opacity: 0.0`, so a bar nobody is pointing at is
+    /// emitted at alpha 0 -- a frame read without the pointer would report no
+    /// bar on a rail that scrolls, and every assertion about placement would
+    /// be vacuous. It also fades in over several frames, hence the settle
+    /// count; `item_list.rs`'s `SETTLE_FRAMES` exists for the same two
+    /// reasons.
+    fn rail_geometry(folder_count: usize, height: f32) -> RailGeometry {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(crate::vault_window::SIDEBAR_WIDTH, height),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let items = vec![item(Some(1), false, Some("f0"))];
+        let folders: Vec<Folder> = (0..folder_count)
+            .map(|i| Folder {
+                id: format!("f{i}"),
+                name: format!("Folder {i}"),
+                other: serde_json::Map::new(),
+            })
+            .collect();
+        let mut selected = SidebarFilter::All;
+        let (mut sends, mut health) = (false, false);
+        const SETTLE: usize = 12;
+        let mut rects = Vec::new();
+        let mut texts = Vec::new();
+        let mut paths = Vec::new();
+        for frame in 0..=SETTLE {
+            let mut raw = input();
+            raw.events.push(egui::Event::PointerMoved(egui::pos2(100.0, height / 2.0)));
+            let output = ctx.run_ui(raw, |ui| {
+                egui::Panel::left("vault-sidebar")
+                    .exact_size(crate::vault_window::SIDEBAR_WIDTH)
+                    .resizable(false)
+                    .frame(panel_frame())
+                    .show(ui, |ui| {
+                        draw_sidebar(
+                            ui,
+                            VaultLists::live_only(&items),
+                            &folders,
+                            &mut selected,
+                            Screens { sends: &mut sends, health: &mut health },
+                            COUNTDOWN,
+                        );
+                    });
+            });
+            if frame == SETTLE {
+                for clipped in &output.shapes {
+                    collect_rect_shapes(&clipped.shape, &mut rects);
+                    collect_text_rects(&clipped.shape, &mut texts);
+                    collect_path_rects(&clipped.shape, &mut paths);
+                }
+            }
+        }
+        // The row `draw_sidebar` was handed as selected, found by ITS OWN
+        // wash rather than by position: `sidebar_row` paints `BLUE_WASH` over
+        // exactly the rect it allocated, so this is the row's real span and
+        // not an inference from a label's x.
+        let row = rects
+            .iter()
+            .find(|r| r.fill == theme::BLUE_WASH && (r.rect.height() - ROW_HEIGHT).abs() < 0.5)
+            .map(|r| r.rect)
+            .expect("the selected row painted its wash");
+        let bar: Vec<egui::Rect> = rects
+            .iter()
+            .filter(|r| r.fill.a() > 0 || (r.stroke.width > 0.0 && r.stroke.color.a() > 0))
+            .map(|r| r.rect)
+            .filter(|r| r.left() > row.right() + 0.5)
+            .collect();
+        let countdown = texts
+            .iter()
+            .find(|(t, _)| t == COUNTDOWN)
+            .map(|(_, r)| *r)
+            .expect("the countdown painted");
+        RailGeometry { row, bar, countdown, pencil: union_of(&paths) }
+    }
+
+    /// The countdown line every in-frame harness here draws, so the string
+    /// looked for on the way out is the string handed in.
+    const COUNTDOWN: &str = "Locks in 11:42";
+
+    /// A rail tall enough to hold one folder and far too short for 26, so
+    /// `[1, 26]` is "the bar is hidden" and "the bar is showing".
+    const TALL_RAIL: f32 = 900.0;
+
+    /// The rail's own edges inside `panel_frame`, all four derived from the
+    /// panel's width and its one horizontal pad rather than written out, so a
+    /// design change to either moves the expectations with the code.
+    const PANEL_RIGHT: f32 = crate::vault_window::SIDEBAR_WIDTH;
+    const ROWS_LEFT: f32 = PANEL_PAD_X as f32;
+    const ROWS_RIGHT: f32 = PANEL_RIGHT - PANEL_PAD_X as f32;
+
+    /// **The rail's rows, bar and countdown are laid out like the item
+    /// list's** -- the bar in a lane of its own, flush to the pane's outer
+    /// edge, with the content it scrolls untouched.
+    ///
+    /// THE REPORT, twice: "Sidebar scroll bar - doesn't match the results".
+    /// The first answer made every `ScrollStyle` field agree between the two
+    /// panes and did not settle it, because what a reader compares with both
+    /// panes on screen is where the bar IS. Measured then, inside this same
+    /// frame: rows x=10..202, bar x=196..202 -- painted on the rows' right
+    /// edge, stopping 10pt short of the panel's own edge, against an item
+    /// list whose tiles end at 380 on a 390pt pane with its bar at 384..390.
+    ///
+    /// So the numbers below are absolute, and they are the item list's
+    /// arrangement transposed onto a 212pt panel:
+    ///
+    /// * the rows span 10..202, the 192pt they spanned before this changed
+    ///   anything -- the panel frame gave up exactly the width the lane takes;
+    /// * the bar is inside 202..212 and flush to its OUTER edge, so all of the
+    ///   lane's leftover -- `PANEL_PAD_X - SCROLLBAR_WIDTH` = 4pt -- lies
+    ///   between the bar and the rows, where the reader compares it to the
+    ///   10pt on the left, and none of it behind the bar. That is
+    ///   `theme::scrollbar_in_gutter`'s rule, asserted here on the rail the
+    ///   same way `item_list.rs` asserts it on the tiles;
+    /// * the countdown, the one thing drawn OUTSIDE the scroll area and so
+    ///   the one thing the lane does not reserve for, still starts on the row
+    ///   labels' x;
+    /// * the glyph column the FOLDERS "+" and the folder pencils share, which
+    ///   `glyph_column_center_x` derives from the rail's width, has not moved
+    ///   either.
+    ///
+    /// Read from the SETTLED frame of an overflowing rail, because a bar that
+    /// is not being drawn cannot be measured; see [`rail_geometry`].
+    #[test]
+    fn the_rail_lays_its_rows_bar_and_countdown_out_like_the_item_list() {
+        let g = rail_geometry(26, TALL_RAIL);
+
+        assert_eq!(
+            (g.row.left(), g.row.right()),
+            (ROWS_LEFT, ROWS_RIGHT),
+            "the rail's rows span {}..{}, expected {ROWS_LEFT}..{ROWS_RIGHT} -- the panel frame \
+             and the bar's lane no longer cancel, so every row inset in the rail has moved",
+            g.row.left(),
+            g.row.right()
+        );
+        assert_eq!(
+            g.row.width(),
+            192.0,
+            "the rail's rows are {}pt wide, not the 192pt they were before the bar was given a \
+             lane; the whole point of paying for it out of the panel's right margin is that the \
+             rows do not resize",
+            g.row.width()
+        );
+
+        assert!(
+            !g.bar.is_empty(),
+            "nothing VISIBLE was painted right of the rows on a rail of 26 folders in a \
+             {TALL_RAIL}pt window, so the rail is not showing the user that it can scroll"
+        );
+        for bar in &g.bar {
+            let slack_left = bar.left() - ROWS_RIGHT;
+            let slack_right = PANEL_RIGHT - bar.right();
+            assert!(
+                bar.right() <= PANEL_RIGHT + 0.01 && slack_left >= -0.01,
+                "the bar spans x={}..{}, which is outside the {ROWS_RIGHT}..{PANEL_RIGHT} lane \
+                 -- it is back over the rows, or off the panel",
+                bar.left(),
+                bar.right()
+            );
+            assert!(
+                (slack_left - (f32::from(PANEL_PAD_X) - theme::SCROLLBAR_WIDTH)).abs() < 0.51
+                    && slack_right.abs() < 0.51,
+                "the bar has {slack_left}pt of lane to its left and {slack_right}pt to its \
+                 right, expected {}pt and 0pt -- what is left of the lane once the bar is in it \
+                 belongs on the ROW side, where the reader compares it to the gap on the left, \
+                 and none of it between the bar and the panel's own edge",
+                f32::from(PANEL_PAD_X) - theme::SCROLLBAR_WIDTH
+            );
+        }
+
+        assert_eq!(
+            g.countdown.left(),
+            ROWS_LEFT + ROW_INSET_X,
+            "the lock countdown starts at x={}, expected {} -- it is drawn outside the scroll \
+             area, so it is the one thing in the rail the bar's lane does not reserve for",
+            g.countdown.left(),
+            ROWS_LEFT + ROW_INSET_X
+        );
+
+        assert!(
+            (g.pencil.center().x - glyph_column_center_x(ROWS_RIGHT)).abs() < 0.51,
+            "the folder pencils are centred on x={}, expected {} -- the glyph column is derived \
+             from the rail's width, so this moves whenever the rows do",
+            g.pencil.center().x,
+            glyph_column_center_x(ROWS_RIGHT)
+        );
+    }
+
+    /// **The rail lays itself out identically whether or not the bar is
+    /// showing**, which `theme::scrollbar_in_gutter` does NOT give for free.
+    ///
+    /// That helper reserves its lane through `floating_allocated_width`, and
+    /// egui applies that only on an axis it is showing a bar for. The rail
+    /// keeps `ScrollBarVisibility::VisibleWhenNeeded`, so on its own the
+    /// reservation comes and goes with the folder count: measured before the
+    /// `set_max_width` that now caps the scroll area's content, a rail with
+    /// one folder laid its rows out 10..212 and a rail with 26 laid them
+    /// 10..202 -- so adding a folder slid every row's right edge, every
+    /// badge and the whole glyph column 10pt sideways, and a fitting rail's
+    /// rows ran flush to the panel's edge with no padding at all.
+    ///
+    /// The item list solves the same problem with `AlwaysVisible` plus
+    /// `theme::hide_scrollbar`; the rail cannot, because that pairing needs to
+    /// know on each frame whether the content fits and the rail's height is
+    /// not known until it has been drawn. See the note at the
+    /// `scrollbar_in_gutter` call.
+    ///
+    /// Asserted as an EQUALITY between the two states and then against the
+    /// absolute number, because "both states agree" is a claim two equally
+    /// wrong layouts would also satisfy.
+    #[test]
+    fn the_rails_rows_keep_one_width_whether_or_not_the_bar_is_showing() {
+        let fits = rail_geometry(1, TALL_RAIL);
+        let scrolls = rail_geometry(26, TALL_RAIL);
+
+        assert!(
+            fits.bar.is_empty(),
+            "a rail with one folder in a {TALL_RAIL}pt window painted something visible in the \
+             bar's lane: {:?}. It has nothing to scroll, so this test is no longer comparing a \
+             hidden bar against a shown one",
+            fits.bar
+        );
+        assert!(
+            !scrolls.bar.is_empty(),
+            "a rail with 26 folders painted no visible bar, so this test is comparing two \
+             hidden-bar frames and says nothing about the reservation"
+        );
+
+        assert_eq!(
+            (fits.row.left(), fits.row.right()),
+            (scrolls.row.left(), scrolls.row.right()),
+            "the rows span {}..{} on a rail that fits and {}..{} on one that scrolls -- the \
+             bar's lane is being reserved only on the frames that show a bar, so adding a \
+             folder slides every row sideways",
+            fits.row.left(),
+            fits.row.right(),
+            scrolls.row.left(),
+            scrolls.row.right()
+        );
+        assert_eq!(
+            (fits.row.left(), fits.row.right()),
+            (ROWS_LEFT, ROWS_RIGHT),
+            "both states agree, on {}..{} rather than the {ROWS_LEFT}..{ROWS_RIGHT} the panel \
+             frame and the lane are meant to leave",
+            fits.row.left(),
+            fits.row.right()
+        );
+        assert!(
+            (fits.pencil.center().x - scrolls.pencil.center().x).abs() < 0.01,
+            "the folder pencils sit on x={} when the rail fits and x={} when it scrolls -- the \
+             glyph column is derived from the rail's width, so it moves with the rows",
+            fits.pencil.center().x,
+            scrolls.pencil.center().x
+        );
+    }
+
+    /// **The countdown's band stops where the rows stop, not at the panel's
+    /// edge.**
+    ///
+    /// It is the only thing in the rail drawn outside the scroll area, so it
+    /// is the only thing `theme::scrollbar_in_gutter` does not narrow --
+    /// which, once the panel frame gave its right margin up to the bar's
+    /// lane, would have left this one band running 10pt further right than
+    /// every row above it.
+    ///
+    /// Asserted on the band `countdown_label` allocates rather than on the
+    /// text it paints, because the text cannot see the difference: it is
+    /// painted left-anchored at `rect.left() + ROW_INSET_X` and would sit in
+    /// exactly the same place with the inset missing. Anything that ever
+    /// reads the band -- a right-aligned element, a hover rect, a second line
+    /// -- would not.
+    /// `the_rail_lays_its_rows_bar_and_countdown_out_like_the_item_list` pins
+    /// the painted x, in the real panel frame; this pins the band.
+    #[test]
+    fn the_countdown_band_gives_back_the_lane_the_panel_frame_handed_to_the_bar() {
+        let ctx = egui::Context::default();
+        let mut band = egui::Rect::NOTHING;
+        let mut available = egui::Rect::NOTHING;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(crate::vault_window::SIDEBAR_WIDTH, 200.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                available = ui.max_rect();
+                band = countdown_label(ui, COUNTDOWN);
+            },
+        );
+        assert!(
+            available.width() > f32::from(PANEL_PAD_X),
+            "control: the harness ui is only {}pt wide, so there is no room for the inset to be \
+             seen in",
+            available.width()
+        );
+        assert_eq!(
+            band.right(),
+            available.right() - f32::from(PANEL_PAD_X),
+            "the countdown's band ends at x={} in a ui ending at x={}, so it is not giving back \
+             the {PANEL_PAD_X}pt the panel frame handed to the scroll bar's lane -- this one \
+             band is {}pt wider than every row above it",
+            band.right(),
+            available.right(),
+            available.right() - band.right()
+        );
+        assert_eq!(
+            band.left(),
+            available.left(),
+            "the countdown's band starts at x={} rather than the ui's own left edge at x={}; \
+             the left inset belongs to the TEXT (`ROW_INSET_X`), not to the band",
+            band.left(),
+            available.left()
+        );
     }
 }

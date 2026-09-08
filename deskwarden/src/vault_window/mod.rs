@@ -2551,10 +2551,13 @@ pub fn build_frame_with_search(
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
-            // Design 4.8: `padding: 14px 10px` -- top/bottom 14, left/right
-            // 10 (`Margin::symmetric`'s args are x=left/right, y=top/bottom,
-            // the opposite order CSS shorthand uses).
-            .frame(egui::Frame::new().fill(theme::CARD).inner_margin(Margin::symmetric(10, 14)))
+            // Design 4.8's `padding: 14px 10px`, minus the RIGHT 10 -- which
+            // the rail reserves back for itself as the lane its scroll bar
+            // is drawn in. The frame is built by `sidebar::panel_frame`
+            // rather than inline here so that the rail's own tests can draw
+            // it inside the REAL one; see that function for the measurements
+            // and for why the padding moved rather than disappeared.
+            .frame(sidebar::panel_frame())
             .show(ui, |ui| {
                 // Every list this window holds, in the one shape the sidebar
                 // and the item pane both read -- so a row's badge and its
