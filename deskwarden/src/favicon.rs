@@ -747,7 +747,33 @@ const MAX_DIRECT_ICON_BYTES: u64 = 2 * 1024 * 1024;
 /// never actually observe `Indexed` -- see the comment on that match arm.
 pub fn decode_rgba(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     let (width, height, rgba) = decode_rgba_unscaled(png_bytes)?;
-    Some(resample_for_display(width, height, rgba))
+    let (width, height, rgba) = resample_for_display(width, height, rgba);
+    // **An image with no ink in it is not an icon, and saying `Some` about it
+    // was a lie with three consequences.**
+    //
+    // `resample_for_display` answers `(0, 0, vec![])` when `trim_transparent`
+    // finds nothing to keep -- a fully transparent PNG, which is a real thing
+    // an icon service returns when it has no icon but does not want to say
+    // 404. The owner's server does exactly that for
+    // `login.microsoftonline.com`: a valid 128x128 RGBA PNG, 426 bytes,
+    // entirely transparent.
+    //
+    // Wrapped in `Some`, that reached the caller as a successful decode. So
+    // `vault_window` cached the bytes as though they were an icon, built a
+    // 0x0 texture out of them, and -- because it logs its warning on
+    // `pixels.is_none()` -- said NOTHING, leaving an item wearing a monogram
+    // for a reason that appeared nowhere. The cache entry is the worst of the
+    // three: it is what a later launch reads back instead of asking again.
+    //
+    // The `(0, 0)` return from `resample_for_display` itself is left alone.
+    // It is the honest answer to "resample this", `card_mark` reaches that
+    // function through `decode_rgba_unscaled` for its own reasons, and the
+    // question "is there an icon here" belongs to this function, which is the
+    // one the icon path calls.
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((width, height, rgba))
 }
 
 /// The decode half of [`decode_rgba`], **without** the display resampling.
@@ -2513,31 +2539,41 @@ mod tests {
         assert_eq!(decode_rgba_unscaled(svg), None, "an SVG body decoded as an image");
         assert_eq!(decode_rgba(svg), None, "an SVG body decoded as an image");
 
-        let has_no_pixels = |decoded: &Option<(usize, usize, Vec<u8>)>| {
-            decoded.as_ref().is_none_or(|(w, h, px)| *w == 0 || *h == 0 || px.is_empty())
-        };
+        // **`None`, exactly** -- and this assertion was deliberately weaker
+        // when it was written. It asked only that nothing DRAWABLE came back,
+        // because `decode_rgba` answered `Some((0, 0, vec![]))` here and the
+        // point of the test was to survive that being tightened. It has been:
+        // a blank image is now no icon at all, so the test can say so.
+        //
+        // The difference is not cosmetic. `Some` meant `vault_window` cached
+        // the bytes as an icon and skipped its own "nothing usable came back"
+        // warning, so the item wore a monogram for a reason that appeared in
+        // no log -- and a later launch read the cache back rather than asking
+        // again. See `decode_rgba`.
         let blank = rgba_png(128, 128, &vec![0u8; 128 * 128 * 4]);
-        let decoded = decode_rgba(&blank);
-        assert!(
-            has_no_pixels(&decoded),
-            "a fully transparent PNG came back as a drawable icon: {:?}",
-            decoded.as_ref().map(|(w, h, px)| (*w, *h, px.len()))
+        assert_eq!(
+            decode_rgba(&blank),
+            None,
+            "a fully transparent PNG came back as an icon; the caller will cache it and say \
+             nothing"
         );
 
-        // And the ICO wrapper is not a way around either answer: the same
-        // blank PNG inside a container is still nothing to draw.
-        let wrapped = decode_rgba(&ico_of(128, 128, 32, &blank));
-        assert!(
-            has_no_pixels(&wrapped),
-            "wrapping a blank PNG in an ICO turned it into an icon: {:?}",
-            wrapped.as_ref().map(|(w, h, px)| (*w, *h, px.len()))
+        // And the ICO wrapper is not a way around it: the same blank PNG
+        // inside a container is still nothing to draw.
+        assert_eq!(
+            decode_rgba(&ico_of(128, 128, 32, &blank)),
+            None,
+            "wrapping a blank PNG in an ICO turned it into an icon"
         );
 
         // The control: an opaque PNG of the same size is still accepted, so
         // the assertions above are about blankness and not about a decoder
-        // that stopped working.
+        // that stopped working. Asserted on real dimensions rather than on
+        // `is_some`, so a decoder that answered `Some((0, 0, _))` for
+        // everything could not satisfy it.
         let opaque = rgba_png(128, 128, &vec![0x7fu8; 128 * 128 * 4]);
-        assert!(!has_no_pixels(&decode_rgba(&opaque)), "an ordinary PNG stopped decoding");
+        let (w, h, px) = decode_rgba(&opaque).expect("an ordinary PNG stopped decoding");
+        assert!(w > 0 && h > 0 && !px.is_empty(), "the control decoded to nothing: {w}x{h}");
     }
 
     // -----------------------------------------------------------------
