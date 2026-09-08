@@ -7963,20 +7963,63 @@ fn totp_status_row(ui: &mut egui::Ui, status: &str, hint: Option<&str>) {
         ui,
         "TOTP",
         |ui| {
+            let status = RichText::new(status)
+                .size(ROW_VALUE_SIZE)
+                .color(theme::TEXT_SECONDARY);
+            // **A row with ONE line does not go through the stack, and that
+            // is the whole of the "Fetching… sits too high" repair.**
+            //
+            // THE REPORT, with a screenshot: the `Fetching…` this row shows
+            // while a poll is in flight sits visibly higher than the six
+            // digits that replace it a moment later, so the value jumps up
+            // and back down as the code arrives.
+            //
+            // Measured on a 900pt pane, as the absolute y of each run's
+            // BASELINE in the value column: the live code's is 281.5 and
+            // `Fetching…`'s was 275.0 -- 6.5pt high, which is a whole line's
+            // worth of jump on a 28pt row.
+            //
+            // The cause is `ui.vertical`, not the baseline correction the
+            // code row carries. `row_body` allocates every row a band of
+            // `ROW_CONTENT_HEIGHT` (28pt) laid out `left_to_right(Center)`,
+            // and egui centres each CHILD in that band -- but a `ui.vertical`
+            // is `Layout::top_down(Align::Min)` over the band's whole
+            // available height, so its first widget is pinned to the band's
+            // TOP whatever it contains. The band here runs 263..291 and the
+            // 15pt status label landed at 263 rather than at the 269.5 an
+            // ordinary centred label gets. Two lines fill the band and the
+            // difference does not show; one line leaves 13pt of it empty,
+            // all of it underneath.
+            //
+            // Tried and rejected: giving the vertical `Align::Center`
+            // (`ui.with_layout(Layout::top_down(Align::Center), ..)`), which
+            // is a HORIZONTAL alignment inside a top-down layout -- it would
+            // centre the hint under the status and move nothing vertically.
+            // Also rejected: dropping the status run with
+            // `paint_on_the_value_baseline`. That function corrects for two
+            // FACES disagreeing about where the baseline sits inside a box
+            // egui has already centred; this run is in the pane's ordinary
+            // value face already, so its drop is 0.0 and it would move
+            // nothing. Nothing was wrong with the type here -- only with the
+            // box it was being placed in.
+            //
+            // The two-line states (`Unavailable`, `NoCodeReported`) keep the
+            // stack: they are genuinely two lines, their 29pt of content
+            // overflows the 28pt band by design (see `row_body`, which lets
+            // the frame grow), and top-aligning them is what puts the status
+            // where every other row's value is with the hint tucked under it.
+            let Some(hint) = hint else {
+                ui.label(status);
+                return;
+            };
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(status);
                 ui.label(
-                    RichText::new(status)
-                        .size(ROW_VALUE_SIZE)
-                        .color(theme::TEXT_SECONDARY),
+                    RichText::new(hint)
+                        .size(ROW_HINT_SIZE)
+                        .color(theme::TEXT_GHOST),
                 );
-                if let Some(hint) = hint {
-                    ui.label(
-                        RichText::new(hint)
-                            .size(ROW_HINT_SIZE)
-                            .color(theme::TEXT_GHOST),
-                    );
-                }
             });
         },
         |_ui| {},
@@ -19081,6 +19124,219 @@ mod tests {
                 "the track's middle is {}pt off the middle of the code's ink: {bar:?} \
                  against {code_ink:?}",
                 bar.center().y - code_ink.center().y
+            );
+        }
+    }
+
+    /// The one-line TOTP status, as `totp_fetching_row` paints it. A literal
+    /// rather than a call, for the reason every other painted-string literal
+    /// in this module is one: a test that re-derives the wording from the
+    /// function under test cannot see the wording change.
+    const FETCHING_STATUS: &str = "Fetching\u{2026}";
+
+    /// The two two-line TOTP statuses and their hints, as
+    /// `totp_unavailable_row` and `totp_no_code_row` paint them.
+    const STACKED_STATUSES: [(TotpState, &str, &str); 2] = [
+        (
+            TotpState::Unavailable,
+            "Unavailable right now",
+            "Couldn't reach the vault to get the current code.",
+        ),
+        (
+            TotpState::NoCodeReported,
+            "No code available for this item",
+            "The vault has no current code for it. If its authenticator key was changed \
+             on another device, Sync to pick that up.",
+        ),
+    ];
+
+    /// **How far a 14px value's ink reaches ABOVE its own baseline**, read off
+    /// a run in that face that has an ascender and no descender.
+    ///
+    /// The conversion this file's TOTP tests need and could not get any other
+    /// way. A run's baseline is its ink BOTTOM only when nothing in it
+    /// descends -- true of `418902` and of [`NO_DESCENDER_USERNAME`], and
+    /// false of `Fetching…`, whose `g` hangs below the line. So the status
+    /// run's baseline is found from its ink TOP instead, which is the
+    /// ASCENDER line: both strings carry a full ascender (`k` in
+    /// `anna.novak`, `h` in `Fetching…`) and both are laid out in the same
+    /// `FontId`, so the distance from that line down to the baseline is one
+    /// number for both and this reads it off the one that can state it.
+    ///
+    /// Wholly on ink -- `drawn_glyph_ink`'s glyph outlines -- which is the
+    /// point. The whole reason `paint_on_the_value_baseline` exists is that
+    /// the allocated boxes agreed while the glyphs did not; a measurement
+    /// taken off a box would be blind in exactly that way again.
+    fn ascender_to_baseline(
+        painted: &[(String, egui::FontId, f32, egui::Rect, egui::Rect)],
+    ) -> (egui::FontId, f32) {
+        let (font, _, _, ink) = one_run(painted, NO_DESCENDER_USERNAME);
+        (font, ink.height())
+    }
+
+    /// **The `Fetching…` status sits on the line the live code replaces it
+    /// on.**
+    ///
+    /// THE REPORT, with a screenshot: while a poll is in flight the row reads
+    /// `Fetching…`, and that text sits visibly HIGHER than the six digits
+    /// that take its place a moment later -- so the value jumps up the row
+    /// and back down again every time a code arrives.
+    ///
+    /// Measured on a 900pt pane as each run's absolute baseline: the code's
+    /// is 281.5, and `Fetching…`'s was 275.0. A 6.5pt jump on a 28pt row.
+    ///
+    /// **The cause was not the code's baseline correction**, which is
+    /// measured and correct and is left alone. It was `totp_status_row`
+    /// wrapping its single label in a `ui.vertical` built for the two-line
+    /// states: a top-down `Ui` pins its first widget to the TOP of the
+    /// `ROW_CONTENT_HEIGHT` band, and one 15pt line in a 28pt band leaves all
+    /// 13pt of the slack underneath it. See that function.
+    ///
+    /// **This is asserted on INK and it has to be**, for the reason
+    /// `every_card_value_paints_its_ink_on_one_baseline_with_its_label`
+    /// gives at length: the boxes on this row have agreed with each other
+    /// through every version of this defect, and a rect-based assertion
+    /// passes on all of them.
+    ///
+    /// The tolerance is the 0.25pt its two sibling tests use, and it is not a
+    /// round number picked to fit: this pane lays out at one point per pixel
+    /// and egui rounds glyph positions to the half pixel, so 0.5pt is the
+    /// smallest disagreement that can reach a screen and 0.25 is half of
+    /// that. The measured disagreement after the repair is 0.0.
+    #[test]
+    fn the_fetching_status_sits_on_the_line_the_live_code_replaces_it_on() {
+        let item = a_login_showing_a_code();
+        let live = TotpState::Code {
+            code: SHOWN_CODE.to_string(),
+            seconds_left: SHOWN_SECONDS,
+        };
+        let showing_code = painted_ink_showing(&item, &live, RevealState::default());
+        let fetching = painted_ink_showing(&item, &TotpState::Fetching, RevealState::default());
+
+        // **The control, and without it every number below could be measuring
+        // one frame twice.** The two frames must be in genuinely different
+        // states: each has to carry its own run and NOT the other's, because
+        // `one_run` is happy to find a run in a frame that never changed.
+        let painted = |painted: &[(String, egui::FontId, f32, egui::Rect, egui::Rect)],
+                       text: &str| painted.iter().any(|(t, ..)| t == text);
+        assert!(
+            painted(&showing_code, SHOWN_CODE) && !painted(&showing_code, FETCHING_STATUS),
+            "the Code frame is not showing a code without the fetching status"
+        );
+        assert!(
+            painted(&fetching, FETCHING_STATUS) && !painted(&fetching, SHOWN_CODE),
+            "the Fetching frame is not showing the fetching status without a code"
+        );
+
+        // **The row's own label has not moved**, which is both a constraint
+        // on the repair and what makes the two frames' absolute y values
+        // comparable at all: everything above this row is identical in them,
+        // so if the label lands in the same box the rows are registered.
+        let label = copy_shortcut_label(CopyShortcut::Totp);
+        let (.., code_label, _) = one_run(&showing_code, label);
+        let (.., fetch_label, _) = one_run(&fetching, label);
+        assert_eq!(
+            code_label, fetch_label,
+            "the {label:?} label is in a different place in the two states, so the two \
+             baselines below are measured from different origins"
+        );
+
+        // The code is digits and nothing else, so its ink bottom IS its
+        // baseline. The status carries a `g`, so its is reached through the
+        // ascender line -- see `ascender_to_baseline`.
+        let (code_font, _, _, code_ink) = one_run(&showing_code, SHOWN_CODE);
+        let code_baseline = code_ink.bottom();
+        let (reference_font, rise) = ascender_to_baseline(&fetching);
+        let (status_font, _, _, status_ink) = one_run(&fetching, FETCHING_STATUS);
+        assert_eq!(
+            status_font, reference_font,
+            "the status run and the run its ascender line is read off are in different \
+             faces, so the conversion to a baseline is not valid"
+        );
+        // And the two runs really are in different faces, so this is the
+        // cross-face question the report is about and not an identity.
+        assert_ne!(
+            status_font, code_font,
+            "the status and the code are laid out in the same face, so this test can no \
+             longer tell a shared baseline from a shared box"
+        );
+        let status_baseline = status_ink.top() + rise;
+
+        assert!(
+            (status_baseline - code_baseline).abs() <= 0.25,
+            "the {FETCHING_STATUS:?} status paints its baseline at y={status_baseline} \
+             and the code that replaces it paints its own at y={code_baseline} -- the \
+             row's value jumps {}pt when the code arrives",
+            code_baseline - status_baseline
+        );
+    }
+
+    /// **And the two-line statuses still stack**, which is the half of
+    /// `totp_status_row` the repair above had to leave alone.
+    ///
+    /// `Unavailable` and `NoCodeReported` are genuinely two lines -- a status
+    /// with an explanation under it -- and their `ui.vertical` is right for
+    /// them. A repair that centred every status in the band would have taken
+    /// the stack with it, so this pins the stack directly: one run above the
+    /// other, both starting at the same left edge (a flowed pair would sit
+    /// side by side), and the status still at the band's TOP rather than at
+    /// the centred position the one-line state now takes.
+    ///
+    /// That last comparison is the one that would catch the repair leaking:
+    /// it is measured against the `Fetching…` run in a frame of its own, so
+    /// it names the difference between the two shapes rather than writing
+    /// down where either of them is.
+    #[test]
+    fn the_two_line_totp_statuses_still_stack_their_hint_under_their_status() {
+        let item = a_login_showing_a_code();
+        let fetching = painted_ink_showing(&item, &TotpState::Fetching, RevealState::default());
+        let (.., one_line_ink) = one_run(&fetching, FETCHING_STATUS);
+
+        for (state, status, hint) in STACKED_STATUSES {
+            let painted = painted_ink_showing(&item, &state, RevealState::default());
+            let (.., status_ink) = one_run(&painted, status);
+            let (.., hint_ink) = one_run(&painted, hint);
+            assert!(
+                hint_ink.top() >= status_ink.bottom(),
+                "{state:?} paints its hint's ink at {:?} and its status's at {:?} -- the \
+                 second line is not under the first",
+                hint_ink,
+                status_ink
+            );
+            // **2pt, and the slack is the LEFT SIDE BEARING**, not a loose
+            // assertion. The two lines start with different letters at
+            // different sizes -- `U` at 14px over `C` at 11px on the
+            // `Unavailable` row -- so their first glyph's outline begins a
+            // different distance inside the layout origin the two runs really
+            // do share; measured here at 1.0pt. What this rules out is the
+            // flowed alternative, where the second run would begin past the
+            // first run's RIGHT edge, over a hundred points away; that is
+            // asserted separately below so the tolerance is not the only
+            // thing standing between the two readings.
+            assert!(
+                (hint_ink.left() - status_ink.left()).abs() <= 2.0,
+                "{state:?} starts its two lines at x={} and x={} -- they are not one \
+                 column",
+                status_ink.left(),
+                hint_ink.left()
+            );
+            assert!(
+                hint_ink.left() < status_ink.right(),
+                "{state:?} begins its hint at x={} past its status's right edge at x={} \
+                 -- the two lines have been flowed onto one",
+                hint_ink.left(),
+                status_ink.right()
+            );
+            // The stack is top-aligned in the band and the one-line state is
+            // centred in it, so the two-line status must still sit ABOVE
+            // where `Fetching…` now sits. Equal tops would mean the stack had
+            // been centred along with it.
+            assert!(
+                status_ink.top() < one_line_ink.top() - 0.25,
+                "{state:?} paints its status at y={} where the one-line state paints its \
+                 own at y={} -- the two-line row has been pulled off the top of its band",
+                status_ink.top(),
+                one_line_ink.top()
             );
         }
     }
