@@ -906,6 +906,22 @@ fn folder_move_body(
 /// and it exists because one write cannot let the key ride: see its doc.
 const REVISION_DATE_KEY: &str = "revisionDate";
 
+/// **The key a server actually checks**, and the one two releases of
+/// concurrency-token fixes never touched.
+///
+/// `revisionDate` above is the server's record of when the item last changed.
+/// This is the CLIENT's claim about which version it is editing, and it is
+/// what a Bitwarden server compares its own copy against before accepting a
+/// write. A stale claim is `400 The client copy of this cipher is out of
+/// date. Resync the client and try again.`
+///
+/// It is a request-only field. A server sending one back in `/api/sync` --
+/// which the owner's does -- puts it in [`VaultItem::other`], from where it
+/// rides out again on the next full-state PUT as a claim the app never made
+/// and cannot vouch for. [`with_revision_date_from`] is where it is replaced
+/// with one that is true.
+const LAST_KNOWN_REVISION_KEY: &str = "lastKnownRevisionDate";
+
 /// A copy of `item` carrying `source`'s revision token instead of its own.
 ///
 /// **For the two writes that cannot return the server's copy.**
@@ -936,9 +952,44 @@ pub fn with_revision_date_from(item: &VaultItem, source: &VaultItem) -> VaultIte
     match source.other.get(REVISION_DATE_KEY) {
         Some(revision) => {
             adopted.other.insert(REVISION_DATE_KEY.to_string(), revision.clone());
+            // **And the CLAIM, from the very same value.**
+            //
+            // `lastKnownRevisionDate` is the field a Bitwarden server
+            // actually checks: it is the client saying "the version I am
+            // editing is this one", and a server whose copy has moved past it
+            // answers `400 The client copy of this cipher is out of date.
+            // Resync the client and try again.` `revisionDate` beside it is
+            // the server's own record of the item, echoed back.
+            //
+            // It should never have arrived in `other` at all -- it is a
+            // REQUEST field, and a server has no business sending one. This
+            // one does, so it rides `other` like every other unmodelled key
+            // and went back out unaltered on every write: the claim a window
+            // made was the claim its copy carried whenever that copy was
+            // fetched, which is stale the moment anything else touches the
+            // item.
+            //
+            // Two releases were spent on the wrong key for want of the field
+            // name. The message names none, so 0.15.16 dropped `revisionDate`
+            // and 0.15.17 refreshed it; neither touched this one, and the
+            // refusal came back. `write_through`'s field-name diagnostic is
+            // what finally said `lastKnownRevisionDate` out loud.
+            //
+            // Set rather than dropped, and that is the point. Dropping it
+            // would pass -- a server skips the check when the claim is absent
+            // -- by giving up optimistic concurrency entirely, which is the
+            // one thing standing between two windows and a silent overwrite.
+            // The caller has just synced, so `source`'s `revisionDate` IS
+            // what this process last knew, and saying so is both true and
+            // sufficient.
+            adopted.other.insert(LAST_KNOWN_REVISION_KEY.to_string(), revision.clone());
         }
         None => {
             adopted.other.remove(REVISION_DATE_KEY);
+            // A source with no token cannot support a claim about one. Left
+            // in place it would be the previous claim, which is exactly the
+            // stale value this function exists to displace.
+            adopted.other.remove(LAST_KNOWN_REVISION_KEY);
         }
     }
     adopted
@@ -5053,7 +5104,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn with_revision_date_from_takes_that_one_key_and_leaves_the_rest() {
+    fn with_revision_date_from_takes_both_tokens_and_leaves_the_rest() {
         // The whole of what `VaultCache::current_revision_of` is allowed to do
         // with a read-back. A `GET` taken right after a restore may still be
         // showing the pre-restore state -- trashed, and under whatever name
@@ -5089,11 +5140,85 @@ mod tests {
         // `mine`, so this cannot pass against a function that quietly dropped
         // a key the way an early `without_deleted_date` bug would have.
         let mut expected = serde_json::to_value(&mine).unwrap();
-        expected.as_object_mut().unwrap().insert(
-            "revisionDate".to_string(),
+        let fields = expected.as_object_mut().unwrap();
+        fields.insert("revisionDate".to_string(), serde_json::json!("2026-08-03T11:47:19.101Z"));
+        // **The claim moves with the record, and from the same value.** See
+        // `LAST_KNOWN_REVISION_KEY`: this is the field a server actually
+        // checks, and `source` has just been fetched -- so its `revisionDate`
+        // is precisely what this process last knew about the item.
+        fields.insert(
+            "lastKnownRevisionDate".to_string(),
             serde_json::json!("2026-08-03T11:47:19.101Z"),
         );
         assert_eq!(expected, serde_json::to_value(&adopted).unwrap());
+    }
+
+    /// **THE REPORT, third time: "Couldn't save your changes to
+    /// \"airbnb-wyze-lockcode.autobis.workers.dev\" -- the vault backend
+    /// refused the write."**
+    ///
+    /// The server's words, unchanged across all three: "The client copy of
+    /// this cipher is out of date. Resync the client and try again." It names
+    /// no field, so 0.15.16 guessed `revisionDate` and dropped it, 0.15.17
+    /// guessed again and refreshed it, and the refusal came back both times.
+    ///
+    /// What settled it was not a guess. `write_through` logs the body's field
+    /// NAMES on a refusal, and the third report's log line reads
+    /// `[... "key", "lastKnownRevisionDate", "login", ...]` -- a claim the
+    /// app never made, arriving from the server's own sync and riding
+    /// `VaultItem::other` straight back out.
+    ///
+    /// So the fixture here is an item whose two tokens DISAGREE: a record
+    /// from a recent fetch, and a claim left over from whenever the window's
+    /// copy was taken. That is the shape on the wire, and no test before this
+    /// one could produce it, because nothing knew the second key existed.
+    #[test]
+    fn a_stale_claim_is_replaced_and_not_merely_left_beside_a_fresh_record() {
+        let stale = "2026-08-01T00:00:00.000Z";
+        let fresh = "2026-09-07T12:00:00.000Z";
+        let mine: VaultItem = serde_json::from_str(&format!(
+            r#"{{"id":"1","name":"Mine","type":1,"fields":[],"reprompt":0,
+                "revisionDate":"{stale}","lastKnownRevisionDate":"{stale}"}}"#
+        ))
+        .unwrap();
+        let source: VaultItem = serde_json::from_str(&format!(
+            r#"{{"id":"1","name":"Mine","type":1,"fields":[],"revisionDate":"{fresh}"}}"#
+        ))
+        .unwrap();
+        // Control: the fixture really does carry a claim to displace. Without
+        // it this test would pass against a function that only ever inserted.
+        assert_eq!(
+            mine.other.get("lastKnownRevisionDate").and_then(|v| v.as_str()),
+            Some(stale),
+            "control: the item under test carries no stale claim, so there is nothing here \
+             for the adoption to have to overwrite"
+        );
+
+        let adopted = with_revision_date_from(&mine, &source);
+
+        assert_eq!(
+            adopted.other.get("lastKnownRevisionDate").and_then(|v| v.as_str()),
+            Some(fresh),
+            "the write still claims to be editing the version the window opened with, which \
+             is the 400 the owner met three times"
+        );
+        // **Set, not dropped, and this is the assertion that says so.**
+        // Removing the key would also stop the refusals -- a server skips the
+        // check when the claim is absent -- by giving up optimistic
+        // concurrency altogether, which is the one thing standing between two
+        // open windows and a silent overwrite. Passing by surrender is the
+        // failure mode this pin exists to refuse.
+        assert!(
+            adopted.other.contains_key("lastKnownRevisionDate"),
+            "the claim was dropped rather than corrected, so this write would overwrite an \
+             edit made anywhere else without the server being able to notice"
+        );
+        assert_eq!(
+            adopted.other.get("revisionDate").and_then(|v| v.as_str()),
+            Some(fresh),
+            "control: the record itself did not move either, so the two tokens are not being \
+             kept in step"
+        );
     }
 
     #[test]
@@ -5118,6 +5243,14 @@ mod tests {
             adopted.other.get("revisionDate"),
             None,
             "an unmentioned token was kept rather than dropped"
+        );
+        // And the claim built on it. A source with no token cannot support a
+        // claim about one, and the claim left behind would be the previous
+        // one -- which is the stale value this function exists to displace.
+        assert_eq!(
+            adopted.other.get("lastKnownRevisionDate"),
+            None,
+            "the claim outlived the record it was made about"
         );
         // POSITIVE CONTROL for the assertion above: a function that returned
         // an empty item, or `tokenless`, would satisfy it for free.
