@@ -15,6 +15,45 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.18 - 2026-09-08
+
+### Saving an item works again, and so does starring one
+
+"Couldn't save your changes ... the vault backend refused the write", from
+a server saying your copy was out of date. It was not. Deskwarden was
+sending back a stale claim about which version of the item it was editing
+-- a field the server had handed it, which it repeated without ever
+updating. It now sends the version it read a moment earlier, from the
+sync it makes immediately before every write.
+
+Two earlier releases aimed at the wrong field, because the server's
+message names none. A refused write now records which fields the request
+carried, by name, so this cannot be guessed at a fourth time.
+
+### Signing in through the window unlocks the tray at the same moment
+
+The vault window would come up with all your items while the tray behind
+it still believed the vault was locked -- CTRL+ALT+B answering "the vault
+is locked" over a vault open on the same screen -- until you closed the
+window. On accounts served directly over REST the window never told the
+daemon it had signed in, because it needed nothing from it. It does now,
+and the two come back together.
+
+The same gap after locking and unlocking is closed with it: a window that
+signs in restores the tray's own copy of the vault, not just the record of
+which account you are on.
+
+### Deskwarden no longer disappears when the fill shortcut has nothing to offer
+
+Pressing CTRL+ALT+B on an app with no matching item could take the whole
+of Deskwarden with it -- tray, vault window and unlocked session -- with
+nothing left behind to say why. A card that had no text to draw asked
+Windows to draw it anyway, from inside a window procedure, which ends the
+process outright.
+
+Every card in the app now goes through one place that will not do that,
+and a test refuses to let a new one be written any other way.
+
 ### A server that could not be reached no longer reads as one that refused
 
 When your vault server was briefly unavailable, Deskwarden said your
@@ -23,19 +62,27 @@ what you typed" rather than "try again in a minute". It now says the
 backend couldn't be reached, and keeps saying that nothing was written and
 your edits are still in the form.
 
-### Previous passwords are cut short like every other value
+### Previous passwords sit beside their date instead of below it
 
-A long entry in PREVIOUS PASSWORDS wrapped onto a second line underneath
-its own reveal button instead of ending in an ellipsis. Every value in the
-details panel is cut short now.
+A long entry in PREVIOUS PASSWORDS dropped its value onto a line of its
+own rather than ending in an ellipsis beside the date, as every other row
+in the details panel does. It now does the same as the rest, except on a
+pane too narrow to show a readable amount of it.
+
+### The sidebar's scroll bar sits beside its rows
+
+It was drawn on top of the rows' right edge, and stopped short of the
+panel's own edge -- where the item list's sits neatly outside its tiles.
+The rail keeps the same row width and the bar has a lane of its own now.
 
 ### Smaller things
 
-* The sidebar's scroll bar is the same width as the item list's, instead
-  of the wider one it was getting by default.
 * A release carries the installer and nothing else. The bare
   `Deskwarden.exe` beside it had no Start Menu entry, no autostart, no
   uninstaller and no version the updater could move forward.
+* A crash now writes what happened to the log. Deskwarden has no console,
+  so until this one a failure could end the app leaving nothing at all
+  behind -- which is exactly what the fill-shortcut crash above did.
 
 ## 0.15.17 - 2026-09-06
 
