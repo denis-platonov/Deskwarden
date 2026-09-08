@@ -202,10 +202,32 @@ pub(crate) const LIST_WIDTH: f32 = 390.0;
 /// column that is ever resized takes this with it.
 const RESTING_PANE_WIDTH: f32 = WINDOW_SIZE[0] - SIDEBAR_WIDTH - LIST_WIDTH;
 
-/// TOTP is re-fetched from `bw serve` on this interval while an item with a
-/// code is selected -- cheap enough to poll (one local HTTP call) and far
-/// simpler than implementing the TOTP algorithm ourselves when `bw serve`
-/// already exposes the current code directly.
+/// How often the selected item's One-time code row is **re-decided** while it
+/// is on screen. This is no longer how often anything is fetched.
+///
+/// It used to be both, and that is the defect: this was the rate a real HTTP
+/// request left the process at, once a second, for as long as a TOTP item
+/// stayed selected. On a direct-REST account each of those began with a full
+/// `GET /api/sync` -- the reporting user measured one at ~3,374 rows against a
+/// Cloudflare D1 allowance of 5M/day, and 3,558 syncs in a day came to 11.4
+/// million rows. Commit `9df273d` removed the request from the path where the
+/// window can compute the code itself ([`totp_poll_plan`]); this interval is
+/// what that path still runs at, because it costs one HMAC over eight bytes
+/// and a code that rolled over should appear immediately rather than up to a
+/// period late.
+///
+/// The path that still *asks* -- seeds this crate refuses (`steam://`, `hotp`,
+/// an odd digit count) and anything a broken clock reaches -- is gated
+/// separately by [`totp_backend_poll_due`], which fires once per code period
+/// on the wall-clock boundary rather than once a second. This interval is
+/// still the outer gate for it, so a boundary is noticed within a second of
+/// passing; it is not what sets the cadence.
+///
+/// Deliberately NOT renamed to something like `TOTP_REFRESH_INTERVAL`: it is
+/// still "how often the poll decision is made", which is what every comment
+/// and test that names it already says, and a rename would have been a diff
+/// across a dozen unrelated lines in the middle of a change about request
+/// counts.
 const TOTP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How often the vault window wakes itself when nothing is animating.
@@ -1069,12 +1091,36 @@ pub fn build_frame_with_search(
     // below.
     let mut totp_state = TotpState::NoSecret;
     let mut totp_last_poll = Instant::now() - TOTP_POLL_INTERVAL;
-    // Tracks whether the *previous* poll for the current selection errored,
-    // so the failure (and its later recovery) can be logged once on the
-    // transition rather than once per second for as long as the backend
-    // stays down -- see the poll site below and review Important 1 on
-    // commit 1d6c5ab.
-    let mut totp_poll_failing = false;
+    // How many polls for the current selection have errored in a row.
+    //
+    // This was a `bool` ("was the previous poll failing?"), which is all the
+    // logging needed: the failure and its later recovery are logged once on
+    // the transition rather than once per second for as long as the backend
+    // stays down (see the poll site below and review Important 1 on commit
+    // 1d6c5ab). A *count* is what a backoff needs, and the two want exactly
+    // the same lifetime -- reset on selection change, on the seed going away,
+    // and on a poll that actually produced a code -- so this is the same
+    // variable widened rather than a second one beside it that could get out
+    // of step with it. `== 0` reads as the old `!totp_poll_failing`.
+    //
+    // Fed to `totp_backoff_stride`; see `totp_backend_poll_due`.
+    let mut totp_poll_failures: u32 = 0;
+    // **When the last poll that actually left the process went out**, in both
+    // clocks, or `None` if none has for this selection.
+    //
+    // Separate from `totp_last_poll` (which is every poll DECISION, once a
+    // second) because the two now run at different rates and for different
+    // reasons: one keeps a locally computed code fresh, this one bounds
+    // requests. Folding them back together is how the fallback path went back
+    // to once a second.
+    //
+    // The wall-clock half is a period INDEX rather than a timestamp, because
+    // "has the code changed?" is `now / period` having incremented and
+    // nothing else -- see `totp_backend_poll_due`, which holds the argument.
+    // The monotonic half is the fallback for a machine whose wall clock could
+    // not be read at all, where there is no index to compare.
+    let mut totp_backend_poll: Option<TotpBackendPollMark> = None;
+    let mut totp_last_backend_poll = Instant::now();
     // The TOTP poll used to run inline on this thread (a real HTTP call to
     // `bw serve` via `ureq`), which stalled the whole window -- input,
     // repaint, everything -- for however long that call took. Since `4058e1c`
@@ -1868,7 +1914,22 @@ pub fn build_frame_with_search(
             // poll (already in flight or about to be spawned) is what
             // determines what B's row shows.
             if totp_poll_result_is_current(&item_id, selected_id.as_deref(), generation, load_generation) {
-                let seconds_left = current_totp_seconds_left();
+                // The countdown belongs to THIS item's period, not to a 30
+                // written into the countdown function -- see
+                // `current_totp_seconds_left`. Looked up by id rather than
+                // taken from a `selected_item` binding because that binding
+                // is computed much further down, inside the detail-pane
+                // block; `totp_poll_result_is_current` has just established
+                // that `selected_id == Some(item_id)`, so this is the
+                // selected item or it is an item that vanished from the
+                // snapshot between the two, and the default is right for
+                // that.
+                let period = items
+                    .iter()
+                    .find(|candidate| candidate.id == item_id)
+                    .map(totp_period_for)
+                    .unwrap_or(totp_add::DEFAULT_PERIOD);
+                let seconds_left = current_totp_seconds_left(period);
                 let before = totp_state.clone();
                 let error = apply_totp_poll_result(poll_result, seconds_left, &mut totp_state);
                 // `Ok(None)` is not a quiet success: at this call site it can
@@ -1891,10 +1952,19 @@ pub fn build_frame_with_search(
                 // session.
                 match &error {
                     Some(e) => {
-                        if !totp_poll_failing {
+                        if totp_poll_failures == 0 {
                             log::warn!("TOTP fetch for {item_id} started failing: {e:?}");
-                            totp_poll_failing = true;
                         }
+                        // Counted on EVERY failure, logged only on the first:
+                        // the log line is a transition and the count is a
+                        // backoff input (`totp_backoff_stride`), so a
+                        // streak that stops growing after the first failure
+                        // would never back off at all. Saturating rather
+                        // than wrapping -- a `u32` streak cannot be reached
+                        // in a session, but wrapping to 0 would read as
+                        // "healthy" and resume full-rate polling against a
+                        // backend that has never once answered.
+                        totp_poll_failures = totp_poll_failures.saturating_add(1);
                         flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, e);
                     }
                     None => {
@@ -1904,9 +1974,20 @@ pub fn build_frame_with_search(
                         // code ..." immediately followed by "TOTP fetch
                         // recovered", two lines that contradict each other
                         // about the same poll.
-                        if totp_poll_failing && poll_success_is_a_recovery(&totp_state) {
+                        if totp_poll_failures > 0 && poll_success_is_a_recovery(&totp_state) {
                             log::info!("TOTP fetch for {item_id} recovered");
-                            totp_poll_failing = false;
+                            // Straight to zero, not decremented: this is what
+                            // makes a recovered backend recover *promptly*.
+                            // The next `totp_backend_poll_due` reads a stride
+                            // of one period again, and the last mark is
+                            // already at least one period old (it is what
+                            // this result came back from), so the very next
+                            // boundary polls. A decrement would have walked
+                            // an eight-period stride back down through four,
+                            // two and one -- fifteen periods, seven and a
+                            // half minutes at 30s, of a working backend still
+                            // being treated as broken.
+                            totp_poll_failures = 0;
                         }
                     }
                 }
@@ -2986,8 +3067,18 @@ pub fn build_frame_with_search(
             totp_last_poll = Instant::now() - TOTP_POLL_INTERVAL;
             // A failure streak belongs to the item that was failing, not the
             // one now selected -- don't carry it over as a false "recovered"
-            // log line for an item that never actually failed.
-            totp_poll_failing = false;
+            // log line for an item that never actually failed, and don't
+            // start the new item on a backed-off cadence it did nothing to
+            // earn.
+            totp_poll_failures = 0;
+            // The same "fetch this one immediately" the line above expresses
+            // for the once-a-second decision, expressed for the once-a-period
+            // request: `None` is what `totp_backend_poll_due` answers `true`
+            // for unconditionally. Without it, selecting an item whose seed
+            // this app cannot read would show "Fetching..." until the
+            // *previous* item's period boundary came round -- up to a full
+            // period of nothing, on a row the user just clicked.
+            totp_backend_poll = None;
             // Recompute once per selection change, not every frame -- see
             // `fill_count`'s declaration above.
             fill_count = selected_id.as_deref().map(|id| fill_stats.count(id)).unwrap_or(0);
@@ -3524,13 +3615,41 @@ pub fn build_frame_with_search(
                             // over would log a false "recovered" later if
                             // this item's secret ever comes back and the
                             // very first poll happens to succeed.
-                            totp_poll_failing = false;
+                            totp_poll_failures = 0;
+                            // And the request cadence with it: a seed that
+                            // comes back (edited on another device, a sync
+                            // landing) must be fetched at once rather than at
+                            // whatever boundary the departed seed's mark left
+                            // behind.
+                            totp_backend_poll = None;
                         } else if should_start_totp_poll(
                             totp_last_poll.elapsed() >= TOTP_POLL_INTERVAL,
                             totp_poll_in_flight,
                             totp_state_wants_poll(&totp_state),
+                            // **On the POLL, never on the derivation above.**
+                            // See `window_is_worth_polling_for`, and see the
+                            // long comment on that derivation: gating IT on a
+                            // condition that can go false is exactly the
+                            // shipped bug that comment describes, where a
+                            // removed seed kept rendering the last code under
+                            // a live countdown forever because the poll that
+                            // would have blanked it was gated off by the same
+                            // condition. A minimised window must stop asking
+                            // the server; it must not stop noticing what the
+                            // item says.
+                            window_is_worth_polling_for(ui.ctx()),
                         ) {
                             totp_last_poll = Instant::now();
+                            // Read ONCE and shared by the plan, the request
+                            // cadence and the countdown below. Three separate
+                            // reads of the wall clock inside one frame can
+                            // straddle a second boundary, which would let the
+                            // code be computed for one period index and the
+                            // request mark be written for the next -- a whole
+                            // period's worth of skew from nothing but call
+                            // order.
+                            let now_unix = totp_clock_now();
+                            let period = totp_period_for(item);
                             // **Most polls never leave this process.** The
                             // seed is in the item this frame is already
                             // drawing, so the code is one HMAC away; only a
@@ -3549,7 +3668,7 @@ pub fn build_frame_with_search(
                             // long as a TOTP item stayed selected, until the
                             // server started answering 503 and the pane read
                             // "Unavailable right now".
-                            match totp_poll_plan(item, totp_clock_now()) {
+                            match totp_poll_plan(item, now_unix) {
                                 TotpPoll::Computed(code) => {
                                     // Applied straight into `totp_state`
                                     // rather than posted through `totp_tx`:
@@ -3580,7 +3699,7 @@ pub fn build_frame_with_search(
                                     // poll's answer does to the pane".
                                     let error = apply_totp_poll_result(
                                         Ok(Some(code)),
-                                        current_totp_seconds_left(),
+                                        totp_seconds_left_at(period, now_unix),
                                         &mut totp_state,
                                     );
                                     debug_assert!(
@@ -3600,17 +3719,58 @@ pub fn build_frame_with_search(
                                     // failure that never ended, and the next
                                     // genuine failure would be silent because
                                     // the flag was still set.
-                                    if totp_poll_failing {
+                                    if totp_poll_failures > 0 {
                                         log::info!(
                                             "TOTP for {} is computed from this vault's own \
                                              snapshot now, so the fetch failures logged above \
                                              have stopped",
                                             item.id
                                         );
-                                        totp_poll_failing = false;
+                                        totp_poll_failures = 0;
                                     }
                                 }
+                                // **Nothing below here runs once a second any
+                                // more.** This is the arm that costs a request
+                                // -- and on a direct-REST account a request
+                                // here is a whole-vault `GET /api/sync` --
+                                // so it fires once per code period, on the
+                                // boundary where the code actually changes,
+                                // and less often than that while the backend
+                                // is failing. See `totp_backend_poll_due`.
+                                //
+                                // The check sits INSIDE the arm rather than
+                                // beside `should_start_totp_poll` above,
+                                // which is the whole point: the arm above
+                                // costs one HMAC and must keep running at
+                                // `TOTP_POLL_INTERVAL` so a rolled-over code
+                                // appears immediately rather than up to a
+                                // period late. One gate over both paths would
+                                // have made the cheap path pay the expensive
+                                // path's cadence.
+                                TotpPoll::AskTheBackend
+                                    if !totp_backend_poll_due(
+                                        now_unix,
+                                        period,
+                                        totp_backend_poll,
+                                        totp_last_backend_poll.elapsed(),
+                                        totp_poll_failures,
+                                    ) => {}
                                 TotpPoll::AskTheBackend => {
+                                    // Marked BEFORE the thread is spawned,
+                                    // not when its answer lands: the mark is
+                                    // "when did we last ask", and writing it
+                                    // on the answer would let a slow backend
+                                    // be asked again on every boundary that
+                                    // passed while it was still thinking.
+                                    // (`totp_poll_in_flight` already bounds
+                                    // that to one outstanding thread, but
+                                    // "bounded" is not "not asked".)
+                                    totp_backend_poll = Some(TotpBackendPollMark {
+                                        period_index: now_unix
+                                            .map(|now| now / u64::from(period.max(1))),
+                                        period,
+                                    });
+                                    totp_last_backend_poll = Instant::now();
                                     totp_poll_in_flight = true;
                                     // Backgrounded on a one-shot thread
                                     // rather than called inline, the same
@@ -3660,7 +3820,20 @@ pub fn build_frame_with_search(
                         // milliseconds ago still needs its countdown to
                         // read as live rather than frozen at the moment
                         // of that poll.
-                        let seconds_left = current_totp_seconds_left();
+                        //
+                        // Unconditional, like the presence derivation above
+                        // and NOT like the poll: it is derivation, not a
+                        // request, and a frozen countdown under a live code
+                        // is the same class of lie the poll gate is not
+                        // allowed to create.
+                        //
+                        // `totp_period_for` is re-read here rather than
+                        // hoisted out of the poll branch because that branch
+                        // only runs once a second and this runs every frame;
+                        // it is a parse of a short string the frame is
+                        // already holding, next to the layout of a whole
+                        // detail pane.
+                        let seconds_left = current_totp_seconds_left(totp_period_for(item));
                         if let TotpState::Code { seconds_left: code_seconds_left, .. } = &mut totp_state {
                             *code_seconds_left = seconds_left;
                         }
@@ -6747,17 +6920,78 @@ fn flag_reauth_if_unauthorized(ctx: &egui::Context, needs_reauth: &Rc<RefCell<bo
     }
 }
 
-/// How many seconds remain in the current 30-second TOTP window, derived
-/// from the wall clock -- `bw serve` doesn't report this itself, and it has
-/// nothing to do with when the last poll happened. Shared by both the poll
-/// site (to seed a freshly-fetched `TotpState::Code`) and the per-frame
+/// How many seconds remain in the current TOTP window, derived from the wall
+/// clock -- `bw serve` doesn't report this itself, and it has nothing to do
+/// with when the last poll happened. Shared by the poll site (to seed a
+/// freshly-fetched `TotpState::Code`), the `totp_rx` drain, and the per-frame
 /// refresh that keeps an already-displayed code's countdown moving between
 /// polls.
-fn current_totp_seconds_left() -> u8 {
-    (30 - (std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() % 30)
-        .unwrap_or(0))) as u8
+///
+/// # `period` is a parameter now, and that is a bug fix
+///
+/// This used to be `d.as_secs() % 30`, unconditionally, with `30` written
+/// into it twice. A card may be sixty (`totp_add::PERIOD_CHOICES` offers 30
+/// and 60, and a saved `otpauth://` URI carries its own `period=`), and for
+/// one of those the row counted 30 -> 1 *twice* inside one code's life: it
+/// said "about to change" thirty seconds before the code changed, and then
+/// said it again when it actually did. A countdown that resets while the code
+/// underneath it does not is worse than no countdown, because a user watching
+/// it wait out the last second before typing has been told the wrong thing.
+///
+/// The period comes from the item's own seed ([`totp_period_for`]).
+fn current_totp_seconds_left(period: u16) -> u8 {
+    totp_seconds_left_at(period, totp_clock_now())
+}
+
+/// [`current_totp_seconds_left`] with the clock read supplied, so the poll
+/// site can share one read of it with everything else that frame and a test
+/// can pin it.
+///
+/// `None` -- a clock that reads before 1970 -- substitutes zero, which yields
+/// a full window. That is the behaviour the `unwrap_or(0)` this replaced
+/// already had, and it is deliberately the *cosmetic* half of the split
+/// [`totp_clock_now`]'s doc describes: a countdown from a broken clock is a
+/// wrong number on screen, while a *code* from one would be six digits
+/// presented as this minute's, so that path refuses instead.
+///
+/// The `u8` return is the width `TotpState::Code` stores, and `crate::otpauth`
+/// will accept any `u16` period, so a period above 255 saturates rather than
+/// wrapping. Wrapping would turn a 300-second card's countdown into a number
+/// that jumps backwards past zero; saturating merely pins it until it drops
+/// into range. Neither is reachable from this app's own writer -- the form
+/// offers 30 and 60 -- and both beat the `as u8` truncation that would have
+/// been the silent default.
+fn totp_seconds_left_at(period: u16, unix_seconds: Option<u64>) -> u8 {
+    let left = totp_add::seconds_left_in_period(period, unix_seconds.unwrap_or(0));
+    u8::try_from(left).unwrap_or(u8::MAX)
+}
+
+/// The code period of `item`'s own seed, in seconds.
+///
+/// [`totp_add::DEFAULT_PERIOD`] (30, RFC 6238's) for a seed this app cannot
+/// read, and that is the honest answer rather than a fallback that happens to
+/// compile: the shapes [`totp_poll_plan`] sends to the backend are exactly the
+/// ones [`crate::otpauth`] refused to parse, so their `period=` -- if they
+/// even have one -- is a value this crate has *declined to interpret*. Reading
+/// it back out with a substring search to time a poll by would be the guessing
+/// that parser exists to refuse, and it would be guessing in the direction
+/// that matters: too long a period is a code fetched after it expired.
+/// Thirty is also `steam://`'s own period, which is the overwhelmingly common
+/// unreadable shape here, and it errs short -- more requests, never a stale
+/// code.
+///
+/// Re-derived from the item each time rather than cached beside `totp_state`:
+/// the seed can change under a running window (a sync reload landing
+/// mid-session is the ordinary case, and the presence derivation above exists
+/// because of it), and a cached period is one more thing that could go on
+/// describing a seed that is gone.
+fn totp_period_for(item: &VaultItem) -> u16 {
+    item.login
+        .as_ref()
+        .and_then(|login| login.totp.as_ref())
+        .and_then(totp_add::read_seed)
+        .map(|auth| auth.period)
+        .unwrap_or(totp_add::DEFAULT_PERIOD)
 }
 
 /// This machine's clock as a count of Unix seconds, or `None` if it reads
@@ -6883,6 +7117,171 @@ fn totp_poll_plan(item: &VaultItem, unix_seconds: Option<u64>) -> TotpPoll {
         // the backend rather than blanking the row.
         None => TotpPoll::AskTheBackend,
     }
+}
+
+/// **When the last TOTP request actually left the process**, for the current
+/// selection. See [`totp_backend_poll_due`], which is the only thing that
+/// reads it.
+///
+/// Both halves are needed and neither is redundant. `period` is stored
+/// alongside the index because an index is meaningless without the divisor it
+/// was computed under: an item whose seed is edited from 30 to 60 seconds
+/// mid-session would otherwise compare a fresh `now / 60` against a stale
+/// `now / 30` and conclude the code had not changed for the next half hour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TotpBackendPollMark {
+    /// `unix_seconds / period` at the moment the request went out, or `None`
+    /// if the wall clock could not be read then (see [`totp_clock_now`]).
+    period_index: Option<u64>,
+    /// The period that index was computed under, in seconds.
+    period: u16,
+}
+
+/// How many *code periods* a TOTP request waits after `failure_streak`
+/// consecutive failures. One (every period) while healthy, doubling per
+/// failure, capped at eight.
+///
+/// # The curve, and why this one
+///
+/// `1, 2, 4, 8, 8, 8, ...` -- binary exponential backoff with a cap, the same
+/// shape every well-behaved client uses against a server that is shedding
+/// load, and the reason it is the right shape here is the incident this whole
+/// change comes from: the reporting user's server started answering `503`
+/// because it was over its row allowance, and the app's response to being told
+/// "too much" was to ask again one second later, forever. A failing backend is
+/// evidence that asking is expensive right now, and the only honest reaction
+/// to that evidence is to ask less.
+///
+/// The **cap** is what a linear or unbounded-exponential curve gets wrong in
+/// opposite directions. Unbounded doubling reaches an hour between attempts
+/// within a dozen failures, and a user staring at "Unavailable right now"
+/// while their server is back up has no way to know the app has stopped
+/// trying; linear growth barely helps in the first minute, which is when a
+/// 503 storm is actually happening. Eight periods -- four minutes on a
+/// thirty-second card -- is 15 requests an hour against 3,600 before this
+/// change, and is short enough that an outage the user waits out resolves on
+/// screen without a click.
+///
+/// (Four minutes is also short next to the outage that prompted this: a daily
+/// row allowance does not come back for hours, and 15 requests an hour is a
+/// cost a shedding server can carry while it does.)
+///
+/// **Recovery is not on this curve at all**, deliberately. The streak is reset
+/// to zero by the first poll that produces a code (see the `totp_rx` drain),
+/// not decremented, so a backend that comes back is polled at the very next
+/// boundary rather than walked back down through 8, 4, 2. A curve that has to
+/// be climbed down is a curve that punishes a recovered server for having been
+/// broken.
+///
+/// A jitter term was considered and rejected: it exists to stop many clients
+/// synchronising on one server, and this is a desktop app polling the user's
+/// own server for the one item they have selected. Jitter here would only make
+/// the cadence unpredictable to the person reading the log.
+fn totp_backoff_stride(failure_streak: u32) -> u32 {
+    // `min` before the shift, not after: `1u32 << 32` is undefined-behaviour
+    // territory in C and a debug-build panic in Rust, and a streak of 32 is
+    // reachable in eight minutes of a down backend at the healthy cadence.
+    1u32 << failure_streak.min(3)
+}
+
+/// **Whether a TOTP poll that must go to the backend should go now.**
+///
+/// This is the gate that turns the fallback path from 3,600 requests an hour
+/// into 120 -- or 15 while the backend is failing, or none at all while
+/// nobody is looking (that last one is `window_is_worth_polling_for`, one
+/// layer out).
+///
+/// # Why a period INDEX and not a timer
+///
+/// The obvious implementation is "poll again `period` seconds after the last
+/// poll", and it is wrong. A TOTP code changes when `unix_seconds / period`
+/// increments -- on the wall-clock boundary, the same instant for every client
+/// in the world -- and *not* `period` seconds after whenever this window
+/// happened to ask. Select an item two seconds before a boundary and a 30s
+/// timer fetches the code that is about to expire, then sleeps 30 seconds and
+/// refetches 2 seconds into the *next* code: every code it shows is 28 seconds
+/// stale, and the row spends most of its life displaying a number that will be
+/// rejected. Worse, the error is invisible to a test that only counts
+/// requests, which is why there is a separate test for the boundary.
+///
+/// Comparing indices makes the alignment structural: the poll happens on the
+/// first frame after the index changed, whatever the phase of the selection
+/// was. The outer `TOTP_POLL_INTERVAL` gate means "first frame after" is
+/// within a second of the boundary rather than within a frame of it, which is
+/// the same latency the old once-a-second poll had and is invisible next to a
+/// thirty-second code.
+///
+/// # The four answers
+///
+///  * **No mark** -- nothing has been asked for this selection yet. Always
+///    due; this is what makes a freshly clicked row fetch immediately instead
+///    of waiting out a boundary.
+///  * **The period changed** under us (the seed was edited elsewhere and a
+///    sync landed). The stored index describes a division that no longer
+///    applies, so it is not compared; ask, and re-mark under the new period.
+///  * **Two readable indices** -- the real case. Due once the index has
+///    advanced by at least the backoff stride.
+///  * **Either index unreadable** -- the wall clock read before 1970, on this
+///    poll or on the one that set the mark. There is no boundary to align to,
+///    so this falls back to the monotonic clock and the drifting timer the
+///    rest of this function exists to avoid. That is not a compromise of the
+///    design: with no wall clock there is no such thing as alignment, and the
+///    property still worth keeping -- "at most one request per period" -- is
+///    the one the fallback keeps. `RestBackend::get_totp` refuses this case by
+///    name anyway, so on that backend it is a failure streak backing itself
+///    off; on `bw serve` the CLI answers and the cadence is right even if the
+///    phase cannot be.
+fn totp_backend_poll_due(
+    unix_seconds: Option<u64>,
+    period: u16,
+    last: Option<TotpBackendPollMark>,
+    since_last: Duration,
+    failure_streak: u32,
+) -> bool {
+    let stride = u64::from(totp_backoff_stride(failure_streak));
+    // Mirrors `totp_add::seconds_left_in_period` and `code_at`, both of which
+    // clamp the same way rather than trusting a period they did not parse.
+    let period = u64::from(period.max(1));
+    let Some(last) = last else {
+        return true;
+    };
+    if u64::from(last.period.max(1)) != period {
+        return true;
+    }
+    match (unix_seconds, last.period_index) {
+        (Some(now), Some(then)) => now / period >= then.saturating_add(stride),
+        _ => since_last >= Duration::from_secs(period.saturating_mul(stride)),
+    }
+}
+
+/// **Whether this window is on screen at all**, and therefore whether a TOTP
+/// code nobody can see is worth a request.
+///
+/// # Which signal, and why not the other one
+///
+/// `ViewportInfo::visible()` -- egui's own combination of *minimised* and
+/// *occluded* (fully covered by another window). `None` there means "this
+/// platform does not report it", and `!= Some(false)` is deliberately the
+/// test: an unknown answer polls. A window that cannot tell us it is hidden
+/// gets the behaviour it had before this function existed, which is the only
+/// safe direction -- the failure mode of guessing "hidden" is a One-time code
+/// row that never fills in, on a platform we cannot debug from here.
+///
+/// **`ctx.input(|i| i.focused)` was the other candidate and it is actively
+/// wrong**, not merely weaker. The entire point of a one-time code is that the
+/// user reads it here and types it *somewhere else*: a browser, a terminal, a
+/// phone-shaped dialog in another app. Focus leaves this window the instant
+/// they click into that other app, which is the exact moment the code on
+/// screen matters most. Gating the poll on focus would freeze the row --
+/// stale code, dead countdown -- for precisely the users doing the thing the
+/// feature exists for. Minimised and occluded do not have that problem: in
+/// both, the row is not on screen for anyone to read.
+///
+/// This gates the POLL only. See the call site, and see the long comment on
+/// `totp_state_for_secret_presence`'s call above it for what happens when a
+/// condition like this one is allowed to gate the state derivation instead.
+fn window_is_worth_polling_for(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.viewport().visible()) != Some(false)
 }
 
 /// Forces `previous` back to `TotpState::NoSecret` the instant
@@ -9801,8 +10200,36 @@ fn draw_read_arm(
 /// rather than taking the `TotpState` itself so this stays the "is it time
 /// yet" decision and the "does this state still want an answer" decision
 /// stays in its own testable function.
-fn should_start_totp_poll(poll_due: bool, poll_in_flight: bool, state_wants_poll: bool) -> bool {
-    poll_due && !poll_in_flight && state_wants_poll
+///
+/// `window_is_visible` (from [`window_is_worth_polling_for`]) is the newest
+/// condition and the one with the largest effect on a real day: nothing here
+/// used to ask whether anyone could see the row, so a vault window left open
+/// behind a browser went on polling for a code no human eye was on, for as
+/// long as the app stayed running. On the fallback path that was a network
+/// request a second into a window nobody was looking at. It is a plain `bool`
+/// for the same reason the other two are -- the egui read that produces it is
+/// the one part of this decision a test cannot make.
+///
+/// It gates this function and nothing above it. The unconditional
+/// `totp_state_for_secret_presence` call at the call site must NOT acquire a
+/// visibility condition: that derivation is what clears a code whose seed was
+/// removed elsewhere, and the shipped bug it was written for was precisely a
+/// state derivation gated off by the same condition that stopped the poll --
+/// the row kept rendering a dead code under a live countdown forever. See its
+/// own doc, and the comment above the call.
+///
+/// A stale code on the way back is not a risk this creates, and that was
+/// checked rather than assumed: the window becoming visible is itself a frame,
+/// this gate reads `true` on that frame, and `poll_due` is long since true
+/// because `totp_last_poll` has not moved -- so the refresh happens in the
+/// same frame the row reappears, not a second into it.
+fn should_start_totp_poll(
+    poll_due: bool,
+    poll_in_flight: bool,
+    state_wants_poll: bool,
+    window_is_visible: bool,
+) -> bool {
+    poll_due && !poll_in_flight && state_wants_poll && window_is_visible
 }
 
 /// Whether a `totp_rx` message fetched for `item_id` should still be applied
@@ -12313,12 +12740,34 @@ mod should_start_totp_poll_tests {
 
     #[test]
     fn starts_when_due_with_nothing_in_flight() {
-        assert!(should_start_totp_poll(true, false, true));
+        assert!(should_start_totp_poll(true, false, true, true));
     }
 
     #[test]
     fn does_not_start_before_the_interval_elapses() {
-        assert!(!should_start_totp_poll(false, false, true));
+        assert!(!should_start_totp_poll(false, false, true, true));
+    }
+
+    #[test]
+    fn does_not_poll_for_a_code_nobody_can_see() {
+        // The condition nothing here used to ask: a vault window minimised,
+        // or fully covered by the browser the user is actually working in,
+        // went on polling for a One-time code no eye was on -- once a second,
+        // over the network on the fallback path, for as long as the app
+        // stayed running. Every other condition below is satisfied, so this
+        // is the only thing stopping the poll.
+        assert!(!should_start_totp_poll(true, false, true, false));
+    }
+
+    #[test]
+    fn a_window_that_becomes_visible_again_polls_on_that_very_frame() {
+        // The other half, and the reason the gate is safe to put on the poll:
+        // nothing has to expire or be re-armed for the row to come back. The
+        // frame in which the window is visible again is a frame in which
+        // `poll_due` is still true (`totp_last_poll` did not move while it was
+        // hidden), so the code refreshes as the row reappears rather than up
+        // to a second later.
+        assert!(should_start_totp_poll(true, false, true, true));
     }
 
     #[test]
@@ -12327,7 +12776,7 @@ mod should_start_totp_poll_tests {
         // the backend has already answered "no current code for this item".
         // Without this the pane re-asked once a second, forever, for as long
         // as the item stayed selected.
-        assert!(!should_start_totp_poll(true, false, false));
+        assert!(!should_start_totp_poll(true, false, false, true));
     }
 
     #[test]
@@ -12337,7 +12786,7 @@ mod should_start_totp_poll_tests {
         // fails) would still spawn a fresh background thread every
         // `TOTP_POLL_INTERVAL`, piling up indefinitely instead of the single
         // outstanding poll this is meant to bound it to.
-        assert!(!should_start_totp_poll(true, true, true));
+        assert!(!should_start_totp_poll(true, true, true, true));
     }
 }
 
@@ -12606,6 +13055,562 @@ mod totp_poll_plan_tests {
 }
 
 #[cfg(test)]
+mod totp_backend_cadence_tests {
+    // **The deliverable is requests per hour, so that is what these count.**
+    //
+    // `totp_poll_plan_tests` above took the first half of this: a seed this
+    // crate can read costs nothing at all, thirty polls, zero syncs. What was
+    // left is the FALLBACK -- `steam://`, `hotp`, an odd digit count, a
+    // machine whose clock will not read -- which still went to the backend
+    // **once a second**. The owner measured what that costs on their server:
+    // one `/api/sync` is ~3,374 Cloudflare D1 rows, 3,558 syncs in one day
+    // came to 11.4 million rows against a 5M/day allowance. The rule they
+    // asked for is "one line per click and once when TOTP refreshed": for the
+    // 33.6 minutes their measurement covers, 67 refreshes rather than 2,016
+    // polls.
+    //
+    // So: 3,600 seconds of simulated time on the fallback path must issue 120
+    // requests, not 3,600. And a test that only counted would pass a timer
+    // that has drifted off the boundary and is showing a dead code, which is
+    // why `a_poll_lands_on_the_boundary...` exists beside the count.
+    //
+    // These drive the same functions `run` does, in the order `run` calls
+    // them, for the reason `totp_poll_plan_tests` gives: a helper that
+    // re-decided when to poll would be counting its own opinion. The count
+    // test is taken against a **real `RestBackend` and a real mock server**,
+    // so the number is requests that reached a socket.
+    use super::{
+        TotpBackendPollMark, TotpPoll, apply_totp_poll_result, poll_success_is_a_recovery,
+        should_start_totp_poll, totp_backend_poll_due, totp_backoff_stride, totp_period_for,
+        totp_poll_plan, totp_seconds_left_at, totp_state_wants_poll,
+    };
+    use crate::vault_backend::VaultBackend;
+    use crate::vault_bridge::{VaultError, VaultItem};
+    use crate::vault_window::detail::TotpState;
+    use std::time::Duration;
+
+    /// One hour of simulated wall clock, one frame per second -- the unit the
+    /// owner's measurement and this crate's fix are both stated in.
+    const AN_HOUR: u64 = 3_600;
+
+    /// The default code period, and what an hour of it costs after this
+    /// change: `3600 / 30`. Before it, an hour cost `AN_HOUR` requests.
+    const REQUESTS_PER_HOUR_AT_30S: usize = 120;
+
+    /// RFC 6238's own test seed, as `totp_poll_plan_tests` uses it: a seed
+    /// this crate reads, so it never reaches the backend at all.
+    const RFC_SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
+
+    /// A seed `crate::otpauth` refuses (not base32), so every poll for it is
+    /// a request. This is the path this module is about.
+    const FALLBACK_SEED: &str = "steam://HXDMVJECJJWSRB3HWIZR4IFUGFTMXBOZ";
+
+    /// The fixture vault's item id, as held by
+    /// `rest::backend::tests::sync_payload`.
+    const FIXTURE_ID: &str = "live-1";
+
+    fn item_with_seed(seed: &str) -> VaultItem {
+        serde_json::from_value(serde_json::json!({
+            "id": FIXTURE_ID,
+            "name": "An item with a one-time code",
+            "type": 1,
+            "login": { "username": "u@example.com", "totp": seed }
+        }))
+        .expect("the fixture item")
+    }
+
+    /// What one simulated run of `run`'s per-frame TOTP block produced.
+    struct Frames {
+        /// The simulated second of **every request that left the process**.
+        /// A `Vec` rather than a count because the count alone cannot tell a
+        /// boundary-aligned poll from a drifting one.
+        asked_at: Vec<u64>,
+        /// How many polls were answered from the snapshot, at no cost.
+        computed: usize,
+        /// What the row would be showing at the end.
+        state: TotpState,
+    }
+
+    /// `run`'s per-frame TOTP block, one frame per simulated second, with the
+    /// wall clock pinned, the window's visibility supplied, and the backend
+    /// call supplied.
+    ///
+    /// Every decision in here is `run`'s own function, called in `run`'s own
+    /// order: `should_start_totp_poll`, then `totp_poll_plan`, then -- on the
+    /// arm that costs a request -- `totp_backend_poll_due`, then
+    /// `apply_totp_poll_result`, then the streak bookkeeping the `totp_rx`
+    /// drain does.
+    ///
+    /// One frame per second rather than two (the real `FRAME_INTERVAL` is
+    /// 500ms) because `TOTP_POLL_INTERVAL` is the outer gate and it is one
+    /// second: a second frame inside the same second cannot reach any of this.
+    /// `poll_in_flight` is `false` throughout, which models a backend that
+    /// answers within the frame -- the same model `totp_poll_plan_tests`
+    /// uses, and the one that makes the request count an upper bound rather
+    /// than an artefact of simulated latency.
+    fn drive(
+        item: &VaultItem,
+        start: u64,
+        seconds: u64,
+        visible: impl Fn(u64) -> bool,
+        mut ask: impl FnMut(u64) -> Result<Option<String>, VaultError>,
+    ) -> Frames {
+        // What `run` holds the instant an item with a seed is selected.
+        let mut state = TotpState::Fetching;
+        let mut mark: Option<TotpBackendPollMark> = None;
+        let mut failures: u32 = 0;
+        // `run` seeds this from `Instant::now()` at the same moment it clears
+        // the mark, so "nothing asked yet" is `mark == None` and this value is
+        // never consulted until something has been.
+        let mut last_ask = start;
+        let mut frames = Frames { asked_at: Vec::new(), computed: 0, state: TotpState::Fetching };
+
+        for now in start..start + seconds {
+            if !should_start_totp_poll(
+                // `TOTP_POLL_INTERVAL` has elapsed: one frame per second.
+                true,
+                false,
+                totp_state_wants_poll(&state),
+                visible(now),
+            ) {
+                continue;
+            }
+            let period = totp_period_for(item);
+            match totp_poll_plan(item, Some(now)) {
+                TotpPoll::Computed(code) => {
+                    frames.computed += 1;
+                    let _ = apply_totp_poll_result(
+                        Ok(Some(code)),
+                        totp_seconds_left_at(period, Some(now)),
+                        &mut state,
+                    );
+                    failures = 0;
+                }
+                TotpPoll::AskTheBackend => {
+                    // Bound to a local rather than tested inline, so `run`'s
+                    // own negated call stays the ONE occurrence of that text
+                    // in this file: `totp_poll_wiring_tests` reads the source
+                    // to prove the gate is wired into the `eframe` closure at
+                    // all, and a second copy of the phrase here would be this
+                    // test helper satisfying that guard on the real call
+                    // site's behalf. (Which is also why this comment does not
+                    // spell the phrase out.)
+                    let due = totp_backend_poll_due(
+                        Some(now),
+                        period,
+                        mark,
+                        Duration::from_secs(now - last_ask),
+                        failures,
+                    );
+                    if !due {
+                        continue;
+                    }
+                    frames.asked_at.push(now);
+                    mark = Some(TotpBackendPollMark {
+                        period_index: Some(now / u64::from(period.max(1))),
+                        period,
+                    });
+                    last_ask = now;
+                    let answer = ask(now);
+                    let error = apply_totp_poll_result(
+                        answer,
+                        totp_seconds_left_at(period, Some(now)),
+                        &mut state,
+                    );
+                    // The `totp_rx` drain's own bookkeeping, verbatim: count
+                    // every failure, and clear the streak outright on a poll
+                    // that actually produced a code.
+                    match error {
+                        Some(_) => failures = failures.saturating_add(1),
+                        None => {
+                            if failures > 0 && poll_success_is_a_recovery(&state) {
+                                failures = 0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        frames.state = state;
+        frames
+    }
+
+    /// **The headline number, over the wire: 120 requests an hour, not
+    /// 3,600.**
+    ///
+    /// `expect(REQUESTS_PER_HOUR_AT_30S)` on the only sync route the server
+    /// has is the assertion -- `RestBackend::get_totp` opens with `synced()`,
+    /// so one request here is one whole-vault sync, which is the ~3,374 D1
+    /// rows the owner measured. `signed_in_with_no_sync_route` rather than
+    /// `logged_in` for the reason `totp_poll_plan_tests` gives: a second,
+    /// uncounted sync mock would make the count meaningless.
+    #[test]
+    fn an_hour_of_a_fallback_seed_costs_one_request_per_period_not_one_per_second() {
+        let (mut server, backend) = crate::rest::backend::tests::signed_in_with_no_sync_route();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(crate::rest::backend::tests::sync_payload())
+            .expect(REQUESTS_PER_HOUR_AT_30S)
+            .create();
+
+        let item = item_with_seed(FALLBACK_SEED);
+        let frames = drive(&item, 0, AN_HOUR, |_| true, |_| backend.get_totp(FIXTURE_ID));
+
+        sync.assert();
+        assert_eq!(
+            frames.asked_at.len(),
+            REQUESTS_PER_HOUR_AT_30S,
+            "an hour of a selected fallback TOTP item cost {} requests; before this change it \
+             cost {AN_HOUR}, and the owner's server was shedding load under it",
+            frames.asked_at.len()
+        );
+        // Stated beside the count so a cadence that achieved it by showing
+        // nothing could not pass.
+        assert!(
+            matches!(frames.state, TotpState::Code { .. }),
+            "the row stopped showing a code: {:?}",
+            frames.state
+        );
+    }
+
+    /// **The alignment, which a count alone cannot see.**
+    ///
+    /// A code changes when `unix_seconds / period` increments -- not `period`
+    /// seconds after this window happened to ask. Select an item 10 seconds
+    /// past a boundary and a naive 30-second timer polls at 1000, 1030, 1060:
+    /// every one of those lands 10 seconds into a code it fetched 20 seconds
+    /// too late to have caught fresh, and the row shows a code that expired
+    /// 20 seconds ago for the last two thirds of every window. It would count
+    /// identically to the correct schedule, which is exactly why this test is
+    /// separate from the one above.
+    #[test]
+    fn a_fallback_poll_lands_on_the_period_boundary_not_a_period_after_the_last_one() {
+        // 1000 is 10 seconds into the code whose index is 33.
+        let item = item_with_seed(FALLBACK_SEED);
+        let frames = drive(&item, 1_000, 131, |_| true, |_| Ok(Some("777777".to_string())));
+
+        assert_eq!(
+            frames.asked_at,
+            vec![1_000, 1_020, 1_050, 1_080, 1_110],
+            "the second poll did not land on the boundary at 1020 -- a drifting 30s timer \
+             started at selection would have asked at 1030, 1060, 1090 and shown a code that \
+             was already 10 seconds old every time"
+        );
+        // Every poll after the first is on a boundary, which is the property
+        // rather than the literal list above.
+        for at in &frames.asked_at[1..] {
+            assert_eq!(at % 30, 0, "{at} is not a period boundary");
+        }
+    }
+
+    /// Every second at which [`totp_backend_poll_due`] fires, for a given
+    /// period and a fixed failure streak. The cadence on its own, without a
+    /// seed or a backend, so a period this app can *read* -- and therefore
+    /// never asks the backend about -- can still have its cadence pinned.
+    fn due_seconds(period: u16, start: u64, seconds: u64, failure_streak: u32) -> Vec<u64> {
+        let mut mark: Option<TotpBackendPollMark> = None;
+        let mut last = start;
+        let mut out = Vec::new();
+        for now in start..start + seconds {
+            if totp_backend_poll_due(
+                Some(now),
+                period,
+                mark,
+                Duration::from_secs(now - last),
+                failure_streak,
+            ) {
+                out.push(now);
+                mark = Some(TotpBackendPollMark {
+                    period_index: Some(now / u64::from(period)),
+                    period,
+                });
+                last = now;
+            }
+        }
+        out
+    }
+
+    /// **A sixty-second card is asked once a minute, not twice.**
+    ///
+    /// `totp_add::PERIOD_CHOICES` offers 30 and 60 and a saved `otpauth://`
+    /// URI carries its own `period=`, so 30 is a default, never a constant.
+    /// The old code had it written into the countdown twice; nothing had it
+    /// written into the cadence because there was no cadence.
+    #[test]
+    fn a_sixty_second_period_is_asked_half_as_often_as_a_thirty_second_one() {
+        let slow = due_seconds(60, 0, AN_HOUR, 0);
+        let fast = due_seconds(30, 0, AN_HOUR, 0);
+
+        assert_eq!(slow.len(), 60, "a 60-second card was not asked once a minute");
+        assert_eq!(fast.len(), REQUESTS_PER_HOUR_AT_30S);
+        for at in &slow {
+            assert_eq!(at % 60, 0, "{at} is not a 60-second boundary");
+        }
+    }
+
+    /// The period comes from the item's own seed, and from nowhere else.
+    ///
+    /// The fallback default is the honest half of this: for a seed
+    /// `crate::otpauth` refused, its `period=` is a value this crate has
+    /// declined to interpret, so the cadence uses RFC 6238's 30 -- which is
+    /// also `steam://`'s -- and errs short. See `totp_period_for`.
+    #[test]
+    fn the_period_is_read_off_the_items_own_seed() {
+        assert_eq!(
+            totp_period_for(&item_with_seed(&format!(
+                "otpauth://totp/RFC:u?secret={RFC_SEED}&period=60"
+            ))),
+            60
+        );
+        assert_eq!(totp_period_for(&item_with_seed(RFC_SEED)), 30, "the RFC default is 30");
+        assert_eq!(
+            totp_period_for(&item_with_seed(FALLBACK_SEED)),
+            30,
+            "a seed this crate will not parse has no period it may be read for"
+        );
+    }
+
+    /// **The countdown for a 60-second card counts 60, not 30 twice.**
+    ///
+    /// This is the latent bug `current_totp_seconds_left` carried:
+    /// `d.as_secs() % 30`, unconditionally. For a 60-second card the row
+    /// counted down to 1, said "about to change", and then the code did not
+    /// change -- and the countdown started over from 30 for the half of the
+    /// code's life that was actually left.
+    #[test]
+    fn the_countdown_runs_the_items_own_period() {
+        // The old arithmetic, for contrast: `30 - (t % 30)`.
+        let old = |t: u64| (30 - (t % 30)) as u8;
+
+        assert_eq!(totp_seconds_left_at(60, Some(0)), 60);
+        assert_eq!(totp_seconds_left_at(60, Some(29)), 31, "the old code said {}", old(29));
+        assert_eq!(totp_seconds_left_at(60, Some(30)), 30);
+        assert_eq!(totp_seconds_left_at(60, Some(59)), 1);
+        assert_eq!(totp_seconds_left_at(60, Some(60)), 60, "the countdown did not roll over");
+        // Unchanged for the ordinary card, which is the other half of a fix.
+        for t in [0_u64, 1, 15, 29, 30, 59] {
+            assert_eq!(totp_seconds_left_at(30, Some(t)), old(t), "the 30s countdown moved");
+        }
+        // A clock that reads before 1970 shows a full window rather than
+        // refusing -- the cosmetic half of `totp_clock_now`'s split. The code
+        // itself is never computed from that clock; see `totp_poll_plan`.
+        assert_eq!(totp_seconds_left_at(60, None), 60);
+        // `TotpState::Code` stores a `u8` and `crate::otpauth` accepts any
+        // `u16` period, so an absurd one saturates rather than wrapping into
+        // a countdown that jumps backwards past zero.
+        assert_eq!(totp_seconds_left_at(1_000, Some(0)), u8::MAX);
+    }
+
+    /// **A window nobody can see asks for nothing, and asks again the moment
+    /// it can be seen.**
+    ///
+    /// Nothing in the poll gate used to ask this, so a vault window left open
+    /// behind a browser polled for a code no eye was on for as long as the app
+    /// ran. The resumption half matters as much as the suppression: it must be
+    /// on the very first visible frame, or the fix trades a wasted request for
+    /// a row that is blank when the user comes back to it.
+    #[test]
+    fn a_hidden_window_asks_for_nothing_and_a_restored_one_asks_at_once() {
+        let item = item_with_seed(FALLBACK_SEED);
+        let hidden = 60..600;
+        let frames = drive(
+            &item,
+            0,
+            700,
+            |now| !hidden.contains(&now),
+            |_| Ok(Some("777777".to_string())),
+        );
+
+        assert!(
+            !frames.asked_at.iter().any(|at| hidden.contains(at)),
+            "a hidden window still asked: {:?}",
+            frames.asked_at
+        );
+        assert_eq!(
+            frames.asked_at,
+            vec![0, 30, 600, 630, 660, 690],
+            "the 540 seconds behind another window cost 18 requests before this change"
+        );
+    }
+
+    /// The hidden gate is on the poll, so the **computed** path stops too --
+    /// and it costs nothing to stop, because it resumes on the first visible
+    /// frame with a code computed for that second rather than a stale one.
+    #[test]
+    fn a_hidden_window_does_not_compute_either_and_resumes_immediately() {
+        let item = item_with_seed(RFC_SEED);
+        let frames = drive(&item, 0, 100, |now| now < 10 || now >= 90, |_| Ok(None));
+
+        assert_eq!(frames.computed, 20, "the hidden 80 seconds were computed anyway");
+        assert_eq!(frames.asked_at, Vec::<u64>::new());
+        // **Computed for the LAST VISIBLE second (99), not left at the value
+        // it had when the window went dark 80 seconds earlier.** Compared
+        // against the plan's own answer for that second rather than a pasted
+        // literal: the six digits are `totp_add::code_at`'s business and are
+        // pinned against RFC 6238's published vectors in its own tests, while
+        // what is being asserted here is *which second* the row is showing.
+        let TotpPoll::Computed(at_99) = totp_poll_plan(&item, Some(99)) else {
+            panic!("the RFC seed is one this app reads");
+        };
+        assert_eq!(
+            frames.state,
+            TotpState::Code { code: at_99, seconds_left: totp_seconds_left_at(30, Some(99)) }
+        );
+    }
+
+    /// **The locally computed path is not slowed down by any of this.**
+    ///
+    /// The whole point of splitting the gate: a code the window can work out
+    /// for itself costs one HMAC over eight bytes, and a code that rolled over
+    /// should appear immediately rather than up to a period late. Ten minutes
+    /// of frames, six hundred refreshes, zero requests.
+    #[test]
+    fn the_locally_computed_path_still_refreshes_every_second() {
+        let (mut server, backend) = crate::rest::backend::tests::signed_in_with_no_sync_route();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(crate::rest::backend::tests::sync_payload())
+            .expect(0)
+            .create();
+
+        let item = item_with_seed(RFC_SEED);
+        let frames = drive(&item, 0, 600, |_| true, |_| backend.get_totp(FIXTURE_ID));
+
+        sync.assert();
+        assert_eq!(frames.computed, 600, "the cheap path was put on the expensive path's cadence");
+        assert_eq!(frames.asked_at, Vec::<u64>::new());
+    }
+
+    /// The curve, stated: `1, 2, 4, 8, 8, 8, ...` periods.
+    #[test]
+    fn the_backoff_doubles_and_then_stops_doubling() {
+        assert_eq!(totp_backoff_stride(0), 1, "a healthy backend is asked every period");
+        assert_eq!(totp_backoff_stride(1), 2);
+        assert_eq!(totp_backoff_stride(2), 4);
+        assert_eq!(totp_backoff_stride(3), 8);
+        // Capped, so an app left open on a dead backend keeps trying at a
+        // rate a user can wait out rather than drifting into hours -- and so
+        // the shift itself cannot reach 32 and panic.
+        for streak in [4_u32, 10, 1_000, u32::MAX] {
+            assert_eq!(totp_backoff_stride(streak), 8, "streak {streak} was not capped");
+        }
+    }
+
+    /// **A backend that is failing is asked less, which is the whole reason
+    /// the streak became a count.**
+    ///
+    /// `totp_state_wants_poll` answers `true` for `Unavailable` -- correctly,
+    /// it is a transient state a later poll should recover from -- so before
+    /// this, a backend answering `503` was asked again one second later,
+    /// forever. That is what a server already shedding load was being hit
+    /// with.
+    #[test]
+    fn a_failing_backend_is_asked_seventeen_times_an_hour_rather_than_a_hundred_and_twenty() {
+        let item = item_with_seed(FALLBACK_SEED);
+        let frames = drive(&item, 0, AN_HOUR, |_| true, |_| {
+            Err(VaultError::Unreachable("the server answered 503".to_string()))
+        });
+
+        assert_eq!(
+            &frames.asked_at[..5],
+            &[0, 60, 180, 420, 660],
+            "the backoff is not doubling from the first failure"
+        );
+        assert_eq!(frames.asked_at.len(), 17);
+        assert!(
+            frames.asked_at.len() < REQUESTS_PER_HOUR_AT_30S,
+            "a failing backend was asked at the healthy rate"
+        );
+        // Once capped, four minutes apart and no further.
+        for pair in frames.asked_at[4..].windows(2) {
+            assert_eq!(pair[1] - pair[0], 240, "the cap is not holding at eight periods");
+        }
+        assert_eq!(frames.state, TotpState::Unavailable, "the row must say so, not show a code");
+    }
+
+    /// **A recovered backend recovers promptly** -- at the very next boundary,
+    /// not by walking an eight-period stride back down through four and two.
+    #[test]
+    fn a_recovered_backend_returns_to_the_normal_cadence_at_the_next_boundary() {
+        let item = item_with_seed(FALLBACK_SEED);
+        let frames = drive(&item, 0, 800, |_| true, |now| {
+            if now < 500 {
+                Err(VaultError::Unreachable("the server answered 503".to_string()))
+            } else {
+                Ok(Some("777777".to_string()))
+            }
+        });
+
+        assert_eq!(
+            frames.asked_at,
+            vec![0, 60, 180, 420, 660, 690, 720, 750, 780],
+            "the first successful poll (at 660, after a 240s backed-off wait) did not restore \
+             the once-a-period cadence"
+        );
+        assert_eq!(frames.state, TotpState::Code { code: "777777".to_string(), seconds_left: 30 });
+    }
+
+    /// A definitive "no code for this item" still stops the polling outright,
+    /// which is a separate mechanism from the cadence and must survive it.
+    /// One request, not one per period.
+    #[test]
+    fn a_backend_that_reports_no_code_is_still_asked_exactly_once() {
+        let item = item_with_seed(FALLBACK_SEED);
+        let frames = drive(&item, 0, AN_HOUR, |_| true, |_| Ok(None));
+
+        assert_eq!(frames.asked_at, vec![0]);
+        assert_eq!(frames.state, TotpState::NoCodeReported);
+    }
+
+    /// The mark carries the period it was computed under, so a seed edited
+    /// from 30 to 60 seconds mid-session does not compare a fresh `now / 60`
+    /// against a stale `now / 30` and conclude the code has not changed for
+    /// the next half hour.
+    #[test]
+    fn a_changed_period_makes_the_next_poll_due_immediately() {
+        let under_thirty = TotpBackendPollMark { period_index: Some(100), period: 30 };
+
+        assert!(
+            !totp_backend_poll_due(Some(3_000), 30, Some(under_thirty), Duration::ZERO, 0),
+            "3000 / 30 is still 100, so nothing has changed yet"
+        );
+        assert!(
+            totp_backend_poll_due(Some(3_000), 60, Some(under_thirty), Duration::ZERO, 0),
+            "the period changed under the mark and the stale index was compared anyway"
+        );
+    }
+
+    /// A machine whose wall clock reads before 1970 has no boundary to align
+    /// to, so the cadence falls back to the monotonic clock -- keeping the
+    /// property that actually matters (at most one request per period) and
+    /// losing only the phase, which does not exist without a wall clock.
+    #[test]
+    fn a_clock_that_will_not_read_still_gets_at_most_one_request_per_period() {
+        let unmarked: Option<TotpBackendPollMark> = None;
+        assert!(totp_backend_poll_due(None, 30, unmarked, Duration::ZERO, 0));
+
+        let marked = TotpBackendPollMark { period_index: None, period: 30 };
+        assert!(!totp_backend_poll_due(None, 30, Some(marked), Duration::from_secs(29), 0));
+        assert!(totp_backend_poll_due(None, 30, Some(marked), Duration::from_secs(30), 0));
+        // And it backs off on the same curve.
+        assert!(!totp_backend_poll_due(None, 30, Some(marked), Duration::from_secs(239), 3));
+        assert!(totp_backend_poll_due(None, 30, Some(marked), Duration::from_secs(240), 3));
+    }
+
+    /// Nothing has been asked yet for this selection: always due. This is what
+    /// makes a freshly clicked row fetch at once instead of waiting out the
+    /// previous item's boundary, and `run` restores it by clearing the mark on
+    /// every selection change.
+    #[test]
+    fn a_fresh_selection_is_asked_immediately() {
+        assert!(totp_backend_poll_due(Some(1_001), 30, None, Duration::ZERO, 0));
+        // Even mid-backoff: the streak is cleared on selection change too, but
+        // the mark alone is enough.
+        assert!(totp_backend_poll_due(Some(1_001), 30, None, Duration::ZERO, 9));
+    }
+}
+
+#[cfg(test)]
 mod totp_poll_wiring_tests {
     // `totp_poll_plan` can be perfect and the app can still sync once a
     // second: the decision only counts if `run`'s per-frame block actually
@@ -12619,12 +13624,25 @@ mod totp_poll_wiring_tests {
     // Needles are split with `concat!` so no constant matches its own
     // definition.
 
-    /// `run` asks the plan, with the pinned clock read beside it.
-    const PLANS: &str = concat!("match totp_poll_plan(item, totp_clock_", "now()) {");
+    /// `run` asks the plan, against the frame's one clock read.
+    const PLANS: &str = concat!("match totp_poll_", "plan(item, now_unix) {");
+    /// That one clock read, shared by the plan, the request cadence and the
+    /// countdown. Three separate reads inside a frame can straddle a second.
+    const ONE_CLOCK_READ: &str = concat!("let now_unix = totp_clock_", "now();");
     /// The one place in this file a TOTP poll leaves the process.
     const ASKS: &str = concat!("bridge.get_", "totp(&item_id)");
     const ASK_ARM: &str = concat!("TotpPoll::AskTheBac", "kend => {");
     const COMPUTED_ARM: &str = concat!("TotpPoll::Comp", "uted(code) => {");
+    /// The once-per-period gate, in the guard of the arm that would otherwise
+    /// ask.
+    const DUE_GUARD: &str = concat!("if !totp_backend_poll_", "due(");
+    /// The visibility read, wherever it appears. Deliberately WITHOUT the
+    /// trailing comma that makes it an argument: the test wants to catch a
+    /// second use of it, and a second use would be spelled `... ) {`.
+    const VISIBILITY: &str = concat!("window_is_worth_polling_", "for(ui.ctx())");
+    /// The derivation that must NOT be gated on anything.
+    const DERIVATION: &str =
+        concat!("totp_state = totp_state_for_secret_", "presence(has_totp_secret, ");
 
     fn source() -> &'static str {
         include_str!("mod.rs")
@@ -12657,6 +13675,128 @@ mod totp_poll_wiring_tests {
             "the locally computed arm no longer sits between the plan and the ask, so the plan \
              has only one outcome"
         );
+    }
+
+    /// **The once-per-period gate is on the arm that asks, and only on it.**
+    ///
+    /// The count tests below drive the same three functions `run` does, but
+    /// they cannot prove `run` consults `totp_backend_poll_due` at all -- and
+    /// a gate that is written, tested and then not wired in is the shape of
+    /// bug this module exists for. Read the source and pin it: the guard has
+    /// to sit between the plan and the `get_totp`, so nothing can reach the
+    /// wire without passing it.
+    #[test]
+    fn the_once_per_period_gate_sits_between_the_plan_and_the_request() {
+        let source = source();
+        assert_eq!(
+            source.matches(DUE_GUARD).count(),
+            1,
+            "{DUE_GUARD} is not the one cadence gate on the fallback path"
+        );
+        let plan = source.find(PLANS).expect("the plan call");
+        let due = source.find(DUE_GUARD).expect("the cadence gate");
+        let ask = source.find(ASKS).expect("the ask");
+        assert!(
+            plan < due && due < ask,
+            "the request is not behind the once-per-period gate, so the fallback path is back \
+             to a request per second"
+        );
+    }
+
+    /// **The visibility condition is on the poll and NOT on the derivation**,
+    /// which is the trap this whole change had to walk past.
+    ///
+    /// `totp_state_for_secret_presence` runs unconditionally, every frame,
+    /// above the poll gate, and its own doc explains why: an item whose seed
+    /// was removed elsewhere used to keep rendering the last code under a live
+    /// countdown forever, because the poll that would have blanked it was
+    /// gated off by the very same condition that had gone false. Adding a
+    /// second such condition -- "is anyone looking?" -- to that line would
+    /// resurrect exactly that bug, and it would only show up on a window that
+    /// had been minimised, which is the sort of thing a unit test never
+    /// notices. So: the derivation is asserted to be *ungated*, textually,
+    /// and the condition is asserted to be on the gate below it.
+    ///
+    /// The first draft of this test asserted only that the derivation's own
+    /// STATEMENT held no `if`, and a deliberate mutant walked straight past
+    /// it by wrapping the untouched statement in an `if <this very visibility
+    /// read> { ... }` on the line above -- which is exactly the bug, spelled
+    /// exactly the way someone would actually introduce it. (Spelled out
+    /// here, that sentence would itself be a second occurrence and fail the
+    /// count below; the needles are `concat!`-split for the same reason.)
+    /// Two assertions replace the first draft, and each one alone
+    /// kills that mutant: the visibility read occurs **once** in this file,
+    /// and the line immediately above the derivation is still the comment
+    /// that explains why it must run unconditionally.
+    #[test]
+    fn visibility_gates_the_poll_and_never_the_presence_derivation() {
+        let source = source();
+        assert_eq!(
+            source.matches(VISIBILITY).count(),
+            1,
+            "there is more than one visibility read in this file. There is one thing it may \
+             gate -- the poll -- and every other use of it is something that stopped happening \
+             while the window was hidden"
+        );
+        let derivation = source.find(DERIVATION).expect("the presence derivation");
+        let visibility = source.find(VISIBILITY).expect("the visibility read");
+        assert!(
+            derivation < visibility,
+            "the visibility read moved above the presence derivation -- if it now gates it, a \
+             seed removed while the window is hidden renders its last code under a live \
+             countdown forever"
+        );
+        // An ARGUMENT, not a condition: `should_start_totp_poll(.., visible)`
+        // ends the call in a comma, an `if` of its own would end it in ` {`.
+        assert!(
+            source[visibility + VISIBILITY.len()..].starts_with(','),
+            "the visibility read is not being passed as an argument to the poll gate, so it is \
+             gating something of its own"
+        );
+
+        // **The comment is load-bearing and this asserts it stayed put.**
+        // Nothing can be inserted between that comment and the statement it
+        // describes without this failing -- and a condition inserted there is
+        // the whole failure mode, whatever it happens to be spelled with.
+        let above = source[..derivation]
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .expect("a line above the derivation");
+        assert!(
+            above.trim_start().starts_with("//"),
+            "the line above the presence derivation is {above:?} rather than the comment \
+             explaining why it must run unconditionally, every frame -- something was inserted \
+             between them, and the one thing that must never go there is a condition"
+        );
+
+        // And the statement itself is still a statement.
+        let line = &source[derivation..];
+        let line = &line[..line.find(';').expect("the derivation's statement end")];
+        for gate in ["if ", "&&", "||", "match "] {
+            assert!(
+                !line.contains(gate),
+                "the presence derivation acquired a {gate:?} -- it must run unconditionally, \
+                 every frame; see its doc for the shipped bug that is about"
+            );
+        }
+    }
+
+    /// One clock read per frame, shared. Two reads either side of a second
+    /// boundary would compute the code for one period index and mark the
+    /// request under the next, which is a whole period of skew from nothing
+    /// but the order of two lines.
+    #[test]
+    fn the_frame_reads_the_wall_clock_once_and_shares_it() {
+        let source = source();
+        assert_eq!(
+            source.matches(ONE_CLOCK_READ).count(),
+            1,
+            "{ONE_CLOCK_READ} is not where the poll block's clock is read"
+        );
+        let read = source.find(ONE_CLOCK_READ).expect("the clock read");
+        let plan = source.find(PLANS).expect("the plan call");
+        assert!(read < plan, "the plan is given a clock read that has not happened yet");
     }
 }
 
@@ -22244,7 +23384,12 @@ mod edit_seam_argument_tests {
         let production = production();
         const PANE_MATCH: &str = concat!("match &mut mo", "de {");
         const TRIGGER: &str = concat!("} else if should_start_totp_", "poll(");
-        const COUNTDOWN: &str = concat!("let seconds_left = current_totp_seconds_", "left();");
+        // Open-parenthesised rather than `left();`: the countdown takes the
+        // item's own period now (a 60-second card counted 30 -> 1 twice
+        // inside one code's life before it did), so the two call sites pass
+        // different expressions for it. What this test is about -- that there
+        // are two of them and both are above the pane match -- is unchanged.
+        const COUNTDOWN: &str = concat!("let seconds_left = current_totp_seconds_", "left(");
 
         assert_eq!(
             occurrences(production, PANE_MATCH),
@@ -22634,7 +23779,15 @@ mod preferences_modal_wiring_tests {
             // the source guard that `run` consults the plan before it spawns
             // the fetch, which is the one link in that chain living inside an
             // `eframe` closure no test can call.
-            modules, 67,
+            // 68 as of the fallback path's cadence, which added
+            // `mod totp_backend_cadence_tests`: the OTHER half of that fix.
+            // The fast path stopped syncing at all; the seeds this crate
+            // refuses still went to the backend once a second, 3,600 requests
+            // an hour, each one a whole-vault `GET /api/sync` on a direct-REST
+            // account. That module counts an hour of simulated frames and
+            // pins 120 -- on the wall-clock boundary, none while the window is
+            // hidden, and fewer still while the backend is failing.
+            modules, 68,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"

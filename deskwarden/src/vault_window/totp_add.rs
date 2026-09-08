@@ -847,7 +847,28 @@ pub fn code_at(auth: &OtpAuth, unix_seconds: u64) -> Option<Zeroizing<String>> {
 /// Seconds until the code changes. Always in `1..=period`, so the countdown
 /// never shows a zero that sits there for a second.
 pub fn seconds_left(auth: &OtpAuth, unix_seconds: u64) -> u16 {
-    let period = auth.period.max(1);
+    seconds_left_in_period(auth.period, unix_seconds)
+}
+
+/// The same arithmetic as [`seconds_left`], over a bare period rather than a
+/// whole [`OtpAuth`].
+///
+/// Split out because the vault window needs this for a seed it could NOT
+/// read: its One-time code row shows a countdown for every item with a code
+/// on screen, including the `steam://` and `hotp` shapes
+/// [`crate::otpauth`] refuses, and there is no `OtpAuth` to hand for those.
+/// `vault_window::mod::current_totp_seconds_left` was a second, independent
+/// copy of this line with `30` written into it, which is precisely the bug a
+/// shared implementation prevents: it counted 30 -> 1 twice inside one
+/// 60-second code's life, so the row said "about to change" thirty seconds
+/// before the code actually changed and then said it again when it did.
+///
+/// `period.max(1)` rather than a debug assertion: `crate::otpauth` already
+/// refuses `period=0` at the parser, so a zero here can only come from a
+/// caller that made one up, and the honest response to that is a countdown of
+/// one second rather than a division-by-zero panic in a UI thread.
+pub fn seconds_left_in_period(period: u16, unix_seconds: u64) -> u16 {
+    let period = period.max(1);
     period - (unix_seconds % u64::from(period)) as u16
 }
 
