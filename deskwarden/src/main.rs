@@ -12044,14 +12044,33 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                 // DPAPI to satisfy a closure would be the wrong direction.
                 let session_path = store.path().to_path_buf();
                 move |token: String, identity: Option<login_ui::SignedInIdentity>| {
-                    if !signing_in_over_bw_serve {
-                        return true;
-                    }
+                    // **BOTH ARMS RING. Only one of them waits.**
+                    //
+                    // This used to answer `true` here and tell the daemon
+                    // nothing at all on the direct-REST arm, on the reasoning
+                    // that the daemon had nothing to do: the window's vault
+                    // is already live, and there is no `bw serve` to start.
+                    // True of the WINDOW, and the whole of what that
+                    // reasoning missed is the daemon's own half -- its item
+                    // cache, its match engine and its session token, which
+                    // are what the tray, CTRL+ALT+B and autofill read.
+                    //
+                    // So the daemon sat locked while the window it had just
+                    // spawned showed 1669 items: "logged in with UI - tray
+                    // shows Locked vault", with the fill hotkey answering
+                    // "the vault is locked" over a vault that was open on the
+                    // same screen. It only came right when the window CLOSED,
+                    // because the child's exit is the other door -- and a
+                    // window is exactly when a user is least likely to close
+                    // it.
+                    //
+                    // The owner's rule: "both should work at the same time".
                     hand_the_bw_serve_sign_in_to_the_daemon(
                         &config_dir,
                         &session_path,
                         &token,
                         identity.as_ref(),
+                        signing_in_over_bw_serve,
                     )
                 }
             },
@@ -12277,6 +12296,19 @@ fn hand_the_bw_serve_sign_in_to_the_daemon(
     session_path: &Path,
     token: &str,
     identity: Option<&login_ui::SignedInIdentity>,
+    // **Whether this window's own vault depends on the answer.**
+    //
+    // `true` on the `bw serve` arm, where the daemon owns the backend and
+    // this window cannot draw an item until it has started one. `false` on
+    // direct REST, where the window is already reading the vault and the ring
+    // is pure news -- see step 4.
+    //
+    // A parameter rather than a second function because everything above step
+    // 4 is identical and is the part that must not drift: the token into the
+    // store, the ear before the ring, the identity file, the doorbell. Two
+    // copies of that is two chances for one of them to stop telling the
+    // daemon.
+    wait_for_the_daemon: bool,
 ) -> bool {
     // 1. The token, into the store the daemon will read it back out of.
     let store = session_store::SessionStore::new(session_path.to_path_buf());
@@ -12333,7 +12365,31 @@ fn hand_the_bw_serve_sign_in_to_the_daemon(
         return false;
     }
 
-    // 4. The wait. The spinner stage is on screen for the whole of it.
+    // 4. The wait -- **and only the `bw serve` arm has anything to wait
+    // for.**
+    //
+    // A direct-REST window's vault is already live by the time it gets here:
+    // `DirectRestLogin::adopt` put a `RestBackend` in the slot this process
+    // reads through, and it needs nothing at all from the daemon. It rang
+    // anyway, three steps above, and that is the change -- see
+    // `signing_in_over_bw_serve` at the call site. What it must NOT do is
+    // block on an event the daemon has no reason to set: the daemon answers
+    // that event when it has started `bw serve`, and on this account it will
+    // never start one, so waiting would spend the whole handshake deadline
+    // staring at a spinner and then report a vault it could already read.
+    //
+    // The owner: "both should work at the same time". Ringing without
+    // waiting is what makes that true -- the window draws its vault now, and
+    // the tray comes back the moment the daemon has drained the ring.
+    if !wait_for_the_daemon {
+        log::info!(
+            "this window signed in and told the daemon, and is opening its vault without \
+             waiting: this account is served directly over REST, so nothing here depends on \
+             what the daemon does with that news"
+        );
+        return true;
+    }
+    // The spinner stage is on screen for the whole of it.
     log::info!("this window signed in and is waiting for the daemon to start `bw serve`");
     let answered = ready.wait(
         u32::try_from(BACKEND_HANDSHAKE_DEADLINE.as_millis())
@@ -20543,6 +20599,80 @@ mod tests {
             !between.contains("else"),
             "there is an `else` between the lock guard and the restore, so a locked window \
              reaches it by the other arm: {between}"
+        );
+    }
+
+    /// **A WINDOW THAT SIGNS IN TELLS THE DAEMON, WHICHEVER BACKEND IT IS
+    /// ON. Only one of the two waits for an answer.**
+    ///
+    /// The report: "logged in with UI - tray shows Locked vault", and then,
+    /// on being told the two arms behave differently, "no, doesn't matter --
+    /// both should work at the same time."
+    ///
+    /// The `--ui` child used to answer `true` and tell the daemon nothing at
+    /// all on the direct-REST arm. The reasoning was sound about the WINDOW:
+    /// its vault is already live, `DirectRestLogin::adopt` having put a
+    /// backend in the slot it reads through, and there is no `bw serve` for
+    /// the daemon to start. What it missed is the daemon's own half -- the
+    /// item cache, the match engine and the session token, which are what the
+    /// tray, CTRL+ALT+B and autofill read. So the daemon sat locked while the
+    /// window it had spawned showed 1669 items, and the fill hotkey answered
+    /// "the vault is locked" over a vault open on the same screen.
+    ///
+    /// This is the third appearance of one mistake: work that the window does
+    /// not need, and the daemon does, left undone because the window was the
+    /// thing being reasoned about. The other two were the child's exit door
+    /// (`restore_the_session_a_child_established`) and the lock recovery
+    /// itself. So this pin states the RULE rather than the case -- there is
+    /// exactly one gate here, and it is on the WAIT, never on the telling.
+    ///
+    /// A source pin because the function it guards opens real Win32 events
+    /// and reads a DPAPI store, and no test in this crate may do either.
+    #[test]
+    fn a_ui_process_tells_the_daemon_on_both_arms_and_only_gates_the_wait() {
+        let code = code_only_lines(production_half_of_this_file());
+        let hand_off = concat!("hand_the_bw_serve_sign_in_to_the_", "daemon(");
+        let arm = "signing_in_over_bw_serve";
+
+        // **The gate is an ARGUMENT, not a guard.** `if !signing_in_over_bw_serve
+        // { return true; }` above the call is precisely the shape that shipped
+        // the defect, and it is what this forbids: the flag may be handed IN,
+        // so the callee can decide whether to wait, and it may not stand
+        // between the sign-in and the telling.
+        assert!(
+            code.contains(&format!("{arm},")),
+            "the `bw serve` arm is no longer passed to `{hand_off}`, so either the wait is \
+             ungated -- a direct-REST window blocking the whole handshake deadline on an \
+             event the daemon has no reason to set -- or the telling is gated again"
+        );
+        assert!(
+            !code.contains(&format!("if !{arm} {{")),
+            "the sign-in is gated on the backend again, so a direct-REST window signs in and \
+             the daemon is never told: the window shows the vault and the tray stays locked, \
+             which is the report this fixed"
+        );
+
+        // Controls, so the two negatives above cannot pass against a file
+        // where any of these moved or was renamed.
+        assert_eq!(
+            code.matches(hand_off).count(),
+            2,
+            "`{hand_off}` is written {} time(s), not the definition and its one call",
+            code.matches(hand_off).count()
+        );
+        assert!(
+            code.contains("let signing_in_over_bw_serve = a_bw_serve_sign_in_is_owed;"),
+            "control: the arm flag is not derived where this pin thinks it is, so the \
+             assertions above are about a name that no longer means the backend"
+        );
+        // And the wait really is still conditional -- the other direction.
+        // Waiting on both arms is the mirror defect: a direct-REST window
+        // would spend the whole handshake deadline on a spinner and then
+        // report a vault it could already read.
+        assert!(
+            code.contains("if !wait_for_the_daemon {"),
+            "the handshake no longer decides whether to wait, so a direct-REST window blocks \
+             on an event the daemon will never set"
         );
     }
 
