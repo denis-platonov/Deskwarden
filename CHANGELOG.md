@@ -15,6 +15,43 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### One-time codes no longer wear the server out to say what they already knew
+
+"Unavailable right now -- couldn't reach the vault to get the current
+code", a few minutes after opening a window whose vault had loaded
+perfectly well. Selecting an item with a one-time code made Deskwarden
+fetch **the entire vault** once a second, for as long as that item stayed
+selected -- around a megabyte each time on a large account -- until the
+server started answering 503 and the code row gave up.
+
+None of that traffic carried a code. Deskwarden computed the code itself
+at the end of it, from a seed already on screen. It now computes it from
+the copy it is already showing, with no request at all. Seeds it cannot
+read on its own -- Steam's, and anything using a setting this app does not
+understand -- are still asked for, so nothing that showed a code before
+stops showing one.
+
+### Site icons that were being thrown away
+
+An icon file can hold several sizes, and Deskwarden took the largest --
+usually 256 pixels square -- then threw away nine tenths of it to fit the
+row. It now takes the smallest one that is still big enough, so the
+picture you see is the one the site drew at about that size.
+
+Icons that are simply blank are treated as missing rather than as icons.
+Some servers answer "no icon" with a fully transparent image, and
+Deskwarden was accepting it, remembering it, and showing you a monogram
+without ever saying why -- including on later launches, from the copy it
+had kept.
+
+### Smaller things
+
+* "Setting up your vault..." and every other sentence on a loading screen
+  are set in the ordinary text weight. They were all in the heavier one
+  meant for buttons and headings.
+* "Fetching..." in the one-time code row sits on the same line as the
+  code that replaces it, instead of a few pixels above it.
+
 ## 0.15.18 - 2026-09-08
 
 ### Saving an item works again, and so does starring one
