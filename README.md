@@ -506,6 +506,20 @@ Deciding whether it is fit for what you need is yours to make. The source is
 here to be read, and [PRIVACY.md](PRIVACY.md) sets out exactly what leaves
 this machine and when.
 
+## About me
+
+Hi, I'm Denis — a tech enthusiast with 15 years in the industry as a QA,
+developer, SDET and manager, based in Los Angeles, CA. This is one of many
+projects I've built.
+
+If you have suggestions, recommendations or bugs, or you'd like to offer me a
+gig, get in touch:
+
+- **Bugs and feature requests** —
+  [open an issue](https://github.com/denis-platonov/Deskwarden/issues)
+- **Anything else, including work** —
+  [@denis-platonov](https://github.com/denis-platonov)
+
 ## License
 
 AGPL-3.0-or-later — see [LICENSE](LICENSE). (The same license also ships with the crate at
