@@ -43,6 +43,22 @@ Addresses on your own network are unchanged: they are always fetched
 directly, whatever the setting says, because an icon service on the
 internet has no route to them.
 
+### Deleting an item asks first, in a window that says what will happen
+
+Delete used to confirm itself inside the menu: the entry changed to
+"Delete? Click to confirm" for three seconds and you clicked it again.
+It now opens a small window naming the item and saying where it goes --
+to the Trash, where you can restore it, or, for **Delete forever**,
+nowhere at all. Cancel or Esc backs out.
+
+If the backend refuses the delete, that window stays open and says so.
+Before, it simply disarmed itself, which looked exactly like a click
+that had not registered.
+
+The item you deleted was open in the detail pane, so the pane closes and
+nothing opens in its place. It used to jump you to whichever item took
+the deleted one's spot.
+
 ### An item's icon can be one you choose
 
 Right-click an item and choose **Select icon...**. Point it at a picture
