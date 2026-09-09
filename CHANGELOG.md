@@ -15,6 +15,17 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### "Fetch site icons from the sites themselves" now falls back
+
+With that setting on, Deskwarden asked each site for its own icon and
+stopped there -- so a site that does not keep one at the usual address
+showed no icon at all, and nothing said why. It now asks the icon service
+about the ones the site itself did not answer.
+
+Addresses on your own network are unchanged: they are always fetched
+directly, whatever the setting says, because an icon service on the
+internet has no route to them.
+
 ### An icon you don't like can be asked for again
 
 Right-click an item and choose **Refresh icon**. Deskwarden forgets the
