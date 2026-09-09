@@ -408,7 +408,14 @@ pub fn menu_entries(
 ///
 /// Takes [`OutOfVault`] rather than a [`FilterSource`], so it cannot be
 /// called for a live item at all.
-fn out_of_vault_entries(out: OutOfVault) -> Vec<MenuEntry> {
+///
+/// **`pub(super)` so the detail pane's own kebab is built from it**, exactly
+/// as that kebab's "Move to folder" submenu is built from [`move_menu`] and
+/// for the same reason: the two surfaces would otherwise be two lists of
+/// what a trashed item can do, and the one that is not the one being read is
+/// the one that goes stale. See `detail::draw_out_of_vault_read`, which maps
+/// each [`RowCommand`] here to the `DetailAction` it reports.
+pub(super) fn out_of_vault_entries(out: OutOfVault) -> Vec<MenuEntry> {
     match out {
         OutOfVault::Trash => vec![
             enabled_command("Restore", RowCommand::Restore),

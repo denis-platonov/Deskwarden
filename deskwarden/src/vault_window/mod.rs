@@ -714,6 +714,14 @@ pub fn build_frame_with_search(
     // The gear's modal, `Some` while it is up. `prefs_ui` owns the state and
     // all of the drawing; this window owns only "is it open".
     let mut prefs: Option<crate::prefs_ui::PrefsState> = None;
+    // **What the out-of-vault pane's ⋮ asked for, waiting for the next
+    // frame.** Restore and Unarchive are acted on by the row menu's own arms
+    // -- one implementation, see where this is merged into `row_command` --
+    // and that block runs before the panel this pane is drawn in, so a
+    // request made here is picked up on the following frame. It lives outside
+    // the frame closure for exactly that reason: a per-frame local would be
+    // dropped before anything could read it.
+    let mut pane_out_of_vault_command: Option<(String, item_list::RowCommand)> = None;
     // When the daemon's shortcut status was last adopted, so the read is
     // throttled to `SHORTCUT_STATUS_REREAD` rather than run per frame. `None`
     // until the modal is first opened, so opening it adopts immediately.
@@ -3183,7 +3191,24 @@ pub fn build_frame_with_search(
         // The item is resolved from the id the menu carried rather than from
         // `selected_id`. They agree -- the right-click selected this row --
         // and that is exactly why neither has to be trusted to.
-        if let Some((id, command)) = row_command.take() {
+        // **The out-of-vault pane's kebab arrives here too, one frame late.**
+        //
+        // Restore and Unarchive have two doors now -- the row's right-click
+        // menu and that pane's ⋮ -- and this is the arm that acts on them:
+        // the cache call, the list invalidation, the failure sentence and the
+        // `no read-back` reasoning are all written once, in the arms below,
+        // and `delete_vault_item` exists because that reasoning had already
+        // been copied for the one command that had two doors first.
+        //
+        // The delay is a frame because the item list is drawn -- and this
+        // block runs -- before the central panel that holds the detail pane,
+        // so a request the pane makes this frame cannot be seen until the
+        // next one. That is invisible at frame rate and it is the whole cost
+        // of not having a second copy of these arms. `or_else`, so a row
+        // menu chosen in the same frame wins: it is the more recent gesture
+        // and the pane's is at most one frame old.
+        let row_command = row_command.take().or_else(|| pane_out_of_vault_command.take());
+        if let Some((id, command)) = row_command {
             // Resolved from the list the row was DRAWN from, not from `items`
             // -- a trashed or archived item is not in the live snapshot at
             // all, so looking it up there would find nothing and every entry
@@ -3992,11 +4017,63 @@ pub fn build_frame_with_search(
                     // editable, and the selection-change reset has already
                     // put `mode` back to Read for the row that was clicked.
                     _ if out_of_vault.is_some() && selected_item.is_some() => {
-                        detail::draw_out_of_vault_read(
+                        let item = selected_item.as_ref().expect("guarded above");
+                        let out = out_of_vault.expect("guarded above");
+                        let action = detail::draw_out_of_vault_read(
                             ui,
-                            selected_item.as_ref().expect("guarded above"),
-                            out_of_vault.expect("guarded above"),
+                            item,
+                            out,
+                            // The same lookup the read pane's header gets,
+                            // called rather than copied, so the two panes
+                            // cannot disagree about an item's folder.
+                            sidebar::folder_name(&folders, item.folder_id.as_deref()),
+                            icons.textures.get(item.id.as_str()),
                         );
+                        // **No `permit_detail_action` here, and that is
+                        // stated rather than omitted.** That gate asks
+                        // whether an action would put a secret on screen;
+                        // this pane offers three that move an item between
+                        // lists and shows no field of it at all. Each is on
+                        // the not-exposing side of
+                        // `detail_action_exposes_secrets`, so routing them
+                        // through the gate would be a call that always
+                        // answers "allowed" -- and one that a future variant
+                        // added beside them could ride through unnoticed,
+                        // which is why the exhaustive `match` in that
+                        // function is the guard rather than a call here.
+                        match action {
+                            detail::DetailAction::ClosePane => {
+                                selected_id = None;
+                                detail_dismissed = true;
+                            }
+                            // The SAME modal the row menu's entry opens, and
+                            // the same `DeleteKind`: one confirmation for the
+                            // one irreversible command, whichever door asked
+                            // for it.
+                            detail::DetailAction::PurgeForever => {
+                                delete_confirm = Some(delete_modal::DeleteConfirmState::new(
+                                    item.id.clone(),
+                                    item.name.clone(),
+                                    delete_modal::DeleteKind::Forever,
+                                ));
+                            }
+                            // Restore and Unarchive are reported to the same
+                            // place the row menu's are handled, rather than
+                            // acted on here: `out_of_vault_command` is where
+                            // the cache call, the list invalidation and the
+                            // failure sentence live, and a second copy of
+                            // them here is the drift this window keeps
+                            // paying for.
+                            detail::DetailAction::Restore => {
+                                pane_out_of_vault_command =
+                                    Some((item.id.clone(), item_list::RowCommand::Restore));
+                            }
+                            detail::DetailAction::Unarchive => {
+                                pane_out_of_vault_command =
+                                    Some((item.id.clone(), item_list::RowCommand::Unarchive));
+                            }
+                            _ => {}
+                        }
                     }
                     DetailMode::Read => {
                         if let Some(item) = &selected_item {
@@ -4487,6 +4564,28 @@ pub fn build_frame_with_search(
                                             );
                                         }
                                     }
+                                }
+                                // **The out-of-vault pane's three, which this
+                                // arm cannot receive.** They are reported by
+                                // `draw_out_of_vault_read` and handled in
+                                // that pane's own arm above, and the read
+                                // pane offers no control that produces one:
+                                // Restore and Unarchive act on an item this
+                                // list does not hold, and Delete forever is
+                                // the trash menu's.
+                                //
+                                // Listed rather than swept into `None`'s arm
+                                // so that a control added to the read pane
+                                // that reported one of them is a `todo!()`
+                                // that fires in a test, not a click that
+                                // silently does nothing.
+                                DetailAction::Restore
+                                | DetailAction::Unarchive
+                                | DetailAction::PurgeForever => {
+                                    log::warn!(
+                                        "the read pane reported {action:?}, which only the \
+                                         out-of-vault pane can act on; it was dropped"
+                                    );
                                 }
                                 DetailAction::None => {}
                             }
@@ -6458,6 +6557,16 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         // Closing the pane HIDES the item; there is nothing here to prove a
         // master password for.
         | DetailAction::ClosePane
+        // **The out-of-vault pane's three, and none of them reads a secret.**
+        // Restore and Unarchive move an item between lists; Delete forever
+        // destroys one. Every one of them acts on the item's PLACE, and none
+        // puts a field of it on screen or on the clipboard -- which is the
+        // question this gate asks. The permanent one is guarded, and guarded
+        // harder than a re-prompt would guard it, by the confirmation modal
+        // that names the item and says the word "forever" three times.
+        | DetailAction::Restore
+        | DetailAction::Unarchive
+        | DetailAction::PurgeForever
         // **And `SendRecord` is on this side deliberately, which looks wrong
         // and is not.** A record Send absolutely exposes a secret -- it
         // publishes one to a link. But this variant does not *do* that: it
@@ -20068,13 +20177,23 @@ mod header_folder_placement_tests {
                  reshaped, so this guard no longer knows where to look"
             )
         });
-        let resolved = production.find(RESOLVED).unwrap_or_else(|| {
-            panic!(
-                "{RESOLVED:?} is not in the production code. The header's folder is no \
-                 longer resolved through `sidebar::folder_name`, which is where the \
-                 virtual bucket and the missing-folder case are decided"
-            )
-        });
+        // **Searched FROM the call, not from the top of the file.** There is
+        // a second resolution now -- the out-of-vault pane's header grew a
+        // folder of its own and resolves it through the same function, on
+        // purpose, so the two panes cannot disagree about what an item's
+        // folder is called -- and it sits earlier in the file. A search from
+        // the top found that one and then measured its distance to the read
+        // arm's call, which is a guard reporting on a pair of things that
+        // have nothing to do with each other.
+        let resolved = production[call..].find(RESOLVED).map(|at| call + at).unwrap_or_else(
+            || {
+                panic!(
+                    "{RESOLVED:?} does not appear after {CALL:?}. The read pane header's \
+                     folder is no longer resolved through `sidebar::folder_name`, which is \
+                     where the virtual bucket and the missing-folder case are decided"
+                )
+            },
+        );
         // Bounded FORWARD from the call and short: the argument is the third
         // one, a few lines in. A window wide enough to reach the next
         // statement would pass against a resolution that had drifted out of

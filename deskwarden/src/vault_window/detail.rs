@@ -692,6 +692,20 @@ pub enum DetailAction {
     /// but a variant that never reached that function would be a variant a
     /// future secret-bearing sibling could be added next to unnoticed.
     ClosePane,
+    /// **The out-of-vault pane's kebab, and only that pane's.** Each is the
+    /// one thing that genuinely works on an item in the place it is in --
+    /// `RowCommand::Restore`, `Unarchive` and `PurgeForever`, reported from
+    /// the detail pane instead of only from the row's right-click menu.
+    ///
+    /// Their own variants rather than a reuse of [`DetailAction::Delete`]:
+    /// that one is the SOFT delete on a live item and goes through
+    /// `delete_vault_item`, and a trashed item's "Delete forever" is the one
+    /// irreversible thing this window does. Two commands sharing a variant
+    /// would be one `match` arm away from doing the wrong one, and the wrong
+    /// one here is unrecoverable.
+    Restore,
+    Unarchive,
+    PurgeForever,
     /// The header's ✉ was clicked: the user wants the record composer for
     /// this item.
     ///
@@ -1587,7 +1601,43 @@ pub fn out_of_vault_text(out: OutOfVault) -> (&'static str, &'static str) {
 ///
 /// It paints the same surface and the same header strip as the read pane, so
 /// the column does not change shape as the user moves between rows.
-pub fn draw_out_of_vault_read(ui: &mut egui::Ui, item: &VaultItem, out: OutOfVault) {
+///
+/// # What it shows, and what it withholds
+///
+/// **The identifying half of the read pane's header, in full**: the item's
+/// icon, its name, its kind and its folder. None of those is an action --
+/// they are what the item IS, and an item does not stop being a login in a
+/// Work folder because it was moved to the Trash. Withholding them was never
+/// argued for; it fell out of this pane starting as a sentence and growing a
+/// name. At the owner's direction: "no harm showing icons, folders etc as
+/// regular item."
+///
+/// **The controls, only the ones that work.** A kebab carrying the same
+/// entries the row's right-click menu offers for this state -- Restore and
+/// Delete forever for the Trash, Unarchive for the Archive -- and the close
+/// ✕, which closes a pane and needs nothing from the live vault. Asked for
+/// directly: "for Trash items add ... with available actions and close
+/// buttons to details page."
+///
+/// Everything else the read pane offers is still absent, for this function's
+/// original reason and unchanged by the above: Edit, Fill, the copy rows, the
+/// favourite star, the ✉ and the TOTP poll all read or write through the
+/// LIVE item list, which by definition does not hold this item, so each would
+/// be a control that quietly did nothing.
+pub fn draw_out_of_vault_read(
+    ui: &mut egui::Ui,
+    item: &VaultItem,
+    out: OutOfVault,
+    // The folder this item is filed in, resolved by the caller exactly as it
+    // resolves the read pane's -- `sidebar::folder_name`, one lookup, so the
+    // two panes cannot disagree about what an item's folder is called.
+    folder: Option<&str>,
+    // This item's favicon, if the window's icon cache has one. `None` falls
+    // back to the same monogram the row shows, through the same `kind_mark`
+    // door the read pane uses.
+    icon: Option<&egui::TextureHandle>,
+) -> DetailAction {
+    let mut action = DetailAction::None;
     let (heading, body) = out_of_vault_text(out);
     let pane = ui.clip_rect();
     ui.painter()
@@ -1601,14 +1651,149 @@ pub fn draw_out_of_vault_read(ui: &mut egui::Ui, item: &VaultItem, out: OutOfVau
         .inner_margin(Margin::symmetric(HEADER_PAD_X, HEADER_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(
-                RichText::new(&item.name)
-                    .size(TITLE_SIZE)
-                    .family(egui::FontFamily::Name(theme::BOLD.into()))
-                    .color(theme::INK),
-            );
-            ui.add_space(6.0);
-            ui.label(RichText::new(heading).size(12.0).color(theme::TEXT_MUTED));
+            ui.horizontal(|ui| {
+                // **The avatar, through the read pane's own two doors.** An
+                // item whose row shows a note mark must not open onto a
+                // header showing a letter pair, which is `kind_mark`'s rule
+                // and the reason the `None` arm is not a monogram written out
+                // here.
+                match icon {
+                    Some(tex) => {
+                        let tile = theme::avatar_artwork_tile(ui, HEADER_AVATAR, true);
+                        theme::avatar_image(ui, tile, tex, true);
+                    }
+                    None => crate::kind_mark::avatar(
+                        ui,
+                        ItemKind::of(item),
+                        &item.name,
+                        HEADER_AVATAR,
+                        true,
+                    ),
+                }
+                ui.add_space(HEADER_GAP);
+                // The controls are laid out from the right, so the title
+                // column below takes whatever is left -- the read pane's
+                // arrangement, without its stacking rule: this pane has two
+                // controls where that one has four, so the width that forces
+                // that one onto a second line does not force this one.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::close_pane_button(ui)
+                        .on_hover_text("Close this panel and show the full list")
+                        .clicked()
+                    {
+                        action = DetailAction::ClosePane;
+                    }
+                    ui.add_space(HEADER_GAP);
+                    let kebab = theme::kebab_button(ui)
+                        .on_hover_text("More actions for this item");
+                    egui::Popup::menu(&kebab)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(|ui| {
+                            // **The row menu's own list, CALLED and not
+                            // copied** -- `item_list::out_of_vault_entries`,
+                            // the same door this pane's "Move to folder"
+                            // submenu goes through for `move_menu`, and for
+                            // the same reason: two hand-written lists of what
+                            // a trashed item can do is one list that goes
+                            // stale, and the stale one is whichever is not
+                            // being read.
+                            //
+                            // `MenuEntry::MoveToFolder` cannot appear here --
+                            // that list holds `Restore`, `PurgeForever` and
+                            // `Unarchive` and nothing else -- but the arm is
+                            // written rather than `unreachable!()`d, because
+                            // a pane that panicked would be a worse answer to
+                            // a future entry than a pane that skipped one.
+                            for entry in super::item_list::out_of_vault_entries(out) {
+                                let super::item_list::MenuEntry::Command(entry) = entry else {
+                                    continue;
+                                };
+                                // **The permanent delete keeps its red
+                                // words**, which is the one thing this menu
+                                // does not take from the shared list: that
+                                // list carries a label and a command, and the
+                                // live pane's own Delete has spent this
+                                // app's whole life in `theme::ERROR`. The
+                                // click still opens the same confirmation
+                                // modal the row menu's entry opens.
+                                let clicked = if entry.command
+                                    == super::item_list::RowCommand::PurgeForever
+                                {
+                                    let button = ui.add(egui::Button::new(
+                                        RichText::new(&entry.label).color(theme::ERROR),
+                                    ));
+                                    if button
+                                        .on_hover_text("Delete this item permanently")
+                                        .clicked()
+                                    {
+                                        ui.close();
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                } else {
+                                    super::item_list::menu_command(ui, &entry)
+                                };
+                                if clicked {
+                                    action = match entry.command {
+                                        super::item_list::RowCommand::Restore => {
+                                            DetailAction::Restore
+                                        }
+                                        super::item_list::RowCommand::Unarchive => {
+                                            DetailAction::Unarchive
+                                        }
+                                        super::item_list::RowCommand::PurgeForever => {
+                                            DetailAction::PurgeForever
+                                        }
+                                        // Not reachable from that list today.
+                                        // Reported rather than panicked for
+                                        // the reason above, and logged so a
+                                        // new entry that arrives here is not
+                                        // silently inert.
+                                        other => {
+                                            log::warn!(
+                                                "the out-of-vault pane's menu offered {other:?}, \
+                                                 which it has no action for; the click was \
+                                                 dropped"
+                                            );
+                                            DetailAction::None
+                                        }
+                                    };
+                                }
+                            }
+                        });
+                    // The title column, in whatever the controls left it.
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = TITLE_GAP;
+                        title_text(ui, &item.id, &item.name);
+                        // **The read pane's subtitle, unchanged**: the kind,
+                        // and the folder after it when there is one. The
+                        // sentence saying WHERE the item is has moved down to
+                        // the card below, which is where the explanation of
+                        // what that means already lives -- two lines under
+                        // the title, one of them repeating the other, was the
+                        // arrangement this pane had when the title was all it
+                        // showed.
+                        let (lead, name) = header_subtitle_parts(ItemKind::of(item), folder);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            subtitle_text(
+                                ui,
+                                egui::Id::new(("out-of-vault-subtitle", &item.id)),
+                                &lead,
+                            );
+                            if let Some(name) = name {
+                                theme::folder_mark(ui, theme::TEXT_FAINT);
+                                subtitle_text(
+                                    ui,
+                                    egui::Id::new(("out-of-vault-folder", &item.id)),
+                                    name,
+                                );
+                            }
+                        });
+                    });
+                });
+            });
         });
     ui.add_space(18.0);
     // **The explanation is a card, like everything else this pane says.**
@@ -1641,9 +1826,17 @@ pub fn draw_out_of_vault_read(ui: &mut egui::Ui, item: &VaultItem, out: OutOfVau
                 .inner_margin(Margin::same(CARD_PAD_X))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
+                    // The heading moved here from under the title, where it
+                    // sat one line above a card that explained it. One place
+                    // says where the item is and what that means, in that
+                    // order, and the subtitle above is free to say what the
+                    // read pane's says.
+                    ui.label(theme::bold(heading, 13.0).color(theme::INK));
+                    ui.add_space(6.0);
                     ui.label(RichText::new(body).size(13.0).color(theme::TEXT_FAINT));
                 });
         });
+    action
 }
 
 /// The values this pane offers a keyboard copy for.
@@ -8443,23 +8636,59 @@ mod tests {
     /// Everything the out-of-vault pane painted: its strings, and -- as a
     /// [`Frame`] -- the drawn icons, which paint no string at all.
     fn painted_out_of_vault(item: &VaultItem, out: OutOfVault) -> (Vec<String>, Frame) {
+        painted_out_of_vault_in(item, out, None)
+    }
+
+    /// [`painted_out_of_vault`], with the item's folder -- the second half of
+    /// the header this pane grew when it stopped showing only a name.
+    fn painted_out_of_vault_in(
+        item: &VaultItem,
+        out: OutOfVault,
+        folder: Option<&str>,
+    ) -> (Vec<String>, Frame) {
+        out_of_vault_frames(item, out, folder, &[])
+    }
+
+    /// [`painted_out_of_vault_in`], driven for as many extra frames as there
+    /// are entries in `events`, and reporting the LAST of them.
+    ///
+    /// Extra frames are needed at all for `Pane`'s two reasons: a press *and*
+    /// a release is what egui counts as a click, and a popup only PAINTS on
+    /// the frame after the one that opened it -- so the frame that finds a
+    /// menu entry can never be the frame that opened the menu.
+    fn out_of_vault_frames(
+        item: &VaultItem,
+        out: OutOfVault,
+        folder: Option<&str>,
+        events: &[Vec<egui::Event>],
+    ) -> (Vec<String>, Frame) {
         let ctx = egui::Context::default();
-        let input = || egui::RawInput {
+        let input = |events: Vec<egui::Event>| egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(900.0, 900.0),
             )),
+            events,
             ..Default::default()
         };
-        let _ = ctx.run_ui(input(), |_ui| {});
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
         theme::apply(&ctx);
         crate::card_mark::install_logo_policy(&ctx, crate::card_mark::LogoPolicy::off());
-        let _ = ctx.run_ui(input(), |_ui| {});
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
 
-        let output = ctx.run_ui(input(), |ui| draw_out_of_vault_read(ui, item, out));
+        let mut action = DetailAction::None;
+        let mut run = |events: Vec<egui::Event>| {
+            ctx.run_ui(input(events), |ui| {
+                action = draw_out_of_vault_read(ui, item, out, folder, None);
+            })
+        };
+        let mut output = run(Vec::new());
+        for events in events {
+            output = run(events.clone());
+        }
         let mut texts = Vec::new();
         let mut frame = Frame {
-            action: DetailAction::None,
+            action,
             texts: Vec::new(),
             rendered: Vec::new(),
             rects: Vec::new(),
@@ -8497,14 +8726,23 @@ mod tests {
     }
 
     /// The out-of-vault pane names the item, says which of the two places it
-    /// is in, and offers NO control.
+    /// is in, and offers only the controls that can work there.
     ///
-    /// The negative half is the point and it is paired with a positive
-    /// control, because "the pane has no Edit button" is also true of a pane
-    /// that painted nothing at all: the item's own name and the state
-    /// sentence are asserted present in the same test.
+    /// **It used to offer none, and this test asserted that.** The owner
+    /// asked for two: "for Trash items add ... with available actions and
+    /// close buttons to details page". So the kebab and the close mark are
+    /// now asserted PRESENT, and what stays absent is everything that reads
+    /// or writes through the live item list -- the star, the reveal eye and
+    /// the Send envelope. That split is the rule this pane has always had;
+    /// only the two controls that never depended on the live list have
+    /// crossed it.
+    ///
+    /// The negative half is still paired with a positive control, because
+    /// "the pane has no star" is also true of a pane that painted nothing at
+    /// all: the item's own name and the state sentence are asserted present
+    /// in the same test.
     #[test]
-    fn the_out_of_vault_pane_states_where_the_item_is_and_offers_no_controls() {
+    fn the_out_of_vault_pane_states_where_the_item_is_and_offers_what_works() {
         let item = VaultItem {
             id: "t1".into(),
             name: "Ledgerline".into(),
@@ -8545,9 +8783,12 @@ mod tests {
                 "the out-of-vault pane draws a favourite star, which writes through the \
                  live item list"
             );
-            assert!(
-                frame.kebab_dots.is_empty(),
-                "the out-of-vault pane draws the kebab, which carries Edit and Delete"
+            assert_eq!(
+                frame.kebab_dots.len(),
+                3,
+                "the out-of-vault pane draws no kebab (its three dots), so Restore, \
+                 Unarchive and Delete forever are reachable only from the row's \
+                 right-click menu"
             );
             assert!(
                 frame.eyes.is_empty(),
@@ -8568,10 +8809,221 @@ mod tests {
                 "the out-of-vault pane draws the Send envelope, so a trashed or archived \
                  item can be published to a public link"
             );
+            assert_eq!(
+                frame.pane_closes.len(),
+                1,
+                "the out-of-vault pane draws no close ✕, so the only way out of a trashed \
+                 item's pane is to select some other row"
+            );
+        }
+    }
+
+    /// An item this pane can be opened on.
+    fn out_of_vault_item(name: &str) -> VaultItem {
+        VaultItem {
+            id: "t1".into(),
+            name: name.into(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// A full press-and-release at `at`, which is what egui needs before it
+    /// will report `Response::clicked` -- a press alone is not a click.
+    fn out_of_vault_click(at: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// Opens the pane's kebab and hands back what the menu painted.
+    ///
+    /// The kebab is found by its own three dots -- the middle one is the
+    /// button's centre -- rather than by a coordinate written down here, so
+    /// this keeps working if the strip is re-laid out.
+    fn open_out_of_vault_kebab(item: &VaultItem, out: OutOfVault) -> Vec<String> {
+        let (_, first) = painted_out_of_vault_in(item, out, None);
+        assert_eq!(
+            first.kebab_dots.len(),
+            3,
+            "the out-of-vault pane painted no kebab to click"
+        );
+        let at = first.kebab_dots[1].0.center();
+        let (painted, _) =
+            out_of_vault_frames(item, out, None, &[out_of_vault_click(at), Vec::new()]);
+        painted
+    }
+
+    /// **The header identifies the item the way the read pane's does**: its
+    /// kind, and the folder it is filed in.
+    ///
+    /// An item does not stop being a login in a Work folder because it was
+    /// moved to the Trash, and withholding those was never argued for -- it
+    /// fell out of this pane starting as a sentence and growing a name. At
+    /// the owner's direction: "no harm showing icons, folders etc as regular
+    /// item."
+    ///
+    /// The folder is asserted in BOTH directions, because a subtitle that
+    /// printed a folder name unconditionally would pass a one-sided check --
+    /// and an unfiled item drawing an empty folder mark is exactly what
+    /// `header_subtitle_parts` exists to prevent.
+    #[test]
+    fn the_out_of_vault_header_names_the_kind_and_the_folder() {
+        let item = out_of_vault_item("Ledgerline");
+        for out in [OutOfVault::Trash, OutOfVault::Archive] {
+            let (filed, _) = painted_out_of_vault_in(&item, out, Some("Work"));
             assert!(
-                frame.pane_closes.is_empty(),
-                "the out-of-vault pane draws the header's close ✕, which reports a \
-                 `DetailAction` this pane's caller does not handle"
+                filed.iter().any(|t| t == "Work"),
+                "{out:?}: the pane did not name the item's folder; it painted {filed:?}"
+            );
+            let (loose, _) = painted_out_of_vault_in(&item, out, None);
+            assert!(
+                !loose.iter().any(|t| t == "Work"),
+                "{out:?}: an unfiled item's pane named a folder anyway: {loose:?}"
+            );
+            // The positive control for the negative half: the kind is still
+            // drawn, so "Work is absent" is a statement about a subtitle that
+            // exists rather than about one that was never painted.
+            let kind = ItemKind::of(&item).label();
+            assert!(
+                loose.iter().any(|t| t.contains(kind.as_str())),
+                "{out:?}: the pane drew no subtitle at all; it painted {loose:?}"
+            );
+        }
+    }
+
+    /// **The pane's kebab offers exactly what the row's right-click menu
+    /// offers for the same state**, because it is built from that same list.
+    ///
+    /// Asserted against `item_list::out_of_vault_entries` rather than against
+    /// hand-written strings: a test naming the labels itself would be a third
+    /// list, and a second list is precisely the defect being prevented.
+    #[test]
+    fn the_panes_menu_is_the_row_menus_list() {
+        let item = out_of_vault_item("Ledgerline");
+        for out in [OutOfVault::Trash, OutOfVault::Archive] {
+            let opened = open_out_of_vault_kebab(&item, out);
+            let expected: Vec<String> = crate::vault_window::item_list::out_of_vault_entries(out)
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    crate::vault_window::item_list::MenuEntry::Command(entry) => Some(entry.label),
+                    _ => None,
+                })
+                .collect();
+            assert!(!expected.is_empty(), "{out:?}: the row menu offers nothing to compare");
+            for label in &expected {
+                assert!(
+                    opened.iter().any(|t| t == label),
+                    "{out:?}: the pane's menu is missing {label:?}; it painted {opened:?}"
+                );
+            }
+        }
+    }
+
+    /// **The Trash and the Archive get different menus**, which the equality
+    /// above cannot establish on its own: a pane that ignored `out` and
+    /// always drew the Trash's two entries would satisfy every `contains`
+    /// check for the Trash and be wrong for the Archive.
+    #[test]
+    fn the_archives_menu_is_not_the_trashs() {
+        let item = out_of_vault_item("Ledgerline");
+        let trash = open_out_of_vault_kebab(&item, OutOfVault::Trash);
+        let archive = open_out_of_vault_kebab(&item, OutOfVault::Archive);
+        assert!(trash.iter().any(|t| t == "Delete forever"), "painted {trash:?}");
+        assert!(
+            !archive.iter().any(|t| t == "Delete forever"),
+            "an archived item's pane offers the permanent delete, which acts on the trash: \
+             {archive:?}"
+        );
+        assert!(archive.iter().any(|t| t == "Unarchive"), "painted {archive:?}");
+        assert!(
+            !trash.iter().any(|t| t == "Unarchive"),
+            "a trashed item's pane offers Unarchive, which acts on the other list: {trash:?}"
+        );
+    }
+
+    /// **The close mark reports `ClosePane`**, which is what makes it a way
+    /// out of this pane rather than a decoration. Clicked where the pane
+    /// really painted it.
+    #[test]
+    fn the_out_of_vault_close_mark_reports_a_close() {
+        let item = out_of_vault_item("Ledgerline");
+        let (_, first) = painted_out_of_vault_in(&item, OutOfVault::Trash, None);
+        assert_eq!(first.pane_closes.len(), 1, "the pane painted no close mark");
+        let at = first.pane_closes[0].0.center();
+        let (_, clicked) =
+            out_of_vault_frames(&item, OutOfVault::Trash, None, &[out_of_vault_click(at)]);
+        assert_eq!(
+            clicked.action,
+            DetailAction::ClosePane,
+            "clicking the out-of-vault pane's close mark reported {:?}",
+            clicked.action
+        );
+    }
+
+    /// **Each menu entry reports its own command.**
+    ///
+    /// The one that matters is the pair: Restore and Delete forever sit next
+    /// to each other on the same menu, one recoverable and one not, and an
+    /// arm that mapped both to the same `DetailAction` would be a Restore
+    /// that destroys the item. So both are clicked, and each is asserted to
+    /// report its own -- which a test that clicked only one could not see.
+    #[test]
+    fn each_out_of_vault_entry_reports_its_own_command() {
+        let item = out_of_vault_item("Ledgerline");
+        for (out, label, expected) in [
+            (OutOfVault::Trash, "Restore", DetailAction::Restore),
+            (OutOfVault::Trash, "Delete forever", DetailAction::PurgeForever),
+            (OutOfVault::Archive, "Unarchive", DetailAction::Unarchive),
+        ] {
+            let (_, first) = painted_out_of_vault_in(&item, out, None);
+            let kebab = first.kebab_dots[1].0.center();
+            // Frame 1 opens the menu, frame 2 paints it -- that is where the
+            // entry's rectangle can first be read.
+            let (_, opened) =
+                out_of_vault_frames(&item, out, None, &[out_of_vault_click(kebab), Vec::new()]);
+            let entry = opened
+                .texts
+                .iter()
+                .find(|(text, _)| text == label)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{out:?}: the menu never painted {label:?}; it painted {:?}",
+                        opened.texts.iter().map(|(t, _)| t).collect::<Vec<_>>()
+                    )
+                })
+                .1
+                .center();
+            let (_, chosen) = out_of_vault_frames(
+                &item,
+                out,
+                None,
+                &[out_of_vault_click(kebab), Vec::new(), out_of_vault_click(entry)],
+            );
+            assert_eq!(
+                chosen.action, expected,
+                "{out:?}: clicking {label:?} reported {:?}",
+                chosen.action
             );
         }
     }
