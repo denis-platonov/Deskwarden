@@ -714,14 +714,23 @@ pub fn build_frame_with_search(
     // The gear's modal, `Some` while it is up. `prefs_ui` owns the state and
     // all of the drawing; this window owns only "is it open".
     let mut prefs: Option<crate::prefs_ui::PrefsState> = None;
-    // **What the out-of-vault pane's ⋮ asked for, waiting for the next
-    // frame.** Restore and Unarchive are acted on by the row menu's own arms
-    // -- one implementation, see where this is merged into `row_command` --
-    // and that block runs before the panel this pane is drawn in, so a
-    // request made here is picked up on the following frame. It lives outside
-    // the frame closure for exactly that reason: a per-frame local would be
-    // dropped before anything could read it.
-    let mut pane_out_of_vault_command: Option<(String, item_list::RowCommand)> = None;
+    // **What the detail pane's ⋮ asked for in the ROW MENU's vocabulary,
+    // waiting for the next frame.** The commands that reach here are already
+    // implemented once, in the row menu's own arms -- see where this is
+    // merged into `row_command` -- and that block runs before the panel the
+    // pane is drawn in, so a request made here is picked up on the following
+    // frame. It lives outside the frame closure for exactly that reason: a
+    // per-frame local would be dropped before anything could read it.
+    //
+    // **Named for the pane and not for one of its menus**, because it now
+    // carries two groups that arrive from two different panes. The
+    // out-of-vault pane's Restore and Unarchive came first and gave this slot
+    // its original name; the read pane's Icon submenu -- Refresh, Select and
+    // "Use the automatic icon" -- travels the same way, for the identical
+    // reason and into the identical arms. A slot still called
+    // `pane_out_of_vault_command` while a live item's icon rides on it would
+    // be a name that has to be disbelieved to be understood.
+    let mut pane_row_command: Option<(String, item_list::RowCommand)> = None;
     // **Whether "No folder" is a destination this backend can reach**, asked
     // once for the life of the window rather than per frame: it is a property
     // of which backend is bound, and the backend does not change under an
@@ -3210,14 +3219,19 @@ pub fn build_frame_with_search(
         // The item is resolved from the id the menu carried rather than from
         // `selected_id`. They agree -- the right-click selected this row --
         // and that is exactly why neither has to be trusted to.
-        // **The out-of-vault pane's kebab arrives here too, one frame late.**
+        // **The detail pane's kebab arrives here too, one frame late.**
         //
-        // Restore and Unarchive have two doors now -- the row's right-click
-        // menu and that pane's ⋮ -- and this is the arm that acts on them:
-        // the cache call, the list invalidation, the failure sentence and the
-        // `no read-back` reasoning are all written once, in the arms below,
-        // and `delete_vault_item` exists because that reasoning had already
-        // been copied for the one command that had two doors first.
+        // Restore, Unarchive and the read pane's three icon actions have two
+        // doors each now -- the row's right-click menu and the pane's ⋮ --
+        // and this is the arm that acts on them: the cache call, the list
+        // invalidation, the failure sentence and the `no read-back` reasoning
+        // are all written once, in the arms below, and `delete_vault_item`
+        // exists because that reasoning had already been copied for the one
+        // command that had two doors first. The icon arms are the ones that
+        // most needed this treatment: between them they delete three caches
+        // in a particular order, open a shell dialog that must not be opened
+        // from inside a draw closure, and write an empty string that REMOVES
+        // a field rather than blanking it.
         //
         // The delay is a frame because the item list is drawn -- and this
         // block runs -- before the central panel that holds the detail pane,
@@ -3226,7 +3240,7 @@ pub fn build_frame_with_search(
         // of not having a second copy of these arms. `or_else`, so a row
         // menu chosen in the same frame wins: it is the more recent gesture
         // and the pane's is at most one frame old.
-        let row_command = row_command.take().or_else(|| pane_out_of_vault_command.take());
+        let row_command = row_command.take().or_else(|| pane_row_command.take());
         if let Some((id, command)) = row_command {
             // Resolved from the list the row was DRAWN from, not from `items`
             // -- a trashed or archived item is not in the live snapshot at
@@ -4108,11 +4122,11 @@ pub fn build_frame_with_search(
                                 );
                             }
                             detail::DetailAction::Restore => {
-                                pane_out_of_vault_command =
+                                pane_row_command =
                                     Some((item.id.clone(), item_list::RowCommand::Restore));
                             }
                             detail::DetailAction::Unarchive => {
-                                pane_out_of_vault_command =
+                                pane_row_command =
                                     Some((item.id.clone(), item_list::RowCommand::Unarchive));
                             }
                             _ => {}
@@ -4555,6 +4569,42 @@ pub fn build_frame_with_search(
                                 // for the answer to drift.
                                 DetailAction::AddTotp => {
                                     add_totp_asked = true;
+                                }
+                                // **The kebab's Icon submenu, handed straight
+                                // back to the row menu's own arms.** Not
+                                // acted on here, and the three are listed
+                                // together because the reason is one: what
+                                // each of them does is delicate in a way this
+                                // arm cannot restate safely. Refresh deletes
+                                // three caches in an order that matters and
+                                // deliberately starts no fetch of its own;
+                                // Select must not open `IFileOpenDialog` from
+                                // inside a draw closure, so it only seeds a
+                                // modal; and "use the automatic icon" writes
+                                // an empty string through
+                                // `with_custom_field`, which REMOVES the
+                                // field rather than blanking it. Each of
+                                // those is written once, a few hundred lines
+                                // up, and this pane reaches it by the slot the
+                                // out-of-vault pane's Restore already uses.
+                                //
+                                // WHICH of the three the kebab offered is
+                                // `item_list::icon_menu`'s decision -- the
+                                // same function the row menu asks -- so there
+                                // is no per-item test to repeat here.
+                                ref action @ (DetailAction::RefreshIcon
+                                | DetailAction::SelectIcon
+                                | DetailAction::ClearIcon) => {
+                                    let command = match action {
+                                        DetailAction::RefreshIcon => {
+                                            item_list::RowCommand::RefreshIcon
+                                        }
+                                        DetailAction::SelectIcon => {
+                                            item_list::RowCommand::SelectIcon
+                                        }
+                                        _ => item_list::RowCommand::ClearIcon,
+                                    };
+                                    pane_row_command = Some((item.id.clone(), command));
                                 }
                                 // **The SECOND door onto the soft delete, and
                                 // it asks the same question the first one
@@ -6645,6 +6695,25 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         // button to it changes nothing about what it shows, so it does not
         // reopen that decision.
         | DetailAction::AddTotp
+        // **The kebab's three icon actions, and the answer is not merely
+        // inherited from the arms above it.** They are argued at
+        // `row_command_exposes_secrets`, which gives their `RowCommand`
+        // counterparts `false` for the same three reasons: a refresh forgets
+        // a cached picture of a public favicon and asks for it again;
+        // choosing one opens a modal showing the item's NAME, which is
+        // already on screen, plus an address the user types themselves; and
+        // clearing one removes a custom field holding a picture. None reads a
+        // field of the item, paints one, or copies one, which is the whole of
+        // what this gate asks.
+        //
+        // Answering differently HERE than there is the specific failure worth
+        // naming: the two menus offer the identical three acts on the
+        // identical item, so a `true` on this side would cost a master
+        // password from the kebab and nothing from the right-click menu --
+        // an arbitrary-looking gate, and a lesson in which door is cheaper.
+        | DetailAction::RefreshIcon
+        | DetailAction::SelectIcon
+        | DetailAction::ClearIcon
         | DetailAction::OpenApp(_) => false,
     }
 }
@@ -12393,7 +12462,7 @@ fn ensure_icon_loaded(
 /// construction.
 ///
 /// **A chosen PICTURE: nothing at all, and `None`.** The entry is absent from
-/// the menu for such an item -- `item_list::icon_entries` decides that, and
+/// the menu for such an item -- `item_list::icon_menu` decides that, and
 /// records why -- so this is unreachable from the UI. It is handled rather
 /// than asserted for the reason the no-domain arm is: this function sits one
 /// `match` arm away from every item in the vault, and a panic here would be a
@@ -23962,7 +24031,7 @@ mod account_details_tests {
     /// **Refresh does nothing for a stored picture, and says so.**
     ///
     /// The menu does not offer the entry for such an item -- that is
-    /// `item_list::icon_entries`' decision -- so this arm is unreachable from
+    /// `item_list::icon_menu`' decision -- so this arm is unreachable from
     /// the UI and is handled rather than asserted, for the reason the
     /// no-domain arm is. What it must not do is drop the texture: it would be
     /// rebuilt from the very same field bytes one frame later, to no visible

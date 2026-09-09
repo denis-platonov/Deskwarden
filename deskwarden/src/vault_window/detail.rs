@@ -686,6 +686,43 @@ pub enum DetailAction {
     /// the draft it opens is destined for a NEW item that the `reprompt` flag
     /// will not follow.
     Clone,
+    /// **The kebab's Icon submenu, one variant per row of it** -- the same
+    /// three acts the item row's right-click menu offers, reported from this
+    /// pane instead of only from that one.
+    ///
+    /// **Which of the three are drawn is not decided here.** The submenu is
+    /// built by `item_list::icon_menu`, called and not copied, exactly as the
+    /// "Move to folder" submenu beside it is built by `item_list::move_menu`
+    /// -- so an item that is offered no "Refresh icon" on its row is offered
+    /// none here either, by construction rather than by two files agreeing.
+    /// See that function for the rules and for the designs it rejected.
+    ///
+    /// **Their own variants rather than a `DetailAction` carrying a
+    /// `RowCommand`**, which is the arrangement [`Self::Restore`] and its two
+    /// neighbours already settled: the two enums are deliberately separate
+    /// (see `item_list::RowCommand`'s own doc), one of them can name things
+    /// the other cannot, and a variant that smuggled the whole of the other
+    /// enum through would put arms in this pane's exhaustive matches for
+    /// every command it can never report.
+    ///
+    /// **They REPORT and do nothing.** `vault_window::mod` answers all three
+    /// by handing them back to the item row's arms -- the same
+    /// `refresh_item_icon`, the same modal, the same `with_custom_field`
+    /// write -- through the slot the out-of-vault pane's Restore and
+    /// Unarchive already travel on. Every one of those effects is delicate in
+    /// its own way (the deletion order of three caches; a shell dialog that
+    /// must not open inside a draw closure; a write whose empty string
+    /// REMOVES a field), and a second copy of any of them reached from this
+    /// pane is the drift this window keeps paying for.
+    ///
+    /// All three are on the **not-exposing** side of
+    /// `detail_action_exposes_secrets`, which is where
+    /// `row_command_exposes_secrets` already puts their counterparts: an act
+    /// that costs a master password from the kebab and not from the
+    /// right-click menu would teach the user to find the cheaper door.
+    RefreshIcon,
+    SelectIcon,
+    ClearIcon,
     /// The header's ✕ was clicked: the user wants the detail pane GONE and
     /// the item list to take the window.
     ///
@@ -3449,6 +3486,56 @@ pub fn draw_detail_read(
                 let menu = egui::Popup::menu(&kebab)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
                 menu.show(|ui| {
+                    // **The Icon submenu, drawn from the item row's own
+                    // `icon_menu` and `menu_command`** -- called, not
+                    // reimplemented, which is the rule "Move to folder"
+                    // below already follows and is here for its reason.
+                    // Which of the three rows appear on a given item, that
+                    // none of them is ever greyed, and that an item with no
+                    // icon action at all is offered no submenu rather than an
+                    // empty one, are decisions that function already made and
+                    // already has tests for. See `DetailAction::RefreshIcon`
+                    // for why each row reports rather than acts.
+                    //
+                    // **First, above Edit**, which is the item row's own
+                    // order: there the icon group sits between "Open website"
+                    // and Edit, and a user who learned one menu should not
+                    // have to relearn the other. It leaves Edit and Clone
+                    // adjacent, which is the one adjacency this menu has ever
+                    // argued for.
+                    if let Some(actions) = super::item_list::icon_menu(item) {
+                        ui.menu_button(super::item_list::ICON_LABEL, |ui| {
+                            // `row`, not `action`: the name this closure
+                            // writes its answer into is `action`, and a loop
+                            // binding spelled the same way shadows it -- the
+                            // assignments below then land on the row being
+                            // read instead of on the pane's return value.
+                            for row in &actions {
+                                if super::item_list::menu_command(ui, row) {
+                                    // `icon_menu` promises these three and
+                                    // nothing else; the catch-all keeps that
+                                    // a promise this file does not have to
+                                    // enforce with a panic, exactly as the
+                                    // move submenu's does one screen down.
+                                    match &row.command {
+                                        super::item_list::RowCommand::RefreshIcon => {
+                                            action = DetailAction::RefreshIcon;
+                                        }
+                                        super::item_list::RowCommand::SelectIcon => {
+                                            action = DetailAction::SelectIcon;
+                                        }
+                                        super::item_list::RowCommand::ClearIcon => {
+                                            action = DetailAction::ClearIcon;
+                                        }
+                                        other => log::warn!(
+                                            "the icon submenu offered {other:?}, which is not an \
+                                             icon action; the click was dropped"
+                                        ),
+                                    }
+                                }
+                            }
+                        });
+                    }
                     if kind_offers_edit(kind) && ui.button("Edit").clicked() {
                         action = DetailAction::Edit;
                         ui.close();
@@ -9971,6 +10058,22 @@ mod tests {
             let _ = self.click(item, totp, entry.center());
             self.idle(item, totp)
         }
+
+        /// The same, for the kebab's **Icon** submenu -- two real clicks on
+        /// two real controls, at the positions the pane actually painted
+        /// them, for `open_move_submenu`'s reasons exactly.
+        ///
+        /// The three icon rows are painted only while this is open, so every
+        /// assertion about which of them an item is offered has to come
+        /// through here. A test that asked `item_list::icon_menu` for the
+        /// list and stopped there would pass just as happily against a kebab
+        /// that drew no submenu at all.
+        fn open_icon_submenu(&mut self, item: &VaultItem, totp: &TotpState) -> Frame {
+            let open = self.open_kebab(item, totp);
+            let entry = open.rect_of(crate::vault_window::item_list::ICON_LABEL);
+            let _ = self.click(item, totp, entry.center());
+            self.idle(item, totp)
+        }
     }
 
     /// A folder as the window holds one.
@@ -10906,6 +11009,261 @@ mod tests {
                  item -- the write succeeds and does nothing: {:?}",
                 submenu.strings()
             );
+        }
+    }
+
+    // ---- the kebab's Icon submenu ---------------------------------------
+    //
+    // Three entries that used to be reachable only from an item row's
+    // right-click menu, offered here through `item_list::icon_menu` -- the
+    // same function that menu asks. These tests are about this pane's half:
+    // that the submenu is drawn, that its rows answer clicks, and -- the one
+    // that the shared function exists to make possible -- that the two
+    // surfaces offer the same rows for the same item.
+
+    /// The rows the ITEM LIST's menu decided for `item`, in order.
+    ///
+    /// Read out of `item_list::menu_entries` -- the item row's single source
+    /// of what its menu contains, not `icon_menu` directly. That distinction
+    /// is the whole value of the assertion it feeds: asking `icon_menu` from
+    /// both sides would compare a function with itself, whereas this compares
+    /// what the ITEM LIST will offer with what THIS PANE painted, and fails
+    /// if either surface stops going through the shared decision.
+    fn icon_rows_the_item_list_offers(item: &VaultItem) -> Vec<String> {
+        crate::vault_window::item_list::menu_entries(
+            item,
+            &[],
+            crate::vault_window::sidebar::FilterSource::LiveVault,
+            false,
+        )
+        .iter()
+        .find_map(|entry| match entry {
+            crate::vault_window::item_list::MenuEntry::Icon(rows) => {
+                Some(rows.iter().map(|row| row.label.clone()).collect())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+    }
+
+    /// Every icon wording, so the painted assertions below are absolute
+    /// ("exactly these rows") rather than "the ones I looked for" -- the rule
+    /// `item_list`'s own `MENU_VOCABULARY` states for the other surface.
+    const ICON_ROWS: [&str; 3] = [
+        crate::vault_window::item_list::REFRESH_ICON_LABEL,
+        crate::vault_window::item_list::SELECT_ICON_LABEL,
+        crate::vault_window::item_list::CLEAR_ICON_LABEL,
+    ];
+
+    /// What this pane's Icon submenu really painted, in order.
+    fn icon_rows_painted(frame: &Frame) -> Vec<String> {
+        frame
+            .texts
+            .iter()
+            .map(|(text, _)| text.clone())
+            .filter(|text| ICON_ROWS.contains(&text.as_str()))
+            .collect()
+    }
+
+    /// An item wearing a chosen icon read off `url`.
+    fn with_a_chosen_url(item: &VaultItem, url: &str) -> VaultItem {
+        crate::vault_bridge::with_custom_field(
+            item,
+            crate::item_icon::ICON_FIELD_NAME,
+            &crate::item_icon::choice_from_url(url).expect("a good URL").to_field_value(),
+        )
+    }
+
+    /// An item wearing a chosen picture, which is the one state that is
+    /// offered no "Refresh icon": the bytes are ON the item, so there is no
+    /// copy to forget and no host to ask.
+    fn with_a_chosen_picture(item: &VaultItem) -> VaultItem {
+        crate::vault_bridge::with_custom_field(
+            item,
+            crate::item_icon::ICON_FIELD_NAME,
+            &crate::item_icon::IconChoice::Png { png: "AAAA".into() }.to_field_value(),
+        )
+    }
+
+    /// **THE property the shared function exists to protect**: the kebab and
+    /// the item row offer the same icon rows for the same item.
+    ///
+    /// One side is what this pane really PAINTED, at coordinates it really
+    /// laid out, after two real clicks; the other is what
+    /// `item_list::menu_entries` decides the row menu will contain. Neither
+    /// side is a restatement of the other, and neither is a call into
+    /// `icon_menu` compared with itself -- so a `detail.rs` that grew its own
+    /// hand-written list fails here on the first item whose state the two
+    /// lists disagree about, which is exactly the drift a second list starts
+    /// out too correct to reveal.
+    ///
+    /// Four items, chosen so that the answer differs between them: a login
+    /// with a site gets Refresh, a note without one does not, a chosen URL
+    /// adds the way back while keeping Refresh, and a chosen picture keeps
+    /// the way back and drops Refresh. A pair of surfaces that both returned
+    /// a constant would agree on any one of these and fail across the set.
+    #[test]
+    fn the_kebabs_icon_submenu_offers_exactly_what_the_item_rows_menu_does() {
+        let cases = [
+            ("a login with a site", a_login()),
+            ("a secure note", an_item(Some(2))),
+            ("a chosen URL", with_a_chosen_url(&a_login(), "https://cdn.example.com/logo.png")),
+            ("a chosen picture", with_a_chosen_picture(&a_login())),
+        ];
+        // The premise, checked before anything is compared: the four items
+        // really do disagree with each other. Without this, a build in which
+        // every item got the identical submenu would satisfy every equality
+        // below and prove nothing about either surface.
+        let decided: Vec<Vec<String>> =
+            cases.iter().map(|(_, item)| icon_rows_the_item_list_offers(item)).collect();
+        assert!(
+            decided.iter().any(|rows| rows != &decided[0]),
+            "every fixture was offered the same icon rows ({decided:?}), so the comparisons \
+             below would pass against two surfaces that each returned a constant"
+        );
+
+        for ((what, item), expected) in cases.iter().zip(&decided) {
+            let mut pane = Pane::new();
+            let submenu = pane.open_icon_submenu(item, &TotpState::NoSecret);
+            assert_eq!(
+                &icon_rows_painted(&submenu),
+                expected,
+                "{what}: the kebab's Icon submenu and the item row's disagree. The pane \
+                 painted: {:?}",
+                submenu.strings()
+            );
+            // And the submenu really opened rather than the two lists
+            // agreeing on nothing: `icon_menu` never answers with an empty
+            // list, so an empty painted list here is a submenu that failed.
+            assert!(
+                !expected.is_empty(),
+                "{what}: the item row's menu offers no icon rows at all, which `icon_menu` \
+                 does not do -- so the equality above compared two empty lists"
+            );
+        }
+    }
+
+    /// The submenu's rows are not decoration: each one reports its own
+    /// action, on the menu the pane really opened, at the coordinates it
+    /// really painted.
+    ///
+    /// The item is one wearing a chosen URL, because that is the single
+    /// state offered all three rows -- so this drives every arm of the match
+    /// behind them in one pass, and a wiring that reported the same action
+    /// for all three fails on two of the three.
+    #[test]
+    fn every_row_of_the_kebabs_icon_submenu_reports_its_own_action() {
+        let item = with_a_chosen_url(&a_login(), "https://cdn.example.com/logo.png");
+        let expected = [
+            (crate::vault_window::item_list::REFRESH_ICON_LABEL, DetailAction::RefreshIcon),
+            (crate::vault_window::item_list::SELECT_ICON_LABEL, DetailAction::SelectIcon),
+            (crate::vault_window::item_list::CLEAR_ICON_LABEL, DetailAction::ClearIcon),
+        ];
+        {
+            let mut pane = Pane::new();
+            let submenu = pane.open_icon_submenu(&item, &TotpState::NoSecret);
+            assert_eq!(
+                icon_rows_painted(&submenu),
+                expected.iter().map(|(label, _)| label.to_string()).collect::<Vec<_>>(),
+                "the fixture is no longer the item that gets all three rows, so the clicks \
+                 below would be aimed at entries that are not there"
+            );
+        }
+        for (label, action) in expected {
+            let mut pane = Pane::new();
+            let submenu = pane.open_icon_submenu(&item, &TotpState::NoSecret);
+            let row = submenu.rect_of(label);
+            let clicked = pane.click(&item, &TotpState::NoSecret, row.center());
+            assert_eq!(
+                clicked.action, action,
+                "clicking {label:?} in the kebab's Icon submenu reported {:?}",
+                clicked.action
+            );
+        }
+    }
+
+    /// **The Icon entry sits above Edit**, which is the item row's own order:
+    /// there the icon group is drawn between "Open website" and Edit, and a
+    /// user who learned one menu should not have to relearn the other.
+    ///
+    /// Read off the painted rects rather than from the source, because the
+    /// claim is about what the user sees. Clone is checked too: the entry
+    /// went in ABOVE Edit precisely so that Edit and Clone stay adjacent,
+    /// which is the one adjacency this menu has ever argued for.
+    #[test]
+    fn the_kebab_draws_icon_above_edit_and_leaves_edit_beside_clone() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        let icon = open.rect_of(crate::vault_window::item_list::ICON_LABEL);
+        let edit = open.rect_of("Edit");
+        let clone = open.rect_of("Clone");
+        let move_to = open.rect_of(crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL);
+        assert!(
+            icon.top() < edit.top(),
+            "Icon is drawn at {icon:?} and Edit at {edit:?} -- the kebab no longer matches \
+             the item row's order"
+        );
+        assert!(
+            edit.top() < clone.top() && clone.top() < move_to.top(),
+            "Edit ({edit:?}), Clone ({clone:?}) and Move to folder ({move_to:?}) are no longer \
+             in that order, so inserting Icon moved something it should not have"
+        );
+    }
+
+    /// **The conditions are the item row's, unchanged.** An item with no
+    /// automatic icon and no chosen one is offered no "Refresh icon" HERE
+    /// either -- absent, not greyed, which is `icon_menu`'s stated rule.
+    ///
+    /// Both halves in one test, because the negative alone passes against a
+    /// kebab whose submenu never opened: a secure note's submenu is asserted
+    /// whole (it holds exactly the one row), and a login's is asserted to
+    /// hold the row the note is missing.
+    #[test]
+    fn the_kebabs_icon_submenu_withholds_refresh_from_an_item_with_no_icon_to_refresh() {
+        let mut pane = Pane::new();
+        let note = pane.open_icon_submenu(&an_item(Some(2)), &TotpState::NoSecret);
+        assert_eq!(
+            icon_rows_painted(&note),
+            vec![crate::vault_window::item_list::SELECT_ICON_LABEL.to_string()],
+            "a secure note's Icon submenu painted more than the one row it is owed: {:?}",
+            note.strings()
+        );
+        let mut pane = Pane::new();
+        let login = pane.open_icon_submenu(&a_login(), &TotpState::NoSecret);
+        assert!(
+            icon_rows_painted(&login)
+                .contains(&crate::vault_window::item_list::REFRESH_ICON_LABEL.to_string()),
+            "the live control failed: no item paints a refresh row at all, so the absence \
+             above is not about the note: {:?}",
+            login.strings()
+        );
+    }
+
+    /// A trashed or archived item's kebab offers no Icon entry at all.
+    ///
+    /// That pane is built from `item_list::out_of_vault_entries`, which
+    /// shares nothing with the live menu, so this is a property that already
+    /// holds by construction -- pinned anyway, because "Icon" is exactly the
+    /// kind of entry someone adds to the header's one kebab-drawing block
+    /// without noticing there are two panes behind it.
+    #[test]
+    fn an_out_of_vault_items_kebab_offers_no_icon_entry() {
+        for out in [OutOfVault::Trash, OutOfVault::Archive] {
+            let painted = open_out_of_vault_kebab(&an_item(Some(1)), out);
+            assert!(
+                !painted.is_empty(),
+                "{out:?}: the kebab painted nothing, so the absence below proves nothing"
+            );
+            for label in
+                std::iter::once(crate::vault_window::item_list::ICON_LABEL).chain(ICON_ROWS)
+            {
+                assert!(
+                    !painted.contains(&label.to_string()),
+                    "{out:?}: an out-of-vault kebab offered {label:?}, which acts on an item \
+                     the live list does not hold: {painted:?}"
+                );
+            }
         }
     }
 
