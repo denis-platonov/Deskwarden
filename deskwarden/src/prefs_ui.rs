@@ -593,13 +593,30 @@ const DIRECT_ICONS_LABEL: &str = "Fetch site icons from the sites themselves";
 /// Off by default, and stated in the copy rather than left to
 /// `Settings::default`, the same way `BREACH_DESCRIPTION` and
 /// `FETCH_ICONS_DESCRIPTION` state theirs.
+///
+/// **It no longer says the icon service goes unasked, because that stopped
+/// being true and a switch whose label overstates its reach is worse than no
+/// switch.** This row used to promise "Deskwarden fetches every icon that way
+/// and the icon service is not asked for any of them", which was an accurate
+/// description of a behaviour that also meant a site serving no favicon at a
+/// fixed path got no icon at all, permanently. `favicon::icon_source_for` now
+/// asks the site first and the icon service only about the ones the site did
+/// not answer, and the sentence here says exactly that: **first**, and **only
+/// for the ones**. A reader who leaves this off must be able to tell from
+/// these words which requests the on state makes, and a reader who turns it on
+/// must not be surprised later to find the icon service in their logs.
+///
+/// The cost sentence is unchanged and is still the point of the row: the
+/// fallback adds no disclosure to any site -- the requests it receives are the
+/// same requests -- so what a site learns is what it always learned, and that
+/// is what is stated.
 const DIRECT_ICONS_DESCRIPTION: &str = "Off by default, and it decides where PUBLIC sites' icons \
      come from. An address on your own network — 192.168.x.x, 10.x.x.x, localhost — is always \
      fetched from that address itself, because an icon service out on the internet has no route \
-     to your network and never will. On, Deskwarden fetches every icon that way and the icon \
-     service is not asked for any of them. What that costs: each of those sites receives a \
-     request from your PC, so it learns that an entry for it exists in your vault and roughly \
-     when you looked at it.";
+     to your network and never will. On, your PC asks each site for its own icon first, and the \
+     icon service is asked only about the ones the site itself did not answer. What that costs: \
+     every site you hold an entry for receives a request from your PC, so it learns that an \
+     entry for it exists in your vault and roughly when you looked at it.";
 
 const BRAND_LOGOS_LABEL: &str = "Show card network logos";
 /// **Says where the images come from, because that is the part a user cannot
@@ -8605,6 +8622,33 @@ mod tests {
             DIRECT_ICONS_DESCRIPTION.contains("192.168"),
             "the copy does not name the addresses this pill does NOT govern, so a user reading \
              the label would think it did: {DIRECT_ICONS_DESCRIPTION:?}"
+        );
+        // **The promise matches `favicon::icon_source_for`, in both
+        // directions.** ON is the site FIRST and the icon service for the
+        // rest, and the copy has to say both halves: a reader who is told only
+        // "your PC asks the site" will not expect the icon service in their
+        // logs, and one who is told only "the icon service is asked" has no
+        // idea what the switch is for.
+        assert!(
+            DIRECT_ICONS_DESCRIPTION.contains("asks each site for its own icon first"),
+            "the copy does not say that ON asks the site FIRST: {DIRECT_ICONS_DESCRIPTION:?}"
+        );
+        assert!(
+            DIRECT_ICONS_DESCRIPTION
+                .contains("the icon service is asked only about the ones the site itself did not \
+                           answer"),
+            "the copy does not say the icon service still answers for the sites that did not: \
+             {DIRECT_ICONS_DESCRIPTION:?}"
+        );
+        // **The sentence this row used to carry, forbidden by name.** "the
+        // icon service is not asked for any of them" described a direct-ONLY
+        // behaviour that silently cost users the icons of every site serving
+        // no favicon at a fixed path. A switch whose label overstates its
+        // reach is worse than no switch, and this is the exact overstatement.
+        assert!(
+            !DIRECT_ICONS_DESCRIPTION.contains("not asked for any of them"),
+            "the copy still promises the icon service goes unasked, which \
+             `favicon::IconSource::DirectThenProxy` makes false: {DIRECT_ICONS_DESCRIPTION:?}"
         );
         // **No stray carriage return, and this is not paranoia.** These
         // sources are CRLF and Rust's string line-continuation is a

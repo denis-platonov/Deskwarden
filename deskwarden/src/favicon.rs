@@ -217,6 +217,38 @@ pub fn is_private_host(host: &str) -> bool {
 }
 
 /// Where one item's icon is fetched from, and by whom.
+///
+/// **Three outcomes, not two, and the third is a CHAIN.** "Fetch it from the
+/// site" and "fetch it from the site, and ask the icon service about the ones
+/// the site did not answer" are different promises to the user, and the whole
+/// point of keeping them apart in the type is that exactly one of them is
+/// available to a private address. A `192.168.x.x` host has nothing to fall
+/// back TO -- see [`is_private_host`] -- so the variant it is answered with,
+/// [`IconSource::Direct`], **has no field a proxy URL could be put in**. That
+/// is the invariant, held by the shape rather than by a rule somebody has to
+/// remember.
+///
+/// **Three shapes were tried for the chain before this one:**
+///
+/// * `Direct { urls: Vec<String>, fallback: Option<String> }`, one variant for
+///   both direct cases. Rejected: the private case then differs from the
+///   public one only by a `None` that the author of `icon_source_for` has to
+///   remember to write, and an `Option` field sitting next to a populated one
+///   is precisely the shape a later "make these symmetric" pass fills in. The
+///   thing that must never happen would be one line of a diff away, forever.
+/// * A flat `Vec<IconStep>` chain, with `IconStep::{Direct, Proxy}`. Rejected
+///   for the same reason and a second one: it makes "a private host's chain
+///   ends in a proxy step" a *representable* state that only a test forbids,
+///   and every consumer has to re-derive which step is which in order to log
+///   about it or to bound it.
+/// * Leaving the enum at two variants and having the caller ask
+///   [`icon_source_for`] a second time with `direct_for_all_hosts` off after a
+///   direct miss. Rejected outright: the loader would then have to know that a
+///   second ask is legal for a public host and forbidden for a private one,
+///   which is the routing rule living in two places -- exactly what
+///   `vault_window::ensure_icon_loaded`'s own comment says must not happen,
+///   since the settings doc and the preferences copy both describe that rule
+///   and a second copy is how the three come to disagree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IconSource {
     /// Ask the icon service -- Bitwarden's, or the self-hosted server's own
@@ -226,7 +258,31 @@ pub enum IconSource {
     /// Fetch it from the site itself, trying these URLs in order and keeping
     /// the first that decodes. Nothing is proxied and the icon service is not
     /// contacted at all.
+    ///
+    /// **This is the private-address answer and there is no step after it.**
+    /// Not "the proxy is skipped as a policy": there is no proxy in existence
+    /// that can open a connection to an address on the user's own LAN, so a
+    /// second step would be a request that cannot succeed, aimed at a third
+    /// party, naming a host the user runs at home. The variant carries no
+    /// field for one.
     Direct(Vec<String>),
+    /// Ask the site itself first, and fall back to the icon service for the
+    /// ones the site did not answer with something that decodes.
+    ///
+    /// **The public-host answer when the direct-fetch setting is on**, and the
+    /// order is the whole content: `direct` is walked exactly as
+    /// [`IconSource::Direct`] is walked, and `proxy` is asked only after every
+    /// candidate in it has failed. A site that serves `/favicon.ico` is never
+    /// mentioned to the icon service at all; a site that 404s all three fixed
+    /// paths (`login.microsoftonline.com`) or answers them with its SPA's
+    /// `index.html` (`www.volaris.com`) still gets an icon, which under the
+    /// old direct-only reading it never could.
+    DirectThenProxy {
+        /// The site's own candidate URLs, in the order they are tried.
+        direct: Vec<String>,
+        /// The icon service URL asked only if every one of `direct` failed.
+        proxy: String,
+    },
 }
 
 /// The query string that tells the icon proxy not to answer from its own
@@ -281,20 +337,49 @@ pub enum IconFreshness {
 /// machine, and the honest way to find a site's declared icon -- fetch the
 /// page, parse its `<link rel="icon">` -- means fetching the page, which
 /// discloses considerably more than asking for a fixed path and is a fetch of
-/// somebody's HTML by a password manager. Three fixed paths, or nothing.
+/// somebody's HTML by a password manager. Three fixed paths, and then either
+/// nothing (a private address, which has no other source) or the icon service
+/// (a public host, via [`IconSource::DirectThenProxy`]) -- but never a fourth
+/// guess and never that host's HTML.
 const DIRECT_ICON_PATHS: [&str; 3] = ["favicon.ico", "favicon.png", "apple-touch-icon.png"];
 
 /// Decides where `authority`'s icon comes from.
 ///
-/// **The two rules, and they are deliberately not the same rule:**
+/// **The three rules, and they are deliberately not the same rule:**
 ///
-/// * A **private** address ([`is_private_host`]) is always fetched directly,
-///   with `direct_for_all_hosts` never consulted. The proxy cannot reach it,
-///   so there is no second option for a setting to choose between, and the
-///   request does not leave the network the user is already on.
-/// * Every **other** host is proxied, unless `direct_for_all_hosts`
-///   ([`crate::settings::Settings::fetch_icons_direct`]) is on, in which case
-///   it too is fetched directly and the proxy is not used at all.
+/// * A **private** address ([`is_private_host`]) is always fetched directly
+///   and *only* directly, with `direct_for_all_hosts` never consulted. The
+///   proxy cannot reach it, so there is no second option for a setting to
+///   choose between and no second step to fall back to, and the request does
+///   not leave the network the user is already on. Answered with
+///   [`IconSource::Direct`], which has no field a proxy could be named in.
+/// * Every **other** host is proxied when `direct_for_all_hosts`
+///   ([`crate::settings::Settings::fetch_icons_direct`]) is off -- the
+///   default, and unchanged for every user who has never touched the switch.
+/// * A public host with `direct_for_all_hosts` **on** is asked *first* and the
+///   icon service is asked only about the ones it did not answer:
+///   [`IconSource::DirectThenProxy`].
+///
+/// **The setting used to mean direct-ONLY, and that was wrong in the way that
+/// leaves no evidence on screen.** A site that does not serve a favicon at one
+/// of [`DIRECT_ICON_PATHS`] -- `login.microsoftonline.com` 404s all three;
+/// `www.volaris.com` answers all three with its single-page app's
+/// `index.html` under a `200` -- got no icon at all, permanently, with nothing
+/// but a monogram to say why, even though the icon service resolves every one
+/// of them. Off-means-service, on-means-service-only-as-a-fallback is also
+/// what the switch's own label already implies ("fetch icons **from the sites
+/// themselves**" is a statement about where this app *asks*, not a promise
+/// that a site which refuses gets no second chance), and it is what the owner
+/// read it as.
+///
+/// **What it does NOT do is widen what any site learns.** The direct
+/// candidates are byte-identical to the ones the old direct-only path built,
+/// so a site sees exactly the requests it saw before; the change is only what
+/// happens after they all fail, and the only new party in that case is the
+/// icon service, which is where the icon would have come from with the switch
+/// off. The switch's cost -- each site learns an entry for it exists -- is
+/// unchanged, and its benefit is that the switch stops silently costing
+/// icons.
 ///
 /// **Scheme is chosen here rather than taken from the item's URI, and only
 /// ever `http` or `https`.** A public host is asked over `https` and is never
@@ -306,16 +391,19 @@ const DIRECT_ICON_PATHS: [&str; 3] = ["favicon.ico", "favicon.png", "apple-touch
 /// segment -- and then over `https`, so a NAS or a router that only speaks
 /// TLS still gets an icon.
 ///
-/// **`freshness` reaches exactly one of the three arms, and that is not an
-/// oversight.** [`IconFreshness::Refresh`] appends [`REFRESH_QUERY`] to the
-/// proxied URL, because the thing being bypassed is the *proxy's* cache. The
-/// two direct arms -- a private address, and a public host with the
-/// direct-fetch setting on -- are handed back unchanged: nothing stands
-/// between this app and the site on those paths, so there is no cache a query
-/// parameter could ask to be skipped, and adding one would put a string this
-/// app invented into a request to a stranger's web server for no effect. What
-/// a refresh does for those two is done entirely by the caller, which drops
-/// the on-disk copy and the loaded texture before asking again.
+/// **`freshness` reaches every URL aimed at the PROXY and no URL aimed at a
+/// site, and that is not an oversight.** [`IconFreshness::Refresh`] appends
+/// [`REFRESH_QUERY`] to a proxied URL, because the thing being bypassed is the
+/// *proxy's* cache -- and that is as true of the fallback URL inside
+/// [`IconSource::DirectThenProxy`] as of a bare [`IconSource::Proxy`]: it is
+/// the same server holding the same seven-day answer, reached down a different
+/// path. Direct candidates are handed back unchanged on both arms that have
+/// them: nothing stands between this app and the site there, so there is no
+/// cache a query parameter could ask to be skipped, and adding one would put a
+/// string this app invented into a request to a stranger's web server for no
+/// effect. What a refresh does for the direct half is done entirely by the
+/// caller, which drops the on-disk copy and the loaded texture before asking
+/// again.
 pub fn icon_source_for(
     authority: &str,
     server_url: Option<&str>,
@@ -323,14 +411,26 @@ pub fn icon_source_for(
     freshness: IconFreshness,
 ) -> IconSource {
     let host = host_of_authority(authority);
-    let private = is_private_host(host);
-    if !private && !direct_for_all_hosts {
-        let base = icon_base_url(server_url);
-        let refresh = match freshness {
-            IconFreshness::Cached => "",
-            IconFreshness::Refresh => REFRESH_QUERY,
-        };
-        let url = format!("{base}/{host}/icon.png{refresh}");
+    // **The private test comes FIRST and returns**, rather than being one
+    // clause of a combined condition as it was when there were two outcomes.
+    // With a third outcome that carries a proxy URL, an `if !private && ..`
+    // chain would leave the private case falling through to code that has a
+    // proxy URL in scope, and "it happens not to be used down there" is the
+    // kind of true-for-now that this function must not rely on. Here the proxy
+    // URL is not built until after every private host has already left.
+    if is_private_host(host) {
+        log::debug!(
+            "icon: {authority} is fetched directly and only directly (a private address, so the \
+             icon service could not reach it either way)"
+        );
+        return IconSource::Direct(direct_candidates(authority, &["http", "https"]));
+    }
+    let refresh = match freshness {
+        IconFreshness::Cached => "",
+        IconFreshness::Refresh => REFRESH_QUERY,
+    };
+    let proxy = format!("{}/{host}/icon.png{refresh}", icon_base_url(server_url));
+    if !direct_for_all_hosts {
         log::debug!(
             "icon: {authority} goes to the icon service{}",
             match freshness {
@@ -338,21 +438,29 @@ pub fn icon_source_for(
                 IconFreshness::Refresh => ", asking it to re-fetch rather than answer from cache",
             }
         );
-        return IconSource::Proxy(url);
+        return IconSource::Proxy(proxy);
     }
-    let schemes: &[&str] = if private { &["http", "https"] } else { &["https"] };
     log::debug!(
-        "icon: {authority} is fetched directly ({})",
-        if private { "a private address, so the proxy could not reach it either way" } else { "the direct-fetch setting is on" }
+        "icon: {authority} is asked directly first and falls back to the icon service (the \
+         direct-fetch setting is on)"
     );
-    IconSource::Direct(
-        schemes
-            .iter()
-            .flat_map(|scheme| {
-                DIRECT_ICON_PATHS.iter().map(move |path| format!("{scheme}://{authority}/{path}"))
-            })
-            .collect(),
-    )
+    IconSource::DirectThenProxy { direct: direct_candidates(authority, &["https"]), proxy }
+}
+
+/// `authority`'s [`DIRECT_ICON_PATHS`] under each of `schemes`, in order.
+///
+/// Split out so the two arms that fetch directly build their candidate list
+/// from one place. They differ **only** in the schemes they pass -- see
+/// `icon_source_for`'s scheme paragraph for why a public host gets `https`
+/// alone -- and a second copy of this loop is how a later change to the path
+/// list reaches one arm and not the other.
+fn direct_candidates(authority: &str, schemes: &[&str]) -> Vec<String> {
+    schemes
+        .iter()
+        .flat_map(|scheme| {
+            DIRECT_ICON_PATHS.iter().map(move |path| format!("{scheme}://{authority}/{path}"))
+        })
+        .collect()
 }
 
 /// The custom field a card's bank domain is stored on.
@@ -528,9 +636,10 @@ const DIRECT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// icon.
 const DIRECT_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 
-/// Fetches `source`'s icon bytes -- from the proxy, or from the site itself.
+/// Fetches `source`'s icon bytes -- from the proxy, or from the site itself,
+/// or from the site with the proxy behind it.
 ///
-/// The two arms are not symmetric, and the asymmetry is the point:
+/// The arms are not symmetric, and the asymmetry is the point:
 ///
 /// * [`IconSource::Proxy`] is one URL and the bytes are returned as they
 ///   arrive, exactly as [`fetch_icon_bytes`] has always returned them. The
@@ -541,28 +650,56 @@ const DIRECT_REQUEST_DEADLINE: Duration = Duration::from_secs(5);
 ///   exotic one, and taking those bytes would cache a page as an icon and
 ///   stop the walk one candidate short of the real one. So a candidate counts
 ///   only if it decodes, and the first that does wins.
+/// * [`IconSource::DirectThenProxy`] is that same walk with one more step
+///   after it. **"Failed" here means "produced nothing that decodes", not
+///   "returned a network error"**, and that distinction is the owner's
+///   `www.volaris.com`: every fixed path answered `200` with 35 KB of a
+///   single-page app's HTML. A fallback keyed on transport failure would have
+///   sat there believing it had been served an icon. `walk_candidates` already
+///   applies exactly that rule, so the fallback is simply "the walk found
+///   nothing", with no second definition of success to drift from the first.
 pub fn fetch_icon_for(source: &IconSource) -> Option<Vec<u8>> {
     match source {
         IconSource::Proxy(url) => fetch_icon_bytes(url),
-        IconSource::Direct(urls) => {
-            if let Some(bytes) = walk_candidates(urls) {
-                return Some(bytes);
-            }
-            let declared = declared_icon_candidates(urls);
-            if declared.is_empty() {
-                return None;
-            }
-            walk_candidates(&declared)
-        }
+        IconSource::Direct(urls) => walk_direct(urls),
+        IconSource::DirectThenProxy { direct, proxy } => walk_direct(direct).or_else(|| {
+            log::debug!(
+                "icon: no candidate at the site itself answered with an image, so the icon \
+                 service is asked after all"
+            );
+            fetch_icon_bytes(proxy)
+        }),
     }
+}
+
+/// The whole direct half of a fetch: the fixed paths, and -- for a host whose
+/// page this app is allowed to read -- the paths that page declares.
+///
+/// One function for both direct arms rather than the `DirectThenProxy` arm
+/// spelling out its own walk. The declared-icon step is gated **inside**
+/// [`declared_icon_candidates`], on the host being private, and that is where
+/// the argument for the gate is written down; hoisting the gate up here would
+/// put the decision two functions away from its reasoning and let the two
+/// arms come to disagree about it. For a public host the call is a cheap
+/// no-op that makes no request at all -- see that function's own doc.
+fn walk_direct(urls: &[String]) -> Option<Vec<u8>> {
+    if let Some(bytes) = walk_candidates(urls) {
+        return Some(bytes);
+    }
+    let declared = declared_icon_candidates(urls);
+    if declared.is_empty() {
+        return None;
+    }
+    walk_candidates(&declared)
 }
 
 /// Tries each candidate in order and keeps the first whose bytes decode.
 ///
-/// Split out of [`fetch_icon_for`] because the walk is now run twice -- once
-/// over [`DIRECT_ICON_PATHS`] and, for a private host that answered none of
-/// them, once over the paths that host's own page declares. One walk, one
-/// rule about what counts as an answer.
+/// Split out of [`walk_direct`] because the walk is run twice -- once over
+/// [`DIRECT_ICON_PATHS`] and, for a private host that answered none of them,
+/// once over the paths that host's own page declares. One walk, one rule about
+/// what counts as an answer -- and that same rule is what
+/// [`IconSource::DirectThenProxy`]'s fallback triggers on.
 fn walk_candidates(urls: &[String]) -> Option<Vec<u8>> {
     urls.iter().find_map(|url| {
         let bytes = fetch_icon_direct(url)?;
@@ -614,6 +751,47 @@ const MAX_DECLARED_ICONS: usize = 4;
 /// at a host the user never stored -- the disclosure the whole direct path is
 /// careful about, handed away by the one fetch that reads a stranger's
 /// markup.
+///
+/// # Why this still does not run for a public host
+///
+/// **The question was reopened when the direct-fetch setting gained a
+/// fallback, and the answer came back the same. The gate is the
+/// `is_private_host` test below**, on the origins of the candidates that were
+/// already tried; a public host contributes no origin, `origins` is empty, and
+/// this returns before making a single request. That is why it did not fire
+/// for `www.volaris.com` (whose three fixed paths answered `200` with an SPA's
+/// `index.html`) or for `login.microsoftonline.com` (whose three fixed paths
+/// `404`).
+///
+/// Running it on the public direct path was considered and rejected on three
+/// separate grounds, any one of which is sufficient:
+///
+/// 1. **It would not have helped the host that motivated the question.**
+///    `login.microsoftonline.com` declares `<link rel="shortcut icon"
+///    href="https://aadcdn.msauth.net/...">` -- a *different* host. The
+///    same-origin rule above refuses that `href`, so the page fetch would buy
+///    an HTML download and no icon. Following it instead is not a free win: it
+///    is this app dialling a host that is in nobody's vault because a web page
+///    told it to, which is the SSRF shape, and it would let any site the user
+///    holds an entry for name a third party to be contacted on its behalf.
+///    That is a strictly larger disclosure than the switch's own stated cost.
+/// 2. **The fallback already answers the case, from a party that is not new.**
+///    All three hosts in the report resolve through the icon service, which
+///    tries the origin and its own fallbacks server-side. With
+///    [`IconSource::DirectThenProxy`] in place, the outcome for a site that
+///    serves no fixed-path favicon is an icon either way -- and the party that
+///    learns of the lookup is the icon service, which is exactly who would
+///    have learned of it with the switch off. Reading the page buys nothing
+///    that is not already bought, at the cost of a new disclosure.
+/// 3. **The disclosure argument in [`DIRECT_ICON_PATHS`] is undiminished.** A
+///    request for `/favicon.ico` is a fixed, contentless string. A page fetch
+///    hands a public site an arbitrary-length response it controls, aimed at
+///    an app that will then follow URLs out of it; even fenced to one origin,
+///    that lets the site choose the *next* URL this app requests, which is a
+///    per-visitor identifier it did not previously get to mint. On a LAN
+///    segment, against a box the user runs, that trade is defensible and the
+///    alternative is "no icon, ever". Against a host on the internet it is
+///    not, and the alternative is now "the icon service answers".
 fn declared_icon_candidates(tried: &[String]) -> Vec<String> {
     let mut origins: Vec<&str> = Vec::new();
     for url in tried {
@@ -1869,10 +2047,21 @@ mod tests {
             true,
             IconFreshness::Cached,
         );
-        let IconSource::Direct(urls) = &direct else { panic!("expected direct, got {direct:?}") };
+        let IconSource::DirectThenProxy { direct: urls, proxy } = &direct else {
+            panic!("expected direct-then-proxy, got {direct:?}")
+        };
         assert!(
             urls.iter().all(|u| u.contains("vault.example.com:8443")),
             "the direct path dropped the port too, so this test is not about the proxy: {urls:?}"
+        );
+        // And the FALLBACK inside that same answer drops it again, for the
+        // reason the proxy arm does: it is a URL for the icon service, which
+        // has never taken a port. A build that got this right on the `Proxy`
+        // arm and wrong on the fallback would look correct until a site with
+        // a port failed its direct fetch.
+        assert_eq!(
+            proxy, "https://vault.example.eu/icons/vault.example.com/icon.png",
+            "the fallback URL carried a port; the icon service has never taken one"
         );
     }
 
@@ -1931,7 +2120,8 @@ mod tests {
         );
     }
 
-    /// **The two direct arms, which must be byte-identical under a refresh.**
+    /// **No request aimed at a SITE changes under a refresh**, on either arm
+    /// that has such requests.
     ///
     /// A refresh of a direct fetch has nothing to bypass -- there is no proxy
     /// between this app and the site, so no cache a query parameter could ask
@@ -1941,27 +2131,79 @@ mod tests {
     /// allowlist` exists to forbid one line further down the same path.
     ///
     /// Both arms, because they are reached by two different rules: a private
-    /// address is direct with the setting OFF, and a public host is direct
-    /// only with it ON.
+    /// address is direct with the setting OFF, and a public host takes the
+    /// direct-then-proxy chain only with it ON. The private arm is compared
+    /// **whole**, because it has nothing in it that a refresh may touch; the
+    /// public one is compared candidate-list to candidate-list, because its
+    /// fallback URL is a request to the proxy and MUST carry the query -- see
+    /// the test below, which is the other half of this claim.
     #[test]
-    fn a_refresh_of_a_direct_fetch_changes_the_request_not_at_all() {
-        for (authority, direct) in [("192.168.68.95:8080", false), ("github.com", true)] {
-            let ordinary = icon_source_for(authority, None, direct, IconFreshness::Cached);
-            let refreshed = icon_source_for(authority, None, direct, IconFreshness::Refresh);
-            let IconSource::Direct(urls) = &ordinary else {
-                panic!("{authority} was not routed to the direct path at all, got {ordinary:?}");
-            };
-            assert!(!urls.is_empty(), "no candidate URLs for {authority}");
-            assert_eq!(
-                refreshed, ordinary,
-                "a refresh changed the direct request for {authority}; there is no server \
-                 cache in front of it for a query parameter to bypass"
-            );
-            assert!(
-                !urls.iter().any(|u| u.contains('?')),
-                "a direct candidate carries a query string: {urls:?}"
-            );
+    fn a_refresh_changes_no_request_this_app_aims_at_a_site() {
+        let private_ordinary =
+            icon_source_for("192.168.68.95:8080", None, false, IconFreshness::Cached);
+        let private_refreshed =
+            icon_source_for("192.168.68.95:8080", None, false, IconFreshness::Refresh);
+        let IconSource::Direct(private_urls) = &private_ordinary else {
+            panic!("a private address left the direct path, got {private_ordinary:?}");
+        };
+        assert!(!private_urls.is_empty(), "no candidate URLs for the private address");
+        assert_eq!(
+            private_refreshed, private_ordinary,
+            "a refresh changed a private address's fetch entirely; there is no server cache in \
+             front of it for a query parameter to bypass, and no proxy URL in this arm at all"
+        );
+
+        let public_ordinary = icon_source_for("github.com", None, true, IconFreshness::Cached);
+        let public_refreshed = icon_source_for("github.com", None, true, IconFreshness::Refresh);
+        let (
+            IconSource::DirectThenProxy { direct: ordinary_urls, .. },
+            IconSource::DirectThenProxy { direct: refreshed_urls, .. },
+        ) = (&public_ordinary, &public_refreshed)
+        else {
+            panic!("a public host with the switch on left the chain: {public_ordinary:?}");
+        };
+        assert!(!ordinary_urls.is_empty(), "no candidate URLs for the public host");
+        assert_eq!(
+            refreshed_urls, ordinary_urls,
+            "a refresh changed the requests aimed at the site itself"
+        );
+
+        for url in private_urls.iter().chain(ordinary_urls).chain(refreshed_urls) {
+            assert!(!url.contains('?'), "a candidate aimed at a site carries a query: {url:?}");
         }
+    }
+
+    /// **And the fallback URL, which is a request to the PROXY, does carry
+    /// it.**
+    ///
+    /// The other half of the test above, and not a detail: the seven-day
+    /// `immutable` failure the whole `IconFreshness` type exists for is held
+    /// by the same server whether it was reached as `Proxy` or as the second
+    /// step of a chain. A build that appended the query on one and not the
+    /// other would leave "Refresh icon" doing nothing at all for exactly the
+    /// users who turned the direct-fetch switch on -- i.e. the users most
+    /// likely to be looking at a stuck icon.
+    #[test]
+    fn a_refresh_reaches_the_fallback_url_because_that_one_is_the_proxys() {
+        let IconSource::DirectThenProxy { proxy, .. } =
+            icon_source_for("github.com", None, true, IconFreshness::Refresh)
+        else {
+            panic!("a public host with the switch on did not take the chain")
+        };
+        assert_eq!(
+            proxy, "https://icons.bitwarden.net/github.com/icon.png?refresh=1",
+            "\"Refresh icon\" produced a fallback URL the proxy cannot tell from an ordinary \
+             one, so the failure cached at its edge is served straight back"
+        );
+        // The control: without the refresh it is the bare URL, so the
+        // assertion above is about the freshness and not about the fallback
+        // being built with a query in it always.
+        let IconSource::DirectThenProxy { proxy: plain, .. } =
+            icon_source_for("github.com", None, true, IconFreshness::Cached)
+        else {
+            panic!("a public host with the switch on did not take the chain")
+        };
+        assert_eq!(plain, "https://icons.bitwarden.net/github.com/icon.png");
     }
 
     /// The on-disk cache really does forget, and really did have something to
@@ -2142,12 +2384,116 @@ mod tests {
             IconSource::Proxy("https://vault.example.eu/icons/github.com/icon.png".to_string()),
             "a self-hosted account stopped proxying through its own server"
         );
-        // The control: the SAME host with the switch on does leave the proxy,
-        // so the two assertions above are about the switch and not about
-        // `icon_source_for` being unable to answer `Direct` at all.
+        // The control: the SAME host with the switch on does stop being a bare
+        // proxy ask, so the two assertions above are about the switch and not
+        // about `icon_source_for` being unable to answer anything else at all.
         assert!(matches!(
             icon_source_for("github.com", None, true, IconFreshness::Cached),
-            IconSource::Direct(_)
+            IconSource::DirectThenProxy { .. }
+        ));
+    }
+
+    /// **The three arms, named, in one place.** `icon_source_for` has exactly
+    /// three outcomes and this says which input produces which, so that a
+    /// change to any one of them fails a test whose name says what was
+    /// promised rather than only a test about ports or schemes.
+    ///
+    /// The `match` is exhaustive on purpose: a fourth arm added later cannot
+    /// slip past this test, it has to be written into it.
+    #[test]
+    fn each_of_the_three_arms_is_reached_by_its_own_rule() {
+        for (authority, direct, expected) in [
+            // Public, switch off -- the default every existing user has.
+            ("github.com", false, "proxy"),
+            // Public, switch on -- the site first, the service behind it.
+            ("github.com", true, "chain"),
+            // Private, either way -- direct, with nothing behind it.
+            ("192.168.68.95:8080", false, "direct"),
+            ("192.168.68.95:8080", true, "direct"),
+            ("localhost", true, "direct"),
+            ("127.0.0.1:8080", true, "direct"),
+        ] {
+            let got = icon_source_for(authority, None, direct, IconFreshness::Cached);
+            let arm = match &got {
+                IconSource::Proxy(_) => "proxy",
+                IconSource::Direct(_) => "direct",
+                IconSource::DirectThenProxy { .. } => "chain",
+            };
+            assert_eq!(
+                arm, expected,
+                "{authority} with the switch {} took the {arm} arm, not the {expected} one: \
+                 {got:?}",
+                if direct { "ON" } else { "OFF" }
+            );
+        }
+    }
+
+    /// **A private host never yields a proxy step, under any setting, any
+    /// freshness and any server URL.**
+    ///
+    /// The single most important property in this module, and the one the
+    /// three-variant shape exists to make unrepresentable: `IconSource::Direct`
+    /// has no field a proxy URL could be put in, so this test can only fail by
+    /// somebody having routed a private address to a different variant. It is
+    /// written anyway, and written as a sweep over every input that could
+    /// influence the decision, because "the type makes it impossible" is a
+    /// claim about today's type.
+    ///
+    /// The proxy has no route to `192.168.x.x` -- see `is_private_host` -- so
+    /// a proxy step for one of these is not merely useless: it is a request to
+    /// a third party naming a host on the user's home network, made on behalf
+    /// of a fetch that could never have succeeded.
+    #[test]
+    fn a_private_host_never_gets_a_proxy_step() {
+        for authority in [
+            "192.168.68.95:8080",
+            "10.1.2.3",
+            "172.16.0.4",
+            "127.0.0.1:8080",
+            "localhost",
+            "[::1]",
+            "169.254.1.1",
+        ] {
+            for direct in [false, true] {
+                for freshness in [IconFreshness::Cached, IconFreshness::Refresh] {
+                    for server in [None, Some("https://vault.example.eu")] {
+                        let got = icon_source_for(authority, server, direct, freshness);
+                        let IconSource::Direct(urls) = &got else {
+                            panic!(
+                                "{authority} (switch {direct}, {freshness:?}, server {server:?}) \
+                                 was answered with {got:?} -- a private address must be Direct, \
+                                 the one variant that cannot name a proxy"
+                            );
+                        };
+                        // Belt to the type's braces: no candidate is aimed at
+                        // an icon service either, which is what a "helpful"
+                        // future edit that appended the proxy URL to the
+                        // candidate LIST would do while still returning
+                        // `Direct`.
+                        assert!(!urls.is_empty(), "{authority} produced no candidates at all");
+                        for url in urls {
+                            assert!(
+                                url.contains(authority),
+                                "{authority} got a candidate aimed elsewhere: {url:?}"
+                            );
+                            assert!(
+                                !url.contains("icons.bitwarden.net")
+                                    && !url.contains("vault.example.eu")
+                                    && !url.contains("/icons/"),
+                                "{authority} got an icon-service URL among its candidates: \
+                                 {url:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // The instrument: the same sweep's public counterpart really does
+        // produce a proxy step, so the loop above is not passing because
+        // nothing ever gets one.
+        assert!(matches!(
+            icon_source_for("github.com", None, true, IconFreshness::Cached),
+            IconSource::DirectThenProxy { .. }
         ));
     }
 
@@ -2179,8 +2525,8 @@ mod tests {
     #[test]
     fn a_public_direct_fetch_is_https_only_and_a_private_one_tries_http_first() {
         let public = icon_source_for("github.com", None, true, IconFreshness::Cached);
-        let IconSource::Direct(public) = public else {
-            panic!("expected direct")
+        let IconSource::DirectThenProxy { direct: public, .. } = public else {
+            panic!("expected the direct-then-proxy chain")
         };
         assert!(!public.is_empty());
         assert!(
@@ -2983,6 +3329,168 @@ mod tests {
         png.assert();
     }
 
+    // -----------------------------------------------------------------
+    // The fallback: a public host that does not answer for itself
+    // -----------------------------------------------------------------
+
+    /// The three fixed paths on a loopback mock server, plus a proxy URL on
+    /// the same server, as an [`IconSource::DirectThenProxy`].
+    ///
+    /// **Hand-built rather than taken from `icon_source_for`, and there is no
+    /// way around it.** That function answers a public host with `https` URLs
+    /// aimed at that host, and a test must not dial `github.com`; it answers a
+    /// loopback authority with [`IconSource::Direct`], which is the arm with no
+    /// fallback, because that is the invariant this module holds. So the
+    /// routing and the fetching are pinned by two different sets of tests --
+    /// `each_of_the_three_arms_is_reached_by_its_own_rule` and
+    /// `a_private_host_never_gets_a_proxy_step` say which chain is built for
+    /// which host, and these say what `fetch_icon_for` does when handed one.
+    /// `fetch_icon_for` does not know or care where its argument came from,
+    /// which is exactly what makes splitting them honest.
+    fn chain_against(port: u16) -> IconSource {
+        IconSource::DirectThenProxy {
+            direct: DIRECT_ICON_PATHS
+                .iter()
+                .map(|path| format!("http://127.0.0.1:{port}/{path}"))
+                .collect(),
+            proxy: format!("http://127.0.0.1:{port}/icons/volaris.example/icon.png"),
+        }
+    }
+
+    /// **The owner's `www.volaris.com`, as a test.** Every fixed path answers
+    /// `200` with a single-page app's `index.html` -- not a `404`, a *success*
+    /// carrying 35 KB of HTML -- and the old direct-ONLY reading of the switch
+    /// therefore left that entry wearing a monogram forever, with nothing on
+    /// screen to say why. The icon service resolves it.
+    ///
+    /// The `200`s are the point of the fixture: a fallback that triggered on a
+    /// transport error or a non-2xx status would sit here believing it had
+    /// been served three icons. What triggers it is the decode, which is the
+    /// same rule `walk_candidates` already applies to choose between
+    /// candidates -- one definition of "answered", not two.
+    #[test]
+    fn a_public_hosts_failed_direct_fetch_falls_back_to_the_icon_service() {
+        let mut server = crate::test_http::server();
+        let port = server.socket_address().port();
+        let icon = rgba_png(2, 2, &[0x5au8; 16]);
+
+        let sites: Vec<_> = DIRECT_ICON_PATHS
+            .iter()
+            .map(|path| {
+                server
+                    .mock("GET", format!("/{path}").as_str())
+                    .with_status(200)
+                    .with_body("<!doctype html><html><head><title>Volaris</title></head></html>")
+                    .expect(1)
+                    .create()
+            })
+            .collect();
+        // **An artifact of the fixture, mocked so the request set is exact.**
+        // The candidates above are on `127.0.0.1` because a test may not dial
+        // a real public host, and `declared_icon_candidates` gates on the
+        // candidates' own origin being private -- so it fires here where it
+        // never could for the public host this test is *about*. That gate is
+        // pinned by `a_public_hosts_page_is_never_read_to_find_its_icon`; here
+        // it is answered `404` so the walk runs out and the fallback is what
+        // is left.
+        let page = server.mock("GET", "/").with_status(404).expect(1).create();
+        let proxy = server
+            .mock("GET", "/icons/volaris.example/icon.png")
+            .with_status(200)
+            .with_body(icon.clone())
+            .expect(1)
+            .create();
+
+        assert_eq!(
+            fetch_icon_for(&chain_against(port)),
+            Some(icon),
+            "the site answered none of the fixed paths with an image and the icon service was \
+             never asked, so this item keeps a monogram forever -- the reported bug"
+        );
+        for mock in &sites {
+            mock.assert();
+        }
+        page.assert();
+        proxy.assert();
+    }
+
+    /// **And the site that answers for itself is never mentioned to the icon
+    /// service**, which is the entire privacy content of the switch.
+    ///
+    /// The negative half is the load-bearing one. A build that asked the proxy
+    /// unconditionally -- or that asked it "just to warm the cache" -- would
+    /// look identical on screen while making the switch a lie: the user turned
+    /// it on precisely so that the icon service stops seeing their domains.
+    #[test]
+    fn a_site_that_answers_directly_is_never_mentioned_to_the_icon_service() {
+        let mut server = crate::test_http::server();
+        let port = server.socket_address().port();
+        let icon = rgba_png(2, 2, &[0x77u8; 16]);
+
+        let first = server
+            .mock("GET", "/favicon.ico")
+            .with_status(200)
+            .with_body(icon.clone())
+            .expect(1)
+            .create();
+        // Every other route this chain could possibly take, pinned at zero
+        // hits: the later fixed paths, the page probe, and the proxy.
+        let untouched: Vec<_> = ["/favicon.png", "/apple-touch-icon.png", "/"]
+            .iter()
+            .chain(["/icons/volaris.example/icon.png"].iter())
+            .map(|path| server.mock("GET", *path).with_status(200).expect(0).create())
+            .collect();
+
+        assert_eq!(
+            fetch_icon_for(&chain_against(port)),
+            Some(icon),
+            "the first candidate served a decodable image and its bytes were not the ones kept"
+        );
+        first.assert();
+        for mock in &untouched {
+            mock.assert();
+        }
+    }
+
+    /// **The switch OFF is unchanged, at the fetch as well as at the
+    /// routing.** An [`IconSource::Proxy`] asks the icon service and asks
+    /// nobody else: no fixed path, no page, no second thought. That is the
+    /// behaviour every user who has never touched the switch has, and the
+    /// fallback must not have leaked backwards into it.
+    #[test]
+    fn the_switch_off_still_asks_the_icon_service_and_nothing_else() {
+        let mut server = crate::test_http::server();
+        let port = server.socket_address().port();
+        let icon = rgba_png(2, 2, &[0x22u8; 16]);
+
+        let proxy = server
+            .mock("GET", "/icons/chase.com/icon.png")
+            .with_status(200)
+            .with_body(icon.clone())
+            .expect(1)
+            .create();
+        let sites: Vec<_> = ["/favicon.ico", "/favicon.png", "/apple-touch-icon.png", "/"]
+            .iter()
+            .map(|path| server.mock("GET", *path).with_status(200).expect(0).create())
+            .collect();
+
+        let source = IconSource::Proxy(format!("http://127.0.0.1:{port}/icons/chase.com/icon.png"));
+        assert_eq!(fetch_icon_for(&source), Some(icon));
+        proxy.assert();
+        for mock in &sites {
+            mock.assert();
+        }
+
+        // The routing half, in the same test, because "unchanged" is a claim
+        // about both: the switch off does not produce a chain at all, so there
+        // is nothing for a direct step to be added to later.
+        let server_url = Some("https://vault.example.eu");
+        assert_eq!(
+            icon_source_for("chase.com", server_url, false, IconFreshness::Cached),
+            IconSource::Proxy("https://vault.example.eu/icons/chase.com/icon.png".to_string())
+        );
+    }
+
     /// **The owner's entry, end to end, against a server that behaves the way
     /// theirs does.**
     ///
@@ -3097,8 +3605,8 @@ mod tests {
         // The switch ON, so a public host takes the direct path at all --
         // otherwise this would prove nothing.
         let public = icon_source_for("example.com", None, true, IconFreshness::Cached);
-        let IconSource::Direct(urls) = public else {
-            panic!("with the switch on a public host must take the direct path");
+        let IconSource::DirectThenProxy { direct: urls, .. } = public else {
+            panic!("with the switch on a public host must ask the site first");
         };
         assert!(
             urls.iter().all(|u| u.starts_with("https://")),

@@ -11527,10 +11527,12 @@ struct IconFetch<'a> {
     /// `false` means no icon request is made and no icon *domain* is even
     /// computed -- see the guard in [`ensure_icon_loaded`].
     enabled: bool,
-    /// `true` means a **public** host's icon is fetched from that host
-    /// instead of through the icon service. A private address is fetched
-    /// directly either way -- `favicon::icon_source_for` owns that split, and
-    /// this field is not consulted for one. `false` is the default.
+    /// `true` means a **public** host's icon is asked for at that host first,
+    /// with the icon service asked only if the host itself did not answer with
+    /// an image. A private address is fetched directly either way, and with no
+    /// fallback at all -- `favicon::icon_source_for` owns both splits, and this
+    /// field is not consulted for a private address. `false` is the default and
+    /// means the icon service and nothing else.
     direct: bool,
     server_url: &'a Option<String>,
 }
@@ -11659,13 +11661,18 @@ fn ensure_icon_loaded(
     let cache_dir = icon_cache_dir.to_path_buf();
     let direct = fetch.direct;
     std::thread::spawn(move || {
-        // Where this icon comes from -- the icon service, or the site itself
-        // -- is decided in one place, `favicon::icon_source_for`, rather than
-        // here. This thread does not know which of the two it got, and that
-        // is deliberate: the rule (private addresses always direct, everyone
-        // else only if the user switched it on) is one the settings doc, the
-        // preferences copy and `PRIVACY.md` all describe, and a second copy
-        // of it in the loader is how those four come to disagree.
+        // Where this icon comes from -- the icon service, the site itself, or
+        // the site with the service behind it -- is decided in one place,
+        // `favicon::icon_source_for`, rather than here. This thread does not
+        // know which of the three it got, and that is deliberate: the rule
+        // (private addresses always direct and never proxied; every other host
+        // proxied, or asked directly first with the proxy as its fallback, if
+        // the user switched it on) is one the settings doc, the preferences
+        // copy and `PRIVACY.md` all describe, and a second copy of it in the
+        // loader is how those four come to disagree. In particular the
+        // fallback lives inside `favicon::fetch_icon_for`, not here: a loader
+        // that re-asked `icon_source_for` after a miss would have to know
+        // which hosts are allowed a second ask, which is the same rule again.
         let source =
             crate::favicon::icon_source_for(&domain, server_url.as_deref(), direct, freshness);
         let pixels = crate::favicon::fetch_icon_for(&source).and_then(|bytes| {

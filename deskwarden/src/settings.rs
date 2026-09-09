@@ -889,14 +889,26 @@ pub struct Settings {
     /// a picture of which domains they hold entries for. `PRIVACY.md` names
     /// this as the request with the most privacy weight in the app.
     pub fetch_icons: bool,
-    /// Whether a site icon may be fetched **from the site itself** rather
-    /// than through the icon service, for hosts that are not on this
-    /// machine's own network.
+    /// Whether a site icon is asked for **at the site itself first**, with the
+    /// icon service used only for the sites that did not answer, for hosts
+    /// that are not on this machine's own network.
     ///
     /// `false` is the default and what an older `settings.json` parses as, so
     /// nobody's traffic changes on upgrade. Read only when
     /// [`Self::fetch_icons`] is on: this is a child of that switch and
     /// decides *where from*, never *whether*.
+    ///
+    /// **`true` means "the site first", not "the site only", and it used to
+    /// mean the second.** Under direct-ONLY, a site that serves no favicon at
+    /// one of `favicon::DIRECT_ICON_PATHS` got no icon at all, forever, with
+    /// nothing on screen to say why -- `login.microsoftonline.com` 404s all
+    /// three and `www.volaris.com` answers all three with its single-page
+    /// app's HTML, while the icon service resolves both. Turning a preference
+    /// about *where* icons come from into a preference that silently deletes
+    /// some of them is not a choice a user made. The fallback costs no site
+    /// anything it was not already told -- the requests to the site are
+    /// byte-identical -- and the only party added is the icon service, which
+    /// is where that icon would have come from with this off.
     ///
     /// **This flag does not govern private addresses, and that is the one
     /// thing about it that has to be right.** `10/8`, `172.16/12`,
