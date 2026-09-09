@@ -248,7 +248,7 @@ const BACKEND_DESCRIPTION: &str =
 /// built-in client had to work out that "off" meant a second product existed.
 /// The owner's instruction was to make both sides visible as peers, so the row
 /// now asks which client, and [`OFFICIAL_CHOICE`] and [`BUILT_IN_CHOICE`]
-/// answer it in a two-cell [`choice_button`] picker.
+/// answer it in a two-cell [`theme::segmented_control`].
 ///
 /// So this string deliberately names NEITHER client: naming one here would put
 /// it back in the privileged position the pill gave it. The naming happens in
@@ -3145,9 +3145,6 @@ const EXPIRY_FIELD_WIDTH: f32 = 72.0;
 const MINT_BUTTON_WIDTH: f32 = 120.0;
 const REVOKE_BUTTON_WIDTH: f32 = 88.0;
 const COPY_BUTTON_WIDTH: f32 = 88.0;
-/// A picker cell's horizontal padding, total. Its width is measured from its
-/// own label, because "Secure note" and "Card" are not the same word.
-const CHOICE_PADDING: f32 = 20.0;
 
 const EVERYTHING_CHOICE: &str = "Everything";
 const ONE_ITEM_CHOICE: &str = "One item";
@@ -3324,6 +3321,38 @@ enum SubjectChoice {
     Everything,
     Category(ItemKind),
     OneItem,
+}
+
+/// **Every subject the picker offers, in the order it offers them.**
+///
+/// The widest grant first and the narrowest last, with the five categories
+/// between them, so the run reads as a scale from "all of it" down to "this
+/// one item" rather than as an unordered menu.
+///
+/// A function rather than the picker building the list inline, because the
+/// picker now both paints the run and reads a pressed *index* back through
+/// it. Those two have to walk the same order, and the way to be certain they
+/// do is for there to be only one order to walk. It is also what the census
+/// below counts, so "the picker has seven cells" is a fact about production
+/// rather than a number a test happens to agree with.
+fn subject_choices() -> Vec<SubjectChoice> {
+    let mut all = vec![SubjectChoice::Everything];
+    all.extend(KEY_CATEGORIES.map(SubjectChoice::Category));
+    all.push(SubjectChoice::OneItem);
+    all
+}
+
+/// What one cell of the subject picker says.
+///
+/// The categories defer to [`ItemKind::label`] rather than restating the five
+/// names here, so a kind renamed in the vault bridge is renamed on this form
+/// too -- the same rule `FillChoice::label` follows for the overlay's rows.
+fn subject_label(subject: SubjectChoice) -> String {
+    match subject {
+        SubjectChoice::Everything => EVERYTHING_CHOICE.to_string(),
+        SubjectChoice::Category(kind) => kind.label(),
+        SubjectChoice::OneItem => ONE_ITEM_CHOICE.to_string(),
+    }
 }
 
 /// What is typed into the mint form, between frames.
@@ -4063,22 +4092,29 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
         card_row(ui, |ui| {
             ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
             ui.label(theme::semibold(SUBJECT_LABEL, 14.0).color(theme::INK));
-            ui.horizontal_wrapped(|ui| {
-                let all = state.key_form.subject == SubjectChoice::Everything;
-                if choice_button(ui, EVERYTHING_CHOICE, all) {
-                    state.key_form.subject = SubjectChoice::Everything;
-                }
-                for kind in KEY_CATEGORIES {
-                    let chosen = state.key_form.subject == SubjectChoice::Category(kind);
-                    if choice_button(ui, &kind.label(), chosen) {
-                        state.key_form.subject = SubjectChoice::Category(kind);
-                    }
-                }
-                let one = state.key_form.subject == SubjectChoice::OneItem;
-                if choice_button(ui, ONE_ITEM_CHOICE, one) {
-                    state.key_form.subject = SubjectChoice::OneItem;
-                }
-            });
+            // The seven subjects in one list, so the run below is built from
+            // the same order the click is read back through. Two loops --
+            // one to paint and one to interpret an index -- would be two
+            // orderings, and the pair only has to disagree once for a press
+            // on "Card" to mint a key for identities.
+            let subjects = subject_choices();
+            // The labels outlive the cells that borrow them: `ItemKind::label`
+            // hands back an owned `String`, and a `Segment` built directly
+            // from a temporary would be borrowing something dropped at the
+            // end of the expression.
+            let labels: Vec<String> =
+                subjects.iter().map(|subject| subject_label(*subject)).collect();
+            let cells: Vec<theme::Segment<'_>> = subjects
+                .iter()
+                .zip(&labels)
+                .map(|(subject, label)| theme::Segment {
+                    label,
+                    selected: state.key_form.subject == *subject,
+                })
+                .collect();
+            if let Some(index) = theme::segmented_control(ui, &cells) {
+                state.key_form.subject = subjects[index];
+            }
         });
 
         if state.key_form.subject == SubjectChoice::OneItem {
@@ -4092,14 +4128,22 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
         card_row(ui, |ui| {
             ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
             ui.label(theme::semibold(ACCESS_LABEL, 14.0).color(theme::INK));
-            ui.horizontal(|ui| {
-                if choice_button(ui, READ_CHOICE, state.key_form.read) {
-                    state.key_form.read = !state.key_form.read;
-                }
-                if choice_button(ui, WRITE_CHOICE, state.key_form.write) {
-                    state.key_form.write = !state.key_form.write;
-                }
-            });
+            // **The one run on either page where more than one cell can be
+            // lit at once**, and it is still this control rather than two
+            // switches: read and write are the two halves of one answer to
+            // "what may this key do", and a grant of neither is a refusal
+            // the form has to be able to express. `Segment::selected` is a
+            // flag per cell precisely so this group and the single-choice
+            // ones can be the same widget.
+            let cells = [
+                theme::Segment { label: READ_CHOICE, selected: state.key_form.read },
+                theme::Segment { label: WRITE_CHOICE, selected: state.key_form.write },
+            ];
+            match theme::segmented_control(ui, &cells) {
+                Some(0) => state.key_form.read = !state.key_form.read,
+                Some(_) => state.key_form.write = !state.key_form.write,
+                None => {}
+            }
         });
 
         row_separator(ui);
@@ -4166,112 +4210,6 @@ fn form_field(ui: &mut Ui, id: &str, buffer: &mut String, width: f32) {
     );
 }
 
-/// One cell of a picker: [`key_button`]'s box, filled when it is the choice
-/// in force.
-///
-/// Selected state is the nav's own language (`BLUE_WASH` behind
-/// `BLUE_DEEP`), rather than a new colour, so "this is the one that is on"
-/// looks the same here as it does in the column to the left.
-fn choice_button(ui: &mut Ui, label: &str, selected: bool) -> bool {
-    let galley_width = ui
-        .painter()
-        .layout_no_wrap(
-            label.to_owned(),
-            FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
-            theme::INK,
-        )
-        .size()
-        .x;
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(galley_width + CHOICE_PADDING, STEPPER_HEIGHT),
-        Sense::click(),
-    );
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let (fill, ink) = if selected {
-        (theme::BLUE_WASH, theme::BLUE_DEEP)
-    } else if response.hovered() {
-        (theme::CANVAS, theme::TEXT_SECONDARY)
-    } else {
-        (theme::CARD, theme::TEXT_SECONDARY)
-    };
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(STEPPER_RADIUS),
-        fill,
-        Stroke::new(1.0, if selected { theme::BLUE_EDGE } else { theme::BORDER_STRONG }),
-        StrokeKind::Inside,
-    );
-    let galley = ui.painter().layout_no_wrap(
-        label.to_owned(),
-        FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
-        ink,
-    );
-    ui.painter().galley(
-        Pos2::new(
-            rect.center().x - galley.size().x / 2.0,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        ink,
-    );
-    response.clicked()
-}
-
-/// [`choice_button`]'s disabled twin, in [`control_row_ghosted`]'s idiom.
-///
-/// A separate function rather than an `enabled` parameter on
-/// [`choice_button`], which is exactly the shape
-/// [`theme::toggle_pill_disabled`] and [`row_text_ghosted`] already take on
-/// this page: the three live call sites in the mint form have no disabled
-/// state and gain nothing from carrying one.
-///
-/// **Disabled means disabled, not merely painted grey** -- [`child_toggle_row`]'s
-/// rule, on the control that replaced it here. The cell senses no click and
-/// sets no hover cursor, so there is no path by which it can be pressed.
-///
-/// **The cell in force is still legible.** It keeps [`theme::BLUE_WASH`], the
-/// same "this is the one that is on" the live control uses, while both labels
-/// go to [`theme::TEXT_GHOST`]. A picker that greyed both cells identically
-/// would tell a user on `bitwarden.com` that they have no client, when what
-/// is true is that they have this one and cannot change it.
-fn choice_button_ghosted(ui: &mut Ui, label: &str, selected: bool) {
-    let galley_width = ui
-        .painter()
-        .layout_no_wrap(
-            label.to_owned(),
-            FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
-            theme::INK,
-        )
-        .size()
-        .x;
-    let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(galley_width + CHOICE_PADDING, STEPPER_HEIGHT),
-        Sense::hover(),
-    );
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(STEPPER_RADIUS),
-        if selected { theme::BLUE_WASH } else { theme::CARD },
-        Stroke::new(1.0, theme::BORDER_STRONG),
-        StrokeKind::Inside,
-    );
-    let galley = ui.painter().layout_no_wrap(
-        label.to_owned(),
-        FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
-        theme::TEXT_GHOST,
-    );
-    ui.painter().galley(
-        Pos2::new(
-            rect.center().x - galley.size().x / 2.0,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        theme::TEXT_GHOST,
-    );
-}
-
 /// **Which client opens this vault: a two-cell picker, not an on/off pill.**
 ///
 /// Returns the value after this frame -- `true` for the official CLI, which
@@ -4288,17 +4226,19 @@ fn choice_button_ghosted(ui: &mut Ui, label: &str, selected: bool) {
 /// above them ([`BACKEND_CHOICE_LABEL`]) is the question rather than one of
 /// the answers.
 ///
-/// # It reuses [`choice_button`] rather than inventing a control
+/// # It reuses [`theme::segmented_control`] rather than inventing a control
 ///
 /// This page already has an either-or control and already draws it twice, on
 /// this very section's sibling card: the mint form's subject and access
-/// pickers ([`draw_mint_form`]). Selected is `BLUE_WASH` behind `BLUE_DEEP`,
-/// which is the nav's own language for "this is the one in force". A new
-/// widget here would have been a third dialect of "selected" in one window.
+/// pickers ([`draw_mint_form`]). All three are now one design-system widget,
+/// which is where a multiple-choice row belongs -- the cells used to be
+/// drawn by a private helper in this file, so "what does a picker look like"
+/// was answered in a settings screen rather than in `theme`, and any other
+/// window that grew a picker would have answered it again.
 ///
 /// The layout is that card's too -- a full-width [`card_row`] with the label
 /// and copy above the cells, not [`control_row`]'s 160-point trailing column,
-/// which neither cell's name fits in.
+/// which neither cell's name fits in, let alone the pair of them joined.
 ///
 /// # Ghosted, it hands back what it was given
 ///
@@ -4316,24 +4256,25 @@ fn backend_choice_row(ui: &mut Ui, description: &str, official: bool, enabled: b
         };
         ui.label(theme::semibold(BACKEND_CHOICE_LABEL, 14.0).color(title));
         ui.label(RichText::new(description).size(12.0).color(body));
-        ui.horizontal(|ui| {
-            if enabled {
-                // Two independent presses rather than one flip, so that
-                // pressing the cell already in force is a no-op and
-                // `backend_switch` sees no proposal -- which is what keeps a
-                // confirmation off the screen of a user who clicked the
-                // client they were already on.
-                if choice_button(ui, OFFICIAL_CHOICE, official) {
-                    next = true;
-                }
-                if choice_button(ui, BUILT_IN_CHOICE, !official) {
-                    next = false;
-                }
-            } else {
-                choice_button_ghosted(ui, OFFICIAL_CHOICE, official);
-                choice_button_ghosted(ui, BUILT_IN_CHOICE, !official);
+        let cells = [
+            theme::Segment { label: OFFICIAL_CHOICE, selected: official },
+            theme::Segment { label: BUILT_IN_CHOICE, selected: !official },
+        ];
+        if enabled {
+            // The pressed index is turned back into the value it stands for
+            // rather than flipping `next`, so that pressing the cell already
+            // in force writes back what was already there and
+            // `backend_switch` sees no proposal -- which is what keeps a
+            // confirmation off the screen of a user who clicked the client
+            // they were already on.
+            match theme::segmented_control(ui, &cells) {
+                Some(0) => next = true,
+                Some(_) => next = false,
+                None => {}
             }
-        });
+        } else {
+            theme::segmented_control_disabled(ui, &cells);
+        }
     });
     next
 }
@@ -6364,7 +6305,7 @@ mod tests {
 
         /// The fill of the smallest rectangle painted behind a text run.
         ///
-        /// **How a [`choice_button`] cell's state is read back**, and the
+        /// **How a [`theme::segmented_control`] cell's state is read back**, and the
         /// reason the backend row's pins got stronger rather than weaker when
         /// it stopped being a pill. The helper it replaced could only say "the
         /// nth switch"; this says "the cell labelled *this*", so an assertion
@@ -6376,6 +6317,16 @@ mod tests {
         /// the card, which sits inside the body, and all three contain the
         /// label's centre.
         fn fill_behind(&self, needle: &str) -> egui::Color32 {
+            self.box_behind(needle).fill
+        }
+
+        /// The whole rectangle [`Self::fill_behind`] reads the colour of --
+        /// how a segmented run's GEOMETRY is read back, cell by cell and by
+        /// label rather than by index. "Do these two cells touch" is a claim
+        /// about two rects, and there is nowhere else on the page to get
+        /// them: a run paints no rectangle of any distinctive size, because
+        /// every cell in it is measured from its own words.
+        fn box_behind(&self, needle: &str) -> RectShape {
             let text = self.rect_of(needle);
             let mut found: Vec<&RectShape> = self
                 .rects
@@ -6383,16 +6334,16 @@ mod tests {
                 .filter(|r| r.rect.contains(text.center()))
                 .collect();
             found.sort_by(|a, b| a.rect.area().total_cmp(&b.rect.area()));
-            found
-                .first()
-                .unwrap_or_else(|| panic!("nothing was painted behind {needle:?}"))
-                .fill
+            match found.first() {
+                Some(smallest) => (*smallest).clone(),
+                None => panic!("nothing was painted behind {needle:?}"),
+            }
         }
 
         // **`pill_fills` is gone, and [`Self::fill_behind`] above is what
         // replaced it.** It read the fill of the *n*th 40x22 rectangle on the
         // page, and existed for exactly one claim: which way round the
-        // backend row was. That row is a two-cell `choice_button` picker now
+        // backend row was. That row is a two-cell `theme::segmented_control` now
         // and paints no pill at all, so its only caller went -- and what took
         // its place says *which cell*, by label, rather than which index.
         // Kept as a note rather than as an `allow(dead_code)` helper, because
@@ -8122,8 +8073,8 @@ mod tests {
             4,
             "the Vault page paints four pills: `keep_backend_running`, the instant-open \
              switch beside it, and the disk copy and its child. It was FIVE while the \
-             backend choice was an on/off pill; that row is a two-cell `choice_button` \
-             picker now and paints no 40x22 rectangle at all, so every index below is one \
+             backend choice was an on/off pill; that row is a two-cell segmented control \
+             now and paints no 40x22 rectangle at all, so every index below is one \
              lower than it was -- and an index that has drifted must fail here rather than \
              quietly click the row above"
         );
@@ -8343,8 +8294,12 @@ mod tests {
 
     #[test]
     fn exactly_one_nav_row_is_highlighted() {
-        // `BLUE_WASH` is 3e's selected-row fill and appears nowhere else on
-        // this window, so counting it counts selections.
+        // `BLUE_WASH` is 3e's selected-row fill, and on this page it appears
+        // nowhere else, so counting it counts selections. It is no longer
+        // unique to the nav across the whole window -- a GHOSTED
+        // [`theme::segmented_control_disabled`] paints the cell in force in
+        // the same wash -- which is why the page painted here is one that has
+        // no picker on it rather than whichever page happened to be handy.
         // Any section but the default one, so "the selection follows
         // `state.section`" is what is being counted and not "General happens
         // to be highlighted". This was `Section::Autofill`, which no longer
@@ -8568,7 +8523,7 @@ mod tests {
         assert!(state.settings.keep_backend_running, "the default");
 
         let first = tall_frame(&ctx, &mut state, &[]);
-        // FIRST pill: the parent above it is a two-cell `choice_button`
+        // FIRST pill: the parent above it is a two-cell segmented control
         // picker and paints no 40x22 rectangle, so this child is the topmost
         // pill on the page. Clicking it must not move the parent, which is
         // what the neighbouring assertion here pins -- a child wired to its
@@ -10713,7 +10668,7 @@ mod tests {
     /// # Both numbers went down by one, and the row that left is still counted
     ///
     /// It was five and four while the backend choice was an on/off pill.
-    /// [`backend_choice_row`] draws a two-cell [`choice_button`] picker
+    /// [`backend_choice_row`] draws a two-cell [`theme::segmented_control`]
     /// instead, which paints no 40x22 rectangle -- so a count alone would now
     /// be satisfied by a page that had simply dropped the choice. The second
     /// half of this test is the replacement: **both cells are painted on both
@@ -10755,13 +10710,234 @@ mod tests {
             };
             assert_eq!(
                 painted.fill_behind(selected),
-                theme::BLUE_WASH,
+                theme::BLUE,
                 "{what} does not show {selected:?} as the client in force"
             );
             assert_ne!(
                 painted.fill_behind(other),
-                theme::BLUE_WASH,
+                theme::BLUE,
                 "{what} shows both clients as selected"
+            );
+        }
+    }
+
+    // -- the multiple-choice rows on Vault and Local API ------------------
+
+    /// **Every multiple-choice row on these two pages is ONE joined run**,
+    /// which is what the owner asked for and what the cells were not.
+    ///
+    /// They used to be separate rounded boxes with the layout's own spacing
+    /// between them, and a row of separate boxes reads as several things you
+    /// might press rather than as one control with several positions. The
+    /// property asserted is the one that difference comes down to: adjacent
+    /// cells overlap by exactly one point -- no gap at all, and exactly
+    /// enough overlap that the two hairlines at a join land on the same pixel
+    /// instead of drawing an interior edge at twice the weight of the run's
+    /// outer one.
+    ///
+    /// Located by label rather than by index, so a run that lost a cell fails
+    /// here rather than quietly measuring a different pair.
+    #[test]
+    fn every_multiple_choice_row_on_these_pages_is_one_joined_run() {
+        let vault = paint_vault_for(Some("self"), true);
+        let api = paint_tall(Section::Api);
+        let subjects: Vec<String> = subject_choices().into_iter().map(subject_label).collect();
+        let runs: Vec<(&str, &Painted, Vec<String>)> = vec![
+            (
+                "the Vault page's backend picker",
+                &vault,
+                vec![OFFICIAL_CHOICE.to_string(), BUILT_IN_CHOICE.to_string()],
+            ),
+            ("the Local API page's subject picker", &api, subjects),
+            (
+                "the Local API page's access pair",
+                &api,
+                vec![READ_CHOICE.to_string(), WRITE_CHOICE.to_string()],
+            ),
+        ];
+        for (what, painted, labels) in runs {
+            let cells: Vec<Rect> =
+                labels.iter().map(|label| painted.box_behind(label).rect).collect();
+            for (index, pair) in cells.windows(2).enumerate() {
+                assert_eq!(
+                    pair[0].right() - pair[1].left(),
+                    theme::SEGMENT_SEAM,
+                    "{what} leaves {:.1} points between cells {index} and {}, so it is a row of \
+                     separate buttons rather than one control",
+                    pair[1].left() - pair[0].right(),
+                    index + 1
+                );
+                assert_eq!(pair[0].top(), pair[1].top(), "{what} has a cell off the run");
+                assert_eq!(
+                    pair[0].height(),
+                    theme::SEGMENT_HEIGHT,
+                    "{what} does not share the design system's segment height"
+                );
+            }
+
+            // **And the whole run fits inside the card it is drawn in.**
+            //
+            // A joined run cannot wrap -- one rounded outline round a set of
+            // cells is the point of it -- so a picker whose cells outgrew the
+            // card would paint straight over the card's edge instead of
+            // moving to a second line. The subject picker is the one this
+            // matters for: it is seven cells wide and it USED to be laid out
+            // by `horizontal_wrapped`, which hid the question of whether they
+            // fit by silently answering no.
+            let run = cells.iter().fold(cells[0], |so_far, cell| so_far.union(*cell));
+            let card = painted
+                .rects
+                .iter()
+                .filter(|r| r.fill == theme::CARD && r.stroke.color == theme::HAIRLINE)
+                .find(|r| r.rect.contains(run.center()))
+                .unwrap_or_else(|| panic!("{what} is not inside a card at all"));
+            assert!(
+                run.right() <= card.rect.right() - f32::from(ROW_PAD_X),
+                "{what} runs to x={:.1} in a card whose content stops at x={:.1}, so its last \
+                 cells are painted over the card's own edge",
+                run.right(),
+                card.rect.right() - f32::from(ROW_PAD_X)
+            );
+        }
+    }
+
+    /// **The subject picker offers every subject the form can express, in
+    /// one run and in the order the form lists them.**
+    ///
+    /// A census, and the number is deliberately spelled out: seven is
+    /// `Everything`, the five categories `KEY_CATEGORIES` names, and
+    /// `One item`. A subject added to the form without a cell here would be
+    /// a grant a user could hold but never mint, and a cell that had drifted
+    /// out of order would make an index-driven press select the wrong one.
+    #[test]
+    fn the_subject_picker_offers_every_subject_in_the_forms_own_order() {
+        let painted = paint_tall(Section::Api);
+        let labels: Vec<String> = subject_choices().into_iter().map(subject_label).collect();
+        assert_eq!(
+            labels.len(),
+            7,
+            "the picker offers {} subjects: `Everything`, the five kinds a key can be scoped \
+             to, and `One item`. If that number has really changed, the reason belongs here",
+            labels.len()
+        );
+        let mut lefts = Vec::new();
+        for label in &labels {
+            assert!(painted.contains(label), "{label:?} is not on the page; got {:?}", painted.strings());
+            lefts.push(painted.box_behind(label).rect.left());
+        }
+        let mut sorted = lefts.clone();
+        sorted.sort_by(f32::total_cmp);
+        assert_eq!(
+            lefts, sorted,
+            "the cells are not painted in the order `subject_choices` lists them, so a pressed \
+             index means a different subject to the run than it does to the form"
+        );
+    }
+
+    /// **Pressing a cell selects the subject that cell names**, which is the
+    /// claim a picker exists to make and the one an index-driven control can
+    /// get subtly wrong: an off-by-one here mints a key over the wrong kind
+    /// of item, and every visual assertion above would still hold.
+    ///
+    /// A category in the MIDDLE of the run, so neither end's arithmetic can
+    /// pass by accident.
+    #[test]
+    fn pressing_a_subject_cell_selects_the_subject_it_names() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        assert_eq!(state.key_form.subject, SubjectChoice::Everything, "the form's default");
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let card = first.box_behind(&ItemKind::Card.label()).rect.center();
+        let after = tall_click(&ctx, &mut state, card);
+
+        assert_eq!(
+            state.key_form.subject,
+            SubjectChoice::Category(ItemKind::Card),
+            "pressing the `Card` cell chose something else"
+        );
+        assert_eq!(
+            after.fill_behind(&ItemKind::Card.label()),
+            theme::BLUE,
+            "the form moved but the run still paints the old subject as the one in force"
+        );
+        assert_ne!(
+            after.fill_behind(EVERYTHING_CHOICE),
+            theme::BLUE,
+            "two subjects are painted as chosen at once, so the run says nothing"
+        );
+    }
+
+    /// **The access pair is the one run on either page where more than one
+    /// cell may be lit**, and pressing one half must not disturb the other.
+    ///
+    /// Read and write are two halves of one answer to "what may this key
+    /// do", so the control is the same widget as the single-choice runs
+    /// beside it -- `theme::Segment` carries a flag per cell precisely so it
+    /// can be. What has to be pinned is that sharing the widget did not
+    /// quietly make the pair exclusive: a run that cleared its neighbour
+    /// would silently halve every grant this form can mint.
+    #[test]
+    fn pressing_one_half_of_the_access_pair_leaves_the_other_alone() {
+        let ctx = tall_context();
+        let mut state = api_state();
+        assert!(state.key_form.read, "the form opens on a read grant");
+        assert!(!state.key_form.write);
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        let write = first.box_behind(WRITE_CHOICE).rect.center();
+        let both = tall_click(&ctx, &mut state, write);
+
+        assert!(state.key_form.write, "pressing `Write` did not grant write");
+        assert!(state.key_form.read, "granting write cleared the read grant beside it");
+        assert_eq!(both.fill_behind(READ_CHOICE), theme::BLUE);
+        assert_eq!(
+            both.fill_behind(WRITE_CHOICE),
+            theme::BLUE,
+            "both halves are granted and the run shows only one of them"
+        );
+
+        // And back off again, so the two paints above are telling states
+        // apart rather than reporting one constant twice.
+        let read = both.box_behind(READ_CHOICE).rect.center();
+        let write_only = tall_click(&ctx, &mut state, read);
+        assert!(!state.key_form.read, "pressing a lit cell did not withdraw the grant");
+        assert!(state.key_form.write, "withdrawing read withdrew write with it");
+        assert_ne!(write_only.fill_behind(READ_CHOICE), theme::BLUE);
+    }
+
+    /// **The nav's wash is not what a live multiple-choice row is painted
+    /// in**, and this is the regression that would be easiest to reintroduce
+    /// by copying the control that used to be here.
+    ///
+    /// The cells used to wear `BLUE_WASH` behind `BLUE_DEEP`, which is the
+    /// nav's own "this is the row you are reading". In a column of nav rows
+    /// that reads correctly, because only one of them may shout; in a
+    /// multiple-choice row it is the wrong weight -- the lit cell is the
+    /// answer to the question above it and is competing with a neighbour one
+    /// point away, not with nothing.
+    ///
+    /// **The wash is still legitimate on the same page**, which is why this
+    /// counts rather than forbidding: a GHOSTED run paints the answer in
+    /// force in exactly that wash, deliberately, so a reader who cannot
+    /// change the setting can still see what it is. The pages counted here
+    /// are the ones whose runs are live.
+    #[test]
+    fn no_live_multiple_choice_row_is_painted_in_the_navs_own_wash() {
+        for (what, painted) in [
+            ("the Vault page", paint_vault_for(Some("self"), true)),
+            ("the Local API page", paint_tall(Section::Api)),
+        ] {
+            let washed = painted
+                .rects
+                .iter()
+                .filter(|r| r.rect.min.x >= NAV_WIDTH)
+                .filter(|r| r.fill == theme::BLUE_WASH)
+                .count();
+            assert_eq!(
+                washed, 0,
+                "{what} paints {washed} washed rectangles in its body, so a multiple-choice \
+                 cell is wearing the nav's selected-row colour again"
             );
         }
     }
@@ -11112,12 +11288,12 @@ mod tests {
         // would pass an assertion about either one alone.
         assert_eq!(
             asked.fill_behind(OFFICIAL_CHOICE),
-            theme::BLUE_WASH,
+            theme::BLUE,
             "the picker moved before the question was answered"
         );
         assert_ne!(
             asked.fill_behind(BUILT_IN_CHOICE),
-            theme::BLUE_WASH,
+            theme::BLUE,
             "the cell that was merely proposed is painted as the one in force"
         );
 
@@ -11132,7 +11308,7 @@ mod tests {
         );
         assert_eq!(
             left.fill_behind(OFFICIAL_CHOICE),
-            theme::BLUE_WASH,
+            theme::BLUE,
             "the picker moved on a refusal"
         );
         assert!(
@@ -11212,12 +11388,12 @@ mod tests {
         assert!(state.pending_backend_switch.is_none(), "the question outlived its answer");
         assert_eq!(
             after.fill_behind(BUILT_IN_CHOICE),
-            theme::BLUE_WASH,
+            theme::BLUE,
             "the switch was taken and the picker still shows the old client"
         );
         assert_ne!(
             after.fill_behind(OFFICIAL_CHOICE),
-            theme::BLUE_WASH,
+            theme::BLUE,
             "the picker shows both clients as the one in force"
         );
         assert!(
@@ -11457,13 +11633,13 @@ mod tests {
         let first = tall_frame(&ctx, &mut state, &[]);
         assert_eq!(
             first.fill_behind(OFFICIAL_CHOICE),
-            theme::BLUE_WASH,
+            theme::BLUE,
             "the shipped default does not show the official CLI as chosen, so a fresh \
              install offers the built-in client while it is running the official CLI"
         );
         assert_ne!(
             first.fill_behind(BUILT_IN_CHOICE),
-            theme::BLUE_WASH,
+            theme::BLUE,
             "both cells are painted as chosen, so the control says nothing"
         );
 
@@ -11480,12 +11656,12 @@ mod tests {
         let second = tall_frame(&ctx, &mut state, &[]);
         assert_eq!(
             second.fill_behind(BUILT_IN_CHOICE),
-            theme::BLUE_WASH,
+            theme::BLUE,
             "a configuration served by the built-in client does not show it as chosen"
         );
         assert_ne!(
             second.fill_behind(OFFICIAL_CHOICE),
-            theme::BLUE_WASH,
+            theme::BLUE,
             "the official CLI is still painted as chosen on a vault the built-in client serves"
         );
 

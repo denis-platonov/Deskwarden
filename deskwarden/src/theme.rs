@@ -1653,6 +1653,258 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
     )
 }
 
+/// One cell of a [`segmented_control`]: what it says, and whether it is one
+/// of the choices currently in force.
+///
+/// A named pair rather than a `(&str, bool)` tuple, because the two fields
+/// are the same shape as each other and a caller that transposed them would
+/// still compile: `Segment { label, selected }` cannot be got wrong at the
+/// call site, and every one of this control's callers builds its cells in a
+/// loop where an argument order is easy to lose track of.
+pub struct Segment<'a> {
+    /// The word or phrase on the cell. Sized to this, plus
+    /// [`SEGMENT_PADDING`].
+    pub label: &'a str,
+    /// Painted as the choice in force -- [`BLUE`] behind white.
+    ///
+    /// A `bool` per cell rather than one selected *index* for the run,
+    /// because this app has both kinds of group: the backend picker is one
+    /// of two, and the Local API key form's access pair is any of two. One
+    /// index could not express the second, and a control that existed in two
+    /// variants would be two controls with one name.
+    pub selected: bool,
+}
+
+/// **The app's multiple-choice row: a run of cells joined into one pill.**
+///
+/// Returns the index of the cell that was pressed this frame, or `None` --
+/// pressing the cell already in force is a press like any other and is
+/// reported, because "you chose the thing you already had" is a question for
+/// the caller (`prefs_ui`'s backend picker turns it into a no-op precisely so
+/// no confirmation appears) rather than something to swallow here.
+///
+/// # Why the cells are joined and not spaced
+///
+/// Separated cells are what this app drew before, and they read as a row of
+/// independent buttons: three things you might press, rather than one control
+/// with three positions. Joining them -- no gap, straight interior edges, a
+/// single rounded outline round the whole run -- is what says the cells are
+/// alternatives to each other and that exactly one region of the row will be
+/// lit. The rounding is therefore applied to the run and not to the cell:
+/// only the first cell's left corners and the last cell's right corners are
+/// [`SEGMENT_RADIUS`], and everything between them is square.
+///
+/// # The one-pixel overlap is not a rounding error
+///
+/// Each cell paints its own 1px stroke *inside* its own rect, so two cells
+/// laid end to end would draw two adjacent hairlines and the interior edges
+/// would come out twice as heavy as the outer ones. Every cell after the
+/// first therefore starts one point back, over its neighbour's right edge, so
+/// the two strokes land on the same pixel -- the same thing CSS segmented
+/// controls do with a negative left margin. The run's total width is short by
+/// one point per seam for exactly that reason.
+///
+/// # Selected is [`BLUE`], not the nav's wash
+///
+/// The wash (`BLUE_WASH` behind `BLUE_DEEP`) says "this is the row you are
+/// reading" in the nav, where a whole column of rows is on screen and only
+/// one of them may shout. A multiple-choice row is the opposite situation:
+/// the cell in force is the answer to the question in the label above it, and
+/// it is competing with two or six neighbours a point away rather than with
+/// nothing. It gets the full fill and white text, which is the same weight
+/// this design system already gives [`primary_button`] -- the other place
+/// where one control in a group is the one that matters.
+pub fn segmented_control(ui: &mut Ui, segments: &[Segment<'_>]) -> Option<usize> {
+    let widths = segment_widths(ui, segments);
+    let (run, response) =
+        ui.allocate_exact_size(Vec2::new(run_width(&widths), SEGMENT_HEIGHT), Sense::click());
+    // Read once: `hover_pos` is a pointer position and this control is
+    // hit-testing it cell by cell, so a second read mid-loop could put the
+    // hover on one cell and the click on another within one frame.
+    let hovered = response.hover_pos().and_then(|at| segment_at(run, &widths, at));
+    if hovered.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    for (index, segment) in segments.iter().enumerate() {
+        let (fill, ink) = if segment.selected {
+            (BLUE, Color32::WHITE)
+        } else if hovered == Some(index) {
+            (CANVAS, INK)
+        } else {
+            (CARD, INK)
+        };
+        // The selected cell's edge is its own fill rather than the run's
+        // grey: a grey hairline drawn round a blue cell reads as a ring
+        // hanging off the end of the pill, and the outline is supposed to be
+        // the outline of one control.
+        let edge = if segment.selected { BLUE } else { BORDER };
+        paint_segment(
+            ui,
+            cell_rect(run, &widths, index),
+            segments.len(),
+            index,
+            fill,
+            ink,
+            edge,
+            segment.label,
+        );
+    }
+    response.clicked().then(|| hovered).flatten()
+}
+
+/// [`segmented_control`]'s inert twin, for a question whose answer is fixed
+/// by something outside the row.
+///
+/// A separate function rather than an `enabled` flag, which is the shape this
+/// design system already uses for the same distinction ([`toggle_pill`] and
+/// [`toggle_pill_disabled`]): the callers that have no disabled state gain
+/// nothing from carrying one, and the two paint different enough that a flag
+/// inside one body would be a branch on every line of it.
+///
+/// **Inert, not merely grey.** The run senses hover only, so there is no path
+/// by which a cell can be pressed and nothing for a caller to ignore.
+///
+/// **The cell in force stays identifiable**, in [`BLUE_WASH`] rather than the
+/// live control's [`BLUE`]: a run that greyed every cell identically would
+/// tell the reader they have no answer at all, when what is true is that they
+/// have this one and cannot change it. The wash is the weight the answer
+/// deserves when it is not a control -- present, legible, and visibly not
+/// something to press.
+pub fn segmented_control_disabled(ui: &mut Ui, segments: &[Segment<'_>]) {
+    let widths = segment_widths(ui, segments);
+    let (run, _) =
+        ui.allocate_exact_size(Vec2::new(run_width(&widths), SEGMENT_HEIGHT), Sense::hover());
+    for (index, segment) in segments.iter().enumerate() {
+        let fill = if segment.selected { BLUE_WASH } else { CARD };
+        paint_segment(
+            ui,
+            cell_rect(run, &widths, index),
+            segments.len(),
+            index,
+            fill,
+            TEXT_GHOST,
+            BORDER,
+            segment.label,
+        );
+    }
+}
+
+/// The height every cell in a run shares, and the height of the run.
+///
+/// The same 28 the Preferences window's steppers, key buttons and form fields
+/// are, because a multiple-choice row sits in cards beside all three and a
+/// control that were a couple of points taller would make the card's rows
+/// look mismeasured rather than deliberate.
+pub const SEGMENT_HEIGHT: f32 = 28.0;
+
+/// A cell's horizontal breathing room, both sides together -- so a cell is
+/// its label's width plus this, and the cells in a run are therefore
+/// different widths from one another. Sizing every cell to the widest label
+/// would make "Card" as wide as "The official Bitwarden CLI" and turn a row
+/// of alternatives into a row of mostly empty boxes.
+pub const SEGMENT_PADDING: f32 = 20.0;
+
+/// The run's outer corner radius: [`secondary_button`]'s and
+/// [`primary_button`]'s own 7, so the multiple-choice row is rounded like
+/// every other pressable thing in this app.
+const SEGMENT_RADIUS: u8 = 7;
+
+/// How far each cell after the first is pulled back over its neighbour, so
+/// the two 1px strokes at a seam land on one pixel. See
+/// [`segmented_control`]'s note on the overlap.
+///
+/// Public for the same reason [`SEGMENT_HEIGHT`] is: "these cells are joined
+/// rather than spaced" is a claim a surface's own tests make about the run
+/// they draw, and a surface that restated the number to make it would be a
+/// second copy of this measurement waiting to disagree with the control.
+pub const SEGMENT_SEAM: f32 = 1.0;
+
+/// Each cell's width: its own label at the run's font, plus
+/// [`SEGMENT_PADDING`].
+fn segment_widths(ui: &Ui, segments: &[Segment<'_>]) -> Vec<f32> {
+    segments
+        .iter()
+        .map(|segment| segment_galley(ui, segment.label, INK).size().x + SEGMENT_PADDING)
+        .collect()
+}
+
+/// The whole run, seams deducted -- [`SEGMENT_SEAM`] per join, of which there
+/// is one fewer than there are cells.
+fn run_width(widths: &[f32]) -> f32 {
+    widths.iter().sum::<f32>() - SEGMENT_SEAM * widths.len().saturating_sub(1) as f32
+}
+
+/// Where cell `index` sits inside `run`.
+fn cell_rect(run: Rect, widths: &[f32], index: usize) -> Rect {
+    let left = run.left() + widths[..index].iter().sum::<f32>() - SEGMENT_SEAM * index as f32;
+    Rect::from_min_size(Pos2::new(left, run.top()), Vec2::new(widths[index], run.height()))
+}
+
+/// Which cell `at` is over, if any.
+///
+/// The seams overlap, so a point on one belongs to two cells; the first match
+/// wins, which puts the shared pixel on the left-hand cell. Either answer is
+/// defensible and the point is that ONE of them is always given -- a hit test
+/// that returned two answers is how a click could light one cell and select
+/// another.
+fn segment_at(run: Rect, widths: &[f32], at: Pos2) -> Option<usize> {
+    (0..widths.len()).find(|&index| cell_rect(run, widths, index).contains(at))
+}
+
+/// One cell, painted: fill, the run's outline where this cell is on it, and
+/// the label centred.
+#[allow(clippy::too_many_arguments)]
+fn paint_segment(
+    ui: &Ui,
+    rect: Rect,
+    count: usize,
+    index: usize,
+    fill: Color32,
+    ink: Color32,
+    edge: Color32,
+    label: &str,
+) {
+    ui.painter().rect(
+        rect,
+        segment_corners(count, index),
+        fill,
+        Stroke::new(1.0, edge),
+        StrokeKind::Inside,
+    );
+    let galley = segment_galley(ui, label, ink);
+    ui.painter().galley(
+        Pos2::new(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        ink,
+    );
+}
+
+/// **The rounding belongs to the run, not the cell.** The first cell rounds
+/// its left corners, the last rounds its right ones, and a cell that is both
+/// -- a run of one -- rounds all four; everything in between is square, which
+/// is what makes the interior edges read as seams rather than as gaps between
+/// separate buttons.
+fn segment_corners(count: usize, index: usize) -> CornerRadius {
+    let first = if index == 0 { SEGMENT_RADIUS } else { 0 };
+    let last = if index + 1 == count { SEGMENT_RADIUS } else { 0 };
+    CornerRadius { nw: first, sw: first, ne: last, se: last }
+}
+
+/// A cell's label, laid out. One place, so the width a cell is ALLOCATED and
+/// the text later PAINTED into it cannot be measured at two different fonts
+/// -- which is how a label ends up a point wider than the box round it.
+fn segment_galley(ui: &Ui, label: &str, color: Color32) -> Arc<egui::Galley> {
+    ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::new(SEGMENT_TEXT_SIZE, FontFamily::Name(SEMIBOLD.into())),
+        color,
+    )
+}
+
+/// The cell label's size: 12px, the same as the Preferences window's other
+/// in-card controls.
+const SEGMENT_TEXT_SIZE: f32 = 12.0;
+
 /// Height of the detail pane's header-strip controls (design 2b: `height:
 /// 34px` on both "Fill in app" and "Edit").
 ///
@@ -5177,6 +5429,421 @@ mod tests {
                 "a quadrant no longer touches the shield center"
             );
         }
+    }
+
+    // -- the multiple-choice row ------------------------------------------
+
+    /// One frame of a [`segmented_control`], read back the way every other
+    /// widget in this crate is: real shapes off a real frame, rather than a
+    /// claim about the code that emitted them.
+    #[derive(Default)]
+    struct PaintedRun {
+        /// The cells, left to right -- everything the run painted at
+        /// [`SEGMENT_HEIGHT`], which excludes the panel background the test
+        /// context paints behind it.
+        cells: Vec<egui::epaint::RectShape>,
+        /// Each cell's label and the colour it was painted in, in the same
+        /// order.
+        labels: Vec<(String, Color32)>,
+        /// What the control reported this frame.
+        pressed: Option<usize>,
+    }
+
+    impl PaintedRun {
+        fn label(&self, needle: &str) -> Color32 {
+            self.labels
+                .iter()
+                .find(|(text, _)| text == needle)
+                .unwrap_or_else(|| panic!("{needle:?} was never painted; got {:?}", self.labels))
+                .1
+        }
+
+        /// The cell behind `needle`, located by the label inside it rather
+        /// than by index, so an assertion about a cell names the cell.
+        fn cell(&self, needle: &str) -> egui::epaint::RectShape {
+            let at = self
+                .labels
+                .iter()
+                .position(|(text, _)| text == needle)
+                .unwrap_or_else(|| panic!("{needle:?} was never painted; got {:?}", self.labels));
+            self.cells[at].clone()
+        }
+    }
+
+    /// The cells this crate's own pickers are built from, at their real
+    /// widths: two long names that are nothing like the same length, which
+    /// is the case per-cell sizing exists for.
+    fn backend_cells(official: bool) -> [Segment<'static>; 2] {
+        [
+            Segment { label: "The official Bitwarden CLI", selected: official },
+            Segment { label: "Deskwarden's built-in client", selected: !official },
+        ]
+    }
+
+    /// One frame of `segments` on `ctx`, with `events` delivered to it.
+    fn run_frame(
+        ctx: &egui::Context,
+        segments: &[Segment<'_>],
+        events: Vec<egui::Event>,
+        live: bool,
+    ) -> PaintedRun {
+        let mut painted = PaintedRun::default();
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 400.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                if live {
+                    painted.pressed = segmented_control(ui, segments);
+                } else {
+                    segmented_control_disabled(ui, segments);
+                }
+            },
+        );
+        for clipped in &output.shapes {
+            collect_run(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    fn collect_run(shape: &egui::Shape, painted: &mut PaintedRun) {
+        match shape {
+            egui::Shape::Rect(rect)
+                if (rect.rect.height() - SEGMENT_HEIGHT).abs() < 0.5 =>
+            {
+                painted.cells.push(rect.clone());
+            }
+            egui::Shape::Text(text) => {
+                let color = text.override_text_color.unwrap_or_else(|| {
+                    text.galley
+                        .job
+                        .sections
+                        .first()
+                        .map(|section| section.format.color)
+                        .unwrap_or(Color32::TRANSPARENT)
+                });
+                painted.labels.push((text.galley.text().to_string(), color));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_run(shape, painted);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Every press test below runs a settling frame first and then the frame
+    // carrying the click, rather than going through a helper that does both.
+    // That is not repetition for its own sake: egui decides what a pointer is
+    // over from the widget rects of the frame BEFORE the one carrying the
+    // press -- a control clicked on its very first frame has never been
+    // anywhere for the pointer to be over -- and each of those tests wants
+    // the settling frame's own painted cells to aim at, so the two frames are
+    // written out where the geometry between them is used.
+
+    /// A press at `pos`, in the three events egui reads one as.
+    fn click_at(pos: Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// **The cells are one pill and not a row of buttons**, which is the
+    /// whole of what this control is for. Two things are asserted together
+    /// because either alone is satisfiable by the wrong picture: that no
+    /// space is left between neighbours, and that they overlap by exactly
+    /// [`SEGMENT_SEAM`] so the two 1px strokes at a join land on one pixel
+    /// rather than painting a seam twice as heavy as the run's outer edge.
+    #[test]
+    fn the_cells_of_a_run_are_joined_rather_than_spaced() {
+        let ctx = ctx_with_fonts();
+        let painted = run_frame(&ctx, &backend_cells(true), Vec::new(), true);
+        assert_eq!(painted.cells.len(), 2, "got {:?}", painted.labels);
+        let (left, right) = (painted.cells[0].rect, painted.cells[1].rect);
+        assert_eq!(
+            left.right() - right.left(),
+            SEGMENT_SEAM,
+            "the cells are {:.1} points apart; a multiple-choice row whose cells do not touch \
+             reads as two independent buttons, and one that merely abuts draws its interior \
+             edge at twice the weight of its outer one",
+            right.left() - left.right()
+        );
+    }
+
+    /// **Every cell in a run is the same height**, so the pill has one top
+    /// edge and one bottom edge rather than a silhouette that steps.
+    #[test]
+    fn every_cell_in_a_run_shares_one_height() {
+        let ctx = ctx_with_fonts();
+        let painted = run_frame(&ctx, &backend_cells(true), Vec::new(), true);
+        for cell in &painted.cells {
+            assert_eq!(cell.rect.height(), SEGMENT_HEIGHT);
+            assert_eq!(cell.rect.top(), painted.cells[0].rect.top(), "a cell sits off the run");
+        }
+    }
+
+    /// **Each cell is measured from its own label**, rather than every cell
+    /// taking the widest one's width: "Card" as wide as "The official
+    /// Bitwarden CLI" would turn a row of alternatives into a row of mostly
+    /// empty boxes.
+    #[test]
+    fn each_cell_is_sized_to_the_words_actually_in_it() {
+        let ctx = ctx_with_fonts();
+        let cells = [
+            Segment { label: "Card", selected: true },
+            Segment { label: "Secure note", selected: false },
+        ];
+        let painted = run_frame(&ctx, &cells, Vec::new(), true);
+        let short = painted.cell("Card").rect.width();
+        let long = painted.cell("Secure note").rect.width();
+        assert!(
+            long > short,
+            "the two cells came out {short:.1} and {long:.1} points wide, so the run is not \
+             measuring the words in it"
+        );
+        // And the padding really is around the text rather than the text
+        // being cropped to a fixed box: the narrower cell still has the
+        // design's breathing room in it.
+        assert!(
+            short > SEGMENT_PADDING,
+            "a cell is narrower than its own padding, so the label has nowhere to sit"
+        );
+    }
+
+    /// **The rounding belongs to the run.** Only the first cell's left
+    /// corners and the last cell's right corners are rounded; the interior
+    /// edges are square, which is what makes the joins read as seams in one
+    /// control rather than as gaps between three.
+    #[test]
+    fn only_the_ends_of_a_run_are_rounded() {
+        let ctx = ctx_with_fonts();
+        let cells = [
+            Segment { label: "Below field", selected: true },
+            Segment { label: "Above", selected: false },
+            Segment { label: "At cursor", selected: false },
+        ];
+        let painted = run_frame(&ctx, &cells, Vec::new(), true);
+        assert_eq!(painted.cells.len(), 3);
+        let corners: Vec<CornerRadius> = painted.cells.iter().map(|c| c.corner_radius).collect();
+        assert_eq!(corners[0].nw, SEGMENT_RADIUS, "the run's leading edge is not rounded");
+        assert_eq!(corners[0].sw, SEGMENT_RADIUS);
+        assert_eq!(corners[0].ne, 0, "the first cell is rounded into the second");
+        assert_eq!(corners[0].se, 0);
+        assert_eq!(
+            corners[1],
+            CornerRadius::ZERO,
+            "a cell in the middle of a run is rounded, so the pill reads as separate buttons"
+        );
+        assert_eq!(corners[2].ne, SEGMENT_RADIUS, "the run's trailing edge is not rounded");
+        assert_eq!(corners[2].se, SEGMENT_RADIUS);
+        assert_eq!(corners[2].nw, 0, "the last cell is rounded into the second");
+        assert_eq!(corners[2].sw, 0);
+    }
+
+    /// A run of one is both ends at once, and rounds all four corners --
+    /// otherwise a picker that happened to offer a single answer would paint
+    /// a box with two square corners and no explanation.
+    #[test]
+    fn a_run_of_one_cell_is_rounded_all_the_way_round() {
+        let ctx = ctx_with_fonts();
+        let painted =
+            run_frame(&ctx, &[Segment { label: "Everything", selected: true }], Vec::new(), true);
+        assert_eq!(painted.cells.len(), 1);
+        assert_eq!(painted.cells[0].corner_radius, CornerRadius::same(SEGMENT_RADIUS));
+    }
+
+    /// **The cell in force is [`BLUE`] behind white**, and the rest are the
+    /// card's own white behind [`INK`]. This is the difference between a
+    /// control that answers the question above it and a row of boxes one of
+    /// which is faintly tinted.
+    #[test]
+    fn the_cell_in_force_is_the_apps_blue_behind_white_text() {
+        let ctx = ctx_with_fonts();
+        let painted = run_frame(&ctx, &backend_cells(true), Vec::new(), true);
+        assert_eq!(painted.cell("The official Bitwarden CLI").fill, BLUE);
+        assert_eq!(painted.label("The official Bitwarden CLI"), Color32::WHITE);
+        assert_eq!(painted.cell("Deskwarden's built-in client").fill, CARD);
+        assert_eq!(painted.label("Deskwarden's built-in client"), INK);
+    }
+
+    /// The outline is the run's, in [`BORDER`] -- except where the run is
+    /// blue, which wears its own fill so the pill's end does not come out
+    /// ringed in grey.
+    #[test]
+    fn the_run_is_outlined_in_the_border_grey_and_the_blue_cell_in_blue() {
+        let ctx = ctx_with_fonts();
+        let painted = run_frame(&ctx, &backend_cells(true), Vec::new(), true);
+        assert_eq!(painted.cell("The official Bitwarden CLI").stroke.color, BLUE);
+        assert_eq!(painted.cell("Deskwarden's built-in client").stroke.color, BORDER);
+        for cell in &painted.cells {
+            assert_eq!(cell.stroke.width, 1.0, "the outline is not a hairline");
+        }
+    }
+
+    /// **The selection follows the argument and nothing else** -- a control
+    /// that painted the first cell blue whatever it was told would pass every
+    /// assertion above.
+    #[test]
+    fn the_blue_moves_to_whichever_cell_is_in_force() {
+        let ctx = ctx_with_fonts();
+        let painted = run_frame(&ctx, &backend_cells(false), Vec::new(), true);
+        assert_eq!(painted.cell("Deskwarden's built-in client").fill, BLUE);
+        assert_eq!(painted.cell("The official Bitwarden CLI").fill, CARD);
+    }
+
+    /// **A press reports the cell it landed on, by index.** The whole point
+    /// of one control rather than a run of buttons is that the caller is
+    /// told which alternative was chosen.
+    #[test]
+    fn pressing_a_cell_reports_that_cell() {
+        let cells = backend_cells(true);
+        let ctx = ctx_with_fonts();
+        let first = run_frame(&ctx, &cells, Vec::new(), true);
+        let target = first.cell("Deskwarden's built-in client").rect.center();
+        let pressed = run_frame(&ctx, &cells, click_at(target), true).pressed;
+        assert_eq!(pressed, Some(1), "the press was reported as {pressed:?}");
+    }
+
+    /// **Pressing the cell already in force is reported too**, rather than
+    /// swallowed here. `prefs_ui`'s backend picker turns that press into a
+    /// no-op deliberately, so that no confirmation appears for a user who
+    /// clicked the client they were already on -- and it can only do that if
+    /// it is told the press happened.
+    #[test]
+    fn pressing_the_cell_already_in_force_is_reported_rather_than_swallowed() {
+        let cells = backend_cells(true);
+        let ctx = ctx_with_fonts();
+        let first = run_frame(&ctx, &cells, Vec::new(), true);
+        let target = first.cell("The official Bitwarden CLI").rect.center();
+        assert_eq!(run_frame(&ctx, &cells, click_at(target), true).pressed, Some(0));
+    }
+
+    /// A frame with no press in it reports none -- the control's answer is
+    /// about this frame and does not latch.
+    #[test]
+    fn a_frame_with_no_press_in_it_reports_nothing() {
+        let cells = backend_cells(true);
+        let ctx = ctx_with_fonts();
+        let first = run_frame(&ctx, &cells, Vec::new(), true);
+        let target = first.cell("The official Bitwarden CLI").rect.center();
+        assert_eq!(run_frame(&ctx, &cells, click_at(target), true).pressed, Some(0));
+        assert_eq!(
+            run_frame(&ctx, &cells, Vec::new(), true).pressed,
+            None,
+            "the press is still being reported a frame later, so a caller would act on it twice"
+        );
+    }
+
+    /// A press that misses the run reports nothing. Without this, a control
+    /// that answered `Some(0)` for every click anywhere would satisfy the
+    /// two tests above.
+    #[test]
+    fn a_press_that_misses_the_run_reports_nothing() {
+        let cells = backend_cells(true);
+        let ctx = ctx_with_fonts();
+        let first = run_frame(&ctx, &cells, Vec::new(), true);
+        let below = Pos2::new(first.cells[0].rect.center().x, first.cells[0].rect.bottom() + 40.0);
+        assert_eq!(run_frame(&ctx, &cells, click_at(below), true).pressed, None);
+    }
+
+    /// **More than one cell may be lit**, because [`Segment::selected`] is a
+    /// flag per cell rather than one index for the run. The Local API key
+    /// form's access pair is the caller this exists for: read and write are
+    /// two halves of one answer, and either, both or neither is a thing a
+    /// user can mean.
+    #[test]
+    fn a_run_can_have_more_than_one_cell_in_force() {
+        let ctx = ctx_with_fonts();
+        let cells =
+            [Segment { label: "Read", selected: true }, Segment { label: "Write", selected: true }];
+        let painted = run_frame(&ctx, &cells, Vec::new(), true);
+        assert_eq!(painted.cell("Read").fill, BLUE);
+        assert_eq!(painted.cell("Write").fill, BLUE);
+    }
+
+    /// ...and none at all, which is the state the key form calls "this key
+    /// may do nothing" and has to be able to show.
+    #[test]
+    fn a_run_can_have_no_cell_in_force() {
+        let ctx = ctx_with_fonts();
+        let cells = [
+            Segment { label: "Read", selected: false },
+            Segment { label: "Write", selected: false },
+        ];
+        let painted = run_frame(&ctx, &cells, Vec::new(), true);
+        for cell in &painted.cells {
+            assert_eq!(cell.fill, CARD, "a cell is lit in a run where nothing was chosen");
+        }
+    }
+
+    /// **The inert run is the live one's geometry exactly**, so a row that is
+    /// ghosted does not change size when whatever ghosted it goes away.
+    #[test]
+    fn the_disabled_run_is_laid_out_exactly_like_the_live_one() {
+        let ctx = ctx_with_fonts();
+        let live = run_frame(&ctx, &backend_cells(true), Vec::new(), true);
+        let inert = run_frame(&ctx, &backend_cells(true), Vec::new(), false);
+        let boxes = |painted: &PaintedRun| -> Vec<Rect> {
+            painted.cells.iter().map(|cell| cell.rect).collect()
+        };
+        assert_eq!(boxes(&live), boxes(&inert));
+    }
+
+    /// **Ghosted, the run still says which answer is in force**, in
+    /// [`BLUE_WASH`] rather than the live control's [`BLUE`]: a run that
+    /// greyed every cell identically would tell the reader they have no
+    /// answer at all, when what is true is that they have this one and
+    /// cannot change it.
+    #[test]
+    fn the_disabled_run_keeps_the_answer_visible_and_greys_every_label() {
+        let ctx = ctx_with_fonts();
+        let painted = run_frame(&ctx, &backend_cells(true), Vec::new(), false);
+        assert_eq!(painted.cell("The official Bitwarden CLI").fill, BLUE_WASH);
+        assert_eq!(painted.cell("Deskwarden's built-in client").fill, CARD);
+        for (label, color) in &painted.labels {
+            assert_eq!(color, &TEXT_GHOST, "{label:?} is not painted as disabled");
+        }
+    }
+
+    /// **Inert, not merely grey.** The disabled run senses hover only, so a
+    /// press on it cannot be reported -- there is no return value to ignore
+    /// and therefore no way for a caller to act on one by accident.
+    ///
+    /// Asserted as a source pin because the property is an ABSENCE: there is
+    /// nothing the disabled control hands back that a frame could read, so
+    /// the only place "it does not sense clicks" is written down is the
+    /// `Sense` it allocates itself with.
+    #[test]
+    fn the_disabled_run_senses_no_click_at_all() {
+        let source = include_str!("theme.rs");
+        let body = source
+            .split("pub fn segmented_control_disabled")
+            .nth(1)
+            .expect("the disabled run is gone");
+        let body = body.split("\r\n}").next().expect("an unterminated function");
+        assert!(
+            body.contains("Sense::hover()"),
+            "the disabled run allocates something other than a hover sense"
+        );
+        assert!(
+            !body.contains("Sense::click()"),
+            "the disabled run senses clicks, so a cell a user cannot change is pressable"
+        );
     }
 }
 
