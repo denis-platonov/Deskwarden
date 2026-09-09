@@ -59,6 +59,20 @@ The item you deleted was open in the detail pane, so the pane closes and
 nothing opens in its place. It used to jump you to whichever item took
 the deleted one's spot.
 
+### Site icons from a server of your own with its own certificate
+
+Preferences → View → **Trust any certificate on your own network**, under
+"Fetch site icons from the sites themselves". Off by default, and it does
+nothing until that row above it is on.
+
+A self-hosted box on your LAN usually serves a certificate this PC has no
+reason to trust, and until now that fetch simply failed and the row kept its
+monogram with nothing saying why. With this on it goes ahead.
+
+It applies to addresses on your own network only — 192.168.x.x, 10.x.x.x,
+localhost and the rest — and only to icons. Certificates are still checked
+for sites out on the internet, and for everything else Deskwarden does.
+
 ### An item's icon can be one you choose
 
 Right-click an item and choose **Select icon...**. Point it at a picture
