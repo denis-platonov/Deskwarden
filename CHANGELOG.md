@@ -43,6 +43,27 @@ Addresses on your own network are unchanged: they are always fetched
 directly, whatever the setting says, because an icon service on the
 internet has no route to them.
 
+### An item's icon can be one you choose
+
+Right-click an item and choose **Select icon...**. Point it at a picture
+on disk or at an address to fetch one from, and that is the icon the item
+wears from then on -- ahead of the one its site offers and ahead of
+anything already cached. It is offered on every item, not only on logins:
+a secure note has no site, which is why giving it a picture is worth
+something.
+
+A picked picture is resized to the size the list draws and re-encoded, so
+what is stored is the picture and nothing else -- no camera data, no
+colour profile, none of what a file off your disk might otherwise carry
+into a field that syncs. Files above 2 MB are refused, and so is anything
+that does not decode as an image; nothing is written when a pick is
+refused.
+
+**Use the automatic icon** appears under it once an item has a chosen
+one, and puts the item back the way it was. **Refresh icon** stays
+available for an icon you gave an address for and disappears for one you
+gave a file -- there is nothing to re-fetch.
+
 ### An icon you don't like can be asked for again
 
 Right-click an item and choose **Refresh icon**. Deskwarden forgets the
