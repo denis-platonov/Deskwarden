@@ -92,6 +92,7 @@
 //! interval and not "when the vault window closes".
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -871,6 +872,272 @@ struct Published {
     status: HotkeyStatus,
 }
 
+// ---------------------------------------------------------------------------
+// Across the process boundary
+// ---------------------------------------------------------------------------
+
+/// The file the daemon writes its shortcut status into, in the config
+/// directory, for a UI process to read.
+///
+/// # Why this exists at all
+///
+/// [`STATUS`] is process-wide, and the two processes that care about it are
+/// not the same one. **The daemon registers every global shortcut** -- one
+/// call, `main`'s `register_fill_hotkeys`, on the thread that pumps the
+/// message queue `WM_HOTKEY` is delivered to -- and **the vault window draws
+/// the Shortcuts page**, in `deskwarden.exe --ui vault`, a process that
+/// registers nothing and never will.
+///
+/// So that page read a `STATUS` that was empty by construction and rendered
+/// the empty answer honestly: *"Deskwarden has not tried to claim CTRL+ALT+B
+/// yet."* Every row, every time, on a machine where the log two lines up said
+/// `the global shortcut for Fill the focused app is registered`. The sentence
+/// was written for the STARTUP window, which runs inside the daemon before
+/// the registration line and where it is true; it became permanent and wrong
+/// the moment the window moved into a process of its own.
+///
+/// # Why a file, and this file
+///
+/// It is the idiom this boundary already uses in the other direction --
+/// `ui_process`'s result, edited-settings and sign-in files, all small files
+/// in the config directory. Nothing here is secret (a chord and whether
+/// Windows granted it), so the "no secrets on a command line" rule that
+/// shapes the outbound half does not bind, and a command line would be stale
+/// the moment a retry changed an answer anyway.
+///
+/// **Not keyed on a pid, unlike every `ui-*.json` beside it.** Those travel
+/// child -> daemon and there may be several children; this travels daemon ->
+/// child and there is exactly one daemon. A pid in the name would be a
+/// filename the reader cannot construct.
+const STATUS_FILE_NAME: &str = "daemon-shortcuts.txt";
+
+/// Where [`STATUS_FILE_NAME`] lives.
+pub fn status_file_path(config_dir: &Path) -> PathBuf {
+    config_dir.join(STATUS_FILE_NAME)
+}
+
+/// This shortcut's name in the status file.
+///
+/// A `match` rather than a derive or an index, so a sixth shortcut is a
+/// compile error here. Positional lines were the alternative and were
+/// rejected: a file written by an older build, or truncated by a full disk,
+/// would then assign each answer to the wrong row silently, which is a worse
+/// failure than not reading it at all.
+fn file_key(which: FillShortcut) -> &'static str {
+    match which {
+        FillShortcut::Picker => "picker",
+        FillShortcut::Username => "username",
+        FillShortcut::Password => "password",
+        FillShortcut::Totp => "totp",
+        FillShortcut::Sequence => "sequence",
+    }
+}
+
+/// This status's word in the status file, and back.
+///
+/// Short stable words rather than `{:?}` output: a `Debug` rendering is a
+/// thing a rename changes without anybody noticing, and this pair is a format
+/// two builds of this app can meet over -- a daemon left running across an
+/// upgrade is exactly the case.
+fn status_word(status: HotkeyStatus) -> &'static str {
+    match status {
+        HotkeyStatus::Armed => "armed",
+        HotkeyStatus::Unbound => "unbound",
+        HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram) => "taken",
+        HotkeyStatus::Unavailable(Unavailable::NoManager) => "no-manager",
+        HotkeyStatus::Unavailable(Unavailable::Refused) => "refused",
+        HotkeyStatus::Unavailable(Unavailable::NotYetAttempted) => "not-yet",
+    }
+}
+
+/// [`status_word`] read back. An unknown word answers `None`, and the caller
+/// drops that line rather than the file -- a word a newer daemon writes must
+/// cost one row, not five.
+fn status_from_word(word: &str) -> Option<HotkeyStatus> {
+    Some(match word {
+        "armed" => HotkeyStatus::Armed,
+        "unbound" => HotkeyStatus::Unbound,
+        "taken" => HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram),
+        "no-manager" => HotkeyStatus::Unavailable(Unavailable::NoManager),
+        "refused" => HotkeyStatus::Unavailable(Unavailable::Refused),
+        "not-yet" => HotkeyStatus::Unavailable(Unavailable::NotYetAttempted),
+        _ => return None,
+    })
+}
+
+/// What this process would write into the status file: one line per
+/// shortcut, `key<TAB>chord<TAB>status`, with an empty chord field for a row
+/// that has none.
+///
+/// Tab-separated text rather than JSON because [`Chord`] has no `serde`
+/// implementation and deliberately so -- see its doc, which keeps the
+/// persisted spelling of a chord out of a third-party crate's hands. The
+/// spelling here is [`Chord::to_string`] and [`Chord::parse`], the same pair
+/// `settings.json` already round-trips through, so this file cannot come to
+/// disagree with that one about what `CTRL+ALT+B` means.
+///
+/// Answers `None` when nothing has been published, which is the daemon before
+/// its first registration pass. Writing "not-yet" five times then would put a
+/// claim in a file for a reader to adopt, and the reader's own default
+/// already says exactly that.
+pub fn status_report() -> Option<String> {
+    Some(encode_status(&STATUS.lock().ok().and_then(|held| *held)?))
+}
+
+/// [`status_report`]'s encoding half, against a value rather than the static.
+///
+/// Split out for [`parse_status_report`]'s reason and the same one:
+/// [`STATUS`] is process-wide and this crate's tests share a process, so a
+/// test that drove the real static would be a test that changed what every
+/// other test in the run observes.
+fn encode_status(all: &[Published; FillShortcut::COUNT]) -> String {
+    let mut out = String::new();
+    for which in FillShortcut::ALL {
+        let entry = all[which.index()];
+        let chord = entry.chord.map(|c| c.to_string()).unwrap_or_default();
+        out.push_str(file_key(which));
+        out.push('\t');
+        out.push_str(&chord);
+        out.push('\t');
+        out.push_str(status_word(entry.status));
+        out.push('\n');
+    }
+    out
+}
+
+/// Writes [`status_report`] into the config directory, for a UI process to
+/// adopt.
+///
+/// **Called by the daemon and only by the daemon.** A failure is logged and
+/// otherwise ignored: the cost is a Shortcuts page that says nothing has been
+/// attempted, which is what it said before this file existed, and it is not
+/// worth failing a launch over.
+pub fn publish_status_file(config_dir: &Path) {
+    let Some(report) = status_report() else { return };
+    // **Written only when it has changed**, because the caller is the
+    // daemon's main loop and that loop turns many times a second. Five
+    // shortcuts that are all armed produce the same forty bytes forever, and
+    // writing them at the loop's rate would be a disk write per iteration for
+    // a value that changes on a rebind, a retry that succeeded, or never.
+    //
+    // The remembered copy is per process and starts empty, so the first
+    // publish of a run always writes -- which is what makes a file left by a
+    // previous run get replaced rather than trusted.
+    static LAST_WRITTEN: Mutex<Option<String>> = Mutex::new(None);
+    if let Ok(mut last) = LAST_WRITTEN.lock() {
+        if last.as_deref() == Some(report.as_str()) {
+            return;
+        }
+        *last = Some(report.clone());
+    }
+    let path = status_file_path(config_dir);
+    if let Err(e) = std::fs::write(&path, report) {
+        log::debug!(
+            "could not write the shortcut status to {} ({e}); a vault window opened from here \
+             will say the shortcuts have not been attempted",
+            path.display()
+        );
+    }
+}
+
+/// Removes the status file.
+///
+/// The daemon calls this on its way out, because the answers in it are only
+/// true while the process that registered those chords is alive. A file left
+/// behind would tell the next UI process that shortcuts are armed in a
+/// process that has exited.
+pub fn forget_status_file(config_dir: &Path) {
+    let path = status_file_path(config_dir);
+    if let Err(e) = std::fs::remove_file(&path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::debug!("could not remove {} ({e})", path.display());
+        }
+    }
+}
+
+/// Reads the daemon's status file into this process's [`STATUS`].
+///
+/// **Called by a UI process and only by a UI process.** Calling it in the
+/// daemon would overwrite what that process actually knows with a copy of
+/// what it wrote a moment ago, and -- on the startup window, which runs
+/// inside the daemon *before* the first registration pass -- it would replace
+/// an honest "nothing has been attempted" with a stale answer from the
+/// previous run.
+///
+/// Adopts wholesale and announces nothing: [`announce`]'s log lines are the
+/// registering process's to write, and a second copy of them from every
+/// window that happens to be open would say the shortcut had just been
+/// claimed each time.
+///
+/// A missing file, an unreadable one, or a line this build does not
+/// understand each cost exactly what they should -- that row keeps whatever
+/// this process already had, which for a UI process is the honest default.
+pub fn adopt_status_file(config_dir: &Path) {
+    let path = status_file_path(config_dir);
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    adopt_status_report(&text);
+}
+
+/// [`adopt_status_file`]'s parsing half, against text rather than a path, so
+/// the format can be driven from a test without a config directory.
+pub fn adopt_status_report(text: &str) {
+    let parsed = parse_status_report(text);
+    if parsed.is_empty() {
+        return;
+    }
+    if let Ok(mut held) = STATUS.lock() {
+        let all = held.get_or_insert(
+            [Published {
+                chord: None,
+                status: HotkeyStatus::Unavailable(Unavailable::NotYetAttempted),
+            }; FillShortcut::COUNT],
+        );
+        for (which, entry) in parsed {
+            all[which.index()] = entry;
+        }
+    }
+}
+
+/// [`adopt_status_report`]'s reading half, answering the rows it understood.
+///
+/// **Pure, and that is why it is separate.** [`STATUS`] is process-wide and
+/// this crate's tests share one process, so a test driving the real static
+/// would change what every other test in the run observes -- the same reason
+/// `register_all`'s tests publish nowhere. Every rule about what a malformed
+/// file costs is in here and is asserted directly.
+fn parse_status_report(text: &str) -> Vec<(FillShortcut, Published)> {
+    let mut parsed: Vec<(FillShortcut, Published)> = Vec::new();
+    for line in text.lines() {
+        // `splitn(3, ..)`, so a chord that ever grew a tab could not silently
+        // become a status word. It cannot today -- `Chord::to_string` writes
+        // `+`-joined names -- and this is the cheap way for that to stay
+        // true.
+        let mut fields = line.splitn(3, '\t');
+        let (Some(key), Some(chord), Some(word)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Some(which) = FillShortcut::ALL.into_iter().find(|w| file_key(*w) == key) else {
+            continue;
+        };
+        let Some(status) = status_from_word(word.trim()) else { continue };
+        // An empty field is a row with no chord; a non-empty one this build
+        // cannot parse is dropped WITH its row, because a status shown
+        // against the wrong chord is worse than no status.
+        let chord = if chord.is_empty() {
+            None
+        } else {
+            match Chord::parse(chord) {
+                Some(chord) => Some(chord),
+                None => continue,
+            }
+        };
+        parsed.push((which, Published { chord, status }));
+    }
+    parsed
+}
+
 /// What the tray and the first window call this shortcut's chord.
 ///
 /// **`&str`-shaped answer for a cleared row**, rather than an `Option` every
@@ -1566,5 +1833,230 @@ mod tests {
         // status that somehow reached the main loop would go and find out
         // rather than sit there being not-yet-attempted forever.
         assert!(should_retry(not_attempted, RETRY_EVERY));
+    }
+}
+
+#[cfg(test)]
+mod status_file_tests {
+    //! The daemon -> UI-process hop for the Shortcuts page.
+    //!
+    //! **The defect these exist for**, reported against a running build:
+    //! the page said *"Deskwarden has not tried to claim CTRL+ALT+B yet"* on
+    //! a machine whose log, seconds earlier, said `the global shortcut for
+    //! Fill the focused app is registered`. Both were true of their own
+    //! process. `STATUS` is process-wide, the daemon is the only process that
+    //! registers a chord, and the vault window -- which draws the page --
+    //! registers none, so it read an empty status and rendered the honest
+    //! empty answer forever.
+    //!
+    //! Everything here drives the pure encode/parse pair rather than
+    //! `STATUS` itself. That static is shared by every test in this process,
+    //! so a test that wrote it would change what the rest of the run
+    //! observes -- the same reason `register_all`'s tests publish nowhere.
+
+    use super::*;
+
+    fn armed(chord: &str) -> Published {
+        Published { chord: Chord::parse(chord), status: HotkeyStatus::Armed }
+    }
+
+    fn five() -> [Published; FillShortcut::COUNT] {
+        [
+            armed("CTRL+ALT+B"),
+            armed("CTRL+ALT+U"),
+            Published {
+                chord: Chord::parse("CTRL+ALT+P"),
+                status: HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram),
+            },
+            Published { chord: None, status: HotkeyStatus::Unbound },
+            Published {
+                chord: Chord::parse("CTRL+ALT+S"),
+                status: HotkeyStatus::Unavailable(Unavailable::Refused),
+            },
+        ]
+    }
+
+    /// **Everything the daemon knows survives the trip**, chord and status
+    /// alike, for every row including the two that are not simply armed.
+    ///
+    /// The round trip is what the feature IS: the page on the other side
+    /// renders exactly these two fields, so a chord that arrived without its
+    /// status -- or a status against the wrong chord -- is the whole bug back
+    /// in a new shape.
+    #[test]
+    fn every_row_round_trips_through_the_file_format() {
+        let written = encode_status(&five());
+        let read = parse_status_report(&written);
+        assert_eq!(read.len(), FillShortcut::COUNT, "read back {read:?}");
+        for which in FillShortcut::ALL {
+            let (_, got) = read
+                .iter()
+                .find(|(w, _)| *w == which)
+                .unwrap_or_else(|| panic!("{which:?} is missing from {written:?}"));
+            assert_eq!(*got, five()[which.index()], "{which:?} came back changed");
+        }
+    }
+
+    /// **A cleared row keeps its `None`**, and does not come back as a chord
+    /// this build invented. `Unbound` with a chord beside it would be the
+    /// page drawing a shortcut the user deliberately cleared.
+    #[test]
+    fn a_cleared_row_comes_back_cleared() {
+        let read = parse_status_report(&encode_status(&five()));
+        let (_, totp) = read.iter().find(|(w, _)| *w == FillShortcut::Totp).expect("the row");
+        assert_eq!(totp.chord, None);
+        assert_eq!(totp.status, HotkeyStatus::Unbound);
+    }
+
+    /// **The rows are keyed, not positional.** A file whose lines arrive in
+    /// another order -- or with a row missing, which is what a newer daemon
+    /// writing a sixth shortcut looks like from here -- must not shift every
+    /// answer onto its neighbour.
+    #[test]
+    fn the_rows_are_read_by_name_and_not_by_position() {
+        let text = "sequence\tCTRL+ALT+S\trefused\npicker\tCTRL+ALT+B\tarmed\n";
+        let read = parse_status_report(text);
+        assert_eq!(read.len(), 2);
+        let (_, picker) =
+            read.iter().find(|(w, _)| *w == FillShortcut::Picker).expect("the picker row");
+        assert_eq!(picker.status, HotkeyStatus::Armed);
+        assert_eq!(picker.chord, Chord::parse("CTRL+ALT+B"));
+    }
+
+    /// **A line this build cannot read costs that line and nothing else.**
+    ///
+    /// Three shapes, one rule: a status word from a newer daemon, a chord
+    /// spelling this build does not know, and a line with a field missing.
+    /// The alternative -- dropping the file on the first bad line -- would
+    /// turn one unknown word from a later version into a page that reports
+    /// nothing at all, which is the exact failure being fixed.
+    #[test]
+    fn one_unreadable_line_does_not_cost_the_others() {
+        let text = "picker\tCTRL+ALT+B\tarmed\n\
+                    username\tCTRL+ALT+U\tsomething-new\n\
+                    password\tCTRL+ALT+NOPE\tarmed\n\
+                    totp\tarmed\n\
+                    sequence\t\tunbound\n";
+        let read = parse_status_report(text);
+        let names: Vec<FillShortcut> = read.iter().map(|(w, _)| *w).collect();
+        assert_eq!(
+            names,
+            vec![FillShortcut::Picker, FillShortcut::Sequence],
+            "read {read:?}"
+        );
+    }
+
+    /// **A status is never shown against a chord it does not belong to.** An
+    /// unparseable chord drops its whole row rather than becoming `None`:
+    /// `None` means *cleared*, and reporting a row the user has bound as
+    /// cleared is a different lie, not a smaller one.
+    #[test]
+    fn an_unreadable_chord_drops_its_row_rather_than_clearing_it() {
+        let read = parse_status_report("picker\tCTRL+ALT+NOPE\tarmed\n");
+        assert!(read.is_empty(), "read {read:?}");
+    }
+
+    /// **An empty file adopts nothing**, so a UI process keeps the honest
+    /// default rather than being handed five rows of silence.
+    #[test]
+    fn an_empty_report_says_nothing() {
+        assert!(parse_status_report("").is_empty());
+        assert!(parse_status_report("\n\n").is_empty());
+        assert!(parse_status_report("nonsense").is_empty());
+    }
+
+    /// **Every status word survives its own round trip**, including the two
+    /// nothing writes today.
+    ///
+    /// `not-yet` is written when a rebind has published one row and not the
+    /// others, and `no-manager` when Windows gave the daemon no hook at all.
+    /// Both are states the page has a sentence for, so both have to arrive
+    /// intact -- and a `Debug` rendering, which is what this pair replaced,
+    /// is a thing a rename changes silently.
+    #[test]
+    fn every_status_word_round_trips() {
+        for status in [
+            HotkeyStatus::Armed,
+            HotkeyStatus::Unbound,
+            HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram),
+            HotkeyStatus::Unavailable(Unavailable::NoManager),
+            HotkeyStatus::Unavailable(Unavailable::Refused),
+            HotkeyStatus::Unavailable(Unavailable::NotYetAttempted),
+        ] {
+            assert_eq!(
+                status_from_word(status_word(status)),
+                Some(status),
+                "{status:?} did not survive its own word"
+            );
+        }
+    }
+
+    /// **The five keys are distinct**, so no two rows can overwrite each
+    /// other. Trivially true today and the kind of thing a copy-pasted arm
+    /// breaks.
+    #[test]
+    fn the_five_keys_are_five_different_words() {
+        let mut keys: Vec<&str> = FillShortcut::ALL.into_iter().map(file_key).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), FillShortcut::COUNT);
+    }
+
+    /// **The path is in the config directory and is not keyed on a pid.**
+    ///
+    /// Every `ui-*.json` beside it carries the child's pid, because those
+    /// travel child -> daemon and there may be several children. This one
+    /// travels daemon -> child and there is exactly one daemon; a pid in the
+    /// name would be a filename the reader cannot construct.
+    #[test]
+    fn the_status_file_sits_in_the_config_directory_under_a_fixed_name() {
+        let path = status_file_path(std::path::Path::new("C:\\cfg"));
+        assert_eq!(path.parent(), Some(std::path::Path::new("C:\\cfg")));
+        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some(STATUS_FILE_NAME));
+        assert!(
+            !STATUS_FILE_NAME.contains("{pid}") && !STATUS_FILE_NAME.contains('%'),
+            "the status file's name is not fixed, so a UI process cannot find it"
+        );
+    }
+
+    /// **Only the daemon writes it, and only a UI process reads it.**
+    ///
+    /// A source pin because the rule is about which process calls what, and
+    /// no type can carry that. `publish_status_file` in the window would have
+    /// it overwrite the daemon's answers with its own empty ones;
+    /// `adopt_status_file` in the daemon would replace what that process
+    /// actually knows with a copy of what it just wrote -- and, in the
+    /// startup window that runs inside it before the first registration pass,
+    /// with a stale answer from the previous run.
+    ///
+    /// Needles split with `concat!` so they cannot match their own
+    /// declaration. Do not re-join them.
+    #[test]
+    fn the_writer_is_the_daemon_and_the_reader_is_the_window() {
+        let main_rs = include_str!("main.rs");
+        let window = include_str!("vault_window/mod.rs");
+        let publish = concat!("publish_status_", "file(");
+        let adopt = concat!("adopt_status_", "file(");
+        assert!(
+            main_rs.contains(publish),
+            "the daemon no longer writes the shortcut status, so the Shortcuts page in a UI \
+             process has nothing to read and is back to saying nothing was attempted"
+        );
+        assert!(
+            !main_rs.contains(adopt),
+            "the daemon adopts its own status file, which overwrites what it knows with what \
+             it wrote -- and in the startup window, which runs inside it before the first \
+             registration pass, with the previous run's answers"
+        );
+        assert!(
+            window.contains(adopt),
+            "the vault window no longer adopts the daemon's status, so its Shortcuts page \
+             reads a status this process never publishes"
+        );
+        assert!(
+            !window.contains(publish),
+            "the vault window writes the status file, overwriting the daemon's real answers \
+             with the empty ones of a process that registers no chords"
+        );
     }
 }

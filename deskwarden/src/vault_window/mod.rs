@@ -249,6 +249,14 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(500);
 /// Roughly one 60Hz refresh.
 const LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
+/// How often this process re-reads the daemon's shortcut status file while
+/// the Preferences modal is up.
+///
+/// A disk read, so it is not done per frame; a second is well inside
+/// [`crate::hotkey::RETRY_EVERY`], which is the rate at which the answer it
+/// carries can actually change. Nothing reads it while the modal is shut.
+const SHORTCUT_STATUS_REREAD: Duration = Duration::from_secs(1);
+
 /// The size and position to open this window at, given whatever the last
 /// session recorded and the monitors that exist now.
 ///
@@ -706,6 +714,10 @@ pub fn build_frame_with_search(
     // The gear's modal, `Some` while it is up. `prefs_ui` owns the state and
     // all of the drawing; this window owns only "is it open".
     let mut prefs: Option<crate::prefs_ui::PrefsState> = None;
+    // When the daemon's shortcut status was last adopted, so the read is
+    // throttled to `SHORTCUT_STATUS_REREAD` rather than run per frame. `None`
+    // until the modal is first opened, so opening it adopts immediately.
+    let mut shortcut_status_read_at: Option<Instant> = None;
     // `settings_path` is read below to place the window and again after the
     // loop to save its geometry, so the closure gets its own copy to seed the
     // modal from.
@@ -2349,6 +2361,33 @@ pub fn build_frame_with_search(
         // that is meant to be blocking it -- and Ctrl+N would drop the user
         // into a new-item form they cannot see. `keyboard_shortcuts_enabled`
         // is the decision, made where a test can reach it.
+        // **The daemon's shortcut answers, adopted while the page that shows
+        // them is open.**
+        //
+        // `hotkey::STATUS` is process-wide and THIS process registers no
+        // chords -- `main`'s one `register_fill_hotkeys` runs in the daemon,
+        // on the thread whose queue `WM_HOTKEY` reaches. So the Shortcuts
+        // page here read an empty status and said "Deskwarden has not tried
+        // to claim CTRL+ALT+B yet" on a machine where the daemon's log said
+        // it was registered. That sentence is true of the STARTUP window,
+        // which runs inside the daemon before the registration line; it
+        // became permanent and wrong when the window moved into a process of
+        // its own.
+        //
+        // Gated on the modal being open, and throttled, because it is a disk
+        // read: nothing reads a shortcut's status while the modal is shut,
+        // and once a second is well inside `hotkey::RETRY_EVERY`, which is
+        // the rate the answer can actually change at.
+        if prefs.is_some() {
+            let due = shortcut_status_read_at
+                .is_none_or(|at: Instant| at.elapsed() >= SHORTCUT_STATUS_REREAD);
+            if due {
+                shortcut_status_read_at = Some(Instant::now());
+                if let Some(dir) = settings_path_for_prefs.as_deref().and_then(|p| p.parent()) {
+                    crate::hotkey::adopt_status_file(dir);
+                }
+            }
+        }
         let shortcuts = keyboard_shortcuts_enabled(prefs.is_some());
         let (ctrl_k, ctrl_l, ctrl_n, send_record_chord, add_totp_chord) = ui.ctx().input(|i| {
             (

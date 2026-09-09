@@ -2925,6 +2925,14 @@ fn main() {
                 // a quit is not a restart, and nothing is coming back. See
                 // `ui_process::farewell_to_an_open_window`.
                 ui_windows.close_on_quit(&config_dir);
+                // **And the shortcut status, because it is only true while
+                // this process is alive.** The chords in it are registered to
+                // THIS process's message queue and die with it; a file left
+                // behind would tell the next UI process that they are armed
+                // in a process that has exited. Last, after the window is
+                // closed, so a window still drawing the Shortcuts page cannot
+                // adopt the file between the removal and its own death.
+                hotkey::forget_status_file(&config_dir);
                 std::process::exit(0);
             }
 
@@ -3518,6 +3526,21 @@ fn main() {
             estate.settings.shortcuts.as_chords(),
             Instant::now(),
         );
+        // **And then the answer is written down, because the page that shows
+        // it is in another process.** `hotkey::STATUS` is process-wide and
+        // this is the only process that ever registers a chord; the Shortcuts
+        // page is drawn by `deskwarden.exe --ui vault`, which registers
+        // nothing, so without this it reads an empty status and tells the
+        // user nothing has been attempted -- on a machine where the log one
+        // line up says the shortcut is registered.
+        //
+        // Here rather than inside `hotkey::publish`, which has no config
+        // directory and should not grow one: this is the loop that already
+        // owns the two lines above, and every way a status can change --
+        // the first pass, a retry that succeeded, a rebind -- goes through
+        // one of them. The write is skipped entirely before the first
+        // publish, and is a few dozen bytes when it happens.
+        hotkey::publish_status_file(&config_dir);
 
         if let Some(shortcut) = hotkey::fill_hotkey_pressed(&fill_hotkey) {
             if let Some((item_id, hwnd)) = pending_hotkey_fill.take() {
