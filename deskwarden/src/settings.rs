@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
 
+use crate::app::FillShortcut;
+use crate::hotkey::Chord;
+
 /// Auto-lock timeout used when the stored value is absent. Matches the
 /// constant this replaces in `vault_window`, which was marked "hardcoded
 /// until the 3e preferences window exists".
@@ -759,6 +762,246 @@ pub fn config_dir() -> Option<std::path::PathBuf> {
 fn default_true() -> bool {
     true
 }
+
+// ---------------------------------------------------------------------------
+// The global shortcuts
+// ---------------------------------------------------------------------------
+
+/// **What each of the five global shortcuts is bound to.**
+///
+/// # Three states, and the file has to tell them apart
+///
+/// A row can be *bound to a chord*, *cleared by the user*, or *not mentioned
+/// in the file at all* -- and the third is not the second. A `settings.json`
+/// written before this feature existed mentions none of them, and reading that
+/// as "the user cleared all five" would silently take `CTRL+ALT+B` off every
+/// existing install on upgrade, which is the one thing an added field must not
+/// do. So:
+///
+/// * **absent** -> the default for that row. Every existing file is this, and
+///   every existing file therefore keeps working exactly as it did.
+/// * **`""`** -> cleared. An empty string rather than JSON `null` because
+///   `Option<Option<_>>` does not distinguish absent from null under serde's
+///   derive without a bespoke `deserialize_with`, and a preference file's
+///   meaning must not rest on that distinction being remembered.
+/// * **anything [`Chord::parse`] rejects** -> the default for that row, and the
+///   row is *live*, not cleared. A hand-edited typo costs the user their
+///   customisation for that one shortcut, which is recoverable in the UI; the
+///   alternative -- failing the parse -- costs them the whole file, and
+///   [`Settings::load`] answers an unparseable file by falling back to
+///   defaults for *everything*, accounts included (see
+///   [`Settings::accounts_unreadable`]). One bad chord may not do that.
+///
+/// The leniency is why this is [`RawShortcuts`] plus a `From` rather than a
+/// derived `Deserialize`: `From` cannot fail, which is precisely the
+/// guarantee wanted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RawShortcuts", into = "RawShortcuts")]
+pub struct Shortcuts {
+    /// `CTRL+ALT+B` -- the one that already existed.
+    pub picker: Option<Chord>,
+    pub username: Option<Chord>,
+    pub password: Option<Chord>,
+    pub totp: Option<Chord>,
+    pub sequence: Option<Chord>,
+}
+
+/// **The defaults, and why these five combinations.**
+///
+/// The picker is `CTRL+ALT+B` because it already was and the owner kept it;
+/// the other four are chosen to sit in the same family, so that a user who
+/// knows one knows where the others are, and to be free on a machine with
+/// nothing unusual on it. `RegisterHotKey` is first-come-first-served across
+/// the logon session (see [`crate::hotkey`]), so a default that collides on a
+/// stock machine is not a bad style choice, it is a shortcut that does not
+/// work out of the box and reports a conflict the user did not create.
+///
+/// **Why `CTRL+ALT+<letter>` at all.** Windows itself reserves no
+/// `Ctrl+Alt+<letter>` combination. The combinations it does take are the
+/// `Win` ones (`Win+L`, `Win+D`, `Win+E`, `Win+R`, `Win+Tab`), the shell's
+/// `Ctrl+Shift+Esc` and `Ctrl+Esc`, `Alt+Tab`, and `Ctrl+Alt+Del` -- which is
+/// the secure attention sequence and cannot be registered by anything at all.
+/// None of those is a `Ctrl+Alt+<letter>`, and `Ctrl+Alt+B` has been running
+/// in this app for its whole life as the proof.
+///
+/// **The known third-party claimants on this family, avoided by choice of
+/// letter and key type:**
+///
+/// * `Ctrl+Alt+A` is **KeePass's** default global auto-type chord, and KeePass
+///   is exactly the kind of program that will be installed beside this one. It
+///   is also by far the best mnemonic for "auto-type the saved sequence",
+///   which is why it is worth saying out loud that it was rejected: the
+///   sequence shortcut is `CTRL+ALT+S`.
+/// * `Ctrl+Alt+F1`-`F4` and `Ctrl+Alt+<arrow>` are the Intel and AMD display
+///   drivers' screen-rotation and mode hotkeys, and are registered at logon on
+///   a great many stock laptops. No default here is a function key or an
+///   arrow.
+///
+/// **The letters are mnemonic and unambiguous**: `B` (the one that was),
+/// `U`sername, `P`assword, `T`OTP, `S`equence. Nothing shares a letter, so the
+/// five are learnable as one set.
+///
+/// **The known cost, stated rather than hidden:** on keyboard layouts where
+/// the right-hand `Alt` is `AltGr`, Windows synthesises `Ctrl+Alt` from it, so
+/// `Ctrl+Alt+<letter>` can shadow an `AltGr` character (`AltGr+S` is `ß` on a
+/// US-International layout). That is a property of the family the owner
+/// already chose for the picker, it applies to `Ctrl+Alt+B` today, and every
+/// one of these five is remappable from Preferences > Shortcuts -- which is
+/// the answer, and is the reason the page exists rather than a reason to pick
+/// a different family for four rows and leave the fifth behind.
+impl Default for Shortcuts {
+    fn default() -> Self {
+        use crate::hotkey::Chord;
+        use global_hotkey::hotkey::{Code, Modifiers};
+        let ctrl_alt = Modifiers::CONTROL | Modifiers::ALT;
+        Self {
+            picker: Some(Chord::new(ctrl_alt, Code::KeyB)),
+            username: Some(Chord::new(ctrl_alt, Code::KeyU)),
+            password: Some(Chord::new(ctrl_alt, Code::KeyP)),
+            totp: Some(Chord::new(ctrl_alt, Code::KeyT)),
+            sequence: Some(Chord::new(ctrl_alt, Code::KeyS)),
+        }
+    }
+}
+
+impl Shortcuts {
+    /// One row's chord, by the shortcut it belongs to.
+    pub fn chord(&self, which: FillShortcut) -> Option<Chord> {
+        match which {
+            FillShortcut::Picker => self.picker,
+            FillShortcut::Username => self.username,
+            FillShortcut::Password => self.password,
+            FillShortcut::Totp => self.totp,
+            FillShortcut::Sequence => self.sequence,
+        }
+    }
+
+    /// Binds one row, or clears it with `None`.
+    pub fn set(&mut self, which: FillShortcut, chord: Option<Chord>) {
+        let slot = match which {
+            FillShortcut::Picker => &mut self.picker,
+            FillShortcut::Username => &mut self.username,
+            FillShortcut::Password => &mut self.password,
+            FillShortcut::Totp => &mut self.totp,
+            FillShortcut::Sequence => &mut self.sequence,
+        };
+        *slot = chord;
+    }
+
+    /// The five, in [`FillShortcut::ALL`]'s order -- the shape
+    /// [`crate::hotkey::register_fill_hotkeys`] registers and
+    /// [`crate::hotkey::rebind_if_changed`] reconciles against.
+    pub fn as_chords(&self) -> [Option<Chord>; FillShortcut::COUNT] {
+        FillShortcut::ALL.map(|which| self.chord(which))
+    }
+
+    /// **Which other row already holds `chord`**, or `None` if it is free.
+    ///
+    /// `except` is the row being edited, so re-pressing a row's own current
+    /// chord is not a conflict with itself.
+    ///
+    /// This is one of the two things the capture widget can refuse on its own
+    /// (the other is a bare key); it is here rather than in `prefs_ui` because
+    /// it is a fact about this record and because `main` is entitled to ask it
+    /// of a hand-edited file. Two rows on one chord is not merely untidy: the
+    /// second `RegisterHotKey` fails with `AlreadyRegistered`, and the app
+    /// would be reporting a conflict *with itself* as though another program
+    /// had taken the keys.
+    pub fn conflict(&self, except: FillShortcut, chord: Chord) -> Option<FillShortcut> {
+        FillShortcut::ALL
+            .into_iter()
+            .find(|which| *which != except && self.chord(*which) == Some(chord))
+    }
+}
+
+/// [`Shortcuts`] as it is written to and read from `settings.json`: five
+/// optional strings.
+///
+/// Every field is `#[serde(default)]`, so a file that mentions none of them
+/// -- which is every file written before this feature -- deserializes to five
+/// `None`s and thence, through [`From`], to the five defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RawShortcuts {
+    #[serde(default)]
+    picker: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    /// **`pass` on disk, and the shorter word is not an abbreviation for
+    /// tidiness.**
+    ///
+    /// `settings.json` is scanned for the literal string `password` by
+    /// `mentions_a_secret`, and the process-boundary result file is scanned
+    /// for it by `ui_process`'s own guard. Both are deliberately blunt
+    /// substring checks -- that bluntness is what makes them impossible to
+    /// tiptoe past -- and both would fire on a *key name*, over a file that
+    /// contains no secret at all.
+    ///
+    /// The house rule is that a guard which fires is reporting something real
+    /// and is never weakened to accommodate the thing that fired it. Widening
+    /// those scans to allow `"password":` as a key would be exactly that, and
+    /// would leave a hole shaped like every future field that spells a secret
+    /// as a key. So the key is `pass`, and this is the note saying why.
+    /// `Settings::reveal_totp_seed` is named `seed` rather than `secret` for
+    /// the same reason, and records it the same way.
+    #[serde(default, rename = "pass")]
+    password: Option<String>,
+    #[serde(default)]
+    totp: Option<String>,
+    #[serde(default)]
+    sequence: Option<String>,
+}
+
+/// The lenient read. See [`Shortcuts`]'s doc for the three states.
+///
+/// Infallible on purpose: this is the only conversion between the file and the
+/// record, so "one unreadable chord cannot cost the user their accounts" is a
+/// property of the *type* rather than a rule a `Deserialize` impl has to keep
+/// remembering.
+impl From<RawShortcuts> for Shortcuts {
+    fn from(raw: RawShortcuts) -> Self {
+        let default = Shortcuts::default();
+        let read = |text: Option<String>, fallback: Option<Chord>| match text {
+            None => fallback,
+            // The cleared marker. Whitespace counts as cleared too: a hand
+            // edit that left a space behind meant to clear the row.
+            Some(text) if text.trim().is_empty() => None,
+            Some(text) => match Chord::parse(text.trim()) {
+                Some(chord) => Some(chord),
+                None => {
+                    log::warn!(
+                        "settings.json has {text:?} where a keyboard shortcut should be; \
+                         using the default for that shortcut instead"
+                    );
+                    fallback
+                }
+            },
+        };
+        Self {
+            picker: read(raw.picker, default.picker),
+            username: read(raw.username, default.username),
+            password: read(raw.password, default.password),
+            totp: read(raw.totp, default.totp),
+            sequence: read(raw.sequence, default.sequence),
+        }
+    }
+}
+
+/// The write. Every row is written, including the cleared ones -- a cleared
+/// row written as an absent field would read back on the next launch as the
+/// default, which is the app undoing something the user did.
+impl From<Shortcuts> for RawShortcuts {
+    fn from(shortcuts: Shortcuts) -> Self {
+        let write = |chord: Option<Chord>| Some(chord.map(|c| c.to_string()).unwrap_or_default());
+        Self {
+            picker: write(shortcuts.picker),
+            username: write(shortcuts.username),
+            password: write(shortcuts.password),
+            totp: write(shortcuts.totp),
+            sequence: write(shortcuts.sequence),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -838,6 +1081,19 @@ pub struct Settings {
     /// fills from. If it did not, `false` would mean autofill was off
     /// entirely, which is the opposite of the fallback it is meant to be.
     pub prompt_on_match: bool,
+    /// **The five global shortcuts**, and the record that survives a
+    /// `settings.json` written before any of them existed.
+    ///
+    /// Directly under [`Self::prompt_on_match`] because that field's own doc
+    /// ends by naming the fill hotkey as what is left when the prompt is off,
+    /// and this is the record that says what the fill hotkey *is*. They were
+    /// one thought split across a field and a hardcoded constant; they are two
+    /// fields now.
+    ///
+    /// See [`Shortcuts`] for the defaults and for how an absent field, a
+    /// cleared binding and an unreadable one are told apart -- which is the
+    /// whole of what this type exists to get right.
+    pub shortcuts: Shortcuts,
     /// Whether saved passwords are checked against known breaches.
     ///
     /// `false` (the default, and what an older `settings.json` without this
@@ -1396,6 +1652,7 @@ impl Default for Settings {
             keep_backend_running: true,
             keep_ui_loaded: false,
             prompt_on_match: true,
+            shortcuts: Shortcuts::default(),
             check_breaches: false,
             fetch_icons: true,
             fetch_icons_direct: false,
@@ -1536,6 +1793,7 @@ impl Settings {
             keep_backend_running,
             keep_ui_loaded,
             prompt_on_match,
+            shortcuts,
             check_breaches,
             fetch_icons,
             fetch_icons_direct,
@@ -1581,6 +1839,11 @@ impl Settings {
         on_disk.keep_backend_running = *keep_backend_running;
         on_disk.keep_ui_loaded = *keep_ui_loaded;
         on_disk.prompt_on_match = *prompt_on_match;
+        // The Shortcuts page is on the preferences window, so this writer owns
+        // the five bindings exactly as it owns the toggles above -- and it
+        // must, because a cleared row that was not written back would come
+        // back on the next launch as its default.
+        on_disk.shortcuts = *shortcuts;
         on_disk.check_breaches = *check_breaches;
         on_disk.fetch_icons = *fetch_icons;
         on_disk.fetch_icons_direct = *fetch_icons_direct;
@@ -1829,6 +2092,203 @@ mod tests {
         assert!(s.keep_backend_running);
         assert!(s.auto_lock_enabled, "auto-lock is on unless it is turned off");
         assert_eq!(s.auto_lock(), AutoLock::After(Duration::from_secs(15 * 60)));
+        // The one shortcut that already existed is still the one that existed.
+        assert_eq!(s.shortcuts.picker.map(|c| c.to_string()).as_deref(), Some("CTRL+ALT+B"));
+    }
+
+    // -- the shortcuts record ----------------------------------------------
+
+    /// **The five defaults, spelled out rather than derived.**
+    ///
+    /// A test that read them back off `Shortcuts::default()` would pass with
+    /// every one of them changed. These are the combinations the app promises
+    /// out of the box and the ones the justification in that impl's doc is
+    /// about, so they are pinned as text.
+    #[test]
+    fn the_five_shipped_shortcuts_are_the_ones_that_were_reasoned_about() {
+        let s = Shortcuts::default();
+        let text = |chord: Option<Chord>| chord.map(|c| c.to_string()).unwrap_or_default();
+        assert_eq!(text(s.picker), "CTRL+ALT+B");
+        assert_eq!(text(s.username), "CTRL+ALT+U");
+        assert_eq!(text(s.password), "CTRL+ALT+P");
+        assert_eq!(text(s.totp), "CTRL+ALT+T");
+        assert_eq!(text(s.sequence), "CTRL+ALT+S");
+        // None of them is a function key or an arrow, which is what the
+        // display drivers' own hotkeys take on a stock laptop, and none is
+        // `CTRL+ALT+A`, which is KeePass's global auto-type.
+        for which in FillShortcut::ALL {
+            let chord = text(s.chord(which));
+            assert!(
+                !chord.contains("+F") && !chord.contains("UP") && !chord.contains("DOWN")
+                    && !chord.contains("LEFT") && !chord.contains("RIGHT"),
+                "the default for {which:?} is {chord}, which is the family Intel's and AMD's \
+                 display drivers register at logon on a great many stock machines"
+            );
+            assert_ne!(
+                chord, "CTRL+ALT+A",
+                "the default for {which:?} is KeePass's default global auto-type chord, which \
+                 is the one program most likely to be installed beside this one"
+            );
+        }
+        // And no two rows share a chord, which would be this app reporting a
+        // conflict with itself on a machine where nothing else is running.
+        for which in FillShortcut::ALL {
+            let chord = s.chord(which).expect("every shipped default is bound");
+            assert_eq!(
+                s.conflict(which, chord),
+                None,
+                "two shipped defaults are the same chord, so one of them fails to register on \
+                 every machine"
+            );
+        }
+    }
+
+    /// **A `settings.json` written before this feature keeps every shortcut.**
+    ///
+    /// The defect this is against is the one an added field can actually
+    /// cause: an absent record read as "the user cleared all five" would take
+    /// `CTRL+ALT+B` off every existing install the first time it was saved.
+    /// Asserted against a file with real content in it, not an empty one, so
+    /// it is the *field* being absent that is under test and not the file.
+    #[test]
+    fn an_old_settings_file_with_no_shortcuts_reads_as_the_defaults() {
+        let path = temp_path("no-shortcuts");
+        std::fs::write(&path, br#"{"keep_backend_running":false,"prompt_on_match":false}"#)
+            .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(!loaded.keep_backend_running, "control: the file was not read at all");
+        assert_eq!(
+            loaded.shortcuts,
+            Shortcuts::default(),
+            "a settings file written before the Shortcuts page existed came back with \
+             shortcuts that are not the defaults -- every existing install would lose the \
+             chord it has been using"
+        );
+        // **And a file that mentions the record but not this row.** The two
+        // absences take different routes: a missing `shortcuts` object is
+        // answered by the container's own `serde(default)` and never reaches
+        // `From<RawShortcuts>` at all, while a missing *key* inside a present
+        // object is answered by that conversion's `None => fallback`. A test
+        // that only covered the first would pass with the second reading every
+        // unmentioned row as cleared -- which is what a user who rebinds one
+        // shortcut and restarts would get.
+        std::fs::write(&path, br#"{"shortcuts":{"username":"CTRL+ALT+9"}}"#).unwrap();
+        let partial = Settings::load(&path);
+        assert_eq!(
+            partial.shortcuts.username.map(|c| c.to_string()).as_deref(),
+            Some("CTRL+ALT+9"),
+            "control: the one row the file does mention was not read"
+        );
+        assert_eq!(
+            partial.shortcuts.picker,
+            Shortcuts::default().picker,
+            "a row the file does not mention came back cleared rather than as its default"
+        );
+        assert_eq!(partial.shortcuts.sequence, Shortcuts::default().sequence);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **A row that is present-but-empty is cleared, and only that row.**
+    ///
+    /// The other half of the rule above: absent means default, `""` means the
+    /// user turned it off, and confusing the two in either direction is a
+    /// preference the app decides for itself.
+    #[test]
+    fn an_empty_shortcut_is_cleared_and_an_absent_one_is_not() {
+        let path = temp_path("cleared-shortcut");
+        // `pass`, not `password` -- see `RawShortcuts::password` for why the
+        // key on disk is the shorter word.
+        std::fs::write(&path, br#"{"shortcuts":{"pass":""}}"#).unwrap();
+        let loaded = Settings::load(&path);
+        assert_eq!(loaded.shortcuts.password, None, "an empty chord did not read as cleared");
+        assert_eq!(
+            loaded.shortcuts.picker,
+            Shortcuts::default().picker,
+            "clearing one row took another row's default with it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **One unreadable chord costs that chord and nothing else.**
+    ///
+    /// [`Settings::load`] answers an unparseable file by falling back to
+    /// defaults for everything -- including [`Settings::accounts`], which is
+    /// why [`Settings::accounts_unreadable`] exists. A `Deserialize` that
+    /// failed on a bad chord string would route a typo in one shortcut through
+    /// that path and present a signed-in user with a first run.
+    #[test]
+    fn a_garbled_chord_costs_that_shortcut_and_not_the_file() {
+        let path = temp_path("garbled-shortcut");
+        std::fs::write(
+            &path,
+            br#"{"prompt_on_match":false,"shortcuts":{"totp":"CTRL+ALT+NOSUCHKEY"}}"#,
+        )
+        .unwrap();
+        let loaded = Settings::load(&path);
+        assert!(
+            !loaded.prompt_on_match,
+            "one unreadable chord threw the whole settings file away, which is the read that \
+             also throws the account list away"
+        );
+        assert!(!loaded.accounts_unreadable, "the file parsed, so nothing is unreadable");
+        assert_eq!(
+            loaded.shortcuts.totp,
+            Shortcuts::default().totp,
+            "an unreadable chord read as CLEARED rather than as the default, so a typo turns \
+             a shortcut off instead of leaving it alone"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **No shortcut key spells a secret**, so the file-content guard stays
+    /// blunt.
+    ///
+    /// `mentions_a_secret` is a substring scan for `password`, `session`,
+    /// `token`, `secret` and `master key`, and the process-boundary result
+    /// file carries a scan of its own. A key named `password` would fire both
+    /// over a file containing no secret at all, and the only ways out are to
+    /// weaken the guards -- which the house rule forbids, and which would
+    /// leave a hole shaped like every future field that names a secret -- or
+    /// to name the key something else. See `RawShortcuts::password`.
+    #[test]
+    fn no_shortcut_key_spells_a_word_the_secret_guard_looks_for() {
+        let path = temp_path("shortcut-keys");
+        Settings::default().save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"shortcuts\""), "the record is not in the file: {text}");
+        assert!(text.contains("\"pass\""), "the password row is not in the file: {text}");
+        assert!(
+            !mentions_a_secret(&text),
+            "a shortcut key trips the NO SECRETS guard over a file with no secret in it: {text}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two rows on one chord is a state the record can *see*, which is what
+    /// the capture widget refuses on.
+    #[test]
+    fn the_record_can_tell_when_two_rows_want_the_same_chord() {
+        let s = Shortcuts::default();
+        let taken = s.password.expect("bound by default");
+        assert_eq!(s.conflict(FillShortcut::Username, taken), Some(FillShortcut::Password));
+        // A row is never in conflict with itself, so re-pressing what a row
+        // already has is not a refusal.
+        assert_eq!(s.conflict(FillShortcut::Password, taken), None);
+        // And a chord nobody holds is free.
+        assert_eq!(s.conflict(FillShortcut::Username, Chord::parse("CTRL+ALT+9").unwrap()), None);
+    }
+
+    /// `as_chords` hands the registrations the five in `FillShortcut::ALL`'s
+    /// order, which is the order every five-long array in this app is indexed
+    /// by. A slot swapped here would register the password chord for the
+    /// username action.
+    #[test]
+    fn the_chords_are_handed_over_in_the_order_everything_indexes_by() {
+        let s = Shortcuts::default();
+        let chords = s.as_chords();
+        for which in FillShortcut::ALL {
+            assert_eq!(chords[which.index()], s.chord(which), "{which:?} is in the wrong slot");
+        }
     }
 
     #[test]
@@ -1848,6 +2308,17 @@ mod tests {
             // agreed would round-trip identically through a writer that assigned
             // one of them from the other.
             prompt_on_match: true,
+            // Not the default, and different from it in BOTH the ways this
+            // record can differ: one row moved to another chord, one row
+            // cleared outright. A writer that dropped the field would round
+            // trip to the defaults, and a writer that wrote a cleared row as
+            // an absent field would round trip that row to its default while
+            // the moved one still looked right.
+            shortcuts: Shortcuts {
+                totp: None,
+                username: Chord::parse("CTRL+SHIFT+F9"),
+                ..Shortcuts::default()
+            },
             // Deliberately the OPPOSITE of this field's own default
             // (`false`), so a writer that dropped it would round-trip to
             // the default and be indistinguishable from one that kept it.
@@ -2146,6 +2617,10 @@ mod tests {
             service_enabled: true,
             keep_backend_running: true,
             prompt_on_match: false,
+            // Not the default, so a writer that dropped the whole record
+            // would round-trip to the defaults and look identical to one
+            // that kept it.
+            shortcuts: Shortcuts { totp: None, ..Shortcuts::default() },
             check_breaches: true,
             fetch_icons: false,
             // Deliberately the OPPOSITE of its own default (`false`) and of
@@ -2884,6 +3359,8 @@ mod tests {
             service_enabled: true,
             keep_backend_running: false,
             prompt_on_match: true,
+            // Not the default, for the reason the field above gives.
+            shortcuts: Shortcuts { totp: None, ..Shortcuts::default() },
             check_breaches: true,
             fetch_icons: false,
             // Deliberately the OPPOSITE of its own default (`false`) and of

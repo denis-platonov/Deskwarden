@@ -2994,7 +2994,14 @@ where
                 // Read every frame rather than captured once: the answer can
                 // change under this window, and a footer that cached it would
                 // be a claim about the shortcut made before the attempt.
-                hotkey: crate::hotkey::availability(),
+                hotkey: crate::hotkey::availability(crate::app::FillShortcut::Picker),
+                // From the same published cell as the status directly above,
+                // and read in the same frame, so the line can never name one
+                // chord's combination beside another chord's state -- see
+                // `hotkey::STATUS`, which holds the pair.
+                hotkey_chord: &crate::hotkey::published_chord_text(
+                    crate::app::FillShortcut::Picker,
+                ),
             },
             login_ui::CloseControl::Active,
         );
@@ -7182,10 +7189,23 @@ mod recovery_host_tests {
              actually been running, so `Taking longer than usual` is either always on screen \
              or never is: {host}"
         );
+        // **The needle grew an argument, and that is the pin reporting a real
+        // change.** There are five shortcuts now, so `availability` takes the
+        // one being asked about; the footer asks about the picker chord, which
+        // is the one it has always named.
         assert!(
-            host.contains(concat!("hotkey::", "availability()")),
+            host.contains(concat!("hotkey::", "availability(crate::app::FillShortcut::Picker)")),
             "the recovery host no longer reads the shortcut's real status, so the footer is \
              back to asserting a hotkey nothing has registered: {host}"
+        );
+        // And the chord beside it is read too, rather than spelled into the
+        // footnote -- the picker chord is remappable, so a window that printed
+        // a constant would teach a user who had moved it a combination this
+        // process does not claim.
+        assert!(
+            host.contains(concat!("hotkey::published_chord_", "text(")),
+            "the recovery host names a chord of its own rather than the one that is actually \
+             registered: {host}"
         );
     }
 

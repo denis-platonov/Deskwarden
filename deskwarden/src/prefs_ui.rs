@@ -125,6 +125,19 @@ const INTERVAL_FIELD_ID: &str = "prefs-clipboard-interval";
 /// breathing room 3e gives its own "+ Add app".
 const RESET_BUTTON_WIDTH: f32 = 72.0;
 
+/// The Shortcuts page's two controls, sized to fill
+/// [`CONTROL_COLUMN_WIDTH`] exactly: `100 + 8 + 52 = 160`.
+///
+/// **Sized to the existing column rather than widening it.** The column is
+/// shared by every row on every page, and a wider one to fit two controls here
+/// would move the description text of nine other pages -- which is the
+/// trade-off `draw_breaches` already spelled out and answered the same way. A
+/// hundred points holds `CTRL+SHIFT+PAGEDOWN` at 12px semibold, which is the
+/// longest chord this app can produce.
+const SHORTCUT_CHORD_WIDTH: f32 = 100.0;
+const SHORTCUT_CLEAR_WIDTH: f32 = 52.0;
+const SHORTCUT_CONTROL_GAP: f32 = 8.0;
+
 // ---------------------------------------------------------------------------
 // Copy
 // ---------------------------------------------------------------------------
@@ -804,18 +817,29 @@ const AUTO_LOCK_LABEL: &str = "Lock the vault after";
 const AUTO_LOCK_DESCRIPTION: &str = "Minutes of no activity before the vault window locks itself. \
      One minute is the shortest Deskwarden will use.";
 
-/// The one global shortcut this app registers, in the form the user sees it.
-///
-/// Hardcoded rather than derived, because `hotkey::register_fill_hotkey`
-/// builds it from `global_hotkey`'s `Modifiers`/`Code` types, which have no
-/// display form worth showing a user. `the_shortcuts_page_names_the_hotkey_
-/// that_is_actually_registered` is a source-text guard over `hotkey.rs` so the
-/// two cannot drift apart silently.
-const FILL_HOTKEY: &str = "CTRL+ALT+B";
-const FILL_HOTKEY_LABEL: &str = "Fill the focused app";
-const FILL_HOTKEY_DESCRIPTION: &str =
-    "The only shortcut Deskwarden registers. It cannot be changed yet.";
-/// The label the row takes when the chord could not be registered.
+// **`FILL_HOTKEY` is no longer a production constant in this file**, and its
+// absence is the point: there are five chords now and every one of them is
+// remappable, so what a row shows comes from `state.settings.shortcuts` and is
+// spelled by `hotkey::Chord`'s own `Display`. A constant here would be a
+// second answer to a question the settings already answer -- exactly the drift
+// the pins below were written to stop.
+//
+// It survives as a test constant inside this file's `tests` module, where it
+// is the *shipped* chord held against `settings::Shortcuts::default` by
+// `the_shortcuts_page_ships_the_chord_this_app_has_always_used`, and read out
+// of this file's source by `tray`'s `the_tray_and_preferences_agree_on_the_
+// chord`. It is inside that module rather than carrying a gate of its own,
+// because three source walks in this crate --
+// `no_test_here_resolves_the_real_key_store`,
+// `no_test_here_resolves_the_real_scan_history` and `breach_scan`'s
+// `nothing_in_this_crate_starts_a_scan_except_a_click` -- split this file at
+// the FIRST cfg-test attribute in it and treat everything after as the test
+// half. A second gate above the module makes all three walk production code
+// and go quietly green. (For the same reason this comment does not spell that
+// attribute out: the walks are substring splits and do not know a comment from
+// code.)
+
+/// The suffix a row's label takes when its chord could not be registered.
 ///
 /// It says *not working* in the label rather than only in the description,
 /// because the label is the line a user scans: a row still headed "Fill the
@@ -823,7 +847,80 @@ const FILL_HOTKEY_DESCRIPTION: &str =
 /// reason -- and what to do about it -- comes from
 /// `hotkey::Unavailable::message`, which is authored next to the decision that
 /// produced it rather than here.
-const FILL_HOTKEY_UNAVAILABLE_LABEL: &str = "Fill the focused app — shortcut not working";
+///
+/// **A suffix rather than five more constants.** Every row can be in this
+/// state, and five hand-written "… — shortcut not working" labels are five
+/// chances for one of them to say something else.
+const SHORTCUT_UNAVAILABLE_SUFFIX: &str = " — shortcut not working";
+
+/// What the chip says on a row the user has cleared.
+const SHORTCUT_NOT_SET: &str = "Not set";
+
+/// The button that clears a row.
+const SHORTCUT_CLEAR: &str = "Clear";
+
+/// What a row says while it is waiting for keys.
+///
+/// **It replaces the chord in the chip, not the description**, so the thing
+/// under the pointer is the thing that changed. The instructions -- including
+/// both escapes, which a user in this state needs and cannot guess -- go where
+/// the description was; see [`SHORTCUT_CAPTURE_HINT`].
+const SHORTCUT_CAPTURING: &str = "Press keys…";
+
+/// The instructions, shown only while a row is capturing.
+///
+/// Names all three ways out, because a widget that swallows the keyboard and
+/// does not say how to stop is the worst thing on this page. Esc first because
+/// it is the one a user will try.
+const SHORTCUT_CAPTURE_HINT: &str =
+    "Hold Ctrl, Alt, Shift or Windows and press a key. Esc leaves this shortcut as it was; \
+     Backspace turns it off.";
+
+/// Why a captured combination was refused: it had no modifier.
+///
+/// **Refused rather than accepted**, and this is not a matter of taste.
+/// `RegisterHotKey` will happily give this process a bare key for the whole
+/// logon session -- bind `P` and every `P` typed into every program on the
+/// machine arrives here instead of in the document the user is writing, with
+/// no way back except a Preferences window they can no longer type a `P` into.
+const SHORTCUT_NEEDS_A_MODIFIER: &str =
+    "That needs a modifier. Hold Ctrl, Alt, Shift or Windows as well, or Deskwarden would \
+     take that key from every program on this PC.";
+
+/// Why a captured combination was refused: this app already uses it.
+///
+/// The other row is named, because "already in use" without saying by what
+/// leaves the user hunting through five rows. The second `RegisterHotKey` for
+/// one chord fails with `AlreadyRegistered`, so accepting it would have this
+/// app reporting a conflict *with itself* as though another program had taken
+/// the keys.
+fn shortcut_taken_note(other: crate::app::FillShortcut) -> String {
+    format!("Deskwarden already uses that for “{}”. Pick another combination.", other.label())
+}
+
+/// Why a captured key cannot be bound at all.
+///
+/// The key table (`hotkey::KEYS`) is closed on purpose -- see its doc -- so a
+/// key press that maps to nothing has to say so rather than be swallowed,
+/// which would leave the row sitting in capture mode looking broken.
+const SHORTCUT_UNUSABLE_KEY: &str =
+    "Deskwarden cannot use that key. Try a letter, a digit, a function key, or one of the \
+     navigation keys.";
+
+/// The line under every direct action's label, appended to what that action
+/// types.
+///
+/// **This is where the "nothing matched" answer is written down.** The four
+/// direct shortcuts do nothing at all when Deskwarden has not matched the
+/// window in front of the user -- no card, no picker, no dialog; see
+/// `app::FillShortcut::opens_a_card_with_nothing_matched`, which records why
+/// each of the alternatives was rejected. Silence is only defensible if the
+/// user can find out *why*, and the Shortcuts page is where they come to ask
+/// it, so every one of those four rows says it here and names the one chord
+/// that does answer for an unmatched window.
+const DIRECT_SHORTCUT_NOTE: &str =
+    " Needs a window Deskwarden has matched; with nothing matched it does nothing, and the \
+     fill shortcut above is the one that asks about the window instead.";
 
 /// What the About page says about the account when nobody has published one.
 ///
@@ -1077,6 +1174,43 @@ const SCAN_BUTTON_WIDTH: f32 = 184.0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     General,
+    /// **Every global keyboard shortcut this app registers**: the picker chord
+    /// and the four that type one thing at the matched item, each with the
+    /// combination it is bound to, whether that combination is actually
+    /// working, and a way to change or clear it.
+    ///
+    /// # Why this page is back
+    ///
+    /// There was a `Shortcuts` section in 3e and it was removed with the other
+    /// four that had nothing on them a user could change: it was one read-only
+    /// chip, and a nav row that leads to a thing you cannot alter spends a
+    /// click to say "not here". `no_page_in_the_nav_is_only_prose` is the
+    /// standing guard that came out of that removal, and this page satisfies
+    /// it comfortably -- there are five controls on it, and every one of them
+    /// edits a stored value.
+    ///
+    /// What changed is the feature, not the judgement. The chip could not be
+    /// rebound because there was one chord and it was a constant in
+    /// `hotkey.rs`; there are five now, all of them settings, and a page is
+    /// what five remappable controls need. The chip that used to be a row on
+    /// General has come with them -- General is one pill again.
+    ///
+    /// # Why it is directly after General
+    ///
+    /// The rule this window already placed three sections by: **a page lands
+    /// where the bulk of it came from.** Breaches went to the top because its
+    /// pill was on General; Updates went next to About because that is where
+    /// its flow was; View and Lock went directly after General, in the order
+    /// their rows sat on it. All of this page's existing content -- the fill
+    /// hotkey row -- was on General, and it sat *above* the rows that became
+    /// View and Lock, so this page sits above them too. The reading order of
+    /// the old General page is preserved by the pages it was split into.
+    ///
+    /// It also keeps the pair that must not be separated together: General's
+    /// `prompt_on_match` description ends "CTRL+ALT+B is the only way to
+    /// fill", and this is the page that says what that chord is and whether it
+    /// is working. One nav row apart is as close as two pages get.
+    Shortcuts,
     /// **What the vault window LOOKS like**: item icons and where they come
     /// from, brand marks on cards, and whether a TOTP secret can be revealed.
     ///
@@ -1197,8 +1331,11 @@ pub enum Section {
 
 impl Section {
     /// The nav, top to bottom.
-    pub const ALL: [Section; 9] = [
+    /// **Ten, not nine.** `Section::Shortcuts` was added directly after
+    /// General; see its own doc for the placement rule it was placed by.
+    pub const ALL: [Section; 10] = [
         Section::General,
+        Section::Shortcuts,
         Section::View,
         Section::Lock,
         Section::Breaches,
@@ -1214,6 +1351,7 @@ impl Section {
     pub fn label(self) -> &'static str {
         match self {
             Section::General => "General",
+            Section::Shortcuts => "Shortcuts",
             Section::View => "View",
             Section::Lock => "Lock",
             Section::Breaches => "Breaches",
@@ -1239,13 +1377,24 @@ impl Section {
     /// sentence, not about the modal it was guarding.
     pub(crate) fn subtitle(self) -> &'static str {
         match self {
-            // **Says "the shortcut it answers" because the fill hotkey row is
-            // on this page now.** A subtitle that named only background
-            // behaviour and locking would be a subtitle a user scanning for
-            // CTRL+ALT+B reads straight past, on the one page that tells them
-            // what it is and whether it is working.
-            Section::General => {
-                "Whether a matched window is offered a fill, and the shortcut that offers it."
+            // **It said "and the shortcut that offers it", and the shortcut
+            // is not here any more.** That clause was added when the fill
+            // hotkey row moved onto this page from the removed Shortcuts
+            // section; the row -- and four siblings -- are on
+            // `Section::Shortcuts` now, and a subtitle promising a shortcut
+            // this page does not carry sends the reader looking for a chip
+            // that is one nav row down. What is left is the one pill General
+            // owns, and the sentence is back to naming it.
+            Section::General => "Whether a matched window is offered a fill.",
+            // Both halves, because the page is both: five combinations to
+            // change, and five live answers about whether Windows actually
+            // gave them to this app. The second half is not decoration -- a
+            // chord another program is holding is the report `hotkey`'s whole
+            // retry path exists for, and this page is where a user comes to
+            // ask why a shortcut stopped working.
+            Section::Shortcuts => {
+                "The keyboard shortcuts Deskwarden listens for, and whether Windows gave them \
+                 to it."
             }
             Section::View => {
                 "What the vault window shows: item icons, brand marks, and TOTP secrets."
@@ -1332,6 +1481,28 @@ pub struct PrefsState {
     /// would put the message on screen while the user was still typing `0.` on
     /// the way to `0.5`, which is scolding them for not having finished.
     clipboard_entry_error: Option<&'static str>,
+    /// Which Shortcuts row is currently waiting for a key press, or `None`.
+    ///
+    /// **One field for five rows**, so that "only one row can be listening" is
+    /// a property of the type rather than a rule five booleans have to keep:
+    /// two rows reading `ctx.input`'s events in the same frame would both take
+    /// the press, and the user would bind two shortcuts with one keystroke.
+    ///
+    /// **On the state and not in the draw**, for [`Self::update`]'s reason:
+    /// the whole point of a capture is that it spans frames -- the click that
+    /// starts it and the key press that ends it are never the same frame.
+    capturing: Option<crate::app::FillShortcut>,
+    /// Why the last captured combination was refused, or `None`.
+    ///
+    /// **Kept in state rather than recomputed each frame**, exactly as
+    /// [`Self::clipboard_entry_error`] is and for its reason: it is about an
+    /// *event* -- the moment a combination was pressed and turned down -- and
+    /// not about what is currently bound. Recomputing it would put the message
+    /// under a row that has been sitting there untouched.
+    ///
+    /// A `String` rather than a `&'static str` because one of the refusals
+    /// names the row that already holds the chord, which is not a constant.
+    shortcut_error: Option<String>,
     /// The Updates page's update flow: its stage, and the receiver its worker
     /// threads report on.
     ///
@@ -1575,6 +1746,10 @@ impl PrefsState {
             auto_lock_text: minutes.to_string(),
             clipboard_interval_text: interval.as_minutes_text(),
             clipboard_entry_error: None,
+            // No row is listening when the window opens, and nothing has been
+            // refused. Both are transient UI state; neither is persisted.
+            capturing: None,
+            shortcut_error: None,
             update: crate::update_panel::UpdatePanel::default(),
             account_source: published_account_status,
             scan: crate::breach_scan::ScanPanel::default(),
@@ -2065,11 +2240,16 @@ fn version_line() -> String {
 fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
     section_heading(ui, state.section);
     match state.section {
-        // The one read of the published status -- see `hotkey::availability`,
-        // and `fill_hotkey_row` for why it is a parameter from here down. It
-        // used to be read for `Section::Shortcuts`; that page was one
-        // read-only chip and is gone, and the chip is a row on General now.
-        Section::General => draw_general(ui, state, crate::hotkey::availability()),
+        Section::General => draw_general(ui, state),
+        // **The one read of the published statuses**, all five at once and in
+        // one place -- see `hotkey::availability`, and `draw_shortcuts` for
+        // why they are a parameter from here down rather than read inside the
+        // page. It used to be one read for the fill hotkey row on General;
+        // that row has moved here with four siblings.
+        Section::Shortcuts => {
+            let live = crate::app::FillShortcut::ALL.map(crate::hotkey::availability);
+            draw_shortcuts(ui, state, live);
+        }
         Section::View => draw_view(ui, state),
         Section::Lock => draw_lock(ui, state),
         Section::Breaches => draw_breaches(ui, state),
@@ -2270,7 +2450,7 @@ fn value_row(ui: &mut Ui, label: &str, description: &str, value: &str) {
 // Pages
 // ---------------------------------------------------------------------------
 
-fn draw_general(ui: &mut Ui, state: &mut PrefsState, hotkey: crate::hotkey::HotkeyStatus) {
+fn draw_general(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
         // **The backend row is not here any more.** It moved, whole, to
         // `Section::Vault` (by way of `Section::SyncAndAccount`), where it is
@@ -2289,25 +2469,28 @@ fn draw_general(ui: &mut Ui, state: &mut PrefsState, hotkey: crate::hotkey::Hotk
         // pairing this comment used to describe (the backend row above, the
         // disk cache below) is intact; both halves simply moved together.
         //
-        // The one switch that governs what a matched window does. It sits on
-        // General beside the other two rather than under Shortcuts, because
-        // it is not about a shortcut: `PROMPT_DESCRIPTION` names the hotkey
-        // only to say what is left when this is off.
+        // The one switch that governs what a matched window does. It stays on
+        // General rather than going to `Section::Shortcuts` with the chords,
+        // because it is not about a shortcut: `PROMPT_DESCRIPTION` names the
+        // fill hotkey only to say what is left when this is off.
         state.settings.prompt_on_match = toggle_row(
             ui,
             PROMPT_LABEL,
             PROMPT_DESCRIPTION,
             state.settings.prompt_on_match,
         );
-        row_separator(ui);
-        // **Directly under the prompt row, because that row's description
-        // already names this chord.** `PROMPT_DESCRIPTION` ends "CTRL+ALT+B
-        // is the only way to fill" -- a sentence that leaves a reader wanting
-        // to know what CTRL+ALT+B is and whether it is working, and this is
-        // the row that answers both. They are the pair the removed Shortcuts
-        // page could never be beside.
-        fill_hotkey_row(ui, hotkey);
-        row_separator(ui);
+        // **The fill hotkey row is not here any more**, and it left the way
+        // View's and Lock's rows left: to sit with the things it is one
+        // decision with. It was the only shortcut this app had and it was
+        // unrebindable, which is why it was a lone chip on this page rather
+        // than a section of its own -- the section it came from was removed
+        // for having nothing on it a user could change. There are five
+        // shortcuts now, all of them settings, and they are
+        // `Section::Shortcuts`, one nav row below this page. What that row
+        // used to be beside is still directly above: `PROMPT_DESCRIPTION`
+        // ends "CTRL+ALT+B is the only way to fill", and the page that says
+        // what CTRL+ALT+B is is the next one down.
+        //
         // **The icon, logo and TOTP rows are not here any more, and the
         // auto-lock pair is not either.** They are `Section::View` and
         // `Section::Lock`, which is what General was split into: "General
@@ -4402,77 +4585,455 @@ fn reset_button(ui: &mut Ui) -> bool {
     response.clicked()
 }
 
-/// **The fill hotkey: what it is, and whether it is actually working.**
+// ---------------------------------------------------------------------------
+// The Shortcuts page
+// ---------------------------------------------------------------------------
+
+/// **The five global shortcuts: what each is bound to, whether it is actually
+/// working, and how to change it.**
 ///
-/// # Why it is a row on General and not a page of its own
+/// # Why this is a page again
 ///
-/// It was the entire content of a `Shortcuts` section, and that section was
-/// removed with the other four that had nothing on them a user could change.
-/// A read-only chip is not a preference, and a nav row that leads to one is a
-/// row that spends a click to say "here is a thing you cannot alter".
+/// A `Shortcuts` section existed in 3e, was one read-only chip, and was
+/// removed with the other four pages on which nothing could be changed. The
+/// chip moved to General because it was the only place in the app that named
+/// `CTRL+ALT+B`, and a user who cannot discover the chord cannot use the
+/// feature at all.
 ///
-/// But the chip itself had to be kept, because it is the only place in the
-/// app that names the chord: **a user who cannot discover CTRL+ALT+B cannot
-/// use the feature at all.** General is where it went, directly under
-/// `PROMPT_LABEL`'s row, whose description already ends by saying the hotkey
-/// is what is left when the prompt is off. The two were always one thought
-/// split across two pages; they are one card now. General is also the page
-/// this window opens on, which is the difference between a discoverable
-/// shortcut and a documented one.
+/// What made that chip read-only was that there was one chord and it was a
+/// constant in `hotkey.rs`. There are five now and every one of them is a
+/// stored preference, so this page has five live controls on it and satisfies
+/// `no_page_in_the_nav_is_only_prose` -- the standing guard that came out of
+/// removing the old one -- by a wide margin.
 ///
-/// # Why it says so here and not in a startup dialog
+/// # Why the state is said here and not in a startup dialog
 ///
-/// The difference matters. A
-/// shortcut another program got to first is a degraded convenience, not a
-/// failure to start: everything else Deskwarden does works. A modal at launch
-/// over a keyboard chord would interrupt every single launch for as long as
-/// the conflict lasted, would arrive before the user had asked anything, and
-/// would be the second most annoying thing this app could do after vanishing.
+/// Unchanged from when this was one row on General, and it is the reason the
+/// page carries a status at all. A chord another program got to first is a
+/// degraded convenience, not a failure to start: everything else Deskwarden
+/// does works. A modal at launch over a keyboard chord would interrupt every
+/// single launch for as long as the conflict lasted, would arrive before the
+/// user had asked anything, and would be the second most annoying thing this
+/// app could do after vanishing.
 ///
 /// But it must be said *somewhere*, because a shortcut that silently does
-/// nothing is its own confusing failure -- the user presses CTRL+ALT+B, some
-/// other program answers or nothing does, and Deskwarden looks broken. General
-/// is the page a user comes to in order to ask that exact question, which
-/// makes it the right place for the answer, and it is the same page in both
-/// shells (the tray's Preferences window and the vault window's Preferences
-/// modal). In the modal, opened from inside the startup vault window, the
-/// status is `Unavailable(NotYetAttempted)` -- and it says so rather than
-/// claiming the chord works; see [`crate::hotkey::availability`].
+/// nothing is its own confusing failure -- the user presses the chord, some
+/// other program answers or nothing does, and Deskwarden looks broken. This is
+/// the page a user comes to in order to ask that exact question, and it is the
+/// same page in both shells (the tray's Preferences window and the vault
+/// window's Preferences modal). In the modal, opened from inside the startup
+/// vault window, every status is `Unavailable(NotYetAttempted)` -- and it says
+/// so rather than claiming the chords work; see
+/// [`crate::hotkey::availability`].
 ///
-/// The status is a parameter rather than read from `hotkey::availability()` in
-/// here, so that the painting can be driven from a test without a process-wide
-/// value another test may be reading at the same moment; [`draw_section`] is
-/// the one place that reads it.
+/// # Why the statuses are a parameter
 ///
-/// **A row, not a card.** It draws directly into General's card between
-/// [`row_separator`]s, exactly as the toggle rows around it do -- a `card` of
-/// its own here would put a second white panel inside the first.
-fn fill_hotkey_row(ui: &mut Ui, status: crate::hotkey::HotkeyStatus) {
-    match status {
-        // `kbd_chip`'s grey-on-canvas treatment, not `kbd_chip_on_card`'s: the
-        // latter is a *white* chip, made for 3h's blue-washed panel, and it
-        // would be invisible on this white card.
-        crate::hotkey::HotkeyStatus::Armed => {
-            control_row(ui, FILL_HOTKEY_LABEL, FILL_HOTKEY_DESCRIPTION, |ui| {
-                theme::kbd_chip(ui, FILL_HOTKEY, false)
-            });
+/// So that the painting can be driven from a test without a process-wide value
+/// another test may be reading at the same moment; [`draw_section`] is the one
+/// place that reads it. Five at once rather than one per row, so the page
+/// cannot show two rows' states read a frame apart.
+fn draw_shortcuts(
+    ui: &mut Ui,
+    state: &mut PrefsState,
+    live: [crate::hotkey::HotkeyStatus; crate::app::FillShortcut::COUNT],
+) {
+    card(ui, |ui| {
+        for (index, which) in crate::app::FillShortcut::ALL.into_iter().enumerate() {
+            if index > 0 {
+                row_separator(ui);
+            }
+            shortcut_row(ui, state, which, live[index]);
         }
-        // Ghosted, which is the treatment this file already gives a control
-        // that is present and not currently doing anything -- the disabled
-        // toggle and the disabled stepper. It reads as "off", which is
-        // accurate, where a normal chip would read as "working" and an absent
-        // row would read as "this feature does not exist".
+    });
+}
+
+/// One shortcut: its label, what it types, its chord, and its state.
+fn shortcut_row(
+    ui: &mut Ui,
+    state: &mut PrefsState,
+    which: crate::app::FillShortcut,
+    live: crate::hotkey::HotkeyStatus,
+) {
+    use crate::hotkey::HotkeyStatus;
+
+    let capturing = state.capturing == Some(which);
+    let bound = state.settings.shortcuts.chord(which);
+    // **What the row is asked to say, in one decision.** The refusal outranks
+    // everything, because it is about the thing the user just did; then the
+    // capture instructions, because a row waiting for keys must say how to
+    // stop; then the reason a chord is not working; then what the shortcut is
+    // for. Only the last of those is the ordinary case, and it is last on
+    // purpose -- every line above it is more urgent than the description.
+    //
+    // The refusal is read only while THIS row is capturing, so that a note
+    // about a combination turned down on one row cannot appear under another.
+    let refusal = if capturing { state.shortcut_error.clone() } else { None };
+    let description = match (refusal, capturing, bound, live) {
+        (Some(note), _, _, _) => note,
+        (None, true, _, _) => SHORTCUT_CAPTURE_HINT.to_string(),
+        // A cleared row is not a broken one: it says what it would do if it
+        // were bound, and nothing about failure. The chip beside it says
+        // "Not set", which is the whole of the state.
+        (None, false, Some(chord), HotkeyStatus::Unavailable(reason)) => {
+            reason.message(&chord.to_string())
+        }
+        _ => shortcut_description(which),
+    };
+    // **The label carries the warning too**, because the label is the line a
+    // user scans: a row still headed "Type the password" over a greyed chip is
+    // a row that can be read as working.
+    let broken = !capturing && bound.is_some() && matches!(live, HotkeyStatus::Unavailable(_));
+    let label = if broken {
+        format!("{}{SHORTCUT_UNAVAILABLE_SUFFIX}", which.label())
+    } else {
+        which.label().to_string()
+    };
+
+    // The two-column row, in the ghosted treatment when the chord is not
+    // working -- which is what this file already gives a control that is
+    // present and not currently doing anything (the disabled toggle, the
+    // disabled stepper). It reads as "off", which is accurate, where a normal
+    // row would read as "working".
+    let mut pressed_chip = false;
+    let mut pressed_clear = false;
+    let controls = |ui: &mut Ui| {
+        ui.spacing_mut().item_spacing.x = SHORTCUT_CONTROL_GAP;
+        // Right-to-left, so `Clear` is added first to land to the right of the
+        // chord button rather than to the left of it.
         //
-        // The reason replaces the description rather than being added under
-        // it: the description says the shortcut is the only one and cannot be
-        // changed, which is exactly what a user staring at a shortcut that is
-        // not working does not need told.
-        crate::hotkey::HotkeyStatus::Unavailable(reason) => {
-            control_row_ghosted(ui, FILL_HOTKEY_UNAVAILABLE_LABEL, reason.message(), |ui| {
-                theme::kbd_chip(ui, FILL_HOTKEY, false)
-            });
+        // **`Clear` is absent while capturing and while already cleared**, and
+        // both absences are the same rule: a button whose action has already
+        // happened, or which would fight the widget beside it, is a button
+        // that cannot be pressed usefully. Cancelling a capture is Esc, which
+        // `SHORTCUT_CAPTURE_HINT` says out loud.
+        if !capturing && bound.is_some() {
+            pressed_clear = key_button(ui, SHORTCUT_CLEAR, SHORTCUT_CLEAR_WIDTH);
+        }
+        pressed_chip = chord_button(ui, capturing, bound);
+    };
+    if broken {
+        control_row_ghosted(ui, &label, &description, controls);
+    } else {
+        control_row(ui, &label, &description, controls);
+    }
+
+    if pressed_clear {
+        state.settings.shortcuts.set(which, None);
+        state.capturing = None;
+        state.shortcut_error = None;
+        return;
+    }
+    if pressed_chip {
+        // **Starting a capture ends any other row's**, because two rows
+        // reading the same key events would both take the press. Pressing the
+        // chip of the row that is already capturing stops it, which is the
+        // mouse's way out.
+        state.capturing = if capturing { None } else { Some(which) };
+        state.shortcut_error = None;
+        return;
+    }
+    if capturing {
+        read_a_chord(ui, state, which);
+    }
+}
+
+/// **What one shortcut types**, as the line under its label.
+///
+/// Built rather than five constants, so that the sentence every direct action
+/// has to carry -- [`DIRECT_SHORTCUT_NOTE`], which is where the "nothing
+/// matched" behaviour is written down for the user -- is appended in one
+/// place. Four hand-written copies of it is four chances for one row to stop
+/// saying it, and the row that stopped saying it would be the row whose
+/// silence a user could not explain.
+fn shortcut_description(which: crate::app::FillShortcut) -> String {
+    use crate::app::FillShortcut;
+    let what = match which {
+        FillShortcut::Picker => {
+            return "Fills the window in front of you. With nothing matched it asks Deskwarden \
+                    about that window instead, which is what makes this the shortcut to reach \
+                    for when nothing happens."
+                .to_string()
+        }
+        FillShortcut::Username => "Types the matched item's username.",
+        FillShortcut::Password => "Types the matched item's password.",
+        FillShortcut::Totp => "Types the matched item's one-time code.",
+        FillShortcut::Sequence => "Types the matched item's own saved auto-type sequence.",
+    };
+    format!("{what}{DIRECT_SHORTCUT_NOTE}")
+}
+
+/// The chord chip, as a button: press it and the row starts listening.
+///
+/// **[`key_button`]'s box rather than `theme::kbd_chip`.** The chip is
+/// paint-only and has no pressed state, and this control is the one thing on
+/// the row a user has to find and click; giving it the same box as the *Clear*
+/// button beside it is what makes the pair read as one control column.
+fn chord_button(ui: &mut Ui, capturing: bool, bound: Option<crate::hotkey::Chord>) -> bool {
+    let text = match (capturing, bound) {
+        (true, _) => SHORTCUT_CAPTURING.to_string(),
+        (false, Some(chord)) => chord.to_string(),
+        (false, None) => SHORTCUT_NOT_SET.to_string(),
+    };
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(SHORTCUT_CHORD_WIDTH, STEPPER_HEIGHT), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // A capturing row is outlined in the accent colour, so that "this one is
+    // listening" is visible from across the page and not only in the word
+    // inside the box -- which matters because the user's hands are on the
+    // keyboard and their eyes are not necessarily on this row.
+    let (fill, stroke, ink) = if capturing {
+        (theme::CANVAS, theme::BLUE, theme::BLUE)
+    } else if response.hovered() {
+        (theme::CANVAS, theme::BORDER_STRONG, theme::TEXT_SECONDARY)
+    } else {
+        (theme::CARD, theme::BORDER_STRONG, theme::TEXT_SECONDARY)
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(STEPPER_RADIUS),
+        fill,
+        Stroke::new(1.0, stroke),
+        StrokeKind::Inside,
+    );
+    let galley = ui.painter().layout_no_wrap(
+        text,
+        FontId::new(12.0, FontFamily::Name(theme::SEMIBOLD.into())),
+        ink,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        ink,
+    );
+    response.clicked()
+}
+
+/// **The capture itself: one key press, accepted or refused.**
+///
+/// # What it refuses, and why the list is exactly this long
+///
+/// * **Escape** cancels. It changes nothing, which is the promise a capture
+///   widget has to make before a user will try one. `Escape` is deliberately
+///   absent from `hotkey::KEYS`, so it can never be bound by accident here.
+/// * **Backspace and Delete** clear the binding. Two keys rather than one
+///   because a user reaching to erase something reaches for either, and this
+///   is the keyboard's way to the thing the *Clear* button does.
+/// * **A key with no modifier** is refused and the previous binding kept --
+///   see [`SHORTCUT_NEEDS_A_MODIFIER`] for the trap that avoids.
+/// * **A chord another row already holds** is refused and the previous binding
+///   kept. Two rows on one chord means the second `RegisterHotKey` fails and
+///   this app reports a conflict with itself as though another program had
+///   taken the keys.
+/// * **A key this app cannot bind** is refused. `hotkey::KEYS` is closed on
+///   purpose; a press that maps to nothing must say so rather than be
+///   swallowed, which would leave the row apparently stuck.
+///
+/// **Every refusal leaves the row capturing**, so the user's next press is the
+/// correction rather than a second click to get back in. Only an accepted
+/// chord, Escape, or a clear ends the capture.
+///
+/// # What it CANNOT refuse, and why that is the other half of the design
+///
+/// It does not ask Windows whether the combination is free. It cannot: this
+/// page is drawn in two shells and one of them is the **vault window, a
+/// separate process from the daemon holding the registrations**. A trial
+/// `RegisterHotKey` there would collide with Deskwarden's own claim and report
+/// every working chord as taken; a trial in the daemon would have to be
+/// unregistered again immediately and would race the very program it was
+/// testing for.
+///
+/// So a chord another program holds is discovered where it can only be
+/// discovered -- at registration, in the daemon -- and comes back to this page
+/// as a live `Unavailable` on that row, with the reason, and is re-attempted
+/// every `hotkey::RETRY_EVERY` in case the other program exits. Neither half
+/// ever rewrites the user's choice; see `hotkey`'s module doc, which states
+/// the same split from the other side.
+fn read_a_chord(ui: &mut Ui, state: &mut PrefsState, which: crate::app::FillShortcut) {
+    // **The first key-down of the frame, and modifier keys produce none.**
+    // egui's `Key` has no `Control`/`Alt`/`Shift` variant at all, so holding
+    // the modifiers down emits nothing and the chord arrives whole on the
+    // press of the key that completes it -- which is exactly the behaviour a
+    // capture widget wants and would otherwise have to filter for.
+    let Some((key, modifiers)) = ui.input(|i| {
+        i.events.iter().find_map(|event| match event {
+            // `repeat` is not filtered: a key held down long enough to repeat
+            // is still the key the user meant, and the first event of the run
+            // has already ended the capture by then.
+            egui::Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+            _ => None,
+        })
+    }) else {
+        return;
+    };
+    match key {
+        egui::Key::Escape => {
+            state.capturing = None;
+            state.shortcut_error = None;
+        }
+        egui::Key::Backspace | egui::Key::Delete => {
+            state.settings.shortcuts.set(which, None);
+            state.capturing = None;
+            state.shortcut_error = None;
+        }
+        key => {
+            // **Every refusal asks for a repaint.** The row's description was
+            // laid out at the top of this frame, before the key event was
+            // read, so a refusal recorded here is on screen only from the NEXT
+            // frame -- and this window is not animating, so without this there
+            // may not be a next frame until the user moves the mouse. A
+            // refusal nobody sees is a widget that swallowed a keystroke.
+            let refuse = |state: &mut PrefsState, note: String| {
+                state.shortcut_error = Some(note);
+                ui.ctx().request_repaint();
+            };
+            let Some(code) = code_for(key) else {
+                refuse(state, SHORTCUT_UNUSABLE_KEY.to_string());
+                return;
+            };
+            let chord = crate::hotkey::Chord::new(egui_modifiers(modifiers), code);
+            if !chord.has_a_modifier() {
+                refuse(state, SHORTCUT_NEEDS_A_MODIFIER.to_string());
+                return;
+            }
+            if let Some(other) = state.settings.shortcuts.conflict(which, chord) {
+                refuse(state, shortcut_taken_note(other));
+                return;
+            }
+            state.settings.shortcuts.set(which, Some(chord));
+            state.capturing = None;
+            state.shortcut_error = None;
         }
     }
+}
+
+/// egui's modifier set as `global_hotkey`'s.
+///
+/// **`command` is deliberately not read.** On Windows egui sets `command` from
+/// `ctrl`, so reading both would be reading `ctrl` twice; on macOS it is the
+/// Cmd key, which this app does not run on. `Chord::new` truncates anything
+/// `RegisterHotKey` cannot claim in any case, so what is stored is what is
+/// registered.
+fn egui_modifiers(modifiers: egui::Modifiers) -> global_hotkey::hotkey::Modifiers {
+    use global_hotkey::hotkey::Modifiers;
+    let mut mods = Modifiers::empty();
+    if modifiers.ctrl {
+        mods |= Modifiers::CONTROL;
+    }
+    if modifiers.alt {
+        mods |= Modifiers::ALT;
+    }
+    if modifiers.shift {
+        mods |= Modifiers::SHIFT;
+    }
+    if modifiers.mac_cmd {
+        mods |= Modifiers::SUPER;
+    }
+    mods
+}
+
+/// One egui key as the `Code` `RegisterHotKey` is given, or `None` for a key
+/// this app will not bind.
+///
+/// **A `match` and not a name-based lookup.** `egui::Key` and
+/// `keyboard_types::Code` disagree about spelling in both directions (`Num0`
+/// against `Digit0`, `OpenBracket` against `BracketLeft`, `A` against `KeyA`),
+/// so a lookup through `Display` would silently return `None` for every letter
+/// on the keyboard.
+///
+/// The `None` arm is the interesting one: egui has keys that are *characters*
+/// rather than positions -- `Plus`, `Pipe`, `Questionmark`, `Colon`,
+/// `Exclamationmark`, the curly brackets -- which a user only ever produces by
+/// holding Shift, and which have no `Code` of their own because a `Code` names
+/// the physical key. Binding one would store a chord whose registered form is
+/// the *unshifted* key, so the page would name one combination and the OS
+/// would listen for another. They are refused, and `SHORTCUT_UNUSABLE_KEY`
+/// says so out loud rather than leaving the row looking stuck.
+fn code_for(key: egui::Key) -> Option<global_hotkey::hotkey::Code> {
+    use egui::Key as K;
+    use global_hotkey::hotkey::Code as C;
+    Some(match key {
+        K::A => C::KeyA,
+        K::B => C::KeyB,
+        K::C => C::KeyC,
+        K::D => C::KeyD,
+        K::E => C::KeyE,
+        K::F => C::KeyF,
+        K::G => C::KeyG,
+        K::H => C::KeyH,
+        K::I => C::KeyI,
+        K::J => C::KeyJ,
+        K::K => C::KeyK,
+        K::L => C::KeyL,
+        K::M => C::KeyM,
+        K::N => C::KeyN,
+        K::O => C::KeyO,
+        K::P => C::KeyP,
+        K::Q => C::KeyQ,
+        K::R => C::KeyR,
+        K::S => C::KeyS,
+        K::T => C::KeyT,
+        K::U => C::KeyU,
+        K::V => C::KeyV,
+        K::W => C::KeyW,
+        K::X => C::KeyX,
+        K::Y => C::KeyY,
+        K::Z => C::KeyZ,
+        K::Num0 => C::Digit0,
+        K::Num1 => C::Digit1,
+        K::Num2 => C::Digit2,
+        K::Num3 => C::Digit3,
+        K::Num4 => C::Digit4,
+        K::Num5 => C::Digit5,
+        K::Num6 => C::Digit6,
+        K::Num7 => C::Digit7,
+        K::Num8 => C::Digit8,
+        K::Num9 => C::Digit9,
+        K::F1 => C::F1,
+        K::F2 => C::F2,
+        K::F3 => C::F3,
+        K::F4 => C::F4,
+        K::F5 => C::F5,
+        K::F6 => C::F6,
+        K::F7 => C::F7,
+        K::F8 => C::F8,
+        K::F9 => C::F9,
+        K::F10 => C::F10,
+        K::F11 => C::F11,
+        K::F12 => C::F12,
+        K::Space => C::Space,
+        K::Enter => C::Enter,
+        K::Tab => C::Tab,
+        K::Insert => C::Insert,
+        K::Home => C::Home,
+        K::End => C::End,
+        K::PageUp => C::PageUp,
+        K::PageDown => C::PageDown,
+        K::ArrowUp => C::ArrowUp,
+        K::ArrowDown => C::ArrowDown,
+        K::ArrowLeft => C::ArrowLeft,
+        K::ArrowRight => C::ArrowRight,
+        K::Minus => C::Minus,
+        K::Equals => C::Equal,
+        K::OpenBracket => C::BracketLeft,
+        K::CloseBracket => C::BracketRight,
+        K::Backslash => C::Backslash,
+        K::Semicolon => C::Semicolon,
+        K::Quote => C::Quote,
+        K::Comma => C::Comma,
+        K::Period => C::Period,
+        K::Slash => C::Slash,
+        K::Backtick => C::Backquote,
+        // Escape, Backspace and Delete are handled by `read_a_chord` before
+        // this is reached and must never be bindable; the rest are the
+        // shifted characters and the clipboard keys, which name no physical
+        // key. See this function's doc.
+        _ => return None,
+    })
 }
 
 /// The account row: which Bitwarden account this vault is, and where it
@@ -7235,25 +7796,57 @@ mod tests {
         painted
     }
 
-    /// One frame of the fill-hotkey row at a given hotkey status.
+    /// Every `egui::Key`, for the sweep in
+    /// [`every_bindable_key_maps_to_the_code_of_its_own_name`].
     ///
-    /// Drives [`fill_hotkey_row`] directly rather than going through
-    /// [`paint`]'s `draw_section`, because the status `draw_section` reads is
-    /// process-wide (`hotkey::availability`) and the tests in this binary run in
-    /// parallel: a test that set it would be setting it for whatever else was
-    /// painting a General page at that instant. (It was a Shortcuts page until
-    /// that section -- one unrebindable chip -- was removed and the row moved
-    /// to General.)
+    /// `egui::Key::ALL` is the crate's own list, so this cannot go stale as
+    /// egui grows keys -- which is the case the sweep exists for: a key added
+    /// upstream that `code_for` accidentally maps to a `Code` this app has no
+    /// name for would persist as `?` and read back as nothing.
+    const ALL_EGUI_KEYS: &[egui::Key] = egui::Key::ALL;
+
+    /// The picker chord as this app ships it.
     ///
-    /// The row is drawn inside a [`card`], because on General it is one row of
-    /// one, and a row painted onto bare canvas would sit on the wrong ground.
-    fn paint_fill_hotkey_at(status: crate::hotkey::HotkeyStatus) -> Painted {
+    /// **In the test module and not in production**, for the reason recorded
+    /// where it used to be declared: the page paints the *stored* chord, and a
+    /// production constant would be a second answer to the same question. Here
+    /// it is a pin -- what a fresh install gets -- and `tray`'s
+    /// `the_tray_and_preferences_agree_on_the_chord` finds it by reading this
+    /// file's source for a line starting `const FILL_HOTKEY`, which an
+    /// indented declaration still satisfies.
+    const FILL_HOTKEY: &str = "CTRL+ALT+B";
+
+    /// Every row armed. The ordinary state, and the one most of the Shortcuts
+    /// tests want to hold still while they drive the widget.
+    const ARMED: [crate::hotkey::HotkeyStatus; crate::app::FillShortcut::COUNT] =
+        [crate::hotkey::HotkeyStatus::Armed; crate::app::FillShortcut::COUNT];
+
+    /// One frame of the Shortcuts page at given settings and given statuses.
+    ///
+    /// Drives [`draw_shortcuts`] directly rather than going through [`paint`]'s
+    /// `draw_section`, because the statuses `draw_section` reads are
+    /// process-wide (`hotkey::availability`) and the tests in this binary run
+    /// in parallel: a test that set them would be setting them for whatever
+    /// else was painting a Shortcuts page at that instant.
+    fn paint_shortcuts(
+        settings: &Settings,
+        live: [crate::hotkey::HotkeyStatus; crate::app::FillShortcut::COUNT],
+    ) -> Painted {
         let ctx = styled_context();
-        let input = egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, BODY_SIZE)),
-            ..Default::default()
-        };
-        let output = ctx.run_ui(input, |ui| card(ui, |ui| fill_hotkey_row(ui, status)));
+        let mut state = PrefsState::new(settings.clone());
+        shortcuts_frame(&ctx, &mut state, live, &[])
+    }
+
+    /// One frame of the Shortcuts page against a state that survives between
+    /// frames, which is what a capture needs: the click that starts one and
+    /// the key press that ends it are never the same frame.
+    fn shortcuts_frame(
+        ctx: &egui::Context,
+        state: &mut PrefsState,
+        live: [crate::hotkey::HotkeyStatus; crate::app::FillShortcut::COUNT],
+        events: &[egui::Event],
+    ) -> Painted {
+        let output = ctx.run_ui(raw_input(events), |ui| draw_shortcuts(ui, state, live));
         let mut painted = Painted::default();
         for clipped in &output.shapes {
             walk(&clipped.shape, &mut painted);
@@ -7261,45 +7854,46 @@ mod tests {
         painted
     }
 
-    /// `settings.rs`'s walk, over a file with one test module.
-    ///
-    /// A line that is exactly a `cfg(test)` gate followed by a column-0 module
-    /// opener starts a skip that runs to the next column-0 `}`; inside a
-    /// module every item is indented, so that brace is the module's own.
-    /// Line-ending agnostic, for the reason the original gives: `lines()`
-    /// strips the carriage return, so this reads the same on a CRLF working
-    /// tree and an LF checkout.
-    fn production_half(source: &str) -> (String, usize) {
-        let mut kept: Vec<&str> = Vec::new();
-        let mut cut = 0usize;
-        let mut gated = false;
-        let mut skipping = false;
-        for line in source.lines() {
-            if skipping {
-                if line == "}" {
-                    skipping = false;
-                }
-                continue;
-            }
-            if gated && line.starts_with("mod ") {
-                // The gate line was pushed on the previous turn; it belongs to
-                // the module being cut.
-                kept.pop();
-                skipping = true;
-                cut += 1;
-                gated = false;
-                continue;
-            }
-            gated = line.trim() == concat!("#[cfg(", "test)]");
-            kept.push(line);
-        }
-        assert!(
-            !skipping,
-            "a test module was opened and never closed by a column-0 brace, so the rest of the \
-             file was dropped and every needle counted over this reads nothing"
-        );
-        (kept.join("\n"), cut)
+    /// A key press, as the capture widget reads it.
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }]
     }
+
+    fn none() -> egui::Modifiers {
+        egui::Modifiers::NONE
+    }
+
+    fn ctrl_alt() -> egui::Modifiers {
+        egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE }
+    }
+
+    fn ctrl_shift() -> egui::Modifiers {
+        egui::Modifiers { ctrl: true, shift: true, ..egui::Modifiers::NONE }
+    }
+
+    // **`production_half` is gone from this module**, and its removal is the
+    // pin it served being replaced by something stronger rather than dropped.
+    //
+    // It existed for one test: a source-text walk over `hotkey.rs`, checking
+    // that the chord this page *named* was still the chord `fill_chord`
+    // *built* -- because the two were a display string here and a constant
+    // there, with no compile-time link between them, and the walk had to skip
+    // `hotkey.rs`'s test module so a fixture could not satisfy a pin
+    // production had stopped satisfying.
+    //
+    // There is no `fill_chord` any more. The picker chord is a value in
+    // `settings::Shortcuts::default`, which this page reads, `hotkey`
+    // registers and the tray prints, so the check is now a comparison of two
+    // values in `the_shortcuts_page_ships_the_chord_this_app_has_always_used`
+    // -- which cannot be satisfied by a substring appearing anywhere.
+    // `foreground.rs` keeps its own copy of the walk for the pins that still
+    // need one.
 
     fn paint_settings(section: Section, settings: Settings) -> Painted {
         let ctx = styled_context();
@@ -7615,22 +8209,34 @@ mod tests {
         // loop is structurally blind to.
         let expected = [
             "General",
+            // **Shortcuts is back, and it is back where the bulk of it came
+            // from.** The 3e section of this name was removed with the other
+            // four that carried nothing a user could change -- it was one
+            // read-only chip -- and that chip became a row on General. There
+            // are five remappable chords now, so it is a page again, and it
+            // sits directly after General because that is where its content
+            // was, above the rows that became View and Lock. Same rule as
+            // Breaches, Updates, View and Lock; see `Section::Shortcuts`.
+            "Shortcuts",
             "View",
             "Lock",
             // Breaches sits directly after General because that is where its
             // one pill used to be, and where a reader will look for it.
             "Breaches",
-            // **Five rows are gone from between Breaches and Vault, and from
+            // **Four rows are gone from between Breaches and Vault, and from
             // between Clipboard and Updates, and this list is re-pinned to
             // say so rather than loosened to tolerate it.** Autofill, Native
-            // apps, Security, Shortcuts and Sync & account were the five
-            // pages on which a user could change nothing -- three of them a
-            // single sentence saying so, one a read-only chip, one two rows
-            // of prose. A nav row promises a decision; those five charged a
-            // click to answer "not here". The one fact that had no other
-            // home, the fill hotkey, is a row on General now
-            // (`fill_hotkey_row`), and `general_names_the_fill_hotkey_and_
-            // its_state` is what stops it going missing with them.
+            // apps, Security and Sync & account were four of the five pages on
+            // which a user could change nothing -- three of them a single
+            // sentence saying so, one two rows of prose. A nav row promises a
+            // decision; those five charged a click to answer "not here".
+            //
+            // **The fifth was Shortcuts, and it is back at the top of this
+            // list rather than gone.** It was removed for the same reason as
+            // the others -- one read-only chip -- and what made the chip
+            // read-only was that there was one chord and it was a constant.
+            // There are five now, all of them stored preferences, so the row
+            // promises five decisions and delivers them.
             //
             // The vault page sits directly after Breaches because that is
             // where a reader looking for "where does my vault come from"
@@ -11171,46 +11777,96 @@ mod tests {
         }
     }
 
+    // -- Shortcuts ---------------------------------------------------------
+
+    /// **All five rows are drawn, each naming its own chord.**
+    ///
+    /// At `Armed`, supplied, rather than through `paint(Section::Shortcuts)`
+    /// and the process-wide `hotkey::availability` it reads: the tests in this
+    /// binary run in parallel, and a page whose content depends on a static
+    /// another test can write is a page whose test fails on somebody else's
+    /// schedule.
     #[test]
-    fn the_hotkey_row_reports_the_one_shortcut_that_exists() {
-        // At `Armed`, supplied, rather than through `paint(Section::General)`
-        // and the process-wide `hotkey::availability()` it reads: the tests in
-        // this binary run in parallel, and a page whose content depends on a
-        // static another test can write is a page whose test fails on somebody
-        // else's schedule.
-        let painted = paint_fill_hotkey_at(crate::hotkey::HotkeyStatus::Armed);
-        assert!(painted.contains("Fill the focused app"));
-        assert!(painted.contains("CTRL+ALT+B"), "got {:?}", painted.strings());
-        assert_eq!(
-            painted.count_of_size(Vec2::new(40.0, 22.0)),
-            0,
-            "a shortcut is reported here, not rebound"
-        );
+    fn every_shortcut_is_a_row_that_names_its_own_chord() {
+        let settings = Settings::default();
+        let painted = paint_shortcuts(&settings, [crate::hotkey::HotkeyStatus::Armed; 5]);
+        for which in crate::app::FillShortcut::ALL {
+            assert!(
+                painted.contains(which.label()),
+                "{which:?} has no row on the Shortcuts page: {:?}",
+                painted.strings()
+            );
+            let chord = settings.shortcuts.chord(which).expect("bound by default").to_string();
+            assert!(
+                painted.contains(&chord),
+                "{which:?}'s row does not name {chord}, so the user cannot discover it: {:?}",
+                painted.strings()
+            );
+        }
+        // Five distinct chords on screen, so the rows are not all painting the
+        // same one -- which every assertion above would tolerate.
+        let mut chords: Vec<String> = crate::app::FillShortcut::ALL
+            .into_iter()
+            .filter_map(|w| settings.shortcuts.chord(w).map(|c| c.to_string()))
+            .collect();
+        chords.sort();
+        chords.dedup();
+        assert_eq!(chords.len(), 5);
     }
 
-    /// **The General page is where the user finds out the shortcut is not
-    /// working.**
+    /// **The picker chord this page ships with is the one this app has always
+    /// registered.**
     ///
-    /// The crash this replaced was a process that vanished; the fix that
-    /// replaced it must not be a shortcut that silently does nothing, which
-    /// is a second invisible failure wearing the first one's clothes. So the
-    /// unavailable row has to name the state and the way out of it. It says it
-    /// on General now, one row under the toggle whose own description ends
-    /// "CTRL+ALT+B is the only way to fill" -- which is the sentence that
-    /// makes a silently dead chord actively misleading.
+    /// A source-text guard's replacement, and a stronger one: the chord used
+    /// to be a constant in `hotkey.rs` with no compile-time link to the string
+    /// this window painted, so the two were held together by reading
+    /// `hotkey.rs`'s text. They are one value now -- `settings::Shortcuts`
+    /// holds it, `hotkey` registers it and this page paints it -- so what is
+    /// left to guard is that the shipped default has not quietly moved.
     #[test]
-    fn a_shortcut_another_program_took_is_reported_on_the_page() {
-        let painted = paint_fill_hotkey_at(crate::hotkey::HotkeyStatus::Unavailable(
+    fn the_shortcuts_page_ships_the_chord_this_app_has_always_used() {
+        assert_eq!(FILL_HOTKEY, "CTRL+ALT+B");
+        assert_eq!(
+            crate::settings::Shortcuts::default()
+                .chord(crate::app::FillShortcut::Picker)
+                .map(|c| c.to_string())
+                .as_deref(),
+            Some(FILL_HOTKEY),
+            "the picker chord this app ships with is no longer the one this page, the tray \
+             and every piece of copy in this crate say it is"
+        );
+        // And it really reaches the page, painted as a run of its own.
+        let painted = paint_shortcuts(
+            &Settings::default(),
+            [crate::hotkey::HotkeyStatus::Armed; 5],
+        );
+        assert!(painted.contains(FILL_HOTKEY), "got {:?}", painted.strings());
+    }
+
+    /// **The page is where the user finds out a shortcut is not working.**
+    ///
+    /// The crash this whole subsystem replaced was a process that vanished;
+    /// the fix that replaced it must not be a shortcut that silently does
+    /// nothing, which is a second invisible failure wearing the first one's
+    /// clothes. So an unavailable row has to name the state and the way out of
+    /// it -- and, now that there are five, name *which* chord.
+    #[test]
+    fn a_shortcut_another_program_took_is_reported_on_its_own_row() {
+        let settings = Settings::default();
+        let mut live = [crate::hotkey::HotkeyStatus::Armed; 5];
+        live[crate::app::FillShortcut::Password.index()] = crate::hotkey::HotkeyStatus::Unavailable(
             crate::hotkey::Unavailable::TakenByAnotherProgram,
-        ));
+        );
+        let painted = paint_shortcuts(&settings, live);
         assert!(
             painted.any_containing("shortcut not working"),
-            "the hotkey row paints an unavailable hotkey as though it worked: {:?}",
+            "the page paints an unavailable shortcut as though it worked: {:?}",
             painted.strings()
         );
         assert!(
-            painted.any_containing("Another program on this PC is already using CTRL+ALT+B"),
-            "the page says the shortcut is off without saying what to do about it: {:?}",
+            painted.any_containing("Another program on this PC is already using CTRL+ALT+P"),
+            "the page says the shortcut is off without saying what to do about it, or names \
+             the wrong chord: {:?}",
             painted.strings()
         );
         assert!(
@@ -11218,67 +11874,29 @@ mod tests {
             "the page names no way out of the conflict: {:?}",
             painted.strings()
         );
-        // Still names the chord, so a user can tell WHICH shortcut is gone --
-        // and see what to stop another program from using.
+        // **The warning is on ONE row.** With five rows, a page that warned
+        // about all of them because one was lost is a page that sends the user
+        // hunting for four conflicts that do not exist.
+        let warnings = painted
+            .strings()
+            .iter()
+            .filter(|t| t.contains("shortcut not working"))
+            .count();
+        assert_eq!(
+            warnings, 1,
+            "one lost chord is being reported on {warnings} rows: {:?}",
+            painted.strings()
+        );
+        // And the four that are fine still name their own chords.
         assert!(painted.contains("CTRL+ALT+B"), "got {:?}", painted.strings());
     }
 
-    /// **The chord is discoverable from the page the window opens on.**
-    ///
-    /// The three tests above drive [`fill_hotkey_row`] directly, which proves
-    /// the row is right and says nothing about whether anything draws it. That
-    /// gap is exactly how the fill hotkey could have been lost: the Shortcuts
-    /// section was removed for having nothing on it a user could change, and
-    /// the one thing it *did* carry -- the chord itself -- would have gone
-    /// with it silently. `PROMPT_DESCRIPTION` does say CTRL+ALT+B, but inside
-    /// a sentence arguing for a toggle, and it says nothing about whether the
-    /// chord is currently registered; a user who cannot discover the shortcut,
-    /// or cannot find out that something else has taken it, cannot use the
-    /// feature at all.
-    ///
-    /// Painted through `paint`, so it is `draw_section` -> `draw_general` that
-    /// is under test and not a harness. The status is whatever this process
-    /// has published (`NotYetAttempted` in a test, which registers nothing),
-    /// so the assertion is on the pair of labels rather than on one of them:
-    /// either wording is a row that is really there.
+    /// And a working page says none of that. Without this, a page that warned
+    /// unconditionally would pass the test above.
     #[test]
-    fn general_names_the_fill_hotkey_and_its_state() {
-        let painted = paint(Section::General);
-        // The chip, as its own painted run -- not the mention inside
-        // `PROMPT_DESCRIPTION`, which is a longer galley and would not match.
-        assert!(
-            painted.contains(FILL_HOTKEY),
-            "General does not name the fill hotkey as a chord of its own. \
-             `PROMPT_DESCRIPTION` mentions it mid-sentence, and that is not discovery: it \
-             is the argument for a toggle, read by someone already deciding about \
-             prompts. Got {:?}",
-            painted.strings()
-        );
-        let armed = painted.contains(FILL_HOTKEY_LABEL);
-        let unavailable = painted.contains(FILL_HOTKEY_UNAVAILABLE_LABEL);
-        assert!(
-            armed != unavailable,
-            "General paints the chord with neither of the row's two labels, or with \r
-             both: a bare chip says what the key is and not whether pressing it does \r
-             anything. Got {:?}",
-            painted.strings()
-        );
-        // The control on the two above: this really is General, and the row
-        // really is next to the toggle whose description promises the chord.
-        assert!(
-            painted.contains(PROMPT_DESCRIPTION),
-            "this is not the General card; got {:?}",
-            painted.strings()
-        );
-    }
-
-    /// And the ordinary row says none of that. Without this, a row that
-    /// warned unconditionally would pass the test above.
-    #[test]
-    fn a_working_shortcut_is_reported_without_a_warning() {
-        let painted = paint_fill_hotkey_at(crate::hotkey::HotkeyStatus::Armed);
-        assert!(painted.contains(FILL_HOTKEY_LABEL));
-        assert!(painted.contains("CTRL+ALT+B"));
+    fn working_shortcuts_are_reported_without_a_warning() {
+        let painted =
+            paint_shortcuts(&Settings::default(), [crate::hotkey::HotkeyStatus::Armed; 5]);
         assert!(
             !painted.any_containing("shortcut not working"),
             "a registered shortcut is being reported as broken: {:?}",
@@ -11291,43 +11909,357 @@ mod tests {
         );
     }
 
+    /// **A cleared row says it is not set, and is not reported as broken.**
+    ///
+    /// The state the old single unrebindable chip could not have. A row the
+    /// user turned off must not wear the words written for a chord another
+    /// program stole: that would be the app arguing with a decision it had
+    /// just carried out, and would send the user looking for a conflicting
+    /// program that does not exist.
     #[test]
-    fn the_hotkey_row_names_the_hotkey_that_is_actually_registered() {
-        // A source-text guard, the same device as `settings.rs`'s
-        // `the_config_path_still_matches_the_one_main_resolves`: `FILL_HOTKEY`
-        // is a display string with no compile-time link to
-        // `hotkey::register_fill_hotkey`, so changing the registered chord
-        // would otherwise leave this window confidently naming the old one.
-        assert_eq!(FILL_HOTKEY, "CTRL+ALT+B");
-        // **Read over the production half, not the whole file**, because
-        // `settings.rs` and `item_list.rs` count their cross-file needles that
-        // way for a reason that has now arrived here: a fixture in another
-        // module's test code can satisfy a presence pin that production has
-        // stopped satisfying. When this pin was written `hotkey.rs` had no
-        // test code at all and said so; it has since grown a test module whose
-        // fixtures build the very chord these two needles look for, so a
-        // whole-file read would go green over a `register_fill_hotkey` that
-        // had stopped registering anything.
-        let (hotkey_rs, cut) = production_half(include_str!("hotkey.rs"));
-        assert_eq!(
-            cut, 1,
-            "`hotkey.rs` no longer has exactly the one test module this walk was measured \
-             against, so what it cut is not what it thinks it cut"
-        );
-        assert_eq!(
-            hotkey_rs.matches(concat!("cfg(", "test)")).count(),
-            0,
-            "a `cfg(test)` gate survived the cut, so the needles below can be satisfied by \
-             test code instead of by the registration they guard"
+    fn a_cleared_shortcut_says_so_rather_than_blaming_anything() {
+        let mut settings = Settings::default();
+        settings.shortcuts.set(crate::app::FillShortcut::Totp, None);
+        let mut live = [crate::hotkey::HotkeyStatus::Armed; 5];
+        live[crate::app::FillShortcut::Totp.index()] = crate::hotkey::HotkeyStatus::Unbound;
+        let painted = paint_shortcuts(&settings, live);
+        assert!(
+            painted.contains(SHORTCUT_NOT_SET),
+            "a cleared shortcut paints no state at all: {:?}",
+            painted.strings()
         );
         assert!(
-            hotkey_rs.contains("Modifiers::CONTROL | Modifiers::ALT"),
-            "hotkey.rs no longer registers Ctrl+Alt -- `FILL_HOTKEY` says it does"
+            !painted.any_containing("shortcut not working"),
+            "a shortcut the user cleared is reported as a failure: {:?}",
+            painted.strings()
         );
         assert!(
-            hotkey_rs.contains("Code::KeyB"),
-            "hotkey.rs no longer registers B -- `FILL_HOTKEY` says it does"
+            !painted.contains("CTRL+ALT+T"),
+            "a cleared shortcut still names the chord it used to have: {:?}",
+            painted.strings()
         );
+        // The other four are untouched.
+        assert!(painted.contains("CTRL+ALT+B"));
+    }
+
+    /// **Each of the four direct actions says what happens with nothing
+    /// matched, and the picker says it does the other thing.**
+    ///
+    /// This is the whole of the user-facing answer to "the shortcut did
+    /// nothing" -- see `app::FillShortcut::opens_a_card_with_nothing_matched`,
+    /// which records why silence was chosen over a card and over a dialog.
+    /// Silence is only defensible while it is explained where the user asks,
+    /// and this page is where they ask.
+    #[test]
+    fn a_direct_shortcut_says_it_needs_a_matched_window() {
+        let painted =
+            paint_shortcuts(&Settings::default(), [crate::hotkey::HotkeyStatus::Armed; 5]);
+        let explained = painted
+            .strings()
+            .iter()
+            .filter(|t| t.contains("with nothing matched it does nothing"))
+            .count();
+        assert_eq!(
+            explained, 4,
+            "{explained} rows explain what a direct action does with nothing matched, not 4 \
+             -- a shortcut that is silent AND unexplained is exactly the failure the whole \
+             status column exists to prevent: {:?}",
+            painted.strings()
+        );
+        // ...and the picker's row does NOT say it, because the picker is the
+        // one that answers for an unmatched window.
+        assert!(
+            painted.any_containing("it asks Deskwarden"),
+            "the picker's row does not say that it is the one that answers for an unmatched \
+             window, so the four rows above point at nothing: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// **Clicking a chord starts a capture, and a combination is taken.**
+    ///
+    /// The whole widget, end to end, through the real draw: a click on the
+    /// chip, then a key press, then the stored value.
+    #[test]
+    fn pressing_a_combination_rebinds_that_shortcut() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let painted = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        let at = painted.rect_of("CTRL+ALT+U").center();
+
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &click(at));
+        assert_eq!(
+            state.capturing,
+            Some(crate::app::FillShortcut::Username),
+            "clicking the chord did not start a capture, so the widget is a label"
+        );
+        let listening = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        assert!(
+            listening.contains(SHORTCUT_CAPTURING),
+            "a capturing row does not say it is listening: {:?}",
+            listening.strings()
+        );
+        assert!(
+            listening.any_containing("Esc leaves this shortcut as it was"),
+            "a widget that has taken the keyboard does not say how to give it back: {:?}",
+            listening.strings()
+        );
+
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &key(egui::Key::F9, ctrl_shift()));
+        assert_eq!(state.capturing, None, "the capture did not end when a chord was taken");
+        assert_eq!(
+            state.settings.shortcuts.username.map(|c| c.to_string()).as_deref(),
+            Some("CTRL+SHIFT+F9"),
+            "the pressed combination was not stored"
+        );
+        // The other four are untouched: one capture binds one row.
+        assert_eq!(state.settings.shortcuts.picker, Settings::default().shortcuts.picker);
+    }
+
+    /// **Esc cancels and changes nothing** -- the promise a capture widget has
+    /// to make before a user will try one.
+    #[test]
+    fn escape_leaves_the_binding_exactly_as_it_was() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let before = state.settings.shortcuts;
+        let painted = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        let at = painted.rect_of("CTRL+ALT+U").center();
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &click(at));
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &key(egui::Key::Escape, none()));
+        assert_eq!(state.capturing, None, "Esc did not end the capture");
+        assert_eq!(state.settings.shortcuts, before, "Esc changed a binding");
+    }
+
+    /// **Backspace clears the row**, which is the keyboard's way to what the
+    /// *Clear* button does -- and the row then says so rather than going
+    /// quiet.
+    #[test]
+    fn backspace_clears_the_binding() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let painted = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        let at = painted.rect_of("CTRL+ALT+U").center();
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &click(at));
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &key(egui::Key::Backspace, none()));
+        assert_eq!(state.capturing, None);
+        assert_eq!(state.settings.shortcuts.username, None, "Backspace did not clear the row");
+        let after = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        assert!(after.contains(SHORTCUT_NOT_SET), "got {:?}", after.strings());
+    }
+
+    /// **The Clear button clears the row**, which is the same thing for the
+    /// hand that is on the mouse.
+    #[test]
+    fn the_clear_button_clears_the_binding() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let painted = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        // The first `Clear` in painted order is the picker's row, which is the
+        // first row on the page.
+        let at = painted.rect_of(SHORTCUT_CLEAR).center();
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &click(at));
+        assert_eq!(
+            state.settings.shortcuts.picker, None,
+            "the Clear button did not clear the row it is on"
+        );
+        assert_eq!(state.capturing, None, "clearing a row started a capture");
+    }
+
+    /// **A bare key is refused and the previous binding kept.**
+    ///
+    /// `RegisterHotKey` would happily give this process a bare `P` for the
+    /// whole logon session -- and then every `P` typed anywhere on the machine
+    /// arrives here, including the ones typed into the Preferences window that
+    /// is the only way back. So the refusal has to be ours, it has to leave
+    /// the old chord in place, and it has to say why.
+    #[test]
+    fn a_key_with_no_modifier_is_refused_and_the_old_chord_kept() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let was = state.settings.shortcuts.username;
+        let painted = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        let at = painted.rect_of("CTRL+ALT+U").center();
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &click(at));
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &key(egui::Key::P, none()));
+        // **The frame AFTER the press.** The row lays its description out at
+        // the top of a frame and reads the key event at the bottom of it, so a
+        // refusal recorded by one frame is painted by the next -- which is why
+        // `read_a_chord` asks for that next frame rather than trusting a
+        // window that is not animating to produce one.
+        let refused = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        assert_eq!(state.settings.shortcuts.username, was, "a bare key was bound");
+        assert_eq!(
+            state.capturing,
+            Some(crate::app::FillShortcut::Username),
+            "a refusal ended the capture, so the user has to click again to correct it"
+        );
+        assert!(
+            refused.any_containing("That needs a modifier"),
+            "the combination was refused without saying why: {:?}",
+            refused.strings()
+        );
+    }
+
+    /// **A chord another row already holds is refused, the previous binding
+    /// kept, and the row that holds it named.**
+    ///
+    /// Accepting it would put two rows on one chord, and the second
+    /// `RegisterHotKey` for a combination fails with `AlreadyRegistered` -- so
+    /// this app would report a conflict *with itself* as though another
+    /// program had taken the keys.
+    #[test]
+    fn a_chord_this_app_already_uses_is_refused_and_the_old_chord_kept() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let was = state.settings.shortcuts.username;
+        let painted = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        let at = painted.rect_of("CTRL+ALT+U").center();
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &click(at));
+        // CTRL+ALT+P is the password row's own default.
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &key(egui::Key::P, ctrl_alt()));
+        // The frame after the press; see the note in the test above.
+        let refused = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        assert_eq!(state.settings.shortcuts.username, was, "a chord in use was bound anyway");
+        assert_eq!(
+            state.settings.shortcuts.password,
+            Settings::default().shortcuts.password,
+            "the row that already held the chord lost it"
+        );
+        assert!(
+            refused.any_containing("Deskwarden already uses that"),
+            "the combination was refused without saying why: {:?}",
+            refused.strings()
+        );
+        assert!(
+            refused.any_containing(crate::app::FillShortcut::Password.label()),
+            "the refusal does not name the row that holds the chord, so the user has five \
+             rows to search: {:?}",
+            refused.strings()
+        );
+    }
+
+    /// **Re-pressing a row's own current chord is not a conflict with
+    /// itself**, which is the case a naive "is this chord in use" check gets
+    /// wrong and which a user hits by pressing the combination they meant to
+    /// keep.
+    #[test]
+    fn a_row_may_be_given_the_chord_it_already_has() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let painted = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        let at = painted.rect_of("CTRL+ALT+U").center();
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &click(at));
+        let after = shortcuts_frame(&ctx, &mut state, ARMED, &key(egui::Key::U, ctrl_alt()));
+        assert_eq!(state.capturing, None, "a row was refused its own chord");
+        assert_eq!(state.settings.shortcuts, Settings::default().shortcuts);
+        assert!(!after.any_containing("Deskwarden already uses that"), "got {:?}", after.strings());
+    }
+
+    /// **A key this app cannot bind says so rather than being swallowed**,
+    /// which would leave the row sitting in capture mode looking broken.
+    #[test]
+    fn a_key_that_cannot_be_bound_is_refused_out_loud() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let was = state.settings.shortcuts.username;
+        let painted = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        let at = painted.rect_of("CTRL+ALT+U").center();
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &click(at));
+        // `Pipe` is a CHARACTER, not a physical key: it has no `Code`, and
+        // binding it would store a chord whose registered form is the
+        // unshifted key -- so the page would name one combination and Windows
+        // would listen for another.
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &key(egui::Key::Pipe, ctrl_alt()));
+        // The frame after the press; see the note two tests above.
+        let refused = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        assert_eq!(state.settings.shortcuts.username, was);
+        assert!(
+            refused.any_containing("cannot use that key"),
+            "an unbindable key was swallowed, so the row looks stuck: {:?}",
+            refused.strings()
+        );
+    }
+
+    /// **Only one row can be listening at a time.**
+    ///
+    /// Two rows reading `ctx.input`'s events in one frame would both take the
+    /// press, and one keystroke would bind two shortcuts -- and then the
+    /// second registration would fail as a conflict with the first.
+    #[test]
+    fn starting_a_capture_ends_any_other_rows() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let painted = shortcuts_frame(&ctx, &mut state, ARMED, &[]);
+        let username = painted.rect_of("CTRL+ALT+U").center();
+        let password = painted.rect_of("CTRL+ALT+P").center();
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &click(username));
+        assert_eq!(state.capturing, Some(crate::app::FillShortcut::Username));
+        let _ = shortcuts_frame(&ctx, &mut state, ARMED, &click(password));
+        assert_eq!(
+            state.capturing,
+            Some(crate::app::FillShortcut::Password),
+            "two rows are listening at once, so one keystroke binds two shortcuts"
+        );
+    }
+
+    /// **The `egui::Key` -> `Code` map is not a shape.**
+    ///
+    /// The one place two crates' key spellings meet, and a table where every
+    /// entry could be wrong independently. A letter mapped to the wrong
+    /// `Code` would register a chord the page does not name, which is
+    /// unobservable from the UI.
+    #[test]
+    fn every_bindable_key_maps_to_the_code_of_its_own_name() {
+        for (key, expect) in [
+            (egui::Key::A, "A"),
+            (egui::Key::Z, "Z"),
+            (egui::Key::Num0, "0"),
+            (egui::Key::Num9, "9"),
+            (egui::Key::F1, "F1"),
+            (egui::Key::F12, "F12"),
+            (egui::Key::OpenBracket, "["),
+            (egui::Key::CloseBracket, "]"),
+            (egui::Key::Equals, "="),
+            (egui::Key::Minus, "-"),
+            (egui::Key::Backtick, "`"),
+            (egui::Key::ArrowLeft, "LEFT"),
+            (egui::Key::PageDown, "PAGEDOWN"),
+            (egui::Key::Space, "SPACE"),
+        ] {
+            let code = code_for(key).unwrap_or_else(|| panic!("{key:?} maps to no key code"));
+            assert_eq!(
+                crate::hotkey::key_label(code),
+                Some(expect),
+                "{key:?} maps to {code:?}, which this app calls something else -- the page \
+                 would name one combination and Windows would listen for another"
+            );
+        }
+        // The keys that must never be bindable: two the widget handles itself,
+        // and the shifted characters that name no physical key.
+        for key in [
+            egui::Key::Escape,
+            egui::Key::Backspace,
+            egui::Key::Delete,
+            egui::Key::Pipe,
+            egui::Key::Questionmark,
+            egui::Key::Plus,
+            egui::Key::Colon,
+            egui::Key::Copy,
+        ] {
+            assert_eq!(code_for(key), None, "{key:?} is bindable and must not be");
+        }
+        // ...and every key this map DOES produce is one `hotkey::KEYS` knows,
+        // so nothing can be captured that cannot then be printed or persisted.
+        for key in ALL_EGUI_KEYS {
+            if let Some(code) = code_for(*key) {
+                assert!(
+                    crate::hotkey::key_label(code).is_some(),
+                    "{key:?} captures as {code:?}, which has no name -- it would persist as \
+                     `?` and read back as nothing"
+                );
+            }
+        }
     }
 
     // -- About -------------------------------------------------------------

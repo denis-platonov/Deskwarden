@@ -419,20 +419,33 @@ pub fn waiting_body(elapsed: Duration, local: LocalCopy) -> FirstWindowBody {
 /// `hotkey`'s own `STATUS`), and printing "already listening" over it would put
 /// the claim back one screen earlier. So each state gets its own line, and the
 /// only one that says the shortcut works is the one where it does.
-pub fn hotkey_footnote(status: crate::hotkey::HotkeyStatus) -> &'static str {
+///
+/// **And the chord is an argument now**, for the same reason the status
+/// already was. The picker chord is remappable from Preferences > Shortcuts,
+/// so a footnote that spelled `Ctrl+Alt+B` into four sentences would teach a
+/// user who had moved it a chord this process no longer claims -- which is
+/// exactly the defect the paragraph above is about, arriving from the other
+/// side. The `&'static str` went with it; the sentences are built now.
+pub fn hotkey_footnote(status: crate::hotkey::HotkeyStatus, chord: &str) -> String {
     use crate::hotkey::{HotkeyStatus, Unavailable};
     match status {
-        HotkeyStatus::Armed => "Autofill is listening · Ctrl+Alt+B",
+        HotkeyStatus::Armed => format!("Autofill is listening · {chord}"),
         HotkeyStatus::Unavailable(Unavailable::NotYetAttempted) => {
-            "Autofill starts when your vault opens · Ctrl+Alt+B"
+            format!("Autofill starts when your vault opens · {chord}")
         }
         HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram) => {
-            "Another program is using Ctrl+Alt+B, so autofill has no shortcut"
+            format!("Another program is using {chord}, so autofill has no shortcut")
         }
         HotkeyStatus::Unavailable(Unavailable::NoManager)
         | HotkeyStatus::Unavailable(Unavailable::Refused) => {
-            "Windows refused Ctrl+Alt+B, so autofill has no shortcut"
+            format!("Windows refused {chord}, so autofill has no shortcut")
         }
+        // **Names no chord, because there is none.** The user cleared this
+        // shortcut on the Shortcuts page; a line that printed the combination
+        // anyway would be teaching them one that does nothing, and a line that
+        // blamed Windows or another program would be blaming somebody for
+        // their own decision.
+        HotkeyStatus::Unbound => "Autofill has no keyboard shortcut set".to_string(),
     }
 }
 
@@ -450,6 +463,15 @@ pub struct FirstWindowFooter<'a> {
     /// What [`crate::hotkey::availability`] answers, rendered by
     /// [`hotkey_footnote`].
     pub hotkey: crate::hotkey::HotkeyStatus,
+    /// The chord that status is *about*, as
+    /// [`crate::hotkey::published_chord_text`] spells it.
+    ///
+    /// **Beside the status rather than derived from it**, because the two are
+    /// one fact and the window must not be able to draw a chord that belongs
+    /// to a different answer than the state beside it. It is a `&str` on the
+    /// footer for the same reason [`Self::account`] is: the host holds the
+    /// string, this struct borrows it for one frame.
+    pub hotkey_chord: &'a str,
 }
 
 /// What one frame of [`draw_first_window_body`] was asked for.
@@ -809,7 +831,10 @@ fn draw_footer(ui: &mut egui::Ui, full: egui::Rect, footer: &FirstWindowFooter<'
             .max_rect(inner)
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
-    right.label(theme::regular(hotkey_footnote(footer.hotkey), FOOT_SIZE).color(theme::TEXT_GHOST));
+    right.label(
+        theme::regular(hotkey_footnote(footer.hotkey, footer.hotkey_chord), FOOT_SIZE)
+            .color(theme::TEXT_GHOST),
+    );
 }
 
 /// The one part of this window a headless `egui::Context` can reach.
@@ -1327,6 +1352,7 @@ mod first_window_body_tests {
                 FirstWindowFooter {
                     account,
                     hotkey: HotkeyStatus::Unavailable(Unavailable::NotYetAttempted),
+                    hotkey_chord: "CTRL+ALT+B",
                 },
                 CloseControl::Active,
             );
@@ -1605,6 +1631,7 @@ mod first_window_body_tests {
                 FirstWindowFooter {
                     account: None,
                     hotkey: HotkeyStatus::Armed,
+                    hotkey_chord: "CTRL+ALT+B",
                 },
                 CloseControl::Disabled,
             );
@@ -1788,10 +1815,18 @@ mod first_window_body_tests {
     /// `hotkey::availability` answers `NotYetAttempted`. A first window that
     /// asserts a working hotkey is the same defect class the `Option`-backed
     /// `hotkey::STATUS` was introduced to remove.
+    ///
+    /// **The chord is now supplied rather than spelled here**, because the
+    /// picker chord is remappable from Preferences > Shortcuts. That turns the
+    /// old "does it say Ctrl+Alt+B" assertion into a stronger one: does it say
+    /// the chord it was *handed*. A footnote that still printed a constant
+    /// would pass the old check on a machine where the user had moved the
+    /// shortcut, and teach them a combination this process does not claim.
     #[test]
     fn the_footer_tells_the_truth_about_the_shortcut() {
+        const CHORD: &str = "CTRL+ALT+B";
         assert!(
-            hotkey_footnote(HotkeyStatus::Armed).contains("is listening"),
+            hotkey_footnote(HotkeyStatus::Armed, CHORD).contains("is listening"),
             "the one state where the shortcut really works does not say so"
         );
         for status in [
@@ -1800,7 +1835,7 @@ mod first_window_body_tests {
             Unavailable::NoManager,
             Unavailable::Refused,
         ] {
-            let line = hotkey_footnote(HotkeyStatus::Unavailable(status));
+            let line = hotkey_footnote(HotkeyStatus::Unavailable(status), CHORD);
             assert!(
                 !line.contains("is listening"),
                 "{status:?} claims autofill is listening: {line:?}"
@@ -1811,21 +1846,35 @@ mod first_window_body_tests {
             HotkeyStatus::Unavailable(Unavailable::NotYetAttempted),
             HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram),
         ] {
-            let line = hotkey_footnote(status);
+            let line = hotkey_footnote(status, CHORD);
             assert!(
-                line.contains("Ctrl+Alt+B"),
+                line.contains(CHORD),
                 "{status:?} names a chord that is not the one this app registers: {line:?}"
             );
             assert!(
                 !line.contains('\u{21e7}'),
                 "{status:?} shows the design's own chord rather than this app's: {line:?}"
             );
+            // The chord really is the one supplied, not one written into this
+            // file: the same state with a rebound chord names the new one.
+            let moved = hotkey_footnote(status, "CTRL+SHIFT+F9");
+            assert!(
+                moved.contains("CTRL+SHIFT+F9") && !moved.contains(CHORD),
+                "{status:?} ignores the chord it is handed, so a user who rebound the \
+                 shortcut is taught the old one: {moved:?}"
+            );
         }
+        // **A shortcut the user cleared names none**, which is the state that
+        // did not exist while the chord was a constant. Printing a chord here
+        // would teach a combination that is deliberately not registered.
+        let cleared = hotkey_footnote(HotkeyStatus::Unbound, CHORD);
+        assert!(!cleared.contains(CHORD), "a cleared shortcut is named anyway: {cleared:?}");
+        assert!(!cleared.contains("is listening"), "a cleared shortcut claims to work");
         // ...and it really reaches the screen, in every body.
         for body in all_bodies() {
             let painted = rendered(&frame(body));
             assert!(
-                painted.contains("Ctrl+Alt+B"),
+                painted.contains(CHORD),
                 "{body:?} draws no shortcut line at all: {painted:?}"
             );
         }
@@ -1900,6 +1949,7 @@ mod first_window_body_tests {
                     FirstWindowFooter {
                         account: None,
                         hotkey: HotkeyStatus::Unavailable(Unavailable::NotYetAttempted),
+                        hotkey_chord: "CTRL+ALT+B",
                     },
                     CloseControl::Active,
                 );

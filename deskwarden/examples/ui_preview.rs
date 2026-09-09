@@ -1864,6 +1864,12 @@ impl Preview {
                 hotkey: deskwarden::hotkey::HotkeyStatus::Unavailable(
                     deskwarden::hotkey::Unavailable::NotYetAttempted,
                 ),
+                // The shipped picker chord, spelled rather than read from
+                // `hotkey::published_chord_text`: this preview registers
+                // nothing, so nothing has been published, and a still frame of
+                // a design ought to show the combination a user would see
+                // rather than an empty one.
+                hotkey_chord: "CTRL+ALT+B",
             },
             login_ui::CloseControl::Active,
         );

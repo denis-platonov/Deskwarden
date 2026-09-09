@@ -2317,9 +2317,16 @@ fn main() {
     // ended a real session: any program in this logon session can be holding
     // `Ctrl+Alt+B` first, and `RegisterHotKey` says so with `AlreadyRegistered`
     // rather than with a way round it. It now degrades -- the app runs on
-    // without the shortcut, Preferences > General says why, and the main
+    // without the shortcut, Preferences > Shortcuts says why, and the main
     // loop re-attempts on `hotkey::RETRY_EVERY` in case whatever holds it
     // exits, which is what the `mut` is for. See `hotkey`'s module docs.
+    //
+    // **Five chords, from the settings, and each classified separately.** The
+    // chords are the user's now (Preferences > Shortcuts) rather than a
+    // constant in `hotkey.rs`, so this reads them off the estate -- which is
+    // one more reason this line has to be below the startup window, since that
+    // window's own Preferences modal can have edited them. A refusal on one
+    // costs that one and no other; see `hotkey::register_all`.
     //
     // **This line is late, and that is now safe rather than merely tolerated.**
     // Everything above it -- including the whole life of the startup vault
@@ -2336,7 +2343,7 @@ fn main() {
     // renders that nothing as "Deskwarden has not tried to claim CTRL+ALT+B
     // yet" rather than as a working shortcut. It used to default to *armed*,
     // and told those users the chord worked before anything had tried for it.
-    let mut fill_hotkey = hotkey::register_fill_hotkey();
+    let mut fill_hotkey = hotkey::register_fill_hotkeys(estate.settings.shortcuts.as_chords());
     // `mut`: the "Accounts" submenu is rebuilt in place after every add,
     // removal and switch, and rebuilding mints new `MenuId`s that the tray has
     // to remember.
@@ -3496,7 +3503,23 @@ fn main() {
         // attempt is on this thread.
         hotkey::retry_if_unavailable(&mut fill_hotkey, Instant::now());
 
-        if hotkey::fill_hotkey_pressed(&fill_hotkey) {
+        // **The user's chords, reconciled against what is registered.**
+        //
+        // Here rather than beside the two places that write `estate.settings`
+        // -- `apply_edited_settings`, reached from the tray's Preferences
+        // window and from the vault window's modal -- because a rebind hung
+        // off those call sites is a rule each of them has to remember, and a
+        // third shell would forget it. One reconciliation against the settings
+        // the daemon actually holds covers every writer there is or will be.
+        // It is a comparison and nothing else on every ordinary iteration; see
+        // `hotkey::rebind_if_changed`.
+        hotkey::rebind_if_changed(
+            &mut fill_hotkey,
+            estate.settings.shortcuts.as_chords(),
+            Instant::now(),
+        );
+
+        if let Some(shortcut) = hotkey::fill_hotkey_pressed(&fill_hotkey) {
             if let Some((item_id, hwnd)) = pending_hotkey_fill.take() {
                 // Revalidate against the *actual* current foreground window
                 // rather than trusting the stored value alone: even with
@@ -3506,25 +3529,30 @@ fn main() {
                 // `ForegroundEvent` for it yet.
                 let current_fg = unsafe { GetForegroundWindow() }.0 as isize;
                 if current_fg == hwnd {
-                    // **`FillChoice::Saved` is the choice that preserves what
-                    // the hotkey has always done**, and the only one that
-                    // does. `fill_action`'s pre-choice body was
-                    // `sequence_for(item)` with an empty-sequence fallback to
-                    // `FillAction::Default`, which is `Saved` exactly;
-                    // `FillChoice::UserTabPass` would be `Default` even for an
-                    // item that stores a sequence, quietly retiring every
-                    // stored sequence on this path. The hotkey has no overlay
-                    // and so no answer of its own to forward -- only
-                    // `handle_match` does -- so it names the preserving choice
-                    // here. `app::every_fill_call_site_passes_the_preserving
-                    // _choice` is what keeps that true.
+                    // **The chord decides what is typed**, and
+                    // `FillShortcut::choice` is the whole of that decision --
+                    // written beside `FillChoice` itself so that a sixth
+                    // shortcut cannot arrive with a fill path of its own.
+                    //
+                    // `FillShortcut::Picker` answers `FillChoice::Saved`,
+                    // which is the choice that preserves what the hotkey has
+                    // always done and the only one that does. `fill_action`'s
+                    // pre-choice body was `sequence_for(item)` with an
+                    // empty-sequence fallback to `FillAction::Default`, which
+                    // is `Saved` exactly; `FillChoice::UserTabPass` would be
+                    // `Default` even for an item that stores a sequence,
+                    // quietly retiring every stored sequence on this path. The
+                    // picker chord has no overlay and so no answer of its own
+                    // to forward -- only `handle_match` does. `app::
+                    // every_fill_call_site_passes_the_preserving_choice` is
+                    // what keeps that true.
                     fill_from_vault(
                         &estate.cache,
                         &injector,
                         &fill_stats,
                         &item_id,
                         hwnd,
-                        deskwarden::app::FillChoice::Saved,
+                        shortcut.choice(),
                         &deskwarden::injector::sequence::REAL_NOTIFIER,
                         // **The hotkey is gated too.** It is the fill with no
                         // window of ours in front of the user, so it is the
@@ -3533,21 +3561,70 @@ fn main() {
                         // the real notifier and not only to the log.
                         &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
                     );
+                    // **A direct action leaves the arming in place; the
+                    // picker consumes it.**
+                    //
+                    // The `take` above is the picker chord's rule and stays
+                    // its rule: that chord can also *open* things, and an arm
+                    // left over from a window the user has moved on from is
+                    // how a fill lands somewhere nobody asked for. The four
+                    // direct actions cannot open anything, and the flow they
+                    // exist for is several presses at one window -- username,
+                    // then password, then the one-time code. Consuming the arm
+                    // would make the second press of that sequence do nothing
+                    // at all, which is the silent no-op the whole subsystem is
+                    // written against.
+                    //
+                    // Safe because the arm is not what decides the target: the
+                    // `current_fg == hwnd` check directly above revalidates
+                    // against the *actual* foreground window every time, so a
+                    // stale arm cannot fill anything -- it can only be
+                    // ignored, which is the `else` below.
+                    if !shortcut.opens_a_card_with_nothing_matched() {
+                        pending_hotkey_fill = Some((item_id, hwnd));
+                    }
                 } else {
                     log::info!("fill hotkey ignored: foreground window is no longer the match");
                 }
+            } else if !shortcut.opens_a_card_with_nothing_matched() {
+                // **A direct action with nothing matched types nothing and
+                // opens nothing.**
+                //
+                // These four say "type this field of the item you have already
+                // matched"; with nothing matched there is no item, no field
+                // and nothing to type. Opening the card the branch below opens
+                // would make each of them a second, slower spelling of the
+                // picker chord -- and would answer "type the password" at an
+                // unmatched browser with a save-this-login card about the
+                // browser. A refusal dialog would be a task-modal `MessageBox`
+                // for a mistyped chord. See
+                // `app::FillShortcut::opens_a_card_with_nothing_matched`,
+                // which records all three answers and why this one.
+                //
+                // **Silence here is paid for on Preferences > Shortcuts**,
+                // where each of these four rows says in its own description
+                // that it needs a matched window and names the chord that
+                // answers for one. That is the same trade `hotkey::
+                // availability` makes: this app does not interrupt over a
+                // keyboard shortcut, it answers on the page a user goes to in
+                // order to ask.
+                log::info!(
+                    "the {} shortcut was pressed with nothing armed; nothing was typed and \
+                     nothing was opened -- see Preferences > Shortcuts",
+                    shortcut.label()
+                );
             } else if let Some(event) = window_watch::current_foreground_event() {
-                // **Nothing was armed, and that is not a reason to do
-                // nothing.** An unmatched window arms no fill, so before this
-                // branch existed `CTRL+ALT+B` was silent for every app the
-                // user had not already bound -- and silent for good, if they
-                // had turned the automatic prompt off, because that setting
-                // reaches `app::disposition`'s unmatched arm. The chord is a
-                // deliberate request, so it dispatches the window in front of
-                // the user through the one dispatcher, with
+                // **Nothing was armed, and for the PICKER chord that is not a
+                // reason to do nothing.** An unmatched window arms no fill, so
+                // before this branch existed `CTRL+ALT+B` was silent for every
+                // app the user had not already bound -- and silent for good,
+                // if they had turned the automatic prompt off, because that
+                // setting reaches `app::disposition`'s unmatched arm. The
+                // chord is a deliberate request, so it dispatches the window
+                // in front of the user through the one dispatcher, with
                 // `Trigger::Hotkey`: `disposition` then reads none of the
                 // three suppressors and none of the field probe's answer, and
-                // opens the account picker (or, locked, the unlock card).
+                // opens the no-match card (or, locked, the unlock card).
                 //
                 // **`last_dispatched_hwnd` is cleared first**, for the reason
                 // `resume_fill_after_unlock` clears it: `dispatch::
@@ -33803,7 +33880,7 @@ mod startup_shape_tests {
     /// it AFTER the window, so a teardown that ran inside the window is
     /// already reflected in what they read. Two of the six could not move up
     /// even if that were wanted: `tray::build_tray` and
-    /// `hotkey::register_fill_hotkey` each create a hidden Win32 window bound
+    /// `hotkey::register_fill_hotkeys` each create a hidden Win32 window bound
     /// to the thread that builds it and deliver their events only while that
     /// thread pumps its message queue -- and for the whole life of the startup
     /// window that thread is inside `eframe`. A tray built above the window
@@ -33873,7 +33950,19 @@ mod startup_shape_tests {
             // number. What this guard exists to catch is a startup
             // initialisation being COPIED, and a third call still makes four.
             (concat!("stop_backend_if_", "idle("), 3),
-            (concat!("let mut fill_hotkey = hotkey::register_fill_", "hotkey();"), 1),
+            // **The needle grew an argument, and that is the pin reporting a
+            // real change rather than drifting.** There are five chords now
+            // and they come off the estate (`settings.shortcuts`), not from a
+            // constant in `hotkey.rs` -- which is one more reason this line
+            // has to stay below the startup window: that window's own
+            // Preferences modal can edit them before it closes.
+            (
+                concat!(
+                    "let mut fill_hotkey = hotkey::register_fill_",
+                    "hotkeys(estate.settings.shortcuts.as_chords());"
+                ),
+                1,
+            ),
             (concat!("let mut tray = tray::build", "_tray();"), 1),
             (concat!("tray.rebuild_accounts_menu(estate.accounts.as_", "ref());"), 2),
             (concat!("window_watch::watch_foreground_", "windows("), 1),

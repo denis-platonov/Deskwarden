@@ -844,6 +844,164 @@ impl FillChoice {
     }
 }
 
+/// **Which global shortcut was pressed**, and therefore which
+/// [`FillChoice`] is fired at the matched item.
+///
+/// # Why this is here and not in `hotkey`
+///
+/// `hotkey` owns `RegisterHotKey` and nothing else: whether a chord could be
+/// claimed, whether it is still claimed, and which id a press arrives under.
+/// **What a press MEANS is a fill question**, and every other fill question in
+/// this app is answered in this file -- [`FillChoice`] is here, [`Trigger`] is
+/// here (and is itself about this very chord), and [`fill_choices`] is here.
+/// Putting the routing beside the thing it routes to is what stops a fifth
+/// shortcut being added with a fill path of its own.
+///
+/// # Four of the five are new; the fifth is not, and that is the design
+///
+/// [`Self::Picker`] is `CTRL+ALT+B` and behaves exactly as it always has. The
+/// other four are the same press against a *narrower* answer: one field, or
+/// the item's own stored sequence, typed at the item Deskwarden has already
+/// matched to the window in front of the user -- no overlay, no picker, no
+/// row to click.
+///
+/// **[`Self::Picker`] and [`Self::Sequence`] resolve to the same
+/// [`FillChoice`], and they are still two shortcuts.** The picker chord has
+/// always typed the stored sequence at an *armed* item (see `main`'s hotkey
+/// branch and `every_fill_call_site_passes_the_preserving_choice`), so there
+/// is nothing to invent for it. Where they part is the case with nothing
+/// armed, which is [`Self::opens_a_card_with_nothing_matched`]: the picker
+/// chord asks Deskwarden about the window in front of the user and gets a
+/// card; a direct action has no item to act on and does not manufacture one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillShortcut {
+    /// `CTRL+ALT+B`, unchanged: fill the armed item, or -- with nothing armed
+    /// -- ask about the window in front of the user.
+    Picker,
+    /// Type the matched item's username, alone.
+    Username,
+    /// Type the matched item's password, alone.
+    Password,
+    /// Type the matched item's one-time code, alone.
+    Totp,
+    /// Type the matched item's own stored auto-type sequence.
+    Sequence,
+}
+
+impl FillShortcut {
+    /// The nav order, the settings order, and the order the Shortcuts page
+    /// draws its rows in -- one list, so the five cannot be listed in three
+    /// orders in three files.
+    ///
+    /// The picker first because it is the one that already existed and the one
+    /// a reader is looking for; then the three fields in the order
+    /// [`fill_choices`] offers them (username, password, one-time code), so a
+    /// user who has seen the overlay finds the page in the order they know;
+    /// then the stored sequence, which is the item-specific one and the odd one
+    /// out.
+    pub const ALL: [FillShortcut; 5] = [
+        FillShortcut::Picker,
+        FillShortcut::Username,
+        FillShortcut::Password,
+        FillShortcut::Totp,
+        FillShortcut::Sequence,
+    ];
+
+    /// `ALL.len()`, as a `const` so that arrays elsewhere can be sized by it.
+    pub const COUNT: usize = Self::ALL.len();
+
+    /// This shortcut's slot in every five-long array in this app: the settings
+    /// record, the registrations, the published statuses, the page's rows.
+    ///
+    /// Derived from [`Self::ALL`] rather than written out as a second `match`,
+    /// which is how the order in one of those arrays comes to disagree with
+    /// the order in another.
+    pub fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|which| *which == self)
+            // Unreachable: `ALL` is this enum's own variants. A `match`-free
+            // lookup is worth the arm.
+            .unwrap_or(0)
+    }
+
+    /// **What this shortcut types at the matched item.**
+    ///
+    /// The whole of the routing, and it is deliberately a total function over
+    /// the five: a shortcut with no answer here would be a chord that
+    /// registers, fires, and does nothing.
+    ///
+    /// [`Self::Picker`] answers [`FillChoice::Saved`] because that is what the
+    /// hotkey path has always passed and the only choice that preserves it --
+    /// `FillChoice::UserTabPass` would be `FillAction::Default` even for an
+    /// item that stores a sequence, quietly retiring every stored sequence on
+    /// this path. See `main`'s hotkey branch, whose comment records that
+    /// decision, and `every_fill_call_site_passes_the_preserving_choice`.
+    pub fn choice(self) -> FillChoice {
+        match self {
+            Self::Picker | Self::Sequence => FillChoice::Saved,
+            Self::Username => FillChoice::Just(key_sequence::FieldRef::Username),
+            Self::Password => FillChoice::Just(key_sequence::FieldRef::Password),
+            Self::Totp => FillChoice::Just(key_sequence::FieldRef::Totp),
+        }
+    }
+
+    /// **Whether pressing this with NOTHING matched puts something on the
+    /// screen.**
+    ///
+    /// True for [`Self::Picker`] alone, and this is the one behavioural
+    /// difference between it and the four direct actions.
+    ///
+    /// # What the picker does, and why the four must not
+    ///
+    /// With no item armed, `CTRL+ALT+B` dispatches the foreground window
+    /// through the one dispatcher with [`Trigger::Hotkey`], and
+    /// [`disposition`] answers `Open::NoMatch` (or `Open::Locked`) -- the 3a
+    /// "nothing saved for this app" card, or the unlock card. That is the
+    /// chord's whole job: *ask Deskwarden about this window*.
+    ///
+    /// The four direct actions ask a different question -- *type this field of
+    /// the item you have already matched* -- and with nothing matched there is
+    /// no item, no field, and nothing to type. Three answers were considered:
+    ///
+    /// * **Open the same card.** Rejected: it makes each of the four a second,
+    ///   slower spelling of `CTRL+ALT+B`, so four shortcuts would do one thing
+    ///   and the owner's "without going through the picker" would be false of
+    ///   all of them. It would also mean a user who pressed the password chord
+    ///   by accident at a browser got a save-this-login card about the browser.
+    /// * **A refusal dialog** through `injector::sequence::REAL_NOTIFIER`.
+    ///   Rejected: that is a task-modal `MessageBoxW`, and a modal box for a
+    ///   mistyped chord is the interruption `hotkey`'s module doc refuses to
+    ///   put at startup, moved to a place it would happen far more often.
+    /// * **Nothing, and say so where the question is asked.** Taken. The press
+    ///   is logged, nothing is typed, and no window appears.
+    ///
+    /// **Silence is only acceptable because it is answered elsewhere**, which
+    /// is the same argument `hotkey::availability` makes: the Shortcuts page
+    /// is where a user goes to ask "why did that shortcut do nothing", and
+    /// each of the four rows says in its description that it needs a matched
+    /// window and names the picker chord as the one that does not. See
+    /// `prefs_ui::DIRECT_SHORTCUT_NOTE`.
+    pub fn opens_a_card_with_nothing_matched(self) -> bool {
+        matches!(self, Self::Picker)
+    }
+
+    /// The Shortcuts page's row label, and the word the log uses for this
+    /// shortcut.
+    ///
+    /// One spelling for both, so a log line about a shortcut names the row the
+    /// reader would go and look at.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Picker => "Fill the focused app",
+            Self::Username => "Type the username",
+            Self::Password => "Type the password",
+            Self::Totp => "Type the one-time code",
+            Self::Sequence => "Type the saved sequence",
+        }
+    }
+}
+
 /// The rows to offer for **this item**, in the order they are shown.
 ///
 /// Pure and presence-only: it asks whether a value is there, never what it is,
@@ -3211,6 +3369,112 @@ mod tests {
     use crate::app_match::APP_MATCH_FIELD_NAME;
     use crate::vault_bridge::VaultField;
 
+    // -- which chord types what ---------------------------------------------
+
+    /// **Every chord routes to the choice it says it does.**
+    ///
+    /// The whole of the new feature, as one assertion per row. A shortcut
+    /// wired to the wrong `FillChoice` is unobservable from the UI -- the page
+    /// still names the chord, the registration still succeeds, and the wrong
+    /// field is typed into whatever the user was looking at.
+    #[test]
+    fn every_shortcut_types_the_thing_its_own_label_promises() {
+        use key_sequence::FieldRef;
+        for (which, expected) in [
+            (FillShortcut::Username, FillChoice::Just(FieldRef::Username)),
+            (FillShortcut::Password, FillChoice::Just(FieldRef::Password)),
+            (FillShortcut::Totp, FillChoice::Just(FieldRef::Totp)),
+            (FillShortcut::Sequence, FillChoice::Saved),
+        ] {
+            assert_eq!(which.choice(), expected, "{which:?} types the wrong thing");
+        }
+        // And no two of the four FIELD shortcuts resolve to the same choice,
+        // which is what a copy-paste slip in the `match` above would produce
+        // and what every individual assertion here would still tolerate if
+        // two rows had been given the same expectation by the same slip.
+        let fields: Vec<FillChoice> =
+            [FillShortcut::Username, FillShortcut::Password, FillShortcut::Totp]
+                .into_iter()
+                .map(FillShortcut::choice)
+                .collect();
+        for (i, a) in fields.iter().enumerate() {
+            for b in &fields[i + 1..] {
+                assert_ne!(a, b, "two field shortcuts type the same field");
+            }
+        }
+    }
+
+    /// **The picker chord still types what it has always typed.**
+    ///
+    /// `FillChoice::Saved` is the choice that preserves the pre-rebinding
+    /// behaviour of `CTRL+ALT+B` and the only one that does: `fill_action`'s
+    /// pre-choice body was `sequence_for(item)` with an empty-sequence
+    /// fallback to `FillAction::Default`, which is `Saved` exactly.
+    /// `FillChoice::UserTabPass` would be `Default` even for an item that
+    /// stores a sequence, quietly retiring every stored sequence on this path.
+    ///
+    /// This assertion used to be a substring pin at the call site in `main.rs`
+    /// (`every_fill_call_site_passes_the_choice_its_own_file_is_entitled_to`).
+    /// That call site names `shortcut.choice()` now, because five chords are
+    /// entitled to different choices, so the guarantee moved here -- where it
+    /// is a comparison of values rather than of text.
+    #[test]
+    fn the_picker_chord_still_types_what_it_has_always_typed() {
+        assert_eq!(FillShortcut::Picker.choice(), FillChoice::Saved);
+    }
+
+    /// **Exactly one shortcut opens something when nothing is matched**, and
+    /// it is the picker.
+    ///
+    /// The one behavioural difference between the picker chord and the four
+    /// direct actions, and the reason they are five rows rather than four --
+    /// `Picker` and `Sequence` resolve to the same [`FillChoice`], so if this
+    /// were true of both they would be the same shortcut twice. See
+    /// [`FillShortcut::opens_a_card_with_nothing_matched`], which records why
+    /// silence was chosen for the other four over a card and over a dialog.
+    #[test]
+    fn only_the_picker_answers_for_a_window_with_nothing_matched() {
+        let opens: Vec<FillShortcut> = FillShortcut::ALL
+            .into_iter()
+            .filter(|w| w.opens_a_card_with_nothing_matched())
+            .collect();
+        assert_eq!(
+            opens,
+            vec![FillShortcut::Picker],
+            "the four direct actions are meant to type at an item Deskwarden has already \
+             matched and to do nothing when there is none; one that opened a card would be a \
+             second, slower spelling of the picker chord"
+        );
+        // ...and the two that share a `FillChoice` really are told apart by
+        // exactly this, which is what makes them two shortcuts.
+        assert_eq!(FillShortcut::Picker.choice(), FillShortcut::Sequence.choice());
+        assert_ne!(
+            FillShortcut::Picker.opens_a_card_with_nothing_matched(),
+            FillShortcut::Sequence.opens_a_card_with_nothing_matched()
+        );
+    }
+
+    /// The five are indexed consistently and labelled distinctly: every
+    /// five-long array in this app is addressed by [`FillShortcut::index`],
+    /// and two rows with one index would silently share a chord, a status and
+    /// a registration.
+    #[test]
+    fn the_five_shortcuts_have_distinct_slots_and_distinct_labels() {
+        let mut seen = vec![false; FillShortcut::COUNT];
+        for which in FillShortcut::ALL {
+            let at = which.index();
+            assert!(!seen[at], "{which:?} shares slot {at} with another shortcut");
+            seen[at] = true;
+            assert_eq!(FillShortcut::ALL[at], which, "{which:?}'s index does not round-trip");
+        }
+        assert!(seen.into_iter().all(|s| s));
+        let mut labels: Vec<&str> = FillShortcut::ALL.into_iter().map(|w| w.label()).collect();
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(labels.len(), before, "two shortcuts wear the same label");
+    }
+
     fn item(id: &str, match_json: Option<&str>) -> VaultItem {
         VaultItem {
             id: id.into(),
@@ -4814,9 +5078,26 @@ mod fill_call_site_tests {
         // `handle_match`: forwards the overlay's own answer; see the module doc.
         ("app.rs", &[", choice,"]),
         ("main.rs", &[
-            // The fill hotkey: names the preserving choice, because there is
-            // no answer to forward.
-            concat!("FillChoice", "::Saved"),
+            // **The fill hotkeys: name the chord's own choice, and the
+            // preserving one is inside it.**
+            //
+            // This form was `FillChoice::Saved` spelled at the call site,
+            // which was right while there was one chord: the hotkey had no
+            // answer to forward, so it named the choice that preserves what it
+            // had always done. There are five chords now and they are entitled
+            // to *different* choices -- that is the whole feature -- so the
+            // call site names `FillShortcut::choice`, which is a total
+            // function over the five written beside `FillChoice` itself.
+            //
+            // **The guarantee has not been loosened, it has moved one hop and
+            // gained a test.** `FillShortcut::Picker.choice()` is
+            // `FillChoice::Saved` and `the_picker_chord_still_types_what_it_
+            // has_always_typed` pins it, so "lose it and every stored
+            // auto-type sequence in every existing vault is retired on that
+            // path" is now an assertion on a value rather than on a substring.
+            // What this row still buys is that the call site does not go back
+            // to naming a choice of its own.
+            "shortcut.choice()",
             // The account picker's fill: forwards the choice destructured out
             // of `NoMatchFollowUp::Fill`, which is the field the user picked
             // on the card's second step.
@@ -4941,7 +5222,16 @@ mod fill_call_site_tests {
     #[test]
     fn the_two_files_rules_are_not_interchangeable() {
         let forwards = "item_id, hwnd, choice, notifier";
-        let names_it = concat!("hwnd,\ndeskwarden::app::FillChoice", "::Saved,\n&notifier,");
+        // **The hotkey's shape, as it is really written now.** It used to be
+        // `deskwarden::app::FillChoice::Saved` spelled at the call site; five
+        // chords are entitled to five different choices, so the call site
+        // names the chord's own answer and the preserving one lives inside
+        // `FillShortcut::choice` -- pinned by value in
+        // `the_picker_chord_still_types_what_it_has_always_typed`. What this
+        // test still holds is unchanged and is the part that matters: the two
+        // forms reject each other, so neither call site can quietly adopt the
+        // other's rule.
+        let names_it = concat!("hwnd,\nshortcut.", "choice(),\n&deskwarden::injector");
         let forwarding = rule("app.rs")[0];
         let hotkey = rule("main.rs")[0];
 

@@ -15,6 +15,23 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### Shortcuts, on a page of their own
+
+Preferences has a **Shortcuts** page, and the fill shortcut has moved onto
+it from General. It can be changed now -- click the chord and press what
+you want, Backspace to clear it, Esc to leave it alone.
+
+Four new shortcuts sit beside it, each acting on the window in front of
+you without asking anything first: **type the username**, **type the
+password**, **type the one-time code**, and **run the item's saved
+sequence**. They default to CTRL+ALT+U, P, T and S. With nothing matched
+they do nothing at all -- CTRL+ALT+B is still the one that asks about the
+window.
+
+A shortcut another program already holds shows as unavailable on its own
+row, with the reason, and starts working by itself if that program lets
+it go. Nothing is silently rebound.
+
 ### "Fetch site icons from the sites themselves" now falls back
 
 With that setting on, Deskwarden asked each site for its own icon and

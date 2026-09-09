@@ -244,9 +244,18 @@ pub struct AppTray {
     accounts: AccountsMenu,
 }
 
-/// The chord this app registers for filling. Spelled here as the tray
-/// shows it; `prefs_ui` has its own copy for the Preferences row, and
-/// `the_tray_and_preferences_agree_on_the_chord` holds the two together.
+/// The chord this app registers for filling, **out of the box**.
+///
+/// **No longer the chord the tray prints**, and that is the whole of what
+/// changed here: the picker chord is remappable from Preferences > Shortcuts,
+/// so a menu that spelled a constant would say `CTRL+ALT+B` to a user who had
+/// moved it -- the same defect as a menu that promises a chord another program
+/// is holding, which is what [`fill_hint`] was already written against. The
+/// live chord comes from `hotkey::published_chord_text`, beside the status it
+/// has to agree with.
+///
+/// Kept because it is still the *shipped* answer and two tests hold it against
+/// `settings::Shortcuts::default`, which is where that answer now lives.
 pub const FILL_HOTKEY: &str = "CTRL+ALT+B";
 
 /// What the tray says about filling by keyboard.
@@ -261,13 +270,22 @@ pub const FILL_HOTKEY: &str = "CTRL+ALT+B";
 /// chord: if another program holds it, a menu promising CTRL+ALT+B would be
 /// a menu lying to somebody whose fill is silently doing nothing — which is
 /// the report that made `hotkey::availability` exist.
+///
+/// **The chord is an argument now.** It used to print [`FILL_HOTKEY`], which
+/// was honest while the chord could not be changed. It can be, from
+/// Preferences > Shortcuts, and a menu naming a combination the user has moved
+/// away from is the same lie in a different direction.
 #[must_use]
-pub fn fill_hint(status: &crate::hotkey::HotkeyStatus) -> String {
+pub fn fill_hint(status: &crate::hotkey::HotkeyStatus, chord: &str) -> String {
     match status {
-        crate::hotkey::HotkeyStatus::Armed => format!("Fill:  {FILL_HOTKEY}"),
+        crate::hotkey::HotkeyStatus::Armed => format!("Fill:  {chord}"),
         crate::hotkey::HotkeyStatus::Unavailable(_) => {
-            format!("Fill shortcut ({FILL_HOTKEY}) unavailable")
+            format!("Fill shortcut ({chord}) unavailable")
         }
+        // **The user cleared it, so there is no shortcut to name.** Saying
+        // "unavailable" here would blame the machine for a decision the user
+        // took, and printing a chord would name one that is not registered.
+        crate::hotkey::HotkeyStatus::Unbound => "Fill shortcut turned off".to_string(),
     }
 }
 
@@ -278,7 +296,15 @@ pub fn build_tray() -> AppTray {
     // **Disabled: a label, not a command.** See `fill_hint` for why a
     // clickable Fill would fill the wrong window. Placed under Add app so
     // the two things about filling sit together.
-    let fill_hint_item = MenuItem::new(fill_hint(&crate::hotkey::availability()), false, None);
+    let picker = crate::app::FillShortcut::Picker;
+    let fill_hint_item = MenuItem::new(
+        fill_hint(
+            &crate::hotkey::availability(picker),
+            &crate::hotkey::published_chord_text(picker),
+        ),
+        false,
+        None,
+    );
     let sync_item = MenuItem::new("Sync", true, None);
     let quit = MenuItem::new("Quit", true, None);
     // **There is no update item here, and its absence is deliberate.** There
@@ -602,8 +628,32 @@ mod tests {
     /// not use.
     #[test]
     fn an_armed_hotkey_is_shown_by_its_chord() {
-        let hint = fill_hint(&HotkeyStatus::Armed);
+        let hint = fill_hint(&HotkeyStatus::Armed, FILL_HOTKEY);
         assert!(hint.contains(FILL_HOTKEY), "the tray does not name the chord: {hint}");
+        // ...and the chord it names is the one it was HANDED, not a constant
+        // in this file. The picker chord is remappable now, so a menu that
+        // printed `FILL_HOTKEY` regardless would be wrong for every user who
+        // moved it.
+        let moved = fill_hint(&HotkeyStatus::Armed, "CTRL+SHIFT+F9");
+        assert!(moved.contains("CTRL+SHIFT+F9"), "the tray ignores the chord it is given: {moved}");
+        assert!(!moved.contains(FILL_HOTKEY));
+    }
+
+    /// **A shortcut the user turned off is not a shortcut that failed.**
+    ///
+    /// The tray has three states to tell apart now, and this is the one that
+    /// did not exist while the chord was hardcoded. Printing "unavailable"
+    /// over it would blame Windows or another program for a decision the user
+    /// took on the Shortcuts page.
+    #[test]
+    fn a_cleared_hotkey_is_neither_advertised_nor_blamed_on_anything() {
+        let hint = fill_hint(&HotkeyStatus::Unbound, "CTRL+ALT+B");
+        assert!(!hint.contains("CTRL+ALT+B"), "the tray names a chord that is not bound: {hint}");
+        assert!(
+            !hint.to_lowercase().contains("unavailable"),
+            "a shortcut the user cleared is reported as a failure: {hint}"
+        );
+        assert_ne!(hint, fill_hint(&HotkeyStatus::Armed, "CTRL+ALT+B"));
     }
 
     /// **And an unregistered one says so rather than printing a chord that
@@ -612,14 +662,17 @@ mod tests {
     /// advertising the chord would hide exactly that.
     #[test]
     fn an_unavailable_hotkey_is_not_advertised_as_working() {
-        let hint = fill_hint(&HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram));
+        let hint = fill_hint(
+            &HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram),
+            FILL_HOTKEY,
+        );
         assert!(
             hint.to_lowercase().contains("unavailable"),
             "the tray promises a shortcut that is not registered: {hint}"
         );
         // The control: the two states really do differ, so the assertion
         // above is not passing on a function that returns one string.
-        assert_ne!(hint, fill_hint(&HotkeyStatus::Armed));
+        assert_ne!(hint, fill_hint(&HotkeyStatus::Armed, FILL_HOTKEY));
     }
 
     /// One chord, two places that print it. The tray and Preferences must not
@@ -635,6 +688,22 @@ mod tests {
         assert!(
             declared.contains(FILL_HOTKEY),
             "the tray and Preferences print different chords: {declared}"
+        );
+        // **And both agree with the value that is actually registered.** The
+        // two constants used to be the only spellings of the chord and holding
+        // them together was the whole guard; the chord is a stored preference
+        // now (`settings::Shortcuts`), so the thing worth pinning is that the
+        // shipped default has not moved out from under the copy in either
+        // file. A source-text agreement between two stale strings is no
+        // agreement at all.
+        assert_eq!(
+            crate::settings::Shortcuts::default()
+                .chord(crate::app::FillShortcut::Picker)
+                .map(|c| c.to_string())
+                .as_deref(),
+            Some(FILL_HOTKEY),
+            "the picker chord this app ships with is not the one the tray and Preferences \
+             both say it is"
         );
     }
 
