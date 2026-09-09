@@ -6598,7 +6598,12 @@ fn ordinary_value_galley(ui: &egui::Ui) -> std::sync::Arc<egui::Galley> {
 /// value is short -- `04/23` is five characters -- but "short" is a fact about
 /// today's data, not a rule, and the row it sits in is exactly as narrow as
 /// the two around it.
-fn digits_fit(ui: &egui::Ui, natural: f32, controls_width: f32) -> (RowShape, f32) {
+fn digits_fit(
+    ui: &egui::Ui,
+    natural: f32,
+    controls_width: f32,
+    revealed: bool,
+) -> (RowShape, f32) {
     let content = row_content_width(ui);
     let beside_the_label = content - ROW_LABEL_WIDTH - ROW_GAP - controls_width;
     // **A value too long for the two-column line is ELIDED on it, and stacks
@@ -6652,7 +6657,31 @@ fn digits_fit(ui: &egui::Ui, natural: f32, controls_width: f32) -> (RowShape, f3
     // safe to change under a suite this size: every row that was `Columns`
     // is still `Columns` (the first arm is untouched), and only rows that
     // used to stack can move.
-    let shape = if natural <= beside_the_label || beside_the_label >= legible_digits_line(ui) {
+    // **And the floor does not apply to a MASK, which is the third report on
+    // this row and the one that says why the rule above was still wrong.**
+    //
+    // "Password still pushes to second line with no ..." -- a Password row
+    // stacked while the Username row directly above it elided, on the same
+    // card, at the same width. The floor caught it because a masked row
+    // carries an eye toggle the username row does not, so its `controls_width`
+    // is bigger and its line is narrower.
+    //
+    // The floor exists to stop a value being cut so short it says nothing.
+    // That reasoning holds for a value a reader READS and fails completely for
+    // a mask: every glyph in a mask is the same bullet, so a mask cut to four
+    // bullets says exactly what one cut to ten says -- this row has a secret
+    // in it, press the chord to copy it. Stacking to protect glyphs that carry
+    // no information buys a second line for nothing, and it is the only reason
+    // two rows on one card were obeying two rules.
+    //
+    // A REVEALED value keeps the floor. Those glyphs are the password, they
+    // are there to be read, and cutting them to four characters loses exactly
+    // what the reveal was for.
+    let masked_and_therefore_contentless = !revealed;
+    let shape = if natural <= beside_the_label
+        || masked_and_therefore_contentless
+        || beside_the_label >= legible_digits_line(ui)
+    {
         RowShape::Columns
     } else {
         RowShape::Stacked
@@ -6879,7 +6908,9 @@ fn digits_row(
     let controls_width = hint.map_or(0.0, |which| {
         CONTROL_GAP + chord_hint_width(ui, copy_shortcut_chord(which))
     });
-    let (shape, room) = digits_fit(ui, natural, controls_width);
+    // `true`: this row's digits are never masked -- a card's expiry is
+    // plain text a reader reads, so it keeps the legibility floor.
+    let (shape, room) = digits_fit(ui, natural, controls_width, true);
     copy_row(
         ui,
         label,
@@ -7130,8 +7161,9 @@ fn masked_row(
     // this value WANT to be?
     let natural = ui.painter().layout_job(digits_job(&shown)).size().x;
     // The same decision, in the same words, as the expiry beside it makes --
-    // see [`digits_fit`].
-    let (shape, room) = digits_fit(ui, natural, controls_width);
+    // see [`digits_fit`], which skips the legibility floor while this row is
+    // masked: a cut mask says exactly what an uncut one does.
+    let (shape, room) = digits_fit(ui, natural, controls_width, *revealed);
     // **A mask is cut HERE; a revealed value is cut by egui.** `digits_fit`
     // has already bought the widest line this row can have -- stacking when
     // the two columns cannot hold it -- so `room` is the real limit and not a
@@ -24648,7 +24680,13 @@ mod breach_badge_tests {
     /// is sized to what it reflowed to -- and the pane scrolls, so the cost
     /// is a taller tile at the narrowest width the window can be dragged to
     /// and nothing at all at the width it opens at.
-    const NARROW_CARD_WITH_AGE: (f32, f32) = (251.0, 67.0);
+    // 251.0 until masked rows stopped stacking at the app's minimum
+    // window size. A `Columns` row asks the pane for a different width
+    // than a `Stacked` one, and the cards settle a point narrower for it.
+    // The value moved; what it guards did not -- see `digits_fit`, and
+    // `the_previous_password_rows_fit_the_narrowest_pane`, which measures
+    // the same pane and stayed green through the change.
+    const NARROW_CARD_WITH_AGE: (f32, f32) = (250.0, 67.0);
 
     /// **What the fourth fact costs the card**, both widths, pinned.
     ///
@@ -24710,7 +24748,13 @@ mod breach_badge_tests {
     const BASELINE_CARD: (f32, f32) = (852.0, 41.0);
 
     /// The same, at the detail column's minimum width: `[[24 471] - [275 525]]`.
-    const BASELINE_CARD_NARROW: (f32, f32) = (251.0, 54.0);
+    // 251.0 until masked rows stopped stacking at the app's minimum
+    // window size. A `Columns` row asks the pane for a different width
+    // than a `Stacked` one, and the cards settle a point narrower for it.
+    // The value moved; what it guards did not -- see `digits_fit`, and
+    // `the_previous_password_rows_fit_the_narrowest_pane`, which measures
+    // the same pane and stayed green through the change.
+    const BASELINE_CARD_NARROW: (f32, f32) = (250.0, 54.0);
 
     /// **The "we broke nothing" test.** With the preference off -- which is
     /// how it ships -- the strip is the string `metadata_line` produces and
@@ -25120,7 +25164,13 @@ mod breach_badge_tests {
     /// Recorded, not argued. If either grows, a rewording has cost a row; if
     /// the wide one drops back to 46 the warning has rejoined the run.
     const BREACHED_CARD: (f32, f32) = (852.0, 54.0);
-    const BREACHED_CARD_NARROW: (f32, f32) = (251.0, 93.0);
+    // 251.0 until masked rows stopped stacking at the app's minimum
+    // window size. A `Columns` row asks the pane for a different width
+    // than a `Stacked` one, and the cards settle a point narrower for it.
+    // The value moved; what it guards did not -- see `digits_fit`, and
+    // `the_previous_password_rows_fit_the_narrowest_pane`, which measures
+    // the same pane and stayed green through the change.
+    const BREACHED_CARD_NARROW: (f32, f32) = (250.0, 93.0);
 
     /// **The un-breached card, unmoved.** 852x46 and 251x72 are what this
     /// same fixture measured on `f2556b8` with a `Safe` answer, and they are
@@ -25135,7 +25185,13 @@ mod breach_badge_tests {
     /// change, and the test below pins the feature-OFF card against the
     /// original two so both facts are stated rather than conflated.
     const SAFE_CARD: (f32, f32) = (852.0, 46.0);
-    const SAFE_CARD_NARROW: (f32, f32) = (251.0, 72.0);
+    // 251.0 until masked rows stopped stacking at the app's minimum
+    // window size. A `Columns` row asks the pane for a different width
+    // than a `Stacked` one, and the cards settle a point narrower for it.
+    // The value moved; what it guards did not -- see `digits_fit`, and
+    // `the_previous_password_rows_fit_the_narrowest_pane`, which measures
+    // the same pane and stayed green through the change.
+    const SAFE_CARD_NARROW: (f32, f32) = (250.0, 72.0);
 
     /// **Two lines breached, one line clean -- as card heights**, which is
     /// the half of "its own line" a reader feels rather than measures.
