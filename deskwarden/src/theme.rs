@@ -4260,6 +4260,382 @@ fn rule(ui: &mut Ui, color: Color32) {
     ui.painter().rect_filled(rect, CornerRadius::ZERO, color);
 }
 
+// ---------------------------------------------------------------------------
+// The modal card
+//
+// **One shape for every question this app puts in front of the window it is
+// asking about.** It is the send preflight's refusal card, in egui: three
+// bands rounded as a single piece and dropped on a dimmed scrim -- a coloured
+// header saying what KIND of question this is, a white body saying which
+// object it is about, and a footer carrying the two answers side by side.
+//
+// It lives here, beside the buttons and the avatar tile, for the reason every
+// other composite widget in this file does. `vault_window::delete_modal` and
+// `vault_window::icon_modal` had each grown a copy of the same hand-assembled
+// card, and a third copy was what this replaced: a layout written out again
+// at every call site is a design that drifts one modal at a time, and nothing
+// about that fails to compile.
+//
+// The window's other overlays -- `folder_modal`, the launch confirmation, the
+// discard prompt, the Send and import cards -- still paint their own plain
+// cards, and are deliberately left where they are. Converting a modal changes
+// what the user sees, and that was asked for on two of them.
+// ---------------------------------------------------------------------------
+
+/// How far a modal dims the window behind it.
+///
+/// Ninety, which is what `folder_modal`, the launch confirmation and
+/// `prefs_ui`'s own modal each already dim by. It is a constant here so that
+/// the next one to be built cannot arrive at a fifth copy of the number and
+/// then quietly disagree with it.
+const MODAL_SCRIM_ALPHA: u8 = 90;
+
+/// The card's corner radius, applied to the outer frame **and to nothing
+/// inside it except the two bands that touch a corner**.
+///
+/// Ten, the radius the cards this replaced already had. The header rounds its
+/// top two corners and squares its bottom pair, the footer does the opposite,
+/// and the body squares all four -- which is what makes three stacked bands
+/// read as one card rather than as three cards in a pile.
+const MODAL_RADIUS: u8 = 10;
+
+/// The coloured header band's height.
+pub const MODAL_HEADER_HEIGHT: f32 = 40.0;
+
+/// The margin down both sides of the card, shared by the body and by the
+/// footer's row of answers so that the buttons line up under the text rather
+/// than nearly lining up under it.
+///
+/// Private, as are the radius and the scrim's alpha above it: a caller hands
+/// this frame its content and its width and gets a card back, and nothing
+/// outside this file has to know how the card is spaced. The one number that
+/// IS `pub` is [`MODAL_HEADER_HEIGHT`], because the two modals' own tests
+/// identify the header band by its height.
+const MODAL_PAD_X: i8 = 20;
+
+/// Breathing room above and below the body's own content.
+const MODAL_BODY_PAD_Y: i8 = 18;
+
+/// The same, for the footer band. Tighter than the body's, because the
+/// buttons carry their own 32px of height and the band would otherwise read
+/// as taller than the text it is answering.
+const MODAL_FOOTER_PAD_Y: i8 = 14;
+
+/// The gap between the two answers. The rest of the footer's width is split
+/// evenly between them, so this number is the only thing that decides how
+/// wide either button is.
+const MODAL_FOOTER_GAP: f32 = 10.0;
+
+/// The header glyph's box, sized against the 14px title beside it.
+const MODAL_GLYPH_SIZE: f32 = 15.0;
+
+/// The header title's size. A step up from the 13px the body and the buttons
+/// are set in: it is the one line on the card that says what the card is.
+const MODAL_TITLE_PX: f32 = 14.0;
+
+/// The gap between the header's glyph and its title.
+const MODAL_GLYPH_GAP: f32 = 8.0;
+
+/// The monogram tile beside the body's subject line.
+const MODAL_SUBJECT_TILE: f32 = 28.0;
+
+/// `box-shadow: 0 6px 20px rgba(45, 43, 43, 0.18)`, and the one thing on this
+/// card that is not also on a card somewhere else in the app.
+///
+/// A modal is the only surface in this window that is *above* the window
+/// rather than part of it, and the scrim alone does not say so -- a dimmed
+/// background with a flat white rectangle on it reads as a panel that has had
+/// the lights turned down around it. The shadow is what lifts it off.
+const MODAL_SHADOW: egui::Shadow = egui::Shadow {
+    offset: [0, 6],
+    blur: 20,
+    spread: 0,
+    color: Color32::from_rgba_unmultiplied_const(45, 43, 43, 46),
+};
+
+/// The mark in the header band, left of the title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalGlyph {
+    /// Nothing at all, and the title starts at the card's own margin.
+    ///
+    /// The design draws a glyph for a refusal because a refusal has one thing
+    /// to say before its words are read. An ordinary question does not, and
+    /// inventing a second mark to fill the slot would be putting a symbol in
+    /// front of the user that means nothing in particular.
+    None,
+    /// The warning triangle, for the destructive and the refused.
+    Warning,
+}
+
+/// Everything the frame needs to know that is not the card's own content.
+pub struct ModalCard<'a> {
+    /// The header band's fill. [`ERROR`] for a destructive question, [`BLUE`]
+    /// for an ordinary one.
+    pub accent: Color32,
+    /// The mark beside the title.
+    pub glyph: ModalGlyph,
+    /// The header's words, in bold white. This is the card's heading and the
+    /// body must not repeat it.
+    pub title: &'a str,
+    /// The card's width. The body and both buttons are laid out from it.
+    pub width: f32,
+    /// The outlined left-hand answer's words -- the way out, always on the
+    /// left, always the quieter of the two.
+    pub dismiss: &'a str,
+}
+
+/// Which of the footer's two answers was pressed, if either.
+///
+/// Both flags rather than an enum with a `None`: the caller's own action type
+/// already has that variant, and a modal that reported "one of these" would
+/// have to be asked which one anyway.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModalPress {
+    /// The outlined button on the left.
+    pub dismissed: bool,
+    /// The filled button on the right.
+    pub confirmed: bool,
+}
+
+/// The dimmed, click-eating scrim a modal sits on.
+///
+/// **The `Area` is the CALLER's, and that is not an accident of style.**
+/// `item_list::MODAL_SCRIM_AREAS` is the list that gates this window's arrow
+/// keys behind every open modal, and the test that keeps it honest walks
+/// `src/` for the literal `Area::new(egui::Id::new("..."))` declaration of
+/// every id ending in `-scrim`. An id passed to this function as a bare
+/// string would be invisible to that walk, and the gate would silently stop
+/// covering the modal that moved. So the declaration stays at the call site
+/// and only the drawing moves here.
+///
+/// **`content_rect().min`, not `Pos2::ZERO`.** An `Area`'s stored rect is
+/// `fixed_pos + what it allocated`, and *that* is what `Memory::layer_id_at`
+/// hit-tests -- the painted rectangle below is a separate thing. Anchored at
+/// the origin the two agree only while `content_rect()` starts there, and
+/// where it does not the scrim looks whole while blocking a box that starts
+/// at the wrong corner. `prefs_ui::draw_prefs_modal` records the measurement;
+/// this is the same fix, applied once for every caller.
+pub fn modal_scrim(ctx: &egui::Context, area: egui::Area) {
+    let screen = ctx.content_rect();
+    area.order(egui::Order::Foreground)
+        .fixed_pos(screen.min)
+        .show(ctx, |ui| {
+            // Allocating the full screen is what makes the block real; an
+            // area that allocates nothing has a near-zero stored rect and
+            // catches nothing outside the card.
+            ui.allocate_response(screen.size(), Sense::click());
+            ui.painter().rect_filled(
+                screen,
+                CornerRadius::ZERO,
+                Color32::from_black_alpha(MODAL_SCRIM_ALPHA),
+            );
+        });
+}
+
+/// Draws one modal card, centred, and reports which of its two answers was
+/// pressed.
+///
+/// `body` fills the white middle band; it is given a `Ui` already inset by
+/// the card's margins and already the right width for a wrapping label.
+/// `confirm` draws the filled right-hand button and hands back its
+/// `Response` -- a closure rather than a label, because the button is
+/// [`destructive_button`] on one card and [`primary_button_enabled`] on
+/// another, and which of those a modal wears is the modal's own decision.
+///
+/// **Two closures rather than one, and they must not both borrow the same
+/// state mutably.** The body writes (a text field edits through it) and the
+/// confirm reads, so a caller whose confirm depends on what the body edits
+/// works out that dependency BEFORE the call -- see `icon_modal`, which
+/// computes whether its address box has anything in it and passes the answer
+/// in by value.
+pub fn modal_card(
+    ctx: &egui::Context,
+    area: egui::Area,
+    card: ModalCard<'_>,
+    body: impl FnOnce(&mut Ui),
+    confirm: impl FnOnce(&mut Ui) -> Response,
+) -> ModalPress {
+    let mut press = ModalPress::default();
+    area.order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(CARD)
+                .corner_radius(CornerRadius::same(MODAL_RADIUS))
+                .stroke(Stroke::new(1.0, BORDER))
+                .shadow(MODAL_SHADOW)
+                .show(ui, |ui| {
+                    ui.set_width(card.width);
+                    // The three bands butt against each other, so the card's
+                    // own stack gets no item spacing at all -- egui's default
+                    // 8px would open a white seam under the coloured header
+                    // and another above the footer, and two hairlines of bare
+                    // card is exactly what "three stacked cards" looks like.
+                    // The body gets the inherited spacing back, because its
+                    // contents are ordinary stacked widgets that want it.
+                    let inherited = ui.spacing().item_spacing;
+                    ui.spacing_mut().item_spacing.y = 0.0;
+
+                    modal_header_band(ui, &card);
+                    egui::Frame::new()
+                        .inner_margin(Margin::symmetric(MODAL_PAD_X, MODAL_BODY_PAD_Y))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = inherited;
+                            body(ui);
+                        });
+                    press = modal_footer_band(ui, &card, confirm);
+                });
+        });
+    press
+}
+
+/// The coloured band across the card's top: the glyph, then the title, on one
+/// line.
+fn modal_header_band(ui: &mut Ui, card: &ModalCard<'_>) {
+    let (band, _) =
+        ui.allocate_exact_size(Vec2::new(card.width, MODAL_HEADER_HEIGHT), Sense::hover());
+    let painter = ui.painter();
+    // Top corners rounded, bottom pair square. Per-corner rather than
+    // `prefs_ui`'s "fill it round, then fill the bottom strip square again"
+    // trick: one shape, and no second rectangle to keep in step with the
+    // first when the radius moves.
+    painter.rect_filled(
+        band,
+        CornerRadius { nw: MODAL_RADIUS, ne: MODAL_RADIUS, sw: 0, se: 0 },
+        card.accent,
+    );
+
+    let mut x = band.left() + f32::from(MODAL_PAD_X);
+    if card.glyph == ModalGlyph::Warning {
+        let at = Rect::from_center_size(
+            Pos2::new(x + MODAL_GLYPH_SIZE / 2.0, band.center().y),
+            Vec2::splat(MODAL_GLYPH_SIZE),
+        );
+        paint_warning_glyph(painter, at, Color32::WHITE);
+        x = at.right() + MODAL_GLYPH_GAP;
+    }
+    painter.text(
+        Pos2::new(x, band.center().y),
+        egui::Align2::LEFT_CENTER,
+        card.title,
+        FontId::new(MODAL_TITLE_PX, FontFamily::Name(BOLD.into())),
+        Color32::WHITE,
+    );
+}
+
+/// The warning triangle, **stroked rather than typed**.
+///
+/// U+26A0 is not in Archivo and is not in egui's fallback stack either, which
+/// is the same measurement [`close_glyph`] records for U+2715 and the same
+/// answer: a codepoint this app's face does not carry renders as a tofu box.
+/// Line segments and not an `egui::Shape::Path`, because `icon_probe` tells
+/// this crate's drawn marks apart by the point count of their closed paths
+/// and a fourth three-point path would be findable as the envelope's flap.
+fn paint_warning_glyph(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let stroke = Stroke::new(1.4, color);
+    let apex = Pos2::new(rect.center().x, rect.top());
+    let left = Pos2::new(rect.left(), rect.bottom());
+    let right = Pos2::new(rect.right(), rect.bottom());
+    painter.line_segment([apex, right], stroke);
+    painter.line_segment([right, left], stroke);
+    painter.line_segment([left, apex], stroke);
+    // The bang inside it: a bar, then a gap, then a dot. The dot is a filled
+    // square and not a circle because `icon_probe` reads circle radii too,
+    // and at 1.6px across nobody can tell the two apart anyway.
+    painter.line_segment(
+        [
+            Pos2::new(rect.center().x, rect.top() + rect.height() * 0.36),
+            Pos2::new(rect.center().x, rect.bottom() - rect.height() * 0.32),
+        ],
+        stroke,
+    );
+    painter.rect_filled(
+        Rect::from_center_size(
+            Pos2::new(rect.center().x, rect.bottom() - rect.height() * 0.17),
+            Vec2::splat(1.6),
+        ),
+        CornerRadius::ZERO,
+        color,
+    );
+}
+
+/// The footer: a hairline, then the tinted band, then the two answers filling
+/// the width between the card's margins.
+///
+/// The tint and the rule above it are the send preflight's own footer,
+/// reproduced rather than reinvented -- that card fills its footer with
+/// [`CARD_TINT`] under a [`HAIRLINE`] rule, and this is the same two colours
+/// in the same order.
+fn modal_footer_band(
+    ui: &mut Ui,
+    card: &ModalCard<'_>,
+    confirm: impl FnOnce(&mut Ui) -> Response,
+) -> ModalPress {
+    let (rule, _) = ui.allocate_exact_size(Vec2::new(card.width, 1.0), Sense::hover());
+    ui.painter().rect_filled(rule, CornerRadius::ZERO, HAIRLINE);
+
+    let mut press = ModalPress::default();
+    egui::Frame::new()
+        .fill(CARD_TINT)
+        .corner_radius(CornerRadius { nw: 0, ne: 0, sw: MODAL_RADIUS, se: MODAL_RADIUS })
+        .inner_margin(Margin::symmetric(MODAL_PAD_X, MODAL_FOOTER_PAD_Y))
+        .show(ui, |ui| {
+            let inner = ui.available_width();
+            let half = ((inner - MODAL_FOOTER_GAP) / 2.0).max(0.0);
+            let (row, _) = ui.allocate_exact_size(Vec2::new(inner, BUTTON_HEIGHT), Sense::hover());
+            press.dismissed = modal_answer(
+                ui,
+                Rect::from_min_size(row.min, Vec2::new(half, BUTTON_HEIGHT)),
+                |ui| secondary_button(ui, card.dismiss),
+            );
+            // Measured from the row's RIGHT edge rather than from the left
+            // one plus a gap, so the two buttons meet the card's two margins
+            // exactly and any rounding error lands in the gap between them
+            // where nobody can see it.
+            press.confirmed = modal_answer(
+                ui,
+                Rect::from_min_size(
+                    Pos2::new(row.max.x - half, row.min.y),
+                    Vec2::new(half, BUTTON_HEIGHT),
+                ),
+                confirm,
+            );
+        });
+    press
+}
+
+/// One footer answer, drawn into the half of the row it was given.
+///
+/// The child `Ui` is **cross-justified**, which is what makes an
+/// `egui::Button` -- which otherwise sizes itself to its own words -- fill
+/// the rect instead. Without it the two answers would be as wide as their
+/// labels, and "Cancel" beside "Delete forever" is the lopsided pair the
+/// design's evenly split row exists to avoid.
+fn modal_answer(ui: &mut Ui, at: Rect, add: impl FnOnce(&mut Ui) -> Response) -> bool {
+    let mut slot = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(at)
+            .layout(egui::Layout::top_down_justified(egui::Align::Center)),
+    );
+    add(&mut slot).clicked()
+}
+
+/// The body's opening line: the monogram tile for `name`, and `name` beside
+/// it.
+///
+/// Both modals that use the frame are about one vault item, and both used to
+/// name it in a faint 11px line under the heading -- which is where a caption
+/// goes, not where the subject of a question goes. The design puts the item's
+/// own tile in front of its own name and sets the name in the body's weight,
+/// so that the thing about to be deleted (or given a picture) is the first
+/// thing on the card that is read.
+pub fn modal_subject(ui: &mut Ui, name: &str) {
+    ui.horizontal(|ui| {
+        avatar(ui, &initials(name), MODAL_SUBJECT_TILE, false);
+        ui.add(egui::Label::new(semibold(name, 13.0).color(INK)).truncate());
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7574,6 +7950,545 @@ mod sliding_bar_tests {
             second > first * 1.5,
             "the first quarter of the cycle covers {first:.3} of the travel and the second \
              {second:.3}; that is a linear slide, not the design's ease-in-out"
+        );
+    }
+}
+
+#[cfg(test)]
+mod modal_card_tests {
+    //! Real frames of [`modal_scrim`] and [`modal_card`], read back through
+    //! the shapes egui emitted -- the same headless technique
+    //! `vault_window::delete_modal` and `vault_window::icon_modal` drive
+    //! their own cards with, run here because the card is now one piece of
+    //! code and a geometry regression in it is a regression in both of them.
+    use super::*;
+    use eframe::egui::epaint::RectShape;
+
+    /// The window the card is centred in. The two modals' own harness
+    /// constant, so what is measured here is measured where they are drawn.
+    const BODY: Vec2 = Vec2::new(900.0, 700.0);
+    /// The card's width, and `delete_modal`'s.
+    const WIDTH: f32 = 340.0;
+    const TITLE: &str = "Delete item";
+    const DISMISS: &str = "Cancel";
+    const CONFIRM: &str = "Delete";
+    const SENTENCE: &str = "It moves to the Trash.";
+
+    /// **Not `-scrim`.** `item_list`'s census walks `src/` for every
+    /// `Area::new(egui::Id::new(...))` whose id ends in `-scrim` and demands
+    /// that `MODAL_SCRIM_AREAS` name it. A test harness's dimmer is not a
+    /// modal this window's arrow keys have to be gated behind, so it
+    /// deliberately does not answer to that suffix.
+    const SHADE_ID: &str = "theme-modal-test-shade";
+    const CARD_ID: &str = "theme-modal-test-card";
+
+    #[derive(Default)]
+    struct Painted {
+        texts: Vec<(String, Rect)>,
+        rects: Vec<RectShape>,
+        segments: Vec<[Pos2; 2]>,
+    }
+
+    impl Painted {
+        /// The one FULL-WIDTH rectangle filled `fill`, or a failure naming
+        /// every fill that WAS painted -- which turns "the band is gone" into
+        /// a readable message rather than an index panic.
+        ///
+        /// The width is part of the question and not a nicety. A band's fill
+        /// is not unique on this card: the confirm button is filled in the
+        /// same accent as the header it sits under, and the warning glyph's
+        /// dot is white, which is exactly [`CARD`]. Only the three bands run
+        /// the card's whole width.
+        fn band(&self, fill: Color32, what: &str) -> RectShape {
+            let found: Vec<&RectShape> = self
+                .rects
+                .iter()
+                .filter(|r| r.fill == fill && (r.rect.width() - WIDTH).abs() < 0.5)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one full-width {what} filled {fill:?}, found {}; the card \
+                 painted {:?}",
+                found.len(),
+                self.rects.iter().map(|r| (r.fill, r.rect.width())).collect::<Vec<_>>()
+            );
+            found[0].clone()
+        }
+
+        fn rect_of(&self, label: &str) -> Rect {
+            self.texts
+                .iter()
+                .find(|(t, _)| t == label)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| {
+                    panic!("the card never painted {label:?}; it painted {:?}", self.texts)
+                })
+        }
+
+        /// The card itself, which is **two points wider than the width it was
+        /// asked for**: `egui::Frame` paints its rectangle expanded by its own
+        /// 1px stroke, so the card's rect is the border ring and the three
+        /// bands run edge to edge *inside* it. Hence a lookup of its own
+        /// rather than one more [`band`](Self::band).
+        fn card(&self) -> RectShape {
+            self.rects
+                .iter()
+                .find(|r| r.fill == CARD && (r.rect.width() - (WIDTH + 2.0)).abs() < 0.5)
+                .cloned()
+                .expect("the card's own rectangle was never painted")
+        }
+
+        /// The outlined answer, found by the one stroke colour
+        /// [`secondary_button`] wears and nothing else on this card does.
+        fn outlined_answer(&self) -> Rect {
+            self.rects
+                .iter()
+                .find(|r| r.stroke.color == BORDER_STRONG)
+                .map(|r| r.rect)
+                .expect("the outlined answer was never painted")
+        }
+    }
+
+    fn walk(shape: &egui::Shape, painted: &mut Painted) {
+        match shape {
+            egui::Shape::Text(text) => painted.texts.push((
+                text.galley.text().to_string(),
+                Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            egui::Shape::Rect(rect) => painted.rects.push(rect.clone()),
+            egui::Shape::LineSegment { points, .. } => painted.segments.push(*points),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    walk(shape, painted);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// **`time` is what makes every colour assertion in this module mean
+    /// anything.**
+    ///
+    /// An `egui::Area` fades itself in over `Style::animation_time`, and the
+    /// fade is applied as an opacity over every shape the layer emits -- so a
+    /// frame taken while it is a quarter of the way in reports the card's
+    /// white as a premultiplied mid-grey, its red header as a dark brown, and
+    /// the scrim at a third of its alpha. Nothing about that is visible to a
+    /// test that only reads strings and rectangles, which is why the two
+    /// modals' own harnesses never noticed. A headless context's clock does
+    /// not advance on its own, so the frames below hand it one.
+    fn raw_input(events: &[egui::Event], time: f64) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, BODY)),
+            time: Some(time),
+            events: events.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// One context, its clock, and the card it is drawing.
+    struct Harness {
+        ctx: egui::Context,
+        accent: Color32,
+        glyph: ModalGlyph,
+        /// Seconds on the context's clock, a tenth of a second per frame --
+        /// comfortably more than the default `animation_time`, so a card is
+        /// fully faded in one frame after it appears.
+        clock: std::cell::Cell<f64>,
+    }
+
+    impl Harness {
+        /// A styled context with the card already up and fully opaque.
+        ///
+        /// The two throwaway frames before `apply` are the ones every other
+        /// harness in this crate runs: a font set registered during a frame is
+        /// only usable from the start of the next. The frames after it are the
+        /// `Area`'s own -- one sizing pass, which tessellates to nothing, then
+        /// one to appear on and one for the fade to finish.
+        fn opened(accent: Color32, glyph: ModalGlyph) -> (Self, Drawn) {
+            let ctx = egui::Context::default();
+            let harness =
+                Harness { ctx, accent, glyph, clock: std::cell::Cell::new(0.0) };
+            let _ = harness.ctx.run_ui(raw_input(&[], harness.tick()), |_ui| {});
+            apply(&harness.ctx);
+            let _ = harness.ctx.run_ui(raw_input(&[], harness.tick()), |_ui| {});
+
+            let sizing = harness.frame(&[]);
+            assert!(
+                sizing.painted.rects.is_empty(),
+                "the sizing pass painted after all; the frame counts in these tests may be off \
+                 by one"
+            );
+            let _ = harness.frame(&[]);
+            let drawn = harness.frame(&[]);
+            assert!(!drawn.painted.rects.is_empty(), "the card painted nothing at all");
+            (harness, drawn)
+        }
+
+        fn tick(&self) -> f64 {
+            self.clock.set(self.clock.get() + 0.1);
+            self.clock.get()
+        }
+    }
+
+    struct Drawn {
+        press: ModalPress,
+        /// Where the filled answer landed, taken from its own `Response`
+        /// rather than guessed from a fill colour -- this is the rect the
+        /// caller's button really occupies.
+        confirm: Rect,
+        painted: Painted,
+    }
+
+    impl Harness {
+        /// One frame of the scrim and the card, with `events` delivered to it.
+        fn frame(&self, events: &[egui::Event]) -> Drawn {
+            let confirm = std::cell::Cell::new(Rect::NOTHING);
+            let mut press = ModalPress::default();
+            let (accent, glyph) = (self.accent, self.glyph);
+            let output = self.ctx.run_ui(raw_input(events, self.tick()), |ui| {
+                let ctx = ui.ctx();
+                modal_scrim(ctx, egui::Area::new(egui::Id::new(SHADE_ID)));
+                press = modal_card(
+                    ctx,
+                    egui::Area::new(egui::Id::new(CARD_ID)),
+                    ModalCard { accent, glyph, title: TITLE, width: WIDTH, dismiss: DISMISS },
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(SENTENCE).size(12.0).color(TEXT_MUTED))
+                                .wrap(),
+                        );
+                    },
+                    |ui| {
+                        let response = destructive_button(ui, CONFIRM);
+                        confirm.set(response.rect);
+                        response
+                    },
+                );
+            });
+            let mut painted = Painted::default();
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut painted);
+            }
+            Drawn { press, confirm: confirm.get(), painted }
+        }
+    }
+
+    fn click(pos: Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// **Three bands, rounded as one piece.** The whole point of the shape:
+    /// the accent runs the full width with only its top corners rounded, the
+    /// footer only its bottom pair, and the card behind them carries the
+    /// radius on all four. Get any of those wrong and the card reads as three
+    /// cards in a pile.
+    #[test]
+    fn the_card_is_three_bands_rounded_as_one_piece() {
+        let (_harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
+        let card = drawn.painted.card();
+        let header = drawn.painted.band(ERROR, "header band");
+        let footer = drawn.painted.band(CARD_TINT, "footer band");
+
+        assert_eq!(card.corner_radius, CornerRadius::same(MODAL_RADIUS));
+        assert!(
+            (card.rect.width() - (WIDTH + 2.0)).abs() < 0.5,
+            "the card is {} wide against the {WIDTH} it was asked for plus its 1px border on \
+             each side",
+            card.rect.width()
+        );
+
+        assert_eq!(
+            header.corner_radius,
+            CornerRadius { nw: MODAL_RADIUS, ne: MODAL_RADIUS, sw: 0, se: 0 },
+            "the header band's bottom corners are rounded, so the body begins under a curve"
+        );
+        assert_eq!(
+            footer.corner_radius,
+            CornerRadius { nw: 0, ne: 0, sw: MODAL_RADIUS, se: MODAL_RADIUS },
+            "the footer band's top corners are rounded, so it reads as a card of its own"
+        );
+
+        // Edge to edge inside the border ring, top band flush with the top of
+        // the card and bottom band flush with its bottom.
+        let inside = card.rect.shrink(1.0);
+        for (band, name) in [(&header, "header"), (&footer, "footer")] {
+            assert!(
+                (band.rect.width() - inside.width()).abs() < 0.5,
+                "the {name} band is {} wide against a card {} wide inside its border, so it \
+                 does not run edge to edge",
+                band.rect.width(),
+                inside.width()
+            );
+        }
+        assert!((header.rect.top() - inside.top()).abs() < 0.5);
+        assert!((header.rect.height() - MODAL_HEADER_HEIGHT).abs() < 0.5);
+        assert!(
+            (footer.rect.bottom() - inside.bottom()).abs() < 0.5,
+            "the footer stops {} short of the card's bottom edge",
+            inside.bottom() - footer.rect.bottom()
+        );
+
+        // The body is the gap between them, and it is a real band rather than
+        // a seam: the sentence is painted in it.
+        assert!(header.rect.bottom() < footer.rect.top());
+        let sentence = drawn.painted.rect_of(SENTENCE);
+        assert!(
+            sentence.top() >= header.rect.bottom() && sentence.bottom() <= footer.rect.top(),
+            "the body's sentence at {sentence:?} is not between the two bands"
+        );
+
+        // And the hairline sits directly on top of the footer, which is the
+        // send preflight's own footer rule reproduced rather than reinvented.
+        let rule = drawn
+            .painted
+            .rects
+            .iter()
+            .find(|r| r.fill == HAIRLINE && r.rect.height() < 1.5)
+            .cloned()
+            .expect("no hairline above the footer band");
+        assert!(
+            (rule.rect.bottom() - footer.rect.top()).abs() < 0.5,
+            "the rule at {:?} does not meet the footer at {}",
+            rule.rect,
+            footer.rect.top()
+        );
+
+        // The title is IN the accent, not floating above or below it.
+        let title = drawn.painted.rect_of(TITLE);
+        assert!(
+            header.rect.contains_rect(title),
+            "the header's title at {title:?} is outside its band at {:?}",
+            header.rect
+        );
+    }
+
+    /// **The two answers split the row between the card's own margins.**
+    /// Half each is what makes the footer read as a choice rather than as one
+    /// button with something small beside it; an `egui::Button` left to
+    /// itself is as wide as its words, and "Cancel" next to "Delete forever"
+    /// is exactly the lopsided pair that produces.
+    #[test]
+    fn the_two_answers_split_the_row_between_the_cards_margins() {
+        let (_harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
+        // The footer band's own edges, which are the card's inside edges --
+        // the card's rect is the border ring around them.
+        let inside = drawn.painted.band(CARD_TINT, "footer band").rect;
+        let dismiss = drawn.painted.outlined_answer();
+        let confirm = drawn.confirm;
+
+        assert!(
+            (dismiss.width() - confirm.width()).abs() < 1.0,
+            "the answers are {} and {} wide, so the row is not an even split",
+            dismiss.width(),
+            confirm.width()
+        );
+        assert!(
+            (dismiss.height() - BUTTON_HEIGHT).abs() < 0.5
+                && (confirm.height() - BUTTON_HEIGHT).abs() < 0.5,
+            "the answers are {} and {} tall, not the app's {BUTTON_HEIGHT}",
+            dismiss.height(),
+            confirm.height()
+        );
+        assert!(
+            dismiss.left() < confirm.left(),
+            "the outlined answer is not the left-hand one"
+        );
+        assert!(
+            (dismiss.left() - (inside.left() + f32::from(MODAL_PAD_X))).abs() < 0.5,
+            "the left answer starts at {} against a card margin of {}",
+            dismiss.left(),
+            inside.left() + f32::from(MODAL_PAD_X)
+        );
+        assert!(
+            (confirm.right() - (inside.right() - f32::from(MODAL_PAD_X))).abs() < 0.5,
+            "the right answer ends at {} against a card margin of {}",
+            confirm.right(),
+            inside.right() - f32::from(MODAL_PAD_X)
+        );
+        assert!(
+            (confirm.left() - dismiss.right() - MODAL_FOOTER_GAP).abs() < 1.0,
+            "the gap between the answers is {}, not {MODAL_FOOTER_GAP}",
+            confirm.left() - dismiss.right()
+        );
+    }
+
+    /// **Each answer reports itself and only itself.** Clicked at the
+    /// coordinates the card really painted, so this fails if either button
+    /// stops being drawn, stops being hit-testable, or starts reporting the
+    /// other one's answer -- which on the delete confirmation is the mistake
+    /// that makes Cancel delete.
+    #[test]
+    fn each_answer_reports_only_itself() {
+        let (harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
+        let at = drawn.painted.outlined_answer().center();
+        let left = harness.frame(&click(at));
+        assert_eq!(
+            left.press,
+            ModalPress { dismissed: true, confirmed: false },
+            "clicking the outlined answer reported {:?}",
+            left.press
+        );
+
+        let (harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
+        let right = harness.frame(&click(drawn.confirm.center()));
+        assert_eq!(
+            right.press,
+            ModalPress { dismissed: false, confirmed: true },
+            "clicking the filled answer reported {:?}",
+            right.press
+        );
+
+        // The control: a frame with no pointer in it answers neither, so
+        // nothing above passes against a card that reports on every frame.
+        let (_harness, idle) = Harness::opened(ERROR, ModalGlyph::Warning);
+        assert_eq!(idle.press, ModalPress::default());
+    }
+
+    /// **The scrim covers the window and dims it.** It is what stops a click
+    /// aimed past the card from reaching the vault behind it, and an area
+    /// that allocates nothing has a near-zero stored rect and catches nothing
+    /// at all -- so the painted region and the blocked region are asserted to
+    /// be the same rectangle.
+    #[test]
+    fn the_scrim_covers_the_whole_window_and_dims_it() {
+        let (harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
+        let ctx = &harness.ctx;
+        let screen = Rect::from_min_size(Pos2::ZERO, BODY);
+        let shade = drawn
+            .painted
+            .rects
+            .iter()
+            .find(|r| r.fill == Color32::from_black_alpha(MODAL_SCRIM_ALPHA))
+            .cloned()
+            .expect("nothing on the frame is painted in the scrim's dim");
+        assert_eq!(shade.rect, screen, "the scrim does not cover the whole window");
+
+        // And the BLOCK is the same rectangle as the paint. An `Area` that
+        // allocated nothing looks identical on screen and catches the pointer
+        // nowhere, so the corners -- the furthest a click can land from the
+        // card -- are asked who would receive it.
+        let shade_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new(SHADE_ID));
+        assert!(ctx.memory(|m| m.areas().is_visible(&shade_layer)));
+        for corner in [
+            screen.min + Vec2::splat(2.0),
+            Pos2::new(screen.max.x - 2.0, screen.min.y + 2.0),
+            screen.max - Vec2::splat(2.0),
+            Pos2::new(screen.min.x + 2.0, screen.max.y - 2.0),
+        ] {
+            assert_eq!(
+                ctx.memory(|m| m.layer_id_at(corner)),
+                Some(shade_layer),
+                "a click at {corner:?} reaches past the scrim to whatever is behind it"
+            );
+        }
+    }
+
+    /// **The warning triangle is strokes, and an ordinary header has no mark
+    /// at all.** U+26A0 is not in this app's face -- the same measurement
+    /// `close_glyph` records for U+2715 -- so drawn it must be; and the slot
+    /// stays empty on a card that is asking rather than refusing, because a
+    /// symbol invented to fill it would mean nothing in particular.
+    #[test]
+    fn the_warning_glyph_is_strokes_and_an_ordinary_header_has_none() {
+        let (_harness, warned) = Harness::opened(ERROR, ModalGlyph::Warning);
+        let band = warned.painted.band(ERROR, "header band").rect;
+        let in_band = warned
+            .painted
+            .segments
+            .iter()
+            .filter(|[a, b]| band.contains(*a) && band.contains(*b))
+            .count();
+        assert_eq!(
+            in_band, 4,
+            "the triangle's three sides and the bang's bar are 4 segments; the band has {in_band}"
+        );
+        assert_eq!(
+            warned.painted.texts.iter().filter(|(_, r)| band.contains_rect(*r)).count(),
+            1,
+            "the header paints something besides its title, so the glyph is being typed"
+        );
+        // The bang's dot, which is a filled square rather than a circle
+        // because `icon_probe` reads circle radii to tell this crate's drawn
+        // marks apart.
+        assert!(
+            warned
+                .painted
+                .rects
+                .iter()
+                .any(|r| band.contains_rect(r.rect) && r.rect.width() < 3.0),
+            "the warning glyph has a bar with no dot under it"
+        );
+
+        let (_plain_harness, plain) = Harness::opened(BLUE, ModalGlyph::None);
+        let band = plain.painted.band(BLUE, "header band").rect;
+        assert!(
+            plain
+                .painted
+                .segments
+                .iter()
+                .all(|[a, b]| !band.contains(*a) || !band.contains(*b)),
+            "the glyph-less header drew a mark anyway"
+        );
+        assert!(
+            (plain.painted.rect_of(TITLE).left() - (band.left() + f32::from(MODAL_PAD_X))).abs()
+                < 1.0,
+            "the title on a glyph-less header is indented as if a glyph were there"
+        );
+    }
+
+    /// **The subject line is the item's own tile in front of the item's own
+    /// name.** Both cards that use the frame are about one vault item, and
+    /// the name is the first thing on them that has to be read -- a tile with
+    /// nothing beside it, or a name with no tile, is half of that.
+    #[test]
+    fn the_subject_line_is_the_items_tile_in_front_of_its_name() {
+        // A panel rather than the card, because the subject line is a
+        // stand-alone widget: what is under test is the tile and the name,
+        // not where in a modal they land.
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(raw_input(&[], 0.1), |_ui| {});
+        apply(&ctx);
+        let _ = ctx.run_ui(raw_input(&[], 0.2), |_ui| {});
+        let mut painted = Painted::default();
+        let output = ctx.run_ui(raw_input(&[], 0.3), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.set_width(300.0);
+                modal_subject(ui, "Ledgerline Bank");
+            });
+        });
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        assert_eq!(initials("Ledgerline Bank"), "LB");
+        let monogram = painted.rect_of("LB");
+        let name = painted.rect_of("Ledgerline Bank");
+        assert!(
+            monogram.right() <= name.left(),
+            "the monogram at {monogram:?} is not in front of the name at {name:?}"
+        );
+        assert!(
+            painted.rects.iter().any(|r| {
+                (r.rect.width() - r.rect.height()).abs() < 0.5
+                    && (r.rect.width() - MODAL_SUBJECT_TILE).abs() < 0.5
+            }),
+            "there is no square tile around the monogram; it painted {:?}",
+            painted.rects.iter().map(|r| r.rect).collect::<Vec<_>>()
         );
     }
 }

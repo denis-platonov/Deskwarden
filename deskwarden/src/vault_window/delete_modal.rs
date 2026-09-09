@@ -38,7 +38,7 @@
 //! lists this window keeps.
 
 use crate::theme;
-use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
+use eframe::egui::{self, RichText};
 
 /// Which of the two deletes is being confirmed.
 ///
@@ -136,9 +136,26 @@ pub enum DeleteConfirmAction {
     Cancel,
 }
 
-/// Draws the modal as a centred card over a dimmed scrim -- the same two
-/// `egui::Area`s [`super::icon_modal::draw_icon_modal`] uses, with ids of
-/// their own -- and reports what was pressed.
+/// How wide the card is. Unchanged from the plain card this replaced: the
+/// sentence under the subject line is the longest thing on it, and 340 is the
+/// width at which the permanent delete's two lines break where they read
+/// best.
+const CARD_WIDTH: f32 = 340.0;
+
+/// Draws the modal as a centred card over a dimmed scrim and reports what was
+/// pressed.
+///
+/// **The card is [`theme::modal_card`]'s**, which is the app's one modal
+/// shape: a coloured header band, a white body, and a footer whose two
+/// answers split its width. This file no longer lays out a card of its own,
+/// and [`super::icon_modal`] no longer lays out a second one -- see that
+/// function's own doc for why the layout moved into `theme`.
+///
+/// **The header carries [`theme::ERROR`] and the warning triangle**, because
+/// the accent is how the card says what kind of question it is before a word
+/// of it is read. It is the same red the confirm button wears, and the same
+/// red this app already spends on exactly this meaning (the kebab's Delete
+/// words, the sidebar's folder ×).
 ///
 /// **Esc cancels and Enter does nothing.** Every other overlay in this app
 /// takes Esc, so this one does too; the affirmative key is deliberately
@@ -151,74 +168,56 @@ pub fn draw_delete_modal(
 ) -> DeleteConfirmAction {
     let mut action = DeleteConfirmAction::None;
 
-    // Dimmed scrim: a full-window click-catcher so a click outside the card
-    // cannot reach the list behind it, on the `Foreground` layer so it sits
-    // above the three panels regardless of draw order. `icon_modal`'s, with
-    // an id of its own -- two `Area`s sharing an id is one `Area`.
-    egui::Area::new(egui::Id::new("delete-confirm-scrim"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
-        .show(ctx, |ui| {
-            let screen = ctx.content_rect();
-            ui.allocate_response(screen.size(), egui::Sense::click());
-            ui.painter()
-                .rect_filled(screen, CornerRadius::ZERO, egui::Color32::from_black_alpha(90));
-        });
+    // The `Area` is declared HERE rather than inside `theme::modal_scrim`,
+    // and the id is a literal on purpose: `item_list::MODAL_SCRIM_AREAS` is
+    // walked for exactly this declaration, and a scrim it cannot see is a
+    // modal the item list's arrow keys steer straight through.
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("delete-confirm-scrim")));
 
-    egui::Area::new(egui::Id::new("delete-confirm-modal"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .show(ctx, |ui| {
-            egui::Frame::new()
-                .fill(theme::CARD)
-                .corner_radius(CornerRadius::same(10))
-                .stroke(Stroke::new(1.0, theme::BORDER))
-                .inner_margin(Margin::same(20))
-                .show(ui, |ui| {
-                    ui.set_width(340.0);
-                    ui.label(theme::bold(state.kind.heading(), 15.0).color(theme::INK));
-                    ui.add_space(2.0);
-                    // The row this is about, named. The menu that opened this
-                    // is gone from the screen by now, and a confirmation that
-                    // did not say which item it was about would be one click
-                    // away from deleting the wrong credential.
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(&state.item_name).size(11.0).color(theme::TEXT_FAINT),
-                        )
-                        .truncate(),
-                    );
+    let press = theme::modal_card(
+        ctx,
+        egui::Area::new(egui::Id::new("delete-confirm-modal")),
+        theme::ModalCard {
+            accent: theme::ERROR,
+            glyph: theme::ModalGlyph::Warning,
+            title: state.kind.heading(),
+            width: CARD_WIDTH,
+            dismiss: "Cancel",
+        },
+        |ui| {
+            // The row this is about, named and wearing its own tile. The menu
+            // that opened this is gone from the screen by now, and a
+            // confirmation that did not say which item it was about would be
+            // one click away from deleting the wrong credential.
+            theme::modal_subject(ui, &state.item_name);
+            ui.add_space(12.0);
+            // Wrapped, not truncated: this is the sentence that says what the
+            // button does, and half of it is worse than none.
+            ui.add(
+                egui::Label::new(
+                    RichText::new(state.kind.body()).size(12.0).color(theme::TEXT_MUTED),
+                )
+                .wrap(),
+            );
 
-                    ui.add_space(14.0);
-                    // Wrapped, not truncated: this is the sentence that says
-                    // what the button does, and half of it is worse than none.
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(state.kind.body()).size(12.0).color(theme::TEXT_MUTED),
-                        )
-                        .wrap(),
-                    );
-
-                    if let Some(error) = &state.error {
-                        ui.add_space(10.0);
-                        ui.add(
-                            egui::Label::new(RichText::new(error).size(12.0).color(theme::ERROR))
-                                .wrap(),
-                        );
-                    }
-
-                    ui.add_space(18.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::destructive_button(ui, state.kind.confirm_label()).clicked() {
-                            action = DeleteConfirmAction::Confirm;
-                        }
-                        ui.add_space(8.0);
-                        if theme::secondary_button(ui, "Cancel").clicked() {
-                            action = DeleteConfirmAction::Cancel;
-                        }
-                    });
-                });
-        });
+            if let Some(error) = &state.error {
+                ui.add_space(10.0);
+                ui.add(
+                    egui::Label::new(RichText::new(error).size(12.0).color(theme::ERROR)).wrap(),
+                );
+            }
+        },
+        |ui| theme::destructive_button(ui, state.kind.confirm_label()),
+    );
+    if press.confirmed {
+        action = DeleteConfirmAction::Confirm;
+    }
+    // Second, so that the cautious answer wins a frame in which the pointer
+    // somehow reported both. Nothing in egui delivers two clicks in one
+    // frame today; this costs nothing and the other order costs a delete.
+    if press.dismissed {
+        action = DeleteConfirmAction::Cancel;
+    }
 
     // Esc cancels, same as every other transient overlay in this app.
     if action == DeleteConfirmAction::None && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
@@ -304,15 +303,39 @@ mod tests {
     /// constant.
     const BODY: eframe::egui::Vec2 = eframe::egui::Vec2::new(900.0, 700.0);
 
-    /// Every string this frame painted, with where it landed.
+    /// Every string this frame painted, with where it landed, and every
+    /// rectangle under them.
     #[derive(Default)]
     struct Painted {
         texts: Vec<(String, egui::Rect)>,
+        rects: Vec<eframe::egui::epaint::RectShape>,
     }
 
     impl Painted {
         fn strings(&self) -> Vec<&str> {
             self.texts.iter().map(|(t, _)| t.as_str()).collect()
+        }
+
+        /// The one band that runs the card's whole width in `fill`.
+        ///
+        /// The width is part of the question: the confirm button is filled in
+        /// the same red as the header it sits under, and only the bands run
+        /// edge to edge.
+        fn band(&self, fill: egui::Color32) -> egui::Rect {
+            let found: Vec<egui::Rect> = self
+                .rects
+                .iter()
+                .filter(|r| r.fill == fill && (r.rect.width() - CARD_WIDTH).abs() < 0.5)
+                .map(|r| r.rect)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected one full-width band filled {fill:?}, found {}; the card painted {:?}",
+                found.len(),
+                self.rects.iter().map(|r| (r.fill, r.rect.width())).collect::<Vec<_>>()
+            );
+            found[0]
         }
 
         /// The LOWEST rect painting `label`.
@@ -346,6 +369,7 @@ mod tests {
                 text.galley.text().to_string(),
                 egui::Rect::from_min_size(text.pos, text.galley.size()),
             )),
+            egui::Shape::Rect(rect) => painted.rects.push(rect.clone()),
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     walk(shape, painted);
@@ -355,9 +379,32 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// The context's clock, a tenth of a second per frame.
+        ///
+        /// **Without it every colour on this card comes back wrong.** An
+        /// `egui::Area` fades itself in over `Style::animation_time`, and the
+        /// fade is an opacity applied to every shape the layer emits -- so a
+        /// frame taken while it is a quarter of the way in reports the header
+        /// band's red as a premultiplied dark brown. A headless context's
+        /// clock does not advance on its own, and a tenth of a second is
+        /// comfortably longer than the animation, so the card is fully opaque
+        /// one frame after it appears.
+        ///
+        /// Thread-local because the test harness gives each test its own
+        /// thread and its own context; all that is asked of the number is
+        /// that it goes up.
+        static CLOCK: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    }
+
     fn raw_input(events: &[egui::Event]) -> egui::RawInput {
+        let time = CLOCK.with(|clock| {
+            clock.set(clock.get() + 0.1);
+            clock.get()
+        });
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, BODY)),
+            time: Some(time),
             events: events.to_vec(),
             ..Default::default()
         }
@@ -437,10 +484,59 @@ mod tests {
             "the sizing pass painted after all; this warm-up no longer describes what egui \
              does, and the frame counts in these tests may be off by one"
         );
+        // Two painting frames, not one: the first is the one the card appears
+        // on and therefore the one its fade-in starts on, and a card read
+        // halfway through that fade reports every fill premultiplied down
+        // toward transparent. See `CLOCK`.
+        let (action, _) = frame(ctx, state, &[]);
+        assert_eq!(action, DeleteConfirmAction::None);
         let (action, painted) = frame(ctx, state, &[]);
         assert_eq!(action, DeleteConfirmAction::None);
         assert!(!painted.texts.is_empty(), "the modal painted nothing at all");
         painted
+    }
+
+    /// **The header band is the destructive red, and the heading is in it.**
+    /// The accent is how the card says what kind of question it is before a
+    /// word of it is read, and this is the one modal in the window whose
+    /// question destroys something -- so it wears the same red as the button
+    /// that carries it out, and the same red this app already spends on
+    /// exactly this meaning everywhere else.
+    #[test]
+    fn the_header_band_is_the_destructive_colour_and_carries_the_heading() {
+        for kind in [DeleteKind::ToTrash, DeleteKind::Forever] {
+            let ctx = styled_context();
+            let mut state =
+                DeleteConfirmState::new("i1".into(), "Ledgerline".into(), kind);
+            let painted = opened(&ctx, &mut state);
+
+            let band = painted.band(theme::ERROR);
+            assert!(
+                (band.height() - theme::MODAL_HEADER_HEIGHT).abs() < 0.5,
+                "{kind:?}: the red band is {} tall, so it is not the header",
+                band.height()
+            );
+            let heading = painted
+                .texts
+                .iter()
+                .find(|(t, r)| t == kind.heading() && band.contains_rect(*r))
+                .map(|(_, r)| *r);
+            assert!(
+                heading.is_some(),
+                "{kind:?}: {:?} is not painted inside the header band at {band:?}; the card \
+                 painted {:?}",
+                kind.heading(),
+                painted.texts
+            );
+            // And the footer really is the third band, so this card is the
+            // frame's card and not a plain one that happens to have a red
+            // rectangle on it.
+            let footer = painted.band(theme::CARD_TINT);
+            assert!(
+                footer.top() > band.bottom(),
+                "the footer band at {footer:?} is not below the header at {band:?}"
+            );
+        }
     }
 
     /// **It names the item.** The menu that opened it is gone from the
