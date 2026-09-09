@@ -15,6 +15,17 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### An icon you don't like can be asked for again
+
+Right-click an item and choose **Refresh icon**. Deskwarden forgets the
+picture it has -- on disk, on screen, and on the server that fetched it --
+and goes and gets another one.
+
+Site icons could get stuck. A server that failed to find one once could
+keep saying so for a week, and Deskwarden's own copy never expired at
+all, so an item that came up with a monogram tended to stay that way. A
+site that changes its logo had the same problem in reverse.
+
 ### Editing one item no longer downloads the whole vault
 
 Renaming an item, starring one, or dragging one into a folder made
