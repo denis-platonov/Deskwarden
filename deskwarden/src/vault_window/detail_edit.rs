@@ -2553,7 +2553,7 @@ impl EditDraft {
     /// everything else; this then replaces the value of each *in place*, so
     /// the user's fields keep their slots and the server's extra keys on ours
     /// survive. Both writes go through
-    /// [`crate::vault_bridge::with_card_field`], which is the one producer of
+    /// [`crate::vault_bridge::with_custom_field`], which is the one producer of
     /// them -- a `fields.push` here would be a second one and would drop
     /// those keys on the next write, exactly as `with_app_match`'s doc
     /// describes.
@@ -2567,12 +2567,12 @@ impl EditDraft {
         if self.kind != ItemKind::Card {
             return updated;
         }
-        let updated = crate::vault_bridge::with_card_field(
+        let updated = crate::vault_bridge::with_custom_field(
             &updated,
             crate::favicon::BANK_DOMAIN_FIELD,
             &self.card.bank_domain,
         );
-        crate::vault_bridge::with_card_field(
+        crate::vault_bridge::with_custom_field(
             &updated,
             crate::vault_bridge::BILLING_ZIP_FIELD,
             &self.card.billing_zip,

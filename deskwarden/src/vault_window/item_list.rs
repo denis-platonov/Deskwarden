@@ -106,6 +106,30 @@ pub enum RowCommand {
     /// are separated by however long the menu stays open, and a stale copy
     /// would delete the wrong file.
     RefreshIcon,
+    /// Open the "Select icon" modal on this row -- see
+    /// `vault_window::icon_modal`.
+    ///
+    /// Carries nothing, [`Self::RefreshIcon`]'s rule: the modal is seeded
+    /// from the item the handler looks up by id, not from a copy taken while
+    /// the menu was open.
+    ///
+    /// **It only OPENS something.** No dialog is shown and no vault write is
+    /// made from the menu: `IFileOpenDialog::Show` is modal and pumps its own
+    /// message loop, and this command is produced from inside
+    /// `response.context_menu`'s draw closure, so shelling out to the shell
+    /// from here would re-enter egui's frame. The modal's own action handler
+    /// is where the dialog opens, which is the same rule
+    /// `EditAction::PickAppFile` and `TotpAddAction::OpenImage` already
+    /// follow.
+    SelectIcon,
+    /// Take the chosen icon back off this item, so it wears whatever the
+    /// automatic path gives it.
+    ///
+    /// **Its own command rather than an argument to [`Self::SelectIcon`],**
+    /// because it is the one icon action that writes to the vault directly
+    /// with nothing to ask the user first. Folding it into the modal would
+    /// mean opening a modal to press a button that closes it.
+    ClearIcon,
     Edit,
     /// The destination folder's id, always a real assignable folder --
     /// see [`move_menu`].
@@ -212,6 +236,27 @@ const NO_ASSIGNABLE_FOLDERS: &str = "No folders yet";
 /// those four is a menu whose test suite is about a string nobody sees.
 pub const REFRESH_ICON_LABEL: &str = "Refresh icon";
 
+/// The "choose this item's picture yourself" entry's wording.
+///
+/// The trailing ellipsis is the platform convention for an entry that opens
+/// something rather than acting, and it is load-bearing here: every other
+/// entry on this menu does its thing on the click, and this one puts a modal
+/// up. `\u{2026}` rather than three periods, matching every other ellipsis in
+/// this app's copy.
+///
+/// A constant for [`REFRESH_ICON_LABEL`]'s reason: the draw code, the
+/// entry-list tests and the tests that read painted galleys all name it.
+pub const SELECT_ICON_LABEL: &str = "Select icon\u{2026}";
+
+/// The way back to the automatic icon.
+///
+/// **"Use the automatic icon", not "Clear icon" or "Remove icon".** The item
+/// does not end up with no picture: it ends up with the picture it would have
+/// had all along, which for a login is its site's favicon and for a secure
+/// note is its monogram. A label promising removal would read as destructive
+/// on an item whose visible result is a *different* picture appearing.
+pub const CLEAR_ICON_LABEL: &str = "Use the automatic icon";
+
 /// Why the item's own folder is greyed inside the submenu. Kept rather than
 /// dropped from the list so the destinations do not reshuffle as items are
 /// selected, and so the row doubles as "this is where it lives now".
@@ -317,30 +362,18 @@ pub fn menu_entries(
             ));
         }
     }
-    // **ABSENT, not greyed, for an item with no icon domain** -- so a secure
-    // note, an identity, an SSH key, a login with no URI and a card with no
-    // `deskwarden:bank-domain` all get a menu that never mentions icons.
+    // **The icon group.** Immediately after "Open website" because the first
+    // of these entries and that one are read off the very same first URI for
+    // a login. Deliberately above Edit rather than down with Archive and
+    // Delete: that trailing pair is the lifecycle group, and entries that
+    // change nothing but a picture do not belong in it.
     //
-    // That is the rule `MenuCommand::enabled`'s own doc states, applied: this
-    // entry is "Copy TOTP"-shaped, not "Edit"-shaped. Such a row draws a
-    // monogram because there is no site to have an icon OF, which is not a
-    // situation a greyed line with a sentence attached would explain -- the
-    // user is not looking for the obvious action and failing to find it, and
-    // a disabled "Refresh icon" on a secure note would invite them to wonder
-    // what icon it meant. `icon_authority_for` is asked rather than
-    // `icon_domain_for`, and rather than a `kind ==` test of its own, so the
-    // one function that decides "does this item have an icon at all" decides
-    // it here too -- the same seam that let cards grow icons without this
-    // file knowing cards exist.
-    //
-    // Immediately after "Open website" because these two are the entries that
-    // exist only when the item names a site, and for a login they are read
-    // off the very same first URI. Deliberately above Edit rather than down
-    // with Archive and Delete: that trailing pair is the lifecycle group, and
-    // an entry that changes nothing but a picture does not belong in it.
-    if crate::favicon::icon_authority_for(item).is_some() {
-        entries.push(enabled_command(REFRESH_ICON_LABEL, RowCommand::RefreshIcon));
-    }
+    // Which of the three appear, and why each is absent rather than greyed
+    // when it does not, is `icon_entries`'. It is one function and one read
+    // of the item's icon field because the three are three answers to one
+    // question -- see its doc, which also records the three designs for
+    // "Refresh icon on an item that has a chosen one" that were rejected.
+    icon_entries(item, &mut entries);
     // Present for every kind, enabled only for those the edit form can
     // honestly edit -- see `MenuCommand::enabled` for why this one is greyed
     // rather than hidden.
@@ -402,6 +435,101 @@ fn out_of_vault_entries(out: OutOfVault, delete_pending: bool) -> Vec<MenuEntry>
         // goes back through the vault, where the ordinary Delete lives with
         // its confirmation.
         OutOfVault::Archive => vec![enabled_command("Unarchive", RowCommand::Unarchive)],
+    }
+}
+
+/// **The icon group**: up to three entries, appended to `entries` in the
+/// order they are read.
+///
+/// One function and one read of the item's icon field, because the three
+/// entries are three answers to one question and deriving them separately is
+/// how a menu comes to offer "Refresh icon" and "Use the automatic icon" for
+/// two different ideas of what this item's icon is.
+///
+/// ## "Select icon..." -- always
+///
+/// Every live item, of every kind, whether or not it has an automatic icon
+/// and whether or not it already has a chosen one. This is deliberately
+/// UNLIKE "Refresh icon": a secure note has no site to have an icon of, which
+/// is exactly why being able to give it one is worth something, and an item
+/// that already has a chosen icon is the item most likely to want a different
+/// one. There is no state in which this entry would do nothing.
+///
+/// ## "Use the automatic icon" -- only when a field is there to remove
+///
+/// Absent, not greyed, `MenuCommand::enabled`'s rule: an item with no chosen
+/// icon is already using the automatic one, so a greyed line would be
+/// explaining the absence of a problem.
+///
+/// Keyed on `item_icon::has_icon_field` and NOT on `item_icon::chosen_icon`,
+/// and the difference is the whole point of there being two functions. They
+/// disagree on exactly one item -- one whose field holds a value this build
+/// cannot parse -- and that item is the one that most needs the way out: it
+/// is wearing its automatic icon already, its field says otherwise, and
+/// keying this entry on the readable answer would have hidden the only
+/// control that could reconcile them.
+///
+/// ## "Refresh icon" -- for the automatic icon, and for a chosen URL
+///
+/// **What Refresh means in this app has never changed: forget the copy and
+/// ask again.** So it appears exactly where there is something to ask again,
+/// and the chosen icon decides which:
+///
+///  * **No chosen icon** -- unchanged from before this feature: present when
+///    `favicon::icon_authority_for` answers, absent otherwise.
+///  * **A chosen URL** -- present. The bytes came off a host that can change
+///    them, and a user who updates the logo at that URL needs a way to say
+///    so; without this entry their only route would be clearing the choice
+///    and setting the same URL again.
+///  * **A chosen file** -- ABSENT. The bytes are ON the item. There is no
+///    copy to forget and no host to ask: re-reading the field produces the
+///    identical picture, so the entry would be a visible control that
+///    provably does nothing, which is the failure this file's comments keep
+///    naming.
+///
+/// **The three designs rejected, and why each is worse.**
+///
+///  * *Refresh clears the chosen icon.* This was the tempting one, because it
+///    makes Refresh "work" on every item. It is the worst of the three: the
+///    entry's wording promises a re-fetch and it would instead destroy a
+///    deliberate choice, with no confirmation, on a menu where the only
+///    destructive entries are two-click confirmed. A user reaching for
+///    Refresh out of habit would lose the picture they picked and have no
+///    idea why.
+///  * *Refresh greyed with a reason on a file-backed item.* Better, and still
+///    wrong for the reason `menu_entries`' own comment gives about a secure
+///    note: a greyed line invites the user to wonder what they have to change
+///    to enable it, and the answer -- "nothing; there is nothing to refresh"
+///    -- is not something a disabled row can say. Absent is the honest shape
+///    for "no such action exists here", and this menu already uses it.
+///  * *Refresh re-fetches the item's automatic icon even though a chosen one
+///    wins.* It would appear to do nothing (the chosen icon still wins) while
+///    quietly making a request to the icon proxy for a host the user thought
+///    they had taken out of the loop. Silent and contrary to the feature's
+///    whole promise.
+fn icon_entries(item: &VaultItem, entries: &mut Vec<MenuEntry>) {
+    let chosen = crate::item_icon::chosen_icon(item);
+    let refreshable = match &chosen {
+        // A chosen URL is re-askable; a chosen picture is not.
+        Some(choice) => choice.url().is_some(),
+        // **ABSENT, not greyed, for an item with no icon domain** -- so a
+        // secure note, an identity, an SSH key, a login with no URI and a
+        // card with no `deskwarden:bank-domain` all get a menu that never
+        // mentions refreshing. Such a row draws a monogram because there is
+        // no site to have an icon OF, and a disabled "Refresh icon" on a
+        // secure note would invite the user to wonder what icon it meant.
+        // `icon_authority_for` is asked rather than a `kind ==` test of its
+        // own, so the one function that decides "does this item have an
+        // automatic icon at all" decides it here too -- the same seam that
+        // let cards grow icons without this file knowing cards exist.
+        None => crate::favicon::icon_authority_for(item).is_some(),
+    };
+    if refreshable {
+        entries.push(enabled_command(REFRESH_ICON_LABEL, RowCommand::RefreshIcon));
+    }
+    entries.push(enabled_command(SELECT_ICON_LABEL, RowCommand::SelectIcon));
+    if crate::item_icon::has_icon_field(item) {
+        entries.push(enabled_command(CLEAR_ICON_LABEL, RowCommand::ClearIcon));
     }
 }
 
@@ -1002,6 +1130,7 @@ fn scroll_offset_id() -> egui::Id {
 const MODAL_SCRIM_AREAS: &[&str] = &[
     "detail-edit-discard-scrim",
     "folder-edit-scrim",
+    "icon-pick-scrim",
     "launch-confirm-scrim",
     "prefs-modal-scrim",
     "record-import-scrim",
@@ -2560,6 +2689,7 @@ mod menu_entry_tests {
                 "Copy TOTP",
                 "Open website",
                 REFRESH_ICON_LABEL,
+                SELECT_ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -2631,6 +2761,13 @@ mod menu_entry_tests {
         assert_eq!(armed, vec!["Restore", "Delete forever? Click to confirm"]);
     }
 
+    /// The five entries a plain card gets, in order.
+    ///
+    /// **`SELECT_ICON_LABEL` is on the list and `REFRESH_ICON_LABEL` is
+    /// not**, which is the whole shape of `icon_entries`' rule in one
+    /// fixture: a card with no `deskwarden:bank-domain` has no automatic icon
+    /// to refresh, and giving it one by hand is exactly the thing that is
+    /// worth offering.
     #[test]
     fn a_card_offers_no_open_website_but_can_be_edited() {
         // "Open website" is login-only (`detail::kind_offers_fill`) and is
@@ -2638,20 +2775,30 @@ mod menu_entry_tests {
         // the card object -- which is the user-visible half of the 2026-08-17
         // fix.
         let entries = menu_entries(&of_kind(Some(3)), &[], false, FilterSource::LiveVault);
-        assert_eq!(labels(&entries), vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
+        assert_eq!(
+            labels(&entries),
+            vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+        );
         assert_eq!(
             enabled_labels(&entries),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
     }
 
+    /// **Renamed from `..._the_same_four_as_a_card` when "Select icon..."
+    /// made it five.** The count moved because the product changed, so the
+    /// name moved with it rather than the list being trimmed to keep an old
+    /// number true.
     #[test]
-    fn a_secure_note_offers_the_same_four_as_a_card() {
+    fn a_secure_note_offers_the_same_five_as_a_card() {
         let entries = menu_entries(&of_kind(Some(2)), &[], false, FilterSource::LiveVault);
-        assert_eq!(labels(&entries), vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]);
+        assert_eq!(
+            labels(&entries),
+            vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+        );
         assert_eq!(
             enabled_labels(&entries),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
     }
 
@@ -2714,7 +2861,16 @@ mod menu_entry_tests {
             .contains(&"Open website".to_string()));
         assert_eq!(
             labels(&menu_entries(&card_with_a_login, &[], false, FilterSource::LiveVault)),
-            vec!["Copy username", "Copy password", "Copy TOTP", "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"],
+            vec![
+                "Copy username",
+                "Copy password",
+                "Copy TOTP",
+                SELECT_ICON_LABEL,
+                "Edit",
+                MOVE_TO_FOLDER_LABEL,
+                "Archive",
+                "Delete",
+            ],
             "a card carrying a login blob was offered a login-only entry"
         );
     }
@@ -2784,9 +2940,221 @@ mod menu_entry_tests {
         });
         assert_eq!(
             labels(&menu_entries(&card, &[], false, FilterSource::LiveVault)),
-            vec![REFRESH_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"],
+            vec![
+                REFRESH_ICON_LABEL,
+                SELECT_ICON_LABEL,
+                "Edit",
+                MOVE_TO_FOLDER_LABEL,
+                "Archive",
+                "Delete",
+            ],
             "a card with a bank domain did not get the entry, or got something else with it"
         );
+    }
+
+    // ---- "Select icon..." and "Use the automatic icon" -------------------
+    //
+    // `icon_entries` decides all three icon entries from one read of the
+    // item's field. These are its rules; what the chosen icon then DOES is
+    // `vault_window::mod`'s half.
+
+    /// `item` with `value` on its `deskwarden:icon` field.
+    fn with_icon_field(item: &VaultItem, value: &str) -> VaultItem {
+        crate::vault_bridge::with_custom_field(item, crate::item_icon::ICON_FIELD_NAME, value)
+    }
+
+    fn chosen_url(item: &VaultItem) -> VaultItem {
+        with_icon_field(
+            item,
+            &crate::item_icon::choice_from_url("https://cdn.example.com/logo.png")
+                .expect("a good URL")
+                .to_field_value(),
+        )
+    }
+
+    fn chosen_picture(item: &VaultItem) -> VaultItem {
+        with_icon_field(
+            item,
+            &crate::item_icon::IconChoice::Png { png: "AAAA".into() }.to_field_value(),
+        )
+    }
+
+    /// **"Select icon..." is offered on every live item, of every kind** --
+    /// including the ones that get no "Refresh icon" because they have no
+    /// automatic icon at all. That difference is the entry's whole point: a
+    /// secure note has no site, which is exactly why being able to give it a
+    /// picture is worth something.
+    #[test]
+    fn every_live_item_is_offered_select_icon_whatever_its_kind() {
+        let mut app_only = of_kind(Some(1));
+        app_only.login = Some(LoginData {
+            uris: vec![UriEntry {
+                uri: Some("androidapp://com.example".into()),
+                other: serde_json::Map::new(),
+            }],
+            ..full_login().login.unwrap()
+        });
+        for (what, item) in [
+            ("a full login", full_login()),
+            ("a card", of_kind(Some(3))),
+            ("a secure note", of_kind(Some(2))),
+            ("an identity", of_kind(Some(4))),
+            ("an SSH key", of_kind(Some(5))),
+            ("a login with no URI at all", of_kind(Some(1))),
+            ("a login whose only URI names no host", app_only),
+        ] {
+            let entries = labels(&menu_entries(&item, &[], false, FilterSource::LiveVault));
+            assert!(
+                entries.contains(&SELECT_ICON_LABEL.to_string()),
+                "{what} was offered no way to choose its own icon: {entries:?}"
+            );
+        }
+    }
+
+    /// A trashed or archived row is offered neither icon entry: those two
+    /// menus are `out_of_vault_entries`' and share nothing with the live one.
+    #[test]
+    fn a_trashed_or_archived_row_is_offered_no_icon_entries_either() {
+        for source in [FilterSource::Trash, FilterSource::Archive] {
+            let entries = labels(&menu_entries(&chosen_url(&full_login()), &[], false, source));
+            for label in [SELECT_ICON_LABEL, CLEAR_ICON_LABEL, REFRESH_ICON_LABEL] {
+                assert!(
+                    !entries.contains(&label.to_string()),
+                    "{source:?} offered {label:?}: {entries:?}"
+                );
+            }
+        }
+    }
+
+    /// **"Use the automatic icon" appears only when there is a field to
+    /// remove**, and it is keyed on the field's PRESENCE rather than on it
+    /// parsing.
+    ///
+    /// The unreadable case is the one that matters: such an item is already
+    /// wearing its automatic icon while its field claims otherwise, and
+    /// keying this entry on `chosen_icon` would have hidden the only control
+    /// that could reconcile the two -- from the one user who is stuck.
+    #[test]
+    fn the_clear_entry_follows_the_field_being_there_and_not_it_parsing() {
+        let plain = full_login();
+        assert!(
+            !labels(&menu_entries(&plain, &[], false, FilterSource::LiveVault))
+                .contains(&CLEAR_ICON_LABEL.to_string()),
+            "an item with no chosen icon was offered a way to un-choose one"
+        );
+        for (what, item) in [
+            ("a chosen URL", chosen_url(&plain)),
+            ("a chosen picture", chosen_picture(&plain)),
+            ("a value this build cannot read", with_icon_field(&plain, "not json at all")),
+            ("a shape from a later build", with_icon_field(&plain, r#"{"kind":"svg"}"#)),
+        ] {
+            let entries = labels(&menu_entries(&item, &[], false, FilterSource::LiveVault));
+            assert!(
+                entries.contains(&CLEAR_ICON_LABEL.to_string()),
+                "an item with {what} was offered no way back to the automatic icon: {entries:?}"
+            );
+        }
+    }
+
+    /// **Refresh follows what there is to re-ask.**
+    ///
+    /// Three cases, and the third is the decision: a chosen picture has no
+    /// copy to forget and no host to ask, so re-reading the field produces
+    /// the identical picture. Absent rather than greyed, `MenuCommand::
+    /// enabled`'s rule -- a disabled row invites the user to work out what to
+    /// change, and the answer is "nothing; there is nothing to refresh",
+    /// which a disabled row cannot say.
+    #[test]
+    fn refresh_is_offered_for_a_chosen_url_and_never_for_a_chosen_picture() {
+        let login = full_login();
+        let has_refresh = |item: &VaultItem| {
+            labels(&menu_entries(item, &[], false, FilterSource::LiveVault))
+                .contains(&REFRESH_ICON_LABEL.to_string())
+        };
+        assert!(has_refresh(&login), "the live control: an ordinary login can refresh its icon");
+        assert!(
+            has_refresh(&chosen_url(&login)),
+            "an item whose icon comes off a URL cannot re-ask that URL, so a logo the user \
+             updated at that address can never reach them"
+        );
+        assert!(
+            !has_refresh(&chosen_picture(&login)),
+            "an item whose picture is ON it was offered a refresh, which would forget a copy \
+             that does not exist and re-read the identical bytes"
+        );
+        // A picture on an item that has NO automatic icon either: the same
+        // answer, reached by a different route through `icon_entries`.
+        assert!(!has_refresh(&chosen_picture(&of_kind(Some(2)))));
+        // And an UNREADABLE field falls all the way back to the automatic
+        // rule, because that is what such an item is wearing.
+        assert!(has_refresh(&with_icon_field(&login, "not json at all")));
+        assert!(!has_refresh(&with_icon_field(&of_kind(Some(2)), "not json at all")));
+    }
+
+    /// The whole menu for an item that has a chosen picture, in order --
+    /// which is where the two rules above meet: Refresh gone, Select present,
+    /// the way back directly under it.
+    #[test]
+    fn an_item_with_a_chosen_picture_gets_the_agreed_menu() {
+        assert_eq!(
+            labels(&menu_entries(
+                &chosen_picture(&full_login()),
+                &[],
+                false,
+                FilterSource::LiveVault
+            )),
+            vec![
+                "Copy username",
+                "Copy password",
+                "Copy TOTP",
+                "Open website",
+                SELECT_ICON_LABEL,
+                CLEAR_ICON_LABEL,
+                "Edit",
+                MOVE_TO_FOLDER_LABEL,
+                "Archive",
+                "Delete",
+            ]
+        );
+    }
+
+    /// And for a chosen URL, which keeps Refresh at the head of the group.
+    #[test]
+    fn an_item_with_a_chosen_url_gets_the_agreed_menu() {
+        assert_eq!(
+            labels(&menu_entries(&chosen_url(&full_login()), &[], false, FilterSource::LiveVault)),
+            vec![
+                "Copy username",
+                "Copy password",
+                "Copy TOTP",
+                "Open website",
+                REFRESH_ICON_LABEL,
+                SELECT_ICON_LABEL,
+                CLEAR_ICON_LABEL,
+                "Edit",
+                MOVE_TO_FOLDER_LABEL,
+                "Archive",
+                "Delete",
+            ]
+        );
+    }
+
+    /// Both entries are enabled wherever they appear. Neither has a state in
+    /// which it would do nothing -- which is the test that would fail if one
+    /// of them were ever greyed instead of hidden.
+    #[test]
+    fn neither_icon_entry_is_ever_greyed() {
+        for item in [full_login(), chosen_url(&full_login()), chosen_picture(&of_kind(Some(2)))] {
+            let entries = menu_entries(&item, &[], false, FilterSource::LiveVault);
+            for entry in &entries {
+                if let MenuEntry::Command(c) = entry {
+                    if c.command == RowCommand::SelectIcon || c.command == RowCommand::ClearIcon {
+                        assert!(c.enabled, "{:?} is greyed", c.label);
+                        assert_eq!(c.disabled_reason, None);
+                    }
+                }
+            }
+        }
     }
 
     /// A trashed or archived row is not offered it either -- those two menus
@@ -2843,6 +3211,7 @@ mod menu_entry_tests {
                 "Copy password",
                 "Open website",
                 REFRESH_ICON_LABEL,
+                SELECT_ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -2868,7 +3237,7 @@ mod menu_entry_tests {
         };
         assert_eq!(
             labels(&menu_entries(&empty, &[], false, FilterSource::LiveVault)),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
     }
 
@@ -6473,12 +6842,20 @@ mod row_tile_tests {
     /// out-of-vault labels is what lets those same tests state that a LIVE
     /// row offers no Restore or Unarchive, rather than being unable to see
     /// one if it did.
-    const MENU_VOCABULARY: [&str; 14] = [
+    /// The count went 14 -> 16 when "Select icon..." and "Use the automatic
+    /// icon" arrived. Both had to be added here and not merely to the
+    /// expected lists: a label missing from this array is one the painted
+    /// assertions cannot see, so an entry that stopped being drawn would have
+    /// gone unnoticed on both sides -- which is the exact defect the
+    /// "Archive" note above records.
+    const MENU_VOCABULARY: [&str; 16] = [
         "Copy username",
         "Copy password",
         "Copy TOTP",
         "Open website",
         REFRESH_ICON_LABEL,
+        SELECT_ICON_LABEL,
+        CLEAR_ICON_LABEL,
         "Edit",
         MOVE_TO_FOLDER_LABEL,
         "Archive",
@@ -6948,6 +7325,7 @@ mod row_tile_tests {
                 "Copy TOTP",
                 "Open website",
                 REFRESH_ICON_LABEL,
+                SELECT_ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -6964,7 +7342,7 @@ mod row_tile_tests {
         let items = [card("Visa (personal)")];
         assert_eq!(
             menu_labels(&open_menu(&items, vec![folder("f1", "Work")], 0)),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", DELETE_LABEL]
+            vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", DELETE_LABEL]
         );
     }
 
@@ -6979,6 +7357,7 @@ mod row_tile_tests {
                 "Copy password",
                 "Open website",
                 REFRESH_ICON_LABEL,
+                SELECT_ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -7392,6 +7771,7 @@ mod row_tile_tests {
                 "Copy TOTP",
                 "Open website",
                 REFRESH_ICON_LABEL,
+                SELECT_ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",

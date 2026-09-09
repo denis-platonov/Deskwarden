@@ -672,6 +672,44 @@ pub fn fetch_icon_for(source: &IconSource) -> Option<Vec<u8>> {
     }
 }
 
+/// **The one URL the owner chose for one item, fetched and nothing else.**
+///
+/// Deliberately NOT [`fetch_icon_for`] with a one-element
+/// [`IconSource::Direct`], which is the shape that first suggests itself and
+/// is wrong on both counts:
+///
+///  * `walk_direct` follows a miss with [`declared_icon_candidates`], which
+///    reads a private host's own root page and fetches up to four more URLs
+///    off it. Those are requests the user did not ask for, at addresses a
+///    remote page chose, on behalf of a field whose whole promise is "this
+///    picture and no other".
+///  * `IconSource` exists to express the routing choice between the site, the
+///    proxy and both. A chosen URL is not routed: there is one address, it is
+///    the user's, and no fallback to a third party may be invented for it.
+///
+/// What IS shared with the automatic path is everything that should be: the
+/// same bounded agent, the same bare [`DIRECT_USER_AGENT`], the same
+/// [`MAX_DIRECT_ICON_BYTES`] ceiling, and the same rule about what counts as
+/// an answer -- bytes that do not decode are not an icon, no matter what
+/// status code carried them, which is `walk_candidates`' rule and the reason
+/// an HTML error page served with a `200` cannot become somebody's logo.
+///
+/// Blocking. Call only from a background thread -- see
+/// `vault_window::ensure_icon_loaded`, its one caller.
+pub fn fetch_chosen_icon(url: &str) -> Option<Vec<u8>> {
+    let bytes = fetch_icon_direct(url)?;
+    if decode_rgba_unscaled(&bytes).is_some() {
+        log::debug!("icon: the chosen URL answered with an image of {} bytes", bytes.len());
+        return Some(bytes);
+    }
+    log::debug!(
+        "icon: the chosen URL answered, but the {} bytes it sent are not an image this app can \
+         decode",
+        bytes.len()
+    );
+    None
+}
+
 /// The whole direct half of a fetch: the fixed paths, and -- for a host whose
 /// page this app is allowed to read -- the paths that page declares.
 ///

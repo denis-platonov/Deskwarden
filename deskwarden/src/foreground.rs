@@ -1325,7 +1325,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 76] = [
+        const OPENS_NO_WINDOW: [&str; 77] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1416,6 +1416,12 @@ mod tests {
             "http_agent",
             "icon",
             "injector",
+            // The chosen-icon custom field: its shape, its parse, its size
+            // caps and one `std::fs::read` of a file somebody already picked.
+            // It draws nothing and knows nothing about a window -- the shell
+            // dialog belongs to `file_picker` and the modal to
+            // `vault_window::icon_modal`, and neither is this module.
+            "item_icon",
             "job_object",
             "key_sequence",
             // Four `egui` glyphs for the four non-login item kinds, painted

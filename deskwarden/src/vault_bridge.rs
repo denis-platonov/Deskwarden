@@ -560,10 +560,21 @@ pub const BILLING_ZIP_FIELD: &str = "deskwarden:billing-zip";
 ///   visibly reshuffle the user's own fields on every save.
 ///
 /// **A blank `value` removes the field rather than storing an empty string.**
-/// These fields mean "this card has a bank" and "this card has a billing
-/// postcode"; an empty one is a claim with nothing behind it, and
-/// `favicon::icon_domain_for` would have to filter it back out anyway.
-pub fn with_card_field(item: &VaultItem, name: &str, value: &str) -> VaultItem {
+/// These fields mean "this card has a bank", "this card has a billing
+/// postcode", "this item has a chosen icon"; an empty one is a claim with
+/// nothing behind it, and every reader would have to filter it back out
+/// anyway. It is also the whole of *clearing*: `""` is how "Use the automatic
+/// icon" and an emptied bank box say the same thing, through one function that
+/// cannot half-remove a field.
+///
+/// **It was called `with_card_field` and the name was wrong before it was
+/// misleading.** Nothing in the body has ever looked at the item's kind: it
+/// takes a field name and a value. The rename happened when
+/// [`crate::item_icon::ICON_FIELD_NAME`] arrived on logins, notes and
+/// identities as well as cards -- a login's icon written by a function called
+/// `with_card_field` would have read as a bug at every call site, and the fix
+/// for that is the name rather than a fourth copy of these twenty lines.
+pub fn with_custom_field(item: &VaultItem, name: &str, value: &str) -> VaultItem {
     let mut fields: Vec<VaultField> = item.fields.clone();
     let existing = fields.iter().position(|f| f.name.as_deref() == Some(name));
 
@@ -3310,7 +3321,7 @@ mod tests {
 
     /// A real-shaped card: two of the user's own custom fields, each carrying
     /// keys `bw` put there, plus this app's bank-domain field carrying its
-    /// own. Every `with_card_field` test below is built from this one item so
+    /// own. Every `with_custom_field` test below is built from this one item so
     /// that "the other fields kept their keys" is a claim about a fixture
     /// that HAS keys to keep.
     fn a_card_with_custom_fields() -> VaultItem {
@@ -3350,7 +3361,7 @@ mod tests {
         }
 
         let updated =
-            with_card_field(&item, crate::favicon::BANK_DOMAIN_FIELD, "ledgerline.example");
+            with_custom_field(&item, crate::favicon::BANK_DOMAIN_FIELD, "ledgerline.example");
         let after = field_objects(&updated);
 
         assert_eq!(after.len(), 3, "the field count changed");
@@ -3377,7 +3388,7 @@ mod tests {
         // modelling from memory. Appended at the end, so the user's own
         // fields keep their slots.
         let item = a_card_with_custom_fields();
-        let updated = with_card_field(&item, BILLING_ZIP_FIELD, "SW1A 1AA");
+        let updated = with_custom_field(&item, BILLING_ZIP_FIELD, "SW1A 1AA");
         let after = field_objects(&updated);
 
         assert_eq!(after.len(), 4, "the zip was not added, or something else was");
@@ -3396,7 +3407,7 @@ mod tests {
         // billing postcode". An empty one is a claim with nothing behind it,
         // and `favicon::icon_domain_for` would have to filter it back out.
         let item = a_card_with_custom_fields();
-        let cleared = with_card_field(&item, crate::favicon::BANK_DOMAIN_FIELD, "   ");
+        let cleared = with_custom_field(&item, crate::favicon::BANK_DOMAIN_FIELD, "   ");
         let names: Vec<&str> =
             cleared.fields.iter().filter_map(|f| f.name.as_deref()).collect();
         assert_eq!(names, vec!["PIN", "Branch"], "the blanked field was kept or too much went");
@@ -3408,7 +3419,7 @@ mod tests {
         // Control: the same card with a real value DOES claim one, so `None`
         // above is about the clear and not about a card that never could.
         assert_eq!(
-            crate::favicon::icon_domain_for(&with_card_field(
+            crate::favicon::icon_domain_for(&with_custom_field(
                 &item,
                 crate::favicon::BANK_DOMAIN_FIELD,
                 "ledgerline.example"
@@ -3421,7 +3432,7 @@ mod tests {
     #[test]
     fn clearing_a_card_field_that_was_never_there_changes_nothing() {
         let item = a_card_with_custom_fields();
-        let updated = with_card_field(&item, BILLING_ZIP_FIELD, "");
+        let updated = with_custom_field(&item, BILLING_ZIP_FIELD, "");
         assert_eq!(
             serde_json::to_value(&updated).unwrap(),
             serde_json::to_value(&item).unwrap(),

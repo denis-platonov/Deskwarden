@@ -66,6 +66,11 @@ pub mod hotkey;
 pub mod http_agent;
 pub mod icon;
 pub mod injector;
+/// The icon the owner CHOSE for one vault item, stored on the item itself so
+/// it syncs. Read before anything in [`favicon`] routes a request: when it
+/// answers, no origin is fetched, no proxy is asked and no third party sees
+/// the item's host.
+pub mod item_icon;
 pub mod job_object;
 pub mod key_sequence;
 pub mod kind_mark;

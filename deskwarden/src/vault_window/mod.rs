@@ -9,6 +9,7 @@ pub mod detail;
 pub mod detail_edit;
 pub mod detail_slide;
 pub mod folder_modal;
+pub mod icon_modal;
 pub mod item_list;
 pub mod password_health;
 pub mod preflight;
@@ -1172,6 +1173,13 @@ pub fn build_frame_with_search(
     // sidebar's `SidebarAction::EditFolder`, seeded with that folder's
     // current name; cleared on Save/Delete success or Cancel/Esc.
     let mut folder_edit: Option<FolderEditState> = None;
+    // The "Select icon" modal's state, `Some` while open. Set from an item
+    // row's `RowCommand::SelectIcon`, seeded with that item's existing choice;
+    // cleared on a successful pick or Cancel/Esc. It lives here beside
+    // `folder_edit` for the reason that one does: panes in this window own no
+    // state, and a URL half-typed into a modal that died with the frame would
+    // be a box that empties itself sixty times a second.
+    let mut icon_pick: Option<icon_modal::IconPickState> = None;
     // **The "Send a record" composer, `Some` while it is on screen** -- see
     // `record_ui::RecordSend`, which holds the item it was opened against as
     // well as the ticks.
@@ -3204,6 +3212,53 @@ pub fn build_frame_with_search(
                             &mut icons,
                         );
                     }
+                    // **Opens the modal and nothing else.** The shell dialog
+                    // and the vault write both live in the modal's own action
+                    // handler, further down the frame: `IFileOpenDialog::Show`
+                    // pumps its own message loop, and this arm runs inside the
+                    // item list's draw. Seeded from the item's existing
+                    // choice, so an address that needs one character changed
+                    // is an edit rather than a retype.
+                    item_list::RowCommand::SelectIcon => {
+                        icon_pick = Some(icon_modal::IconPickState::new(
+                            item.id.clone(),
+                            item.name.clone(),
+                            crate::item_icon::chosen_icon(&item).as_ref(),
+                        ));
+                    }
+                    // **The one icon action that writes with nothing to ask
+                    // first**, so it acts here rather than opening anything.
+                    // `""` through `with_custom_field` REMOVES the field
+                    // rather than blanking it -- see that function -- which is
+                    // what makes this the exact inverse of setting one.
+                    item_list::RowCommand::ClearIcon => {
+                        let cleared = crate::vault_bridge::with_custom_field(
+                            &item,
+                            crate::item_icon::ICON_FIELD_NAME,
+                            "",
+                        );
+                        match cache.update_item(&cleared) {
+                            Ok(saved) => {
+                                apply_icon_write(
+                                    &saved,
+                                    &mut items,
+                                    &mut favicon_requested,
+                                    &mut icons,
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "failed to clear the chosen icon on item {}: {e:?}",
+                                    item.id
+                                );
+                                flag_reauth_if_unauthorized(
+                                    ui.ctx(),
+                                    &needs_reauth_for_closure,
+                                    &e,
+                                );
+                            }
+                        }
+                    }
                     // Only from Read. A draft already open on this item IS
                     // what "Edit" asks for, so re-seeding it would do nothing
                     // but discard whatever the user had typed; the same goes
@@ -4792,6 +4847,111 @@ pub fn build_frame_with_search(
             }
         }
 
+        // **The "Select icon" modal, drawn here for `folder_edit`'s reason**
+        // -- late, so its scrim is over the three panels -- and its action
+        // handled here for a second reason of its own: `pick_icon_image`
+        // opens a shell dialog that pumps its own message loop, and this
+        // block runs after every pane's draw closure has returned. The same
+        // rule and the same place as `TotpAddAction::OpenImage`.
+        if let Some(state) = &mut icon_pick {
+            let action = icon_modal::draw_icon_modal(ui.ctx(), state);
+            // The item is looked up FRESH, by id, at the moment it is written
+            // -- never captured when the modal opened. A sync can replace the
+            // snapshot while the modal is up, and writing a copy taken before
+            // it would PUT a stale full state back over whatever the sync
+            // brought (`bw serve`'s edit endpoint is state-replacing), which
+            // is the defect `VaultCache::set_app_match`'s doc describes one
+            // field over. An item that has gone away in the meantime is a
+            // pick that quietly does nothing but close, which is the truthful
+            // outcome: there is no longer anything to put an icon on.
+            let target = items.iter().find(|i| i.id == state.item_id).cloned();
+            // Each arm produces the CHOICE to store, or a sentence saying why
+            // it cannot. One write below, not three: the vault call, the
+            // failure sentence and `apply_icon_write` are identical for both
+            // routes, and it is the picking that differs.
+            let picked: Option<Result<crate::item_icon::IconChoice, String>> = match action {
+                icon_modal::IconPickAction::None => None,
+                icon_modal::IconPickAction::Cancel => {
+                    icon_pick = None;
+                    None
+                }
+                // The dialog answering `None` is a cancel, and a cancel is
+                // not an event this app narrates back at the user: the modal
+                // stays exactly as it was, with whatever they had typed.
+                icon_modal::IconPickAction::ChooseFile => {
+                    crate::file_picker::pick_icon_image().map(|path| {
+                        crate::item_icon::read_icon_file(std::path::Path::new(&path))
+                            .map_err(icon_modal::refusal_sentence)
+                    })
+                }
+                // Re-validated here rather than trusted: the modal checked
+                // the shape before reporting this, and checking it again at
+                // the one place that writes costs a string comparison and
+                // removes "the caller validated it" from the list of things
+                // that have to stay true.
+                icon_modal::IconPickAction::UseUrl(url) => Some(
+                    crate::item_icon::choice_from_url(&url)
+                        .map_err(icon_modal::refusal_sentence),
+                ),
+            };
+            // Re-borrowed: the `match` above may have cleared `icon_pick`,
+            // and a `Cancel` produces no pick at all.
+            if let (Some(picked), Some(state)) = (picked, icon_pick.as_mut()) {
+                match (picked, target) {
+                    (Ok(choice), Some(item)) => {
+                        let updated = crate::vault_bridge::with_custom_field(
+                            &item,
+                            crate::item_icon::ICON_FIELD_NAME,
+                            &choice.to_field_value(),
+                        );
+                        match cache.update_item(&updated) {
+                            Ok(saved) => {
+                                apply_icon_write(
+                                    &saved,
+                                    &mut items,
+                                    &mut favicon_requested,
+                                    &mut icons,
+                                );
+                                icon_pick = None;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "failed to save the chosen icon on item {}: {e:?}",
+                                    item.id
+                                );
+                                // **The modal stays open and says so.** A
+                                // failure that only logged would leave it
+                                // sitting there unchanged, which from the
+                                // outside is indistinguishable from the click
+                                // never having registered -- `folder_edit`'s
+                                // recorded lesson, applied.
+                                state.error = Some(icon_modal::write_failed_sentence());
+                                flag_reauth_if_unauthorized(
+                                    ui.ctx(),
+                                    &needs_reauth_for_closure,
+                                    &e,
+                                );
+                            }
+                        }
+                    }
+                    // **A refusal writes NOTHING.** No field is set, no field
+                    // is removed, and the item keeps exactly the icon it had
+                    // -- which is the whole of the rule that an oversized or
+                    // undecodable pick may not cost the user the picture they
+                    // already had.
+                    (Err(sentence), _) => state.error = Some(sentence),
+                    (Ok(_), None) => {
+                        log::info!(
+                            "the item the icon picker was opened on ({}) is no longer in this \
+                             window's list; the pick was dropped",
+                            state.item_id
+                        );
+                        icon_pick = None;
+                    }
+                }
+            }
+        }
+
         // **THE ONE GATING POSITION for the record composer.** Both doors --
         // the detail header's ✉ and the CTRL+SHIFT+S chord -- arrive here as
         // `send_record_asked`, and this is the only line in the frame that
@@ -6227,6 +6387,26 @@ fn row_command_exposes_secrets(command: &item_list::RowCommand) -> bool {
         // stands for -- so a Hello prompt here would cost a master password
         // to redraw something the user is looking at.
         | item_list::RowCommand::RefreshIcon
+        // **Choosing and clearing an icon reveal nothing either, and they are
+        // argued rather than appended to the refresh above** -- they write to
+        // the item, which `RefreshIcon` does not, and a write is the kind of
+        // act this gate could plausibly be about.
+        //
+        // It is not. What this gate asks is whether the act puts a SECRET in
+        // front of somebody who has not proved the master password (see
+        // `detail_action_exposes_secrets`), and neither of these reads a
+        // field of the item, paints one, or copies one. `SelectIcon` opens a
+        // modal showing the row's NAME -- which is already on screen, on the
+        // row that was right-clicked -- plus an address the user types
+        // themselves. `ClearIcon` removes a custom field holding a picture.
+        //
+        // The comparison that settles it is `MoveToFolder` on the line below:
+        // that one is a vault write too, on the same menu, and it is `false`
+        // for exactly this reason. A gate that charged a master password to
+        // change a picture and not to re-file a credential would look
+        // arbitrary and teach the user to distrust it.
+        | item_list::RowCommand::SelectIcon
+        | item_list::RowCommand::ClearIcon
         | item_list::RowCommand::MoveToFolder(_)
         | item_list::RowCommand::Delete
         | item_list::RowCommand::Archive
@@ -11537,13 +11717,98 @@ struct IconFetch<'a> {
     server_url: &'a Option<String>,
 }
 
+/// What the owner's own icon choice leaves [`ensure_icon_loaded`] to do.
+#[derive(Debug, PartialEq, Eq)]
+enum IconPlan {
+    /// The item carries a stored picture and it is now a texture. Nothing
+    /// else may run: no domain is worked out, no host is asked, and the
+    /// `fetch_icons` switch is not even consulted.
+    Loaded,
+    /// The item carries a chosen URL. It is fetched, and it is the FIRST
+    /// thing fetched -- see [`ensure_icon_loaded`]'s one background job.
+    ChosenUrl(String),
+    /// No usable choice. The ordinary automatic path decides everything.
+    Automatic,
+}
+
+/// **The first question [`ensure_icon_loaded`] asks: did the owner already
+/// say what this item's picture is?**
+///
+/// Split out so that the parse and the decode -- the only expensive part of
+/// the answer -- happen once, in one place, and so that
+/// [`ensure_icon_loaded`] (already at clippy's argument limit) gains one
+/// `match` rather than three nested `if let`s.
+///
+/// ## A stored picture: decoded here, and nothing is fetched, ever
+///
+/// The bytes are on the item, so this path has no thread, no network and no
+/// disk cache in it -- the texture is built in the frame that first draws the
+/// row, and [`IconPlan::Loaded`] stops everything downstream.
+///
+/// **The `fetch_icons` switch does not gate it, and that is a decision rather
+/// than an oversight.** That switch exists to stop this app disclosing which
+/// hosts the user holds entries for (see [`IconFetch::enabled`]). A picture
+/// that lives in the cipher discloses nothing to anybody: no request is made,
+/// no host is named, nothing leaves the process. Suppressing it would be a
+/// privacy setting destroying a picture that costs no privacy, and the user
+/// would have no way to understand why the icon they deliberately chose is
+/// missing. That is also why this runs BEFORE the switch rather than after
+/// it, which is the one ordering in this function that is load-bearing.
+///
+/// ## Anything else: [`IconPlan::Automatic`]
+///
+/// No field, a field this build cannot parse, a payload whose base64 or PNG
+/// does not decode -- all three answer the same way, because all three mean
+/// the same thing to the caller: there is nothing usable here, so the item
+/// gets the icon it would have had anyway. **Nothing is written, rewritten or
+/// removed on any of those paths**; the field stays exactly as it is, which
+/// is what keeps "Use the automatic icon" able to get rid of it and what
+/// stops this app repairing a user's data on a guess.
+///
+/// **The cost of that last arm, stated.** A payload that does not decode is
+/// re-attempted on every frame the row is visible, because nothing marks the
+/// item here and the automatic path below only marks items that have an
+/// authority. So an item with BOTH a corrupt payload AND no automatic icon
+/// re-decodes per frame. It is the same accepted cost the automatic path
+/// already pays for every note and identity in the vault (it re-asks
+/// `icon_authority_for` each frame, deliberately, so that giving an item a
+/// domain works without reopening the window), it is bounded by the on-screen
+/// prefetch window, and reaching it takes a field this app only ever writes
+/// from bytes it has just decoded -- so it needs an edit made in another
+/// client. Marking the item instead would be worse: it would deny it the
+/// automatic icon this arm exists to preserve.
+fn icon_plan(ctx: &egui::Context, item: &VaultItem, icons: &mut IconCache) -> IconPlan {
+    let Some(choice) = crate::item_icon::chosen_icon(item) else {
+        return IconPlan::Automatic;
+    };
+    if let Some(url) = choice.url() {
+        return IconPlan::ChosenUrl(url.to_string());
+    }
+    let Some((w, h, rgba)) = choice.pixels() else {
+        log::debug!(
+            "icon: item {}'s stored picture did not decode; it falls back to its ordinary icon",
+            item.id
+        );
+        return IconPlan::Automatic;
+    };
+    let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
+    icons.textures.insert(
+        item.id.clone(),
+        ctx.load_texture(item.id.clone(), image, egui::TextureOptions::default()),
+    );
+    // The id and the size, never the bytes: the picture is the user's.
+    log::debug!("icon: item {} wears its own stored {w}x{h} picture", item.id);
+    IconPlan::Loaded
+}
+
 /// Ensures `item`'s favicon is loading or loaded, doing as little work as
 /// possible: skips entirely if already resolved (loaded or a fetch already
-/// dispatched) this session, serves instantly from the on-disk cache if
-/// present (no thread, no network), and only falls back to a background
-/// network fetch on a genuine cache miss -- writing the result to the disk
-/// cache on success so future opens (and every other item on the same
-/// domain) never re-fetch it.
+/// dispatched) this session, honours the owner's own choice of picture
+/// without asking anybody (see [`icon_plan`]), serves instantly from the
+/// on-disk cache if present (no thread, no network), and only falls back to a
+/// background network fetch on a genuine cache miss -- writing the result to
+/// the disk cache on success so future opens (and every other item on the
+/// same domain) never re-fetch it.
 ///
 /// Cheap to call redundantly: this is called once per selected item and once
 /// per currently-visible item, every frame, and the vast majority of those
@@ -11558,6 +11823,16 @@ fn ensure_icon_loaded(
     icons: &mut IconCache,
 ) {
     if icons.textures.contains_key(&item.id) || favicon_requested.contains(&item.id) {
+        return;
+    }
+    // **The owner's own choice, asked before anything works out where a
+    // picture would otherwise come from.** A stored picture is loaded and
+    // this returns; a chosen URL is carried past the switch below and becomes
+    // the first thing the one background job asks for. See `icon_plan` for
+    // the whole rule, including why a stored picture is deliberately NOT
+    // gated by the switch and the URL deliberately is.
+    let plan = icon_plan(ctx, item, icons);
+    if plan == IconPlan::Loaded {
         return;
     }
     // **The user's switch, and it stands in front of the QUESTION rather than
@@ -11604,9 +11879,23 @@ fn ensure_icon_loaded(
     // domain. `icon_domain_for` is still the answer everywhere a domain is
     // what is wanted, and a card -- whose bank domain is typed into a field
     // and carries no port -- gets exactly the same string from either.
-    let Some(domain) = crate::favicon::icon_authority_for(item) else {
-        return;
+    //
+    // **It is an `Option` now rather than an early return, because a chosen
+    // URL gives an item something to fetch even when it has no authority at
+    // all.** That is the whole point of being able to give a secure note a
+    // picture: it has no site, so `icon_authority_for` answers `None` for it
+    // forever, and a `return` here would have made the URL route work for
+    // logins and silently do nothing for everything else. The "nothing to do"
+    // return moved one line down, where it now asks about both.
+    let domain = crate::favicon::icon_authority_for(item);
+    let chosen_url = match plan {
+        IconPlan::ChosenUrl(url) => Some(url),
+        // `Loaded` returned above; `Automatic` is the ordinary path.
+        IconPlan::Loaded | IconPlan::Automatic => None,
     };
+    if domain.is_none() && chosen_url.is_none() {
+        return;
+    }
     favicon_requested.insert(item.id.clone());
     // **Drained here, at the one place a fetch is dispatched from.** The set
     // is written by `refresh_item_icon` when the user chooses "Refresh icon",
@@ -11624,8 +11913,21 @@ fn ensure_icon_loaded(
     // its id, not its URI -- a host:port the user chose to store, which is
     // the one fact the icon path acts on and the one this log is for. Every
     // other line below names the same string or a URL built from it.
-    log::debug!("icon: {domain} is this item's icon authority");
+    if let Some(domain) = &domain {
+        log::debug!("icon: {domain} is this item's icon authority");
+    }
 
+    // **The disk cache is skipped entirely when a URL was chosen**, and not
+    // merely bypassed: that cache is keyed on the authority the item
+    // discloses, and a chosen URL is not that authority. Reading it here
+    // would serve the item's OLD automatic icon in front of the picture the
+    // user picked, and only until the fetch landed -- a flicker that looks
+    // like the choice not having taken.
+    //
+    // Nothing is written into it on the chosen-URL path either. See
+    // `icon_plan` for why a chosen URL gets no on-disk cache of its own
+    // rather than a third key namespace with a fourth invalidation rule.
+    //
     // **A refreshing pass does not consult the disk cache at all**, and that
     // is a belt to `refresh_item_icon`'s braces rather than a duplicate of
     // them. That function deletes the file first, but the delete is
@@ -11636,23 +11938,23 @@ fn ensure_icon_loaded(
     // A menu entry that silently does nothing is worse than one that costs a
     // request, and this path is only ever taken right after a deliberate
     // click.
-    let cached = match freshness {
-        crate::favicon::IconFreshness::Refresh => None,
-        crate::favicon::IconFreshness::Cached => {
-            crate::favicon::read_cached_icon(icon_cache_dir, &domain)
+    let cached = match (&chosen_url, &domain, freshness) {
+        (None, Some(domain), crate::favicon::IconFreshness::Cached) => {
+            crate::favicon::read_cached_icon(icon_cache_dir, domain)
         }
+        _ => None,
     };
     if let Some(cached_bytes) = cached {
         if let Some((w, h, rgba)) = crate::favicon::decode_rgba(&cached_bytes) {
             let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
             let tex = ctx.load_texture(item.id.clone(), image, egui::TextureOptions::default());
             icons.textures.insert(item.id.clone(), tex);
-            log::debug!("icon: {domain} was served from the on-disk cache");
+            log::debug!("icon: this item was served from the on-disk cache");
             return;
         }
         // Corrupt/unreadable cache entry -- fall through and re-fetch as if
         // it were a miss, rather than permanently failing this domain.
-        log::debug!("icon: {domain}'s cache entry did not decode; re-fetching as a miss");
+        log::debug!("icon: the cache entry did not decode; re-fetching as a miss");
     }
 
     let tx = favicon_tx.clone();
@@ -11661,6 +11963,46 @@ fn ensure_icon_loaded(
     let cache_dir = icon_cache_dir.to_path_buf();
     let direct = fetch.direct;
     std::thread::spawn(move || {
+        // **The chosen URL first, and it is the only thing tried while it
+        // works.** One GET of one address, through
+        // `favicon::fetch_chosen_icon` -- no proxy, no candidate walk, no
+        // declared-icon page read. Nothing is written to the disk cache from
+        // this arm, for the reason above.
+        let chosen = chosen_url.as_deref().and_then(|url| {
+            let pixels =
+                crate::favicon::fetch_chosen_icon(url).and_then(|b| crate::favicon::decode_rgba(&b));
+            if pixels.is_none() {
+                // `warn`, not `debug`: the user typed this address
+                // themselves, and this is the line that tells them it did not
+                // answer with a picture. The URL is NOT interpolated -- it is
+                // a value out of the user's vault, and the lines
+                // `fetch_chosen_icon` logs at `debug` already carry what a
+                // diagnosis needs.
+                log::warn!(
+                    "icon: the chosen icon URL for item {item_id} produced nothing usable; the \
+                     item falls back to the icon it would have had"
+                );
+            }
+            pixels
+        });
+        // **The automatic path, reached either because there was no choice or
+        // because the chosen URL produced nothing.**
+        //
+        // The fall-through is the user's own requirement -- no failure may
+        // leave an item with neither icon -- and it costs nothing in
+        // disclosure: it asks about the very authority this item would have
+        // asked about with no choice at all, which the user already accepted
+        // for it. "The chosen icon wins over everything" is a statement about
+        // the case where there IS a chosen icon; a URL that 404s is not that
+        // case, and a monogram there reads as a bug in the app rather than as
+        // a dead link.
+        //
+        // A stored PICTURE never reaches this, because `icon_plan` either
+        // turned it into a texture and returned, or found it undecodable and
+        // answered `Automatic` with no URL -- so `chosen` is `None` and this
+        // arm is the ordinary one. Nothing that was picked off disk is ever
+        // the cause of a request.
+        //
         // Where this icon comes from -- the icon service, the site itself, or
         // the site with the service behind it -- is decided in one place,
         // `favicon::icon_source_for`, rather than here. This thread does not
@@ -11673,27 +12015,30 @@ fn ensure_icon_loaded(
         // fallback lives inside `favicon::fetch_icon_for`, not here: a loader
         // that re-asked `icon_source_for` after a miss would have to know
         // which hosts are allowed a second ask, which is the same rule again.
-        let source =
-            crate::favicon::icon_source_for(&domain, server_url.as_deref(), direct, freshness);
-        let pixels = crate::favicon::fetch_icon_for(&source).and_then(|bytes| {
-            let decoded = crate::favicon::decode_rgba(&bytes);
-            if decoded.is_some() {
-                crate::favicon::write_cached_icon(&cache_dir, &domain, &bytes);
-            } else {
-                log::debug!(
-                    "icon: the {} bytes fetched for {domain} did not decode, so nothing was \
-                     cached",
-                    bytes.len()
-                );
-            }
-            decoded
+        let pixels = chosen.or_else(|| {
+            let domain = domain?;
+            let source =
+                crate::favicon::icon_source_for(&domain, server_url.as_deref(), direct, freshness);
+            crate::favicon::fetch_icon_for(&source).and_then(|bytes| {
+                let decoded = crate::favicon::decode_rgba(&bytes);
+                if decoded.is_some() {
+                    crate::favicon::write_cached_icon(&cache_dir, &domain, &bytes);
+                } else {
+                    log::debug!(
+                        "icon: the {} bytes fetched for {domain} did not decode, so nothing was \
+                         cached",
+                        bytes.len()
+                    );
+                }
+                decoded
+            })
         });
         if pixels.is_none() {
             // `warn`, not `debug`: this is the state the user is looking at
             // -- an item wearing a monogram when they expected a picture --
             // and the lines above it in the log say which candidate failed
             // and how.
-            log::warn!("icon: nothing usable came back for {domain}; the item keeps its monogram");
+            log::warn!("icon: nothing usable came back for item {item_id}; it keeps its monogram");
         }
         let _ = tx.send(FaviconResult { item_id, pixels });
     });
@@ -11738,12 +12083,47 @@ fn ensure_icon_loaded(
 /// menu (the entry is absent for such an item; see
 /// `item_list::menu_entries`) and is handled rather than asserted because
 /// this is one `match` arm away from every other item in the vault.
+///
+/// # A chosen icon changes what "refresh" has to forget
+///
+/// **A chosen URL: caches 2 and 3, and NOT cache 1.** There is no on-disk
+/// file to delete -- `ensure_icon_loaded` never writes one for a chosen URL
+/// (see `icon_plan`) -- and the file that IS on disk under this item's
+/// authority belongs to the item's *automatic* icon, which is shared with
+/// every other item on that domain and is not what the user is refreshing.
+/// Deleting it would make one row's menu click cost every other row on that
+/// domain a re-fetch, silently. The proxy's own cache is not in this path at
+/// all, so `IconCache::refreshing` is left unmarked too: there is nobody to
+/// ask for a fresh copy but the address itself, and it is asked afresh by
+/// construction.
+///
+/// **A chosen PICTURE: nothing at all, and `None`.** The entry is absent from
+/// the menu for such an item -- `item_list::icon_entries` decides that, and
+/// records why -- so this is unreachable from the UI. It is handled rather
+/// than asserted for the reason the no-domain arm is: this function sits one
+/// `match` arm away from every item in the vault, and a panic here would be a
+/// window that dies on a menu click. Forgetting the caches would be wrong as
+/// well as pointless: the texture would be dropped and rebuilt from the very
+/// same field bytes, one frame later, to no visible effect.
 fn refresh_item_icon(
     item: &VaultItem,
     icon_cache_dir: &std::path::Path,
     favicon_requested: &mut std::collections::HashSet<String>,
     icons: &mut IconCache,
 ) -> Option<String> {
+    if let Some(choice) = crate::item_icon::chosen_icon(item) {
+        let url = choice.url()?;
+        icons.textures.remove(&item.id);
+        favicon_requested.remove(&item.id);
+        // The item, not the address: a chosen URL is a value out of the
+        // user's vault, and an `info` line is the one level that reaches an
+        // ordinary log file.
+        log::info!(
+            "icon: item {}'s chosen icon URL will be fetched again on the next frame",
+            item.id
+        );
+        return Some(url.to_string());
+    }
     // `icon_authority_for`, not `icon_domain_for`, for the reason
     // `ensure_icon_loaded` states: the disk cache is keyed on the authority,
     // so a login on `http://192.168.68.95:8080/` has its file named for the
@@ -11755,6 +12135,46 @@ fn refresh_item_icon(
     icons.refreshing.insert(item.id.clone());
     log::info!("icon: {domain} was forgotten on request; it will be fetched again");
     Some(domain)
+}
+
+/// **What a successful icon write has to do besides landing in the vault.**
+///
+/// Shared by all three writers -- the file route, the URL route and "Use the
+/// automatic icon" -- because they differ only in what they put in the field
+/// and not at all in what has to happen afterwards, and three copies of this
+/// is three chances for one of them to leave the old picture on screen.
+///
+/// Two things, and the second is the one that is easy to forget:
+///
+/// 1. **The window's own list takes the SERVER's copy**, `saved`, not the
+///    value that was sent. The value sent carries a `revisionDate` this write
+///    has already superseded, so the next write of that item would be refused
+///    with a 400 -- see `vault_bridge`'s `REVISION_DATE_KEY`, and
+///    `VaultCache::update_item`'s doc, which is where this rule is written
+///    down.
+/// 2. **The two in-memory icon caches are dropped for this id.**
+///    `ensure_icon_loaded` returns on its very first line when either the
+///    texture or the "already asked" mark is present, so a write that left
+///    them in place would save the choice to the vault and leave the row
+///    wearing the old picture until the window was closed and reopened --
+///    which is exactly the failure `refresh_item_icon` exists to describe.
+///
+/// **The on-disk cache is deliberately NOT touched.** It holds the item's
+/// *automatic* icon, keyed by the authority it shares with every other item
+/// on that domain. Choosing a picture for one row does not make that file
+/// stale -- and clearing a choice needs it more than ever, since it is what
+/// the row is about to fall back to.
+fn apply_icon_write(
+    saved: &VaultItem,
+    items: &mut [VaultItem],
+    favicon_requested: &mut std::collections::HashSet<String>,
+    icons: &mut IconCache,
+) {
+    if let Some(at) = items.iter().position(|i| i.id == saved.id) {
+        items[at] = saved.clone();
+    }
+    icons.textures.remove(&saved.id);
+    favicon_requested.remove(&saved.id);
 }
 
 /// True when `pending` is currently armed for `id` as of `now` -- i.e. a
@@ -22790,6 +23210,666 @@ mod account_details_tests {
         asked.expect("the mock was never asked, so no URL was captured")
     }
 
+    // ---- The owner's own chosen icon -------------------------------------
+    //
+    // The menu half is `item_list`'s: which of the three icon entries appear
+    // for which item. These are the other half -- what a stored choice does
+    // to the loader, what a refresh does to each kind of choice, and what
+    // happens when a choice cannot be turned into a picture.
+
+    /// An item id nothing else in these tests uses, so a texture keyed on it
+    /// can only have come from the call under test.
+    const CHOSEN_ID: &str = "chosen-1";
+
+    /// A login on a PUBLIC host with no chosen icon -- the automatic case
+    /// every test below compares against.
+    fn choosable_login() -> VaultItem {
+        routing_item(&format!(
+            r#"{{"id":"{CHOSEN_ID}","name":"Chase","type":1,
+                 "login":{{"uris":[{{"uri":"https://chase.com/login"}}]}}}}"#
+        ))
+    }
+
+    /// `item` with `choice` written onto its `deskwarden:icon` field --
+    /// **through the production writer**, and then round-tripped through
+    /// JSON.
+    ///
+    /// The round trip is the point and not decoration: it is what a sync is.
+    /// `bw serve` answers a write with the server's own copy of the item, so
+    /// the value every reader in this app actually sees has been serialized
+    /// by `VaultItem`'s `Serialize`, sent, stored, and parsed back by its
+    /// `Deserialize`. A test that read back the in-memory value it had just
+    /// built would prove nothing about the base64 surviving that, and base64
+    /// is exactly the sort of thing a JSON layer can mangle.
+    fn with_chosen_icon(item: &VaultItem, choice: &crate::item_icon::IconChoice) -> VaultItem {
+        let written = crate::vault_bridge::with_custom_field(
+            item,
+            crate::item_icon::ICON_FIELD_NAME,
+            &choice.to_field_value(),
+        );
+        let wire = serde_json::to_string(&written).expect("an item serializes");
+        serde_json::from_str(&wire).expect("and comes back")
+    }
+
+    /// The stored-picture choice these tests use, built the way a pick is:
+    /// real PNG bytes through the real `choice_from_image_bytes`.
+    fn picture_choice() -> crate::item_icon::IconChoice {
+        crate::item_icon::choice_from_image_bytes(&tiny_png()).expect("the fixture PNG is one")
+    }
+
+    /// One `ensure_icon_loaded` call against `dir`, with `server_url` for the
+    /// proxy, reporting whether a texture landed.
+    ///
+    /// The real loader, not a copy of its shape -- every test below drives
+    /// this so that "the chosen icon wins" is measured against the same
+    /// function production calls sixty times a second.
+    fn load_once(
+        item: &VaultItem,
+        dir: &std::path::Path,
+        server_url: &Option<String>,
+        icons: &mut IconCache,
+        requested: &mut std::collections::HashSet<String>,
+        tx: &mpsc::Sender<FaviconResult>,
+    ) -> bool {
+        let ctx = egui::Context::default();
+        ensure_icon_loaded(
+            &ctx,
+            item,
+            dir,
+            &IconFetch { enabled: true, direct: false, server_url },
+            tx,
+            requested,
+            icons,
+        );
+        icons.textures.contains_key(&item.id)
+    }
+
+    /// **A chosen picture beats every network path, and beats the disk cache
+    /// too.**
+    ///
+    /// The three things that could have supplied this item's icon are all
+    /// present and all wrong: a populated on-disk cache for `chase.com`, a
+    /// live icon service that would answer, and a URI that routes to it. The
+    /// item still wears its own bytes, and the mock is never asked -- which
+    /// is asserted from the mock's own hit count, not from the absence of a
+    /// texture.
+    ///
+    /// The live control is the SAME everything with the chosen icon removed:
+    /// without it, a fixture that had quietly stopped routing anywhere would
+    /// satisfy "the proxy was not asked" for reasons that have nothing to do
+    /// with the choice.
+    #[test]
+    fn a_chosen_picture_beats_the_disk_cache_and_the_icon_service() {
+        let mut server = crate::test_http::server();
+        let port = server.socket_address().port();
+        let proxy = server
+            .mock("GET", "/icons/chase.com/icon.png")
+            .match_query(crate::test_http::Matcher::Any)
+            .with_status(200)
+            .with_body(tiny_png())
+            // Zero, and stated: the default is one, so a mock left at the
+            // default would pass this test by being asked.
+            .expect(0)
+            .create();
+        let server_url = Some(format!("http://127.0.0.1:{port}"));
+
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-chosen-beats-all");
+        crate::favicon::write_cached_icon(&dir, "chase.com", &tiny_png());
+        let (tx, rx) = mpsc::channel::<FaviconResult>();
+
+        let chosen = with_chosen_icon(&choosable_login(), &picture_choice());
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        assert!(
+            load_once(&chosen, &dir, &server_url, &mut icons, &mut requested, &tx),
+            "an item carrying its own picture ended up with no texture at all"
+        );
+        assert!(
+            requested.is_empty(),
+            "the item was marked as having had a request dispatched for it, but a stored \
+             picture is decoded in the frame and asks nobody"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a background fetch reported back, so a thread was spawned for an item whose \
+             picture was already in hand"
+        );
+        assert!(
+            cached_icon_files(&dir) == 1,
+            "the stored picture was written into the domain-keyed disk cache, where it would \
+             become every other item on chase.com's icon"
+        );
+
+        // THE LIVE CONTROL. The same item, the same directory, the same
+        // server -- with the choice taken off. It must reach the disk cache,
+        // which proves the routing this test claims to be short-circuiting is
+        // really there.
+        let plain = choosable_login();
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        assert!(
+            load_once(&plain, &dir, &server_url, &mut icons, &mut requested, &tx),
+            "the live control failed: this item reaches no icon path even with no choice on \
+             it, so the assertions above are about a fixture that routes nowhere"
+        );
+        // The proxy is asked ZERO times across both halves: the first was
+        // short-circuited by the choice and the second by the disk cache.
+        // That is the strongest statement available here -- and the disk hit
+        // above is what keeps the control honest.
+        proxy.assert();
+    }
+
+    /// **The round trip, end to end: pick, write, sync, read back, render.**
+    ///
+    /// `with_chosen_icon` is the write and the sync (see its doc); this is
+    /// the read and the render, through the real loader, with the network
+    /// unreachable and the disk cache empty. A texture here can have come
+    /// from nowhere but the field.
+    #[test]
+    fn a_picked_picture_survives_the_write_the_sync_and_the_read_back() {
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-chosen-round-trip");
+        let (tx, _rx) = mpsc::channel::<FaviconResult>();
+        let item = with_chosen_icon(&choosable_login(), &picture_choice());
+
+        // The field really is on the item as a Bitwarden custom field, under
+        // the one name, and it is the only one: a round trip that had lost or
+        // duplicated it would still render if the loader read the first match.
+        assert_eq!(
+            item.fields
+                .iter()
+                .filter(|f| f.name.as_deref() == Some(crate::item_icon::ICON_FIELD_NAME))
+                .count(),
+            1
+        );
+        assert!(crate::item_icon::has_icon_field(&item));
+
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        assert!(
+            load_once(&item, &dir, &None, &mut icons, &mut requested, &tx),
+            "the picture did not survive the write, the wire and the read back"
+        );
+        assert_eq!(
+            cached_icon_files(&dir),
+            0,
+            "rendering a stored picture touched the on-disk icon cache"
+        );
+    }
+
+    /// **A kind with no automatic icon at all gets its picture too.**
+    ///
+    /// A secure note has no site, so `favicon::icon_authority_for` answers
+    /// `None` for it forever -- and the loader used to return on exactly that
+    /// line. This is the arm that would silently do nothing if the chosen-icon
+    /// check had been placed after the domain question rather than before it.
+    #[test]
+    fn a_secure_note_can_be_given_a_picture_even_though_it_has_no_domain() {
+        let note = routing_item(r#"{"id":"n1","name":"Recovery codes","type":2}"#);
+        assert!(
+            crate::favicon::icon_authority_for(&note).is_none(),
+            "the fixture has an icon authority, so it is not the case this test is about"
+        );
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-chosen-note");
+        let (tx, _rx) = mpsc::channel::<FaviconResult>();
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        assert!(
+            load_once(
+                &with_chosen_icon(&note, &picture_choice()),
+                &dir,
+                &None,
+                &mut icons,
+                &mut requested,
+                &tx
+            ),
+            "a secure note with a chosen picture got no texture, so the choice is consulted \
+             after the domain question rather than before it"
+        );
+    }
+
+    /// **The privacy pill does not take a stored picture away.**
+    ///
+    /// `fetch_icons` off means this app discloses no host. A picture in the
+    /// cipher discloses nothing to anybody, so suppressing it would be a
+    /// privacy setting destroying something that costs no privacy. The
+    /// control is the same item with no choice, which must NOT get a texture
+    /// with the pill off -- otherwise this is measuring a setting that has
+    /// stopped working at all.
+    #[test]
+    fn icon_fetching_off_still_shows_a_picture_that_is_already_on_the_item() {
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-chosen-pill-off");
+        crate::favicon::write_cached_icon(&dir, "chase.com", &tiny_png());
+        let (tx, _rx) = mpsc::channel::<FaviconResult>();
+        let ctx = egui::Context::default();
+        let off = IconFetch { enabled: false, direct: false, server_url: &None };
+
+        let chosen = with_chosen_icon(&choosable_login(), &picture_choice());
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        ensure_icon_loaded(&ctx, &chosen, &dir, &off, &tx, &mut requested, &mut icons);
+        assert!(
+            icons.textures.contains_key(&chosen.id),
+            "the icon-fetching pill hid a picture stored on the item itself, which no request \
+             would ever have been made for"
+        );
+
+        let plain = choosable_login();
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        ensure_icon_loaded(&ctx, &plain, &dir, &off, &tx, &mut requested, &mut icons);
+        assert!(
+            !icons.textures.contains_key(&plain.id),
+            "the live control failed: with the pill off an ordinary item still picked its icon \
+             up off disk, so the assertion above says nothing about the pill"
+        );
+    }
+
+    /// **A chosen URL is fetched at the address the user gave, and the icon
+    /// service is not asked at all.**
+    ///
+    /// Both mocks are on the same test server and both would answer with a
+    /// valid PNG, so the item gets a picture either way -- what is measured
+    /// is WHICH one was asked. `expect(0)` on the proxy is the half that
+    /// matters: "no proxy, no third party" is a statement about requests, and
+    /// only a hit count can make it.
+    #[test]
+    fn a_chosen_url_is_the_only_thing_asked_for() {
+        let mut server = crate::test_http::server();
+        let port = server.socket_address().port();
+        let chosen_mock = server
+            .mock("GET", "/brand/logo.png")
+            .with_status(200)
+            .with_body(tiny_png())
+            .expect(1)
+            .create();
+        let proxy = server
+            .mock("GET", "/icons/chase.com/icon.png")
+            .match_query(crate::test_http::Matcher::Any)
+            .with_status(200)
+            .with_body(tiny_png())
+            .expect(0)
+            .create();
+
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-chosen-url");
+        let (tx, rx) = mpsc::channel::<FaviconResult>();
+        // A dotted host, because `favicon::authority_from_uri` refuses a bare
+        // `localhost` and `choice_from_url` is deliberately held to the same
+        // rule. `127.0.0.1` is private, which is what the loader would route
+        // directly anyway -- and is beside the point here, since a chosen URL
+        // is not routed at all.
+        let url = format!("http://127.0.0.1:{port}/brand/logo.png");
+        let item = with_chosen_icon(
+            &choosable_login(),
+            &crate::item_icon::choice_from_url(&url).expect("a good URL"),
+        );
+
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        let loaded = load_once(
+            &item,
+            &dir,
+            &Some(format!("http://127.0.0.1:{port}")),
+            &mut icons,
+            &mut requested,
+            &tx,
+        );
+        assert!(!loaded, "a chosen URL was resolved without a request, which cannot be");
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the loader spawned no fetch for the chosen URL, or it never answered");
+        assert!(
+            answer.pixels.is_some(),
+            "the chosen URL answered with a PNG and nothing usable came back"
+        );
+        chosen_mock.assert();
+        proxy.assert();
+        assert_eq!(
+            cached_icon_files(&dir),
+            0,
+            "a chosen URL's bytes were written into the domain-keyed disk cache, where they \
+             would become every other item on chase.com's icon"
+        );
+    }
+
+    /// **A chosen URL that does not answer leaves the item on the icon it
+    /// would have had.**
+    ///
+    /// The user's own rule: no failure may leave an item with neither icon.
+    /// The chosen address 404s, the icon service answers, and one picture
+    /// comes back -- from the service, on the same background job, with no
+    /// second frame needed.
+    #[test]
+    fn a_chosen_url_that_404s_falls_back_to_the_automatic_icon() {
+        let mut server = crate::test_http::server();
+        let port = server.socket_address().port();
+        let dead = server.mock("GET", "/gone.png").with_status(404).expect(1).create();
+        let proxy = server
+            .mock("GET", "/icons/chase.com/icon.png")
+            .match_query(crate::test_http::Matcher::Any)
+            .with_status(200)
+            .with_body(tiny_png())
+            .expect(1)
+            .create();
+
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-chosen-url-404");
+        let (tx, rx) = mpsc::channel::<FaviconResult>();
+        let item = with_chosen_icon(
+            &choosable_login(),
+            &crate::item_icon::choice_from_url(&format!("http://127.0.0.1:{port}/gone.png"))
+                .expect("a good URL"),
+        );
+
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        load_once(
+            &item,
+            &dir,
+            &Some(format!("http://127.0.0.1:{port}")),
+            &mut icons,
+            &mut requested,
+            &tx,
+        );
+        let answer = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the loader never answered");
+        assert!(
+            answer.pixels.is_some(),
+            "the chosen URL 404'd and the item was left with nothing, so a dead link costs the \
+             user the icon they had before they set it"
+        );
+        dead.assert();
+        proxy.assert();
+    }
+
+    /// **A stored picture whose bytes are corrupt falls back too, and the
+    /// field is not touched.**
+    ///
+    /// Reaching this needs an edit made in another client -- this app only
+    /// ever writes bytes it has just decoded -- so the arm is unreachable by
+    /// use and very much reachable by hand. It must not blank the row and it
+    /// must not "repair" the field.
+    #[test]
+    fn a_corrupt_stored_picture_falls_back_and_is_left_alone() {
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-chosen-corrupt");
+        crate::favicon::write_cached_icon(&dir, "chase.com", &tiny_png());
+        let (tx, _rx) = mpsc::channel::<FaviconResult>();
+        let item = with_chosen_icon(
+            &choosable_login(),
+            // Valid base64 of something that is not a PNG: the field parses,
+            // the payload does not decode. A value that failed to parse would
+            // be a different arm (`chosen_icon` answers `None` for it) and
+            // would not exercise this one.
+            &crate::item_icon::IconChoice::Png { png: {
+                let mut b64 = String::new();
+                crate::record::seal::base64_into(&mut b64, b"not a picture");
+                b64
+            } },
+        );
+        assert!(crate::item_icon::chosen_icon(&item).is_some(), "the field no longer parses");
+
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        assert!(
+            load_once(&item, &dir, &None, &mut icons, &mut requested, &tx),
+            "an item whose stored picture is corrupt got no icon at all, when the automatic \
+             one was sitting in the disk cache"
+        );
+        assert!(
+            crate::item_icon::has_icon_field(&item),
+            "rendering removed the field, which is this app repairing a user's data on a guess"
+        );
+    }
+
+    /// **An oversized file is refused, and a refusal writes nothing.**
+    ///
+    /// Both halves against real files on disk, through the real
+    /// `read_icon_file`, because the size is read off the directory entry
+    /// before the bytes are taken in and a test over a `Vec<u8>` would skip
+    /// that step entirely.
+    #[test]
+    fn an_oversized_or_undecodable_file_is_refused_and_the_old_icon_stays() {
+        use crate::item_icon::{IconRefusal, MAX_PICKED_ICON_BYTES};
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-chosen-refusals");
+
+        let huge = dir.join("huge.png");
+        std::fs::write(&huge, vec![0u8; MAX_PICKED_ICON_BYTES + 1]).expect("write the fixture");
+        assert_eq!(crate::item_icon::read_icon_file(&huge), Err(IconRefusal::TooLarge));
+
+        let junk = dir.join("junk.png");
+        std::fs::write(&junk, b"PNG? no.").expect("write the fixture");
+        assert_eq!(crate::item_icon::read_icon_file(&junk), Err(IconRefusal::NotAnImage));
+
+        let missing = dir.join("no-such-file.png");
+        assert_eq!(crate::item_icon::read_icon_file(&missing), Err(IconRefusal::Unreadable));
+
+        // The live control: a real picture in the same directory IS accepted,
+        // so the three refusals above are about those three files rather than
+        // about a reader that refuses everything.
+        let good = dir.join("good.png");
+        std::fs::write(&good, tiny_png()).expect("write the fixture");
+        assert!(crate::item_icon::read_icon_file(&good).is_ok());
+
+        // And the half that matters most: the item the pick was for still
+        // wears the picture it had. Nothing about a refusal reaches the item,
+        // which is a property of the handler's shape -- pinned below by
+        // `a_refused_pick_never_reaches_the_vault_write`.
+        let dir2 = crate::test_scratch::ScratchDir::new("test-icon-chosen-refusal-intact");
+        let (tx, _rx) = mpsc::channel::<FaviconResult>();
+        let item = with_chosen_icon(&choosable_login(), &picture_choice());
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        assert!(
+            load_once(&item, &dir2, &None, &mut icons, &mut requested, &tx),
+            "the item lost the picture it already had"
+        );
+    }
+
+    /// **Refresh re-asks a chosen URL, and touches nothing it should not.**
+    ///
+    /// The two in-memory caches go, because `ensure_icon_loaded` returns on
+    /// its first line while either holds the id. The two that stay are the
+    /// interesting half: the on-disk file belongs to the item's AUTOMATIC
+    /// icon and is shared with every other item on that domain, and
+    /// `IconCache::refreshing` is a message to the icon proxy, which is not
+    /// in this path at all.
+    #[test]
+    fn refreshing_a_url_backed_icon_drops_the_texture_and_nothing_else() {
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-chosen-refresh-url");
+        crate::favicon::write_cached_icon(&dir, "chase.com", &tiny_png());
+        let url = "https://cdn.example.com/logo.png";
+        let item = with_chosen_icon(
+            &choosable_login(),
+            &crate::item_icon::choice_from_url(url).expect("a good URL"),
+        );
+
+        let mut icons = IconCache::default();
+        icons.textures.insert(item.id.clone(), a_texture());
+        let mut requested: std::collections::HashSet<String> =
+            std::iter::once(item.id.clone()).collect();
+
+        assert_eq!(
+            refresh_item_icon(&item, &dir, &mut requested, &mut icons),
+            Some(url.to_string()),
+            "the refresh did not report the address it is about to re-ask"
+        );
+        assert!(!icons.textures.contains_key(&item.id), "the loaded texture survived");
+        assert!(!requested.contains(&item.id), "the session's \"already asked\" mark survived");
+        assert_eq!(
+            cached_icon_files(&dir),
+            1,
+            "refreshing one row's chosen URL deleted the shared on-disk icon for chase.com, so \
+             every other item on that domain silently pays for a re-fetch"
+        );
+        assert!(
+            icons.refreshing.is_empty(),
+            "the item was marked for a cache-bypassing PROXY request, and no proxy is in this \
+             path at all"
+        );
+    }
+
+    /// **Refresh does nothing for a stored picture, and says so.**
+    ///
+    /// The menu does not offer the entry for such an item -- that is
+    /// `item_list::icon_entries`' decision -- so this arm is unreachable from
+    /// the UI and is handled rather than asserted, for the reason the
+    /// no-domain arm is. What it must not do is drop the texture: it would be
+    /// rebuilt from the very same field bytes one frame later, to no visible
+    /// effect, at the cost of a decode.
+    #[test]
+    fn refreshing_a_file_backed_icon_does_nothing_at_all() {
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-chosen-refresh-file");
+        crate::favicon::write_cached_icon(&dir, "chase.com", &tiny_png());
+        let item = with_chosen_icon(&choosable_login(), &picture_choice());
+
+        let mut icons = IconCache::default();
+        icons.textures.insert(item.id.clone(), a_texture());
+        let mut requested: std::collections::HashSet<String> =
+            std::iter::once(item.id.clone()).collect();
+
+        assert_eq!(
+            refresh_item_icon(&item, &dir, &mut requested, &mut icons),
+            None,
+            "a stored picture reported something to refresh"
+        );
+        assert!(icons.textures.contains_key(&item.id), "the texture was dropped for nothing");
+        assert!(requested.contains(&item.id), "the session mark was dropped for nothing");
+        assert_eq!(cached_icon_files(&dir), 1, "the shared on-disk icon was deleted for nothing");
+        assert!(icons.refreshing.is_empty());
+
+        // The live control: the SAME function on the SAME item with the
+        // choice taken off does all four of those things, so the four
+        // assertions above are about the choice and not about a function that
+        // has stopped working.
+        let plain = choosable_login();
+        let mut icons = IconCache::default();
+        icons.textures.insert(plain.id.clone(), a_texture());
+        let mut requested: std::collections::HashSet<String> =
+            std::iter::once(plain.id.clone()).collect();
+        assert_eq!(
+            refresh_item_icon(&plain, &dir, &mut requested, &mut icons),
+            Some("chase.com".to_string())
+        );
+        assert!(!icons.textures.contains_key(&plain.id));
+        assert!(!requested.contains(&plain.id));
+        assert_eq!(cached_icon_files(&dir), 0);
+        assert!(icons.refreshing.contains(&plain.id));
+    }
+
+    /// **Clearing the choice puts the automatic icon back.**
+    ///
+    /// The clear is the production one -- `with_custom_field` with `""`,
+    /// which REMOVES the field rather than blanking it -- and it is
+    /// round-tripped through JSON like every other write here. The item then
+    /// loads its site's icon out of the disk cache, which is the automatic
+    /// path and nothing else.
+    #[test]
+    fn clearing_the_choice_restores_the_automatic_icon() {
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-chosen-clear");
+        crate::favicon::write_cached_icon(&dir, "chase.com", &tiny_png());
+        let (tx, rx) = mpsc::channel::<FaviconResult>();
+
+        let chosen = with_chosen_icon(&choosable_login(), &picture_choice());
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        assert!(
+            load_once(&chosen, &dir, &None, &mut icons, &mut requested, &tx),
+            "the fixture never had a chosen icon, so clearing one below proves nothing"
+        );
+        assert!(
+            requested.is_empty(),
+            "the chosen picture went through the requesting path, so the state cleared below \
+             is not the state this test is about"
+        );
+
+        let cleared_json = serde_json::to_string(&crate::vault_bridge::with_custom_field(
+            &chosen,
+            crate::item_icon::ICON_FIELD_NAME,
+            "",
+        ))
+        .expect("an item serializes");
+        let cleared: VaultItem = serde_json::from_str(&cleared_json).expect("and comes back");
+        assert!(
+            !crate::item_icon::has_icon_field(&cleared),
+            "the field was blanked rather than removed, so the item still claims a chosen icon"
+        );
+
+        // The caches the handler drops on a successful write. Without this
+        // the loader returns on its first line and the assertion below would
+        // be reading the OLD texture.
+        let mut icons = IconCache::default();
+        let mut requested = std::collections::HashSet::new();
+        assert!(
+            load_once(&cleared, &dir, &None, &mut icons, &mut requested, &tx),
+            "a cleared item got no icon at all, when its site's icon was in the disk cache"
+        );
+        assert!(
+            requested.contains(&cleared.id),
+            "the cleared item did not go through the ordinary requesting path, so what it is \
+             wearing did not come from the automatic one"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the disk cache did not answer for the cleared item, so a fetch was started"
+        );
+    }
+
+    /// A 1x1 texture to stand in for one the loader made. Its content is
+    /// irrelevant: every assertion about it is presence or absence.
+    fn a_texture() -> egui::TextureHandle {
+        egui::Context::default().load_texture(
+            "icon-test",
+            egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]),
+            egui::TextureOptions::default(),
+        )
+    }
+
+    /// **A refused pick never reaches the vault write.**
+    ///
+    /// The behavioural half is above; this is the shape that makes it true.
+    /// The icon picker's block writes in exactly one place, and that place is
+    /// inside the arm that has a `Ok(choice)` AND an item to put it on --
+    /// so a refusal, or an item that has gone away, cannot fall into it. A
+    /// source pin because the alternative is driving a whole vault-backed
+    /// frame through a modal, and what would break here is the SHAPE.
+    #[test]
+    fn a_refused_pick_never_reaches_the_vault_write() {
+        let source = production();
+        // Bounded at both ends by anchors that are elsewhere in the frame,
+        // rather than by a closing brace at some indentation: the block ends
+        // in four nested ones, and a brace-counting split was measured
+        // running past it into the rest of the closure -- which made this
+        // read a `cache.update_item` belonging to a different feature and
+        // report it as a second write here.
+        let block = source
+            .split("if let Some(state) = &mut icon_pick {")
+            .nth(1)
+            .expect("the icon picker's block is no longer in the frame")
+            .split("THE ONE GATING POSITION for the record composer")
+            .next()
+            .expect("the block that follows the icon picker is no longer the record composer's");
+        assert_eq!(
+            block.matches("cache.update_item(").count(),
+            1,
+            "the icon picker writes to the vault in more than one place, so one of them is not \
+             covered by the `Ok` arm below"
+        );
+        let arm = block
+            .find("(Ok(choice), Some(item)) => {")
+            .expect("the write arm is no longer matched on `Ok` and a live item");
+        let write = block.find("cache.update_item(").expect("the write is there");
+        assert!(
+            arm < write,
+            "the vault write sits OUTSIDE the `(Ok(choice), Some(item))` arm, so a refused \
+             pick writes to the item"
+        );
+        // And the refusal arm really is there and really only sets the
+        // sentence -- otherwise the ordering above would be an accident.
+        assert!(
+            block.contains("(Err(sentence), _) => state.error = Some(sentence),"),
+            "the refusal arm is no longer a single assignment to the modal's error"
+        );
+    }
+
     fn routing_item(json: &str) -> VaultItem {
         serde_json::from_str(json).expect("fixture item parses")
     }
@@ -24048,6 +25128,12 @@ mod preferences_modal_wiring_tests {
         let at = source().find(draws).expect("the draw call is there");
         for (later, what) in [
             (concat!("draw_folder_edit_", "modal(ui.ctx()"), "the folder editor"),
+            // Added with "Select icon...". Its scrim is on the same
+            // `Foreground` layer as the two beside it, so it belongs on this
+            // list for the identical reason: a modal drawn AFTER the
+            // preferences panel puts its scrim over the panel, and the gear
+            // the user just pressed stops working.
+            (concat!("draw_icon_", "modal(ui.ctx()"), "the icon picker"),
             (concat!("draw_launch_confirm_", "modal(ui.ctx()"), "the launch confirmation"),
         ] {
             let other = source().find(later).expect("that modal is drawn too");

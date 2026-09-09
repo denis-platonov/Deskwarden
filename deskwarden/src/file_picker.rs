@@ -23,22 +23,35 @@
 //! [`crate::app_match::AppMatch::launchable_path`]'s job for the open dialog
 //! and [`crate::vault_export::plan_export`]'s job for the save one.
 //!
-//! # Three siblings, not one parameterised dialog
+//! # Four siblings, not one parameterised dialog
 //!
-//! [`pick_executable`], [`pick_qr_image`] and [`pick_export_destination`] are
-//! separate functions on purpose. Two are `IFileOpenDialog` and one is
-//! `IFileSaveDialog`, they answer different types, and every visible setting
-//! -- title, filters, default extension, suggested name, options -- differs.
-//! A single function taking six arguments to serve three callers would be the
-//! parameterisation that only reads well from one end of it. What they *do*
-//! share is factored out and shared for real: [`with_com`] owns the apartment
-//! balance for all three, and `chosen_path` owns the one correct way to read a
-//! filesystem path back out of an `IFileDialog`.
+//! [`pick_executable`], [`pick_qr_image`], [`pick_icon_image`] and
+//! [`pick_export_destination`] are separate functions on purpose. Three are
+//! `IFileOpenDialog` and one is `IFileSaveDialog`, they answer different
+//! types, and every visible setting -- title, filters, default extension,
+//! suggested name, options -- differs. A single function taking six arguments
+//! to serve four callers would be the parameterisation that only reads well
+//! from one end of it. What they *do* share is factored out and shared for
+//! real: [`with_com`] owns the apartment balance for all four, `chosen_path`
+//! owns the one correct way to read a filesystem path back out of an
+//! `IFileDialog`, and `image_options` owns the one option set both image
+//! dialogs need.
 //!
 //! **[`pick_qr_image`] is a third sibling and not a second picker.** Design
 //! 6a's image route needs an open dialog; it gets this module's, through this
 //! module's `with_com` and this module's `chosen_path`, rather than a
 //! second COM apartment balance written next to a form.
+//!
+//! **[`pick_icon_image`] is a fourth on the same terms, and it differs from
+//! the third in exactly one thing that matters: the formats it offers.** Both
+//! answer "an image off disk", and the temptation is to call `pick_qr_image`
+//! and change the title. The reason not to is that the two are gated by two
+//! different decoders. The QR route hands its pixels to `rqrr` through a
+//! `png`-only path and says so in the dialog; the icon route hands its bytes
+//! to `favicon::decode_rgba`, which reads ICO as well and has to, because a
+//! `.ico` is what half the icons on a Windows disk are. A filter that hid
+//! them would be this dialog lying about what the app can read, which is the
+//! same defect as offering a format it cannot -- just pointing the other way.
 //!
 //! # Blocking
 //!
@@ -209,9 +222,88 @@ fn image_options(current: FILEOPENDIALOGOPTIONS) -> FILEOPENDIALOGOPTIONS {
     current | FOS_FORCEFILESYSTEM
 }
 
+// ---------------------------------------------------------------------------
+// The item-icon dialog
+// ---------------------------------------------------------------------------
+
+/// **The formats `favicon::decode_rgba` can turn into an icon**, as the two
+/// halves of one filter row.
+///
+/// Pinned as a constant for [`IMAGE_EXTENSION`]'s reason: the dialog's filter
+/// below and `vault_window::icon_modal`'s copy -- which tells the user what
+/// to bring *before* they open a dialog -- must say the same thing. A filter
+/// and a sentence that disagree is how a user is told to save a JPEG and then
+/// shown a dialog that will not display it.
+///
+/// **ICO is here and JPEG is not, and both halves of that are the decoder's
+/// doing rather than a preference.** `favicon::decode_rgba_unscaled`
+/// dispatches on the file's own magic and handles a Windows `.ico` container
+/// (PNG-payload and DIB alike) before it tries the PNG decoder; it has no
+/// JPEG arm at all, and giving it one means a new dependency parsing an
+/// untrusted format -- the same decision `pick_qr_image` records and declines
+/// one dialog up.
+pub const ICON_FILTER_NAME: &str = "Icon image (*.png, *.ico)";
+pub const ICON_FILTER_SPEC: &str = "*.png;*.ico";
+
+/// Opens the shell's file-open dialog for **"Select icon..."** and returns the
+/// chosen path, or `None` if the user cancelled or the dialog could not be
+/// created. Cancel and failure are the same answer, for [`pick_executable`]'s
+/// reason.
+///
+/// # Blocking
+///
+/// The same rule as its three siblings: `Show` is modal and pumps its own
+/// message loop, so this is called from the **vault window's action handler**,
+/// after the frame's draw closures have returned, and never from inside one.
+///
+/// # It chooses a path and nothing else
+///
+/// It does not read the file, check its size, or decide whether it is an
+/// image. Those are [`crate::item_icon::read_icon_file`]'s, exactly as
+/// deciding whether a picked program may be launched is
+/// `app_match::launchable_path`'s -- see this module's "What this does NOT
+/// do".
+pub fn pick_icon_image() -> Option<String> {
+    with_com(|| unsafe { show_icon_dialog() })
+}
+
+/// The COM half of [`pick_icon_image`], split out so [`with_com`]'s balance
+/// covers every `?` in it -- `show_dialog`'s reason exactly.
+///
+/// # Safety
+///
+/// The calling thread must have COM initialised.
+unsafe fn show_icon_dialog() -> Option<String> {
+    let dialog: IFileOpenDialog =
+        CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+
+    // **One filter and no "All files" row**, `show_image_dialog`'s rule: this
+    // app knows exactly what it can decode, so a row that let the user settle
+    // on a `.jpg` would turn a missing decoder into a refusal they read as a
+    // bug. The one row names both formats because the one decoder reads both.
+    let filters = [COMDLG_FILTERSPEC {
+        pszName: w!("Icon image (*.png, *.ico)"),
+        pszSpec: w!("*.png;*.ico"),
+    }];
+    let _ = dialog.SetFileTypes(&filters);
+    let _ = dialog.SetFileTypeIndex(1); // 1-based, not 0-based.
+    let _ = dialog.SetTitle(w!("Choose the picture for this item"));
+
+    // The SAME option set the QR dialog uses, from the same function: the
+    // answer is about to be handed to `std::fs::read`, which is the whole of
+    // `image_options`' argument and is no less true here. Read-modify-write,
+    // because `SetOptions` replaces the set rather than adding to it.
+    if let Ok(current) = dialog.GetOptions() {
+        let _ = dialog.SetOptions(image_options(current));
+    }
+
+    dialog.Show(HWND::default()).ok()?;
+    chosen_path(&dialog)
+}
+
 /// Reads the answered item back out of a dialog that has already returned from
-/// `Show`. Shared by all three dialogs because the `SIGDN_FILESYSPATH` choice
-/// and the `CoTaskMemFree` below are the same mistake to make three times.
+/// `Show`. Shared by all four dialogs because the `SIGDN_FILESYSPATH` choice
+/// and the `CoTaskMemFree` below are the same mistake to make four times.
 ///
 /// # Safety
 ///
@@ -689,16 +781,51 @@ mod tests {
         assert_eq!(code.matches("CoInitializeEx(").count(), 1);
         assert!(code.contains("    with_com(|| unsafe { show_dialog() })\n"));
         assert!(code.contains("    with_com(|| unsafe { show_image_dialog() })\n"));
+        assert!(code.contains("    with_com(|| unsafe { show_icon_dialog() })\n"));
         assert!(code.contains(
             "    with_com(|| unsafe { show_save_dialog(suggested_name) }).map(PathBuf::from)\n"
         ));
-        // Three dialogs, three `Show` calls, and no fourth entry point that
-        // skipped the balance above.
+        // **Four dialogs, four `Show` calls, and no fifth entry point that
+        // skipped the balance above.** The count was three until "Select
+        // icon..." added `show_icon_dialog`; it is raised rather than relaxed,
+        // because the whole value of this line is that a new dialog cannot
+        // arrive without somebody looking at the apartment balance -- which is
+        // exactly what this edit made happen.
         assert_eq!(
             code.matches("dialog.Show(HWND::default()).ok()?;").count(),
-            3,
+            4,
             "a dialog was added or removed without the apartment balance being re-checked"
         );
+    }
+
+    /// **The icon dialog's filter row and the constants that describe it to
+    /// the user are the same two strings.**
+    ///
+    /// `w!()` takes a literal, so the dialog cannot be built from
+    /// [`ICON_FILTER_NAME`] and [`ICON_FILTER_SPEC`] directly -- which leaves
+    /// exactly the drift those constants exist to prevent: the modal telling
+    /// the user "PNG or ICO" over a dialog that shows one of them. This is the
+    /// pin that makes the two move together.
+    #[test]
+    fn the_icon_dialogs_filter_is_the_one_the_constants_describe() {
+        let code = code_under_test();
+        assert!(
+            code.contains(&format!(r#"pszName: w!("{ICON_FILTER_NAME}")"#)),
+            "the icon dialog's filter NAME is not {ICON_FILTER_NAME:?}"
+        );
+        assert!(
+            code.contains(&format!(r#"pszSpec: w!("{ICON_FILTER_SPEC}")"#)),
+            "the icon dialog's filter SPEC is not {ICON_FILTER_SPEC:?}"
+        );
+        // Both formats, because `favicon::decode_rgba_unscaled` reads both --
+        // and nothing else, because it reads nothing else.
+        assert!(ICON_FILTER_SPEC.contains("*.png") && ICON_FILTER_SPEC.contains("*.ico"));
+        for absent in ["*.jpg", "*.jpeg", "*.svg", "*.*"] {
+            assert!(
+                !ICON_FILTER_SPEC.contains(absent),
+                "the icon filter offers {absent}, which `favicon::decode_rgba` cannot read"
+            );
+        }
     }
 
     /// **The image route reaches the shell through this module's dialog.**
