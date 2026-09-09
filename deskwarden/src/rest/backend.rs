@@ -247,6 +247,60 @@ pub struct RestBackend {
     /// the state guard is already borrowed mutably across the send, and a
     /// reader wanting only the keys would have queued behind every write.
     keys: Mutex<Option<Arc<VaultKeys>>>,
+    /// The last `GET /api/sync` this backend made, with the revision the
+    /// server reported just before it.
+    ///
+    /// # This one IS a vault cache, and the module docs refuse those
+    ///
+    /// The paragraph above says a second cache under
+    /// [`crate::vault_cache::VaultCache`] is how two caches come to disagree
+    /// about a vault. That is true of a cache that decides *for itself* how
+    /// long its copy is good for. This one decides nothing: before it is
+    /// reused, the server is asked what the account's revision is, and the
+    /// copy is used only if the answer is byte-identical to the one recorded
+    /// when it was taken. A cache that re-validates against the authority on
+    /// every read cannot hold an opinion the authority does not.
+    ///
+    /// # What it costs and what it saves
+    ///
+    /// The check is `GET /api/accounts/revision-date` -- one primary-key
+    /// lookup, **one row** on the owner's D1-backed server. The sync it
+    /// avoids was measured at ~1,686 rows, and `synced` had five callers on
+    /// paths that are not "load the vault": listing the Trash, listing the
+    /// Archive, and the two halves of a populate. Opening the Trash row read
+    /// the entire account.
+    ///
+    /// # Why the revision is read BEFORE the sync, not after
+    ///
+    /// The recorded revision must never be *newer* than the vault beside it.
+    /// Read first, a write landing between the two calls leaves the cache
+    /// tagged with the older revision, so the next check sees a difference
+    /// and refetches -- one wasted sync, and correct. Read after, the same
+    /// write would leave a vault that predates its own tag, and the next
+    /// check would call it current forever.
+    ///
+    /// # The write path
+    ///
+    /// An older comment in this file said caching what `synced()` returns is
+    /// the change [`RestBackend::update_item`] must not have, because a write
+    /// quotes the `revisionDate` of the sync it just made. That is still the
+    /// rule and this does not break it: `update_item` and `set_app_match` go
+    /// through [`RestBackend::one_record`], which fetches the record by id and
+    /// never touches this field. Nothing that writes reads this cache.
+    ///
+    /// **An `Arc<DecryptedVault>`**, so a hit hands out a pointer rather than
+    /// copying a vault. The two callers that need to own the folder list clone
+    /// that list alone.
+    synced: Mutex<Option<CachedSync>>,
+}
+
+/// One sync, and the revision the server reported immediately before it.
+struct CachedSync {
+    /// From `GET /api/accounts/revision-date`, compared for equality and
+    /// never interpreted -- see [`crate::rest::api::RestClient::revision_date`].
+    revision: i64,
+    vault: Arc<DecryptedVault>,
+    keys: Arc<VaultKeys>,
 }
 
 /// Hand-written, and it must be: [`Authenticated`] hand-writes its own for
@@ -273,7 +327,12 @@ impl RestBackend {
         // `None`, and it must be: a constructor that pre-warmed the key cache
         // would be a constructor that fetches, which is exactly what
         // `signed_in_with_no_sync_route`'s doc relies on not happening.
-        Self { client, state: Mutex::new(authenticated), keys: Mutex::new(None) }
+        Self {
+            client,
+            state: Mutex::new(authenticated),
+            keys: Mutex::new(None),
+            synced: Mutex::new(None),
+        }
     }
 
     // ---- the two things every method starts with ---------------------------
@@ -344,7 +403,29 @@ impl RestBackend {
     /// dropped on the floor. The log carries **counts and field names only**
     /// -- [`crate::rest::sync::DecryptFailure`] holds nothing else by
     /// construction.
-    fn synced(&self) -> Result<(DecryptedVault, Arc<VaultKeys>), VaultError> {
+    fn synced(&self) -> Result<(Arc<DecryptedVault>, Arc<VaultKeys>), VaultError> {
+        // **The revision FIRST, and with no other lock held.** One row on the
+        // server, against the ~1,686 the sync below costs. Read before the
+        // sync so the recorded revision can never be newer than the vault it
+        // is filed with -- see `CachedSync`.
+        //
+        // A failure here is NOT fatal and is not even reported: the whole
+        // point of this call is to avoid work, so a server that will not
+        // answer it just means the sync happens, exactly as it always did.
+        let revision = {
+            let mut state = self.locked();
+            self.client.revision_date(&mut state.session).ok()
+        };
+        if let Some(revision) = revision {
+            if let Ok(held) = self.synced.lock() {
+                if let Some(cached) = held.as_ref() {
+                    if cached.revision == revision {
+                        return Ok((Arc::clone(&cached.vault), Arc::clone(&cached.keys)));
+                    }
+                }
+            }
+        }
+
         let mut state = self.locked();
         let response = self.client.sync_refreshing(&mut state.session).map_err(rest_error)?;
         let vault = decrypt_vault(&response, &state.master_key).map_err(crypto_error)?;
@@ -362,7 +443,19 @@ impl RestBackend {
             );
         }
         drop(state);
-        Ok((vault, self.remember_keys(keys)))
+        let vault = Arc::new(vault);
+        let keys = self.remember_keys(keys);
+        // Filed under the revision read BEFORE the sync. `None` -- the server
+        // would not answer that question -- stores nothing, so the next call
+        // syncs again rather than reusing a copy it cannot re-validate.
+        if let (Some(revision), Ok(mut held)) = (revision, self.synced.lock()) {
+            *held = Some(CachedSync {
+                revision,
+                vault: Arc::clone(&vault),
+                keys: Arc::clone(&keys),
+            });
+        }
+        Ok((vault, keys))
     }
 
     /// Stores `keys` as the account's current ones and hands back the shared
@@ -574,15 +667,12 @@ impl RestBackend {
             .collect()
     }
 
-    /// The decrypted cipher with this id, or a refusal naming the id as
-    /// missing.
-    ///
-    /// Not found is [`VaultError::Http`] and not [`VaultError::Unsupported`]:
-    /// the operation *is* supported, the server simply has no such record --
-    /// which on `bw serve` arrives as a 404 through the same variant.
-    fn find<'v>(vault: &'v DecryptedVault, id: &str) -> Result<&'v DecryptedItem, VaultError> {
-        vault.items.iter().find(|d| d.item.id == id).ok_or_else(|| no_such_item(id))
-    }
+    // **`find` is gone with its one caller.** It picked a decrypted cipher out
+    // of a whole sync by id, for `get_totp`, which now reads that one record
+    // over `GET /api/ciphers/{id}` instead. The refusal it produced has not
+    // gone anywhere: `one_record` maps the server's 404 to `no_such_item(id)`,
+    // the same sentence naming the same id, so an item that is not there still
+    // says so.
 }
 
 // ---- the trait ---------------------------------------------------------------
@@ -632,7 +722,10 @@ impl VaultBackend for RestBackend {
     /// wants items and folders pays for the vault twice.
     fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
         let (vault, _) = self.synced()?;
-        Ok(vault.folders)
+        // Cloned, because the vault behind this is shared -- see the
+        // `synced` field. A folder list is a handful of names; the alternative
+        // was copying every item beside them on every cache hit.
+        Ok(vault.folders.clone())
     }
 
     /// **Cost: one full sync, for both halves.** This is the method the
@@ -652,7 +745,10 @@ impl VaultBackend for RestBackend {
     /// hides.
     fn list_vault(&self) -> Result<crate::vault_cache::VaultSnapshot, VaultError> {
         let (vault, _) = self.synced()?;
-        Ok(crate::vault_cache::VaultSnapshot { items: Self::live(&vault), folders: vault.folders })
+        Ok(crate::vault_cache::VaultSnapshot {
+            items: Self::live(&vault),
+            folders: vault.folders.clone(),
+        })
     }
 
     /// **Cost: one full sync, then one `PUT`.**
@@ -1055,27 +1151,33 @@ impl VaultBackend for RestBackend {
     /// for a seed [`read_seed`] will not read, which on this backend answers
     /// `Ok(None)` **once** and stops the polling.
     ///
-    /// **The sync stays, and it is now the only per-id read in this file that
-    /// is still a whole vault.** That is a deliberate line rather than an
-    /// omission. What this method wants is the item's *seed*, which
-    /// [`Self::one_record`] would answer for one row -- but the seed is
-    /// plaintext the caller is about to compute a code from, and the fallback
-    /// exists precisely for items whose seed the snapshot could not supply. It
-    /// is reached once per item, answers `Ok(None)` for the malformed case and
-    /// stops the polling, so the cost is bounded by a user's clicks in a way
-    /// an edit's was not.
+    /// **The sync is gone, and this is one row.**
     ///
-    /// The paragraph this replaces said that cheapening it "by caching what
+    /// It was the last per-id read in this file that was still a whole vault,
+    /// and the paragraph here argued for keeping it: the cost was "bounded by
+    /// a user's clicks", since the fallback is reached once per item and then
+    /// stops the polling. The bound was real and the price was not. `wrangler
+    /// d1 insights` put one `GET /api/sync` at ~1,686 rows out of `ciphers` on
+    /// the owner's server, which is what this paid to read a single seed --
+    /// and [`Self::one_record`] answers with the same decrypted item for one.
+    ///
+    /// Nothing else changes. `one_record` maps a 404 to the same sentence
+    /// [`Self::find`] produced for an id the sync did not carry, so an item
+    /// that is gone still says it is gone; the seed is the same plaintext out
+    /// of the same decrypt; and the malformed case still answers `Ok(None)`
+    /// once and stops the poll.
+    ///
+    /// An older paragraph here said that cheapening this "by caching what
     /// `synced()` returns" would be the change [`Self::update_item`] must not
     /// have, because a write quotes the `revisionDate` of the sync it just
-    /// made. That reasoning was about caching the *vault*, and it still holds
-    /// -- but the keys are not the vault. [`Self::keys`] caches only the
-    /// unwrapped keys, and the record an edit quotes is fetched fresh by id
-    /// every time, which is why `update_item` could be made cheap without
-    /// touching the property that comment was protecting.
+    /// made. That reasoning was about caching the *vault*, and it is answered
+    /// where the caching now happens -- see [`Self::synced`], which asks the
+    /// server whether the vault moved before it reuses anything, and
+    /// `update_item`, which has not gone through `synced` since it moved to
+    /// `one_record`.
     fn get_totp(&self, id: &str) -> Result<Option<String>, VaultError> {
-        let (vault, _) = self.synced()?;
-        let item = Self::find(&vault, id)?;
+        let (record, _) = self.one_record(id)?;
+        let item = &record;
         let Some(seed) = item.item.login.as_ref().and_then(|l| l.totp.as_ref()) else {
             return Ok(None);
         };
@@ -1716,7 +1818,7 @@ pub mod tests {
     /// per-id read produces is byte-identical to the record the sync produces
     /// for the same id. A second fixture here would let the two paths drift
     /// apart in exactly the way these tests exist to detect.
-    fn fixture_cipher_for(path: &str) -> String {
+    pub fn fixture_cipher_for(path: &str) -> String {
         let id = path.rsplit('/').next().unwrap_or_default();
         let extra = match id {
             "trash-1" => serde_json::json!({ "deletedDate": "2022-01-01T00:00:00.000000Z" }),
@@ -3233,11 +3335,114 @@ pub mod tests {
         })
         .to_string();
         server.mock("GET", "/api/sync?excludeDomains=true").with_body(body).create();
+        // **The per-id route, because this no longer syncs.** `get_totp` reads
+        // the one record it needs rather than the whole vault; the sync above
+        // stays mocked because the keys still come from it the first time they
+        // are wanted.
+        let one = server
+            .mock("GET", "/api/ciphers/no-totp")
+            .with_body(cipher("no-totp", "A note", &serde_json::json!({ "login": null })).to_string())
+            .create();
 
         let client = RestClient::new(server.url());
         let authenticated = fixture_login(&client);
         let backend = RestBackend::new(client, authenticated);
         assert_eq!(backend.get_totp("no-totp").expect("no failure"), None);
+        one.assert();
+    }
+
+    /// **A vault the server says has not moved is not fetched again.**
+    ///
+    /// The whole of tier 2, as one assertion: two reads that each used to be
+    /// a whole `GET /api/sync` are one sync and two one-row questions. On the
+    /// owner's D1-backed server that is ~1,686 rows against 1.
+    ///
+    /// `list_trash` twice rather than `list_vault` twice, because the Trash
+    /// row is the case that made this worth doing: opening it read the entire
+    /// account, and it is not a vault load by any reading.
+    #[test]
+    fn an_unchanged_revision_is_not_a_second_sync() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let revision = server
+            .mock("GET", "/api/accounts/revision-date")
+            .with_body("1700000000000")
+            .expect_at_least(2)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+
+        let first = backend.list_trash().expect("the first read");
+        let second = backend.list_trash().expect("the second read");
+
+        sync.assert();
+        revision.assert();
+        assert_eq!(
+            first.iter().map(|i| &i.id).collect::<Vec<_>>(),
+            second.iter().map(|i| &i.id).collect::<Vec<_>>(),
+            "the cached read answered something different from the sync it came from"
+        );
+        assert!(!first.is_empty(), "the fixture vault has a trashed item; this read found none");
+    }
+
+    /// **And a vault the server says HAS moved is.**
+    ///
+    /// The other half, and the one that makes the test above mean something:
+    /// without it, a cache that never refreshed would pass it perfectly.
+    #[test]
+    fn a_changed_revision_is_fetched_again() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        // A different answer each time, so the second read cannot match the
+        // revision the first was filed under.
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&asked);
+        server
+            .mock("GET", "/api/accounts/revision-date")
+            .with_body_from_request(move |_| {
+                let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!("{}", 1_700_000_000_000_u64 + n as u64).into_bytes()
+            })
+            .expect_at_least(2)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(2)
+            .create();
+
+        backend.list_trash().expect("the first read");
+        backend.list_trash().expect("the second read");
+
+        sync.assert();
+    }
+
+    /// **A server that will not answer the cheap question is synced, every
+    /// time.**
+    ///
+    /// The gate exists to avoid work, so failing it must cost nothing but the
+    /// work it was avoiding. A `None` here is never stored, so nothing can be
+    /// reused without having been re-validated -- which is the property the
+    /// cache rests on, held even against a server that has no such route.
+    #[test]
+    fn a_backend_that_cannot_ask_the_revision_still_reads_the_vault() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        server
+            .mock("GET", "/api/accounts/revision-date")
+            .with_status(404)
+            .expect_at_least(0)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(2)
+            .create();
+
+        backend.list_trash().expect("the first read");
+        backend.list_trash().expect("the second read");
+
+        sync.assert();
     }
 
     /// This backend has to be usable from the threads `VaultCache` hands it

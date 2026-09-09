@@ -1336,6 +1336,53 @@ impl RestClient {
         })
     }
 
+    /// `GET /api/accounts/revision-date` -- **the one question a client can
+    /// ask that is not the whole vault.**
+    ///
+    /// The answer is a bare JSON number: milliseconds since the epoch, of the
+    /// last change to this account's vault. Bitwarden's own clients poll it to
+    /// decide whether a sync is worth making, and it is the only delta
+    /// primitive the protocol has -- `GET /api/sync` is all or nothing, and
+    /// there is no "since" on it.
+    ///
+    /// # Why it earns its round trip
+    ///
+    /// On the owner's D1-backed server this is one primary-key lookup in
+    /// `user_revisions`: **one row**. The sync it stands in for was measured
+    /// at ~1,686 rows out of `ciphers`, and 74 of them in a day accounted for
+    /// the entire remaining cipher-read bill. A vault that has not changed
+    /// since the last sync can now be established for a row instead of
+    /// re-fetched for seventeen hundred.
+    ///
+    /// # A number, not a date
+    ///
+    /// It is compared for equality and never parsed into a calendar, so this
+    /// returns the integer the server sent rather than a timestamp type. Two
+    /// syncs of the same vault return the same integer; anything else is a
+    /// change. Nothing here needs to know which of them is later -- and a
+    /// server whose clock went backwards would still be *different*, which is
+    /// the only property [`crate::rest::backend::RestBackend::synced`] rests
+    /// on.
+    ///
+    /// A response this cannot read is an error rather than a `None`, because
+    /// the caller's fallback for "no answer" must be to sync, and a silent
+    /// `None` would be indistinguishable from "nothing changed".
+    pub fn revision_date(&self, session: &mut Session) -> Result<i64, RestError> {
+        let url = format!("{}/api/accounts/revision-date", self.base_url);
+        let value = self.refreshing(session, |session| {
+            self.value_from(self.bearer(self.sync_agent.get(&url), session).call())
+        })?;
+        value
+            .as_i64()
+            // A server that answered a float (or a quoted number) is still
+            // answering this question; only something that is neither is not.
+            .or_else(|| value.as_f64().map(|seconds| seconds as i64))
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+            .ok_or_else(|| {
+                RestError::Parse("a number from the revision-date route")
+            })
+    }
+
     // ---- writing one cipher -------------------------------------------------
 
     /// `POST /api/ciphers` -- a new item.

@@ -13743,6 +13743,12 @@ mod totp_poll_plan_tests {
     /// that is thirty asks over thirty polls -- exactly the cost the readable
     /// path above stopped paying, still paid by the seeds that need it.
     ///
+    /// **The route is the per-id one, and that is the second half of this
+    /// cost.** It used to be `GET /api/sync`: thirty whole vaults, ~1,686
+    /// rows each on the owner's D1-backed server, to read thirty seeds. What
+    /// is asserted is still the ask -- the same thirty -- against a route
+    /// that answers with one record.
+    ///
     /// The fixture backend answers out of its own copy of `live-1`, whose
     /// stored seed it *can* read, so the code that comes back is that seed's.
     /// What is being asserted here is the **ask**: that this seed leaves the
@@ -13750,16 +13756,22 @@ mod totp_poll_plan_tests {
     #[test]
     fn a_seed_this_app_cannot_read_still_reaches_the_backend_over_the_wire() {
         let (mut server, backend) = crate::rest::backend::tests::signed_in_with_no_sync_route();
-        let sync = server
+        // The keys still come off one sync, the first time they are wanted.
+        server
             .mock("GET", "/api/sync?excludeDomains=true")
             .with_body(crate::rest::backend::tests::sync_payload())
+            .expect_at_least(0)
+            .create();
+        let record = server
+            .mock("GET", "/api/ciphers/live-1")
+            .with_body(crate::rest::backend::tests::fixture_cipher_for("/api/ciphers/live-1"))
             .expect(POLLS)
             .create();
 
         let item = item_with_seed("steam://HXDMVJECJJWSRB3HWIZR4IFUGFTMXBOZ");
         let (state, asked) = drive_polls(&item, 59, |id| backend.get_totp(id));
 
-        sync.assert();
+        record.assert();
         assert_eq!(asked, POLLS);
         assert!(
             matches!(state, TotpState::Code { .. }),
@@ -14073,25 +14085,33 @@ mod totp_backend_cadence_tests {
     /// **The headline number, over the wire: 120 requests an hour, not
     /// 3,600.**
     ///
-    /// `expect(REQUESTS_PER_HOUR_AT_30S)` on the only sync route the server
-    /// has is the assertion -- `RestBackend::get_totp` opens with `synced()`,
-    /// so one request here is one whole-vault sync, which is the ~3,374 D1
-    /// rows the owner measured. `signed_in_with_no_sync_route` rather than
-    /// `logged_in` for the reason `totp_poll_plan_tests` gives: a second,
-    /// uncounted sync mock would make the count meaningless.
+    /// `expect(REQUESTS_PER_HOUR_AT_30S)` on the per-id cipher route is the
+    /// assertion. It used to be on the sync route, because
+    /// `RestBackend::get_totp` opened with `synced()` -- so one request here
+    /// was one whole-vault sync, the ~3,374 D1 rows the owner measured, 120
+    /// times an hour. It reads one record now, so the same 120 requests are
+    /// 120 rows. `signed_in_with_no_sync_route` rather than `logged_in` for
+    /// the reason `totp_poll_plan_tests` gives: an uncounted second mock on
+    /// the route under test would make the count meaningless.
     #[test]
     fn an_hour_of_a_fallback_seed_costs_one_request_per_period_not_one_per_second() {
         let (mut server, backend) = crate::rest::backend::tests::signed_in_with_no_sync_route();
-        let sync = server
+        // The keys still come off one sync, the first time they are wanted.
+        server
             .mock("GET", "/api/sync?excludeDomains=true")
             .with_body(crate::rest::backend::tests::sync_payload())
+            .expect_at_least(0)
+            .create();
+        let record = server
+            .mock("GET", "/api/ciphers/live-1")
+            .with_body(crate::rest::backend::tests::fixture_cipher_for("/api/ciphers/live-1"))
             .expect(REQUESTS_PER_HOUR_AT_30S)
             .create();
 
         let item = item_with_seed(FALLBACK_SEED);
         let frames = drive(&item, 0, AN_HOUR, |_| true, |_| backend.get_totp(FIXTURE_ID));
 
-        sync.assert();
+        record.assert();
         assert_eq!(
             frames.asked_at.len(),
             REQUESTS_PER_HOUR_AT_30S,
