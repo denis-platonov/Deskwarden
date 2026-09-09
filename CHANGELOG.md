@@ -127,6 +127,13 @@ had kept.
   meant for buttons and headings.
 * "Fetching..." in the one-time code row sits on the same line as the
   code that replaces it, instead of a few pixels above it.
+* A masked password sits beside its label with an ellipsis when the pane
+  is narrow, instead of wrapping to a line of its own while the username
+  above it elided. Cutting a row of bullets short loses nothing; a
+  password you have revealed still gets the second line.
+* The sentence explaining that an item is in the Trash sits on a white
+  tile, like everything else the detail pane says. It was drawn straight
+  onto the pane, against the window edge.
 
 ## 0.15.18 - 2026-09-08
 
