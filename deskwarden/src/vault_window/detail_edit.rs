@@ -2440,6 +2440,36 @@ impl EditDraft {
             (None, Some(original)) => Some(original.clone()),
             (chosen, _) => chosen.clone(),
         };
+        // **The notes, on every kind, and this used to be a secure note's
+        // alone.**
+        //
+        // Reported: an item's notes "just not visible on Edit screen". They
+        // were on the READ pane -- `detail` draws a NOTES card for any item
+        // that carries them -- so the vault held something the form could
+        // show, could not edit, and could not even display. `note_body` was
+        // populated by `from_item` for every kind already; only the editor
+        // and this write were missing, and the field's own doc said so
+        // outright ("written back only for `ItemKind::SecureNote`, because
+        // that is the only kind this form offers a notes editor for").
+        //
+        // Item-level, like `name` and `folder_id`, and applied before the
+        // per-kind match for that reason: `notes` is not part of any type
+        // object, and a secure note's body is the same field every other
+        // kind's notes live in.
+        //
+        // `edited_secret` keeps the "absent stays absent" rule the rest of
+        // this form follows: an item with no notes, left alone, does not gain
+        // an empty `notes` key.
+        //
+        // `edits_notes` and not a `match` of its own: the form writes what it
+        // offered an editor for, and that is one predicate rather than two
+        // that can drift. `false` for `creating` because this method applies a
+        // draft ONTO an existing item -- a create goes through `to_new_item`,
+        // which builds its own payload.
+        if edits_notes(self.kind, false) {
+            updated.notes =
+                edited_secret(updated.notes.as_deref().map(|n| n.as_str()), &self.note_body);
+        }
 
         // The item is the authority on its own type, not the draft: if the
         // two ever disagree (a draft carried across a selection change, say)
@@ -2495,12 +2525,11 @@ impl EditDraft {
             ItemKind::SecureNote => {
                 // A secure note has no object of its own to write: its
                 // `secureNote` key is a `{"type": 0}` discriminator that
-                // rides `VaultItem::other`, and the body is item-level
-                // `notes`.
-                updated.notes = edited_secret(
-                    updated.notes.as_deref().map(|n| n.as_str()),
-                    &self.note_body,
-                );
+                // rides `VaultItem::other`. Its body is item-level `notes`,
+                // written by the line below this match along with every other
+                // kind's -- this arm is left as a place to say so, because
+                // "the note kind writes nothing here" reads like an omission
+                // otherwise.
             }
             // Edits nothing but the name and folder already applied above.
             //
@@ -2795,6 +2824,35 @@ enum FormBody {
 }
 
 /// See [`FormBody`]. Exhaustive with no catch-all, as [`ItemKind`] requires.
+/// Whether this draft has a notes editor at all, and therefore whether
+/// [`EditDraft::apply_to`] may write `notes`.
+///
+/// True for every kind but one. `FormBody::UneditableNotice` promises, in the
+/// sentence it draws, that the item's contents are "left exactly as they
+/// are"; that promise is what `kind_offers_edit` rests on for an SSH key and
+/// an unknown type, and
+/// `edit_is_offered_for_exactly_the_kinds_apply_to_writes` holds the two
+/// together. A write here with no editor behind it is `note_body`'s initial
+/// value applied to an item nobody edited, which is what
+/// `editing_an_ssh_key_or_an_unknown_type_changes_only_the_name` caught the
+/// moment this was added without a gate.
+fn edits_notes(kind: ItemKind, creating: bool) -> bool {
+    !matches!(form_body(kind, creating), FormBody::UneditableNotice)
+}
+
+/// Whether that editor is a box of its OWN, drawn under the kind's rows.
+///
+/// [`edits_notes`] and not a secure note, whose body already IS this field --
+/// `FormBody::Note` draws the same multiline box as the whole of its form, so
+/// a second one would be two boxes bound to one string.
+///
+/// The pair are separate because they answer different questions and differ
+/// on exactly one kind. Folding them into one predicate made a secure note
+/// stop saving its body, which is the whole of that kind.
+fn draws_own_notes_box(kind: ItemKind, creating: bool) -> bool {
+    edits_notes(kind, creating) && !matches!(form_body(kind, creating), FormBody::Note)
+}
+
 fn form_body(kind: ItemKind, creating: bool) -> FormBody {
     match kind {
         ItemKind::Login => FormBody::Login,
@@ -5636,7 +5694,11 @@ pub fn draw_detail_edit(
             // Exhaustive, no catch-all: `ItemKind`'s doc forbids one, and a
             // `_ =>` here would render a login's username and password box
             // over whatever kind Bitwarden ships next.
-            match form_body(draft.kind, creating) {
+            // Bound rather than matched in place: the notes block below asks
+            // which body was drawn, and re-deriving it there would be a
+            // second call that a future edit could let disagree with this one.
+            let body = form_body(draft.kind, creating);
+            match body {
                 FormBody::Login => {
                     // Username and password are the floor for a login -- see
                     // [`Slot::always_shown`] -- so neither is gated and
@@ -6026,6 +6088,43 @@ pub fn draw_detail_edit(
                     );
                     ui.add_space(10.0);
                 }
+            }
+
+            // **The notes, on every kind that is not already all notes.**
+            //
+            // Reported: an item's notes were "just not visible on Edit
+            // screen". The read pane draws a NOTES card for any item carrying
+            // them, so the vault held something this form could neither show
+            // nor change -- and `from_item` had been filling `note_body` for
+            // every kind all along. Only the editor and the write-back were
+            // missing.
+            //
+            // Skipped for `FormBody::Note`, whose editor above IS this one: a
+            // secure note's body is item-level `notes`, so drawing it twice
+            // would be two boxes bound to one string.
+            //
+            // Skipped for `UneditableNotice` too, and that one is a judgement
+            // rather than a technicality. That body is shown for an item this
+            // form will not write the contents of, and the sentence in it
+            // promises those contents are "left exactly as they are". A notes
+            // box under that promise would be a control contradicting the
+            // paragraph above it.
+            //
+            // NOT behind the Add control. An item that HAS notes must show
+            // them, and that menu is for rows a kind could have and this item
+            // does not -- a box the user has to go looking for is the defect
+            // being fixed, not a smaller version of it.
+            if draws_own_notes_box(draft.kind, creating) {
+                theme::field_label(ui, Slot::Note.label());
+                // The same multiline box the note kind gets, and for the same
+                // reason: notes run to several lines on any kind. `theme` has
+                // no multiline helper, so this is egui's own, as above.
+                ui.add(
+                    egui::TextEdit::multiline(&mut draft.note_body)
+                        .desired_width(ui.available_width())
+                        .desired_rows(4),
+                );
+                ui.add_space(10.0);
             }
 
             // **Immediately under the kind's own rows, and above everything
@@ -7756,6 +7855,102 @@ mod tests {
         assert!(saved.card.is_none(), "a login edit invented a card object");
         assert!(saved.identity.is_none(), "a login edit invented an identity object");
         assert_eq!(saved.notes.as_deref().map(|n| n.as_str()), Some("a note"));
+    }
+
+    /// **A login's notes are editable, which they were not.**
+    ///
+    /// Reported against a real item: its notes were "just not visible on Edit
+    /// screen". They were on the READ pane -- `detail` draws a NOTES card for
+    /// any item carrying them -- so the vault held something this form could
+    /// neither show nor change. `from_item` had been filling `note_body` for
+    /// every kind all along; the box and the write-back were what was
+    /// missing, and `EditDraft::note_body`'s own doc said so.
+    ///
+    /// The item here is a LOGIN, deliberately: the kind that had the editor
+    /// was the secure note, whose body IS this field, and that case passing
+    /// is what made the gap easy to miss.
+    #[test]
+    fn a_logins_notes_can_be_edited_and_are_written_back() {
+        let item = parse(LOGIN_WITH_EXTRAS);
+        let mut draft = EditDraft::from_item(&item);
+        assert_eq!(
+            draft.note_body, "a note",
+            "the draft did not pick the login's existing notes up to show them"
+        );
+
+        draft.note_body = "an edited note".into();
+        let saved = draft.apply_to(&item);
+
+        assert_eq!(saved.notes.as_deref().map(|n| n.as_str()), Some("an edited note"));
+        // The rest of the item is untouched: this is one field, not a rewrite.
+        let login = saved.login.as_ref().expect("the login object");
+        assert_eq!(login.totp.as_deref().map(|t| t.as_str()), Some("SEED"));
+        assert!(saved.card.is_none(), "a notes edit invented a card object");
+    }
+
+    /// **Clearing them is an edit too**, and the empty box must not be read as
+    /// "leave whatever was there".
+    ///
+    /// `edited_secret`'s rule, which the rest of this form follows: a value
+    /// that WAS there and is now blank is a removal.
+    #[test]
+    fn emptying_a_logins_notes_removes_them() {
+        let item = parse(LOGIN_WITH_EXTRAS);
+        let mut draft = EditDraft::from_item(&item);
+        draft.note_body = String::new();
+        let saved = draft.apply_to(&item);
+
+        assert_eq!(
+            saved.notes.as_deref().map(|n| n.as_str()),
+            None,
+            "an emptied notes box left the old text on the item"
+        );
+    }
+
+    /// **An item with no notes, saved untouched, does not gain an empty
+    /// `notes` key.**
+    ///
+    /// The other half of `edited_secret`'s rule. Without it, every save of
+    /// every item would write a field the item never had -- a payload change
+    /// on items nobody edited, and the shape this form is careful about
+    /// everywhere else.
+    #[test]
+    fn a_login_with_no_notes_does_not_gain_them_by_being_saved() {
+        let mut item = parse(LOGIN_WITH_EXTRAS);
+        item.notes = None;
+        let draft = EditDraft::from_item(&item);
+        let saved = draft.apply_to(&item);
+        assert!(saved.notes.is_none(), "saving an untouched item invented a notes field");
+    }
+
+    /// **The two predicates agree with the bodies they are about.**
+    ///
+    /// `edits_notes` and `draws_own_notes_box` differ on exactly one kind --
+    /// the secure note, whose editor is its whole form -- and folding them
+    /// into one is what stopped that kind saving its body the first time this
+    /// was written. Both directions, per kind, so neither can quietly become
+    /// the other.
+    #[test]
+    fn the_notes_editor_is_offered_for_every_kind_that_has_a_form() {
+        for kind in
+            [ItemKind::Login, ItemKind::Card, ItemKind::Identity, ItemKind::SecureNote]
+        {
+            assert!(edits_notes(kind, false), "{kind:?} has a form but writes no notes");
+        }
+        // Its own body is the box, so it draws no second one -- and still
+        // writes.
+        assert!(!draws_own_notes_box(ItemKind::SecureNote, false));
+        assert!(edits_notes(ItemKind::SecureNote, false));
+        for kind in [ItemKind::Login, ItemKind::Card, ItemKind::Identity] {
+            assert!(draws_own_notes_box(kind, false), "{kind:?} draws no notes box");
+        }
+        // And the kinds whose form promises it changes nothing but the name
+        // do neither. An SSH key on a CREATE has a real form, so it does.
+        for kind in [ItemKind::SshKey, ItemKind::Unknown(9)] {
+            assert!(!edits_notes(kind, false), "{kind:?} writes notes it drew no box for");
+            assert!(!draws_own_notes_box(kind, false));
+        }
+        assert!(draws_own_notes_box(ItemKind::SshKey, true), "a new SSH key takes notes");
     }
 
     #[test]
