@@ -2936,7 +2936,6 @@ mod tests {
                     &sidebar::SidebarFilter::All,
                     &mut search,
                     &mut selected,
-                    None,
                     &icons,
                     &mut visible,
                     None,

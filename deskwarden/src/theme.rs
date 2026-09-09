@@ -1551,6 +1551,31 @@ pub fn primary_button_matching_field(ui: &mut Ui, label: &str) -> Response {
     primary_button_with_metrics(ui, label, None, SEARCH_FIELD_HEIGHT, 8, true)
 }
 
+/// The filled button that confirms **destroying** something -- today, the
+/// delete modal's confirm and nothing else.
+///
+/// [`primary_button`]'s metrics exactly, with [`ERROR`] where [`BLUE`] goes.
+/// It has to carry a primary button's weight, because it is the thing its
+/// modal exists for and burying it in a [`secondary_button`] would make the
+/// destructive answer the quieter of the two. It cannot wear [`BLUE`],
+/// because the habit that fills in a form and presses the blue button is
+/// precisely what a confirmation is there to interrupt -- a red button is a
+/// hand on the arm, and this app already spends [`ERROR`] on exactly this
+/// meaning (the kebab's Delete words, the sidebar's folder ×).
+///
+/// No `kbd` parameter, and no Enter binding at the call site either: a
+/// keyboard shortcut for "yes, destroy it" is a shortcut for doing it by
+/// accident, which is the whole thing the modal was put in the way of.
+pub fn destructive_button(ui: &mut Ui, label: &str) -> Response {
+    ui.add(
+        egui::Button::new(semibold(label, 13.0).color(Color32::WHITE))
+            .fill(ERROR)
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(7))
+            .min_size(Vec2::new(0.0, BUTTON_HEIGHT)),
+    )
+}
+
 fn primary_button_with_metrics(
     ui: &mut Ui,
     label: &str,
@@ -2689,23 +2714,20 @@ pub fn star_toggle(ui: &mut Ui, on: bool) -> Response {
 /// The detail header's overflow control: three dots stacked vertically, the
 /// menu affordance every desktop app spells the same way.
 ///
-/// `armed` turns them [`ERROR`] red: the Delete inside this menu keeps its
-/// two-click confirmation, and once the first click has armed it the menu
-/// may well be closed -- so the state has to be legible on the button that
-/// opens it, not only on the entry inside.
-pub fn kebab_button(ui: &mut Ui, armed: bool) -> Response {
+/// **No state of its own.** It took an `armed` flag that turned the dots
+/// [`ERROR`] red, because the Delete inside this menu confirmed itself with
+/// a two-click arm and that arm could outlive the menu being closed -- so
+/// the button had to carry a state the entry could no longer show. The
+/// confirmation is a modal now (`vault_window::delete_modal`), which is
+/// visible on its own, so a menu button that changes colour to report
+/// something happening elsewhere has nothing left to report.
+pub fn kebab_button(ui: &mut Ui) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    let color = if armed {
-        ERROR
-    } else if response.hovered() {
-        INK
-    } else {
-        TEXT_SECONDARY
-    };
+    let color = if response.hovered() { INK } else { TEXT_SECONDARY };
     const PITCH: f32 = 6.0;
     let painter = ui.painter();
     for step in [-1.0_f32, 0.0, 1.0] {
@@ -5582,7 +5604,7 @@ mod drawn_icon_family_tests {
             ("★", control(|ui| star_toggle(ui, false)).1),
             ("✉", control(send_record_button).1),
             ("⏱", control(add_totp_button).1),
-            ("⋮", control(|ui| kebab_button(ui, false)).1),
+            ("⋮", control(|ui| kebab_button(ui)).1),
             ("✕", control(close_pane_button).1),
         ]
     }
@@ -5998,7 +6020,7 @@ mod drawn_icon_family_tests {
     fn the_tune_icon_repeats_no_more_marks_than_the_kebab_beside_it() {
         let (_, tune) = control(tune_button);
         let (_, eye) = control(|ui| eye_toggle(ui, false));
-        let (_, kebab) = control(|ui| kebab_button(ui, false));
+        let (_, kebab) = control(|ui| kebab_button(ui));
 
         // Positive control: `marks_in` really does find marks, so the counts
         // below are counts of something.

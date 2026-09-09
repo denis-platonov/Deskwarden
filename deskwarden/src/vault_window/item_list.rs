@@ -262,19 +262,18 @@ pub const CLEAR_ICON_LABEL: &str = "Use the automatic icon";
 /// selected, and so the row doubles as "this is where it lives now".
 const ALREADY_IN_THIS_FOLDER: &str = "This item is already in this folder";
 
-/// The Delete entry's two labels. The second is the armed state of
-/// `vault_window::mod`'s existing `confirm_click` two-click confirmation --
-/// the SAME mechanism and the same wording the detail pane's Delete button
-/// uses, deliberately, rather than a second confirmation idiom.
+/// The Delete entry's label. **One label, because the confirmation is no
+/// longer in the menu**: choosing this opens
+/// [`super::delete_modal`], which asks the question somewhere a question can
+/// actually be asked. It used to have a second, armed label
+/// ("Delete? Click to confirm") that this entry re-labelled itself with for
+/// three seconds -- see that module's doc for why a menu is the wrong place
+/// to hold a state.
 const DELETE_LABEL: &str = "Delete";
-const DELETE_CONFIRM_LABEL: &str = "Delete? Click to confirm";
 
-/// The Trash row's permanent delete, in the same two-click shape -- the same
-/// mechanism, so there is one confirmation idiom in this menu and not two.
-/// The wording says "forever" in both states because that is the difference
-/// between this entry and the one above it, and it is not recoverable.
+/// The Trash row's permanent delete. Also one label, through the same modal,
+/// which says "forever" in its heading, its sentence and its button.
 const PURGE_LABEL: &str = "Delete forever";
-const PURGE_CONFIRM_LABEL: &str = "Delete forever? Click to confirm";
 
 /// Trimmed text, or `None` when there is nothing worth an entry -- the same
 /// rule `detail::non_empty` applies to that pane's rows, restated here
@@ -292,9 +291,6 @@ fn menu_non_empty(value: Option<&str>) -> Option<&str> {
 /// decision made inside that closure is one no test in this crate could
 /// reach.
 ///
-/// `delete_pending` is `vault_window::mod`'s `item_delete_pending` for THIS
-/// item; it only changes the Delete entry's wording.
-///
 /// `source` is which list the row was drawn from, and it selects between
 /// three DISJOINT menus rather than adding or removing a line from one.
 /// That is the point: an item in the trash cannot be edited, filled, moved
@@ -311,11 +307,10 @@ fn menu_non_empty(value: Option<&str>) -> Option<&str> {
 pub fn menu_entries(
     item: &VaultItem,
     folders: &[Folder],
-    delete_pending: bool,
     source: FilterSource,
 ) -> Vec<MenuEntry> {
     if let Some(out) = source.out_of_vault() {
-        return out_of_vault_entries(out, delete_pending);
+        return out_of_vault_entries(out);
     }
     let kind = ItemKind::of(item);
     let login = item.login.as_ref();
@@ -389,10 +384,7 @@ pub fn menu_entries(
     // ways to take an item out of the working vault, and the design lists
     // the two rows in that order too.
     entries.push(enabled_command("Archive", RowCommand::Archive));
-    entries.push(enabled_command(
-        if delete_pending { DELETE_CONFIRM_LABEL } else { DELETE_LABEL },
-        RowCommand::Delete,
-    ));
+    entries.push(enabled_command(DELETE_LABEL, RowCommand::Delete));
     entries
 }
 
@@ -416,18 +408,15 @@ pub fn menu_entries(
 ///
 /// Takes [`OutOfVault`] rather than a [`FilterSource`], so it cannot be
 /// called for a live item at all.
-fn out_of_vault_entries(out: OutOfVault, delete_pending: bool) -> Vec<MenuEntry> {
+fn out_of_vault_entries(out: OutOfVault) -> Vec<MenuEntry> {
     match out {
         OutOfVault::Trash => vec![
             enabled_command("Restore", RowCommand::Restore),
-            // The two-click confirmation, and the only entry in this file
-            // that is not undoable. It uses the SAME `confirm_click`
-            // mechanism the ordinary Delete does rather than a second
-            // confirmation idiom.
-            enabled_command(
-                if delete_pending { PURGE_CONFIRM_LABEL } else { PURGE_LABEL },
-                RowCommand::PurgeForever,
-            ),
+            // The only entry in this file that is not undoable. It goes
+            // through the SAME `delete_modal` the ordinary Delete does
+            // rather than a second confirmation idiom -- the modal tells the
+            // two apart by its `DeleteKind`, in every sentence it shows.
+            enabled_command(PURGE_LABEL, RowCommand::PurgeForever),
         ],
         // One entry, because there is exactly one thing to do with an
         // archived item. "Delete" is deliberately not offered: archiving is
@@ -1128,6 +1117,7 @@ fn scroll_offset_id() -> egui::Id {
 /// the difference. `every_modal_scrim_in_the_crate_is_named_here` walks `src/`
 /// and fails if a modal is added with a scrim this list does not name.
 const MODAL_SCRIM_AREAS: &[&str] = &[
+    "delete-confirm-scrim",
     "detail-edit-discard-scrim",
     "folder-edit-scrim",
     "icon-pick-scrim",
@@ -1306,11 +1296,9 @@ fn scroll_offset_for_row(row: usize, offset: f32, viewport_height: f32) -> Optio
 /// module stays otherwise unaware of favicons/threads/caching -- it just
 /// reports what it drew.
 ///
-/// `folders` and `delete_pending_id` are both only ever read by the rows'
-/// right-click menus: the first supplies "Move to folder"'s destinations, the
-/// second is `vault_window::mod`'s `item_delete_pending`, which decides
-/// whether that row's Delete entry reads "Delete" or the armed
-/// "Delete? Click to confirm". Neither affects what a row paints.
+/// `folders` is only ever read by the rows' right-click menus, where it
+/// supplies "Move to folder"'s destinations. It does not affect what a row
+/// paints.
 ///
 /// **`items` is `None` when the list this row reads has not been fetched
 /// yet** -- the Trash and Archive rows are on-demand queries, so "no answer
@@ -1328,7 +1316,6 @@ pub fn draw_item_list(
     filter: &SidebarFilter,
     search: &mut String,
     selected_id: &mut Option<String>,
-    delete_pending_id: Option<&str>,
     icons: &IconCache,
     visible_ids: &mut Vec<String>,
     move_error: Option<&str>,
@@ -1710,7 +1697,6 @@ pub fn draw_item_list(
                                     item,
                                     folders,
                                     selected,
-                                    delete_pending_id == Some(item.id.as_str()),
                                     icons.textures.get(&item.id),
                                     filter.source(),
                                 )
@@ -1935,7 +1921,6 @@ fn item_row(
     item: &VaultItem,
     folders: &[Folder],
     selected: bool,
-    delete_pending: bool,
     icon: Option<&egui::TextureHandle>,
     // Which list this row was drawn from -- the row's menu is entirely
     // different for a trashed or archived item. See `menu_entries`.
@@ -2178,7 +2163,7 @@ fn item_row(
     // here.
     let mut command = None;
     response.context_menu(|ui| {
-        for entry in menu_entries(item, folders, delete_pending, source) {
+        for entry in menu_entries(item, folders, source) {
             match entry {
                 MenuEntry::Command(entry) => {
                     if menu_command(ui, &entry) {
@@ -2682,7 +2667,7 @@ mod menu_entry_tests {
     #[test]
     fn a_full_login_offers_every_entry_in_the_agreed_order() {
         assert_eq!(
-            labels(&menu_entries(&full_login(), &[], false, FilterSource::LiveVault)),
+            labels(&menu_entries(&full_login(), &[], FilterSource::LiveVault)),
             vec![
                 "Copy username",
                 "Copy password",
@@ -2712,7 +2697,6 @@ mod menu_entry_tests {
             labels(&menu_entries(
                 &full_login(),
                 &[folder("f1", "Work")],
-                false,
                 FilterSource::Trash,
             )),
             vec!["Restore", "Delete forever"]
@@ -2721,7 +2705,6 @@ mod menu_entry_tests {
             labels(&menu_entries(
                 &full_login(),
                 &[folder("f1", "Work")],
-                false,
                 FilterSource::Archive,
             )),
             vec!["Unarchive"]
@@ -2738,27 +2721,39 @@ mod menu_entry_tests {
     #[test]
     fn the_menu_follows_the_list_the_row_was_drawn_from_not_the_item() {
         let item = full_login();
-        let live = labels(&menu_entries(&item, &[], false, FilterSource::LiveVault));
-        let trashed = labels(&menu_entries(&item, &[], false, FilterSource::Trash));
+        let live = labels(&menu_entries(&item, &[], FilterSource::LiveVault));
+        let trashed = labels(&menu_entries(&item, &[], FilterSource::Trash));
         assert!(live.contains(&"Delete".to_string()));
         assert!(!trashed.contains(&"Delete".to_string()));
         assert!(!live.contains(&"Restore".to_string()));
         assert!(trashed.contains(&"Restore".to_string()));
     }
 
-    /// The permanent delete is armed by the same two-click confirmation the
-    /// ordinary Delete uses, and its wording changes to say so.
+    /// **Neither delete asks its question in the menu any more.** Both
+    /// entries carry one fixed label and open
+    /// [`super::super::delete_modal`], so a menu built twice in a row is the
+    /// same menu -- there is no armed state for it to be in.
     ///
-    /// Both states are asserted: a label that read "Delete forever? Click to
-    /// confirm" unconditionally would pass a test that only looked at the
-    /// armed one, and it would mean the menu asking for confirmation of a
-    /// click the user has not made yet.
+    /// Asserted as the ABSENCE of the old wording rather than only as the
+    /// presence of the new: an entry that re-labelled itself under some
+    /// condition this test does not set would pass a `contains("Delete")`
+    /// happily, and the whole point of the modal is that the menu stopped
+    /// being where the confirmation lives.
     #[test]
-    fn delete_forever_states_when_it_is_armed() {
-        let unarmed = labels(&menu_entries(&full_login(), &[], false, FilterSource::Trash));
-        let armed = labels(&menu_entries(&full_login(), &[], true, FilterSource::Trash));
-        assert_eq!(unarmed, vec!["Restore", "Delete forever"]);
-        assert_eq!(armed, vec!["Restore", "Delete forever? Click to confirm"]);
+    fn neither_delete_entry_confirms_inside_the_menu() {
+        for source in [FilterSource::LiveVault, FilterSource::Trash] {
+            let once = labels(&menu_entries(&full_login(), &[], source));
+            let again = labels(&menu_entries(&full_login(), &[], source));
+            assert_eq!(once, again, "{source:?}: the menu is not the same twice");
+            assert!(
+                !once.iter().any(|label| label.contains("Click to confirm")),
+                "{source:?}: a delete entry still confirms in the menu: {once:?}"
+            );
+        }
+        assert_eq!(
+            labels(&menu_entries(&full_login(), &[], FilterSource::Trash)),
+            vec!["Restore", "Delete forever"]
+        );
     }
 
     /// The five entries a plain card gets, in order.
@@ -2774,7 +2769,7 @@ mod menu_entry_tests {
         // ABSENT. Editing a card is offered and enabled -- `apply_to` writes
         // the card object -- which is the user-visible half of the 2026-08-17
         // fix.
-        let entries = menu_entries(&of_kind(Some(3)), &[], false, FilterSource::LiveVault);
+        let entries = menu_entries(&of_kind(Some(3)), &[], FilterSource::LiveVault);
         assert_eq!(
             labels(&entries),
             vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
@@ -2791,7 +2786,7 @@ mod menu_entry_tests {
     /// number true.
     #[test]
     fn a_secure_note_offers_the_same_five_as_a_card() {
-        let entries = menu_entries(&of_kind(Some(2)), &[], false, FilterSource::LiveVault);
+        let entries = menu_entries(&of_kind(Some(2)), &[], FilterSource::LiveVault);
         assert_eq!(
             labels(&entries),
             vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
@@ -2808,7 +2803,7 @@ mod menu_entry_tests {
     fn the_greyed_edit_entry_says_why() {
         // Greying without a reason is the failure this is guarding: the user
         // sees the action they came for, unavailable, and no explanation.
-        let entries = menu_entries(&of_kind(Some(5)), &[], false, FilterSource::LiveVault);
+        let entries = menu_entries(&of_kind(Some(5)), &[], FilterSource::LiveVault);
         let edit = entries
             .iter()
             .find_map(|e| match e {
@@ -2857,10 +2852,10 @@ mod menu_entry_tests {
         );
         // And the positive control on the predicate itself: the SAME blob
         // on a login-typed item does offer the entry.
-        assert!(labels(&menu_entries(&full_login(), &[], false, FilterSource::LiveVault))
+        assert!(labels(&menu_entries(&full_login(), &[], FilterSource::LiveVault))
             .contains(&"Open website".to_string()));
         assert_eq!(
-            labels(&menu_entries(&card_with_a_login, &[], false, FilterSource::LiveVault)),
+            labels(&menu_entries(&card_with_a_login, &[], FilterSource::LiveVault)),
             vec![
                 "Copy username",
                 "Copy password",
@@ -2888,7 +2883,7 @@ mod menu_entry_tests {
     /// entry altogether cannot pass the negative half.
     #[test]
     fn refresh_icon_is_absent_for_every_item_with_no_icon_domain() {
-        let live = |item: &VaultItem| labels(&menu_entries(item, &[], false, FilterSource::LiveVault));
+        let live = |item: &VaultItem| labels(&menu_entries(item, &[], FilterSource::LiveVault));
         assert!(
             live(&full_login()).contains(&REFRESH_ICON_LABEL.to_string()),
             "the live control failed: an item that DOES have a domain was offered no refresh, \
@@ -2939,7 +2934,7 @@ mod menu_entry_tests {
             other: serde_json::Map::new(),
         });
         assert_eq!(
-            labels(&menu_entries(&card, &[], false, FilterSource::LiveVault)),
+            labels(&menu_entries(&card, &[], FilterSource::LiveVault)),
             vec![
                 REFRESH_ICON_LABEL,
                 SELECT_ICON_LABEL,
@@ -3003,7 +2998,7 @@ mod menu_entry_tests {
             ("a login with no URI at all", of_kind(Some(1))),
             ("a login whose only URI names no host", app_only),
         ] {
-            let entries = labels(&menu_entries(&item, &[], false, FilterSource::LiveVault));
+            let entries = labels(&menu_entries(&item, &[], FilterSource::LiveVault));
             assert!(
                 entries.contains(&SELECT_ICON_LABEL.to_string()),
                 "{what} was offered no way to choose its own icon: {entries:?}"
@@ -3016,7 +3011,7 @@ mod menu_entry_tests {
     #[test]
     fn a_trashed_or_archived_row_is_offered_no_icon_entries_either() {
         for source in [FilterSource::Trash, FilterSource::Archive] {
-            let entries = labels(&menu_entries(&chosen_url(&full_login()), &[], false, source));
+            let entries = labels(&menu_entries(&chosen_url(&full_login()), &[], source));
             for label in [SELECT_ICON_LABEL, CLEAR_ICON_LABEL, REFRESH_ICON_LABEL] {
                 assert!(
                     !entries.contains(&label.to_string()),
@@ -3038,7 +3033,7 @@ mod menu_entry_tests {
     fn the_clear_entry_follows_the_field_being_there_and_not_it_parsing() {
         let plain = full_login();
         assert!(
-            !labels(&menu_entries(&plain, &[], false, FilterSource::LiveVault))
+            !labels(&menu_entries(&plain, &[], FilterSource::LiveVault))
                 .contains(&CLEAR_ICON_LABEL.to_string()),
             "an item with no chosen icon was offered a way to un-choose one"
         );
@@ -3048,7 +3043,7 @@ mod menu_entry_tests {
             ("a value this build cannot read", with_icon_field(&plain, "not json at all")),
             ("a shape from a later build", with_icon_field(&plain, r#"{"kind":"svg"}"#)),
         ] {
-            let entries = labels(&menu_entries(&item, &[], false, FilterSource::LiveVault));
+            let entries = labels(&menu_entries(&item, &[], FilterSource::LiveVault));
             assert!(
                 entries.contains(&CLEAR_ICON_LABEL.to_string()),
                 "an item with {what} was offered no way back to the automatic icon: {entries:?}"
@@ -3068,7 +3063,7 @@ mod menu_entry_tests {
     fn refresh_is_offered_for_a_chosen_url_and_never_for_a_chosen_picture() {
         let login = full_login();
         let has_refresh = |item: &VaultItem| {
-            labels(&menu_entries(item, &[], false, FilterSource::LiveVault))
+            labels(&menu_entries(item, &[], FilterSource::LiveVault))
                 .contains(&REFRESH_ICON_LABEL.to_string())
         };
         assert!(has_refresh(&login), "the live control: an ordinary login can refresh its icon");
@@ -3100,7 +3095,6 @@ mod menu_entry_tests {
             labels(&menu_entries(
                 &chosen_picture(&full_login()),
                 &[],
-                false,
                 FilterSource::LiveVault
             )),
             vec![
@@ -3122,7 +3116,7 @@ mod menu_entry_tests {
     #[test]
     fn an_item_with_a_chosen_url_gets_the_agreed_menu() {
         assert_eq!(
-            labels(&menu_entries(&chosen_url(&full_login()), &[], false, FilterSource::LiveVault)),
+            labels(&menu_entries(&chosen_url(&full_login()), &[], FilterSource::LiveVault)),
             vec![
                 "Copy username",
                 "Copy password",
@@ -3145,7 +3139,7 @@ mod menu_entry_tests {
     #[test]
     fn neither_icon_entry_is_ever_greyed() {
         for item in [full_login(), chosen_url(&full_login()), chosen_picture(&of_kind(Some(2)))] {
-            let entries = menu_entries(&item, &[], false, FilterSource::LiveVault);
+            let entries = menu_entries(&item, &[], FilterSource::LiveVault);
             for entry in &entries {
                 if let MenuEntry::Command(c) = entry {
                     if c.command == RowCommand::SelectIcon || c.command == RowCommand::ClearIcon {
@@ -3164,7 +3158,7 @@ mod menu_entry_tests {
     #[test]
     fn a_trashed_or_archived_row_is_offered_no_refresh() {
         for source in [FilterSource::Trash, FilterSource::Archive] {
-            let entries = labels(&menu_entries(&full_login(), &[], false, source));
+            let entries = labels(&menu_entries(&full_login(), &[], source));
             assert!(
                 !entries.contains(&REFRESH_ICON_LABEL.to_string()),
                 "{source:?} offered a refresh: {entries:?}"
@@ -3180,7 +3174,7 @@ mod menu_entry_tests {
         // it was widened to cards, notes and identities.
         for item_type in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(9)] {
             let item = of_kind(item_type);
-            let entries = menu_entries(&item, &[], false, FilterSource::LiveVault);
+            let entries = menu_entries(&item, &[], FilterSource::LiveVault);
             let edit = entries
                 .iter()
                 .find_map(|e| match e {
@@ -3203,9 +3197,9 @@ mod menu_entry_tests {
             login: Some(LoginData { totp: None, ..with_seed.login.clone().unwrap() }),
             ..full_login()
         };
-        assert!(labels(&menu_entries(&with_seed, &[], false, FilterSource::LiveVault)).contains(&"Copy TOTP".to_string()));
+        assert!(labels(&menu_entries(&with_seed, &[], FilterSource::LiveVault)).contains(&"Copy TOTP".to_string()));
         assert_eq!(
-            labels(&menu_entries(&without, &[], false, FilterSource::LiveVault)),
+            labels(&menu_entries(&without, &[], FilterSource::LiveVault)),
             vec![
                 "Copy username",
                 "Copy password",
@@ -3236,14 +3230,14 @@ mod menu_entry_tests {
             ..of_kind(Some(1))
         };
         assert_eq!(
-            labels(&menu_entries(&empty, &[], false, FilterSource::LiveVault)),
+            labels(&menu_entries(&empty, &[], FilterSource::LiveVault)),
             vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
     }
 
     #[test]
     fn open_website_carries_the_url_the_detail_pane_would_open() {
-        let entries = menu_entries(&full_login(), &[], false, FilterSource::LiveVault);
+        let entries = menu_entries(&full_login(), &[], FilterSource::LiveVault);
         let opens: Vec<&RowCommand> = entries
             .iter()
             .filter_map(|e| match e {
@@ -3265,7 +3259,7 @@ mod menu_entry_tests {
         // out of every sidebar row -- a Critical fixed in the edit form, and
         // this menu must not reintroduce it.
         let folders = [folder("", "No Folder"), folder("f1", "Work"), folder("f2", "Personal")];
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false, FilterSource::LiveVault))
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault))
         else {
             panic!("the submenu reported no assignable folders when two exist");
         };
@@ -3288,7 +3282,7 @@ mod menu_entry_tests {
         // user may own a folder actually called "No Folder", and matching on
         // the name would lock them out of it.
         let folders = [folder("f9", "No Folder")];
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false, FilterSource::LiveVault))
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault))
         else {
             panic!("a real folder named \"No Folder\" was dropped");
         };
@@ -3300,7 +3294,7 @@ mod menu_entry_tests {
     fn a_vault_with_no_assignable_folder_says_so_instead_of_opening_an_empty_box() {
         let folders = [folder("", "No Folder")];
         assert_eq!(
-            move_menu_of(&menu_entries(&full_login(), &folders, false, FilterSource::LiveVault)),
+            move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault)),
             MoveMenu::Empty(NO_ASSIGNABLE_FOLDERS)
         );
     }
@@ -3309,7 +3303,7 @@ mod menu_entry_tests {
     fn the_folder_the_item_already_lives_in_is_greyed_not_dropped() {
         let folders = [folder("f1", "Work"), folder("f2", "Personal")];
         let item = VaultItem { folder_id: Some("f1".into()), ..full_login() };
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&item, &folders, false, FilterSource::LiveVault)) else {
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&item, &folders, FilterSource::LiveVault)) else {
             panic!("the submenu reported no assignable folders when two exist");
         };
         assert_eq!(
@@ -3325,7 +3319,7 @@ mod menu_entry_tests {
         // write succeeds and does nothing. Every destination this menu
         // offers must therefore name a real folder.
         let folders = [folder("", "No Folder"), folder("f1", "Work")];
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, false, FilterSource::LiveVault))
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault))
         else {
             panic!("the submenu reported no assignable folders when one exists");
         };
@@ -3337,29 +3331,17 @@ mod menu_entry_tests {
         }
     }
 
+    /// **Delete is the last entry and reads exactly one thing.** The entry
+    /// used to carry the confirmation itself; it now opens
+    /// [`super::super::delete_modal`], so its label is a constant and its
+    /// position is the design's (below Archive, the gentler of the two ways
+    /// to take an item out of the vault).
     #[test]
-    fn delete_wears_the_armed_label_while_its_confirmation_is_pending() {
-        // The SAME two-click confirmation the detail pane's Delete button
-        // uses (`vault_window::mod`'s `confirm_click`), not a second idiom:
-        // the first click arms, the label changes, the second confirms.
+    fn delete_is_the_last_entry_and_wears_one_label() {
         assert_eq!(
-            labels(&menu_entries(&of_kind(Some(3)), &[], false, FilterSource::LiveVault)).last().unwrap(),
+            labels(&menu_entries(&of_kind(Some(3)), &[], FilterSource::LiveVault)).last().unwrap(),
             DELETE_LABEL
         );
-        assert_eq!(
-            labels(&menu_entries(&of_kind(Some(3)), &[], true, FilterSource::LiveVault)).last().unwrap(),
-            DELETE_CONFIRM_LABEL
-        );
-    }
-
-    #[test]
-    fn arming_the_delete_changes_nothing_else_about_the_menu() {
-        let folders = [folder("f1", "Work")];
-        let armed = menu_entries(&full_login(), &folders, true, FilterSource::LiveVault);
-        let idle = menu_entries(&full_login(), &folders, false, FilterSource::LiveVault);
-        assert_eq!(labels(&armed).len(), labels(&idle).len());
-        assert_eq!(labels(&armed)[..labels(&idle).len() - 1], labels(&idle)[..labels(&idle).len() - 1]);
-        assert_eq!(move_menu_of(&armed), move_menu_of(&idle));
     }
 }
 
@@ -3626,7 +3608,6 @@ mod row_tile_tests {
     /// of padding.
     struct Menu {
         folders: Vec<Folder>,
-        delete_pending: Option<String>,
         /// One `Vec` of events per extra frame to run after the first draw.
         /// Extra frames are needed at all because egui resolves a click only
         /// on the frame the button is released, and a popup only exists from
@@ -3648,7 +3629,6 @@ mod row_tile_tests {
         fn none() -> Self {
             Self {
                 folders: Vec::new(),
-                delete_pending: None,
                 frames: Vec::new(),
                 filter: SidebarFilter::All,
             }
@@ -3767,7 +3747,7 @@ mod row_tile_tests {
         // to the assertion is the measured frame's own answer and not a
         // click from a set-up frame that came before it.
         let mut row_opened = false;
-        let Menu { folders, delete_pending, mut frames, filter } = menu;
+        let Menu { folders, mut frames, filter } = menu;
         let mut draw = |ctx: &egui::Context, input: egui::RawInput, visible: &mut Vec<String>| {
             row_opened = false;
             ctx.run_ui(input, |ui| {
@@ -3778,7 +3758,6 @@ mod row_tile_tests {
                     &filter,
                     &mut search,
                     &mut selected_id,
-                    delete_pending.as_deref(),
                     &icons,
                     visible,
                     // This harness predates the inline move-error band and
@@ -4135,7 +4114,6 @@ mod row_tile_tests {
             |_| IconCache::default(),
             Menu {
                 folders: Vec::new(),
-                delete_pending: None,
                 frames,
                 filter: SidebarFilter::All,
             },
@@ -6848,7 +6826,15 @@ mod row_tile_tests {
     /// assertions cannot see, so an entry that stopped being drawn would have
     /// gone unnoticed on both sides -- which is the exact defect the
     /// "Archive" note above records.
-    const MENU_VOCABULARY: [&str; 16] = [
+    ///
+    /// Then 16 -> 14 when the two deletes stopped confirming inside the menu:
+    /// the armed wordings ("Delete? Click to confirm", "Delete forever?
+    /// Click to confirm") are not labels this menu can draw any more, so
+    /// leaving them here would be two entries the painted assertions look
+    /// for and never find -- vocabulary that reads as coverage and is not.
+    /// The tests that watched for that wording now look for the substring
+    /// directly, because its absence is the thing being asserted.
+    const MENU_VOCABULARY: [&str; 14] = [
         "Copy username",
         "Copy password",
         "Copy TOTP",
@@ -6860,11 +6846,9 @@ mod row_tile_tests {
         MOVE_TO_FOLDER_LABEL,
         "Archive",
         DELETE_LABEL,
-        DELETE_CONFIRM_LABEL,
         "Restore",
         "Unarchive",
         PURGE_LABEL,
-        PURGE_CONFIRM_LABEL,
     ];
 
     fn menu_labels(p: &Painted) -> Vec<String> {
@@ -6905,7 +6889,7 @@ mod row_tile_tests {
     /// Right-clicks row `row` under the ordinary live vault and returns the
     /// frame the menu is open on.
     fn open_menu(items: &[VaultItem], folders: Vec<Folder>, row: usize) -> Painted {
-        open_menu_with(items, folders, None, row, SidebarFilter::All)
+        open_menu_with(items, folders, row, SidebarFilter::All)
     }
 
     /// The same, under whichever sidebar row `filter` names. The Trash and
@@ -6918,13 +6902,12 @@ mod row_tile_tests {
         row: usize,
         filter: SidebarFilter,
     ) -> Painted {
-        open_menu_with(items, folders, None, row, filter)
+        open_menu_with(items, folders, row, filter)
     }
 
     fn open_menu_with(
         items: &[VaultItem],
         folders: Vec<Folder>,
-        delete_pending: Option<String>,
         row: usize,
         filter: SidebarFilter,
     ) -> Painted {
@@ -6937,7 +6920,6 @@ mod row_tile_tests {
             |_| IconCache::default(),
             Menu {
                 folders,
-                delete_pending,
                 frames: click_frames(at, egui::PointerButton::Secondary),
                 filter,
             },
@@ -6969,7 +6951,7 @@ mod row_tile_tests {
             0,
             PANE_WIDTH,
             |_| IconCache::default(),
-            Menu { folders, delete_pending: None, frames, filter: SidebarFilter::All },
+            Menu { folders, frames, filter: SidebarFilter::All },
         )
     }
 
@@ -7009,7 +6991,7 @@ mod row_tile_tests {
             0,
             PANE_WIDTH,
             |_| IconCache::default(),
-            Menu { folders, delete_pending: None, frames, filter },
+            Menu { folders, frames, filter },
         )
     }
 
@@ -7306,7 +7288,6 @@ mod row_tile_tests {
             |_| IconCache::default(),
             Menu {
                 folders: vec![],
-                delete_pending: None,
                 frames: click_frames(at, egui::PointerButton::Primary),
                 filter: SidebarFilter::All,
             },
@@ -7402,8 +7383,7 @@ mod row_tile_tests {
                 |_| IconCache::default(),
                 Menu {
                     folders: vec![],
-                    delete_pending: None,
-                    frames,
+                        frames,
                     filter: SidebarFilter::All,
                 },
             )
@@ -7454,7 +7434,6 @@ mod row_tile_tests {
             |_| IconCache::default(),
             Menu {
                 folders: vec![],
-                delete_pending: None,
                 frames: vec![vec![egui::Event::Key {
                     key: egui::Key::ArrowDown,
                     physical_key: None,
@@ -7493,26 +7472,28 @@ mod row_tile_tests {
         );
     }
 
+    /// **Every row's Delete reads the same thing, whichever row it is.**
+    /// The wording used to depend on `delete_pending_id`, which was one id
+    /// rather than a flag precisely so an arm belonged to the row it was set
+    /// on. There is no arm now, and this pins that the menu two rows apart
+    /// is one menu -- a per-row label would be a state that survived the
+    /// change to the modal.
     #[test]
-    fn an_armed_delete_paints_its_confirming_label() {
-        let items = [full_login("Ledgerline")];
-        let p = open_menu_with(&items, vec![], Some("Ledgerline".to_string()), 0, SidebarFilter::All);
-        assert!(
-            menu_labels(&p).contains(&DELETE_CONFIRM_LABEL.to_string()),
-            "the menu drew {:?}",
-            menu_labels(&p)
-        );
-        assert!(!menu_labels(&p).contains(&DELETE_LABEL.to_string()));
-    }
-
-    #[test]
-    fn an_armed_delete_on_another_row_leaves_this_row_s_entry_alone() {
-        // `delete_pending_id` is one id, not a flag: an arm belongs to the
-        // item it was set on.
+    fn every_rows_delete_entry_reads_the_same() {
         let items = [full_login("Ledgerline"), full_login("Vantage")];
-        let p = open_menu_with(&items, vec![], Some("Vantage".to_string()), 0, SidebarFilter::All);
-        assert!(menu_labels(&p).contains(&DELETE_LABEL.to_string()));
-        assert!(!menu_labels(&p).contains(&DELETE_CONFIRM_LABEL.to_string()));
+        for row in 0..items.len() {
+            let p = open_menu_with(&items, vec![], row, SidebarFilter::All);
+            assert!(
+                menu_labels(&p).contains(&DELETE_LABEL.to_string()),
+                "row {row} drew {:?}",
+                menu_labels(&p)
+            );
+            assert!(
+                !menu_labels(&p).iter().any(|label| label.contains("Click to confirm")),
+                "row {row} still confirms in the menu: {:?}",
+                menu_labels(&p)
+            );
+        }
     }
 
     #[test]
@@ -7660,7 +7641,7 @@ mod row_tile_tests {
             0,
             PANE_WIDTH,
             |_| IconCache::default(),
-            Menu { folders, delete_pending: None, frames, filter: SidebarFilter::All },
+            Menu { folders, frames, filter: SidebarFilter::All },
         );
         assert_eq!(
             p.action,
@@ -7735,7 +7716,7 @@ mod row_tile_tests {
             0,
             PANE_WIDTH,
             |_| IconCache::default(),
-            Menu { folders: vec![], delete_pending: None, frames, filter: SidebarFilter::All },
+            Menu { folders: vec![], frames, filter: SidebarFilter::All },
         );
 
         assert_eq!(dragging.visible, still.visible, "the laid-out row range changed mid-drag");
@@ -7845,7 +7826,6 @@ mod row_tile_tests {
             |_| IconCache::default(),
             Menu {
                 folders: vec![],
-                delete_pending: None,
                 frames: click_frames(at, egui::PointerButton::Primary),
                 filter: SidebarFilter::All,
             },
@@ -7912,7 +7892,6 @@ mod row_tile_tests {
             |_| IconCache::default(),
             Menu {
                 folders: vec![],
-                delete_pending: None,
                 frames,
                 filter: SidebarFilter::All,
             },
@@ -7978,7 +7957,7 @@ mod row_tile_tests {
                 0,
                 PANE_WIDTH,
                 |_| IconCache::default(),
-                Menu { folders: vec![], delete_pending: None, frames, filter: SidebarFilter::All },
+                Menu { folders: vec![], frames, filter: SidebarFilter::All },
             );
             assert_eq!(
                 p.action,
@@ -8110,27 +8089,27 @@ mod row_tile_tests {
         }
     }
 
+    /// **The trash row's one irreversible entry is painted, with one
+    /// wording.** It used to change its words when armed, and this test
+    /// asserted that the arm reached the out-of-vault menu at all. The arm
+    /// is gone -- the entry opens [`super::super::delete_modal`] with
+    /// `DeleteKind::Forever` -- so what is worth pinning is that the entry
+    /// really reaches the painted menu for a row drawn under Trash, which is
+    /// still the half `draw_item_list` could silently drop by forwarding the
+    /// wrong source.
     #[test]
-    fn a_trashed_rows_purge_entry_arms_the_same_two_click_confirmation() {
-        // `delete_pending` reaches the out-of-vault menu too -- the one
-        // irreversible entry in this window, and the only one whose wording
-        // changes. Reaching it proves `draw_item_list` forwards both the
-        // source AND the pending id into the same call.
+    fn a_trashed_rows_purge_entry_is_painted_with_one_wording() {
         let items = vec![full_login("Ledgerline")];
-        let p = open_menu_with(
-            &items,
-            vec![],
-            Some("Ledgerline".to_string()),
-            0,
-            SidebarFilter::Trash,
-        );
+        let p = open_menu_with(&items, vec![], 0, SidebarFilter::Trash);
         let painted = painted_strings(&p);
         assert!(
-            painted.contains(&PURGE_CONFIRM_LABEL),
-            "the armed \"Delete forever\" wording never reached the trash menu; \
-             painted: {painted:?}"
+            painted.contains(&PURGE_LABEL),
+            "\"Delete forever\" never reached the trash menu; painted: {painted:?}"
         );
-        assert!(!painted.contains(&PURGE_LABEL), "both wordings were painted: {painted:?}");
+        assert!(
+            !painted.iter().any(|text| text.contains("Click to confirm")),
+            "the trash menu still confirms inside itself: {painted:?}"
+        );
     }
 
     #[test]
@@ -8249,7 +8228,6 @@ mod toolbar_strip_tests {
                     &SidebarFilter::All,
                     search,
                     &mut selected,
-                    None,
                     &icons,
                     &mut visible,
                     None,
@@ -8698,7 +8676,6 @@ mod move_error_band_tests {
                     &SidebarFilter::All,
                     &mut search,
                     &mut selected,
-                    None,
                     &icons,
                     &mut visible,
                     move_error,
@@ -9102,7 +9079,6 @@ mod list_placeholder_paint_tests {
                     &SidebarFilter::All,
                     search,
                     &mut selected,
-                    None,
                     &icons,
                     &mut visible,
                     None,
@@ -9432,7 +9408,6 @@ mod keyboard_selection_tests {
                     &SidebarFilter::All,
                     search,
                     selected,
-                    None,
                     &icons,
                     &mut drawn,
                     None,

@@ -1903,9 +1903,7 @@ impl Preview {
                     &fixtures.folders,
                     &SidebarFilter::All,
                     search,
-                    selected,
-                    None,
-                    icons,
+                    selected,                    icons,
                     visible,
                     None,
                     false,
@@ -1940,9 +1938,7 @@ impl Preview {
                     &fixtures.folders,
                     &SidebarFilter::All,
                     search,
-                    selected,
-                    None,
-                    icons,
+                    selected,                    icons,
                     visible,
                     None,
                     false,
@@ -1978,9 +1974,7 @@ impl Preview {
                     &fixtures.folders,
                     &SidebarFilter::All,
                     search,
-                    selected,
-                    None,
-                    icons,
+                    selected,                    icons,
                     visible,
                     None,
                     false,
@@ -2144,9 +2138,7 @@ impl Preview {
                         // honest one to show without a folder list.
                         &[],
                         if card { 0 } else { 42 },
-                        totp,
-                        false,
-                        &mut fixtures.reveal,
+                        totp,                        &mut fixtures.reveal,
                         // A favicon only on the shot that is ABOUT one --
                         // every other detail shot keeps the monogram
                         // fallback, which is what an avatar shows without

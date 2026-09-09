@@ -596,11 +596,12 @@ pub enum DetailAction {
     /// is `Zeroizing` in the model either.
     CopyValue(String),
     OpenWebsite(String),
-    /// The header's Delete button was clicked. `vault_window::mod`'s
-    /// two-click `confirm_click` gates whether this click is armed or
-    /// confirming -- `draw_detail_read` itself only reports the click, via
-    /// `delete_pending` (see that param's doc comment) for which label/state
-    /// to show.
+    /// The kebab's Delete entry was clicked. `vault_window::mod` opens
+    /// [`super::delete_modal`] on it; this pane only reports the click, and
+    /// has no state of its own for the confirmation -- which is the whole
+    /// difference from the two-click arm this used to feed, where the pane
+    /// had to be told whether the click it was reporting was the arming one
+    /// or the confirming one.
     Delete,
     /// A destination in the kebab's **Move to folder** submenu was chosen,
     /// carrying that folder's **id**.
@@ -2854,12 +2855,6 @@ pub fn draw_detail_read(
     folders: &[Folder],
     fill_count: u32,
     totp: &TotpState,
-    // Whether *this* item currently has a delete armed (its first click
-    // already happened and the confirm window hasn't expired) -- purely for
-    // what the kebab and its Delete entry show; `vault_window::mod`'s
-    // `confirm_click` is what actually decides whether a click here is
-    // arming or confirming.
-    delete_pending: bool,
     // Owned by `vault_window::mod`'s `run` and reset on selection change --
     // see `RevealState`'s doc for why it cannot live inside this function.
     reveal: &mut RevealState,
@@ -3220,8 +3215,8 @@ pub fn draw_detail_read(
                 // every kind (see `every_kind_can_still_be_deleted`), so
                 // there is no kind whose menu would be empty. Edit inside
                 // it is still `kind_offers_edit`'s decision.
-                let kebab = theme::kebab_button(ui, delete_pending)
-                    .on_hover_text("More actions for this item");
+                let kebab =
+                    theme::kebab_button(ui).on_hover_text("More actions for this item");
                 // **A click inside this menu closes it only when an entry
                 // says so.** egui's menus default to
                 // `PopupCloseBehavior::CloseOnClick`, which shuts the popup
@@ -3229,14 +3224,17 @@ pub fn draw_detail_read(
                 // every entry below that wants to close already calls
                 // `ui.close()` itself, so that default was never what made
                 // Edit or Clone dismiss the menu. What it did do was take
-                // the one entry that deliberately does NOT close: the first
-                // click on Delete arms the confirm and the menu vanished
+                // the one entry that deliberately did NOT close: the first
+                // click on Delete armed the confirm and the menu vanished
                 // under the pointer, so the user saw a click do nothing and
                 // the second click of a two-click confirm had nothing left
-                // to land on. That is the "item is not deleted" half of the
-                // report, and it is why the comment on that entry claiming
-                // "no `ui.close()` on the arming click" was true and still
-                // not enough.
+                // to land on.
+                //
+                // That report is what the delete modal answered, and Delete
+                // does close the menu now -- but the behaviour stays,
+                // because it is what a menu should do either way and
+                // because reverting it would be a change made for no
+                // reason beyond "the case that forced it is gone".
                 //
                 // `CloseOnClickOutside` keeps the dismissal a user expects
                 // -- click anywhere off the menu and it goes -- and hands
@@ -3319,26 +3317,22 @@ pub fn draw_detail_read(
                             }
                         }
                     });
-                    // **Still two clicks, and the menu stays open between
-                    // them.** Burying Delete does not remove the reason
-                    // `vault_window::mod`'s `confirm_click` gates it: one
-                    // misclick permanently deletes. So the armed state is
-                    // expressed exactly as the header button expressed it
-                    // -- the same two labels, the same `ERROR` red -- and
-                    // no `ui.close()` on the arming click, because a menu
-                    // that shut itself would hide the state it just
-                    // entered. The kebab itself also turns red (see
-                    // `kebab_button`) so an armed delete is visible after
-                    // a click elsewhere closes the menu.
-                    let (delete_label, delete_hover) = if delete_pending {
-                        (
-                            "Delete? Click to confirm",
-                            "Click again to delete this item. It may still be recoverable \
-                             from bitwarden.com or another Bitwarden client afterward.",
-                        )
-                    } else {
-                        ("Delete", "Delete this item")
-                    };
+                    // **One click, and it asks.** Burying Delete does not
+                    // remove the reason it needs a confirmation -- one
+                    // misclick deletes -- and this used to be a two-click
+                    // arm the menu had to hold the state of: the entry
+                    // re-labelled itself, the kebab went red so the state
+                    // survived the menu closing, and the click did not close
+                    // the menu because closing would have hidden what it had
+                    // just done. All three of those were the price of asking
+                    // a question in a place that cannot hold one.
+                    //
+                    // It now opens [`super::delete_modal`], which asks in a
+                    // sentence and has somewhere to put the answer when the
+                    // vault refuses the write. The entry keeps its red words
+                    // and its hover; the arming label, the red kebab and the
+                    // menu-stays-open rule are gone with the arm.
+                    let (delete_label, delete_hover) = ("Delete", "Delete this item");
                     //
                     // **The red is on the WORDS and nothing else.** This
                     // entry used to carry `.fill(theme::CARD)`, which is the
@@ -3360,6 +3354,13 @@ pub fn draw_detail_read(
                         .add(egui::Button::new(RichText::new(delete_label).color(theme::ERROR)));
                     if delete.on_hover_text(delete_hover).clicked() {
                         action = DetailAction::Delete;
+                        // Closes, like Edit and Clone above it. The one
+                        // entry in this menu that deliberately did NOT close
+                        // was this one, and the arm it was protecting is
+                        // gone: a modal is about to cover the menu anyway,
+                        // and a menu left open under a scrim is a menu the
+                        // user finds still open when they cancel.
+                        ui.close();
                     }
                 });
                 // **"Add a one-time code", and this is the control
@@ -8394,7 +8395,6 @@ mod tests {
     fn painted_text(
         item: &VaultItem,
         totp: &TotpState,
-        delete_pending: bool,
         reveal: RevealState,
     ) -> Vec<String> {
         let ctx = egui::Context::default();
@@ -8423,7 +8423,6 @@ mod tests {
                 &[],
                 3,
                 totp,
-                delete_pending,
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
@@ -8818,7 +8817,6 @@ mod tests {
                 &[],
                 3,
                 totp,
-                false,
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
@@ -8882,14 +8880,13 @@ mod tests {
     /// a menu entry and the frame that opened the menu can never be the
     /// same one.
     ///
-    /// It carries the `RevealState` and the `delete_pending` flag across
-    /// frames the way `vault_window::mod`'s `run` does, which is the only
-    /// way a toggle can be observed outliving the frame it happened in.
+    /// It carries the `RevealState` across frames the way
+    /// `vault_window::mod`'s `run` does, which is the only way a toggle can
+    /// be observed outliving the frame it happened in.
     struct Pane {
         ctx: egui::Context,
         width: f32,
         reveal: RevealState,
-        delete_pending: bool,
         /// The folder name the window would have resolved for this item --
         /// `None` unless a test sets it, which is the vault's usual case.
         folder: Option<String>,
@@ -9292,7 +9289,6 @@ mod tests {
                 ctx,
                 width,
                 reveal: RevealState::default(),
-                delete_pending: false,
                 folder: None,
                 folders: Vec::new(),
                 apps: crate::app_identity::AppIdentityCache::default(),
@@ -9361,7 +9357,6 @@ mod tests {
                         &self.folders,
                         3,
                         totp,
-                        self.delete_pending,
                         &mut self.reveal,
                         None,
                         &mut self.apps,
@@ -9497,11 +9492,11 @@ mod tests {
     }
 
     fn painted(item: &VaultItem, totp: &TotpState) -> Vec<String> {
-        painted_text(item, totp, false, RevealState::default())
+        painted_text(item, totp, RevealState::default())
     }
 
     fn painted_with_reveal(item: &VaultItem, totp: &TotpState, reveal: RevealState) -> Vec<String> {
-        painted_text(item, totp, false, reveal)
+        painted_text(item, totp, reveal)
     }
 
     /// Every text the pane painted, and **the box of every bitmap it
@@ -10008,89 +10003,56 @@ mod tests {
         }
     }
 
-    /// **The report, reproduced end to end**: the kebab's Delete really
-    /// deletes on the second click, and really does not on the first.
+    /// **The report, reproduced end to end**: the kebab's Delete row really
+    /// reports the click, on the menu the pane really opened, at the
+    /// coordinates the pane really painted.
     ///
-    /// Both clicks are pressed at the coordinates the pane painted, on the
-    /// menu the pane really opened, and each is fed to `vault_window::mod`'s
-    /// own [`crate::vault_window::confirm_click_at`] -- the gate that decides whether a
-    /// reported `DetailAction::Delete` becomes a deletion. Driving that
-    /// function rather than reimplementing its rule is the point: this fails
-    /// if the entry stops reporting, if the menu shuts itself between the
-    /// clicks, if the armed label stops being drawn, or if the confirm gate
-    /// changes its mind.
+    /// This used to drive `vault_window::mod`'s two-click gate: press once,
+    /// assert nothing was deleted, redraw the pane in its armed state,
+    /// assert the armed label was painted, press the armed row, assert the
+    /// gate confirmed. All of that was the machinery of asking a question
+    /// inside a menu. The question moved to a modal, so what is left for
+    /// this pane to owe is exactly one thing -- the click reaches the caller
+    /// -- and that is what this asserts, for every kind, because nothing in
+    /// this row has ever been kind-specific.
     ///
-    /// `gap` is the wait between the two clicks, as a synthetic `Instant`
-    /// offset -- no sleeping, and no real date anywhere near it.
-    fn delete_through_the_kebab(kind: ItemKind, gap: std::time::Duration) -> bool {
+    /// Whether the reported click then deletes anything is
+    /// `vault_window::mod`'s to answer and is pinned there, at the one place
+    /// that can now reach `cache.delete_item` at all.
+    fn delete_reported_through_the_kebab(kind: ItemKind) -> DetailAction {
         let item = an_item(item_type_for(kind));
         let mut pane = Pane::new();
-        let mut pending: Option<(String, std::time::Instant)> = None;
-        let armed_at = std::time::Instant::now();
-
         let open = pane.open_kebab(&item, &TotpState::NoSecret);
         let entry = open.menu_row_of("Delete").0;
-        let first = pane.click(&item, &TotpState::NoSecret, entry.center());
-        assert_eq!(
-            first.action,
-            DetailAction::Delete,
-            "{kind:?}: the first click on the Delete row reported {:?}",
-            first.action
-        );
-        assert!(
-            !crate::vault_window::confirm_click_at(&mut pending, &item.id, armed_at),
-            "{kind:?}: one click deleted the item"
-        );
-
-        // What the window does next frame: the item is armed, so the pane is
-        // drawn armed. The menu must still be open -- nothing closed it.
-        let then = armed_at + gap;
-        pane.delete_pending = crate::vault_window::is_armed_at(&mut pending, &item.id, then);
-        assert!(pane.delete_pending, "{kind:?}: the first click armed nothing");
-        let armed = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            armed.painted("Delete? Click to confirm"),
-            "{kind:?}: the menu closed or lost its armed label after the first click; it \
-             painted: {:?}",
-            armed.strings()
-        );
-
-        let row = armed.menu_row_of("Delete? Click to confirm").0;
-        let second = pane.click(&item, &TotpState::NoSecret, row.center());
-        assert_eq!(
-            second.action,
-            DetailAction::Delete,
-            "{kind:?}: the second click on the armed row reported {:?}",
-            second.action
-        );
-        crate::vault_window::confirm_click_at(&mut pending, &item.id, then)
+        pane.click(&item, &TotpState::NoSecret, entry.center()).action
     }
 
-    /// Two clicks a comfortable moment apart delete the item -- on a card,
-    /// which is what the report was filed against, and on the other kinds,
-    /// because nothing in this row has ever been kind-specific.
+    /// One click on the kebab's Delete reports it, for every kind.
     #[test]
-    fn two_clicks_on_the_kebabs_delete_really_delete_the_item() {
+    fn one_click_on_the_kebabs_delete_reports_it() {
         for kind in EVERY_KIND {
-            assert!(
-                delete_through_the_kebab(kind, std::time::Duration::from_millis(600)),
-                "{kind:?}: two clicks through the kebab did not delete the item"
+            assert_eq!(
+                delete_reported_through_the_kebab(kind),
+                DetailAction::Delete,
+                "{kind:?}: clicking the kebab's Delete row reported the wrong thing"
             );
         }
     }
 
-    /// The other side of `CloseOnClickOutside`: the entries that DO close the
+    /// The other side of `CloseOnClickOutside`: the entries that close the
     /// menu still close it, and a click off the menu still dismisses it.
     ///
-    /// Delete is the exception in this menu, not the rule, and handing the
-    /// close decision to the entries is only safe if the entries make it.
-    /// Without this, "the menu stays open on Delete" could be satisfied by a
-    /// menu that never closes at all -- which is a worse defect than the one
-    /// being fixed, and one no other test here would see.
+    /// **Delete is in the list now.** It used to be the one exception --
+    /// its first click armed a confirmation and a menu that shut itself
+    /// would have hidden the state it had just entered -- and handing the
+    /// close decision to the entries was only safe because the other
+    /// entries made it. The confirmation is a modal, so Delete closes like
+    /// everything else, and the exception this test was written around is
+    /// gone.
     #[test]
-    fn the_kebabs_other_entries_still_close_the_menu_behind_them() {
+    fn the_kebabs_entries_close_the_menu_behind_them() {
         let item = a_login();
-        for label in ["Edit", "Clone"] {
+        for label in ["Edit", "Clone", "Delete"] {
             let mut pane = Pane::new();
             let open = pane.open_kebab(&item, &TotpState::NoSecret);
             let entry = open.menu_row_of(label).0;
@@ -10115,23 +10077,6 @@ mod tests {
             "clicking outside the kebab menu left it open; the pane painted: {:?}",
             after.strings()
         );
-    }
-
-    /// And two clicks arriving faster than the confirm dwell do not.
-    ///
-    /// This is the guard on the other side of the test above, and the reason
-    /// the dwell exists: a double-click landing on a freshly-opened menu must
-    /// not be able to delete an item by accident. It is asserted per kind
-    /// alongside the positive case so that "deleting works" can never be made
-    /// to pass by removing the floor.
-    #[test]
-    fn a_double_click_on_the_kebabs_delete_does_not_delete_the_item() {
-        for kind in EVERY_KIND {
-            assert!(
-                !delete_through_the_kebab(kind, std::time::Duration::from_millis(50)),
-                "{kind:?}: two clicks 50ms apart deleted the item; the confirm dwell is gone"
-            );
-        }
     }
 
     /// Delete is the one action that means the same thing for every kind, so
@@ -10473,69 +10418,57 @@ mod tests {
         }
     }
 
-    /// **Delete still takes two clicks, and the menu still says so.**
-    /// `vault_window::mod`'s `confirm_click` is what actually gates the
-    /// deletion; what this pane owes it is an armed state the user can see.
-    /// Burying the control in a menu is exactly the change that could have
-    /// dropped it -- and a menu that closed itself on the arming click would
-    /// hide the state it had just entered.
+    /// **The menu asks nothing, and never reads as if it had.**
     ///
-    /// Both directions, so this cannot pass against an entry hardcoded to
-    /// either label.
+    /// This pane used to owe the confirmation an armed state the user could
+    /// see: the entry re-labelled itself "Delete? Click to confirm", the
+    /// kebab's dots went `ERROR` red so the state survived the menu closing,
+    /// and two tests here asserted both. All of it was the cost of asking a
+    /// question in a menu, and the question moved to a modal.
+    ///
+    /// What replaces them is the negative: the entry reads one thing, and no
+    /// part of this pane paints the old wording under any state it can be
+    /// put in -- because a half-removed arm that still re-labelled would be
+    /// a menu asking for a confirmation nothing acts on.
     #[test]
-    fn an_armed_delete_says_so_in_the_menu_and_on_the_kebab() {
+    fn the_kebabs_delete_asks_nothing_and_reports_the_click() {
         let item = a_login();
-
-        let mut idle = Pane::new();
-        let unarmed = idle.open_kebab(&item, &TotpState::NoSecret);
+        let mut pane = Pane::new();
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
         assert!(
-            unarmed.painted("Delete") && !unarmed.painted("Delete? Click to confirm"),
-            "an unarmed delete already asks for confirmation: {:?}",
-            unarmed.strings()
-        );
-
-        let mut armed = Pane::new();
-        armed.delete_pending = true;
-        let open = armed.open_kebab(&item, &TotpState::NoSecret);
-        assert!(
-            open.painted("Delete? Click to confirm"),
-            "an armed delete reads exactly like an unarmed one, so the confirmation \
-             step is invisible: {:?}",
+            open.painted("Delete"),
+            "the kebab has no Delete entry at all: {:?}",
             open.strings()
         );
-        // And it is still reported, so the SECOND click can confirm.
-        let entry = open.rect_of("Delete? Click to confirm");
-        let clicked = armed.click(&item, &TotpState::NoSecret, entry.center());
+        assert!(
+            !open.strings().iter().any(|text| text.contains("Click to confirm")),
+            "the kebab still confirms inside itself: {:?}",
+            open.strings()
+        );
+        let entry = open.rect_of("Delete");
+        let clicked = pane.click(&item, &TotpState::NoSecret, entry.center());
         assert_eq!(
             clicked.action,
             DetailAction::Delete,
-            "the armed Delete entry is inert, so a delete can be armed but never confirmed"
+            "the Delete entry is inert, so the modal can never be opened"
         );
     }
 
-    /// The armed state has to be legible with the menu SHUT, because a click
-    /// anywhere else closes it while `confirm_click`'s window is still open.
-    /// The kebab's own dots turn `ERROR` red for that.
+    /// **The kebab has one colour scheme, and red is not in it.**
+    ///
+    /// Its dots turned `ERROR` red while a delete was armed, because the arm
+    /// could outlive the menu being closed and had to be legible somewhere.
+    /// A modal is legible on its own, so the only red left on this strip
+    /// would be an alarm reporting nothing -- and the ✕ beside it has its
+    /// own test (below) resting on there being none.
     #[test]
-    fn the_kebab_itself_shows_that_a_delete_is_armed() {
+    fn the_kebab_is_never_painted_as_an_alarm() {
         let item = a_login();
-        let colour = |delete_pending: bool| {
-            let mut pane = Pane::new();
-            pane.delete_pending = delete_pending;
-            pane.idle(&item, &TotpState::NoSecret).kebab_colour()
-        };
-        assert_eq!(
-            colour(true),
-            theme::ERROR,
-            "an armed delete leaves the kebab looking exactly like an unarmed one, so \
-             closing the menu hides the confirmation entirely"
-        );
-        // Both directions, so this cannot pass against a kebab that is
-        // always red -- which would be a permanent alarm instead of a state.
+        let mut pane = Pane::new();
         assert_ne!(
-            colour(false),
+            pane.idle(&item, &TotpState::NoSecret).kebab_colour(),
             theme::ERROR,
-            "the kebab is red with nothing armed"
+            "the kebab is red with nothing to report"
         );
     }
 
@@ -15885,26 +15818,28 @@ mod tests {
     /// off the same frame for the same reason -- it compares two things the
     /// user is looking at, not two entries in a palette.
     ///
-    /// The armed frame is the one that matters, and it is why this drives the
-    /// pane twice: an unarmed kebab is grey too, so "the ✕ is not red" is
-    /// trivially true there. With the delete armed the kebab really does turn
-    /// `ERROR` -- asserted here, as the positive control -- and the ✕ beside
-    /// it must not have followed.
+    /// **There is no longer an armed frame, and that is the change.** This
+    /// used to drive the pane twice -- unarmed and armed -- because the
+    /// kebab turned `ERROR` red while a delete was armed, and an unarmed
+    /// strip has no red on it at all, so "the ✕ is not red" was trivially
+    /// true there. The arm is gone with the delete modal, so the positive
+    /// control it rested on is gone too. What is left is the relationship
+    /// between the ✕ and the ✉, which is the half that was always about this
+    /// strip rather than about the confirmation.
     #[test]
     fn the_close_mark_is_never_dressed_as_the_delete_beside_it() {
         let item = a_login();
 
-        for delete_pending in [false, true] {
+        {
             let mut pane = Pane::new();
-            pane.delete_pending = delete_pending;
             let frame = pane.idle(&item, &TotpState::NoSecret);
             let (_, close_colour) = frame.pane_close();
             assert_ne!(
                 close_colour,
                 theme::ERROR,
-                "with delete_pending={delete_pending} the header's close ✕ is painted in \
-                 the palette's error red, one control away from a Delete that arms on its \
-                 first click"
+                "the header's close ✕ is painted in the palette's error red, one control \
+                 away from the Delete entry that wears the same colour inside the kebab's \
+                 menu"
             );
             // **The relationship, not the constant.** This used to read
             // `assert_eq!(close_colour, theme::TEXT_GHOST)` -- a photograph of
@@ -15921,24 +15856,11 @@ mod tests {
             let (_, envelope_colour) = frame.envelope();
             assert_eq!(
                 close_colour, envelope_colour,
-                "with delete_pending={delete_pending} the close ✕ rests at {close_colour:?} \
-                 while the ✉ beside it rests at {envelope_colour:?} -- the two are the same \
-                 kind of control on the same strip and one of them is fainter than the other"
+                "the close ✕ rests at {close_colour:?} while the ✉ beside it rests at \
+                 {envelope_colour:?} -- the two are the same kind of control on the same \
+                 strip and one of them is fainter than the other"
             );
         }
-
-        // The positive control: the kebab REALLY does turn red when armed, so
-        // the two assertions above are about a frame in which "red" is a
-        // colour something on this strip is actually wearing.
-        let mut pane = Pane::new();
-        pane.delete_pending = true;
-        let armed = pane.idle(&item, &TotpState::NoSecret);
-        assert_eq!(
-            armed.kebab_colour(),
-            theme::ERROR,
-            "the kebab does not go red on an armed delete, so \"the ✕ is not red\" above is \
-             a statement about a strip with no red in it"
-        );
     }
 
     /// **The ✉'s tooltip carries its chord, and carries it from the ONE place
@@ -22493,7 +22415,6 @@ mod read_pane_scroll_tests {
                         &[],
                         3,
                         &TotpState::NoSecret,
-                        false,
                         &mut self.reveal,
                         None,
                         &mut self.apps,
@@ -24489,7 +24410,6 @@ mod breach_badge_tests {
                     &[],
                     3,
                     &TotpState::NoSecret,
-                    false,
                     &mut reveal,
                     None,
                     &mut apps,

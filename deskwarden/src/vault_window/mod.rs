@@ -5,6 +5,7 @@
 //! (`draw_window_chrome`/`round_window_corners`) rather than duplicating
 //! it -- both are already `pub fn` there for exactly this reason.
 
+pub mod delete_modal;
 pub mod detail;
 pub mod detail_edit;
 pub mod detail_slide;
@@ -247,27 +248,6 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(500);
 /// so the spinner animates smoothly and a landed load is painted promptly.
 /// Roughly one 60Hz refresh.
 const LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(16);
-
-/// How long a click-to-delete button (the sidebar's per-folder × button, or
-/// the detail pane's item Delete button) stays armed waiting for a
-/// confirming second click before reverting to its normal state. Chosen
-/// over a native Win32 `MessageBox` (which would block the async egui event
-/// loop) or a full inline "Delete X? [Yes] [No]" row (more UI than a
-/// two-click pattern needs) as the simplest way to make deletion not be a
-/// single accidental click away, for either the only irreversible
-/// destructive action in this window (folder delete) or the newly-wired-up
-/// item delete (see `confirm_click`).
-const DELETE_CONFIRM_WINDOW: Duration = Duration::from_secs(3);
-
-/// Minimum time that must pass between the arming click and the confirming
-/// click before a second click on the same id is actually treated as a
-/// confirmation. Without this, a habitual double-click delivers both clicks
-/// to egui within the same (or an adjacent) frame, so the intermediate
-/// "armed, click again" state is never actually seen on screen before the
-/// delete already fires -- defeating the entire point of the two-click
-/// confirmation. This is a *lower* bound on top of `DELETE_CONFIRM_WINDOW`'s
-/// existing upper bound (the arm still expires after that long either way).
-const MIN_CONFIRM_DWELL: Duration = Duration::from_millis(300);
 
 /// The size and position to open this window at, given whatever the last
 /// session recorded and the monitors that exist now.
@@ -1159,16 +1139,19 @@ pub fn build_frame_with_search(
     // single repaint while an item was selected.
     let mut fill_count: u32 = selected_id.as_deref().map(|id| fill_stats.count(id)).unwrap_or(0);
 
-    // Two-click "delete" confirmation state for the detail pane's item
-    // Delete button. `(id, armed_at)`: a second click on the same id, at
-    // least `MIN_CONFIRM_DWELL` but less than `DELETE_CONFIRM_WINDOW` after
-    // `armed_at`, confirms the delete; anything else (a different id, too
-    // fast, or the window elapsing) just (re)arms it. See `confirm_click`.
-    // Folder delete used to have its own copy of this same pattern for the
-    // sidebar's inline × button; it now lives in the "Edit folder" modal
-    // (`folder_edit` below) instead, which already requires a deliberate
-    // open-the-editor step before Delete is even reachable.
-    let mut item_delete_pending: Option<(String, Instant)> = None;
+    // **The delete confirmation modal's state, `Some` while it is up.** Set
+    // from all THREE doors onto a delete -- an item row's Delete, a trashed
+    // row's Delete forever, and the detail pane kebab's Delete -- and the
+    // only place any of them can reach `cache.delete_item` or
+    // `cache.purge_item` from.
+    //
+    // This replaced a two-click arm (`(id, armed_at)`, confirmed by a second
+    // click on the same id inside a three-second window) that both menus and
+    // the detail pane shared. It worked, and it asked its question in the
+    // one place that cannot hold a question: a menu. See
+    // [`delete_modal`]'s module doc for the whole of that reasoning, and for
+    // why the sidebar's folder delete keeps the older idiom.
+    let mut delete_confirm: Option<delete_modal::DeleteConfirmState> = None;
     // The "Edit folder" modal's state, `Some` while open. Set from the
     // sidebar's `SidebarAction::EditFolder`, seeded with that folder's
     // current name; cleared on Save/Delete success or Cancel/Esc.
@@ -2901,7 +2884,6 @@ pub fn build_frame_with_search(
                         &filter,
                         &mut search,
                         &mut selected_id,
-                        item_delete_pending.as_ref().map(|(id, _)| id.as_str()),
                         &icons,
                         &mut visible_ids,
                         notice.map(|(_, message)| message),
@@ -3091,9 +3073,13 @@ pub fn build_frame_with_search(
             // Recompute once per selection change, not every frame -- see
             // `fill_count`'s declaration above.
             fill_count = selected_id.as_deref().map(|id| fill_stats.count(id)).unwrap_or(0);
-            // A delete armed on the previous item shouldn't silently carry
-            // over and be confirmable against the newly selected one.
-            item_delete_pending = None;
+            // **Nothing to reset for the delete any more.** This block used
+            // to clear a two-click arm here, because an arm set on the
+            // previous item would otherwise have been confirmable against
+            // the newly selected one. The modal carries the id it was opened
+            // with and cannot be answered against a different item, so there
+            // is no cross-selection state left to wipe -- and while it is up
+            // its scrim means no row can be selected anyway.
             // **A selection made is a dismissal undone.** Clicking any row
             // reopens the pane -- which needs nothing from this flag, since
             // `selected_id` is `Some` again -- but a stale `true` left here
@@ -3116,11 +3102,13 @@ pub fn build_frame_with_search(
 
         // An entry of some item row's right-click menu, chosen this frame.
         //
-        // Handled here, and deliberately AFTER the reset block above: a
-        // right-click both opens the menu and selects the row, and that
-        // reset clears `item_delete_pending`. Acting first would let the
-        // reset wipe the arm a Delete entry had just set, so the two-click
-        // confirmation could never reach its confirming click.
+        // Handled here, after the reset block above. It used to MATTER that
+        // it was after: a right-click both opens the menu and selects the
+        // row, that reset cleared the two-click arm, and acting first would
+        // have wiped the arm a Delete entry had just set. The arm is gone
+        // and `delete_confirm` is not touched by the reset, so the order is
+        // no longer load-bearing for this reason -- it is kept because the
+        // rest of the paragraph below still is.
         //
         // Handled in its OWN block rather than folded into the read arm's
         // `DetailAction` match, because the item list is drawn in EVERY
@@ -3303,25 +3291,19 @@ pub fn build_frame_with_search(
                             }
                         }
                     }
-                    // The existing two-click confirmation, unchanged: the
-                    // first choice arms `item_delete_pending` (which makes
-                    // the entry read "Delete? Click to confirm" the next time
-                    // the menu is opened), a second within the window
-                    // confirms.
+                    // **Asks, and does nothing else.** The delete itself is
+                    // in one place -- the `delete_confirm` block after the
+                    // panels -- and this arm's whole job is to open the
+                    // question against this row's item. Both the id and the
+                    // name are copied because the modal outlives this frame
+                    // and a sync can replace the snapshot under it; the
+                    // handler looks the item up fresh by id when it acts.
                     item_list::RowCommand::Delete => {
-                        if confirm_click(&mut item_delete_pending, &item.id) {
-                            if let Some(message) = delete_vault_item(
-                                ui.ctx(),
-                                &cache,
-                                &needs_reauth_for_closure,
-                                &mut items,
-                                &mut selected_id,
-                                &mut trash_list,
-                                &item,
-                            ) {
-                                move_error = Some(message);
-                            }
-                        }
+                        delete_confirm = Some(delete_modal::DeleteConfirmState::new(
+                            item.id.clone(),
+                            item.name.clone(),
+                            delete_modal::DeleteKind::ToTrash,
+                        ));
                     }
                     // Delete, just above, is the FIRST of the five commands
                     // that move an item between this window's three lists,
@@ -3456,32 +3438,15 @@ pub fn build_frame_with_search(
                             }
                         }
                     }
-                    // The only irreversible command in this window, on the
-                    // same two-click confirmation as Delete.
+                    // The only irreversible command in this window, through
+                    // the same modal as Delete -- which tells the two apart
+                    // by its `DeleteKind`, in every sentence it shows.
                     item_list::RowCommand::PurgeForever => {
-                        if confirm_click(&mut item_delete_pending, &item.id) {
-                            match cache.purge_item(&item.id) {
-                                Ok(()) => {
-                                    if selected_id.as_deref() == Some(item.id.as_str()) {
-                                        selected_id = None;
-                                    }
-                                    trash_list.invalidate();
-                                }
-                                Err(e) => {
-                                    log::warn!("failed to purge item {}: {e:?}", item.id);
-                                    move_error = Some(list_command_failure_message(
-                                        ListCommand::Purge,
-                                        &item.name,
-                                        &e,
-                                    ));
-                                    flag_reauth_if_unauthorized(
-                                        ui.ctx(),
-                                        &needs_reauth_for_closure,
-                                        &e,
-                                    );
-                                }
-                            }
-                        }
+                        delete_confirm = Some(delete_modal::DeleteConfirmState::new(
+                            item.id.clone(),
+                            item.name.clone(),
+                            delete_modal::DeleteKind::Forever,
+                        ));
                     }
                 }
                 }
@@ -3656,8 +3621,10 @@ pub fn build_frame_with_search(
                 //  * `Create` -- there is no item, which is exactly why the
                 //    create form is handed `None` at the seam below.
                 //
-                // `item_delete_pending`'s expiry stays in the `Read` arm: it
-                // is that pane's own armed confirmation, not a vault fact.
+                // The delete confirmation is a modal and has no expiry to
+                // run down here -- it used to be a two-click arm whose
+                // timer lived in the `Read` arm, being that pane's own
+                // state and not a vault fact.
                 if out_of_vault.is_none() && !matches!(mode, DetailMode::Create(_)) {
                     if let Some(item) = &selected_item {
                         // Only poll `bw serve` for a TOTP code if this
@@ -3998,15 +3965,6 @@ pub fn build_frame_with_search(
                             // non-login kinds if any early return reappears
                             // inside `draw_read_arm`.
 
-                            // Auto-expire a stale armed item delete the same
-                            // way the sidebar's folder delete does above.
-                            if let Some((_, armed_at)) = item_delete_pending {
-                                if Instant::now() >= armed_at + DELETE_CONFIRM_WINDOW {
-                                    item_delete_pending = None;
-                                }
-                            }
-                            let delete_pending = item_delete_pending.as_ref().map(|(id, _)| id.as_str()) == Some(item.id.as_str());
-
                             // Everything this arm *draws* -- the pane -- lives
                             // in `draw_read_arm` rather than here, so it can be
                             // driven headlessly by a test. See that
@@ -4039,7 +3997,6 @@ pub fn build_frame_with_search(
                                 &folders,
                                 fill_count,
                                 &totp_state,
-                                delete_pending,
                                 &mut reveal,
                                 icons.textures.get(item.id.as_str()),
                                 &mut app_identities,
@@ -4404,33 +4361,23 @@ pub fn build_frame_with_search(
                                 DetailAction::AddTotp => {
                                     add_totp_asked = true;
                                 }
-                                // As with the sidebar's folder ×,
-                                // `confirm_click` gates this on a confirming
-                                // second click -- see its doc comment. Only
-                                // then does this actually call
-                                // `cache.delete_item`.
+                                // **The SECOND door onto the soft delete, and
+                                // it asks the same question the first one
+                                // does.** This arm used to call
+                                // `delete_vault_item` behind a `confirm_click`
+                                // of its own; both doors now open one modal,
+                                // and the delete lives in one place after the
+                                // panels. That is what makes "the pane closes
+                                // and nothing opens" a property of the delete
+                                // rather than something each door has to
+                                // remember.
                                 DetailAction::Delete => {
-                                    if confirm_click(&mut item_delete_pending, &item.id) {
-                                        // The SECOND door onto the soft
-                                        // delete. It gets the invalidation
-                                        // and the band message for free
-                                        // because both live in
-                                        // `delete_vault_item`; all this arm
-                                        // owes is routing the sentence to
-                                        // the band, exactly as the row menu's
-                                        // arm does.
-                                        if let Some(message) = delete_vault_item(
-                                            ui.ctx(),
-                                            &cache,
-                                            &needs_reauth_for_closure,
-                                            &mut items,
-                                            &mut selected_id,
-                                            &mut trash_list,
-                                            item,
-                                        ) {
-                                            move_error = Some(message);
-                                        }
-                                    }
+                                    delete_confirm =
+                                        Some(delete_modal::DeleteConfirmState::new(
+                                            item.id.clone(),
+                                            item.name.clone(),
+                                            delete_modal::DeleteKind::ToTrash,
+                                        ));
                                 }
                                 // **The MATCHED APP card's two writes.** Both
                                 // go through `cache.update_item`, which
@@ -4947,6 +4894,111 @@ pub fn build_frame_with_search(
                             state.item_id
                         );
                         icon_pick = None;
+                    }
+                }
+            }
+        }
+
+        // **The delete confirmation, drawn here for `folder_edit`'s reason**
+        // -- late, so its scrim is over the three panels -- and, far more
+        // importantly, **THE ONE PLACE IN THIS WINDOW THAT DELETES
+        // ANYTHING.** All three doors (the item row's Delete, a trashed
+        // row's Delete forever, the detail pane kebab's Delete) do nothing
+        // but open the modal, so `cache.delete_item` and `cache.purge_item`
+        // each have exactly one caller. That is what makes the two things
+        // this block owes -- the Trash list invalidation, and closing the
+        // detail pane onto nothing -- properties of the delete rather than
+        // three copies each door has to remember.
+        if let Some(state) = &mut delete_confirm {
+            let action = delete_modal::draw_delete_modal(ui.ctx(), state);
+            // The kind and the id are COPIED out before anything acts,
+            // because the deed below needs `delete_confirm` free to write a
+            // refusal back into. Same re-borrow shape as the icon modal
+            // directly above.
+            let asked = match action {
+                delete_modal::DeleteConfirmAction::None => None,
+                delete_modal::DeleteConfirmAction::Cancel => {
+                    delete_confirm = None;
+                    None
+                }
+                delete_modal::DeleteConfirmAction::Confirm => {
+                    Some((state.kind, state.item_id.clone(), state.item_name.clone()))
+                }
+            };
+            if let Some((kind, id, name)) = asked {
+                let refusal = match kind {
+                    // The item is looked up FRESH, by id, at the moment it is
+                    // acted on -- never captured when the modal opened, for
+                    // the icon modal's reason one block up. An item that has
+                    // gone away in the meantime is a delete that quietly
+                    // closes: there is nothing left to delete, which is the
+                    // outcome the user asked for.
+                    delete_modal::DeleteKind::ToTrash => {
+                        match items.iter().find(|i| i.id == id).cloned() {
+                            Some(item) => delete_vault_item(
+                                ui.ctx(),
+                                &cache,
+                                &needs_reauth_for_closure,
+                                &mut items,
+                                &mut trash_list,
+                                &item,
+                            ),
+                            None => {
+                                log::info!(
+                                    "the item the delete confirmation was opened on ({id}) is \
+                                     no longer in this window's list; nothing to delete"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    // The permanent one needs no lookup at all: `purge_item`
+                    // takes an id, and the item is in the Trash list rather
+                    // than in `items`.
+                    delete_modal::DeleteKind::Forever => match cache.purge_item(&id) {
+                        Ok(()) => {
+                            trash_list.invalidate();
+                            None
+                        }
+                        Err(e) => {
+                            log::warn!("failed to purge item {id}: {e:?}");
+                            flag_reauth_if_unauthorized(
+                                ui.ctx(),
+                                &needs_reauth_for_closure,
+                                &e,
+                            );
+                            Some(list_command_failure_message(ListCommand::Purge, &name, &e))
+                        }
+                    },
+                };
+                match refusal {
+                    // **A refused delete leaves the modal up, saying why.**
+                    // The two-click arm had nowhere to put this: it disarmed
+                    // itself and left a menu that looked exactly like a click
+                    // that never registered. Re-borrowed because the deed
+                    // above needed `delete_confirm` released.
+                    Some(sentence) => {
+                        if let Some(state) = delete_confirm.as_mut() {
+                            state.error = Some(sentence);
+                        }
+                    }
+                    // **Closed, and NOTHING opens behind it** -- the half of
+                    // this the user asked for by name. `selected_id = None`
+                    // alone would half-land it: `apply_vault_load_result`
+                    // reads that as "the initial load, select the first
+                    // item", so the next sync would open the pane on
+                    // whatever item took the deleted one's place. That is
+                    // the ✕'s recorded lesson (see `DetailAction::ClosePane`)
+                    // and `detail_dismissed` is the same load-bearing half
+                    // here.
+                    //
+                    // `detail_slide` is deliberately NOT armed: the slide has
+                    // exactly two arm sites, both gestures the owner named,
+                    // and a delete is neither.
+                    None => {
+                        delete_confirm = None;
+                        selected_id = None;
+                        detail_dismissed = true;
                     }
                 }
             }
@@ -6684,17 +6736,19 @@ fn delete_vault_item(
     cache: &VaultCache,
     needs_reauth: &Rc<RefCell<bool>>,
     items: &mut Vec<VaultItem>,
-    selected_id: &mut Option<String>,
     trash_list: &mut AuxList,
     item: &VaultItem,
 ) -> Option<String> {
     match cache.delete_item(&item.id) {
         Ok(()) => {
             items.retain(|i| i.id != item.id);
-            // Select the first remaining item, or `None` if the vault is now
-            // empty -- either way the selection-change reset block clears
-            // `mode`/`reveal`/`totp_state` on the next frame.
-            *selected_id = items.first().map(|i| i.id.clone());
+            // **The selection is NOT set here any more.** This used to pick
+            // the first remaining item, which meant deleting the item you
+            // were reading dropped you onto a different one's detail pane --
+            // an item you did not ask to see, one keystroke away from the
+            // controls you were just using. The caller closes the pane onto
+            // nothing instead, and it does so for BOTH deletes rather than
+            // only this one, which is why the decision moved out of here.
             trash_list.invalidate();
             None
         }
@@ -10364,7 +10418,6 @@ fn draw_read_arm(
     folders: &[Folder],
     fill_count: u32,
     totp_state: &TotpState,
-    delete_pending: bool,
     reveal: &mut detail::RevealState,
     icon: Option<&egui::TextureHandle>,
     // The window's one `AppIdentityCache`, threaded through to the read pane
@@ -10390,7 +10443,6 @@ fn draw_read_arm(
         folders,
         fill_count,
         totp_state,
-        delete_pending,
         reveal,
         icon,
         apps,
@@ -12175,63 +12227,6 @@ fn apply_icon_write(
     }
     icons.textures.remove(&saved.id);
     favicon_requested.remove(&saved.id);
-}
-
-/// True when `pending` is currently armed for `id` as of `now` -- i.e. a
-/// delete-button click on `id` at `now` would be on the same id as the
-/// arming click and within `DELETE_CONFIRM_WINDOW` of it (the dwell-time
-/// floor is checked separately, by the caller). Also clears `pending` once
-/// it has expired, so a stale arm from several seconds ago can never be
-/// silently confirmed by an unrelated later click.
-fn is_armed_at(pending: &mut Option<(String, Instant)>, id: &str, now: Instant) -> bool {
-    match pending {
-        Some((pending_id, armed_at)) => {
-            if now >= *armed_at + DELETE_CONFIRM_WINDOW {
-                *pending = None;
-                false
-            } else {
-                pending_id == id
-            }
-        }
-        None => false,
-    }
-}
-
-/// Handles one click, at `now`, on a click-to-delete button for `id`.
-///
-/// The first click arms a `DELETE_CONFIRM_WINDOW`-long confirmation (storing
-/// `now` as when it was armed) and returns `false` (don't delete yet). A
-/// second click on the *same* `id`, within that window, only counts as the
-/// *confirming* click -- clearing `pending` and returning `true` -- once at
-/// least `MIN_CONFIRM_DWELL` has passed since the arming click; egui
-/// delivers both clicks of a fast double-click within the same or adjacent
-/// frames, so without this floor a habitual double-click would arm and
-/// confirm before the user ever saw the intermediate "armed, click again"
-/// state, defeating the confirmation entirely. A click on the same id that's
-/// too fast, on a different id, or after the window has elapsed just
-/// (re)arms `id` instead of confirming anything.
-fn confirm_click_at(pending: &mut Option<(String, Instant)>, id: &str, now: Instant) -> bool {
-    if is_armed_at(pending, id, now) {
-        let armed_at = pending.as_ref().map(|(_, armed_at)| *armed_at).expect(
-            "is_armed_at only returns true when pending is Some, so this is always populated",
-        );
-        if now.saturating_duration_since(armed_at) >= MIN_CONFIRM_DWELL {
-            *pending = None;
-            true
-        } else {
-            false
-        }
-    } else {
-        *pending = Some((id.to_string(), now));
-        false
-    }
-}
-
-/// [`confirm_click_at`] using the real clock. Split out so tests can drive
-/// `confirm_click_at` with synthetic `Instant`s instead of relying on real
-/// `std::thread::sleep` calls to exercise `MIN_CONFIRM_DWELL`.
-fn confirm_click(pending: &mut Option<(String, Instant)>, id: &str) -> bool {
-    confirm_click_at(pending, id, Instant::now())
 }
 
 /// True when `url` is safe to hand off to the shell to open: an `http://`
@@ -15187,112 +15182,6 @@ mod url_safety_tests {
 }
 
 #[cfg(test)]
-mod delete_confirm_tests {
-    use super::{confirm_click, confirm_click_at, DELETE_CONFIRM_WINDOW, MIN_CONFIRM_DWELL};
-    use std::time::Instant;
-
-    #[test]
-    fn first_click_arms_but_does_not_confirm() {
-        let mut pending = None;
-        assert!(!confirm_click(&mut pending, "f1"));
-        assert!(pending.is_some());
-    }
-
-    #[test]
-    fn second_click_on_the_same_id_after_the_dwell_confirms_and_disarms() {
-        let start = Instant::now();
-        let mut pending = None;
-        assert!(!confirm_click_at(&mut pending, "f1", start));
-        // Comfortably past MIN_CONFIRM_DWELL but still well inside
-        // DELETE_CONFIRM_WINDOW.
-        let later = start + MIN_CONFIRM_DWELL + std::time::Duration::from_millis(1);
-        assert!(confirm_click_at(&mut pending, "f1", later));
-        assert!(pending.is_none());
-    }
-
-    #[test]
-    fn a_click_on_a_different_id_rearms_instead_of_confirming() {
-        let start = Instant::now();
-        let mut pending = None;
-        assert!(!confirm_click_at(&mut pending, "f1", start));
-        let later = start + MIN_CONFIRM_DWELL + std::time::Duration::from_millis(1);
-        assert!(!confirm_click_at(&mut pending, "f2", later));
-        // f2 is now armed, not f1 -- confirming f1 again should just re-arm it.
-        assert!(!confirm_click_at(
-            &mut pending,
-            "f1",
-            later + MIN_CONFIRM_DWELL + std::time::Duration::from_millis(1)
-        ));
-    }
-
-    // -- Fix: a fast double-click must not arm and confirm in one gesture --
-    //
-    // egui delivers both clicks of a rapid double-click within the same (or
-    // an adjacent) frame, so the two `confirm_click` calls land only
-    // microseconds apart in real time -- far under `MIN_CONFIRM_DWELL`. The
-    // pre-fix implementation treated any second click on the same id within
-    // `DELETE_CONFIRM_WINDOW` as confirming, so a habitual double-click could
-    // arm and confirm a delete before the "armed, click again" state was
-    // ever rendered. These tests exercise that exact timing directly, via
-    // synthetic `Instant`s, without needing a real sleep or an egui context.
-
-    #[test]
-    fn a_second_click_faster_than_the_dwell_window_does_not_confirm() {
-        let start = Instant::now();
-        let mut pending = None;
-        assert!(!confirm_click_at(&mut pending, "f1", start));
-        // Simulates both clicks of a fast double-click landing in the same
-        // frame: well under MIN_CONFIRM_DWELL after the arming click.
-        let too_soon = start + std::time::Duration::from_millis(1);
-        assert!(!confirm_click_at(&mut pending, "f1", too_soon));
-        // Still armed for f1, not silently dropped -- the user gets another
-        // chance to actually see the armed state and confirm it for real.
-        assert!(pending.is_some());
-    }
-
-    #[test]
-    fn a_click_exactly_at_the_dwell_boundary_confirms() {
-        let start = Instant::now();
-        let mut pending = None;
-        assert!(!confirm_click_at(&mut pending, "f1", start));
-        let at_boundary = start + MIN_CONFIRM_DWELL;
-        assert!(confirm_click_at(&mut pending, "f1", at_boundary));
-    }
-
-    #[test]
-    fn a_click_still_too_fast_after_a_rearm_still_does_not_confirm() {
-        // Arm, then immediately click again (too fast -- stays armed per the
-        // test above), then click again immediately once more: still too
-        // fast relative to the *original* arming click, so this must still
-        // not confirm.
-        let start = Instant::now();
-        let mut pending = None;
-        assert!(!confirm_click_at(&mut pending, "f1", start));
-        let too_soon = start + std::time::Duration::from_millis(1);
-        assert!(!confirm_click_at(&mut pending, "f1", too_soon));
-        let still_too_soon = start + std::time::Duration::from_millis(2);
-        assert!(!confirm_click_at(&mut pending, "f1", still_too_soon));
-        assert!(pending.is_some());
-    }
-
-    #[test]
-    fn confirmation_still_expires_after_delete_confirm_window() {
-        // The dwell floor is additive, not a replacement for the existing
-        // upper bound: an arm still lapses after DELETE_CONFIRM_WINDOW, well
-        // past MIN_CONFIRM_DWELL, and a "confirming" click that arrives only
-        // after the window elapsed just re-arms instead.
-        let start = Instant::now();
-        let mut pending = None;
-        assert!(!confirm_click_at(&mut pending, "f1", start));
-        let after_window = start + DELETE_CONFIRM_WINDOW + std::time::Duration::from_millis(1);
-        assert!(!confirm_click_at(&mut pending, "f1", after_window));
-        // Re-armed, not confirmed or empty.
-        assert!(pending.is_some());
-    }
-}
-
-#[cfg(test)]
-#[cfg(test)]
 mod clone_name_tests {
     //! What a cloned item is called, and why it cannot simply be the
     //! original's name.
@@ -17240,10 +17129,10 @@ mod out_of_vault_wiring_tests {
         );
     }
 
-    /// The **five** commands that move an item between this window's three
-    /// lists: the arm marker, the needle proving it drops the on-demand list
-    /// it moved an item into or out of, and the needle proving a refusal
-    /// reaches the user.
+    /// The **three** commands that move an item between this window's three
+    /// lists FROM WITHIN THEIR OWN ARM: the arm marker, the needle proving
+    /// it drops the on-demand list it moved an item into or out of, and the
+    /// needle proving a refusal reaches the user.
     ///
     /// The list is not cached anywhere, so refetching it is the cheap,
     /// always-correct answer -- but only if the command actually asks. After
@@ -17260,20 +17149,18 @@ mod out_of_vault_wiring_tests {
     /// `MENU_VOCABULARY` once filtered a real menu entry out of both sides of
     /// an "exactly these entries" comparison.
     ///
-    /// Delete's two needles are the delegation rather than the deed, because
-    /// its deed is in `delete_vault_item`: it has TWO doors (this menu and
-    /// the detail pane's kebab), so writing the invalidation and the message
-    /// inline here would have covered one of them. What this array pins for
-    /// Delete is that the arm hands the helper the list to drop and routes
-    /// the sentence it returns to the band;
-    /// `the_soft_delete_is_wired_at_both_of_its_doors` pins the helper itself
-    /// and the other door.
-    const COMMAND_ARMS: [(&str, &str, &str); 5] = [
-        (
-            concat!("RowCommand::Del", "ete => {"),
-            concat!("&mut trash_", "list,"),
-            concat!("move_error = Some(mes", "sage);"),
-        ),
+    /// **And it listed five until the delete modal.** Delete and Delete
+    /// forever are still commands that move an item between these lists, and
+    /// they still owe both rules -- but their arms no longer *do* anything:
+    /// each opens the confirmation and stops, so an arm-slice needle for
+    /// either would pin an empty promise. The two of them are pinned
+    /// instead against the block that really acts, by
+    /// [`the_two_delete_arms_only_ask`] and
+    /// [`the_delete_modal_is_the_only_thing_that_deletes`] below. Removing
+    /// them from here is the same move the array's own warning forbids in
+    /// the other direction, which is why it is stated: what narrows a guard
+    /// is an entry dropped SILENTLY, and these two gained a stricter pair.
+    const COMMAND_ARMS: [(&str, &str, &str); 3] = [
         (
             concat!("RowCommand::Arch", "ive => {"),
             concat!("archive_list.inval", "idate();"),
@@ -17289,11 +17176,13 @@ mod out_of_vault_wiring_tests {
             concat!("trash_list.inval", "idate();"),
             REPORTS_THE_FAILURE,
         ),
-        (
-            concat!("RowCommand::PurgeFor", "ever => {"),
-            concat!("trash_list.inval", "idate();"),
-            REPORTS_THE_FAILURE,
-        ),
+    ];
+
+    /// The two arms that delete, and the state each must open the
+    /// confirmation with.
+    const DELETE_ARMS: [(&str, &str); 2] = [
+        (concat!("RowCommand::Del", "ete => {"), "DeleteKind::ToTrash"),
+        (concat!("RowCommand::PurgeFor", "ever => {"), "DeleteKind::Forever"),
     ];
 
     /// Where an arm body stops. The four arms are consecutive, so each ends
@@ -17318,9 +17207,21 @@ mod out_of_vault_wiring_tests {
             .find(marker)
             .unwrap_or_else(|| panic!("no {marker:?} arm in this file"));
         let rest = &source[at + marker.len()..];
-        let end = rest
-            .find(NEXT_ARM)
-            .or_else(|| rest.find(AFTER_LAST_ARM))
+        // **The NEARER of the two, not the first one that matches.** This
+        // read `find(NEXT_ARM).or_else(|| find(AFTER_LAST_ARM))`, which is
+        // correct for every arm that has another arm after it and wrong for
+        // the last one: `item_list::RowCommand::` occurs again much further
+        // down the file, so the LAST arm's slice ran past the end of the
+        // match and swallowed thousands of lines -- `delete_vault_item`'s
+        // body among them. Every needle in this module is an "appears once"
+        // count, so an over-long slice fails safe in one direction and not
+        // at all in the other: `the_two_delete_arms_only_ask` asserts an
+        // absence, and it found `cache.delete_item(` in an arm that does not
+        // contain it.
+        let end = [rest.find(NEXT_ARM), rest.find(AFTER_LAST_ARM)]
+            .into_iter()
+            .flatten()
+            .min()
             .unwrap_or_else(|| {
                 panic!(
                     "no {NEXT_ARM:?} or {AFTER_LAST_ARM:?} after the {marker:?} arm -- \
@@ -17414,55 +17315,157 @@ mod out_of_vault_wiring_tests {
     const DEFINES_DELETE: &str = concat!("fn delete_vault", "_item(");
     /// The `fn` that follows it, which is where its body stops.
     const AFTER_DELETE: &str = concat!("fn move_item_into", "_folder(");
-    /// Both doors' shared spelling of "route the sentence to the band".
-    const DELETE_REPORTS: &str = concat!("move_error = Some(mes", "sage);");
     /// The helper's name at a call site or a definition alike.
     const CALLS_DELETE: &str = concat!("delete_vault_", "item(");
-    /// The SECOND door: the detail pane's kebab, and the arm that follows it.
-    /// The row menu's door is `COMMAND_ARMS[0]`, sliced by `arm_body`.
-    const KEBAB_DOOR: &str = concat!("DetailAction::Del", "ete => {");
-    const AFTER_KEBAB_DOOR: &str = concat!("DetailAction::No", "ne => {}");
 
-    /// The detail pane's kebab arm, from its own `=> {` to the arm after it.
+    /// **The delete confirmation's handler**, which is the one block in this
+    /// window that can reach `cache.delete_item` or `cache.purge_item`.
+    const DELETE_BLOCK: &str = concat!("if let Some(state) = &mut delete_", "confirm {");
+    /// Where it stops: the composer's gating comment, drawn straight after
+    /// it. A marker in prose rather than in code because the block ends on a
+    /// closing brace, and a brace is not a thing a `find` can aim at.
+    const AFTER_DELETE_BLOCK: &str =
+        concat!("THE ONE GATING POSITION for the ", "record composer");
+
+    /// The handler's body, from its own `{` to the block after it.
     ///
     /// Same idiom, and the same reason, as [`arm_body`]: a file-wide count
-    /// cannot tell which door supplied a match. `DELETE_REPORTS` counted 2
-    /// across the whole file while the kebab door was `let _ =
-    /// delete_vault_item(...)` and one unrelated `move_error =
-    /// Some(message);` elsewhere in `run` made up the difference -- which is
-    /// a plausible spelling for any future arm that gets a sentence back
-    /// from a helper.
-    fn kebab_delete_body() -> &'static str {
+    /// cannot tell which region supplied a match, and this guard's whole
+    /// claim is about WHERE the two `cache` calls are.
+    fn delete_block_body() -> &'static str {
         let source = production();
         let at = source
-            .find(KEBAB_DOOR)
-            .unwrap_or_else(|| panic!("no {KEBAB_DOOR:?} arm in production code"));
-        let rest = &source[at + KEBAB_DOOR.len()..];
-        let end = rest.find(AFTER_KEBAB_DOOR).unwrap_or_else(|| {
+            .find(DELETE_BLOCK)
+            .unwrap_or_else(|| panic!("no {DELETE_BLOCK:?} in production code"));
+        let rest = &source[at + DELETE_BLOCK.len()..];
+        let end = rest.find(AFTER_DELETE_BLOCK).unwrap_or_else(|| {
             panic!(
-                "no {AFTER_KEBAB_DOOR:?} after the {KEBAB_DOOR:?} arm -- this guard slices \
-                 the arm body up to it and cannot without it"
+                "no {AFTER_DELETE_BLOCK:?} after {DELETE_BLOCK:?} -- this guard slices the \
+                 handler up to it and cannot without it"
             )
         });
         &rest[..end]
     }
 
+    /// **Both delete arms ask, and neither acts.**
+    ///
+    /// The finding this closes is the one the modal was built for, stated as
+    /// a rule a future edit can break: an arm that goes back to deleting
+    /// directly is a delete with no confirmation in front of it, and it
+    /// would still pass every menu test in `item_list.rs` (the entry is
+    /// drawn, the command comes back) and every wiring test above (the arm
+    /// exists). The only thing that catches it is asserting that the arm
+    /// does NOT delete.
     #[test]
-    fn the_soft_delete_is_wired_at_both_of_its_doors() {
-        // The finding this closes: Delete is a SOFT delete, so it moves the
-        // item into the Trash, and it did neither of the two things the other
-        // four do. Reproduce the invalidation half by hand -- open Trash (the
-        // list is fetched and the badge reads N), switch to All items, delete
-        // an item, open Trash again: `wants_fetch` sees a list already in
-        // hand, nothing refetches, and the just-deleted item is absent from
-        // Trash with the badge still reading N for the life of the window.
-        //
-        // It has TWO doors -- the row menu and the detail pane's kebab -- and
-        // the per-arm guard above can only ever see the first. That is why
-        // the deed is in `delete_vault_item` and this checks the helper's own
-        // body: one body, so both doors are covered by construction rather
-        // than by a second needle that could be satisfied by the first door
-        // alone.
+    fn the_two_delete_arms_only_ask() {
+        for (marker, kind) in DELETE_ARMS {
+            let body = arm_body(marker);
+            assert!(
+                body.contains(concat!("DeleteConfirmState::", "new(")),
+                "the {marker:?} arm does not open the confirmation, so its menu entry \
+                 either does nothing or deletes without asking.\n{body}"
+            );
+            assert!(
+                body.contains(kind),
+                "the {marker:?} arm opens the confirmation with the wrong kind -- it does \
+                 not name {kind:?}, so the modal would ask the other delete's question and \
+                 the handler would do the other delete's deed.\n{body}"
+            );
+            for forbidden in
+                [concat!("cache.delete_", "item("), concat!("cache.purge_", "item(")]
+            {
+                assert!(
+                    !body.contains(forbidden),
+                    "the {marker:?} arm calls {forbidden:?} itself, so it deletes without \
+                     the confirmation the modal exists to put in front of it.\n{body}"
+                );
+            }
+        }
+    }
+
+    /// **One place deletes, and it is the one behind the modal.**
+    ///
+    /// Counted across production code rather than sliced, because the claim
+    /// is about the whole file: a second caller anywhere is a second door,
+    /// and a second door is one the confirmation does not cover.
+    /// `delete_vault_item` is the soft delete's body and is counted at two
+    /// (its definition plus the handler's single call); `purge_item` is the
+    /// permanent delete's `cache` call itself.
+    #[test]
+    fn the_delete_modal_is_the_only_thing_that_deletes() {
+        let body = delete_block_body();
+        assert!(
+            !body.trim().is_empty(),
+            "the handler slice came out empty -- DELETE_BLOCK or AFTER_DELETE_BLOCK is \
+             stale and this guard proved nothing"
+        );
+        assert_eq!(
+            production().matches(CALLS_DELETE).count(),
+            2,
+            "expected {CALLS_DELETE:?} twice in production code: the definition and the \
+             confirmation handler's one call. A third is another door onto the soft \
+             delete, and it is not behind the modal"
+        );
+        assert_eq!(
+            production().matches(concat!("cache.purge_", "item(")).count(),
+            1,
+            "the permanent delete is called from somewhere other than the confirmation \
+             handler, so the one irreversible action in this window can happen without \
+             the question being asked"
+        );
+        assert!(
+            body.contains(concat!("cache.purge_", "item(")),
+            "the confirmation handler does not purge, so \"Delete forever\" is a modal \
+             that asks and then does nothing.\n{body}"
+        );
+        assert!(
+            body.contains(CALLS_DELETE),
+            "the confirmation handler does not call {CALLS_DELETE:?}, so \"Delete\" is a \
+             modal that asks and then does nothing.\n{body}"
+        );
+    }
+
+    /// **A confirmed delete closes the pane onto nothing** -- the half the
+    /// owner asked for by name: "if it was open on details screen, it needs
+    /// to be closed and nothing open".
+    ///
+    /// Both needles, because `selected_id = None` alone half-lands it:
+    /// `apply_vault_load_result` reads a `None` selection as "the initial
+    /// load, select the first item", so the next sync would reopen the pane
+    /// on whatever item took the deleted one's place. That is the close
+    /// button's own recorded lesson, and `detail_dismissed` is the same
+    /// load-bearing half here.
+    #[test]
+    fn a_confirmed_delete_closes_the_pane_onto_nothing() {
+        let body = delete_block_body();
+        for (needle, why) in [
+            (
+                concat!("selected_id = No", "ne;"),
+                "the pane stays open on the item that was just deleted",
+            ),
+            (
+                concat!("detail_dismissed = tr", "ue;"),
+                "the pane closes and the next sync reopens it on whatever item took the \
+                 deleted one's place, because a `None` selection reads as never chosen",
+            ),
+        ] {
+            assert!(
+                body.contains(needle),
+                "the confirmation handler does not do {needle:?}, so {why}.\n{body}"
+            );
+        }
+    }
+
+    /// The soft delete's own body still drops the Trash list it moved an
+    /// item INTO, and still words its own refusal.
+    ///
+    /// Reproduce the invalidation half by hand: open Trash (the list is
+    /// fetched and the badge reads N), switch to All items, delete an item,
+    /// open Trash again -- `wants_fetch` sees a list already in hand,
+    /// nothing refetches, and the just-deleted item is absent from Trash
+    /// with the badge still reading N for the life of the window.
+    #[test]
+    fn the_soft_delete_drops_the_trash_list_and_words_its_own_refusal() {
         let source = production();
         let at = source
             .find(DEFINES_DELETE)
@@ -17498,50 +17501,6 @@ mod out_of_vault_wiring_tests {
                 "`delete_vault_item` does not do {needle:?} exactly once -- {why}.\n{body}"
             );
         }
-        // Positive control for the slice, and for the "one body" claim: the
-        // helper must be reached from exactly two places. Three occurrences
-        // = the definition plus two call sites; a third caller, or a call
-        // site deleted, changes the count and this guard stops being true.
-        assert_eq!(
-            production().matches(CALLS_DELETE).count(),
-            3,
-            "expected {CALLS_DELETE:?} three times in production code: the definition, \
-             the row menu's arm, and the detail pane's kebab. A fourth door would not be \
-             covered by anything here; a missing one means a Delete that no longer goes \
-             through the body checked above"
-        );
-        // And that BOTH doors forward the sentence. `#[must_use]` on the
-        // helper makes ignoring the return a warning rather than nothing, but
-        // `let _ =` silences that, and this does not.
-        //
-        // ONCE IN EACH DOOR'S OWN SLICE, not twice in the file. The file-wide
-        // count let one door supply the other's needle: the kebab as `let _ =
-        // delete_vault_item(...)` plus one unrelated `if let Some(message) =
-        // ... { move_error = Some(message); }` anywhere else in `run` counts
-        // 2, keeps `CALLS_DELETE` at 3, and passes with the kebab door
-        // silent. Same shape as `COMMAND_ARMS`, which has always sliced the
-        // row menu's door for exactly this reason.
-        for (door, body) in [
-            ("the row menu's arm", arm_body(COMMAND_ARMS[0].0)),
-            ("the detail pane's kebab", kebab_delete_body()),
-        ] {
-            assert_eq!(
-                body.matches(DELETE_REPORTS).count(),
-                1,
-                "{door} does not do {DELETE_REPORTS:?} exactly once. `delete_vault_item` \
-                 returning a sentence that this door drops is exactly as silent as the \
-                 `log::warn!` it replaced -- and the other door having it proves nothing \
-                 about this one.\n{body}"
-            );
-        }
-        // And that there is no THIRD reporting site: two doors, two forwards.
-        assert_eq!(
-            production().matches(DELETE_REPORTS).count(),
-            2,
-            "expected {DELETE_REPORTS:?} twice in production code -- once per door, and \
-             the two slices above account for both. A third is either an undiscovered \
-             door onto the soft delete or a second spelling of the same forward"
-        );
     }
 
     #[test]
@@ -17575,7 +17534,7 @@ mod out_of_vault_wiring_tests {
         let mut bodies: Vec<&str> = COMMAND_ARMS.iter().map(|(m, _, _)| arm_body(m)).collect();
         bodies.sort_unstable();
         bodies.dedup();
-        assert_eq!(bodies.len(), 5, "two command arms sliced to the same text");
+        assert_eq!(bodies.len(), 3, "two command arms sliced to the same text");
     }
 }
 
@@ -19617,11 +19576,23 @@ mod out_of_vault_pane_placement_tests {
     }
 
     #[test]
-    fn each_of_the_four_list_commands_calls_the_cache() {
+    fn each_of_the_three_list_commands_calls_the_cache() {
         // One needle per command, each naming the cache method it must
         // reach. A missing arm is a compile error (the match is exhaustive);
         // an arm that logs and does nothing is not, and that is what this
         // catches.
+        //
+        // **"Delete forever" left this list when it moved behind the
+        // modal.** Its arm no longer calls the cache at all -- it opens the
+        // confirmation, and the confirmation's handler purges -- so the
+        // needle here would have pinned a call that is correctly absent.
+        // What replaced it is stricter, not weaker:
+        // `out_of_vault_wiring_tests::the_two_delete_arms_only_ask` requires
+        // the arm to open the modal AND forbids it from calling either cache
+        // delete itself, and
+        // `the_delete_modal_is_the_only_thing_that_deletes` counts
+        // `cache.purge_item(` across the whole file to prove the handler is
+        // the only caller there is.
         for (command, call) in [
             (
                 concat!("RowCommand::Arch", "ive =>"),
@@ -19634,10 +19605,6 @@ mod out_of_vault_pane_placement_tests {
             (
                 concat!("RowCommand::Rest", "ore =>"),
                 concat!("cache.restore", "_item(&item)"),
-            ),
-            (
-                concat!("RowCommand::PurgeFor", "ever =>"),
-                concat!("cache.purge", "_item(&item.id)"),
             ),
         ] {
             let at = source()
@@ -19652,15 +19619,22 @@ mod out_of_vault_pane_placement_tests {
     }
 
     #[test]
-    fn the_permanent_delete_is_still_behind_the_two_click_confirmation() {
+    fn the_permanent_delete_is_still_behind_a_confirmation() {
         // The one irreversible action in this window. A `purge_item` reached
-        // without `confirm_click` deletes the user's item on the first click
-        // of a menu entry.
+        // without a confirmation deletes the user's item for good on the
+        // first click of a menu entry.
+        //
+        // It used to be a two-click arm and this needle read
+        // `confirm_click(&mut item_delete_pending`. The modal replaced it,
+        // so what proves the same thing now is that the arm opens the modal
+        // with the PERMANENT kind: an arm that opened it with `ToTrash`
+        // would ask a question -- and would ask the wrong one, promising the
+        // Trash could catch an item it is about to destroy.
         let at = source().find(concat!("RowCommand::PurgeFor", "ever =>")).expect("the arm");
         let arm = &source()[at..at + 1400];
         assert!(
-            arm.contains(concat!("confirm_", "click(&mut item_delete_pending")),
-            "\"Delete forever\" is no longer two-click confirmed"
+            arm.contains(concat!("DeleteKind::For", "ever")),
+            "\"Delete forever\" no longer opens the permanent confirmation"
         );
     }
 
@@ -19834,7 +19808,6 @@ mod draw_read_arm_tests {
                 &[],
                 3,
                 &TotpState::NoSecret,
-                false,
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
@@ -25422,7 +25395,13 @@ mod preferences_modal_wiring_tests {
             // account. That module counts an hour of simulated frames and
             // pins 120 -- on the wall-clock boundary, none while the window is
             // hidden, and fewer still while the backend is failing.
-            modules, 68,
+            // 67 when `mod delete_confirm_tests` went with the two-click
+            // arm it tested. That module drove `confirm_click_at` with
+            // synthetic `Instant`s -- the dwell floor, the expiry window,
+            // the wrong-id case -- and every one of those rules is gone from
+            // the crate rather than moved, because the delete confirmation
+            // is a modal now and a modal has no clock in it.
+            modules, 67,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -31408,7 +31387,7 @@ mod send_delete_wiring {
     /// `favicon_requested`, `visible_ids`, `send_delete.view().in_flight`.
     /// **Fifteen are never once true, in any test, on any frame:**
     /// `export.in_flight`, `move_error`, `generate_error`, `folder_edit`,
-    /// `prefs`, `item_delete_pending`, `pending_launch`,
+    /// `prefs`, `delete_confirm`, `pending_launch`,
     /// `totp_poll_in_flight`, `totp_poll_failing`, `sync_status`,
     /// `last_sync_at`, `vault_load_error`, `fill_count`, `mode !=
     /// DetailMode::Read`, `initial_load_started`. With `last_activity`
