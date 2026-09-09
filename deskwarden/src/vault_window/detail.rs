@@ -1610,7 +1610,39 @@ pub fn draw_out_of_vault_read(ui: &mut egui::Ui, item: &VaultItem, out: OutOfVau
             ui.label(RichText::new(heading).size(12.0).color(theme::TEXT_MUTED));
         });
     ui.add_space(18.0);
-    ui.label(RichText::new(body).size(13.0).color(theme::TEXT_FAINT));
+    // **The explanation is a card, like everything else this pane says.**
+    //
+    // It was a bare `ui.label` on the pane's own background: no fill, no
+    // border, and -- because the pane's frame lost its margin when the header
+    // strip was made to reach the panel's edges -- no inset either, so the
+    // sentence started hard against the window edge while every other thing
+    // this pane draws sits on white with 16pt of air. Reported with a
+    // screenshot of exactly that.
+    //
+    // Built from the same three values `card` uses rather than through `card`
+    // itself: that helper draws a heading, a `border-bottom` hairline and then
+    // its contents, and this block has no heading. Giving it one ("TRASHED",
+    // say) was considered and rejected -- the pane's own header two rows above
+    // already says "This item is in the Trash.", and a card heading repeating
+    // it would be the third time the same fact is on screen.
+    //
+    // `HEADER_PAD_X` for the outer inset, matching the header strip directly
+    // above it, so the two boxes share a left edge; `CARD_PAD_X` inside, so
+    // the text sits where a card's rows do.
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(HEADER_PAD_X, 0))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .corner_radius(CornerRadius::same(10))
+                .stroke(Stroke::new(1.0, theme::HAIRLINE))
+                .inner_margin(Margin::same(CARD_PAD_X))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new(body).size(13.0).color(theme::TEXT_FAINT));
+                });
+        });
 }
 
 /// The values this pane offers a keyboard copy for.
