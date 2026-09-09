@@ -2497,7 +2497,47 @@ mod tests {
             // message. That implementation was first run against the PREVIOUS
             // pinned pair and reproduced (17484, 0x8fea_7c18_c6c9_0d5e)
             // exactly, so it is measuring what this test measures.
-            (21763, 0xb612_6058_b89a_c276_u64),
+            //
+            // **23092 bytes, new hash: A DEPENDENCY EDIT, and the case this
+            // pin exists for.** TWO names were ADDED, both from crates.io:
+            // `rustls = { version = "0.23", default-features = false,
+            // features = ["ring", "std", "tls12", "logging"] }` and
+            // `rustls-pki-types = "1"`. They are for `src/http_agent.rs`'s
+            // `bounded_total_plain_trusting_any_certificate`, which is what
+            // makes the site-icon setting "trust any certificate on your own
+            // network" possible: ureq 2 has no per-request knob for it, only
+            // a `tls_config` setter on its agent builder, which takes a
+            // `rustls::ClientConfig` -- so the type has to be nameable in
+            // this crate or the feature cannot be written. (That builder's
+            // type is not spelled here: `http_agent`'s
+            // `bare_ureq_calls_are_confined_to_this_module` walks `src/` for
+            // the name and this file is not exempt, correctly -- the guard
+            // cannot tell a comment from a call.)
+            //
+            // **It brings NO new crate into the tree.** Both were already
+            // here as ureq's own dependencies at exactly these versions
+            // (rustls 0.23.42, rustls-pki-types 1.15.1, per `Cargo.lock`
+            // before this edit); naming them makes them direct rather than
+            // transitive. `default-features = false` plus ureq's own four
+            // features is what keeps that true: rustls's default provider is
+            // `aws-lc-rs`, which is a C library wanting cmake and NASM on
+            // Windows, and it would have been a new toolchain requirement for
+            // a build that has never had one.
+            //
+            // No existing name was removed or re-pointed, no
+            // `[patch]`/`[replace]`/`[workspace.dependencies]` table was
+            // introduced, no path or fork appeared, no existing feature list
+            // was touched, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. 21763 -> 23092 bytes: the two entries
+            // and the comment arguing for them.
+            //
+            // Recomputed the same way the hop above records -- FNV-1a/64 over
+            // the file with CRLF normalised to LF, in a separate
+            // implementation outside this crate -- and that implementation
+            // was first run against the PREVIOUS pinned pair and reproduced
+            // (21763, 0xb612_6058_b89a_c276) exactly, so it is measuring what
+            // this test measures.
+            (23092, 0x1922_0faf_c630_46af_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

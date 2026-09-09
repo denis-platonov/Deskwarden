@@ -713,6 +713,8 @@ dependencies = [
  "regex",
  "rqrr",
  "rsa",
+ "rustls",
+ "rustls-pki-types",
  "semver",
  "serde",
  "serde_json",

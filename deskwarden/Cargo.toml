@@ -123,6 +123,30 @@ windows = { version = "0.58", features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
+# ureq 2.12's own TLS stack, named here so `http_agent` can hand it a
+# `ClientConfig` of its own. The ONE thing that needs one is the site-icon
+# fetch's "ignore certificate errors on my own LAN" switch: ureq exposes no
+# per-agent knob for that, only `AgentBuilder::tls_config`, which takes a
+# `rustls::ClientConfig` -- so the type has to be nameable here or the setting
+# cannot exist. The version tracks ureq's exactly (2.12.1 -> rustls 0.23,
+# rustls-pki-types 1) because a `ClientConfig` from a different rustls is a
+# different type and will not compile against ureq's builder; that mismatch
+# failing loudly is the reason both are pinned rather than left to unify.
+#
+# `default-features = false` plus ureq's own four is not tidying: rustls's
+# default provider is `aws-lc-rs`, a C library wanting cmake and NASM on
+# Windows, and turning it on here would add a toolchain requirement to a build
+# that has never needed one -- for a feature that is one checkbox. ureq builds
+# rustls on `ring`, and an agent whose `ClientConfig` was made by a different
+# provider than the one the agent installs is a runtime panic, not a compile
+# error. So this list mirrors ureq's exactly.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+    "logging",
+] }
+rustls-pki-types = "1"
 directories = "5"
 tray-icon = "0.19"
 # 0.31+ is where egui's text rendering got visibly sharper (better gamma

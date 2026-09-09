@@ -1332,6 +1332,18 @@ pub fn build_frame_with_search(
         .as_deref()
         .map(|path| crate::settings::Settings::load(path).fetch_icons_direct)
         .unwrap_or(false);
+    // The certificate-leniency switch that rides alongside it, recorded for
+    // the icon threads. Same source, same "off when there is nowhere to read
+    // preferences from" default, and re-recorded every frame beside `direct`
+    // below so a toggle takes effect without a restart. See
+    // `favicon::set_tls_leniency_for_private_hosts` for why this is a
+    // process-wide flag rather than a parameter, and why a stale `true` still
+    // cannot reach a public host.
+    let tls_lenient_at_open = settings_path
+        .as_deref()
+        .map(|path| crate::settings::Settings::load(path).icons_ignore_tls_on_private_hosts)
+        .unwrap_or(false);
+    crate::favicon::set_tls_leniency_for_private_hosts(tls_lenient_at_open);
     // **The window's one breach cache**, alive exactly as long as the window
     // and holding nothing but five-character SHA-1 prefixes and counts.
     //
@@ -1646,6 +1658,17 @@ pub fn build_frame_with_search(
                 .map_or(direct_icons_at_open, |s| s.fetch_icons_direct),
             server_url: &server_url,
         };
+        // Recorded every frame, beside `direct` above, so flipping the
+        // checkbox in Preferences takes effect on the next icon fetched
+        // rather than on the next launch. Not part of `IconFetch`: nothing
+        // that draws reads it, and the only thing that does is a background
+        // fetch two modules away.
+        crate::favicon::set_tls_leniency_for_private_hosts(
+            edited_settings_for_closure
+                .borrow()
+                .as_ref()
+                .map_or(tls_lenient_at_open, |s| s.icons_ignore_tls_on_private_hosts),
+        );
 
         // The initial vault load, arriving from the thread spawned before
         // the window opened. Non-blocking like every other drain here, so

@@ -253,6 +253,22 @@ yours. Public sites are contacted over HTTPS only and are never downgraded to
 plain HTTP. Icons fetched this way are cached on disk like any other, so a
 site is normally contacted once.
 
+**Certificates are checked, with one switch and one boundary.** Preferences →
+View → *Trust any certificate on your own network*, a row under *Fetch site
+icons from the sites themselves*. **It ships off.** With it on, a direct icon
+fetch to an address on your own network — `192.168.x.x`, `10.x.x.x`,
+`172.16–31.x.x`, `127.x.x.x`, `localhost`, `169.254.x.x`, and the IPv6
+equivalents — proceeds even if the certificate is one this PC does not trust,
+which is what a self-hosted server with a self-signed certificate serves.
+Nothing else changes: sites out on the internet have their certificates
+checked whatever this is set to, as does every other connection this program
+makes — your vault server, the breach service, the update check. The boundary
+is decided from the address being fetched, at the moment of the request, and
+is covered by tests that walk the neighbours of each range on both sides.
+What it costs, on a network where another machine can answer for that
+address: that machine chooses the picture on that row, and learns that you
+hold an entry for the address.
+
 ## What Deskwarden does not do
 
 - No telemetry, analytics, crash reporting, or usage statistics.

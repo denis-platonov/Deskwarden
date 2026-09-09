@@ -1201,6 +1201,36 @@ pub struct Settings {
     /// machine, behind a different network, is entitled to a different
     /// answer, and that is exactly what a per-machine setting gives.
     pub fetch_icons_direct: bool,
+    /// Whether a direct icon fetch to a **private address** may proceed
+    /// despite a certificate this machine does not trust.
+    ///
+    /// The case, in the owner's words: "for local servers for example, like I
+    /// have a couple". A self-hosted box on a home LAN commonly serves a
+    /// self-signed certificate, or one issued for a name the machine does not
+    /// answer to. A browser lets you past that with a click; this app has no
+    /// click to offer, so the fetch simply fails and the row keeps its
+    /// monogram with nothing saying why.
+    ///
+    /// **It applies to private addresses ONLY, and that is enforced at the
+    /// fetch and not by this comment.** `favicon::fetch_icon_direct` asks
+    /// `favicon::is_private_host` about the URL in hand and reaches for the
+    /// lenient agent only when both this switch and that question say yes.
+    /// A public host gets the ordinary agent whatever this is set to. The
+    /// bound matters because "ignore certificate errors" without one is a
+    /// machine-in-the-middle's licence to choose what is drawn on rows for
+    /// every site in the vault -- and, more to the point, to be told which
+    /// sites those are.
+    ///
+    /// Off by default, and it does nothing at all unless
+    /// [`Self::fetch_icons_direct`] is on: there is no direct fetch to be
+    /// lenient about otherwise, and the icon service is asked over a
+    /// certificate this app has every reason to check.
+    ///
+    /// **Per machine, not per account**, for [`Self::fetch_icons_direct`]'s
+    /// reason: it answers a question about this computer's own network, and
+    /// the same account on a laptop elsewhere is entitled to a different
+    /// answer.
+    pub icons_ignore_tls_on_private_hosts: bool,
     /// Whether a card's network mark is drawn as the network's own logo, when
     /// an image for it is on disk.
     ///
@@ -1656,6 +1686,7 @@ impl Default for Settings {
             check_breaches: false,
             fetch_icons: true,
             fetch_icons_direct: false,
+            icons_ignore_tls_on_private_hosts: false,
             use_brand_logos: false,
             check_for_updates: true,
             reveal_totp_seed: false,
@@ -1797,6 +1828,7 @@ impl Settings {
             check_breaches,
             fetch_icons,
             fetch_icons_direct,
+            icons_ignore_tls_on_private_hosts,
             use_brand_logos,
             check_for_updates,
             reveal_totp_seed,
@@ -1847,6 +1879,7 @@ impl Settings {
         on_disk.check_breaches = *check_breaches;
         on_disk.fetch_icons = *fetch_icons;
         on_disk.fetch_icons_direct = *fetch_icons_direct;
+        on_disk.icons_ignore_tls_on_private_hosts = *icons_ignore_tls_on_private_hosts;
         on_disk.use_brand_logos = *use_brand_logos;
         on_disk.check_for_updates = *check_for_updates;
         on_disk.reveal_totp_seed = *reveal_totp_seed;
@@ -2331,6 +2364,8 @@ mod tests {
             // that assigned it from its parent switch, would round-trip to
             // something that still looks plausible.
             fetch_icons_direct: true,
+            // Opposite of the default, like every field in this record.
+            icons_ignore_tls_on_private_hosts: true,
             // Deliberately the OPPOSITE of this field's own default
             // (`false`), for the reason the lines above give.
             use_brand_logos: true,
@@ -2628,6 +2663,8 @@ mod tests {
             // that assigned it from its parent switch, would round-trip to
             // something that still looks plausible.
             fetch_icons_direct: true,
+            // Opposite of the default, like every field in this record.
+            icons_ignore_tls_on_private_hosts: true,
             use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
@@ -3368,6 +3405,8 @@ mod tests {
             // that assigned it from its parent switch, would round-trip to
             // something that still looks plausible.
             fetch_icons_direct: true,
+            // Opposite of the default, like every field in this record.
+            icons_ignore_tls_on_private_hosts: true,
             use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
@@ -4599,6 +4638,8 @@ mod tests {
             // the parent switch beside it, so a reset that reached this field
             // could not land on a value that looks deliberate.
             fetch_icons_direct: true,
+            // Opposite of the default, like every field in this record.
+            icons_ignore_tls_on_private_hosts: true,
             use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,

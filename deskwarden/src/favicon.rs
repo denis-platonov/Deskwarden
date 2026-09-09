@@ -962,6 +962,97 @@ fn absolute_icon_url(origin: &str, href: &str) -> Option<String> {
     Some(format!("{origin}/{path}"))
 }
 
+/// Whether a direct icon fetch to a **private** address may proceed despite
+/// an untrusted certificate -- `Settings::icons_ignore_tls_on_private_hosts`,
+/// mirrored here.
+///
+/// **A process-wide `AtomicBool` rather than a parameter, and the reason is
+/// the call graph and not convenience.** `fetch_icon_direct` is reached from
+/// three places, two of them recursive walks over candidate URLs, and all of
+/// them run on a detached thread that outlives the frame that spawned it. A
+/// parameter would have to be threaded through `fetch_icon_for`,
+/// `walk_direct`, `walk_candidates`, `declared_icon_candidates` and
+/// `fetch_chosen_icon` -- five signatures carrying a flag that only the
+/// bottom one reads, which is five chances for one path to be handed the
+/// wrong value and no compiler check that they agree.
+///
+/// What makes the global safe is that it is not the whole rule: it is one of
+/// two conditions, and the other -- the host being private -- is answered
+/// from the URL in hand at the moment of the request. A stale `true` here
+/// still cannot reach a public host.
+static IGNORE_TLS_ON_PRIVATE_HOSTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Records the user's `icons_ignore_tls_on_private_hosts` preference for the
+/// icon threads to read.
+///
+/// Called from the one place the vault window already re-reads the icon
+/// settings each frame, beside the `fetch_icons_direct` it belongs to.
+/// Idempotent and cheap: it is a relaxed store of a bool.
+pub fn set_tls_leniency_for_private_hosts(allowed: bool) {
+    IGNORE_TLS_ON_PRIVATE_HOSTS.store(allowed, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// What [`set_tls_leniency_for_private_hosts`] last recorded.
+///
+/// `Relaxed` on both sides: this is a preference, not a lock. The worst a
+/// reordering can do is fetch one icon under the previous answer, one frame
+/// after the user flipped a checkbox.
+fn tls_leniency_for_private_hosts() -> bool {
+    IGNORE_TLS_ON_PRIVATE_HOSTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the fetch of `url` may skip certificate checking, given that the
+/// user's switch is `allowed`.
+///
+/// **Both halves, and the second one is the bound.** A setting read on its
+/// own would be a certificate bypass on the open internet under a name that
+/// says "your own network", which is exactly the failure the wording invites.
+/// The host is answered from the URL in hand rather than from anything the
+/// caller carries, so no stale flag anywhere can widen it.
+///
+/// A pure function rather than an expression inside [`fetch_icon_direct`],
+/// because it is the whole security boundary of the feature and a boundary
+/// that can only be tested by making an HTTPS request is a boundary that does
+/// not get tested. See `tls_leniency_tests`.
+///
+/// **Not [`authority_from_uri`], and not [`host_from_url`] either**, though
+/// both were tried:
+///
+/// * `host_from_url` splits the port off at the first `:`, which turns
+///   `[::1]:8443` into `[` -- the loopback address this switch most obviously
+///   exists for, read as a public host.
+/// * `authority_from_uri` carries `domain_from_uri`'s dotted-host rule, which
+///   rejects a bare `localhost` on purpose. That rule is about which vault
+///   entries get an icon at all, and borrowing it here would tie this
+///   security boundary to a decision made for an unrelated reason -- one the
+///   function's own doc says may be widened in a later commit. A widening
+///   would silently switch this rule's answer for `localhost` from "not
+///   reachable" to "reachable and public", which is a checkbox that stops
+///   working with nothing going red.
+///
+/// So the host is taken from the URL directly: a web scheme, then everything
+/// before the first path separator, then [`host_of_authority`] for the port
+/// (which leaves an IPv6 literal's brackets alone, and [`is_private_host`]
+/// strips them). A URL with no `http`/`https` scheme, or no host, answers
+/// `false` and gets the strict agent -- the only safe direction for a
+/// question whose `true` switches off certificate checking.
+fn may_ignore_tls_for(url: &str, allowed: bool) -> bool {
+    if !allowed {
+        return false;
+    }
+    let trimmed = url.trim();
+    let Some(rest) = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = host_of_authority(authority);
+    !host.is_empty() && is_private_host(host)
+}
+
 /// Blocking GET of one direct candidate URL. Call only from a background
 /// thread.
 ///
@@ -977,13 +1068,38 @@ fn absolute_icon_url(origin: &str, href: &str) -> Option<String> {
 /// share a host.
 fn fetch_icon_direct(url: &str) -> Option<Vec<u8>> {
     static AGENT: OnceLock<crate::http_agent::TotalBounded> = OnceLock::new();
-    let agent = AGENT.get_or_init(|| {
-        crate::http_agent::bounded_total_plain(
-            DIRECT_CONNECT_TIMEOUT,
-            DIRECT_REQUEST_DEADLINE,
-            DIRECT_USER_AGENT,
-        )
-    });
+    static LENIENT_AGENT: OnceLock<crate::http_agent::TotalBounded> = OnceLock::new();
+    // **THE ONE PLACE the certificate bypass is scoped, and it is scoped
+    // here rather than at the switch.** Both halves have to be true: the
+    // user turned `icons_ignore_tls_on_private_hosts` on, AND the host in
+    // this URL is one `is_private_host` recognises. A setting read on its
+    // own would be a bypass on the open internet under a name that says
+    // "private hosts", which is the whole failure mode the wording invites.
+    //
+    // Two agents rather than one built per call: the strict one is what the
+    // three callers above have always used and stays the default for every
+    // public host whatever the switch says, and pooling is worth keeping for
+    // a burst of icons against one LAN box. They are separate `OnceLock`s
+    // because an agent's TLS config is fixed at build time -- there is no
+    // per-request knob in ureq 2 -- so "sometimes lenient" can only be two
+    // agents.
+    let agent = if may_ignore_tls_for(url, tls_leniency_for_private_hosts()) {
+        LENIENT_AGENT.get_or_init(|| {
+            crate::http_agent::bounded_total_plain_trusting_any_certificate(
+                DIRECT_CONNECT_TIMEOUT,
+                DIRECT_REQUEST_DEADLINE,
+                DIRECT_USER_AGENT,
+            )
+        })
+    } else {
+        AGENT.get_or_init(|| {
+            crate::http_agent::bounded_total_plain(
+                DIRECT_CONNECT_TIMEOUT,
+                DIRECT_REQUEST_DEADLINE,
+                DIRECT_USER_AGENT,
+            )
+        })
+    };
     let response = match agent.get(url).call() {
         Ok(response) => response,
         Err(ureq::Error::Status(code, _)) => {
@@ -3724,5 +3840,152 @@ mod tests {
         assert_eq!(read_cached_icon(&dir, domain), Some(bytes));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod tls_leniency_tests {
+    //! The one setting in this app that can switch off certificate checking,
+    //! and the bound that keeps it off the open internet.
+    //!
+    //! Every case here is a call to [`super::may_ignore_tls_for`], which is
+    //! the whole decision: `fetch_icon_direct` asks it and picks one of two
+    //! agents on the answer. A boundary that could only be tested by
+    //! standing up an HTTPS server with a bad certificate is a boundary that
+    //! would not be tested.
+
+    use super::may_ignore_tls_for;
+
+    /// **The switch off means the switch off**, for every host including the
+    /// ones it would allow. The first thing to break if the two conditions
+    /// were ever collapsed into one.
+    #[test]
+    fn nothing_is_lenient_while_the_setting_is_off() {
+        for url in [
+            "https://192.168.1.10/favicon.ico",
+            "https://localhost:8443/favicon.ico",
+            "https://[::1]/favicon.ico",
+            "https://example.com/favicon.ico",
+        ] {
+            assert!(!may_ignore_tls_for(url, false), "{url} was lenient with the switch off");
+        }
+    }
+
+    /// **A public host is never lenient, whatever the switch says.** This is
+    /// the assertion the feature exists inside: "ignore certificate errors"
+    /// scoped to nothing is a machine-in-the-middle's licence to choose what
+    /// is drawn on rows for every site in the vault.
+    ///
+    /// The list walks the neighbours of the private ranges on purpose --
+    /// `172.32`, `192.169`, `11.0` -- because those boundaries are where a
+    /// hand-rolled host check goes wrong, and this one delegates to
+    /// `is_private_host` precisely so it inherits that function's own tested
+    /// answers rather than repeating them.
+    #[test]
+    fn a_public_host_is_never_lenient_even_with_the_setting_on() {
+        for url in [
+            "https://example.com/favicon.ico",
+            "https://icons.bitwarden.net/example.com/icon.png",
+            "https://172.32.0.1/favicon.ico",
+            "https://192.169.0.1/favicon.ico",
+            "https://11.0.0.1/favicon.ico",
+            "https://8.8.8.8/favicon.ico",
+            "https://localhost.example.com/favicon.ico",
+        ] {
+            assert!(
+                !may_ignore_tls_for(url, true),
+                "{url} was treated as private, so certificate checking was skipped for a host \
+                 out on the internet"
+            );
+        }
+    }
+
+    /// **A private host with the setting on is lenient** -- otherwise the
+    /// switch is a checkbox that does nothing, which is the other way this
+    /// pair can be wrong.
+    ///
+    /// `[::1]` is in the list because it is the case a plausible
+    /// implementation gets wrong: `host_from_url` splits the port off at the
+    /// first `:` and would hand `[` to the host check. See
+    /// `may_ignore_tls_for`'s doc.
+    #[test]
+    fn a_private_host_is_lenient_with_the_setting_on() {
+        for url in [
+            "https://192.168.68.95/favicon.ico",
+            "https://10.0.0.4:8443/favicon.ico",
+            "https://172.16.0.1/favicon.ico",
+            "https://127.0.0.1/favicon.ico",
+            "https://localhost/favicon.ico",
+            "https://localhost:8443/favicon.ico",
+            "https://vault.localhost/favicon.ico",
+            "https://[::1]/favicon.ico",
+            "https://[::1]:8443/favicon.ico",
+            "https://[fd00::1]/favicon.ico",
+            "https://169.254.1.1/favicon.ico",
+        ] {
+            assert!(
+                may_ignore_tls_for(url, true),
+                "{url} is on the user's own network and was not covered by the setting, so the \
+                 checkbox does nothing for the case it was asked for"
+            );
+        }
+    }
+
+    /// **A URL this cannot read is not lenient.** Failing closed is the only
+    /// safe direction for a question whose `true` answer switches off
+    /// certificate checking, and a scheme this app does not fetch is exactly
+    /// the shape a candidate URL built from vault data could take.
+    #[test]
+    fn an_unreadable_url_falls_back_to_checking_certificates() {
+        for url in [
+            "",
+            "   ",
+            "not a url",
+            "favicon.ico",
+            "ftp://192.168.1.10/favicon.ico",
+            "androidapp://com.example/favicon.ico",
+        ] {
+            assert!(
+                !may_ignore_tls_for(url, true),
+                "{url:?} was treated as a private host, so an address this app cannot even \
+                 parse switched off certificate checking"
+            );
+        }
+    }
+
+    /// **The lenient agent has exactly one caller, and it is the branch this
+    /// decision guards.**
+    ///
+    /// The pure function above is the rule; this is what stops a second
+    /// caller appearing beside it with no rule at all. `http_agent`'s
+    /// constructor will talk to any host it is given -- the bound is here,
+    /// in this file, and a call from anywhere else is a certificate bypass
+    /// with nothing scoping it.
+    ///
+    /// Needles split with `concat!` so they cannot match their own
+    /// declaration. Do not re-join them.
+    #[test]
+    fn the_lenient_agent_is_built_in_one_place_and_only_behind_this_rule() {
+        let source = include_str!("favicon.rs");
+        let builder = concat!("bounded_total_plain_trusting_any_", "certificate(");
+        assert_eq!(
+            source.matches(builder).count(),
+            1,
+            "expected exactly one call to {builder:?} in this file. A second is a second \
+             certificate bypass, and only the first one is behind `may_ignore_tls_for`"
+        );
+        let at = source.find(builder).expect("the one call");
+        let before = &source[..at];
+        let guard = concat!("may_ignore_tls", "_for(url,");
+        let guarded_at = before
+            .rfind(guard)
+            .expect("the lenient agent is built without `may_ignore_tls_for` deciding it");
+        assert!(
+            at - guarded_at < 400,
+            "the only call to {builder:?} is no longer inside the branch `may_ignore_tls_for` \
+             decides -- {} characters separate them, so something has been inserted between \
+             the rule and the thing it scopes",
+            at - guarded_at
+        );
     }
 }

@@ -631,6 +631,37 @@ const DIRECT_ICONS_DESCRIPTION: &str = "Off by default, and it decides where PUB
      every site you hold an entry for receives a request from your PC, so it learns that an \
      entry for it exists in your vault and roughly when you looked at it.";
 
+const LAN_TLS_LABEL: &str = "Trust any certificate on your own network";
+/// **Names the boundary in the label and states the cost in the copy**, which
+/// for a row that switches off certificate checking is the whole content.
+///
+/// The case is the owner's: "for local servers for example, like I have a
+/// couple". A self-hosted box on a home LAN commonly serves a certificate
+/// nothing on this machine trusts -- self-signed, or issued for a name it
+/// does not answer to -- and a browser gets past that with a click this app
+/// has no way to offer. Without this the fetch just fails and the row keeps
+/// its monogram with nothing saying why.
+///
+/// **The scope is the first thing said, because a label reading "ignore
+/// certificate errors" would be read as applying to everything.** It applies
+/// only to addresses `favicon::is_private_host` recognises, and only to icon
+/// requests, and the copy says both -- but what actually holds the boundary
+/// is `favicon::fetch_icon_direct`, which asks about the host in hand at the
+/// moment of the request. See `Settings::icons_ignore_tls_on_private_hosts`.
+///
+/// The cost is stated as what somebody on that network could do, not as
+/// "reduces security": on a network where a machine can answer for another
+/// machine's address, the icon a row wears becomes that machine's choice, and
+/// the request still tells it that this vault holds an entry for that
+/// address. That is a small thing and it is not nothing, which is exactly why
+/// it is off by default and why the sentence is here rather than in a doc.
+const LAN_TLS_DESCRIPTION: &str = "Off by default. Only for addresses on your own network — \
+     192.168.x.x, 10.x.x.x, localhost — and only for icons; certificates are always checked \
+     for sites out on the internet, and for everything else this app does. Turn it on if a \
+     server of your own serves its icon over HTTPS with a certificate this PC does not trust. \
+     What that costs: on a network where another machine can answer for that address, it \
+     chooses the picture on that row and learns you hold an entry for it.";
+
 const BRAND_LOGOS_LABEL: &str = "Show card network logos";
 /// **Says where the images come from, because that is the part a user cannot
 /// guess and the only part they have to act on.** This row is unlike every
@@ -2568,6 +2599,29 @@ fn draw_view(ui: &mut Ui, state: &mut PrefsState) {
             DIRECT_ICONS_DESCRIPTION,
             state.settings.fetch_icons_direct,
             icons_on,
+        );
+        row_separator(ui);
+        // **A child of the DIRECT row, not of the master switch.** It is a
+        // question about how a direct fetch is made, so it is meaningless
+        // when there are no direct fetches -- and greying it under
+        // `fetch_icons` alone would leave it live under "icons on, direct
+        // off", where it governs nothing at all.
+        //
+        // The one place that answer is not quite the whole truth is a private
+        // address, which is fetched directly with the row above turned off
+        // (see its copy). Gating on `fetch_icons` alone for that case was
+        // considered and rejected: it would leave a certificate-bypass row
+        // live and clickable on a machine whose only direct fetches are the
+        // ones nobody asked for, which is the harder state to reason about of
+        // the two. A user with a LAN server turns the row above on -- the
+        // copy tells them what it does -- and this one wakes up under it.
+        let direct_on = icons_on && state.settings.fetch_icons_direct;
+        state.settings.icons_ignore_tls_on_private_hosts = child_toggle_row(
+            ui,
+            LAN_TLS_LABEL,
+            LAN_TLS_DESCRIPTION,
+            state.settings.icons_ignore_tls_on_private_hosts,
+            direct_on,
         );
         row_separator(ui);
         // Directly under the icon row because the two are the same question
@@ -8444,9 +8498,10 @@ mod tests {
         );
         assert_eq!(
             paint(Section::View).count_of_size(Vec2::new(40.0, 22.0)),
-            4,
-            "View is `fetch_icons`, its child `fetch_icons_direct`, `use_brand_logos` and \
-             `reveal_totp_seed`, and nothing else"
+            5,
+            "View is `fetch_icons`, its child `fetch_icons_direct`, THAT one's own child \
+             `icons_ignore_tls_on_private_hosts`, `use_brand_logos` and `reveal_totp_seed`, \
+             and nothing else"
         );
         assert_eq!(
             paint(Section::Lock).count_of_size(Vec2::new(40.0, 22.0)),
@@ -9078,9 +9133,9 @@ mod tests {
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
         assert_eq!(
             pills.len(),
-            4,
-            "the View card no longer paints its four pills: site icons, the direct-icons child, \
-             brand logos and the TOTP secret"
+            5,
+            "the View card no longer paints its five pills: site icons, the direct-icons child, \
+             the LAN-certificate child under IT, brand logos and the TOTP secret"
         );
         // SECOND pill down now: prompt, site icons, network logos, TOTP
         // secret, auto-lock. Five rows have left this page -- the breach row
@@ -9132,9 +9187,9 @@ mod tests {
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
         assert_eq!(
             pills.len(),
-            4,
-            "the View card no longer paints its four pills: site icons, the direct-icons child, \
-             brand logos and the TOTP secret"
+            5,
+            "the View card no longer paints its five pills: site icons, the direct-icons child, \
+             the LAN-certificate child under IT, brand logos and the TOTP secret"
         );
         // THIRD pill down: prompt, site icons, THIS, network logos, TOTP
         // secret, auto-lock. It sits directly under its master switch.
@@ -9174,7 +9229,7 @@ mod tests {
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
         assert_eq!(
             pills.len(),
-            4,
+            5,
             "a ghosted child row still paints a 40x22 pill, so switching the master off must \
              not change View's count -- and every index below it must not shift either"
         );
@@ -9193,7 +9248,7 @@ mod tests {
         live.section = Section::View;
         let live_first = frame(&ctx, &mut live, &[]);
         let live_pills = live_first.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(live_pills.len(), 4);
+        assert_eq!(live_pills.len(), 5);
         assert_eq!(
             live_pills[1].center(),
             pills[1].center(),
@@ -9333,14 +9388,15 @@ mod tests {
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
         assert_eq!(
             pills.len(),
-            4,
-            "the View card no longer paints its four pills: site icons, the direct-icons child, \
-             brand logos and the TOTP secret"
+            5,
+            "the View card no longer paints its five pills: site icons, the direct-icons child, \
+             the LAN-certificate child under IT, brand logos and the TOTP secret"
         );
-        // FOURTH pill down: prompt, site icons, the direct-fetch child of
-        // site icons, network logos, TOTP secret, auto-lock. It was the
-        // third until that child row was inserted above it.
-        let pill = pills[2].center();
+        // FIFTH pill down: prompt, site icons, the direct-fetch child of
+        // site icons, the LAN-certificate child of THAT, network logos, TOTP
+        // secret, auto-lock. It was the fourth until the second child row was
+        // inserted above it, and the third before the first one was.
+        let pill = pills[3].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -9595,14 +9651,15 @@ mod tests {
         let pills = first.rects_of_size(Vec2::new(40.0, 22.0));
         assert_eq!(
             pills.len(),
-            4,
-            "the View card no longer paints its four pills: site icons, the direct-icons child, \
-             brand logos and the TOTP secret"
+            5,
+            "the View card no longer paints its five pills: site icons, the direct-icons child, \
+             the LAN-certificate child under IT, brand logos and the TOTP secret"
         );
-        // FIFTH pill down now: prompt, site icons, the direct-fetch child
-        // of site icons, network logos, TOTP secret, auto-lock. It was the
-        // fourth until that child row was inserted.
-        let pill = pills[3].center();
+        // SIXTH pill down now: prompt, site icons, the direct-fetch child of
+        // site icons, the LAN-certificate child of THAT, network logos, TOTP
+        // secret, auto-lock. It was the fifth until the second child row was
+        // inserted, and the fourth before the first one was.
+        let pill = pills[4].center();
 
         frame(&ctx, &mut state, &click(pill));
         assert!(
@@ -9661,24 +9718,24 @@ mod tests {
         // and not just its text.
         //
         // **The indices are named, because they moved again.** View paints
-        // site icons(0), the direct-fetch child of site icons(1), network
-        // logos(2) and the TOTP secret(3). They were 1, 2, 3 and 4 on
-        // General, behind the prompt pill; General was split and the prompt
-        // stayed there. The pill under test is the LAST one, and its
-        // neighbour above is 2.
+        // site icons(0), the direct-fetch child of site icons(1), the
+        // LAN-certificate child of THAT(2), network logos(3) and the TOTP
+        // secret(4). They were 1, 2, 3 and 4 on General, behind the prompt
+        // pill; General was split and the prompt stayed there. The pill under
+        // test is the LAST one, and its neighbour above is 3.
         let pills = painted.rects_of_size(Vec2::new(40.0, 22.0));
-        assert_eq!(pills.len(), 4);
+        assert_eq!(pills.len(), 5);
         assert!(
-            pills[2].top() < pills[3].top(),
+            pills[3].top() < pills[4].top(),
             "the TOTP-secret pill is not below the network-logos pill"
         );
         assert!(
-            pills[3].top() > breach.bottom(),
+            pills[4].top() > breach.bottom(),
             "the TOTP-secret pill is level with the site-icons row's text, so the pills and the \
              labels disagree about which row is which"
         );
         assert!(
-            pills[3].top() > auto_lock.bottom(),
+            pills[4].top() > auto_lock.bottom(),
             "the TOTP-secret pill overhangs the network-logos row"
         );
     }

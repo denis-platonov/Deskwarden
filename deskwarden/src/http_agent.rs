@@ -165,6 +165,102 @@ pub fn bounded_total_plain(connect: Duration, total: Duration, agent: &str) -> T
     )
 }
 
+/// [`bounded_total_plain`], **with certificate checking switched off**.
+///
+/// # This is a TLS bypass. Read the caller's guard before adding one.
+///
+/// It exists for one setting and one host class: "ignore certificate errors
+/// when fetching icons from my own servers". The user's reason was literal --
+/// "for local servers for example, like I have a couple" -- and a self-hosted
+/// box on a home LAN commonly has a self-signed certificate, which is a
+/// warning no browser lets you past without a click and which this app has no
+/// UI to click.
+///
+/// **`favicon::fetch_icon_direct` is what makes it safe, not this
+/// constructor.** This function will happily talk to any host it is given;
+/// the rule that it is only ever *given* a private one lives at the single
+/// call site, alongside `favicon::is_private_host`, and is pinned by
+/// `an_agent_that_skips_certificate_checks_is_never_used_for_a_public_host`.
+/// Anything that reaches for this from somewhere else is a bypass on the open
+/// internet, and the two guards in this module's tests exist to make that a
+/// red test rather than a discovery.
+///
+/// What is at stake is bounded but real. The response is decoded by
+/// `favicon::decode_rgba`, so the worst a machine-in-the-middle gets is a
+/// picture on a row -- but "a picture on a row" is a signal it chose, and the
+/// request itself still tells whoever answers that this vault holds an entry
+/// for that host. That is why the switch is off by default, why it is worded
+/// as being about private addresses, and why it is not offered for anything
+/// but icons.
+pub fn bounded_total_plain_trusting_any_certificate(
+    connect: Duration,
+    total: Duration,
+    agent: &str,
+) -> TotalBounded {
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(TrustAnyCertificate))
+        .with_no_client_auth();
+    // ureq's own default. Set explicitly because a `ClientConfig` built here
+    // does not inherit whatever ureq would have built.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    TotalBounded(
+        ureq::AgentBuilder::new()
+            .timeout_connect(connect)
+            .timeout(total)
+            .redirects(0)
+            .user_agent(agent)
+            .tls_config(std::sync::Arc::new(config))
+            .build(),
+    )
+}
+
+/// A `rustls` verifier that accepts every certificate it is shown.
+///
+/// Private to this module and constructed in exactly one place, so the only
+/// agent it can reach is the one above. The `supported_verify_schemes` list
+/// is rustls's own default set rather than a hand-picked one: this type is
+/// not trying to be a *stricter* verifier, it is trying to be no verifier at
+/// all, and narrowing the list would make some certificates fail for a
+/// reason unrelated to the bypass.
+#[derive(Debug)]
+struct TrustAnyCertificate;
+
+impl rustls::client::danger::ServerCertVerifier for TrustAnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
 /// An agent whose requests are bounded by **time without progress**.
 ///
 /// For streamed transfers where the legitimate duration is unknown and a total
