@@ -120,6 +120,28 @@ pub trait VaultBackend: Send + Sync {
         item: &VaultItem,
         folder_id: Option<&str>,
     ) -> Result<VaultItem, VaultError>;
+    /// Whether [`Self::move_item_to_folder`] with `None` actually clears the
+    /// item's folder on this backend.
+    ///
+    /// **A capability, because the two backends genuinely differ and one of
+    /// them fails SILENTLY.** `bw serve` (CLI 2026.7.0) merges a `PUT` and
+    /// ignores a null `folderId`: omitting the key, sending `null`, sending
+    /// `""` and sending a fully round-tripped object were each measured
+    /// against a control field that changed in the same request, and the
+    /// folder never moved -- `.superpowers/sdd/put-semantics-capture.md` has
+    /// the capture. The write returns 200. The Bitwarden API replaces the
+    /// whole cipher, so "no `folderId` key" means no folder there and
+    /// un-filing is an ordinary edit (see `RestBackend::move_item_to_folder`,
+    /// which says so at its own definition).
+    ///
+    /// **Required rather than defaulted.** A default of `false` would make a
+    /// backend that CAN un-file quietly withhold the option, and a default of
+    /// `true` would put the silent lie back; either way the answer would be
+    /// given by whoever forgot to write one. Every surface that offers a
+    /// folder destination asks this -- `item_list::move_menu`, the detail
+    /// pane's kebab submenu and `EditDraft::may_unfile` -- so a wrong answer
+    /// here is wrong in three places at once.
+    fn can_unfile_items(&self) -> bool;
     fn delete_item(&self, id: &str) -> Result<(), VaultError>;
     fn list_trash(&self) -> Result<Vec<VaultItem>, VaultError>;
     fn list_archive(&self) -> Result<Vec<VaultItem>, VaultError>;
@@ -194,6 +216,16 @@ impl VaultBackend for VaultBridge {
         folder_id: Option<&str>,
     ) -> Result<VaultItem, VaultError> {
         VaultBridge::move_item_to_folder(self, item, folder_id)
+    }
+    /// **`false`, and measured.** This is the backend the capture in
+    /// `.superpowers/sdd/put-semantics-capture.md` was taken against: it
+    /// merges a `PUT`, so every spelling of "no folder" was accepted with a
+    /// 200 and left the item exactly where it was.
+    ///
+    /// Re-test after a CLI upgrade rather than assuming this is permanent --
+    /// Bitwarden's own `main` clears the folder on an explicit null.
+    fn can_unfile_items(&self) -> bool {
+        false
     }
     fn delete_item(&self, id: &str) -> Result<(), VaultError> {
         VaultBridge::delete_item(self, id)
@@ -353,6 +385,11 @@ impl VaultBackend for CachingBackend {
     ) -> Result<VaultItem, VaultError> {
         self.inner.move_item_to_folder(item, folder_id)
     }
+    /// The wrapped backend's answer. This one caches reads and changes no
+    /// write semantics.
+    fn can_unfile_items(&self) -> bool {
+        self.inner.can_unfile_items()
+    }
     fn delete_item(&self, id: &str) -> Result<(), VaultError> {
         self.inner.delete_item(id)
     }
@@ -421,6 +458,9 @@ impl VaultBackend for Box<dyn VaultBackend> {
         folder_id: Option<&str>,
     ) -> Result<VaultItem, VaultError> {
         (**self).move_item_to_folder(item, folder_id)
+    }
+    fn can_unfile_items(&self) -> bool {
+        (**self).can_unfile_items()
     }
     fn delete_item(&self, id: &str) -> Result<(), VaultError> {
         (**self).delete_item(id)
@@ -608,6 +648,13 @@ impl VaultBackend for LateBoundBackend {
     ) -> Result<VaultItem, VaultError> {
         self.with(|b| b.move_item_to_folder(item, folder_id))
     }
+    /// Asked of whatever is bound now. **`false` before anything is**,
+    /// which is the right direction for this question: withholding an option
+    /// costs a menu row, and offering one that silently does nothing is the
+    /// whole defect being avoided.
+    fn can_unfile_items(&self) -> bool {
+        self.with(|b| Ok(b.can_unfile_items())).unwrap_or(false)
+    }
     fn delete_item(&self, id: &str) -> Result<(), VaultError> {
         self.with(|b| b.delete_item(id))
     }
@@ -687,6 +734,9 @@ impl VaultBackend for SharedLateBoundBackend {
         folder_id: Option<&str>,
     ) -> Result<VaultItem, VaultError> {
         (**self).move_item_to_folder(item, folder_id)
+    }
+    fn can_unfile_items(&self) -> bool {
+        (**self).can_unfile_items()
     }
     fn delete_item(&self, id: &str) -> Result<(), VaultError> {
         (**self).delete_item(id)
@@ -791,6 +841,13 @@ mod late_bound_tests {
             _folder_id: Option<&str>,
         ) -> Result<VaultItem, VaultError> {
             Ok(item.clone())
+        }
+        // Neither double is asked this: no test in this module drives a
+        // folder menu. `false` rather than `true` so that if one ever is, it
+        // reads the answer that withholds an option rather than the one that
+        // offers a write this double does not actually perform.
+        fn can_unfile_items(&self) -> bool {
+            false
         }
         fn delete_item(&self, _id: &str) -> Result<(), VaultError> {
             Ok(())
@@ -993,6 +1050,12 @@ mod caching_backend_tests {
         ) -> Result<VaultItem, VaultError> {
             self.writes.fetch_add(1, Ordering::SeqCst);
             Ok(item.clone())
+        }
+        /// `false`, for `OneItem`'s reason: this double counts writes and
+        /// performs none, so the answer that withholds an option is the
+        /// honest one.
+        fn can_unfile_items(&self) -> bool {
+            false
         }
         fn delete_item(&self, _id: &str) -> Result<(), VaultError> {
             self.writes.fetch_add(1, Ordering::SeqCst);

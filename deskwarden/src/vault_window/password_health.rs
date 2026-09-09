@@ -2937,6 +2937,7 @@ mod tests {
                     &mut search,
                     &mut selected,
                     &icons,
+                    false,
                     &mut visible,
                     None,
                     false,

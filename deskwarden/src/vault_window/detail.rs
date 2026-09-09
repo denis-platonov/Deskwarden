@@ -636,6 +636,14 @@ pub enum DetailAction {
     /// destination list makes the item's current folder visible while the user
     /// is choosing, so there is nothing a confirmation would tell them.
     MoveToFolder(String),
+    /// **The "No folder" destination at the top of that same submenu**, which
+    /// takes the item out of every folder.
+    ///
+    /// Carries nothing, mirroring `item_list::RowCommand::Unfile` and for its
+    /// reason: an empty folder id is a real and different thing on `bw serve`
+    /// -- the id of its virtual "No Folder" bucket -- and a variant with no
+    /// payload cannot be confused with it.
+    Unfile,
     /// The kebab's **Clone** was clicked: the user wants a second item like
     /// this one.
     ///
@@ -3048,6 +3056,11 @@ pub fn draw_detail_read(
     folders: &[Folder],
     fill_count: u32,
     totp: &TotpState,
+    // Whether this window's backend can take an item out of a folder --
+    // `VaultBackend::can_unfile_items`, forwarded rather than decided here.
+    // Read by the kebab's "Move to folder" submenu alone; see
+    // `item_list::move_menu`.
+    may_unfile: bool,
     // Owned by `vault_window::mod`'s `run` and reset on selection change --
     // see `RevealState`'s doc for why it cannot live inside this function.
     reveal: &mut RevealState,
@@ -3487,7 +3500,7 @@ pub fn draw_detail_read(
                     // `move_menu` files a card or an SSH key exactly as it
                     // files a login.
                     ui.menu_button(super::item_list::MOVE_TO_FOLDER_LABEL, |ui| {
-                        match super::item_list::move_menu(item, folders) {
+                        match super::item_list::move_menu(item, folders, may_unfile) {
                             super::item_list::MoveMenu::Targets(targets) => {
                                 for target in &targets {
                                     if super::item_list::menu_command(ui, target) {
@@ -3497,10 +3510,27 @@ pub fn draw_detail_read(
                                         // keeps that a promise this file
                                         // does not have to enforce with a
                                         // panic.
-                                        if let super::item_list::RowCommand::MoveToFolder(id) =
-                                            &target.command
-                                        {
-                                            action = DetailAction::MoveToFolder(id.clone());
+                                        // Two commands now, and the second
+                                        // is why this is a `match` rather
+                                        // than the `if let` it was: "No
+                                        // folder" is `RowCommand::Unfile`,
+                                        // which carries no id precisely so
+                                        // it cannot be mistaken for a folder
+                                        // whose id is the empty string. The
+                                        // catch-all keeps that a promise
+                                        // this file does not enforce with a
+                                        // panic.
+                                        match &target.command {
+                                            super::item_list::RowCommand::MoveToFolder(id) => {
+                                                action =
+                                                    DetailAction::MoveToFolder(id.clone());
+                                            }
+                                            super::item_list::RowCommand::Unfile => {
+                                                action = DetailAction::Unfile;
+                                            }
+                                            other => log::warn!(
+                                                "the move submenu offered {other:?}, which is                                                  not a destination; the click was dropped"
+                                            ),
                                         }
                                     }
                                 }
@@ -8616,6 +8646,9 @@ mod tests {
                 &[],
                 3,
                 totp,
+                // The harness backend un-files nothing; the submenu is not
+                // what these tests drive.
+                false,
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
@@ -9269,6 +9302,9 @@ mod tests {
                 &[],
                 3,
                 totp,
+                // The harness backend un-files nothing; the submenu is not
+                // what these tests drive.
+                false,
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
@@ -9809,6 +9845,9 @@ mod tests {
                         &self.folders,
                         3,
                         totp,
+                        // The harness backend un-files nothing; the submenu is not
+                        // what these tests drive.
+                        false,
                         &mut self.reveal,
                         None,
                         &mut self.apps,
@@ -22867,6 +22906,9 @@ mod read_pane_scroll_tests {
                         &[],
                         3,
                         &TotpState::NoSecret,
+                        // The harness backend un-files nothing; the submenu is not
+                        // what these tests drive.
+                        false,
                         &mut self.reveal,
                         None,
                         &mut self.apps,
@@ -24862,6 +24904,9 @@ mod breach_badge_tests {
                     &[],
                     3,
                     &TotpState::NoSecret,
+                    // The harness backend un-files nothing; the submenu is not
+                    // what these tests drive.
+                    false,
                     &mut reveal,
                     None,
                     &mut apps,

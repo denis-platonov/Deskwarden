@@ -134,6 +134,21 @@ pub enum RowCommand {
     /// The destination folder's id, always a real assignable folder --
     /// see [`move_menu`].
     MoveToFolder(String),
+    /// **Take the item out of every folder** -- the "No folder" destination
+    /// at the top of the same submenu.
+    ///
+    /// Its own variant rather than a `MoveToFolder("")`, because an empty
+    /// folder id is a real and different thing: `bw serve` reports a virtual
+    /// "No Folder" bucket whose id IS the empty string, writing it strands
+    /// the item out of every sidebar row, and
+    /// `the_move_submenu_never_offers_an_empty_folder_id` exists to keep it
+    /// out of that payload. A variant carrying nothing cannot be confused
+    /// with a folder that happens to be named nothing.
+    ///
+    /// **Offered only where it works.** `VaultBackend::can_unfile_items`
+    /// answers `false` for `bw serve`, which accepts every spelling of "no
+    /// folder" with a 200 and moves nothing -- see [`move_menu`].
+    Unfile,
     Delete,
     /// Put a live item into the archive.
     Archive,
@@ -262,6 +277,15 @@ pub const CLEAR_ICON_LABEL: &str = "Use the automatic icon";
 /// selected, and so the row doubles as "this is where it lives now".
 const ALREADY_IN_THIS_FOLDER: &str = "This item is already in this folder";
 
+/// The "no folder at all" destination's label, and the reason it is greyed
+/// for an item that already has none.
+///
+/// The wording is Bitwarden's own ("No folder"), so a user who files things
+/// in another client meets the phrase they already know rather than this
+/// app's invention of one.
+const NO_FOLDER_LABEL: &str = "No folder";
+const ALREADY_IN_NO_FOLDER: &str = "This item is not in a folder";
+
 /// The Delete entry's label. **One label, because the confirmation is no
 /// longer in the menu**: choosing this opens
 /// [`super::delete_modal`], which asks the question somewhere a question can
@@ -308,6 +332,11 @@ pub fn menu_entries(
     item: &VaultItem,
     folders: &[Folder],
     source: FilterSource,
+    // Whether this window's backend can actually take an item out of a
+    // folder -- `VaultBackend::can_unfile_items`, threaded from the window
+    // rather than decided here. See [`move_menu`], which is the only thing
+    // that reads it.
+    may_unfile: bool,
 ) -> Vec<MenuEntry> {
     if let Some(out) = source.out_of_vault() {
         return out_of_vault_entries(out);
@@ -379,7 +408,7 @@ pub fn menu_entries(
         enabled: editable,
         disabled_reason: (!editable).then_some(EDIT_DISABLED_REASON),
     }));
-    entries.push(MenuEntry::MoveToFolder(move_menu(item, folders)));
+    entries.push(MenuEntry::MoveToFolder(move_menu(item, folders, may_unfile)));
     // Above Delete, below everything else: Archive is the gentler of the two
     // ways to take an item out of the working vault, and the design lists
     // the two rows in that order too.
@@ -557,22 +586,51 @@ fn enabled_command(label: &str, command: RowCommand) -> MenuEntry {
 /// invisible: both menus would look right, and only an item in a folder the
 /// backend had stopped reporting would show the two disagreeing.
 ///
-/// Note what is **not** here and cannot be: a "No folder" destination.
-/// `bw serve` (CLI 2026.7.0) cannot un-file an item at all --
-/// `.superpowers/sdd/put-semantics-capture.md` records the controlled run, in
-/// which omitting `folderId`, sending `null`, sending `""` and PUTting a fully
-/// round-tripped object all left the folder unchanged while a name change in
-/// the very same request applied. See `EditDraft::may_unfile`, which withholds
-/// the same option in the edit form for the same reason.
-pub(super) fn move_menu(item: &VaultItem, folders: &[Folder]) -> MoveMenu {
+/// **"No folder" is here now, and only where it works.** It used to be
+/// absent from this menu unconditionally, because `bw serve` (CLI 2026.7.0)
+/// cannot un-file an item at all: `.superpowers/sdd/put-semantics-capture.md`
+/// records the controlled run in which omitting `folderId`, sending `null`,
+/// sending `""` and PUTting a fully round-tripped object all left the folder
+/// unchanged while a name change in the very same request applied. That
+/// finding stands, and it is a fact about **one backend**. The direct-REST
+/// backend replaces the whole cipher, so an omitted key is an absent folder
+/// and un-filing is an ordinary edit -- `RestBackend::move_item_to_folder`
+/// says so at its own definition.
+///
+/// `may_unfile` is `VaultBackend::can_unfile_items`, threaded from the window
+/// rather than decided here, so this menu offers the destination exactly when
+/// the write behind it does something. Withholding it from everyone was the
+/// honest answer while one backend existed; it is the wrong answer now, and
+/// offering it to everyone would put back the silent lie the capture found.
+///
+/// A `false` here also keeps `EditDraft::may_unfile`'s reasoning intact: that
+/// form still withholds the option on its own rule, so the two surfaces agree
+/// on `bw serve` and the form is simply the stricter of the two on REST.
+pub(super) fn move_menu(item: &VaultItem, folders: &[Folder], may_unfile: bool) -> MoveMenu {
     let assignable = assignable_folders(folders);
-    if assignable.is_empty() {
+    if assignable.is_empty() && !may_unfile {
         return MoveMenu::Empty(NO_ASSIGNABLE_FOLDERS);
     }
+    // **First, above the folders**, which is where Bitwarden's own clients
+    // put it and where a destination that is not a folder belongs: reading
+    // down a list of folder names and meeting "No folder" among them reads as
+    // a folder someone named that.
+    //
+    // Greyed when the item is already unfiled, for the same reason the item's
+    // own folder is greyed below: it is a write that would achieve nothing,
+    // and dropping the row instead would make the destinations reshuffle from
+    // item to item.
+    let already_unfiled = item.folder_id.as_deref().unwrap_or("").is_empty();
+    let unfile = may_unfile.then(|| MenuCommand {
+        label: NO_FOLDER_LABEL.to_string(),
+        command: RowCommand::Unfile,
+        enabled: !already_unfiled,
+        disabled_reason: already_unfiled.then_some(ALREADY_IN_NO_FOLDER),
+    });
     MoveMenu::Targets(
-        assignable
+        unfile
             .into_iter()
-            .map(|folder| {
+            .chain(assignable.into_iter().map(|folder| {
                 // The item's own folder stays in the list, greyed: dropping
                 // it would make the destinations reshuffle from item to
                 // item, and it is useful as a statement of where the item
@@ -586,7 +644,7 @@ pub(super) fn move_menu(item: &VaultItem, folders: &[Folder]) -> MoveMenu {
                     enabled: !here,
                     disabled_reason: here.then_some(ALREADY_IN_THIS_FOLDER),
                 }
-            })
+            }))
             .collect(),
     )
 }
@@ -1324,6 +1382,9 @@ pub fn draw_item_list(
     search: &mut String,
     selected_id: &mut Option<String>,
     icons: &IconCache,
+    // See `menu_entries`' own parameter. Read by the rows' right-click menus
+    // alone; it changes nothing a row paints.
+    may_unfile: bool,
     visible_ids: &mut Vec<String>,
     move_error: Option<&str>,
     // Whether the fetch that would have filled `items` gave up -- the window's
@@ -1705,6 +1766,7 @@ pub fn draw_item_list(
                                     folders,
                                     selected,
                                     icons.textures.get(&item.id),
+                                    may_unfile,
                                     filter.source(),
                                 )
                             })
@@ -1929,6 +1991,8 @@ fn item_row(
     folders: &[Folder],
     selected: bool,
     icon: Option<&egui::TextureHandle>,
+    // See `menu_entries`' own parameter.
+    may_unfile: bool,
     // Which list this row was drawn from -- the row's menu is entirely
     // different for a trashed or archived item. See `menu_entries`.
     source: FilterSource,
@@ -2170,7 +2234,7 @@ fn item_row(
     // here.
     let mut command = None;
     response.context_menu(|ui| {
-        for entry in menu_entries(item, folders, source) {
+        for entry in menu_entries(item, folders, source, may_unfile) {
             match entry {
                 MenuEntry::Command(entry) => {
                     if menu_command(ui, &entry) {
@@ -2674,7 +2738,7 @@ mod menu_entry_tests {
     #[test]
     fn a_full_login_offers_every_entry_in_the_agreed_order() {
         assert_eq!(
-            labels(&menu_entries(&full_login(), &[], FilterSource::LiveVault)),
+            labels(&menu_entries(&full_login(), &[], FilterSource::LiveVault, false)),
             vec![
                 "Copy username",
                 "Copy password",
@@ -2705,6 +2769,7 @@ mod menu_entry_tests {
                 &full_login(),
                 &[folder("f1", "Work")],
                 FilterSource::Trash,
+                false,
             )),
             vec!["Restore", "Delete forever"]
         );
@@ -2713,6 +2778,7 @@ mod menu_entry_tests {
                 &full_login(),
                 &[folder("f1", "Work")],
                 FilterSource::Archive,
+                false,
             )),
             vec!["Unarchive"]
         );
@@ -2728,12 +2794,119 @@ mod menu_entry_tests {
     #[test]
     fn the_menu_follows_the_list_the_row_was_drawn_from_not_the_item() {
         let item = full_login();
-        let live = labels(&menu_entries(&item, &[], FilterSource::LiveVault));
-        let trashed = labels(&menu_entries(&item, &[], FilterSource::Trash));
+        let live = labels(&menu_entries(&item, &[], FilterSource::LiveVault, false));
+        let trashed = labels(&menu_entries(&item, &[], FilterSource::Trash, false));
         assert!(live.contains(&"Delete".to_string()));
         assert!(!trashed.contains(&"Delete".to_string()));
         assert!(!live.contains(&"Restore".to_string()));
         assert!(trashed.contains(&"Restore".to_string()));
+    }
+
+    /// **"No folder" is offered exactly where the backend can perform it.**
+    ///
+    /// Both directions, because each is a different defect: withheld on a
+    /// backend that CAN un-file is this app hiding something that works, and
+    /// offered on one that cannot is the silent no-op
+    /// `.superpowers/sdd/put-semantics-capture.md` measured -- a 200 that
+    /// moves nothing, with the pane showing the item unfiled until the next
+    /// sync puts it back.
+    #[test]
+    fn no_folder_is_offered_only_where_the_backend_can_unfile() {
+        let folders = [folder("f1", "Work")];
+        let item = of_folder(Some("f1"));
+
+        let MoveMenu::Targets(with) = move_menu(&item, &folders, true) else {
+            panic!("the submenu reported no destinations at all");
+        };
+        assert_eq!(
+            with.first().map(|entry| entry.label.as_str()),
+            Some(NO_FOLDER_LABEL),
+            "\"No folder\" is not the first destination; it drew {:?}",
+            with.iter().map(|e| &e.label).collect::<Vec<_>>()
+        );
+
+        let MoveMenu::Targets(without) = move_menu(&item, &folders, false) else {
+            panic!("the submenu reported no destinations at all");
+        };
+        assert!(
+            !without.iter().any(|entry| entry.label == NO_FOLDER_LABEL),
+            "a backend that cannot un-file was offered \"No folder\" anyway: {:?}",
+            without.iter().map(|e| &e.label).collect::<Vec<_>>()
+        );
+        // And nothing else moved: the folders below it are the same list.
+        let names = |menu: &[MenuCommand]| {
+            menu.iter()
+                .filter(|e| e.label != NO_FOLDER_LABEL)
+                .map(|e| e.label.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&with), names(&without));
+    }
+
+    /// **It carries `Unfile`, never a `MoveToFolder("")`.**
+    ///
+    /// The empty string is the id of `bw serve`'s virtual "No Folder" bucket,
+    /// and writing it is what strands an item out of every sidebar row --
+    /// `the_move_submenu_never_offers_an_empty_folder_id` exists for that.
+    /// A destination that means "no folder" therefore has to be a command
+    /// carrying nothing rather than a folder id that happens to be empty.
+    #[test]
+    fn the_no_folder_entry_carries_no_folder_id_at_all() {
+        let MoveMenu::Targets(targets) =
+            move_menu(&of_folder(Some("f1")), &[folder("f1", "Work")], true)
+        else {
+            panic!("the submenu reported no destinations at all");
+        };
+        let entry = targets.first().expect("the first destination");
+        assert_eq!(entry.command, RowCommand::Unfile, "it carried {:?}", entry.command);
+    }
+
+    /// **Greyed for an item that is already out of every folder**, with its
+    /// own reason -- the same treatment the item's own folder gets, and for
+    /// the same reason: a write that would achieve nothing, on a row that
+    /// stays present so the destinations do not reshuffle from item to item.
+    #[test]
+    fn the_no_folder_entry_is_greyed_for_an_item_that_has_none() {
+        let folders = [folder("f1", "Work")];
+        for (item, enabled) in
+            [(of_folder(Some("f1")), true), (of_folder(None), false), (of_folder(Some("")), false)]
+        {
+            let MoveMenu::Targets(targets) = move_menu(&item, &folders, true) else {
+                panic!("the submenu reported no destinations at all");
+            };
+            let entry = targets.first().expect("the first destination");
+            assert_eq!(
+                entry.enabled, enabled,
+                "with folder_id {:?} the \"No folder\" row was enabled={}",
+                item.folder_id, entry.enabled
+            );
+            assert_eq!(entry.disabled_reason.is_some(), !enabled);
+        }
+    }
+
+    /// **A vault with no assignable folders still offers it**, where the
+    /// backend can un-file.
+    ///
+    /// Without this the submenu answers `Empty("no folders yet")` and the one
+    /// destination that exists is unreachable -- which is the state an
+    /// account that files nothing is permanently in, and exactly the account
+    /// most likely to want an item taken back out of a folder created by
+    /// another client.
+    #[test]
+    fn a_vault_with_no_folders_still_offers_no_folder() {
+        let MoveMenu::Targets(targets) = move_menu(&of_folder(Some("f1")), &[], true) else {
+            panic!("the submenu refused to offer the one destination that exists");
+        };
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].command, RowCommand::Unfile);
+        // And with the backend unable to, it is still the "no folders yet"
+        // note rather than an empty box.
+        assert!(matches!(move_menu(&of_folder(Some("f1")), &[], false), MoveMenu::Empty(_)));
+    }
+
+    /// An item filed in `folder_id`.
+    fn of_folder(folder_id: Option<&str>) -> VaultItem {
+        VaultItem { folder_id: folder_id.map(str::to_string), ..full_login() }
     }
 
     /// **Neither delete asks its question in the menu any more.** Both
@@ -2749,8 +2922,8 @@ mod menu_entry_tests {
     #[test]
     fn neither_delete_entry_confirms_inside_the_menu() {
         for source in [FilterSource::LiveVault, FilterSource::Trash] {
-            let once = labels(&menu_entries(&full_login(), &[], source));
-            let again = labels(&menu_entries(&full_login(), &[], source));
+            let once = labels(&menu_entries(&full_login(), &[], source, false));
+            let again = labels(&menu_entries(&full_login(), &[], source, false));
             assert_eq!(once, again, "{source:?}: the menu is not the same twice");
             assert!(
                 !once.iter().any(|label| label.contains("Click to confirm")),
@@ -2758,7 +2931,7 @@ mod menu_entry_tests {
             );
         }
         assert_eq!(
-            labels(&menu_entries(&full_login(), &[], FilterSource::Trash)),
+            labels(&menu_entries(&full_login(), &[], FilterSource::Trash, false)),
             vec!["Restore", "Delete forever"]
         );
     }
@@ -2776,7 +2949,7 @@ mod menu_entry_tests {
         // ABSENT. Editing a card is offered and enabled -- `apply_to` writes
         // the card object -- which is the user-visible half of the 2026-08-17
         // fix.
-        let entries = menu_entries(&of_kind(Some(3)), &[], FilterSource::LiveVault);
+        let entries = menu_entries(&of_kind(Some(3)), &[], FilterSource::LiveVault, false);
         assert_eq!(
             labels(&entries),
             vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
@@ -2793,7 +2966,7 @@ mod menu_entry_tests {
     /// number true.
     #[test]
     fn a_secure_note_offers_the_same_five_as_a_card() {
-        let entries = menu_entries(&of_kind(Some(2)), &[], FilterSource::LiveVault);
+        let entries = menu_entries(&of_kind(Some(2)), &[], FilterSource::LiveVault, false);
         assert_eq!(
             labels(&entries),
             vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
@@ -2810,7 +2983,7 @@ mod menu_entry_tests {
     fn the_greyed_edit_entry_says_why() {
         // Greying without a reason is the failure this is guarding: the user
         // sees the action they came for, unavailable, and no explanation.
-        let entries = menu_entries(&of_kind(Some(5)), &[], FilterSource::LiveVault);
+        let entries = menu_entries(&of_kind(Some(5)), &[], FilterSource::LiveVault, false);
         let edit = entries
             .iter()
             .find_map(|e| match e {
@@ -2859,10 +3032,10 @@ mod menu_entry_tests {
         );
         // And the positive control on the predicate itself: the SAME blob
         // on a login-typed item does offer the entry.
-        assert!(labels(&menu_entries(&full_login(), &[], FilterSource::LiveVault))
+        assert!(labels(&menu_entries(&full_login(), &[], FilterSource::LiveVault, false))
             .contains(&"Open website".to_string()));
         assert_eq!(
-            labels(&menu_entries(&card_with_a_login, &[], FilterSource::LiveVault)),
+            labels(&menu_entries(&card_with_a_login, &[], FilterSource::LiveVault, false)),
             vec![
                 "Copy username",
                 "Copy password",
@@ -2890,7 +3063,7 @@ mod menu_entry_tests {
     /// entry altogether cannot pass the negative half.
     #[test]
     fn refresh_icon_is_absent_for_every_item_with_no_icon_domain() {
-        let live = |item: &VaultItem| labels(&menu_entries(item, &[], FilterSource::LiveVault));
+        let live = |item: &VaultItem| labels(&menu_entries(item, &[], FilterSource::LiveVault, false));
         assert!(
             live(&full_login()).contains(&REFRESH_ICON_LABEL.to_string()),
             "the live control failed: an item that DOES have a domain was offered no refresh, \
@@ -2941,7 +3114,7 @@ mod menu_entry_tests {
             other: serde_json::Map::new(),
         });
         assert_eq!(
-            labels(&menu_entries(&card, &[], FilterSource::LiveVault)),
+            labels(&menu_entries(&card, &[], FilterSource::LiveVault, false)),
             vec![
                 REFRESH_ICON_LABEL,
                 SELECT_ICON_LABEL,
@@ -3005,7 +3178,7 @@ mod menu_entry_tests {
             ("a login with no URI at all", of_kind(Some(1))),
             ("a login whose only URI names no host", app_only),
         ] {
-            let entries = labels(&menu_entries(&item, &[], FilterSource::LiveVault));
+            let entries = labels(&menu_entries(&item, &[], FilterSource::LiveVault, false));
             assert!(
                 entries.contains(&SELECT_ICON_LABEL.to_string()),
                 "{what} was offered no way to choose its own icon: {entries:?}"
@@ -3018,7 +3191,7 @@ mod menu_entry_tests {
     #[test]
     fn a_trashed_or_archived_row_is_offered_no_icon_entries_either() {
         for source in [FilterSource::Trash, FilterSource::Archive] {
-            let entries = labels(&menu_entries(&chosen_url(&full_login()), &[], source));
+            let entries = labels(&menu_entries(&chosen_url(&full_login()), &[], source, false));
             for label in [SELECT_ICON_LABEL, CLEAR_ICON_LABEL, REFRESH_ICON_LABEL] {
                 assert!(
                     !entries.contains(&label.to_string()),
@@ -3040,7 +3213,7 @@ mod menu_entry_tests {
     fn the_clear_entry_follows_the_field_being_there_and_not_it_parsing() {
         let plain = full_login();
         assert!(
-            !labels(&menu_entries(&plain, &[], FilterSource::LiveVault))
+            !labels(&menu_entries(&plain, &[], FilterSource::LiveVault, false))
                 .contains(&CLEAR_ICON_LABEL.to_string()),
             "an item with no chosen icon was offered a way to un-choose one"
         );
@@ -3050,7 +3223,7 @@ mod menu_entry_tests {
             ("a value this build cannot read", with_icon_field(&plain, "not json at all")),
             ("a shape from a later build", with_icon_field(&plain, r#"{"kind":"svg"}"#)),
         ] {
-            let entries = labels(&menu_entries(&item, &[], FilterSource::LiveVault));
+            let entries = labels(&menu_entries(&item, &[], FilterSource::LiveVault, false));
             assert!(
                 entries.contains(&CLEAR_ICON_LABEL.to_string()),
                 "an item with {what} was offered no way back to the automatic icon: {entries:?}"
@@ -3070,7 +3243,7 @@ mod menu_entry_tests {
     fn refresh_is_offered_for_a_chosen_url_and_never_for_a_chosen_picture() {
         let login = full_login();
         let has_refresh = |item: &VaultItem| {
-            labels(&menu_entries(item, &[], FilterSource::LiveVault))
+            labels(&menu_entries(item, &[], FilterSource::LiveVault, false))
                 .contains(&REFRESH_ICON_LABEL.to_string())
         };
         assert!(has_refresh(&login), "the live control: an ordinary login can refresh its icon");
@@ -3103,6 +3276,7 @@ mod menu_entry_tests {
                 &chosen_picture(&full_login()),
                 &[],
                 FilterSource::LiveVault
+                , false
             )),
             vec![
                 "Copy username",
@@ -3123,7 +3297,7 @@ mod menu_entry_tests {
     #[test]
     fn an_item_with_a_chosen_url_gets_the_agreed_menu() {
         assert_eq!(
-            labels(&menu_entries(&chosen_url(&full_login()), &[], FilterSource::LiveVault)),
+            labels(&menu_entries(&chosen_url(&full_login()), &[], FilterSource::LiveVault, false)),
             vec![
                 "Copy username",
                 "Copy password",
@@ -3146,7 +3320,7 @@ mod menu_entry_tests {
     #[test]
     fn neither_icon_entry_is_ever_greyed() {
         for item in [full_login(), chosen_url(&full_login()), chosen_picture(&of_kind(Some(2)))] {
-            let entries = menu_entries(&item, &[], FilterSource::LiveVault);
+            let entries = menu_entries(&item, &[], FilterSource::LiveVault, false);
             for entry in &entries {
                 if let MenuEntry::Command(c) = entry {
                     if c.command == RowCommand::SelectIcon || c.command == RowCommand::ClearIcon {
@@ -3165,7 +3339,7 @@ mod menu_entry_tests {
     #[test]
     fn a_trashed_or_archived_row_is_offered_no_refresh() {
         for source in [FilterSource::Trash, FilterSource::Archive] {
-            let entries = labels(&menu_entries(&full_login(), &[], source));
+            let entries = labels(&menu_entries(&full_login(), &[], source, false));
             assert!(
                 !entries.contains(&REFRESH_ICON_LABEL.to_string()),
                 "{source:?} offered a refresh: {entries:?}"
@@ -3181,7 +3355,7 @@ mod menu_entry_tests {
         // it was widened to cards, notes and identities.
         for item_type in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(9)] {
             let item = of_kind(item_type);
-            let entries = menu_entries(&item, &[], FilterSource::LiveVault);
+            let entries = menu_entries(&item, &[], FilterSource::LiveVault, false);
             let edit = entries
                 .iter()
                 .find_map(|e| match e {
@@ -3204,9 +3378,9 @@ mod menu_entry_tests {
             login: Some(LoginData { totp: None, ..with_seed.login.clone().unwrap() }),
             ..full_login()
         };
-        assert!(labels(&menu_entries(&with_seed, &[], FilterSource::LiveVault)).contains(&"Copy TOTP".to_string()));
+        assert!(labels(&menu_entries(&with_seed, &[], FilterSource::LiveVault, false)).contains(&"Copy TOTP".to_string()));
         assert_eq!(
-            labels(&menu_entries(&without, &[], FilterSource::LiveVault)),
+            labels(&menu_entries(&without, &[], FilterSource::LiveVault, false)),
             vec![
                 "Copy username",
                 "Copy password",
@@ -3237,14 +3411,14 @@ mod menu_entry_tests {
             ..of_kind(Some(1))
         };
         assert_eq!(
-            labels(&menu_entries(&empty, &[], FilterSource::LiveVault)),
+            labels(&menu_entries(&empty, &[], FilterSource::LiveVault, false)),
             vec![SELECT_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
     }
 
     #[test]
     fn open_website_carries_the_url_the_detail_pane_would_open() {
-        let entries = menu_entries(&full_login(), &[], FilterSource::LiveVault);
+        let entries = menu_entries(&full_login(), &[], FilterSource::LiveVault, false);
         let opens: Vec<&RowCommand> = entries
             .iter()
             .filter_map(|e| match e {
@@ -3266,7 +3440,7 @@ mod menu_entry_tests {
         // out of every sidebar row -- a Critical fixed in the edit form, and
         // this menu must not reintroduce it.
         let folders = [folder("", "No Folder"), folder("f1", "Work"), folder("f2", "Personal")];
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault))
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault, false))
         else {
             panic!("the submenu reported no assignable folders when two exist");
         };
@@ -3289,7 +3463,7 @@ mod menu_entry_tests {
         // user may own a folder actually called "No Folder", and matching on
         // the name would lock them out of it.
         let folders = [folder("f9", "No Folder")];
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault))
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault, false))
         else {
             panic!("a real folder named \"No Folder\" was dropped");
         };
@@ -3301,7 +3475,7 @@ mod menu_entry_tests {
     fn a_vault_with_no_assignable_folder_says_so_instead_of_opening_an_empty_box() {
         let folders = [folder("", "No Folder")];
         assert_eq!(
-            move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault)),
+            move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault, false)),
             MoveMenu::Empty(NO_ASSIGNABLE_FOLDERS)
         );
     }
@@ -3310,7 +3484,7 @@ mod menu_entry_tests {
     fn the_folder_the_item_already_lives_in_is_greyed_not_dropped() {
         let folders = [folder("f1", "Work"), folder("f2", "Personal")];
         let item = VaultItem { folder_id: Some("f1".into()), ..full_login() };
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&item, &folders, FilterSource::LiveVault)) else {
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&item, &folders, FilterSource::LiveVault, false)) else {
             panic!("the submenu reported no assignable folders when two exist");
         };
         assert_eq!(
@@ -3326,7 +3500,7 @@ mod menu_entry_tests {
         // write succeeds and does nothing. Every destination this menu
         // offers must therefore name a real folder.
         let folders = [folder("", "No Folder"), folder("f1", "Work")];
-        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault))
+        let MoveMenu::Targets(targets) = move_menu_of(&menu_entries(&full_login(), &folders, FilterSource::LiveVault, false))
         else {
             panic!("the submenu reported no assignable folders when one exists");
         };
@@ -3346,7 +3520,7 @@ mod menu_entry_tests {
     #[test]
     fn delete_is_the_last_entry_and_wears_one_label() {
         assert_eq!(
-            labels(&menu_entries(&of_kind(Some(3)), &[], FilterSource::LiveVault)).last().unwrap(),
+            labels(&menu_entries(&of_kind(Some(3)), &[], FilterSource::LiveVault, false)).last().unwrap(),
             DELETE_LABEL
         );
     }
@@ -3766,6 +3940,7 @@ mod row_tile_tests {
                     &mut search,
                     &mut selected_id,
                     &icons,
+                    false,
                     visible,
                     // This harness predates the inline move-error band and
                     // has no business growing a parameter for it; the band
@@ -8236,6 +8411,7 @@ mod toolbar_strip_tests {
                     search,
                     &mut selected,
                     &icons,
+                    false,
                     &mut visible,
                     None,
                     false,
@@ -8684,6 +8860,7 @@ mod move_error_band_tests {
                     &mut search,
                     &mut selected,
                     &icons,
+                    false,
                     &mut visible,
                     move_error,
                     false,
@@ -9087,6 +9264,7 @@ mod list_placeholder_paint_tests {
                     search,
                     &mut selected,
                     &icons,
+                    false,
                     &mut visible,
                     None,
                     fetch_failed,
@@ -9416,6 +9594,7 @@ mod keyboard_selection_tests {
                     search,
                     selected,
                     &icons,
+                    false,
                     &mut drawn,
                     None,
                     false,

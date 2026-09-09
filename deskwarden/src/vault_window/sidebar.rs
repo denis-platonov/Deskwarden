@@ -355,7 +355,13 @@ pub enum SidebarAction {
     /// An item row was dragged out of the item list and dropped on a folder
     /// row that will take it. Both ids are carried; the caller resolves the
     /// item itself.
-    MoveItemToFolder { item_id: String, folder_id: String },
+    /// `folder_id` is `None` for the virtual "No Folder" row, which is a
+    /// real destination on a backend that can un-file -- see
+    /// [`drop_outcomes`]. An `Option` rather than the empty string that row's
+    /// id actually is, because writing that id is what strands an item out of
+    /// every sidebar row, and `item_list::RowCommand::Unfile` refuses the
+    /// same confusion for the same reason.
+    MoveItemToFolder { item_id: String, folder_id: Option<String> },
     /// An item row was dropped on a folder row that will NOT take it,
     /// carrying the reason for the caller to show inline.
     ///
@@ -660,6 +666,10 @@ pub fn draw_sidebar(
     // "at most one of these, and any item row clears them" invariant lives.
     mut screens: Screens<'_>,
     lock_countdown: &str,
+    // Whether this window's backend can take an item out of a folder --
+    // `VaultBackend::can_unfile_items`. Read by the drop decision alone; see
+    // [`drop_outcomes`].
+    may_unfile: bool,
 ) -> SidebarAction {
     let mut action = SidebarAction::None;
 
@@ -880,7 +890,8 @@ pub fn draw_sidebar(
             let dragged = egui::DragAndDrop::payload::<crate::vault_window::item_list::DraggedItem>(
                 ui.ctx(),
             );
-            let outcomes = dragged.as_ref().map(|item| drop_outcomes(folders, item));
+            let outcomes =
+                dragged.as_ref().map(|item| drop_outcomes(folders, item, may_unfile));
             for (index, folder) in folders.iter().enumerate() {
                 // The virtual "No Folder" bucket gets the filter that says what
                 // it means. Building `Folder(folder.id.clone())` here for *every*
@@ -958,10 +969,15 @@ pub fn draw_sidebar(
                     // computed from the payload as it stood at the top of this
                     // function; they agree, and that is exactly why neither has to
                     // be trusted to.
-                    action = match drop_outcomes(folders, &item)[index] {
+                    action = match drop_outcomes(folders, &item, may_unfile)[index] {
                         DropOutcome::Accept => SidebarAction::MoveItemToFolder {
                             item_id: item.id.clone(),
-                            folder_id: folder.id.clone(),
+                            // The virtual row's id is the EMPTY STRING, and
+                            // writing it is what strands an item out of every
+                            // sidebar row. `None` is what that row means, and
+                            // it is the only place this conversion happens.
+                            folder_id: (!is_virtual_folder(folder))
+                                .then(|| folder.id.clone()),
                         },
                         DropOutcome::Refuse(reason) => SidebarAction::RefusedMove(reason),
                     };
@@ -1055,6 +1071,15 @@ pub const CANNOT_UNFILE: &str =
 /// row menu's "Move to folder" submenu greys that destination for.
 pub const ALREADY_IN_THIS_FOLDER: &str = "That item is already in this folder.";
 
+/// The same refusal for the "No Folder" row, on a backend that CAN un-file:
+/// the item is not in a folder, so there is nothing for the drop to do.
+///
+/// Its own sentence rather than a reuse of [`ALREADY_IN_THIS_FOLDER`],
+/// because "already in this folder" is untrue of a row that is not a folder
+/// -- and a refusal a user cannot square with what they are looking at is
+/// worse than the silent no-op it replaced.
+pub const ALREADY_IN_NO_FOLDER: &str = "That item is not in a folder.";
+
 /// What each of `folders` does when `dragged` is released on it -- **one
 /// entry per folder, in the order the sidebar draws them**, which is what
 /// lets the FOLDERS loop zip this against itself.
@@ -1070,15 +1095,39 @@ pub const ALREADY_IN_THIS_FOLDER: &str = "That item is already in this folder.";
 /// no unit test could reach.
 ///
 /// [`assignable_folders`]: super::detail_edit::assignable_folders
-pub fn drop_outcomes(folders: &[Folder], dragged: &crate::vault_window::item_list::DraggedItem) -> Vec<DropOutcome> {
+pub fn drop_outcomes(
+    folders: &[Folder],
+    dragged: &crate::vault_window::item_list::DraggedItem,
+    // Whether this window's backend can actually take an item out of a
+    // folder -- `VaultBackend::can_unfile_items`. See the `CANNOT_UNFILE`
+    // arm below, which is what it decides.
+    may_unfile: bool,
+) -> Vec<DropOutcome> {
     let assignable = super::detail_edit::assignable_folders(folders);
     folders
         .iter()
         .map(|folder| {
             if !assignable.iter().any(|f| f.id == folder.id) {
                 // The only way `assignable_folders` drops a row is
-                // `is_virtual_folder`, so this is the un-file case.
-                return DropOutcome::Refuse(CANNOT_UNFILE);
+                // `is_virtual_folder`, so this is the un-file case -- and
+                // whether it works is a fact about the BACKEND rather than
+                // about this row. `bw serve` accepts every spelling of "no
+                // folder" with a 200 and moves nothing, which is why this
+                // was an unconditional refusal; the direct-REST backend
+                // replaces the whole cipher, so there the drop is a real
+                // move and refusing it would be this app withholding
+                // something that works.
+                if !may_unfile {
+                    return DropOutcome::Refuse(CANNOT_UNFILE);
+                }
+                // Already unfiled: a write that would achieve nothing, and
+                // the same refusal the row below gives for the folder an
+                // item already lives in.
+                return if dragged.folder_id.as_deref().unwrap_or("").is_empty() {
+                    DropOutcome::Refuse(ALREADY_IN_NO_FOLDER)
+                } else {
+                    DropOutcome::Accept
+                };
             }
             if dragged.folder_id.as_deref() == Some(folder.id.as_str()) {
                 return DropOutcome::Refuse(ALREADY_IN_THIS_FOLDER);
@@ -1381,10 +1430,74 @@ mod drop_outcome_tests {
         vec![folder("", "No Folder"), folder("f1", "Work"), folder("f2", "Personal")]
     }
 
+    /// **The "No Folder" row is a real drop target where the backend can
+    /// un-file, and a visible refusal where it cannot.**
+    ///
+    /// This row was refused unconditionally, and the refusal was the right
+    /// answer for the only backend that existed: `bw serve` accepts every
+    /// spelling of "no folder" with a 200 and moves nothing
+    /// (`.superpowers/sdd/put-semantics-capture.md`), so an accepting row
+    /// would have been a drop that appeared to work until the next sync put
+    /// the item back. The direct-REST backend replaces the whole cipher, so
+    /// there the same drop is a real move -- and refusing it would be this
+    /// app withholding something that works.
+    ///
+    /// Both directions in one test, because each alone passes against a row
+    /// that ignores the flag.
+    #[test]
+    fn the_no_folder_row_accepts_a_drop_only_where_the_backend_can_unfile() {
+        let folders = [folder("", "No Folder"), folder("f1", "Work")];
+        let filed = dragged(Some("f1"));
+        assert_eq!(
+            drop_outcomes(&folders, &filed, true)[0],
+            DropOutcome::Accept,
+            "a backend that can un-file still refused the drop"
+        );
+        assert_eq!(
+            drop_outcomes(&folders, &filed, false)[0],
+            DropOutcome::Refuse(CANNOT_UNFILE),
+            "a backend that cannot un-file accepted a drop that would do nothing"
+        );
+        // **The rest of the rail is unaffected either way** -- the flag
+        // decides one row, not the rail. Asserted as an equality between the
+        // two runs rather than against `Accept`, because the folder this item
+        // is already in is correctly refused and that refusal is not what
+        // this test is about.
+        assert_eq!(
+            &drop_outcomes(&folders, &filed, true)[1..],
+            &drop_outcomes(&folders, &filed, false)[1..],
+            "the un-file flag changed a row that is not the \"No Folder\" one"
+        );
+    }
+
+    /// **An item that is already out of every folder is refused, with its own
+    /// sentence.**
+    ///
+    /// The same treatment the folder an item already lives in gets, and for
+    /// the same reason -- the drop would be a write that achieves nothing.
+    /// Its own wording because "already in this folder" is untrue of a row
+    /// that is not a folder, and a refusal a user cannot square with what
+    /// they are looking at is worse than the no-op it replaced.
+    #[test]
+    fn dropping_an_unfiled_item_on_the_no_folder_row_is_refused_for_its_own_reason() {
+        let folders = [folder("", "No Folder"), folder("f1", "Work")];
+        for already in [None, Some("")] {
+            assert_eq!(
+                drop_outcomes(&folders, &dragged(already), true)[0],
+                DropOutcome::Refuse(ALREADY_IN_NO_FOLDER),
+                "with folder_id {already:?} the drop was not refused for being a no-op"
+            );
+        }
+        assert_ne!(
+            ALREADY_IN_NO_FOLDER, ALREADY_IN_THIS_FOLDER,
+            "the two refusals read alike, so one of them is describing the wrong row"
+        );
+    }
+
     #[test]
     fn an_unfiled_item_may_go_into_any_real_folder_and_nowhere_else() {
         assert_eq!(
-            drop_outcomes(&a_real_looking_vault(), &dragged(None)),
+            drop_outcomes(&a_real_looking_vault(), &dragged(None), false),
             vec![
                 DropOutcome::Refuse(CANNOT_UNFILE),
                 DropOutcome::Accept,
@@ -1404,7 +1517,7 @@ mod drop_outcome_tests {
         // loud, with a reason.
         for from in [None, Some("f1"), Some("f2")] {
             assert_eq!(
-                drop_outcomes(&a_real_looking_vault(), &dragged(from))[0],
+                drop_outcomes(&a_real_looking_vault(), &dragged(from), false)[0],
                 DropOutcome::Refuse(CANNOT_UNFILE),
                 "the virtual bucket accepted an item dragged from {from:?}"
             );
@@ -1416,7 +1529,7 @@ mod drop_outcome_tests {
         // A write that achieves nothing, and a different refusal from the
         // un-file one -- the user needs to be told which of the two happened.
         assert_eq!(
-            drop_outcomes(&a_real_looking_vault(), &dragged(Some("f1"))),
+            drop_outcomes(&a_real_looking_vault(), &dragged(Some("f1")), false),
             vec![
                 DropOutcome::Refuse(CANNOT_UNFILE),
                 DropOutcome::Refuse(ALREADY_IN_THIS_FOLDER),
@@ -1431,7 +1544,7 @@ mod drop_outcome_tests {
         // shorter or reordered result would attach one folder's verdict to
         // another folder's row.
         let folders = a_real_looking_vault();
-        let outcomes = drop_outcomes(&folders, &dragged(Some("f2")));
+        let outcomes = drop_outcomes(&folders, &dragged(Some("f2")), false);
         assert_eq!(outcomes.len(), folders.len());
         assert_eq!(outcomes[2], DropOutcome::Refuse(ALREADY_IN_THIS_FOLDER));
     }
@@ -1439,10 +1552,10 @@ mod drop_outcome_tests {
     #[test]
     fn a_vault_with_no_real_folders_accepts_nothing() {
         assert_eq!(
-            drop_outcomes(&[folder("", "No Folder")], &dragged(None)),
+            drop_outcomes(&[folder("", "No Folder")], &dragged(None), false),
             vec![DropOutcome::Refuse(CANNOT_UNFILE)]
         );
-        assert_eq!(drop_outcomes(&[], &dragged(None)), Vec::<DropOutcome>::new());
+        assert_eq!(drop_outcomes(&[], &dragged(None), false), Vec::<DropOutcome>::new());
     }
 
     #[test]
@@ -1453,7 +1566,7 @@ mod drop_outcome_tests {
         // keeps this, the row menu's submenu and the edit form's dropdown
         // from drifting apart.
         let folders = a_real_looking_vault();
-        let accepting: Vec<&str> = drop_outcomes(&folders, &dragged(Some("f1")))
+        let accepting: Vec<&str> = drop_outcomes(&folders, &dragged(Some("f1")), false)
             .iter()
             .zip(&folders)
             .filter(|(outcome, _)| **outcome == DropOutcome::Accept)
@@ -1573,6 +1686,7 @@ mod drag_and_drop_tests {
                                 &mut filter,
                                 Screens { sends: &mut false, health: &mut false },
                                 "Locks in 11:42",
+                                false,
                             );
                         },
                     );
@@ -1588,6 +1702,7 @@ mod drag_and_drop_tests {
                                 &mut search,
                                 &mut selected_id,
                                 &icons,
+                                false,
                                 &mut visible,
                                 None,
                                 false,
@@ -1797,6 +1912,7 @@ mod drag_and_drop_tests {
                                 filter,
                                 Screens { sends, health },
                                 countdown,
+                                false,
                             );
                         },
                     );
@@ -1810,7 +1926,9 @@ mod drag_and_drop_tests {
                                 folders,
                                 &SidebarFilter::All,
                                 search,
-                                selected_id,                                &icons,
+                                selected_id,
+                                &icons,
+                                false,
                                 visible,
                                 None,
                                 false,
@@ -1961,6 +2079,7 @@ mod drag_and_drop_tests {
                                 &mut filter,
                                 Screens { sends: &mut false, health: &mut false },
                                 "Locks in 11:42",
+                                false,
                             );
                         },
                     );
@@ -1976,6 +2095,7 @@ mod drag_and_drop_tests {
                                 &mut search,
                                 &mut selected_id,
                                 &icons,
+                                false,
                                 &mut visible,
                                 None,
                                 false,
@@ -2029,7 +2149,7 @@ mod drag_and_drop_tests {
             run.action,
             SidebarAction::MoveItemToFolder {
                 item_id: "Ledgerline".to_string(),
-                folder_id: "f2".to_string(),
+                folder_id: Some("f2".to_string()),
             }
         );
     }
@@ -2089,7 +2209,7 @@ mod drag_and_drop_tests {
             run.action,
             SidebarAction::MoveItemToFolder {
                 item_id: "Ledgerline".to_string(),
-                folder_id: "f2".to_string(),
+                folder_id: Some("f2".to_string()),
             }
         );
         assert_eq!(run.selected, None, "the drag selected the row it picked up");
@@ -2632,6 +2752,7 @@ mod tests {
                 &mut selected,
                 Screens { sends: &mut sends_selected, health: &mut health_selected },
                 lock_countdown,
+                false,
             );
         });
 
@@ -3469,6 +3590,7 @@ mod tests {
                     &mut selected,
                     Screens { sends: &mut sends, health: &mut health },
                     "Locks in 11:42",
+                    false,
                 );
             }));
         }
@@ -3579,6 +3701,7 @@ mod tests {
                     &mut selected,
                     Screens { sends: &mut sends_selected, health: &mut health_selected },
                     "Locks in 11:42",
+                    false,
                 );
             })
         };
@@ -3661,6 +3784,7 @@ mod tests {
                 &mut selected,
                 Screens { sends: &mut false, health: &mut false },
                 "Locks in 11:42",
+                false,
             );
         });
 
@@ -3874,6 +3998,7 @@ mod tests {
                             &mut selected,
                             Screens { sends: &mut sends, health: &mut health },
                             "Locks in 11:42",
+                            false,
                         );
                     });
             });
@@ -4036,6 +4161,7 @@ mod tests {
                             &mut selected,
                             Screens { sends: &mut sends, health: &mut health },
                             COUNTDOWN,
+                            false,
                         );
                     });
             });

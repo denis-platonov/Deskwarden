@@ -722,6 +722,18 @@ pub fn build_frame_with_search(
     // the frame closure for exactly that reason: a per-frame local would be
     // dropped before anything could read it.
     let mut pane_out_of_vault_command: Option<(String, item_list::RowCommand)> = None;
+    // **Whether "No folder" is a destination this backend can reach**, asked
+    // once for the life of the window rather than per frame: it is a property
+    // of which backend is bound, and the backend does not change under an
+    // open window (an account switch closes it -- see
+    // `VaultWindowResult::switch_to`).
+    //
+    // `bw serve` answers `false` and the direct-REST backend `true`; the
+    // measurement behind that split is in `VaultBackend::can_unfile_items`.
+    // Both menus that offer folder destinations read this one value, so they
+    // cannot come to disagree about whether the write behind the entry does
+    // anything.
+    let may_unfile = cache.can_unfile_items();
     // When the daemon's shortcut status was last adopted, so the read is
     // throttled to `SHORTCUT_STATUS_REREAD` rather than run per frame. `None`
     // until the modal is first opened, so opening it adopts immediately.
@@ -2659,7 +2671,10 @@ pub fn build_frame_with_search(
         // Set by a drop on a folder row below: `Ok` is a move to attempt,
         // `Err` a refusal the sidebar already decided. Drained after the
         // panel, for the same reason `row_command` is.
-        let mut folder_drop: Option<Result<(String, String), &'static str>> = None;
+        // `None` for the folder is the virtual "No Folder" row, which is a
+        // real destination wherever the backend can un-file -- see
+        // `sidebar::drop_outcomes`.
+        let mut folder_drop: Option<Result<(String, Option<String>), &'static str>> = None;
 
         // The on-demand lists, started here -- BEFORE the panels draw, and
         // off-thread. The selected row is what asks for one, so a user who
@@ -2734,6 +2749,7 @@ pub fn build_frame_with_search(
                         health: &mut health_selected,
                     },
                     &lock_countdown,
+                    may_unfile,
                 ) {
                     SidebarAction::NewFolder => match cache.create_folder("New folder") {
                         Ok(folder) => folders.push(folder),
@@ -2790,7 +2806,9 @@ pub fn build_frame_with_search(
                     &needs_reauth_for_closure,
                     &mut items,
                     &item_id,
-                    &folder_id,
+                    // `None` is the "No Folder" row, which is a destination
+                    // wherever the backend performs it.
+                    folder_id.as_deref(),
                 );
             }
             Some(Err(reason)) => move_error = Some(reason.to_string()),
@@ -2955,6 +2973,7 @@ pub fn build_frame_with_search(
                         &mut search,
                         &mut selected_id,
                         &icons,
+                        may_unfile,
                         &mut visible_ids,
                         notice.map(|(_, message)| message),
                         // NOT `notice.is_some()`: the band can be carrying a
@@ -3350,8 +3369,20 @@ pub fn build_frame_with_search(
                     // snapshot is what the rest of the app reads, and its
                     // replay log is what stops an in-flight populate filing
                     // the item back where it was.
-                    item_list::RowCommand::MoveToFolder(folder_id) => {
-                        match cache.move_item_to_folder(&item, Some(folder_id.as_str())) {
+                    // **One body, two destinations.** "No folder" is
+                    // `Unfile`, which carries no id -- see that variant, and
+                    // `move_menu`, which offers it only where the backend can
+                    // actually perform it. A second arm spelling out the same
+                    // fifteen lines with `None` is the drift this file keeps
+                    // paying for, so the destination is computed from the
+                    // command and everything after it is shared.
+                    ref command @ (item_list::RowCommand::MoveToFolder(_)
+                    | item_list::RowCommand::Unfile) => {
+                        let folder_id = match command {
+                            item_list::RowCommand::MoveToFolder(id) => Some(id.as_str()),
+                            _ => None,
+                        };
+                        match cache.move_item_to_folder(&item, folder_id) {
                             Ok(moved) => {
                                 if let Some(pos) = items.iter().position(|i| i.id == item.id) {
                                     // The value the cache wrote into its own
@@ -3366,7 +3397,7 @@ pub fn build_frame_with_search(
                             }
                             Err(e) => {
                                 log::warn!(
-                                    "failed to move item {} ({}) into folder {folder_id}: {e:?}",
+                                    "failed to move item {} ({}) into folder {folder_id:?}:                                      {e:?}",
                                     item.id,
                                     item.name
                                 );
@@ -4064,6 +4095,18 @@ pub fn build_frame_with_search(
                             // failure sentence live, and a second copy of
                             // them here is the drift this window keeps
                             // paying for.
+                            // **Not reachable from this pane**, which draws
+                            // no "Move to folder" submenu at all: a trashed
+                            // item cannot be filed anywhere. Listed rather
+                            // than swept into the catch-all so that a
+                            // submenu added here later is a warning rather
+                            // than a click that does nothing.
+                            detail::DetailAction::Unfile => {
+                                log::warn!(
+                                    "the out-of-vault pane reported Unfile, which it offers no \
+                                     control for; the click was dropped"
+                                );
+                            }
                             detail::DetailAction::Restore => {
                                 pane_out_of_vault_command =
                                     Some((item.id.clone(), item_list::RowCommand::Restore));
@@ -4136,6 +4179,7 @@ pub fn build_frame_with_search(
                                 &folders,
                                 fill_count,
                                 &totp_state,
+                                may_unfile,
                                 &mut reveal,
                                 icons.textures.get(item.id.as_str()),
                                 &mut app_identities,
@@ -4458,14 +4502,26 @@ pub fn build_frame_with_search(
                                         mode = DetailMode::Create(draft);
                                     }
                                 }
-                                DetailAction::MoveToFolder(folder_id) => {
+                                // **One arm for both destinations**, for the
+                                // row menu's reason: "No folder" is
+                                // `DetailAction::Unfile`, which carries no
+                                // id, and everything after the destination is
+                                // shared -- the optimistic write, the revert
+                                // and the band's sentence all live in
+                                // `move_item_into_folder`.
+                                ref action @ (DetailAction::MoveToFolder(_)
+                                | DetailAction::Unfile) => {
+                                    let folder_id = match action {
+                                        DetailAction::MoveToFolder(id) => Some(id.as_str()),
+                                        _ => None,
+                                    };
                                     move_error = move_item_into_folder(
                                         ui.ctx(),
                                         &cache,
                                         &needs_reauth_for_closure,
                                         &mut items,
                                         &item.id,
-                                        &folder_id,
+                                        folder_id,
                                     );
                                 }
                                 // **The moved "Send a record" control.** It
@@ -6553,6 +6609,9 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         // from the kebab and not from the right-click menu would make the
         // gate look arbitrary and teach the user to find the cheaper door.
         | DetailAction::MoveToFolder(_)
+        // Taking an item OUT of a folder discloses no more than putting it
+        // into one, which is the arm directly above.
+        | DetailAction::Unfile
         | DetailAction::RemoveAppMatch
         // Closing the pane HIDES the item; there is nothing here to prove a
         // master password for.
@@ -6631,6 +6690,7 @@ fn row_command_exposes_secrets(command: &item_list::RowCommand) -> bool {
         | item_list::RowCommand::SelectIcon
         | item_list::RowCommand::ClearIcon
         | item_list::RowCommand::MoveToFolder(_)
+        | item_list::RowCommand::Unfile
         | item_list::RowCommand::Delete
         | item_list::RowCommand::Archive
         | item_list::RowCommand::Unarchive
@@ -6980,12 +7040,20 @@ fn move_item_into_folder(
     needs_reauth: &Rc<RefCell<bool>>,
     items: &mut [VaultItem],
     item_id: &str,
-    folder_id: &str,
+    // **`None` is "no folder", and it is a real destination.** The drag-and-
+    // drop gesture can only produce a folder, but the detail pane's kebab
+    // offers "No folder" wherever the backend can perform it -- see
+    // `item_list::move_menu`. One helper for both, because everything that
+    // makes this function worth having (the optimistic write, the revert, the
+    // one-place rule below) is identical either way.
+    folder_id: Option<&str>,
 ) -> Option<String> {
     let Some(at) = items.iter().position(|i| i.id == item_id) else {
         // The vault reloaded out from under the gesture. Nothing to move and
         // nothing to say -- the row the user dragged is not on screen either.
-        log::warn!("dropped item {item_id} onto folder {folder_id}, but it is no longer listed");
+        log::warn!(
+            "dropped item {item_id} onto folder {folder_id:?}, but it is no longer listed"
+        );
         return None;
     };
     let before = items[at].clone();
@@ -6994,15 +7062,15 @@ fn move_item_into_folder(
     // copy on success below -- keeping this value would leave the row holding
     // a `revisionDate` the write has superseded, and the next write of it
     // would be refused (see `vault_bridge`'s `REVISION_DATE_KEY`).
-    items[at] = crate::vault_bridge::with_folder(&before, Some(folder_id));
-    match cache.move_item_to_folder(&before, Some(folder_id)) {
+    items[at] = crate::vault_bridge::with_folder(&before, folder_id);
+    match cache.move_item_to_folder(&before, folder_id) {
         Ok(moved) => {
             items[at] = moved;
             None
         }
         Err(e) => {
             items[at] = before;
-            log::warn!("failed to move item {item_id} into folder {folder_id}: {e:?}");
+            log::warn!("failed to move item {item_id} into folder {folder_id:?}: {e:?}");
             flag_reauth_if_unauthorized(ctx, needs_reauth, &e);
             Some(move_failure_message(&items[at].name, &e))
         }
@@ -10589,6 +10657,9 @@ fn draw_read_arm(
     folders: &[Folder],
     fill_count: u32,
     totp_state: &TotpState,
+    // Forwarded to the read pane's kebab, not decided here -- see
+    // `item_list::move_menu`.
+    may_unfile: bool,
     reveal: &mut detail::RevealState,
     icon: Option<&egui::TextureHandle>,
     // The window's one `AppIdentityCache`, threaded through to the read pane
@@ -10614,6 +10685,7 @@ fn draw_read_arm(
         folders,
         fill_count,
         totp_state,
+        may_unfile,
         reveal,
         icon,
         apps,
@@ -15510,7 +15582,7 @@ mod folder_drop_tests {
         let (ctx, reauth) = ctx_and_reauth();
         let mut items = vec![item("i1", None)];
 
-        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", "f2");
+        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", Some("f2"));
 
         put.assert();
         assert_eq!(message, None, "a successful move should have nothing to say");
@@ -15539,7 +15611,7 @@ mod folder_drop_tests {
         let (ctx, reauth) = ctx_and_reauth();
         let mut items = vec![item("i1", Some("f1"))];
 
-        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", "f2");
+        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", Some("f2"));
 
         assert_eq!(
             items[0].folder_id.as_deref(),
@@ -15564,7 +15636,7 @@ mod folder_drop_tests {
         let before = item("i1", Some("f1"));
         let mut items = vec![before.clone()];
 
-        let _ = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", "f2");
+        let _ = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", Some("f2"));
 
         // `VaultItem` is not `PartialEq` (it carries a `Zeroizing` password),
         // so the whole entry is compared through its own serialization --
@@ -15585,7 +15657,7 @@ mod folder_drop_tests {
         let (ctx, reauth) = ctx_and_reauth();
         let mut items = vec![item("i1", None)];
 
-        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "gone", "f2");
+        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "gone", Some("f2"));
 
         assert_eq!(message, None);
         assert_eq!(items.len(), 1);
@@ -15605,7 +15677,7 @@ mod folder_drop_tests {
         let (ctx, reauth) = ctx_and_reauth();
         let mut items = vec![item("i1", Some("f1"))];
 
-        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", "f2");
+        let message = move_item_into_folder(&ctx, &cache, &reauth, &mut items, "i1", Some("f2"));
 
         assert_eq!(items[0].folder_id.as_deref(), Some("f1"));
         assert!(*reauth.borrow(), "a 401 did not flag re-authentication");
@@ -19979,6 +20051,9 @@ mod draw_read_arm_tests {
                 &[],
                 3,
                 &TotpState::NoSecret,
+                // The submenu this feeds has its own tests; with no folders
+                // in the list there is nothing here for it to change.
+                false,
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
@@ -21031,6 +21106,9 @@ mod the_idle_timer_follows_the_edited_setting {
                 &mut selected,
                 sidebar::Screens { sends: &mut false, health: &mut false },
                 lock_countdown,
+                // This harness reads the rail's painted text; no drag is in
+                // flight, so the drop decision has nothing to decide.
+                false,
             );
         });
 

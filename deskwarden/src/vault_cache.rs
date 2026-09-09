@@ -611,6 +611,18 @@ impl VaultCache {
         Arc::clone(&self.bridge)
     }
 
+    /// Whether [`Self::move_item_to_folder`] with `None` really takes the
+    /// item out of its folder -- [`VaultBackend::can_unfile_items`], asked
+    /// through the cache because the window has a cache and not a backend.
+    ///
+    /// **A pass-through with no caching of its own**, unlike everything else
+    /// on this type: the answer is a constant per backend, there is no
+    /// snapshot to consult, and a copy held here would be a second place for
+    /// it to be wrong after a late binding resolves.
+    pub fn can_unfile_items(&self) -> bool {
+        self.bridge.can_unfile_items()
+    }
+
     /// Fills the snapshot from the backend. Called once per unlock, and
     /// again after a sync.
     ///

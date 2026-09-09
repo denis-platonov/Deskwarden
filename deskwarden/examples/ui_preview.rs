@@ -1903,7 +1903,11 @@ impl Preview {
                     &fixtures.folders,
                     &SidebarFilter::All,
                     search,
-                    selected,                    icons,
+                    selected,
+                    icons,
+                    // The preview drives no drag and opens no menu, so
+                    // the un-file destination has nothing to decide.
+                    false,
                     visible,
                     None,
                     false,
@@ -1938,7 +1942,11 @@ impl Preview {
                     &fixtures.folders,
                     &SidebarFilter::All,
                     search,
-                    selected,                    icons,
+                    selected,
+                    icons,
+                    // The preview drives no drag and opens no menu, so
+                    // the un-file destination has nothing to decide.
+                    false,
                     visible,
                     None,
                     false,
@@ -1974,7 +1982,11 @@ impl Preview {
                     &fixtures.folders,
                     &SidebarFilter::All,
                     search,
-                    selected,                    icons,
+                    selected,
+                    icons,
+                    // The preview drives no drag and opens no menu, so
+                    // the un-file destination has nothing to decide.
+                    false,
                     visible,
                     None,
                     false,
@@ -2089,6 +2101,7 @@ impl Preview {
                     selected,
                     sidebar::Screens { sends, health },
                     "Locks in 11:42",
+                    false,
                 );
             });
     }
@@ -2138,7 +2151,9 @@ impl Preview {
                         // honest one to show without a folder list.
                         &[],
                         if card { 0 } else { 42 },
-                        totp,                        &mut fixtures.reveal,
+                        totp,
+                        false,
+                        &mut fixtures.reveal,
                         // A favicon only on the shot that is ABOUT one --
                         // every other detail shot keeps the monogram
                         // fallback, which is what an avatar shows without

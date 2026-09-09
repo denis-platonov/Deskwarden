@@ -874,6 +874,22 @@ impl VaultBackend for RestBackend {
         self.update_item(&moved)
     }
 
+    /// **`true`, and it is the reason this capability exists.**
+    ///
+    /// The paragraph above is the whole argument: this backend's `PUT`
+    /// replaces the cipher, `rest::write` omits the `folderId` key for a
+    /// `None`, and an omitted key on a replacing write is an absent folder.
+    /// `bw serve` answers `false` because the same three spellings there were
+    /// measured to change nothing.
+    ///
+    /// So "Move to folder → No folder" is a real destination on this
+    /// backend, and the surfaces that offer it -- `item_list::move_menu`, the
+    /// detail pane's kebab and `EditDraft::may_unfile` -- ask this rather
+    /// than withholding it from everyone.
+    fn can_unfile_items(&self) -> bool {
+        true
+    }
+
     /// **Cost: one `PUT /api/ciphers/{id}/delete`. No sync.**
     ///
     /// A **soft** delete -- the item goes to the trash and
