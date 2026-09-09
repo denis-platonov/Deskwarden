@@ -15,6 +15,8 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.19 - 2026-09-09
+
 ### Shortcuts, on a page of their own
 
 Preferences has a **Shortcuts** page, and the fill shortcut has moved onto

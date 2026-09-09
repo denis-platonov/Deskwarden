@@ -2537,7 +2537,13 @@ mod tests {
             // was first run against the PREVIOUS pinned pair and reproduced
             // (21763, 0xb612_6058_b89a_c276) exactly, so it is measuring what
             // this test measures.
-            (23092, 0x1922_0faf_c630_46af_u64),
+            //
+            // 23088 bytes, new hash: **the 0.15.19 release, and nothing
+            // else.** `version = "0.15.19-dev"` became `"0.15.19"`, four
+            // bytes shorter, which is why 23092 becomes 23088. No dependency
+            // was added, removed, re-pointed or re-featured -- the only thing
+            // this pair exists to notice.
+            (23088, 0xa691_2605_703d_bf71_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
