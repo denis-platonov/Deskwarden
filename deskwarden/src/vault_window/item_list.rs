@@ -15,12 +15,30 @@ use crate::vault_bridge::{Folder, ItemKind, VaultItem};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::collections::HashMap;
 
-/// Holds loaded favicon textures, keyed by item id. Owned by
-/// `vault_window::mod` (Task 9), which populates it from the background
-/// favicon loader; this module only ever reads it.
+/// The window's in-memory icon state. Owned by `vault_window::mod` (Task 9),
+/// which populates it from the background favicon loader; this module only
+/// ever reads [`Self::textures`], and never touches [`Self::refreshing`] at
+/// all.
 #[derive(Default)]
 pub struct IconCache {
+    /// Loaded favicon textures, keyed by item id.
     pub textures: HashMap<String, egui::TextureHandle>,
+    /// The ids whose next icon fetch must bypass the icon proxy's own cache
+    /// -- "Refresh icon" was chosen on that row.
+    ///
+    /// **Here rather than as an eighth parameter to `ensure_icon_loaded`,**
+    /// which is already at clippy's argument limit (see that function's
+    /// `IconFetch` doc). It also belongs here on the merits: a refresh drops
+    /// the texture and marks the id, and those are one act on one piece of
+    /// per-item icon state rather than two facts kept in two places that can
+    /// disagree.
+    ///
+    /// **Drained, not read.** `ensure_icon_loaded` removes the id at the
+    /// moment it dispatches, so a refresh buys exactly one refreshing
+    /// request; every later frame asks the ordinary way and the proxy is
+    /// allowed to serve what it has just re-fetched. A flag that stayed set
+    /// would make one menu click into a permanent cache-buster on that row.
+    pub refreshing: std::collections::HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +97,15 @@ pub enum RowCommand {
     /// Carries the URL, resolved from the item when the menu is built by the
     /// same rule the detail pane's AUTOFILL TARGETS card uses.
     OpenWebsite(String),
+    /// Forget this item's site icon everywhere it is remembered and fetch it
+    /// again -- see `vault_window::mod`'s `refresh_item_icon`.
+    ///
+    /// Carries nothing. The domain is `favicon::icon_authority_for`'s answer
+    /// for the item, and the handler asks it the same way the loader does
+    /// rather than being handed a copy taken when the menu was built: the two
+    /// are separated by however long the menu stays open, and a stale copy
+    /// would delete the wrong file.
+    RefreshIcon,
     Edit,
     /// The destination folder's id, always a real assignable folder --
     /// see [`move_menu`].
@@ -177,6 +204,13 @@ const EDIT_DISABLED_REASON: &str =
 /// Shown instead of a destination list when the vault has no folder that can
 /// be assigned to.
 const NO_ASSIGNABLE_FOLDERS: &str = "No folders yet";
+
+/// The "forget this icon and fetch it again" entry's wording, the owner's own.
+///
+/// A constant because the draw code, the entry-list tests and the tests that
+/// read painted galleys all name it, and a relabelling that reached three of
+/// those four is a menu whose test suite is about a string nobody sees.
+pub const REFRESH_ICON_LABEL: &str = "Refresh icon";
 
 /// Why the item's own folder is greyed inside the submenu. Kept rather than
 /// dropped from the list so the destinations do not reshuffle as items are
@@ -282,6 +316,30 @@ pub fn menu_entries(
                 RowCommand::OpenWebsite(url.to_string()),
             ));
         }
+    }
+    // **ABSENT, not greyed, for an item with no icon domain** -- so a secure
+    // note, an identity, an SSH key, a login with no URI and a card with no
+    // `deskwarden:bank-domain` all get a menu that never mentions icons.
+    //
+    // That is the rule `MenuCommand::enabled`'s own doc states, applied: this
+    // entry is "Copy TOTP"-shaped, not "Edit"-shaped. Such a row draws a
+    // monogram because there is no site to have an icon OF, which is not a
+    // situation a greyed line with a sentence attached would explain -- the
+    // user is not looking for the obvious action and failing to find it, and
+    // a disabled "Refresh icon" on a secure note would invite them to wonder
+    // what icon it meant. `icon_authority_for` is asked rather than
+    // `icon_domain_for`, and rather than a `kind ==` test of its own, so the
+    // one function that decides "does this item have an icon at all" decides
+    // it here too -- the same seam that let cards grow icons without this
+    // file knowing cards exist.
+    //
+    // Immediately after "Open website" because these two are the entries that
+    // exist only when the item names a site, and for a login they are read
+    // off the very same first URI. Deliberately above Edit rather than down
+    // with Archive and Delete: that trailing pair is the lifecycle group, and
+    // an entry that changes nothing but a picture does not belong in it.
+    if crate::favicon::icon_authority_for(item).is_some() {
+        entries.push(enabled_command(REFRESH_ICON_LABEL, RowCommand::RefreshIcon));
     }
     // Present for every kind, enabled only for those the edit form can
     // honestly edit -- see `MenuCommand::enabled` for why this one is greyed
@@ -2501,6 +2559,7 @@ mod menu_entry_tests {
                 "Copy password",
                 "Copy TOTP",
                 "Open website",
+                REFRESH_ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -2660,6 +2719,91 @@ mod menu_entry_tests {
         );
     }
 
+    /// **"Refresh icon" is ABSENT, not greyed, for an item with no icon.**
+    ///
+    /// The rule `MenuCommand::enabled`'s doc states, applied to a new entry:
+    /// this one is "Copy TOTP"-shaped (nothing to act on, so nothing to
+    /// offer) rather than "Edit"-shaped (the obvious action, withheld, and
+    /// therefore owed a reason). A greyed "Refresh icon" on a secure note
+    /// would invite the user to wonder which icon it meant.
+    ///
+    /// Whole lists rather than `contains`, and a live control in the same
+    /// test: `full_login` DOES offer it, so a build that had dropped the
+    /// entry altogether cannot pass the negative half.
+    #[test]
+    fn refresh_icon_is_absent_for_every_item_with_no_icon_domain() {
+        let live = |item: &VaultItem| labels(&menu_entries(item, &[], false, FilterSource::LiveVault));
+        assert!(
+            live(&full_login()).contains(&REFRESH_ICON_LABEL.to_string()),
+            "the live control failed: an item that DOES have a domain was offered no refresh, \
+             so the absences below prove nothing"
+        );
+
+        // A login whose only URI is one `authority_from_uri` refuses --
+        // `androidapp://` names no host this app could fetch from.
+        let app_only = VaultItem {
+            login: Some(LoginData {
+                uris: vec![UriEntry {
+                    uri: Some("androidapp://com.ledgerline.app".into()),
+                    other: serde_json::Map::new(),
+                }],
+                ..full_login().login.unwrap()
+            }),
+            ..of_kind(Some(1))
+        };
+        for (what, item) in [
+            ("a secure note", of_kind(Some(2))),
+            ("a card with no bank domain", of_kind(Some(3))),
+            ("an identity", of_kind(Some(4))),
+            ("an SSH key", of_kind(Some(5))),
+            ("a login with no URI at all", of_kind(Some(1))),
+            ("a login whose only URI names no host", app_only),
+        ] {
+            assert!(
+                !live(&item).contains(&REFRESH_ICON_LABEL.to_string()),
+                "{what} was offered \"{REFRESH_ICON_LABEL}\", which would refresh nothing: {:?}",
+                live(&item)
+            );
+        }
+    }
+
+    /// The entry follows `favicon::icon_authority_for` and not the item's
+    /// KIND, which is the whole reason it asks that function.
+    ///
+    /// A card carrying `deskwarden:bank-domain` has an icon -- that is the
+    /// seam `icon_domain_for` exists for -- so it gets the entry, while the
+    /// card two tests up, with no such field, does not. A `kind == Login`
+    /// test would have been green against every other assertion in this file.
+    #[test]
+    fn a_card_with_a_bank_domain_is_offered_the_refresh_its_icon_can_use() {
+        let mut card = of_kind(Some(3));
+        card.fields.push(crate::vault_bridge::VaultField {
+            name: Some(crate::favicon::BANK_DOMAIN_FIELD.to_string()),
+            value: Some(Zeroizing::new("chase.com".into())),
+            other: serde_json::Map::new(),
+        });
+        assert_eq!(
+            labels(&menu_entries(&card, &[], false, FilterSource::LiveVault)),
+            vec![REFRESH_ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"],
+            "a card with a bank domain did not get the entry, or got something else with it"
+        );
+    }
+
+    /// A trashed or archived row is not offered it either -- those two menus
+    /// are built by `out_of_vault_entries` and share nothing with the live
+    /// one, which is exactly the property that keeps this from being a
+    /// question anybody has to remember to ask again.
+    #[test]
+    fn a_trashed_or_archived_row_is_offered_no_refresh() {
+        for source in [FilterSource::Trash, FilterSource::Archive] {
+            let entries = labels(&menu_entries(&full_login(), &[], false, source));
+            assert!(
+                !entries.contains(&REFRESH_ICON_LABEL.to_string()),
+                "{source:?} offered a refresh: {entries:?}"
+            );
+        }
+    }
+
     #[test]
     fn edit_follows_kind_offers_edit_for_every_kind() {
         // Drives the predicate the menu itself consumes, so relaxing
@@ -2698,6 +2842,7 @@ mod menu_entry_tests {
                 "Copy username",
                 "Copy password",
                 "Open website",
+                REFRESH_ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -6328,11 +6473,12 @@ mod row_tile_tests {
     /// out-of-vault labels is what lets those same tests state that a LIVE
     /// row offers no Restore or Unarchive, rather than being unable to see
     /// one if it did.
-    const MENU_VOCABULARY: [&str; 13] = [
+    const MENU_VOCABULARY: [&str; 14] = [
         "Copy username",
         "Copy password",
         "Copy TOTP",
         "Open website",
+        REFRESH_ICON_LABEL,
         "Edit",
         MOVE_TO_FOLDER_LABEL,
         "Archive",
@@ -6801,6 +6947,7 @@ mod row_tile_tests {
                 "Copy password",
                 "Copy TOTP",
                 "Open website",
+                REFRESH_ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -6831,6 +6978,7 @@ mod row_tile_tests {
                 "Copy username",
                 "Copy password",
                 "Open website",
+                REFRESH_ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -7011,6 +7159,50 @@ mod row_tile_tests {
                 id: "Ledgerline".to_string(),
                 command: RowCommand::OpenWebsite("https://ledgerline.com".to_string()),
             }
+        );
+    }
+
+    /// **The real menu, really clicked.** `menu_entry_tests` pins what
+    /// `menu_entries` decides; this is the other half -- that the popup draws
+    /// the entry and that clicking it comes back out of `draw_item_list` as
+    /// `RowCommand::RefreshIcon` against the row that was right-clicked.
+    ///
+    /// The second row deliberately, not the first: an implementation that
+    /// reported the selected id, or the first item, or the id the menu was
+    /// last built for, passes on row 0 and fails here.
+    #[test]
+    fn choosing_refresh_icon_reports_it_against_the_row_that_was_right_clicked() {
+        let items = [full_login("Ledgerline"), full_login("Vantage")];
+        let p = choose_entry(&items, vec![], 1, REFRESH_ICON_LABEL);
+        assert_eq!(
+            p.action,
+            ItemListAction::Row {
+                id: "Vantage".to_string(),
+                command: RowCommand::RefreshIcon,
+            }
+        );
+    }
+
+    /// The painted half of `refresh_icon_is_absent_for_every_item_with_no_
+    /// icon_domain`: a row with no icon domain draws no such entry, so there
+    /// is nothing on screen to click.
+    ///
+    /// Whole list, and a live control drawn by the same harness one line
+    /// down -- `menu_labels` filters through `MENU_VOCABULARY`, so a label
+    /// missing from that array would make BOTH halves silently vacuous.
+    #[test]
+    fn a_row_with_no_icon_domain_paints_no_refresh_entry() {
+        let note = VaultItem { item_type: Some(2), login: None, ..login("Recovery codes", "") };
+        let painted = menu_labels(&open_menu(&[note], vec![], 0));
+        assert!(
+            !painted.contains(&REFRESH_ICON_LABEL.to_string()),
+            "a secure note's menu painted \"{REFRESH_ICON_LABEL}\": {painted:?}"
+        );
+        assert!(
+            menu_labels(&open_menu(&[full_login("Ledgerline")], vec![], 0))
+                .contains(&REFRESH_ICON_LABEL.to_string()),
+            "the live control failed: no row paints the entry at all, so the absence above is \
+             not about this item"
         );
     }
 
@@ -7199,6 +7391,7 @@ mod row_tile_tests {
                 "Copy password",
                 "Copy TOTP",
                 "Open website",
+                REFRESH_ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",

@@ -3188,6 +3188,22 @@ pub fn build_frame_with_search(
                         ),
                     },
                     item_list::RowCommand::OpenWebsite(url) => webbrowser_open(&url),
+                    // Everything this does is a deletion -- see
+                    // `refresh_item_icon` for the three caches and the order.
+                    // No fetch is started here on purpose: the item list
+                    // already calls `ensure_icon_loaded` for every visible
+                    // row on every frame, and with the disk file, the texture
+                    // and the requested-set mark all gone that ordinary call
+                    // is the new request, carrying `?refresh=1` because the
+                    // id was left in `icons.refreshing`.
+                    item_list::RowCommand::RefreshIcon => {
+                        refresh_item_icon(
+                            &item,
+                            &icon_cache_dir,
+                            &mut favicon_requested,
+                            &mut icons,
+                        );
+                    }
                     // Only from Read. A draft already open on this item IS
                     // what "Edit" asks for, so re-seeding it would do nothing
                     // but discard whatever the user had typed; the same goes
@@ -6204,6 +6220,13 @@ fn row_command_exposes_secrets(command: &item_list::RowCommand) -> bool {
         | item_list::RowCommand::CopyTotp
         | item_list::RowCommand::Edit => true,
         item_list::RowCommand::OpenWebsite(_)
+        // **A refresh reveals nothing.** It deletes a cached picture of a
+        // public website's favicon and asks for it again; it reads no field
+        // of the item, paints none and copies none. The domain it acts on is
+        // already on screen -- it is what the row's own icon or monogram
+        // stands for -- so a Hello prompt here would cost a master password
+        // to redraw something the user is looking at.
+        | item_list::RowCommand::RefreshIcon
         | item_list::RowCommand::MoveToFolder(_)
         | item_list::RowCommand::Delete
         | item_list::RowCommand::Archive
@@ -11583,13 +11606,41 @@ fn ensure_icon_loaded(
         return;
     };
     favicon_requested.insert(item.id.clone());
+    // **Drained here, at the one place a fetch is dispatched from.** The set
+    // is written by `refresh_item_icon` when the user chooses "Refresh icon",
+    // and taking the mark out now is what makes a refresh cost exactly one
+    // bypassing request: every frame after this one asks the ordinary way, so
+    // the proxy is allowed to serve the copy it has just re-fetched. Left
+    // set, one menu click would turn that row into a permanent cache-buster
+    // against the owner's own server.
+    let freshness = if icons.refreshing.remove(&item.id) {
+        crate::favicon::IconFreshness::Refresh
+    } else {
+        crate::favicon::IconFreshness::Cached
+    };
     // **The authority, and nothing else about the item.** Not its name, not
     // its id, not its URI -- a host:port the user chose to store, which is
     // the one fact the icon path acts on and the one this log is for. Every
     // other line below names the same string or a URL built from it.
     log::debug!("icon: {domain} is this item's icon authority");
 
-    if let Some(cached_bytes) = crate::favicon::read_cached_icon(icon_cache_dir, &domain) {
+    // **A refreshing pass does not consult the disk cache at all**, and that
+    // is a belt to `refresh_item_icon`'s braces rather than a duplicate of
+    // them. That function deletes the file first, but the delete is
+    // best-effort in the same way `favicon::write_cached_icon` is -- a file
+    // held open by an indexer or a backup agent is the ordinary Windows way
+    // for `remove_file` to fail -- and reading the stale bytes back here
+    // would serve the exact picture the user pressed the entry to be rid of.
+    // A menu entry that silently does nothing is worse than one that costs a
+    // request, and this path is only ever taken right after a deliberate
+    // click.
+    let cached = match freshness {
+        crate::favicon::IconFreshness::Refresh => None,
+        crate::favicon::IconFreshness::Cached => {
+            crate::favicon::read_cached_icon(icon_cache_dir, &domain)
+        }
+    };
+    if let Some(cached_bytes) = cached {
         if let Some((w, h, rgba)) = crate::favicon::decode_rgba(&cached_bytes) {
             let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
             let tex = ctx.load_texture(item.id.clone(), image, egui::TextureOptions::default());
@@ -11616,7 +11667,7 @@ fn ensure_icon_loaded(
         // preferences copy and `PRIVACY.md` all describe, and a second copy
         // of it in the loader is how those four come to disagree.
         let source =
-            crate::favicon::icon_source_for(&domain, server_url.as_deref(), direct);
+            crate::favicon::icon_source_for(&domain, server_url.as_deref(), direct, freshness);
         let pixels = crate::favicon::fetch_icon_for(&source).and_then(|bytes| {
             let decoded = crate::favicon::decode_rgba(&bytes);
             if decoded.is_some() {
@@ -11639,6 +11690,64 @@ fn ensure_icon_loaded(
         }
         let _ = tx.send(FaviconResult { item_id, pixels });
     });
+}
+
+/// Forgets everything this app knows about `item`'s icon, so the next
+/// [`ensure_icon_loaded`] call fetches a fresh one and asks the icon service
+/// not to answer from its own cache either.
+///
+/// **There are THREE caches between a stuck monogram and a new picture, and
+/// two of them are this app's.** In the order they are cleared, which is also
+/// the order they would otherwise short-circuit the ask:
+///
+/// 1. **The on-disk file**, `<cache_dir>/<domain>.png`. Nothing in
+///    `favicon` ever expires it -- see [`crate::favicon::forget_cached_icon`]
+///    -- so a placeholder that landed during one bad minute is that domain's
+///    icon forever. Cleared FIRST, because it is the only one of the three
+///    that outlives the process: a refresh that cleared only the in-memory
+///    state would look fixed until the next launch and then be stuck again.
+/// 2. **The loaded texture**, `IconCache::textures`. `ensure_icon_loaded`
+///    returns on its very first line when this holds the id, so a refresh
+///    that left it in place would do nothing at all this run.
+/// 3. **The "already asked" mark**, `favicon_requested`. Same first line,
+///    same nothing. Both have to go: either one alone still returns early.
+///
+/// The third cache is the icon proxy's, at the Cloudflare edge, and this
+/// function cannot reach it -- it can only ask. That is what
+/// [`crate::favicon::IconFreshness::Refresh`] is for, and marking
+/// `IconCache::refreshing` here is how the ask reaches the request the loader
+/// builds several frames later. See that enum for the seven-day
+/// `immutable` header this whole feature exists because of.
+///
+/// **Nothing is fetched here.** The refresh is expressed entirely as absence,
+/// and the ordinary per-frame `ensure_icon_loaded` call the item list already
+/// makes for every visible row is what turns it into a request. One fetch
+/// path, not two: a spawn of its own here would be a second copy of the
+/// setting gate, the domain question, the disk write and the channel send,
+/// and this file's history is a list of exactly that defect.
+///
+/// Answers with the domain it forgot, for the log and for the tests -- and
+/// `None` for an item that has no icon domain, which cannot arrive from the
+/// menu (the entry is absent for such an item; see
+/// `item_list::menu_entries`) and is handled rather than asserted because
+/// this is one `match` arm away from every other item in the vault.
+fn refresh_item_icon(
+    item: &VaultItem,
+    icon_cache_dir: &std::path::Path,
+    favicon_requested: &mut std::collections::HashSet<String>,
+    icons: &mut IconCache,
+) -> Option<String> {
+    // `icon_authority_for`, not `icon_domain_for`, for the reason
+    // `ensure_icon_loaded` states: the disk cache is keyed on the authority,
+    // so a login on `http://192.168.68.95:8080/` has its file named for the
+    // port too, and forgetting the bare host would delete nothing.
+    let domain = crate::favicon::icon_authority_for(item)?;
+    crate::favicon::forget_cached_icon(icon_cache_dir, &domain);
+    icons.textures.remove(&item.id);
+    favicon_requested.remove(&item.id);
+    icons.refreshing.insert(item.id.clone());
+    log::info!("icon: {domain} was forgotten on request; it will be fetched again");
+    Some(domain)
 }
 
 /// True when `pending` is currently armed for `id` as of `now` -- i.e. a
@@ -16840,6 +16949,37 @@ mod out_of_vault_wiring_tests {
                  toolbar is.\n{body}"
             );
         }
+    }
+
+    /// The "Refresh icon" arm's marker and the call that has to be inside it.
+    ///
+    /// Split with `concat!` like every other needle here, so this test cannot
+    /// be satisfied by its own source text.
+    const REFRESH_ARM: &str = concat!("RowCommand::RefreshIc", "on => {");
+    const FORGETS_THE_ICON: &str = concat!("refresh_item_", "icon(");
+
+    /// **The join between the menu and the caches.**
+    ///
+    /// `item_list` proves the entry is painted and that clicking it produces
+    /// `RowCommand::RefreshIcon`; `refreshing_an_icon_forgets_the_disk_file_
+    /// the_texture_and_the_session_mark` proves what `refresh_item_icon`
+    /// does. Neither can see that the arm between them calls it -- an arm
+    /// left as `=> {}` keeps both of those tests green while the menu entry
+    /// does nothing at all, which is the exact failure this feature exists to
+    /// remove.
+    ///
+    /// Sliced with `arm_body` rather than searched file-wide for the reason
+    /// that function's own doc gives: the definition and this test's own
+    /// needle would satisfy a whole-file count on their own.
+    #[test]
+    fn the_refresh_icon_arm_forgets_the_icon() {
+        let body = arm_body(REFRESH_ARM);
+        assert_eq!(
+            body.matches(FORGETS_THE_ICON).count(),
+            1,
+            "the {REFRESH_ARM:?} arm does not call {FORGETS_THE_ICON:?}, so \"Refresh icon\" \
+             is a menu entry that returns a command nobody acts on.\n{body}"
+        );
     }
 
     /// `delete_vault_item`'s body: where the soft delete's invalidation and
@@ -22386,6 +22526,261 @@ mod account_details_tests {
             "the loader still calls `icon_domain_for` somewhere, so the port a login carries \
              is dropped on whichever path that is"
         );
+    }
+
+    // ---- "Refresh icon" ---------------------------------------------------
+    //
+    // The menu half is `item_list`'s: that the entry is drawn, that clicking
+    // it comes back as `RowCommand::RefreshIcon` against the right row, and
+    // that an item with no icon domain is offered nothing. These are the
+    // other half -- what the command then DOES to the two caches this app
+    // holds, and what the request it causes looks like on the wire.
+
+    /// The fixture every refresh test below uses: a login on a PUBLIC host,
+    /// so `favicon::icon_source_for` routes it to the proxy arm -- the only
+    /// one of its three that `?refresh=1` reaches at all.
+    fn refreshable_login() -> VaultItem {
+        routing_item(
+            r#"{"id":"r1","name":"Chase","type":1,"login":{"uris":[{"uri":"https://chase.com/login"}]}}"#,
+        )
+    }
+
+    /// How many files are in `dir` -- the on-disk cache's whole contents.
+    ///
+    /// Counted rather than probed by name on purpose: `favicon::
+    /// icon_cache_path` sanitises the domain into a file name and that rule
+    /// is private to that module, so a test that rebuilt the name here would
+    /// be asserting against its own copy of it. "The directory that held one
+    /// file now holds none" needs no copy of anything.
+    fn cached_icon_files(dir: &std::path::Path) -> usize {
+        std::fs::read_dir(dir).map(|entries| entries.count()).unwrap_or(0)
+    }
+
+    /// The three things a refresh must forget, and the order it forgets them
+    /// in.
+    ///
+    /// Driven through the REAL loader first, so what is being cleared is the
+    /// state production actually put there -- a texture `ensure_icon_loaded`
+    /// loaded from the real disk cache, and the mark it made in
+    /// `favicon_requested` -- rather than a hand-built approximation of it.
+    ///
+    /// **The control is the middle third of this test**: a second ordinary
+    /// `ensure_icon_loaded` call, which must change NOTHING. Without it every
+    /// assertion below would also pass against a build that cleared these
+    /// caches on every frame -- which is not a refresh, it is an app that
+    /// re-fetches every icon sixty times a second and never uses either
+    /// cache again.
+    #[test]
+    fn refreshing_an_icon_forgets_the_disk_file_the_texture_and_the_session_mark() {
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-refresh-clears");
+        crate::favicon::write_cached_icon(&dir, "chase.com", &tiny_png());
+        let item = refreshable_login();
+
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::channel::<FaviconResult>();
+        let mut requested = std::collections::HashSet::new();
+        let mut icons = IconCache::default();
+        let load = |icons: &mut IconCache,
+                    requested: &mut std::collections::HashSet<String>| {
+            ensure_icon_loaded(
+                &ctx,
+                &item,
+                &dir,
+                &IconFetch { enabled: true, direct: false, server_url: &None },
+                &tx,
+                requested,
+                icons,
+            );
+        };
+
+        load(&mut icons, &mut requested);
+        assert!(
+            icons.textures.contains_key(&item.id),
+            "the fixture never reached the icon path, so nothing below is being cleared"
+        );
+        assert!(requested.contains(&item.id));
+        assert_eq!(cached_icon_files(&dir), 1, "the fixture icon is not on disk");
+
+        // THE CONTROL. An ordinary frame -- and the item list makes one of
+        // these per visible row, every frame -- forgets nothing at all.
+        load(&mut icons, &mut requested);
+        assert!(
+            icons.textures.contains_key(&item.id)
+                && requested.contains(&item.id)
+                && cached_icon_files(&dir) == 1,
+            "an ordinary `ensure_icon_loaded` call cleared something. Every assertion below \
+             would then pass against a build that refreshes constantly, which is not this \
+             feature -- it is an app that never uses either cache."
+        );
+        assert!(
+            icons.refreshing.is_empty(),
+            "an ordinary frame marked the item for a cache-bypassing fetch"
+        );
+
+        assert_eq!(
+            refresh_item_icon(&item, &dir, &mut requested, &mut icons),
+            Some("chase.com".to_string()),
+            "the refresh acted on a different domain than the one that was cached"
+        );
+
+        assert_eq!(
+            cached_icon_files(&dir),
+            0,
+            "the on-disk copy survived the refresh. Nothing else in this app ever expires it, \
+             so the stale icon comes back on the next launch even if this run looks fixed"
+        );
+        assert!(
+            crate::favicon::read_cached_icon(&dir, "chase.com").is_none(),
+            "`read_cached_icon` still answers for this domain"
+        );
+        assert!(
+            !icons.textures.contains_key(&item.id),
+            "the loaded texture survived, and `ensure_icon_loaded` returns on its first line \
+             when it is there -- so the refresh does nothing for the rest of this run"
+        );
+        assert!(
+            !requested.contains(&item.id),
+            "the session's \"already asked\" mark survived, which stops the loader on the same \
+             first line the texture would have"
+        );
+        assert!(
+            icons.refreshing.contains(&item.id),
+            "nothing recorded that the next fetch must bypass the icon service's own cache, \
+             so the refresh reaches this app's two caches and not the one holding the failure"
+        );
+    }
+
+    /// An item with no icon domain is a no-op rather than a panic.
+    ///
+    /// It cannot arrive from the menu -- `item_list::menu_entries` offers no
+    /// entry for such an item, and `refresh_icon_is_absent_for_every_item_
+    /// with_no_icon_domain` pins that -- but this is one `match` arm away
+    /// from every other item in the vault, so the handler answers rather than
+    /// assumes.
+    #[test]
+    fn refreshing_an_item_with_no_icon_domain_does_nothing_and_says_so() {
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-refresh-nodomain");
+        let note = routing_item(r#"{"id":"n1","name":"Recovery codes","type":2}"#);
+        let mut requested = std::collections::HashSet::new();
+        let mut icons = IconCache::default();
+        assert_eq!(refresh_item_icon(&note, &dir, &mut requested, &mut icons), None);
+        assert!(icons.refreshing.is_empty(), "an item with no icon was queued for a refetch");
+    }
+
+    /// **What actually goes on the wire.**
+    ///
+    /// Both halves against the same mock icon service, because the claim is a
+    /// difference: the refreshing fetch carries `?refresh=1` and the ordinary
+    /// one carries nothing. Either assertion alone is satisfied by a build
+    /// that always appends the query or never does.
+    ///
+    /// The server URL is the loopback mock, so `favicon::icon_base_url` reads
+    /// it as a self-hosted server and `icon_source_for` takes the PROXY arm
+    /// -- which is the deployment this feature exists for. The upstream
+    /// timeout being cached as `immutable` for seven days is the owner's own
+    /// proxy's behaviour; `?refresh=1` is the agreed way to ask it to
+    /// re-fetch, and it is assumed rather than tested here because that
+    /// server is a separate program.
+    #[test]
+    fn a_refreshed_fetch_asks_the_icon_service_to_bypass_its_cache() {
+        let refreshed = icon_request_query(true);
+        assert_eq!(
+            refreshed, "/icons/chase.com/icon.png?refresh=1",
+            "the fetch a refresh caused is one the icon service cannot tell from any other, so \
+             the placeholder cached at its edge is served straight back"
+        );
+        let ordinary = icon_request_query(false);
+        assert_eq!(
+            ordinary, "/icons/chase.com/icon.png",
+            "an ordinary icon fetch carries the cache-bypassing query, which makes this app a \
+             permanent cache-buster against the user's own server"
+        );
+    }
+
+    /// Runs the real loader against a mock icon service and answers with the
+    /// path and query it asked for.
+    ///
+    /// `refreshed` chooses which of the two routes into that fetch is taken,
+    /// and they are deliberately different routes rather than one route with
+    /// a flag: the refreshing one starts from a POPULATED disk cache, loads
+    /// the icon from it, and then goes through `refresh_item_icon` -- so what
+    /// is measured is a fetch that only happens because the refresh emptied
+    /// the caches. The ordinary one starts from an empty directory, which is
+    /// the plain first-ever miss.
+    fn icon_request_query(refreshed: bool) -> String {
+        let mut server = crate::test_http::server();
+        let port = server.socket_address().port();
+        let asked: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = std::sync::Arc::clone(&asked);
+        let png = tiny_png();
+        let _mock = server
+            .mock("GET", "/icons/chase.com/icon.png")
+            // The query is what this whole helper is about, so the mock must
+            // not select on it -- a mock that only matched one spelling would
+            // answer 501 for the other and the failure would read as a
+            // network problem rather than as the wrong URL.
+            .match_query(crate::test_http::Matcher::Any)
+            .with_status(200)
+            .with_body_from_request(move |request| {
+                *sink.lock().expect("the asked sink") =
+                    Some(request.path_and_query().to_string());
+                png.clone()
+            })
+            .expect(1)
+            .create();
+
+        let dir = crate::test_scratch::ScratchDir::new(if refreshed {
+            "test-icon-refresh-wire-refreshed"
+        } else {
+            "test-icon-refresh-wire-ordinary"
+        });
+        let item = refreshable_login();
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel::<FaviconResult>();
+        let mut requested = std::collections::HashSet::new();
+        let mut icons = IconCache::default();
+        let server_url = Some(format!("http://127.0.0.1:{port}"));
+        let load = |icons: &mut IconCache,
+                    requested: &mut std::collections::HashSet<String>| {
+            ensure_icon_loaded(
+                &ctx,
+                &item,
+                &dir,
+                &IconFetch { enabled: true, direct: false, server_url: &server_url },
+                &tx,
+                requested,
+                icons,
+            );
+        };
+
+        if refreshed {
+            crate::favicon::write_cached_icon(&dir, "chase.com", &tiny_png());
+            load(&mut icons, &mut requested);
+            assert!(
+                icons.textures.contains_key(&item.id),
+                "the disk cache did not answer, so the fetch measured below is an ordinary \
+                 miss rather than the one the refresh caused"
+            );
+            refresh_item_icon(&item, &dir, &mut requested, &mut icons);
+        }
+        load(&mut icons, &mut requested);
+
+        // The fetch is on a detached thread; the channel is how it reports
+        // back, and waiting on it is what makes this deterministic rather
+        // than a sleep. The budget is generous because it is a loopback
+        // round trip and a failure here should read as "no request was made"
+        // rather than as a flake.
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the loader spawned no fetch at all, or it never answered");
+        assert!(
+            result.pixels.is_some(),
+            "the mock served a PNG and nothing usable came back, so the request that was made \
+             is not the one this helper is reading"
+        );
+        let asked = asked.lock().expect("the asked sink").clone();
+        asked.expect("the mock was never asked, so no URL was captured")
     }
 
     fn routing_item(json: &str) -> VaultItem {
@@ -35506,6 +35901,7 @@ mod reprompt_gating_tests {
         }
         for command in [
             item_list::RowCommand::OpenWebsite("https://example.com".to_string()),
+            item_list::RowCommand::RefreshIcon,
             item_list::RowCommand::MoveToFolder("f1".to_string()),
             item_list::RowCommand::Delete,
             item_list::RowCommand::Archive,

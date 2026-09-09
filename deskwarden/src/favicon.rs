@@ -229,6 +229,47 @@ pub enum IconSource {
     Direct(Vec<String>),
 }
 
+/// The query string that tells the icon proxy not to answer from its own
+/// cache.
+///
+/// **Declared once, here, because it is a contract with a server this app
+/// does not build.** The self-hosted proxy is a separate program; a second
+/// spelling of this at a call site is a refresh that silently does nothing,
+/// which is indistinguishable on screen from the stuck icon it was pressed to
+/// fix.
+const REFRESH_QUERY: &str = "?refresh=1";
+
+/// Whether a request is allowed to be answered out of a cache somebody else
+/// holds.
+///
+/// **This exists because a FAILURE gets cached, and cached hard.** The
+/// owner's icon proxy sits behind Cloudflare and returns
+/// `Cache-Control: public, max-age=604800, immutable` for the placeholder it
+/// serves when the upstream site does not answer inside its 2.5s budget. One
+/// slow moment on the site's end therefore marks that domain iconless at the
+/// edge for **seven days**, and this app draws a monogram for a week with no
+/// way to ask again. A site that rebrands has the same defect pointing the
+/// other way: the old picture is pinned for the same week.
+///
+/// A named type rather than a `bool` parameter, and rather than a query
+/// string appended wherever somebody happens to want one: the two states are
+/// a decision the user makes ("Refresh icon" on a row's right-click menu) and
+/// every layer between that menu and the request has to carry it *as* that
+/// decision. `icon_source_for(.., true)` next to `direct_for_all_hosts: bool`
+/// would be two adjacent bools meaning entirely different things, which is
+/// how the wrong one gets passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IconFreshness {
+    /// The ordinary ask. Whatever the proxy has cached is a fine answer, and
+    /// on the direct path this is the only meaningful state anyway.
+    Cached,
+    /// The user pressed "Refresh icon". A proxied request carries
+    /// [`REFRESH_QUERY`] so the proxy re-fetches upstream and resets its own
+    /// cache window; a direct request is unchanged, because there is no
+    /// server cache in front of it to bypass -- see [`icon_source_for`].
+    Refresh,
+}
+
 /// The paths a direct fetch tries, in order.
 ///
 /// `/favicon.ico` is first because it is the one location every web server
@@ -264,17 +305,39 @@ const DIRECT_ICON_PATHS: [&str; 3] = ["favicon.ico", "favicon.png", "apple-touch
 /// overwhelmingly plain HTTP, and that traffic stays on the user's own
 /// segment -- and then over `https`, so a NAS or a router that only speaks
 /// TLS still gets an icon.
+///
+/// **`freshness` reaches exactly one of the three arms, and that is not an
+/// oversight.** [`IconFreshness::Refresh`] appends [`REFRESH_QUERY`] to the
+/// proxied URL, because the thing being bypassed is the *proxy's* cache. The
+/// two direct arms -- a private address, and a public host with the
+/// direct-fetch setting on -- are handed back unchanged: nothing stands
+/// between this app and the site on those paths, so there is no cache a query
+/// parameter could ask to be skipped, and adding one would put a string this
+/// app invented into a request to a stranger's web server for no effect. What
+/// a refresh does for those two is done entirely by the caller, which drops
+/// the on-disk copy and the loaded texture before asking again.
 pub fn icon_source_for(
     authority: &str,
     server_url: Option<&str>,
     direct_for_all_hosts: bool,
+    freshness: IconFreshness,
 ) -> IconSource {
     let host = host_of_authority(authority);
     let private = is_private_host(host);
     if !private && !direct_for_all_hosts {
         let base = icon_base_url(server_url);
-        let url = format!("{base}/{host}/icon.png");
-        log::debug!("icon: {authority} goes to the icon service");
+        let refresh = match freshness {
+            IconFreshness::Cached => "",
+            IconFreshness::Refresh => REFRESH_QUERY,
+        };
+        let url = format!("{base}/{host}/icon.png{refresh}");
+        log::debug!(
+            "icon: {authority} goes to the icon service{}",
+            match freshness {
+                IconFreshness::Cached => "",
+                IconFreshness::Refresh => ", asking it to re-fetch rather than answer from cache",
+            }
+        );
         return IconSource::Proxy(url);
     }
     let schemes: &[&str] = if private { &["http", "https"] } else { &["https"] };
@@ -1284,6 +1347,46 @@ pub fn write_cached_icon(cache_dir: &Path, domain: &str, png_bytes: &[u8]) {
     let _ = std::fs::write(path, png_bytes);
 }
 
+/// Drops `domain`'s on-disk icon, so the next ask is a genuine miss.
+///
+/// **Nothing else in this module ever expires an entry**, which is the whole
+/// reason this exists. [`write_cached_icon`] writes a file named for the
+/// domain and no code path deletes it or looks at its age, so an icon that
+/// landed once -- including a placeholder fetched during the exact moment the
+/// site was down -- is that domain's icon for the life of the installation.
+/// "Refresh icon" is the one thing that can say otherwise.
+///
+/// Reports whether a file was actually removed, so a caller can tell "the
+/// stale copy is gone" from "there was nothing there" -- the tests read it,
+/// and a `false` in production means only that this domain had never been
+/// cached, which is already the state a refresh is trying to reach.
+///
+/// Best-effort in the same sense [`write_cached_icon`] is: a removal that
+/// fails (the file open elsewhere, a permission problem) is a refresh that
+/// re-fetches over the top rather than an error path. The in-memory clears
+/// the caller does are what make the refresh visible either way, and
+/// `ensure_icon_loaded` deliberately does not read this cache back on a
+/// refreshing pass for exactly this case.
+pub fn forget_cached_icon(cache_dir: &Path, domain: &str) -> bool {
+    let path = icon_cache_path(cache_dir, domain);
+    let existed = path.exists();
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            log::debug!("icon: dropped the cached icon for {domain}");
+            true
+        }
+        Err(err) => {
+            if existed {
+                log::warn!(
+                    "icon: the cached icon for {domain} could not be removed ({err}); the \
+                     refresh will fetch over the top of it instead"
+                );
+            }
+            false
+        }
+    }
+}
+
 /// Builds a cache-file path for `domain`, sanitizing it into a safe file
 /// name first. `domain_from_uri` already strips scheme/path/port, so this
 /// is normally just alphanumerics/dots/hyphens already -- but treat that as
@@ -1720,7 +1823,7 @@ mod tests {
             authority_from_uri("http://192.168.68.95:8080/"),
             Some("192.168.68.95:8080".to_string())
         );
-        let source = icon_source_for("192.168.68.95:8080", None, false);
+        let source = icon_source_for("192.168.68.95:8080", None, false, IconFreshness::Cached);
         let IconSource::Direct(urls) = &source else {
             panic!("a private address must be fetched directly, got {source:?}");
         };
@@ -1746,7 +1849,12 @@ mod tests {
     /// claim.
     #[test]
     fn the_proxy_is_still_asked_for_the_bare_host_with_no_port() {
-        let source = icon_source_for("vault.example.com:8443", Some("https://vault.example.eu"), false);
+        let source = icon_source_for(
+            "vault.example.com:8443",
+            Some("https://vault.example.eu"),
+            false,
+            IconFreshness::Cached,
+        );
         assert_eq!(
             source,
             IconSource::Proxy("https://vault.example.eu/icons/vault.example.com/icon.png".to_string()),
@@ -1755,12 +1863,145 @@ mod tests {
         // The control: the same authority, fetched directly, DOES keep it --
         // so the assertion above is about the proxy path rather than about
         // `host_of_authority` having eaten the port for everybody.
-        let direct = icon_source_for("vault.example.com:8443", Some("https://vault.example.eu"), true);
+        let direct = icon_source_for(
+            "vault.example.com:8443",
+            Some("https://vault.example.eu"),
+            true,
+            IconFreshness::Cached,
+        );
         let IconSource::Direct(urls) = &direct else { panic!("expected direct, got {direct:?}") };
         assert!(
             urls.iter().all(|u| u.contains("vault.example.com:8443")),
             "the direct path dropped the port too, so this test is not about the proxy: {urls:?}"
         );
+    }
+
+    // ---- "Refresh icon": what reaches the wire ---------------------------
+
+    /// **The proxy arm, both ways round.** `?refresh=1` is a contract with a
+    /// server this repository does not contain, so the one thing this side
+    /// can be held to is that the query is on the URL when the user asked for
+    /// a refresh and off it when they did not.
+    ///
+    /// The negative half is the load-bearing one. A build that appended the
+    /// query unconditionally would look perfect on screen -- every icon still
+    /// arrives -- while making this app a permanent cache-buster against the
+    /// owner's own Cloudflare edge, which is the opposite of what the entry
+    /// is for.
+    #[test]
+    fn a_refresh_asks_the_proxy_to_bypass_its_cache_and_an_ordinary_ask_does_not() {
+        let cached = icon_source_for("chase.com", None, false, IconFreshness::Cached);
+        assert_eq!(
+            cached,
+            IconSource::Proxy("https://icons.bitwarden.net/chase.com/icon.png".to_string()),
+            "an ordinary ask grew a query string; every icon this app fetches would now miss \
+             the service's cache"
+        );
+
+        // `false` is `direct_for_all_hosts` and it stays `false` here on
+        // purpose: this test is about the PROXY arm, and turning the
+        // direct-fetch setting on would route the same call down the direct
+        // one, where the assertion below would fail for a reason that has
+        // nothing to do with the query.
+        let refreshed = icon_source_for("chase.com", None, false, IconFreshness::Refresh);
+        assert_eq!(
+            refreshed,
+            IconSource::Proxy(
+                "https://icons.bitwarden.net/chase.com/icon.png?refresh=1".to_string()
+            ),
+            "\"Refresh icon\" produced a URL the proxy cannot tell from an ordinary one, so the \
+             failure cached at the edge for seven days is served straight back"
+        );
+
+        // The self-hosted base too, which is the deployment the whole feature
+        // is about: the owner's own proxy is the thing holding the stuck
+        // answer. Asserted separately because the query is appended after
+        // `icon_base_url` has chosen a base, and a build that got the join
+        // wrong for one base could be right for the other.
+        assert_eq!(
+            icon_source_for(
+                "chase.com",
+                Some("https://vault.example.eu"),
+                false,
+                IconFreshness::Refresh,
+            ),
+            IconSource::Proxy(
+                "https://vault.example.eu/icons/chase.com/icon.png?refresh=1".to_string()
+            )
+        );
+    }
+
+    /// **The two direct arms, which must be byte-identical under a refresh.**
+    ///
+    /// A refresh of a direct fetch has nothing to bypass -- there is no proxy
+    /// between this app and the site, so no cache a query parameter could ask
+    /// to be skipped. Appending one anyway would put a string this app
+    /// invented into a `GET` aimed at somebody else's web server, which is
+    /// precisely what `the_direct_request_head_carries_nothing_beyond_the_
+    /// allowlist` exists to forbid one line further down the same path.
+    ///
+    /// Both arms, because they are reached by two different rules: a private
+    /// address is direct with the setting OFF, and a public host is direct
+    /// only with it ON.
+    #[test]
+    fn a_refresh_of_a_direct_fetch_changes_the_request_not_at_all() {
+        for (authority, direct) in [("192.168.68.95:8080", false), ("github.com", true)] {
+            let ordinary = icon_source_for(authority, None, direct, IconFreshness::Cached);
+            let refreshed = icon_source_for(authority, None, direct, IconFreshness::Refresh);
+            let IconSource::Direct(urls) = &ordinary else {
+                panic!("{authority} was not routed to the direct path at all, got {ordinary:?}");
+            };
+            assert!(!urls.is_empty(), "no candidate URLs for {authority}");
+            assert_eq!(
+                refreshed, ordinary,
+                "a refresh changed the direct request for {authority}; there is no server \
+                 cache in front of it for a query parameter to bypass"
+            );
+            assert!(
+                !urls.iter().any(|u| u.contains('?')),
+                "a direct candidate carries a query string: {urls:?}"
+            );
+        }
+    }
+
+    /// The on-disk cache really does forget, and really did have something to
+    /// forget.
+    ///
+    /// Every step is asserted rather than assumed: a test that only checked
+    /// `read_cached_icon` was `None` afterwards would pass just as happily
+    /// against a `write_cached_icon` that had silently failed, and the
+    /// directory this uses is a real one on disk (`ScratchDir`) rather than a
+    /// stub, because a path-sanitising bug is exactly the sort of thing that
+    /// makes the file the writer made and the file the remover looks for two
+    /// different files.
+    #[test]
+    fn a_forgotten_icon_is_gone_from_disk_and_says_whether_it_was_there() {
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-forget");
+        let domain = "app.ledgerline.com";
+        let bytes = vec![1u8, 2, 3, 4];
+
+        // Nothing cached yet: the answer is `false`, and it is not an error.
+        assert!(
+            !forget_cached_icon(&dir, domain),
+            "a domain that was never cached reported that something was removed"
+        );
+
+        write_cached_icon(&dir, domain, &bytes);
+        assert_eq!(
+            read_cached_icon(&dir, domain),
+            Some(bytes),
+            "the fixture never landed on disk, so the removal below proves nothing"
+        );
+        let path = icon_cache_path(&dir, domain);
+        assert!(path.exists(), "the writer made no file at {}", path.display());
+
+        assert!(forget_cached_icon(&dir, domain));
+        assert!(
+            !path.exists(),
+            "{} survived; the next window's loader serves the stale icon straight back from it",
+            path.display()
+        );
+        assert_eq!(read_cached_icon(&dir, domain), None);
     }
 
     /// `host_from_url` and `domain_from_uri` are deliberately unchanged: they
@@ -1886,13 +2127,18 @@ mod tests {
     #[test]
     fn with_the_switch_off_a_public_host_still_goes_to_the_proxy() {
         assert_eq!(
-            icon_source_for("github.com", None, false),
+            icon_source_for("github.com", None, false, IconFreshness::Cached),
             IconSource::Proxy("https://icons.bitwarden.net/github.com/icon.png".to_string()),
             "a public host stopped being proxied with the switch OFF, which is the behaviour \
              every existing user has and did not ask to change"
         );
         assert_eq!(
-            icon_source_for("github.com", Some("https://vault.example.eu/"), false),
+            icon_source_for(
+                "github.com",
+                Some("https://vault.example.eu/"),
+                false,
+                IconFreshness::Cached,
+            ),
             IconSource::Proxy("https://vault.example.eu/icons/github.com/icon.png".to_string()),
             "a self-hosted account stopped proxying through its own server"
         );
@@ -1900,7 +2146,7 @@ mod tests {
         // so the two assertions above are about the switch and not about
         // `icon_source_for` being unable to answer `Direct` at all.
         assert!(matches!(
-            icon_source_for("github.com", None, true),
+            icon_source_for("github.com", None, true, IconFreshness::Cached),
             IconSource::Direct(_)
         ));
     }
@@ -1911,15 +2157,18 @@ mod tests {
     fn a_private_address_is_fetched_directly_with_the_switch_off() {
         for authority in ["192.168.68.95:8080", "10.1.2.3", "127.0.0.1:8080", "localhost"] {
             assert!(
-                matches!(icon_source_for(authority, None, false), IconSource::Direct(_)),
+                matches!(
+                    icon_source_for(authority, None, false, IconFreshness::Cached),
+                    IconSource::Direct(_)
+                ),
                 "{authority} was sent to the icon proxy, which has no route to it -- so the \
                  item gets no icon, ever"
             );
             // ... and the switch makes no difference to it, which is the
             // other half of the claim: this is not the switch defaulting on.
             assert_eq!(
-                icon_source_for(authority, None, false),
-                icon_source_for(authority, None, true),
+                icon_source_for(authority, None, false, IconFreshness::Cached),
+                icon_source_for(authority, None, true, IconFreshness::Cached),
                 "the direct-fetch switch changed what happens to a private address"
             );
         }
@@ -1929,7 +2178,8 @@ mod tests {
     /// host is never asked over plaintext.
     #[test]
     fn a_public_direct_fetch_is_https_only_and_a_private_one_tries_http_first() {
-        let IconSource::Direct(public) = icon_source_for("github.com", None, true) else {
+        let public = icon_source_for("github.com", None, true, IconFreshness::Cached);
+        let IconSource::Direct(public) = public else {
             panic!("expected direct")
         };
         assert!(!public.is_empty());
@@ -1939,7 +2189,8 @@ mod tests {
              in between: {public:?}"
         );
 
-        let IconSource::Direct(private) = icon_source_for("192.168.68.95:8080", None, false) else {
+        let private = icon_source_for("192.168.68.95:8080", None, false, IconFreshness::Cached);
+        let IconSource::Direct(private) = private else {
             panic!("expected direct")
         };
         assert!(
@@ -2617,7 +2868,7 @@ mod tests {
         // The setting is OFF, and the address is loopback: this is the
         // private-address rule, not the switch.
         let authority = format!("127.0.0.1:{port}");
-        let source = icon_source_for(&authority, None, false);
+        let source = icon_source_for(&authority, None, false, IconFreshness::Cached);
         assert!(
             matches!(source, IconSource::Direct(_)),
             "loopback was not routed to the direct path, so nothing below is under test"
@@ -2719,7 +2970,8 @@ mod tests {
             .expect(1)
             .create();
 
-        let source = icon_source_for(&format!("127.0.0.1:{port}"), None, false);
+        let source =
+            icon_source_for(&format!("127.0.0.1:{port}"), None, false, IconFreshness::Cached);
         assert_eq!(
             fetch_icon_for(&source),
             Some(icon),
@@ -2769,7 +3021,7 @@ mod tests {
         // directly either way, so `fetch_icons_direct` is not the reason this
         // icon was missing.
         let IconSource::Direct(candidates) =
-            icon_source_for("192.168.68.95:8080", None, false)
+            icon_source_for("192.168.68.95:8080", None, false, IconFreshness::Cached)
         else {
             panic!("a private address was not routed to the direct path with the switch off");
         };
@@ -2809,7 +3061,8 @@ mod tests {
             .expect(1)
             .create();
 
-        let source = icon_source_for(&format!("127.0.0.1:{port}"), None, false);
+        let source =
+            icon_source_for(&format!("127.0.0.1:{port}"), None, false, IconFreshness::Cached);
         let fetched = fetch_icon_for(&source).expect(
             "the icon was not fetched: every fixed path 404s and the page's declared icon was \
              never asked for -- which is exactly the owner's symptom",
@@ -2843,7 +3096,8 @@ mod tests {
         let page_was_asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         // The switch ON, so a public host takes the direct path at all --
         // otherwise this would prove nothing.
-        let IconSource::Direct(urls) = icon_source_for("example.com", None, true) else {
+        let public = icon_source_for("example.com", None, true, IconFreshness::Cached);
+        let IconSource::Direct(urls) = public else {
             panic!("with the switch on a public host must take the direct path");
         };
         assert!(
