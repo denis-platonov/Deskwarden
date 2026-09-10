@@ -2616,14 +2616,46 @@ pub fn draw_add_modal(
             );
         });
 
-    egui::Area::new(egui::Id::new("totp-add-modal"))
+    let action = egui::Area::new(egui::Id::new("totp-add-modal"))
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
             ui.set_max_width(stage_width(state.stage));
             draw_stage(ui, state, now_unix)
         })
-        .inner
+        .inner;
+
+    // **Escape closes it, and this is the only key the modal answers.**
+    //
+    // Every other overlay in this app takes Escape -- the delete
+    // confirmation, the icon picker, the folder editor -- and this one took
+    // nothing. Before 6a moved the dismiss into the header its only way out
+    // was a button at the BOTTOM of a card tall enough to hold four route
+    // rows, a refusal line and the privacy note, inside a centre-anchored
+    // `Area` that does not scroll: on a short window that button sat off
+    // screen, the scrim swallowed clicks, and no key closed it. A surface a
+    // user cannot leave is indistinguishable from one that has stopped
+    // responding, and it was reported as a hang alongside a real one.
+    //
+    // **Not while the overlay is up.** Escape belongs to 6b then: it is a
+    // full-screen always-on-top window with the keyboard, so this branch
+    // could only fire on a stray frame after the overlay had gone -- and it
+    // would throw the form away on the keystroke the user meant as "stop
+    // scanning". The overlay's own Escape cancels the scan and captures
+    // nothing, which is the whole of what that key means at that moment.
+    //
+    // Answered LAST, after `draw_stage` has reported, so a control that acts
+    // on this frame wins. Nothing in the card is bound to Escape today; a
+    // control added later that is would be silently overridden here, and this
+    // is the order that makes that the safe direction rather than the
+    // dangerous one.
+    if matches!(action, TotpAddAction::None)
+        && state.stage != Stage::Scanning
+        && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+    {
+        return TotpAddAction::Cancel;
+    }
+    action
 }
 
 /// How wide the card is at each stage.
@@ -4631,5 +4663,118 @@ mod tests {
         // Positive control on the split: a needle only ever spelled out below
         // the marker is not found above it.
         assert!(!code.contains("the_vault_window_opens_the_overlay_and_applies"));
+    }
+    /// **Escape closes the modal, from the two stages that own the keyboard.**
+    ///
+    /// It answered no key at all before this. Its only way out was a button,
+    /// and on a short window that button could sit off the bottom of a
+    /// centre-anchored card that does not scroll -- a surface with no exit,
+    /// which is indistinguishable from one that has stopped responding.
+    ///
+    /// Driven per stage rather than once, because the stages are different
+    /// surfaces: the picker is four rows and the manual form holds a text
+    /// field, and a key answered on one and swallowed on the other is exactly
+    /// the kind of gap this test exists to close.
+    #[test]
+    fn escape_closes_the_picker_and_the_manual_form() {
+        for stage in [Stage::Picker, Stage::Manual] {
+            let modal = Modal::new();
+            let mut state = TotpAdd::opening("i1", "Git Host", false);
+            state.stage = stage;
+            // One frame to lay the card out, so the second is a frame with a
+            // real surface under the keystroke rather than a sizing pass.
+            let _ = modal.frame(&mut state, Vec::new());
+            let action = modal.frame(&mut state, Modal::escape());
+            assert_eq!(
+                action,
+                TotpAddAction::Cancel,
+                "{stage:?}: Escape did not close the modal"
+            );
+        }
+    }
+
+    /// **And it is NOT answered while 6b's overlay is up**, where the key
+    /// belongs to the overlay.
+    ///
+    /// The overlay is a full-screen always-on-top window with the keyboard,
+    /// so this branch could only fire on a stray frame after it had gone --
+    /// and it would throw the whole form away on the keystroke the user meant
+    /// as "stop scanning". The overlay's own Escape cancels the scan and
+    /// captures nothing, which is what that key means at that moment.
+    #[test]
+    fn escape_is_the_overlays_while_a_scan_is_running() {
+        let modal = Modal::new();
+        let mut state = TotpAdd::opening("i1", "Git Host", false);
+        state.stage = Stage::Scanning;
+        let _ = modal.frame(&mut state, Vec::new());
+        let action = modal.frame(&mut state, Modal::escape());
+        assert_eq!(
+            action,
+            TotpAddAction::None,
+            "Escape closed the form while a scan was running, discarding it on the key that \
+             was meant to stop the scan"
+        );
+    }
+
+    /// **A frame with no keystroke reports nothing**, which is the control
+    /// the two above need: an assertion that Escape closes the modal passes
+    /// just as well against a modal that closes on every frame.
+    #[test]
+    fn an_idle_frame_does_not_close_the_modal() {
+        let modal = Modal::new();
+        let mut state = TotpAdd::opening("i1", "Git Host", false);
+        let _ = modal.frame(&mut state, Vec::new());
+        let action = modal.frame(&mut state, Vec::new());
+        assert_eq!(action, TotpAddAction::None);
+    }
+
+    /// The whole modal, driven through [`draw_add_modal`] rather than through
+    /// one stage's own draw function.
+    ///
+    /// The picker harness above calls `draw_picker` directly, which is right
+    /// for questions about what a stage paints and useless for this one:
+    /// Escape is answered by the modal, after the stage has reported, and a
+    /// harness that never runs that code could not see it.
+    struct Modal {
+        ctx: egui::Context,
+    }
+
+    impl Modal {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            crate::theme::apply(&ctx);
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            Modal { ctx }
+        }
+
+        fn input(events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(560.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn escape() -> Vec<egui::Event> {
+            vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]
+        }
+
+        fn frame(&self, state: &mut TotpAdd, events: Vec<egui::Event>) -> TotpAddAction {
+            let mut action = TotpAddAction::None;
+            let _ = self.ctx.run_ui(Self::input(events), |ui| {
+                action = draw_add_modal(ui.ctx(), state, 0);
+            });
+            action
+        }
     }
 }
