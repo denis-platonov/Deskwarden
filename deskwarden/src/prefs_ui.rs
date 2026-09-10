@@ -4256,6 +4256,12 @@ fn backend_choice_row(ui: &mut Ui, description: &str, official: bool, enabled: b
         };
         ui.label(theme::semibold(BACKEND_CHOICE_LABEL, 14.0).color(title));
         ui.label(RichText::new(description).size(12.0).color(body));
+        // **The cells are not a third line of the copy.** They are a
+        // control under it, so the air above the run is the row's own
+        // padding -- the same gap that already sits between the run and
+        // the row below -- rather than `ROW_TEXT_GAP`, which is the lead
+        // between two lines of the same block of text.
+        ui.spacing_mut().item_spacing.y = f32::from(ROW_PAD_Y);
         let cells = [
             theme::Segment { label: OFFICIAL_CHOICE, selected: official },
             theme::Segment { label: BUILT_IN_CHOICE, selected: !official },
