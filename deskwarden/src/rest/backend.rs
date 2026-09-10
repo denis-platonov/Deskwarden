@@ -3078,21 +3078,29 @@ pub mod tests {
         put.assert();
     }
 
-    /// Un-filing an item is an ordinary edit here, and the way it says "no
-    /// folder" is by the key being **absent** from a body that replaces the
-    /// whole cipher. On `bw serve` the same request needs an explicitly
-    /// stated `null`, which that backend ignores unless it is spelled a
-    /// particular way -- see `move_item_to_folder`'s doc for the difference
-    /// and why the two must not be tidied into agreement.
+    /// Un-filing an item states `folderId: null`. It used to leave the key
+    /// **out**, and this test asserted that, on the reasoning that a body
+    /// which replaces the whole cipher says "no folder" by absence.
+    ///
+    /// That is true of Bitwarden's own API and false of a server that MERGES
+    /// -- and the owner's self-hosted one does: it spreads the incoming body
+    /// over the stored row, so an absent key restores the value that was
+    /// there. The un-file wrote a body that server read as "leave the folder
+    /// alone", which is a destination this app offers and that silently did
+    /// nothing.
+    ///
+    /// A `null` is unambiguous under both readings, so nothing that can be
+    /// CLEARED is sent by absence any more. See `rest::write`'s `notes` call
+    /// site, which is the report this was found through.
     #[test]
-    fn moving_an_item_out_of_every_folder_omits_the_key_rather_than_stating_it() {
+    fn moving_an_item_out_of_every_folder_states_a_null_rather_than_omitting_the_key() {
         let (mut server, backend) = logged_in();
         let put = server
             .mock("PUT", "/api/ciphers/live-1")
             .match_request(|request| {
                 let body: serde_json::Value =
                     serde_json::from_slice(request.body()).expect("json");
-                body.get("folderId").is_none()
+                body.get("folderId") == Some(&serde_json::Value::Null)
             })
             .with_body(cipher("live-1", "A live item", &serde_json::json!({})).to_string())
             .create();

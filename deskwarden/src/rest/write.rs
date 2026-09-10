@@ -220,7 +220,25 @@ pub fn encrypt_item(
     // goes back to having no exception at all: build from the remainder,
     // never from the model.
     put_text(&mut out, "name", Some("name"), Some(item.name.as_str()), key, retained)?;
-    put_text(
+    // **`notes` is CLEARED with an explicit `null`, not by leaving the key
+    // out**, and that distinction is a bug this app shipped.
+    //
+    // Reported: clear an item's notes, save, and the note comes back. The
+    // draft was right (`EditDraft::apply_to` produced `notes: None`) and so
+    // was every test around it -- the loss was on the wire. `seal_text`
+    // removes the key for a `None`, which is the correct thing to send to a
+    // server that REPLACES the cipher, and this file's own comments say the
+    // Bitwarden API is one. The owner's server is not: it merges, spreading
+    // the incoming body over the stored row, so an absent key restores the
+    // value that was there. The note was never deleted; it was preserved by
+    // an omission that meant "unchanged" rather than "gone".
+    //
+    // A `null` is unambiguous under both readings -- it overwrites on a
+    // merging server and clears on a replacing one -- and it is what
+    // Bitwarden's own clients send for an emptied note. Absence is the
+    // thing no two servers have to agree about, so nothing that CAN be
+    // cleared is sent by absence.
+    put_clearable_text(
         &mut out,
         "notes",
         Some("notes"),
@@ -233,9 +251,15 @@ pub fn encrypt_item(
         Some(t) => out.insert("type".to_string(), Value::from(t)),
         None => out.remove("type"),
     };
+    // **The same rule, and the same bug.** This removed the key for an
+    // unfiled item, so "Move to folder -> No folder" wrote a body the owner's
+    // merging server read as "leave the folder alone" -- a destination this
+    // app had just started offering, on the strength of
+    // `RestBackend::can_unfile_items` answering `true`, that silently did
+    // nothing. `null` says it outright.
     match &item.folder_id {
         Some(id) => out.insert("folderId".to_string(), Value::String(id.clone())),
-        None => out.remove("folderId"),
+        None => out.insert("folderId".to_string(), Value::Null),
     };
     out.insert("favorite".to_string(), Value::Bool(item.favorite));
 
@@ -392,6 +416,36 @@ fn put_text(
 /// [`put_text`] is this plus the retention guard, and is what every cipher
 /// field goes through. This half exists on its own for the folder name, which
 /// has no decrypt pass behind it.
+/// [`put_text`], but a value that is not there is written as an explicit
+/// `null` rather than left out.
+///
+/// **For the top-level fields a user can EMPTY**, where the two spellings
+/// mean different things to different servers -- see the `notes` call site,
+/// which is the report this exists for. The retained-ciphertext guard is
+/// [`put_text`]'s, unchanged and checked first: a field that failed to
+/// decrypt is still written back verbatim, and is never mistaken for one the
+/// user cleared.
+fn put_clearable_text(
+    out: &mut Object,
+    wire: &str,
+    path: Option<&str>,
+    plain: Option<&str>,
+    key: &SymmetricKey,
+    retained: &Retained,
+) -> Result<(), CryptoError> {
+    if let Some(original) = path.and_then(|p| retained.ciphertext(p)) {
+        out.insert(wire.to_string(), Value::String(original.to_string()));
+        return Ok(());
+    }
+    match plain {
+        Some(text) => seal_text(out, wire, Some(text), key),
+        None => {
+            out.insert(wire.to_string(), Value::Null);
+            Ok(())
+        }
+    }
+}
+
 fn seal_text(
     out: &mut Object,
     wire: &str,
@@ -1694,7 +1748,17 @@ pub(crate) mod tests {
         let login = written.get("login").and_then(|v| v.as_object()).expect("a login");
         assert!(!login.contains_key("password"), "an absent password became a written one");
         assert!(!login.contains_key("totp"), "an absent totp became a written one");
-        assert!(!written.as_object().expect("an object").contains_key("notes"));
+        // **`notes` is present and null, where the two `login` fields above
+        // are absent.** The difference is deliberate and is the fix for
+        // "clear the notes, save, and the note comes back": a merging server
+        // reads an absent key as "unchanged", so anything a user can EMPTY is
+        // sent as an explicit null. The login object does not need it -- it
+        // is replaced whole, so a key missing from it is a value gone.
+        assert_eq!(
+            written.as_object().expect("an object").get("notes"),
+            Some(&serde_json::Value::Null),
+            "an item with no notes did not say so; a merging server will keep the old note"
+        );
 
         let username = login.get("username").and_then(|v| v.as_str()).expect("a username");
         assert!(username.starts_with("2."), "an empty username was written as plaintext");
