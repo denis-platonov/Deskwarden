@@ -1450,6 +1450,17 @@ mod tests {
         // paint the show it is waiting for, so the window would never come
         // back. See `ui_show`.
         ("vault_window/mod.rs", 9),
+        // One: the capture loop behind design 6a's webcam route. It cannot
+        // be a tick in a frame loop for a reason none of the entries above
+        // has -- `IMFSourceReader::ReadSample` BLOCKS until the camera has
+        // a picture, which is up to a frame interval on healthy hardware
+        // and forever on a wedged driver or a device pulled out of its
+        // port. On the frame thread that is the window hanging, which is
+        // the defect class this project had just finished removing from
+        // `region_overlay`. The thread is also never joined, for the same
+        // reason: see `webcam`'s module docs on how the device is released
+        // without the UI thread ever waiting on it.
+        ("webcam.rs", 1),
     ];
 
     /// The budget [`THREAD_SPAWN_SITES`] grants a file, by the same relative
@@ -2543,7 +2554,91 @@ mod tests {
             // bytes shorter, which is why 23092 becomes 23088. No dependency
             // was added, removed, re-pointed or re-featured -- the only thing
             // this pair exists to notice.
-            (23088, 0xa691_2605_703d_bf71_u64),
+            //
+            // **27355 bytes, new hash: A DEPENDENCY EDIT, and the case
+            // this pin exists for.** ONE name was ADDED, from crates.io:
+            // `image = { version = "0.25", default-features = false,
+            // features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }`.
+            // It is for design 6a's "Open an image file" route, whose
+            // decoder read PNG and nothing else until the owner said that
+            // "all images should work"; `vault_window::totp_add::
+            // image_to_rgba` goes through it now and reads all six.
+            //
+            // **It was ALREADY in the tree**, so this makes it DIRECT
+            // rather than transitive: `arboard` pulls it for `egui-winit`'s
+            // clipboard image data with `bmp` and `png` on, and `eframe`
+            // pulls it with `png`. `Cargo.lock` held `image 0.25.10` before
+            // this edit and holds `image 0.25.10` after it.
+            //
+            // It brings THREE new crates and no more: `gif`, its
+            // `color_quant`, and `image-webp`. The JPEG decoder
+            // (`zune-jpeg` + `zune-core`) was already in `Cargo.lock`, as
+            // were `weezl`, `quick-error`, `byteorder-lite`, `bytemuck` and
+            // `moxcms` -- `image` reaches the first four through its `tiff`
+            // feature, which `arboard` turns on for macOS, so the lock
+            // already carried them for a platform this app does not ship
+            // to. `default-features = false` with six formats named one at
+            // a time is what keeps that number three: the default set adds
+            // TIFF, DDS, TGA, HDR, OpenEXR, PNM, QOI, farbfeld and AVIF,
+            // nine further parsers of a file a shell dialog handed over.
+            // `cargo deny check` passes with NO change to `deny.toml`: all
+            // three new crates are `MIT` or `MIT OR Apache-2.0`, already on
+            // the allow-list.
+            //
+            // **This hop also absorbs a FEATURE edit that is not part of
+            // that dependency move, and names it rather than letting the
+            // byte count imply that `image` accounts for everything.** One
+            // feature was added to the `windows` dependency that was
+            // already here -- `Win32_Media_MediaFoundation`, for
+            // `src/webcam.rs` -- by work on design 6a's webcam route
+            // landing in the same tree. No dependency moved for it. Of the
+            // 4267 new bytes, 3672 are the `image` entry plus the rewrites
+            // it forced on the `png` and `rqrr` comments above it (both of
+            // which argued that `image` was NOT a direct dependency), and
+            // 595 are that feature name and the comment over it.
+            //
+            // **The webcam half of this hop, written by the work that made
+            // it, because a feature name is not a reason.**
+            // `Win32_Media_MediaFoundation` is the ONLY feature added, and
+            // it turns on `MFStartup`, `MFEnumDeviceSources`,
+            // `MFCreateDeviceSource` and the source reader --
+            // `src/webcam.rs` and nothing else in this crate calls any of
+            // them. Media Foundation rather than the two alternatives on
+            // Windows: DirectShow is deprecated and has no supported
+            // binding in the `windows` crate, and the WinRT
+            // `Windows.Media.Capture` classes want a package identity this
+            // app does not have when it is run from a plain install.
+            // Media Foundation is also the only one of the three that will
+            // convert a camera's native NV12 or MJPG output to RGB for the
+            // caller, which is what keeps a YUV converter and a JPEG
+            // decoder out of a route whose whole job is to read a
+            // black-and-white square.
+            //
+            // **It brings no crate into the tree at all.** `windows 0.58`
+            // was already here with twenty-odd features on; this is one
+            // more module of the same generated binding, and `Cargo.lock`
+            // is byte-identical across the feature edit. What it DOES add
+            // is a link against `mfplat.dll`/`mfreadwrite.dll` and, at
+            // runtime, the ability to open a capture device -- which is a
+            // real widening of what this process can do, is why it is
+            // recorded here in its own paragraph rather than inside a
+            // sentence about `image`, and is documented for the user in
+            // `PRIVACY.md` under "The camera".
+            //
+            // NOT changed: no name was removed or re-pointed, no
+            // `[patch]`/`[replace]`/`[workspace.dependencies]` table was
+            // introduced, no path or fork appeared, and
+            // `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. 23088 -> 27355 bytes.
+            //
+            // Recomputed the way every hop above records -- FNV-1a/64 over
+            // the file with CRLF normalised to LF, in a separate
+            // implementation outside this crate -- rather than copied out
+            // of the failure message. That implementation was first run
+            // against the PREVIOUS pinned pair and reproduced
+            // (23088, 0xa691_2605_703d_bf71) exactly, so it is measuring
+            // what this test measures.
+            (27355, 0x58f0_eccf_6d63_741f_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

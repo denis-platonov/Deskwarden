@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Last updated:** 2026-09-02
+**Last updated:** 2026-09-10
 
 Deskwarden is a Windows companion application for Bitwarden-compatible
 vaults. It is unofficial and unaffiliated with Bitwarden, Inc.
@@ -63,6 +63,48 @@ The answer is used to decide one thing: whether to show you a card saying
 there is no saved login for this application. Without it, an application
 with nothing saved is met with silence, which is indistinguishable from
 Deskwarden being broken.
+
+### The camera
+
+**Deskwarden can use a webcam, and it is off unless you open the one
+screen that uses it.** That screen is *Add a one-time code* → *Use a
+webcam*, which exists so you can enrol a two-factor code by holding its QR
+code up to the camera instead of typing a long key off a screen. Nothing
+else in this program opens a camera: not the tray, not the vault window,
+not the autofill path, and there is no background use of any kind.
+
+While that screen is open:
+
+- **The camera is on, and you can see that it is** — its own light, and a
+  live preview on the card in front of you. It is switched on when you
+  choose it and switched off the moment you leave: when the code is read,
+  when you go back, when you close the card, when the vault locks, and if
+  the window goes away for any other reason.
+- **Each picture is looked at once, on this PC, and thrown away.** The only
+  question asked of it is whether it contains a QR code, and the only thing
+  kept is the code if it does. The picture itself is overwritten in memory
+  as the next one arrives.
+- **Nothing is recorded and nothing is sent.** No picture, no clip and no
+  still is written to disk, to a temporary file, or to the log; the reader
+  that decodes the code makes no network request at all, and the video
+  machinery is started without its networking. No frame reaches the
+  developer, your vault server, or anyone else — there is no mechanism in
+  the software to send one.
+- **If you have more than one camera you are asked which**, by name, and
+  none of them is switched on until you pick one.
+
+There is no setting for this, deliberately, and it is listed here rather
+than under *Your choices* below for that reason: a switch marked "allow
+the camera" would only govern a screen you have to open on purpose to
+reach. Not opening it is the switch. Windows' own camera permission
+(Settings → Privacy & security → Camera) applies on top and can refuse
+Deskwarden the camera outright, in which case the screen says so.
+
+The same screen offers three other ways in, and the picture they read is
+handled the same way: a region of your own screen that you drag a box
+around, a picture file that you choose, and typing the key by hand. The
+first two read only what you point them at, decode it here, and keep
+nothing but the code.
 
 ## What leaves your machine, and to whom
 

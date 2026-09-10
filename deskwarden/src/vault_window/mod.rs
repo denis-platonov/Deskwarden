@@ -339,6 +339,16 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(500);
 /// Roughly one 60Hz refresh.
 const LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
+/// The cadence the camera preview asks for on top of [`FRAME_INTERVAL`],
+/// while `totp_add`'s webcam stage is on screen.
+///
+/// About thirty frames a second, which is what a webcam produces; asking for
+/// more would draw the same picture twice, and asking for much less would
+/// show a picture the user cannot aim by. Looser than
+/// [`LOADING_FRAME_INTERVAL`] deliberately -- that one is a spinner, and a
+/// spinner is judged on smoothness where a preview is judged on latency.
+const PREVIEW_FRAME_INTERVAL: Duration = Duration::from_millis(33);
+
 /// How often this process re-reads the daemon's shortcut status file while
 /// the Preferences modal is up.
 ///
@@ -5746,14 +5756,27 @@ pub fn build_frame_with_search(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|since| since.as_secs())
                 .unwrap_or(0);
-            // **No repaint request here, deliberately.** The countdown needs
-            // this window to keep drawing while nobody touches it, and it
-            // already does: the frame closure schedules its successor at
+            // **No repaint request for the COUNTDOWN, deliberately.** It
+            // needs this window to keep drawing while nobody touches it, and
+            // it already does: the frame closure schedules its successor at
             // `FRAME_INTERVAL` (500 ms) unconditionally, above every early
-            // return, which is twice the rate a one-second countdown needs. A
-            // `request_repaint_after` here would be a third scheduler in a
-            // file whose whole cadence story is that there are two, and
-            // `nothing_else_schedules_a_frame_behind_its_back` would say so.
+            // return, which is twice the rate a one-second countdown needs.
+            //
+            // **The camera preview is the exception, and it is the third and
+            // last scheduler in this file.** It is here rather than folded
+            // into `FRAME_INTERVAL` for the reason the loading branch's own
+            // tightening is: a cadence every surface pays is a cadence chosen
+            // by the most demanding one, and this window spends almost all of
+            // its life not showing a camera. Half a second a frame is a
+            // slideshow rather than a preview, and a preview a user cannot
+            // aim by is a route that does not work; it also throttles the
+            // rate at which frames are taken off the session, which is what
+            // decides how promptly a decoded code reaches 6c.
+            // `nothing_else_schedules_a_frame_behind_its_back` counts three
+            // and says which each one is.
+            if state.stage == totp_add::Stage::Webcam {
+                ui.ctx().request_repaint_after(PREVIEW_FRAME_INTERVAL);
+            }
             let mut close = false;
             match totp_add::draw_add_modal(ui.ctx(), state, now_unix) {
                 totp_add::TotpAddAction::Save => {
@@ -5868,6 +5891,34 @@ pub fn build_frame_with_search(
                         state,
                         picked.as_ref().map(std::path::Path::new),
                     );
+                }
+                // **The camera route opens from here, and HERE for the
+                // reason above it.**
+                //
+                // `webcam::devices` asks Media Foundation to enumerate the
+                // capture devices, which is bounded and one-shot but not
+                // instant, so it belongs in the action handler after
+                // `draw_add_modal` has returned rather than inside a draw
+                // closure -- the same place and the same rule as the file
+                // dialog above. It is the ONLY call this window makes into
+                // `webcam`: the device itself is opened, read and released on
+                // a thread of that module's own, and nothing in this closure
+                // ever waits for a camera.
+                //
+                // A second press replaces whatever was open, because
+                // `open_webcam` assigns `state.webcam` -- so two devices
+                // cannot end up running, and there is no `is_none()` guard
+                // here of the kind the overlay needs.
+                totp_add::TotpAddAction::OpenWebcam => {
+                    let seams = crate::webcam::WebcamSeams::production();
+                    totp_add::open_webcam(state, &seams, (seams.devices)());
+                }
+                // Pressing a row on the camera list. It needs the same seam
+                // and nothing else -- opening a device spawns `webcam`'s own
+                // thread and returns, so this line does not block either.
+                totp_add::TotpAddAction::UseCamera(index) => {
+                    let seams = crate::webcam::WebcamSeams::production();
+                    totp_add::choose_camera(state, &seams, index);
                 }
                 totp_add::TotpAddAction::None => {}
             }
@@ -19740,14 +19791,30 @@ mod frame_schedule_placement_tests {
 
     #[test]
     fn nothing_else_schedules_a_frame_behind_its_back() {
-        // Exactly two: the one hoisted call, and the loading branch's tighter
-        // refinement of it. A third would mean the cadence is back to being a
-        // property of which branch you happen to be in.
+        // Exactly three, and each is named here rather than merely counted:
+        // the one hoisted call, the loading branch's tighter refinement of
+        // it, and the camera preview's. A fourth would mean the cadence is
+        // back to being a property of which branch you happen to be in.
+        //
+        // **The third was added with design 6a's webcam route**, and it is
+        // the second surface in this window whose refresh rate is its own
+        // rather than the window's: a live camera at `FRAME_INTERVAL` is two
+        // frames a second, which is a slideshow and not a preview. It is
+        // scoped to `Stage::Webcam` and dies with it, which is what keeps it
+        // a refinement rather than a new ambient rate.
         assert_eq!(
             production().matches(ANY_SCHEDULE).count(),
-            2,
-            "{ANY_SCHEDULE:?} must appear exactly twice in production: the unconditional \
-             per-frame schedule and the loading branch's faster one"
+            3,
+            "{ANY_SCHEDULE:?} must appear exactly three times in production: the \
+             unconditional per-frame schedule, the loading branch's faster one, and the \
+             camera preview's"
+        );
+        // And the third really is the camera's, so the count above cannot be
+        // met by some other branch quietly growing one of its own.
+        assert_eq!(
+            production().matches("request_repaint_after(PREVIEW_FRAME_INTERVAL)").count(),
+            1,
+            "the camera preview no longer schedules its own frames"
         );
     }
 

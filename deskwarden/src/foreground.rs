@@ -1325,7 +1325,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 77] = [
+        const OPENS_NO_WINDOW: [&str; 78] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1599,6 +1599,18 @@ mod tests {
             // service it counts attachments to is `bw serve` or the REST
             // backend, neither of which has a window either.
             "vault_service",
+            // Opens a CAMERA and not a window. It enumerates video capture
+            // devices, reads frames off one on a thread of its own, and hands
+            // them to `qr::decode_qr`; the preview those frames are painted
+            // into is a rectangle inside the vault window's own modal, drawn
+            // by `vault_window::totp_add`. It calls no `CreateWindowExW`, no
+            // `run_ui_native` and no `show_viewport_*`, and has no title for
+            // `raise_window` to match -- which is deliberate rather than
+            // incidental: design 6a's other capture route needed a
+            // full-screen overlay because the thing being captured was the
+            // screen, and this one needs no surface of its own because the
+            // thing being captured is in front of the machine.
+            "webcam",
             // GDI painting helpers -- brushes, text and blits -- called from
             // an existing window's paint path. It creates no window of its
             // own; whatever HWND it draws into was already created by its

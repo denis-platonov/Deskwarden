@@ -15,6 +15,29 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### The one-time-code picker reads any ordinary picture
+
+**Open an image file** used to read PNG and nothing else, and said so; a
+screenshot saved as a JPEG or a photo off a phone had to be converted before
+Deskwarden would look at it. It now reads **PNG, JPG, GIF, BMP, WebP and
+ICO**, the file dialog offers all six, and the decoding still happens on this
+machine with the picture's pixels wiped as soon as the code is read.
+
+### Scan a one-time code with a webcam
+
+**Use a webcam** was drawn on the *Add a one-time code* picker and did
+nothing, with a line under it saying so. It works now: point a camera at
+the QR code on a phone or on paper, watch the live preview, and the code is
+read the moment it can be. It lands on the same confirmation card every
+other route lands on -- what was extracted, with a live code and its
+countdown -- and **nothing is saved until you press Save**.
+
+The camera is off unless you open that screen, it is switched off again the
+instant you leave it, and if you have more than one you are asked which --
+none of them switched on until you pick. Every picture is read on this
+machine and thrown away; nothing is recorded and nothing is sent anywhere.
+`PRIVACY.md` has the long version, under **The camera**.
+
 ## 0.15.19 - 2026-09-09
 
 ### Shortcuts, on a page of their own

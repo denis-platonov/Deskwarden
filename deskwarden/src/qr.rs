@@ -137,8 +137,20 @@ fn luma(r: u8, g: u8, b: u8) -> u8 {
     ((77 * r as u32 + 150 * g as u32 + 29 * b as u32) >> 8) as u8
 }
 
+/// **`pub(crate)` rather than private**, so that
+/// `vault_window::totp_add`'s image-format tests can render THIS matrix
+/// rather than commit a second one of their own.
+///
+/// Those tests ask whether a JPEG, a GIF, a BMP, a WebP and an ICO carrying a
+/// QR code come out of the file decoder as a code this app can read. That
+/// question is only answered if the code inside them is a real one, and a
+/// fixture invented over there would be a second thing to keep correct and a
+/// second thing to change when this one changes. The independence argument on
+/// [`tests::FIXTURE`] -- that it was generated outside this repository by a
+/// crate that is not a dependency -- is exactly what makes it worth sharing:
+/// it is evidence for both callers or for neither.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A QR code of [`FIXTURE_TEXT`], one character per module: `#` dark, `.`
@@ -158,7 +170,7 @@ mod tests {
     /// independent implementation from the decoder under test, which is what
     /// makes the decode below evidence of anything: a fixture produced by
     /// `rqrr` itself would only prove `rqrr` agrees with `rqrr`.
-    const FIXTURE: [&str; 45] = [
+    pub(crate) const FIXTURE: [&str; 45] = [
         "#######...#...#.#...#.#..##..#####..#.#######",
         "#.....#.##.#.....####..####........#..#.....#",
         "#.###.#.#..######.#..#.#....#....#.#..#.###.#",
@@ -209,14 +221,14 @@ mod tests {
     /// What [`FIXTURE`] encodes. A real `otpauth://` URI with every parameter
     /// stated, so the decode below can be checked against something the rest
     /// of this feature actually consumes.
-    const FIXTURE_TEXT: &str = "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&issuer=Git%20Host&digits=8&period=60&algorithm=SHA256";
+    pub(crate) const FIXTURE_TEXT: &str = "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&issuer=Git%20Host&digits=8&period=60&algorithm=SHA256";
 
     /// Renders [`FIXTURE`] to an RGBA buffer at `scale` pixels per module,
     /// with a four-module quiet zone -- the margin the QR specification
     /// requires and without which no decoder finds the code.
     ///
     /// Returns `(rgba, width, height)`.
-    fn fixture_rgba(scale: usize) -> (Vec<u8>, usize, usize) {
+    pub(crate) fn fixture_rgba(scale: usize) -> (Vec<u8>, usize, usize) {
         const QUIET: usize = 4;
         let modules = FIXTURE.len();
         let side = (modules + 2 * QUIET) * scale;

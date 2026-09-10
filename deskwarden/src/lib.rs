@@ -213,6 +213,13 @@ pub mod vault_export;
 /// without having to say so.
 pub mod vault_service;
 pub mod vault_window;
+/// Design 6a's fourth route: a camera, a live preview, and the same decoder
+/// the region overlay uses. **At the crate root beside `screen_capture` and
+/// `region_overlay`**, for their reason -- it is the OS-touching half of a
+/// route whose surface lives under `vault_window`, and it opens no window of
+/// its own. The device is opened on a thread of this module's making and
+/// never on the UI thread; see its own docs for how it is released.
+pub mod webcam;
 pub mod win32_draw;
 pub mod window_list;
 pub mod window_watch;

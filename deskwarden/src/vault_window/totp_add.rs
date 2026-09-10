@@ -66,6 +66,7 @@ use crate::otpauth::{parse_otpauth, to_uri, Algorithm, OtpAuth, OtpRefusal};
 use crate::region_overlay::Outcome;
 use crate::screen_capture::CaptureRefusal;
 use crate::theme;
+use crate::webcam::{CameraRefusal, Session, WebcamSeams};
 use eframe::egui::{self, CornerRadius};
 use zeroize::Zeroizing;
 
@@ -277,11 +278,12 @@ pub const PRIVACY_LINE: &str = "Decoding happens on this machine. The captured p
 pub enum Route {
     /// 6b: drag a box on a dimmed desktop.
     ScanRegion,
-    /// A PNG the user already has.
+    /// A picture the user already has, in any format [`image_to_rgba`] reads.
     ImageFile,
     /// 6d: the form that was already here.
     ByHand,
-    /// Present and dead. See [`WEBCAM_REASON`].
+    /// A camera, a live preview, and the same decoder the other two use.
+    /// [`crate::webcam`] owns the device.
     Webcam,
 }
 
@@ -295,35 +297,42 @@ pub struct RouteRow {
     /// The line under the title.
     pub subtitle: &'static str,
     /// Whether the row does anything. `false` is a **visible** deferral --
-    /// see [`WEBCAM_REASON`].
+    /// see [`DEFERRED_REASON`].
     pub enabled: bool,
 }
 
-/// **Why the webcam row is drawn and dead rather than left out.**
+/// **What a row that is drawn and dead says on its face.**
 ///
-/// It is in design 6a and it is not in this plan. A route the design promises
-/// and the product silently omits reads as a bug: the user looks for it, does
-/// not find it, and cannot tell whether they are looking in the wrong place.
-/// A row that says what it is and why it is off answers that in one glance,
-/// in the place they went looking.
-pub const WEBCAM_REASON: &str = "Not in this version";
-
-/// See [`WEBCAM_REASON`]. The sentence under the dead row -- the honest
-/// reason, not an apology: a webcam needs a capture API, a device picker and a
-/// preview surface, and on a Windows desktop the code is nearly always
-/// already on the screen, which is what the first row is for.
-pub const WEBCAM_DETAIL: &str = "A webcam needs a capture device and a preview of its own. On a \
-     desktop the code is nearly always already on screen \u{2014} scan a region instead.";
+/// **Nothing in [`ROUTES`] is deferred today** -- the webcam row was the one
+/// that was, and it is now a route like the other three. The machinery is
+/// kept, and this constant with it, because the argument for it has not
+/// changed and the next deferral should not have to re-invent it: a route the
+/// design promises and the product silently omits reads as a bug, since the
+/// user looks for it, does not find it, and cannot tell whether they are
+/// looking in the wrong place. A row that says what it is and why it is off
+/// answers that in one glance, in the place they went looking.
+///
+/// `no_route_is_deferred_today` pins the first sentence above, and
+/// `a_deferred_row_still_says_that_it_is_deferred` paints a synthetic
+/// disabled row so that the treatment stays exercised rather than becoming
+/// code nothing has run in a year.
+pub const DEFERRED_REASON: &str = "Not in this version";
 
 /// **Design 6a's four routes, in its order** -- *"ordered by how often they're
 /// the right one on Windows"*.
 ///
-/// The `ImageFile` subtitle says **PNG** where 6a says *"PNG, JPG"*, and that
-/// is a deliberate edit rather than an omission: this ships a `png`-crate
-/// decode and no JPEG one, [`crate::file_picker::pick_qr_image`]'s filter says
-/// the same, and a row promising JPG over a dialog that will not show one is a
-/// promise broken one click later. The copy was changed, not the reader's
-/// impression.
+/// **The `ImageFile` subtitle names every format the decoder reads, which is
+/// now more than 6a's *"PNG, JPG"* rather than less.** It used to say PNG
+/// alone, and that was a deliberate edit: the route shipped a `png`-crate
+/// decode and no JPEG one, so a row promising JPG over a dialog that would
+/// not show one was a promise broken a click later. The owner's answer to
+/// that was "all images should work", so the decoder widened
+/// ([`image_to_rgba`]) and the copy widened with it. The rule did not change,
+/// only which way it points: this row, the file dialog's filter
+/// ([`crate::file_picker::QR_FILTER_SPEC`]) and what
+/// [`image_to_rgba`] can actually decode say one thing, and a row that hid a
+/// format the app reads would be the same defect as one that offered a format
+/// it does not.
 pub const ROUTES: [RouteRow; 4] = [
     RouteRow {
         route: Route::ScanRegion,
@@ -334,7 +343,7 @@ pub const ROUTES: [RouteRow; 4] = [
     RouteRow {
         route: Route::ImageFile,
         title: "Open an image file",
-        subtitle: "A screenshot or photo of the code \u{b7} PNG",
+        subtitle: "A screenshot or photo \u{b7} PNG, JPG, GIF, BMP, WebP, ICO",
         enabled: true,
     },
     RouteRow {
@@ -346,8 +355,13 @@ pub const ROUTES: [RouteRow; 4] = [
     RouteRow {
         route: Route::Webcam,
         title: "Use a webcam",
-        subtitle: WEBCAM_DETAIL,
-        enabled: false,
+        // 6a's own line for this row is about a camera being pointed at
+        // something, and what a user needs to know before pressing it is what
+        // they will have to hold up. The second clause is the promise
+        // [`crate::webcam`] keeps and `PRIVACY.md` repeats: the camera is not
+        // on until this row is pressed, and nothing it sees is kept.
+        subtitle: "Hold the code up to the camera \u{b7} the picture stays on this PC",
+        enabled: true,
     },
 ];
 
@@ -357,6 +371,60 @@ pub const OTHER_WAYS_LABEL: &str = "Other ways to add it";
 
 /// The heading while the 6b overlay is up.
 pub const SCANNING_HEADING: &str = "Scanning your screen";
+
+/// The heading over the camera preview.
+///
+/// An instruction rather than a status, for the reason 6b's own bar is an
+/// instruction: the user is holding a phone in one hand and has one thing to
+/// do with it.
+pub const WEBCAM_HEADING: &str = "Point the camera at the code";
+
+/// The line under [`WEBCAM_HEADING`].
+///
+/// Deliberately the same two clauses as `region_overlay::DRAG_HINT` -- it
+/// reads by itself, and nothing is saved yet -- because they are the same two
+/// facts and a user who has tried both routes should not have to learn them
+/// twice.
+pub const WEBCAM_HINT: &str = "Deskwarden reads it as soon as it can. Nothing is saved yet.";
+
+/// What the preview says before the first frame arrives.
+///
+/// A camera can take two or three seconds to wake, and a black rectangle for
+/// that long is indistinguishable from a broken route. See
+/// `crate::webcam::FIRST_FRAME_GRACE` for what happens if it never wakes.
+pub const WEBCAM_STARTING: &str = "Starting the camera\u{2026}";
+
+/// The heading over the device list, when there is more than one camera.
+pub const WEBCAM_CHOOSE: &str = "Which camera?";
+
+/// The line under [`WEBCAM_CHOOSE`], which is the promise the list keeps: no
+/// device is opened, so no camera light comes on, until one is pressed.
+pub const WEBCAM_CHOOSE_HINT: &str = "None of them is switched on until you pick one.";
+
+/// The way back to the device list from an open camera, when there is more
+/// than one to go back to.
+pub const WEBCAM_ANOTHER_LABEL: &str = "Use a different camera";
+
+/// **The camera's own privacy line, and it must stay true of
+/// [`crate::webcam`].**
+///
+/// [`PRIVACY_LINE`]'s clauses cover the pixels; this one covers the *device*,
+/// which is the thing a user is entitled to be told about in the moment the
+/// light comes on. Each clause is a claim about specific code:
+///
+/// * *"only while this is open"* -- [`TotpAdd::webcam`] is the device's
+///   lifetime and `crate::webcam::Session`'s `Drop` stops the capture thread,
+///   so there is no state of this app other than this stage in which a camera
+///   is open.
+/// * *"the picture is read here and thrown away"* --
+///   `crate::webcam::Frame`'s buffer is a [`Zeroizing`], the slot it passes
+///   through wipes what it replaces, and nothing on this route hands pixels
+///   to a caller.
+/// * *"nothing is recorded"* -- no path in `crate::webcam` opens a file, and
+///   `this_module_writes_nothing_anywhere` reads the module's own source to
+///   say so.
+pub const WEBCAM_PRIVACY_LINE: &str = "The camera is on only while this is open. The picture is \
+     read on this PC and thrown away \u{2014} nothing is recorded and nothing is sent anywhere.";
 
 /// Which half of the form is on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +436,12 @@ pub enum Stage {
     /// window: a user who alt-tabs away from it would otherwise be looking at
     /// a modal with no visible state at all.
     Scanning,
+    /// **A camera is open and its preview is inside this card.** Unlike
+    /// [`Self::Scanning`] there is no second OS window: the surface a webcam
+    /// needs is a rectangle of pixels, and this card already has one to give
+    /// it. See [`WebcamStage`], which is what keeps the device alive, and
+    /// [`TotpAdd::webcam`], which is what lets it go.
+    Webcam,
     /// 6d's field and 6c's confirmation. Reached by hand, or by a decode
     /// landing in [`TotpAdd::typed`].
     Manual,
@@ -398,7 +472,19 @@ pub enum PickerRefusal {
     /// The capture itself refused. The words are [`CaptureRefusal::title`]'s
     /// and `detail`'s, from design 6d.
     Capture(CaptureRefusal),
-    /// The file is not a PNG this app can decode.
+    /// The camera refused, or never produced a picture. The words are
+    /// [`CameraRefusal::title`]'s and `detail`'s, and they are that module's
+    /// rather than this one's for [`Self::Capture`]'s reason exactly: the
+    /// thing that knows why a device would not open is the thing that tried
+    /// to open it.
+    Camera(CameraRefusal),
+    /// The file is not a picture this app can decode -- it is not one of the
+    /// formats named in `Cargo.toml`'s `image` features, or it is one of them
+    /// and is malformed, truncated or absurdly large. **One refusal for all
+    /// of those on purpose**: the user's next move is the same in every case
+    /// (choose a different file), and a variant per failure mode would be a
+    /// diagnosis of a file this app is deliberately not describing back to
+    /// them.
     NotAnImage,
     /// The file could not be opened at all.
     Unreadable,
@@ -430,9 +516,14 @@ impl PickerRefusal {
                 "No code in that image. {NO_CODE_ADVICE}, or open a larger copy of the picture."
             ),
             PickerRefusal::Capture(why) => format!("{}. {}", why.title(), why.detail()),
+            // The same two-clause shape as the capture's, because it is the
+            // same kind of thing: a device that would not give this app what
+            // it asked for, said in the device's own words rather than
+            // paraphrased into a second vocabulary here.
+            PickerRefusal::Camera(why) => format!("{}. {}", why.title(), why.detail()),
             PickerRefusal::NotAnImage => {
-                "That file isn't a PNG Deskwarden can read. Save the picture as a PNG and \
-                 choose it again \u{2014} this version reads PNG only."
+                "That file isn't a picture Deskwarden can read. It reads PNG, JPEG, GIF, BMP, \
+                 WebP and ICO \u{2014} choose a screenshot or a photo saved as one of those."
                     .to_string()
             }
             PickerRefusal::Unreadable => {
@@ -453,7 +544,11 @@ impl PickerRefusal {
 /// [`crate::region_overlay::RegionSeams`]'s shape, and its reason: behind a
 /// seam every arm of [`decode_image_with`] is reachable from a test that
 /// builds its bytes arithmetically, and that test can **look at the pixels**
-/// the PNG half produced rather than trust that it produced any.
+/// the decoding half produced rather than trust that it produced any. That
+/// matters more now than it did when this route read one format: what a test
+/// through this seam can say about a JPEG or a WebP is that the picture came
+/// out the size and the colours it went in as, which is the whole of what
+/// this file owns.
 #[derive(Clone, Copy)]
 pub struct ImageSeams {
     /// [`crate::qr::decode_qr`] in production.
@@ -469,79 +564,225 @@ impl ImageSeams {
     }
 }
 
-/// A PNG's pixels as straight RGBA8, rows top to bottom, no padding -- what
-/// [`crate::qr::decode_qr`] and `GetDIBits` both speak.
+/// [`crate::qr::MAX_PIXELS`] expressed as a limit on ONE side, which is the
+/// only shape [`image::Limits`] understands.
 ///
-/// **Not [`crate::favicon::decode_rgba`]**, which is this crate's other PNG
-/// reader. That one resamples every image down to 64 pixels on its longest
-/// edge for the item list, and 64 pixels is smaller than a QR code's module
-/// grid: it would hand back a picture of a code that no decoder could read.
-///
-/// Both buffers are [`Zeroizing`], because a picture of a QR code is a picture
-/// of a seed.
-fn png_to_rgba(bytes: &[u8]) -> Result<(Zeroizing<Vec<u8>>, usize, usize), PickerRefusal> {
-    let mut decoder = png::Decoder::new(bytes);
-    // The same normalisation `favicon` uses: indexed and sub-8-bit sources are
-    // expanded during the decode, so the match below never sees them.
-    decoder.set_transformations(png::Transformations::normalize_to_color8());
-    let mut reader = decoder.read_info().map_err(|_| PickerRefusal::NotAnImage)?;
+/// `image` bounds width and height separately and has no notion of an area,
+/// while the bound this module actually wants is on the product. Capping each
+/// side at the square root would be the tighter rule and the wrong one: a
+/// panorama screenshot is legitimately thousands of times wider than it is
+/// tall and well inside the pixel cap. So this is the *loose* half of the
+/// bound and [`image_to_rgba`]'s own area check is the tight half. What this
+/// half buys is that a header claiming four billion pixels of width is
+/// refused by `image` inside the decoder's own constructor, before that
+/// number is allowed to size a row buffer this module never sees.
+const MAX_SIDE: u32 = crate::qr::MAX_PIXELS as u32;
 
-    // **Bounded before anything is allocated.** The header is attacker-chosen
-    // -- it is a file -- and `output_buffer_size` is derived from it. The
-    // bound is `qr`'s own, so a picture refused here is exactly a picture the
-    // decoder would have refused anyway.
-    let (declared_width, declared_height) = {
-        let info = reader.info();
-        (info.width as usize, info.height as usize)
-    };
-    if declared_width == 0 || declared_height == 0 {
+/// The most any decode here may allocate, counting the decoder's own working
+/// buffers as well as the pixels it hands back.
+///
+/// The area check below bounds the *picture*; it says nothing about what a
+/// compressed format asks the allocator for on the way to producing it, and
+/// the file that chooses that is the file the user was talked into opening.
+/// Four bytes a pixel at the pixel cap is exactly the size of the RGBA answer
+/// this module is going to build, so the rule is "no intermediate larger than
+/// the result": a source carrying more precision per pixel than that is
+/// carrying more than a QR decoder can use.
+const MAX_DECODE_BYTES: u64 = crate::qr::MAX_PIXELS as u64 * 4;
+
+/// A picture file's pixels as straight RGBA8, rows top to bottom, no padding
+/// -- what [`crate::qr::decode_qr`] and `GetDIBits` both speak.
+///
+/// **Every ordinary raster format, because the owner's rule for this route is
+/// that "all images should work".** PNG, JPEG, GIF, BMP, WebP and ICO: what a
+/// screenshot tool, a phone camera and a Windows disk produce between them.
+/// The list is named once in `Cargo.toml`'s `image` features and mirrored by
+/// [`crate::file_picker::QR_FILTER_SPEC`], because a dialog that offers a
+/// format this cannot read hands the user a file and then a refusal, and a
+/// dialog that hides one it can read is the same defect pointing the other
+/// way.
+///
+/// **Not [`crate::favicon::decode_rgba`]**, which is this crate's other
+/// picture reader. That one resamples every image down to 64 pixels on its
+/// longest edge for the item list, and 64 pixels is smaller than a QR code's
+/// module grid: it would hand back a picture of a code that no decoder could
+/// read.
+///
+/// # Bounded before anything is allocated
+///
+/// The header is attacker-chosen -- it is a file -- and every allocation on
+/// this path is sized from it. So [`image::ImageReader::into_decoder`] is
+/// used rather than `decode`: it parses the header and stops, which makes the
+/// declared dimensions readable *before* a pixel buffer exists. They are
+/// checked against [`crate::qr::MAX_PIXELS`], `qr`'s own bound, so a picture
+/// refused here is exactly a picture the decoder would have refused anyway;
+/// [`MAX_SIDE`] and [`MAX_DECODE_BYTES`] go in as [`image::Limits`] so that
+/// the same rule also binds the decoder's internals, which this module cannot
+/// see and cannot size.
+///
+/// # Both buffers are [`Zeroizing`], and that is not incidental
+///
+/// A picture of a QR code is a picture of a seed. The decoder is asked to
+/// write its pixels *into a buffer this module owns* rather than to hand one
+/// back, so the full-size copy of the seed's image lives in a `Zeroizing`
+/// from the moment it exists -- which is what the `png`-only version of this
+/// function did, and switching to a general decoder did not give it up.
+/// What remains outside this module's reach is what
+/// [`crate::qr::decode_qr`]'s documentation already concedes for `rqrr`: a
+/// third-party decoder's own intermediates are ordinary allocations, released
+/// un-wiped when the call returns. That concession is unchanged in kind here,
+/// not widened.
+fn image_to_rgba(bytes: &[u8]) -> Result<(Zeroizing<Vec<u8>>, usize, usize), PickerRefusal> {
+    // Imported here rather than at the top of the file because this is the
+    // one function in it that speaks to a decoder; `as _` because none of the
+    // trait's own name is wanted, only its methods.
+    use image::ImageDecoder as _;
+
+    // The format comes from the CONTENT and never from the name: the path was
+    // typed by a shell dialog and its extension is whatever the file happens
+    // to be called, so a `.png` holding a JPEG is a file this route should
+    // read rather than refuse.
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| PickerRefusal::NotAnImage)?;
+    // Assigned rather than built as a literal because `image::Limits` is
+    // `#[non_exhaustive]`, so a struct expression -- functional update
+    // included -- will not compile outside its own crate.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_SIDE);
+    limits.max_image_height = Some(MAX_SIDE);
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    reader.limits(limits);
+
+    // Header only. Nothing is decoded until `read_image` below, so every
+    // check between here and it happens before a pixel is allocated.
+    let decoder = reader.into_decoder().map_err(|_| PickerRefusal::NotAnImage)?;
+    let (declared_width, declared_height) = decoder.dimensions();
+    let (width, height) = (declared_width as usize, declared_height as usize);
+    if width == 0 || height == 0 {
         return Err(PickerRefusal::NotAnImage);
     }
-    match declared_width.checked_mul(declared_height) {
-        Some(pixels) if pixels <= crate::qr::MAX_PIXELS => {}
+    let pixels = match width.checked_mul(height) {
+        Some(pixels) if pixels <= crate::qr::MAX_PIXELS => pixels,
         _ => return Err(PickerRefusal::NotAnImage),
+    };
+    // `read_image` PANICS on a buffer of the wrong length, so this is sized
+    // from the decoder's own arithmetic and not from the product above -- the
+    // two differ by the bytes per pixel of whatever colour type the file
+    // turned out to hold.
+    if decoder.total_bytes() > MAX_DECODE_BYTES {
+        return Err(PickerRefusal::NotAnImage);
     }
+    let color = decoder.color_type();
+    let total =
+        usize::try_from(decoder.total_bytes()).map_err(|_| PickerRefusal::NotAnImage)?;
 
-    let mut buf = Zeroizing::new(vec![0u8; reader.output_buffer_size()]);
-    let frame = reader.next_frame(&mut buf).map_err(|_| PickerRefusal::NotAnImage)?;
-    let (width, height) = (frame.width as usize, frame.height as usize);
-    let used = frame.buffer_size().min(buf.len());
-    let source = &buf[..used];
+    let mut buf = Zeroizing::new(vec![0u8; total]);
+    decoder.read_image(&mut buf).map_err(|_| PickerRefusal::NotAnImage)?;
 
-    let mut rgba = Zeroizing::new(Vec::with_capacity(width.saturating_mul(height) * 4));
-    match frame.color_type {
-        png::ColorType::Rgba => rgba.extend_from_slice(source),
-        png::ColorType::Rgb => {
-            for px in source.chunks_exact(3) {
-                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
-            }
-        }
-        png::ColorType::Grayscale => {
-            for grey in source {
-                rgba.extend_from_slice(&[*grey, *grey, *grey, 255]);
-            }
-        }
-        png::ColorType::GrayscaleAlpha => {
-            for px in source.chunks_exact(2) {
-                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
-            }
-        }
-        // Unreachable: `normalize_to_color8` expands indexed frames during the
-        // decode, exactly as `favicon::decode_rgba` documents. Kept only so
-        // this match stays exhaustive.
-        png::ColorType::Indexed => return Err(PickerRefusal::NotAnImage),
-    }
-    if rgba.len() < width * height * 4 {
-        // A truncated frame: `next_frame` can succeed on a file whose last
-        // rows are missing. A short buffer handed to the decoder answers
-        // `None`, which would be reported as "no code in that image" rather
-        // than as the broken file it is.
+    let rgba = expand_to_rgba(&buf, color, pixels)?;
+    if rgba.len() < pixels * 4 {
+        // Short of what was declared. A decode can succeed on a file whose
+        // last rows are missing, and a short buffer handed to `decode_qr`
+        // answers `None` -- which would be reported as "no code in that
+        // image" rather than as the broken file it is.
         return Err(PickerRefusal::NotAnImage);
     }
     Ok((rgba, width, height))
 }
 
-/// **A PNG's bytes to the string its QR carries**, through `seams`.
+/// The top eight bits of a 16-bit sample.
+///
+/// `ImageDecoder::read_image` documents that it writes wide samples in the
+/// **machine's own** byte order, so `from_ne_bytes` is the correct reader and
+/// indexing `[1]` for the high byte would be a little-endian assumption
+/// written down as a fact.
+fn high_byte(sample: &[u8]) -> u8 {
+    (u16::from_ne_bytes([sample[0], sample[1]]) >> 8) as u8
+}
+
+/// `source` -- whatever colour type `image` decoded the file into -- as
+/// straight RGBA8.
+///
+/// Kept out of [`image_to_rgba`] so that the arms can be read as the one
+/// table they are. `pixels` only reserves; the arms decide the length, and
+/// the caller checks it.
+fn expand_to_rgba(
+    source: &[u8],
+    color: image::ColorType,
+    pixels: usize,
+) -> Result<Zeroizing<Vec<u8>>, PickerRefusal> {
+    let mut rgba = Zeroizing::new(Vec::with_capacity(pixels.saturating_mul(4)));
+    match color {
+        image::ColorType::Rgba8 => rgba.extend_from_slice(source),
+        image::ColorType::Rgb8 => {
+            for px in source.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 0xff]);
+            }
+        }
+        // The shape a screenshot tool saving a black-and-white QR really
+        // produces, and the arm that has to expand one channel into four.
+        image::ColorType::L8 => {
+            for grey in source {
+                rgba.extend_from_slice(&[*grey, *grey, *grey, 0xff]);
+            }
+        }
+        image::ColorType::La8 => {
+            for px in source.chunks_exact(2) {
+                rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
+            }
+        }
+        // The wide arms are reachable through PNG, which is the only format
+        // in this app's list that carries sixteen bits a channel. Narrowing
+        // to the top byte is not a loss worth defending against: `decode_qr`
+        // weighs the three channels into one eight-bit luma before it looks
+        // at a single module.
+        image::ColorType::L16 => {
+            for px in source.chunks_exact(2) {
+                let grey = high_byte(px);
+                rgba.extend_from_slice(&[grey, grey, grey, 0xff]);
+            }
+        }
+        image::ColorType::La16 => {
+            for px in source.chunks_exact(4) {
+                let grey = high_byte(&px[..2]);
+                rgba.extend_from_slice(&[grey, grey, grey, high_byte(&px[2..])]);
+            }
+        }
+        image::ColorType::Rgb16 => {
+            for px in source.chunks_exact(6) {
+                rgba.extend_from_slice(&[
+                    high_byte(&px[..2]),
+                    high_byte(&px[2..4]),
+                    high_byte(&px[4..]),
+                    0xff,
+                ]);
+            }
+        }
+        image::ColorType::Rgba16 => {
+            for px in source.chunks_exact(8) {
+                rgba.extend_from_slice(&[
+                    high_byte(&px[..2]),
+                    high_byte(&px[2..4]),
+                    high_byte(&px[4..6]),
+                    high_byte(&px[6..]),
+                ]);
+            }
+        }
+        // **Refused rather than converted, and the catch-all is required
+        // rather than lazy**: `image::ColorType` is `#[non_exhaustive]`, so
+        // this match cannot be written exhaustively from outside that crate.
+        // What it covers today is the two floating-point colour types, which
+        // only OpenEXR and Radiance HDR produce and neither is a format this
+        // app turns on (see `Cargo.toml`). A conversion written here for them
+        // would be a conversion no test in this crate could reach, which is
+        // worse than a refusal that says the file is not one this app reads.
+        _ => return Err(PickerRefusal::NotAnImage),
+    }
+    Ok(rgba)
+}
+
+/// **A picture file's bytes to the string its QR carries**, through `seams`.
 ///
 /// Nothing leaves this function but the decoded string: the pixels are a
 /// [`Zeroizing`] local that dies here, which is [`PRIVACY_LINE`]'s second
@@ -550,7 +791,7 @@ pub fn decode_image_with(
     seams: &ImageSeams,
     bytes: &[u8],
 ) -> Result<Zeroizing<String>, PickerRefusal> {
-    let (rgba, width, height) = png_to_rgba(bytes)?;
+    let (rgba, width, height) = image_to_rgba(bytes)?;
     (seams.decode)(&rgba, width, height).ok_or(PickerRefusal::NoCode(CodeSource::Image))
 }
 
@@ -562,7 +803,7 @@ pub fn decode_image(bytes: &[u8]) -> Result<Zeroizing<String>, PickerRefusal> {
 /// Reads the file the user pointed at, and decodes it.
 ///
 /// The **only** line in this feature that touches the filesystem, and it only
-/// reads. The bytes are a [`Zeroizing`] for `png_to_rgba`'s reason; nothing is
+/// reads. The bytes are a [`Zeroizing`] for `image_to_rgba`'s reason; nothing is
 /// written, copied out, or logged.
 pub fn read_image_file(path: &std::path::Path) -> Result<Zeroizing<String>, PickerRefusal> {
     let bytes = Zeroizing::new(std::fs::read(path).map_err(|_| PickerRefusal::Unreadable)?);
@@ -1109,6 +1350,24 @@ pub struct TotpAdd {
     /// keyboard. Drives [`CODE_READ_LABEL`] -- see it, because this flag is a
     /// privacy decision and not a cosmetic one.
     pub scanned: bool,
+    /// **The open camera, while there is one.** `Some` exactly while
+    /// [`Stage::Webcam`] is on screen.
+    ///
+    /// **This field is the device's lifetime**, and putting it here rather
+    /// than beside the form in `vault_window::mod` is the whole release
+    /// story. [`crate::webcam::Session`]'s `Drop` stops the capture thread, so
+    /// every way this surface can end -- Save, Cancel, Escape, the way back to
+    /// the picker, a decode landing, the vault locking, the window being
+    /// destroyed, a panic unwinding through the frame -- releases the camera,
+    /// because every one of them drops this struct or replaces this field.
+    /// None of them has to remember to.
+    ///
+    /// The 6b overlay is held the other way round, beside the form, and that
+    /// is not an inconsistency: an overlay is a *window*, and a window has to
+    /// be re-shown every frame by something that outlives one draw call. A
+    /// camera has to be **let go of**, which is the opposite requirement and
+    /// wants the opposite home.
+    pub webcam: Option<WebcamStage>,
 }
 
 impl TotpAdd {
@@ -1125,6 +1384,7 @@ impl TotpAdd {
             stage: Stage::Picker,
             refusal: None,
             scanned: false,
+            webcam: None,
         }
     }
 
@@ -1142,12 +1402,18 @@ impl TotpAdd {
     ///
     /// [`Self::revealed`] is put back to `false`, because the seed that was on
     /// screen a moment ago is not this one.
+    /// **The camera is let go of here**, and this is the line that makes
+    /// "the light goes out the moment it has read the code" true. It is in
+    /// `accept_decoded` rather than in the webcam route's own code so that
+    /// there is no spelling of "a code was accepted" that leaves a device
+    /// open behind the confirmation card.
     pub fn accept_decoded(&mut self, text: Zeroizing<String>) {
         self.typed = text;
         self.scanned = true;
         self.stage = Stage::Manual;
         self.refusal = None;
         self.revealed = false;
+        self.webcam = None;
     }
 
     /// Back to 6a, with the field emptied.
@@ -1156,12 +1422,18 @@ impl TotpAdd {
     /// stepped away from is not a place to leave one resident. The
     /// `Zeroizing` is replaced rather than cleared in place so the old
     /// allocation is wiped on drop.
+    ///
+    /// **And the camera is closed**, for the same reason one step further
+    /// out: a user who has walked back to the picker is not looking at a
+    /// preview, and a device left open behind a card that is no longer
+    /// showing it is exactly the leak this route must not have.
     pub fn back_to_picker(&mut self) {
         self.typed = Zeroizing::new(String::new());
         self.scanned = false;
         self.revealed = false;
         self.stage = Stage::Picker;
         self.refusal = None;
+        self.webcam = None;
     }
 }
 
@@ -1235,6 +1507,210 @@ pub enum TotpAddAction {
     /// handler after this frame's draw closures have returned, exactly where
     /// `EditAction::PickAppFile` is called from.
     OpenImage,
+    /// **Open a camera.** Reported rather than done, for
+    /// [`Self::OpenImage`]'s reason with one difference worth naming: the
+    /// blocking part is the enumeration and not a dialog.
+    /// [`crate::webcam::devices`] asks Media Foundation for the list and
+    /// returns, which is bounded but not instant, so it belongs in the action
+    /// handler after this frame's draw closures have returned rather than
+    /// inside one. Everything after the enumeration -- opening the device,
+    /// every frame, every decode -- is on a thread of `webcam`'s own and
+    /// never on this one.
+    OpenWebcam,
+    /// **Open one of the enumerated cameras**, by its index in
+    /// [`WebcamStage::devices`].
+    ///
+    /// Reported rather than done for a reason none of the three above
+    /// share: opening a device needs [`crate::webcam::WebcamSeams`], and a
+    /// draw function that reached for `WebcamSeams::production()` itself
+    /// would be a surface that opens a real camera when a test presses a
+    /// row on it. The seam has to arrive from the caller for the same
+    /// reason it exists at all.
+    UseCamera(usize),
+}
+
+// ---------------------------------------------------------------------------
+// The webcam route
+// ---------------------------------------------------------------------------
+
+/// **The camera stage's state, and the camera's lifetime.**
+///
+/// Held by [`TotpAdd::webcam`]; see that field for why it lives there and not
+/// beside the form. Everything in here dies together, which is the point:
+/// the [`Session`] releases the device, and the texture releases the one copy
+/// of a frame this route cannot wipe.
+///
+/// **No `Debug`.** [`Self::texture`] is a picture of whatever the camera is
+/// pointed at, which on this screen is by construction a QR code of a seed.
+pub struct WebcamStage {
+    /// Every camera Windows offered, in enumeration order. Held even when
+    /// there is only one, so [`WEBCAM_ANOTHER_LABEL`] can offer the others
+    /// after a refusal without a second enumeration.
+    pub devices: Vec<crate::webcam::Device>,
+    /// Which of [`Self::devices`] is open, as an index. `None` means the
+    /// device picker is on screen: more than one camera, and the user has not
+    /// said which.
+    pub chosen: Option<usize>,
+    /// The running camera. `None` while the device picker is up -- **which is
+    /// the point of it being an `Option` rather than always present**: no
+    /// device is opened, and so no camera light comes on, until the user has
+    /// picked one.
+    pub session: Option<Session>,
+    /// The last frame's size in pixels, for the preview's aspect ratio. Kept
+    /// beside the texture rather than read off it so the two cannot disagree
+    /// on the frame a camera changes resolution mid-stream.
+    pub size: Option<(usize, usize)>,
+    /// The preview's texture. **The one copy of a frame that is not a
+    /// [`Zeroizing`]**, because `egui` has no such thing; it is freed when
+    /// this struct drops, and what it holds is a picture of a code that is at
+    /// that moment being held up in front of the machine.
+    pub texture: Option<egui::TextureHandle>,
+}
+
+impl WebcamStage {
+    /// Whether a picture has arrived yet, which is what the surface says
+    /// instead of painting a black rectangle.
+    pub fn showing(&self) -> bool {
+        self.texture.is_some()
+    }
+}
+
+/// **What the enumeration came back with, applied to the form.**
+///
+/// A free function taking `&mut TotpAdd`, [`apply_region_outcome`]'s rule and
+/// for its reason: every arm is reachable from a test with no camera
+/// anywhere.
+///
+/// **One camera opens immediately; two or more ask first.** A device picker
+/// shown for a single built-in webcam is a question with one answer, and the
+/// route that asks it is a route that takes two presses to do what one
+/// should.
+pub fn open_webcam(
+    state: &mut TotpAdd,
+    seams: &WebcamSeams,
+    found: Result<Vec<crate::webcam::Device>, CameraRefusal>,
+) {
+    let devices = match found {
+        Ok(devices) if !devices.is_empty() => devices,
+        Ok(_) => {
+            // `webcam::devices` already turns an empty list into `NoCamera`;
+            // this arm exists because a seam is a seam and a stub could hand
+            // back an empty `Ok`, which must not become a stage with nothing
+            // in it.
+            state.stage = Stage::Picker;
+            state.refusal = Some(PickerRefusal::Camera(CameraRefusal::NoCamera));
+            return;
+        }
+        Err(why) => {
+            state.stage = Stage::Picker;
+            state.refusal = Some(PickerRefusal::Camera(why));
+            return;
+        }
+    };
+    let only_one = devices.len() == 1;
+    state.stage = Stage::Webcam;
+    state.refusal = None;
+    // Assigned rather than mutated: whatever camera was open before this
+    // press is dropped here, so pressing the row twice cannot leave two
+    // devices running.
+    state.webcam = Some(WebcamStage {
+        devices,
+        chosen: None,
+        session: None,
+        size: None,
+        texture: None,
+    });
+    if only_one {
+        choose_camera(state, seams, 0);
+    }
+}
+
+/// **Opens one of the enumerated cameras**, by index.
+///
+/// Out of range is ignored rather than refused: the only thing that can pass
+/// an index is the list this stage is drawing, so an out-of-range one is a
+/// bug in this file and not a thing to explain to a user.
+pub fn choose_camera(state: &mut TotpAdd, seams: &WebcamSeams, index: usize) {
+    let Some(stage) = state.webcam.as_mut() else {
+        return;
+    };
+    let Some(device) = stage.devices.get(index).cloned() else {
+        return;
+    };
+    // The previous session is dropped by the assignment, which stops its
+    // capture thread -- so switching cameras cannot leave the first one open.
+    stage.session = Some(Session::open(seams, device));
+    stage.chosen = Some(index);
+    stage.size = None;
+    stage.texture = None;
+}
+
+/// **One frame of the camera stage**, with everything from outside as
+/// arguments.
+///
+/// Returns the newest frame for the caller to paint, having already: decided
+/// whether the session has anything to report, applied it, and -- when it was
+/// a code -- moved the form to 6c. Nothing here draws, so every one of those
+/// decisions is a thing a test can drive.
+///
+/// **The decode is not here.** It happens on the capture thread, inside
+/// [`crate::webcam::offer`], which is why this function cannot be slow however
+/// large a frame is or however hard a picture is to read.
+pub fn advance_webcam(
+    state: &mut TotpAdd,
+    now: std::time::Instant,
+) -> Option<crate::webcam::Frame> {
+    use crate::webcam::Verdict;
+
+    let Some(stage) = state.webcam.as_mut() else {
+        return None;
+    };
+    let Some(session) = stage.session.as_mut() else {
+        // The device picker is up. Nothing is open, so there is nothing to
+        // ask.
+        return None;
+    };
+    let taken = session.take();
+    if let Some(verdict) = taken.verdict {
+        return match verdict {
+            // `accept_decoded` closes the camera; see its own note.
+            Verdict::Read(text) => {
+                state.accept_decoded(text);
+                None
+            }
+            Verdict::Refused(why) => {
+                refuse_camera(state, why);
+                None
+            }
+            // A producer that ran out with nothing to say. The real capture
+            // loop reports `Lost` instead, so this is only reachable from a
+            // stub -- but a stage left running against a finished session
+            // would sit on "Starting the camera" forever, so it is answered
+            // rather than ignored.
+            Verdict::Ended => {
+                refuse_camera(state, CameraRefusal::Silent);
+                None
+            }
+        };
+    }
+    if session.stalled(now, crate::webcam::FIRST_FRAME_GRACE) {
+        refuse_camera(state, CameraRefusal::Silent);
+        return None;
+    }
+    if let Some(frame) = &taken.frame {
+        stage.size = Some((frame.width(), frame.height()));
+    }
+    taken.frame
+}
+
+/// Ends the camera stage with a reason, back on the picker.
+///
+/// `state.webcam = None` is what closes the device, and it is done here
+/// rather than left to the caller so that no refusal path can forget it.
+fn refuse_camera(state: &mut TotpAdd, why: CameraRefusal) {
+    state.webcam = None;
+    state.stage = Stage::Picker;
+    state.refusal = Some(PickerRefusal::Camera(why));
 }
 
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
@@ -2370,9 +2846,10 @@ const DEFAULT_ROW: usize = 0;
 
 /// The gap between a dead row's title and the reason beside it.
 ///
-/// The design has no such element -- 6a draws all four routes live. See
-/// [`WEBCAM_REASON`] for why this app draws one of them off and says so, and
-/// [`route_row`] for the inks it says it in.
+/// The design has no such element -- 6a draws all four routes live, and so
+/// does this app now. See [`DEFERRED_REASON`] for why the treatment is kept
+/// with nothing currently using it, and [`route_row`] for the inks it says
+/// it in.
 const REASON_GAP: f32 = 6.0;
 
 /// The footer: `padding: 12px 18px`, `background: #fbfaf9`
@@ -2602,15 +3079,19 @@ pub struct PickerFrame {
 /// What pressing a route means. A pure function so the routing is a thing a
 /// test can enumerate rather than four arms buried in a click handler.
 ///
-/// [`Route::Webcam`] answers [`TotpAddAction::None`] and its row is drawn
-/// disabled, so there are two independent reasons it does nothing.
+/// Three of the four are reported to the caller and one is not, and the line
+/// between them is whether anything outside this file has to happen first.
+/// [`Route::ByHand`] is a stage change and nothing else; the other three each
+/// need something the draw closure must not do -- a second OS window, a modal
+/// shell dialog, or an enumeration of capture devices.
 pub fn action_for(route: Route) -> TotpAddAction {
     match route {
         Route::ScanRegion => TotpAddAction::ScanRegion,
         Route::ImageFile => TotpAddAction::OpenImage,
+        Route::Webcam => TotpAddAction::OpenWebcam,
         // Handled in the picker itself: it is a stage change and not something
         // the caller has to do.
-        Route::ByHand | Route::Webcam => TotpAddAction::None,
+        Route::ByHand => TotpAddAction::None,
     }
 }
 
@@ -2624,11 +3105,11 @@ pub fn action_for(route: Route) -> TotpAddAction {
 /// taller -- the tile's 36px rectangle, or the title and subtitle stacked
 /// with 2px between them. On the design's own copy the tile wins and the row
 /// comes out at 62; that is why the height is computed rather than pinned to
-/// a number, and it is also what makes the deferred row work.
-/// [`WEBCAM_DETAIL`] is longer than anything 6a puts on a fourth row and
-/// wraps to two lines, and the pair of hardcoded heights this replaced (46
-/// for a live row, 62 for the dead one) were two guesses that had already
-/// been corrected once against a render.
+/// a number, and it is also what makes a deferred row work. A subtitle
+/// longer than anything 6a puts on a row wraps to two lines and the row
+/// grows, and the pair of hardcoded heights this replaced (46 for a live
+/// row, 62 for the dead one) were two guesses that had already been
+/// corrected once against a render.
 ///
 /// # The selected treatment
 ///
@@ -2690,7 +3171,7 @@ fn route_row(ui: &mut egui::Ui, row: &RouteRow, index: usize) -> (egui::Response
     // The deferred row's reason shares the title's line, so the title wraps
     // against what is left of it.
     let reason = (!row.enabled).then(|| {
-        lay_out(ui, WEBCAM_REASON, text_width, body_face(ROW_SUB_PX, sub_ink))
+        lay_out(ui, DEFERRED_REASON, text_width, body_face(ROW_SUB_PX, sub_ink))
     });
     let reason_width = reason.as_ref().map_or(0.0, |g| g.size().x + REASON_GAP);
     let title = lay_out(
@@ -2950,10 +3431,21 @@ fn picker_subject(ui: &mut egui::Ui, name: &str) {
 /// because a claim about what happens to the pixels belongs beside the row
 /// that captures them.
 fn picker_footer(ui: &mut egui::Ui) {
+    footer_band(ui, PRIVACY_LINE);
+}
+
+/// [`picker_footer`]'s band with the sentence as an argument.
+///
+/// Split out for the camera stage, which makes a claim of its own about a
+/// device rather than about pixels ([`WEBCAM_PRIVACY_LINE`]) and must make it
+/// in the same place, in the same band, at the same size. A second footer
+/// built beside this one is how the two come to disagree about where a
+/// privacy claim sits on a card.
+fn footer_band(ui: &mut egui::Ui, line: &str) {
     let width = ui.available_width();
     let text = lay_out(
         ui,
-        PRIVACY_LINE,
+        line,
         width - FOOTER_PAD_X * 2.0 - FOOTER_GLYPH - FOOTER_GAP,
         egui::TextFormat {
             line_height: Some(FOOTER_TEXT_PX * FOOTER_LINE),
@@ -3040,7 +3532,8 @@ pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
                 // **What the ↵ on the default row means.** The design draws a
                 // keycap and not an ordinal on that one row, and a keycap for
                 // a key nothing answers is the kind of promise this file
-                // refuses elsewhere (see [`ROUTES`] on "PNG, JPG"). Enter is
+                // refuses elsewhere (see [`ROUTES`] on what the image row
+                // names). Enter is
                 // unbound everywhere else in this window's production, so it
                 // is answered here, by the row the design says it belongs to.
                 if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -3105,6 +3598,268 @@ pub fn draw_scanning(ui: &mut egui::Ui, state: &mut TotpAdd) {
         state.back_to_picker();
     }
 }
+
+// ---------------------------------------------------------------------------
+// The camera stage
+// ---------------------------------------------------------------------------
+
+/// How wide the card is with a camera in it.
+///
+/// [`PICKER_WIDTH`]'s 470, and a separate constant for `MANUAL_WIDTH`'s
+/// reason: two things the same size today for different reasons are two
+/// constants. The reason here is the one 6a and 6d share -- this stage is
+/// reached by pressing a row on the picker, and a card that changed width
+/// under the press would read as a second window opening rather than as the
+/// same one a step on. It is also simply what a preview wants: a QR code
+/// filling a fifth of a webcam's field of view is about forty pixels across
+/// at 380 points, and about fifty at 470.
+const WEBCAM_WIDTH: f32 = 470.0;
+
+/// The preview's height, in points.
+///
+/// Fixed rather than derived from the frame's aspect ratio, so the card does
+/// not resize the first time a picture arrives and again if the camera
+/// changes mode. The picture is letterboxed inside it -- see
+/// [`preview_fit`] -- which is the trade this takes: a stable card, and bars
+/// at the sides of a 4:3 camera on a 16:9 rectangle.
+const PREVIEW_HEIGHT: f32 = 232.0;
+
+/// The preview's corner radius and the ground behind a picture that has not
+/// arrived yet. The radius is 6a's row radius, because the preview sits where
+/// the rows were.
+const PREVIEW_RADIUS: u8 = ROW_RADIUS;
+
+/// One camera's row in the device list: 6a's row padding, at the text size of
+/// a row title.
+const DEVICE_ROW_PAD_X: f32 = ROW_PAD_X;
+/// See [`DEVICE_ROW_PAD_X`].
+const DEVICE_ROW_PAD_Y: f32 = 9.0;
+
+/// **Where a frame goes inside the preview rectangle**, preserving its aspect
+/// ratio and never enlarging past the rectangle.
+///
+/// A pure function because it is arithmetic that fails invisibly: a preview
+/// that stretched its frame would show a QR code as a rectangle of rectangles,
+/// which still looks like a QR code and reads as a camera that cannot focus.
+fn preview_fit(into: egui::Rect, frame: (usize, usize)) -> egui::Rect {
+    let (w, h) = (frame.0 as f32, frame.1 as f32);
+    if w <= 0.0 || h <= 0.0 || !into.is_positive() {
+        return into;
+    }
+    let scale = (into.width() / w).min(into.height() / h);
+    let size = egui::vec2(w * scale, h * scale);
+    egui::Rect::from_center_size(into.center(), size)
+}
+
+/// **The camera stage.** A preview, what to do with it, and the way back.
+///
+/// `frame` is the newest picture, already taken off the session by
+/// [`advance_webcam`] -- this function does not touch the camera at all, which
+/// is what keeps the decision about what the session reported out of a draw
+/// closure. It is consumed here: the pixels are uploaded to the texture and
+/// the [`crate::webcam::Frame`] drops at the end of the call, wiping them.
+pub fn draw_webcam(
+    ui: &mut egui::Ui,
+    state: &mut TotpAdd,
+    frame: Option<crate::webcam::Frame>,
+) -> TotpAddAction {
+    let mut action = TotpAddAction::None;
+    let mut go_back = false;
+    let mut chosen: Option<usize> = None;
+    let mut back_to_list = false;
+    let name = state.item_name.clone();
+
+    // The texture is written before anything is laid out, so the rectangle
+    // below paints this frame's picture rather than the previous one's.
+    if let (Some(stage), Some(frame)) = (state.webcam.as_mut(), frame) {
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [frame.width(), frame.height()],
+            frame.pixels(),
+        );
+        match &mut stage.texture {
+            // Written into the texture that already exists rather than
+            // loading a new one every frame: at thirty frames a second the
+            // second shape allocates and frees a full-size GPU texture thirty
+            // times a second, and each of those is another copy of a picture
+            // of a seed handed to a driver.
+            Some(texture) => texture.set(image, egui::TextureOptions::LINEAR),
+            None => {
+                stage.texture = Some(ui.ctx().load_texture(
+                    "totp-add-webcam-preview",
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ))
+            }
+        }
+    }
+
+    let Some(stage) = state.webcam.as_ref() else {
+        // Reachable only if the stage was left between `advance_webcam` and
+        // here. Nothing is drawn; the next frame is on whatever stage took
+        // over.
+        return action;
+    };
+    let showing = stage.showing();
+    let several = stage.devices.len() > 1;
+    let picking = stage.chosen.is_none();
+    let texture = stage.texture.clone();
+    let size = stage.size;
+    let devices: Vec<String> = stage.devices.iter().map(|d| d.name.clone()).collect();
+
+    stage_card(ui, WEBCAM_WIDTH, |ui| {
+        let (dismissed, _) = picker_header(ui);
+        if dismissed {
+            action = TotpAddAction::Cancel;
+        }
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: BODY_PAD_X,
+                right: BODY_PAD_X,
+                top: BODY_PAD_TOP,
+                bottom: BODY_PAD_BOTTOM,
+            })
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = BODY_GAP;
+                picker_subject(ui, &name);
+
+                if picking {
+                    // **No device is open yet.** The list is the whole stage:
+                    // nothing has been switched on, and the line under the
+                    // heading says so.
+                    ui.label(
+                        theme::bold(WEBCAM_CHOOSE, ROW_TITLE_PX).color(theme::INK),
+                    );
+                    ui.label(
+                        theme::regular(WEBCAM_CHOOSE_HINT, ROW_SUB_PX)
+                            .color(theme::TEXT_FAINT),
+                    );
+                    for (index, camera) in devices.iter().enumerate() {
+                        if device_row(ui, camera).clicked() {
+                            chosen = Some(index);
+                        }
+                    }
+                } else {
+                    ui.label(theme::bold(WEBCAM_HEADING, ROW_TITLE_PX).color(theme::INK));
+                    preview(ui, texture.as_ref(), size, showing);
+                    ui.label(
+                        theme::regular(
+                            if showing { WEBCAM_HINT } else { WEBCAM_STARTING },
+                            ROW_SUB_PX,
+                        )
+                        .color(theme::TEXT_MUTED),
+                    );
+                    if several && theme::link_label(ui, WEBCAM_ANOTHER_LABEL, ROW_SUB_PX).clicked()
+                    {
+                        back_to_list = true;
+                    }
+                }
+
+                if theme::link_label(ui, OTHER_WAYS_LABEL, ROW_SUB_PX).clicked() {
+                    go_back = true;
+                }
+            });
+        // The camera's own claim, in 6a's footer band and not in a note of
+        // this stage's invention. See [`WEBCAM_PRIVACY_LINE`].
+        footer_band(ui, WEBCAM_PRIVACY_LINE);
+    });
+
+    // Answered after the card has been drawn, so the borrow above is over
+    // before any of them mutates the stage.
+    if go_back {
+        state.back_to_picker();
+    } else if back_to_list {
+        // **Back to the list closes the device**, which is the whole content
+        // of the gesture: the user is saying "not that one".
+        if let Some(stage) = state.webcam.as_mut() {
+            stage.session = None;
+            stage.chosen = None;
+            stage.texture = None;
+            stage.size = None;
+        }
+    } else if let Some(index) = chosen {
+        // Reported, not opened -- see [`TotpAddAction::UseCamera`]. A
+        // dismissal from the header wins over it, because a card being
+        // closed is not a card that should switch a camera on first.
+        if action == TotpAddAction::None {
+            action = TotpAddAction::UseCamera(index);
+        }
+    }
+    action
+}
+
+/// The preview rectangle: the picture if there is one, and the ground it sits
+/// on if there is not.
+///
+/// The ground is painted whether or not there is a picture, so a camera whose
+/// frame does not fill the rectangle is letterboxed against the card's own
+/// tint rather than against whatever was underneath.
+fn preview(
+    ui: &mut egui::Ui,
+    texture: Option<&egui::TextureHandle>,
+    size: Option<(usize, usize)>,
+    showing: bool,
+) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), PREVIEW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(PREVIEW_RADIUS), theme::CANVAS);
+    let (Some(texture), Some(size), true) = (texture, size, showing) else {
+        return;
+    };
+    painter.image(
+        texture.id(),
+        preview_fit(rect, size),
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+/// One camera's row in the device list.
+///
+/// 6a's row chrome without its tile: the list is a list of names, and a mark
+/// repeated down it would be four copies of the same camera glyph saying
+/// nothing about which is which.
+fn device_row(ui: &mut egui::Ui, name: &str) -> egui::Response {
+    let width = ui.available_width();
+    let title = lay_out(
+        ui,
+        name,
+        (width - ROW_STROKE * 2.0 - DEVICE_ROW_PAD_X * 2.0).max(1.0),
+        face(ROW_TITLE_PX, theme::SEMIBOLD, theme::INK),
+    );
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, ROW_STROKE * 2.0 + DEVICE_ROW_PAD_Y * 2.0 + title.size().y),
+        egui::Sense::click(),
+    );
+    let painter = ui.painter();
+    let hovered = response.hovered();
+    painter.rect_filled(
+        rect,
+        CornerRadius::same(ROW_RADIUS),
+        if hovered { theme::CANVAS } else { theme::CARD },
+    );
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(ROW_RADIUS),
+        egui::Stroke::new(ROW_STROKE, theme::HAIRLINE),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(
+        egui::pos2(
+            rect.left() + ROW_STROKE + DEVICE_ROW_PAD_X,
+            rect.top() + ROW_STROKE + DEVICE_ROW_PAD_Y,
+        ),
+        title,
+        theme::INK,
+    );
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
 
 // ---------------------------------------------------------------------------
 // Design 6c's numbers, all of them lifted out of the CSS under `id="6c"`
@@ -3542,23 +4297,51 @@ pub fn draw_add_modal(
 /// [`Stage::Scanning`] keeps [`MODAL_WIDTH`]: it is four short lines with no
 /// design panel of its own asking it to be wider, and widening it as a side
 /// effect of this would make the card jump on the way to 6b and back.
+/// [`Stage::Webcam`] is the other way about -- see [`WEBCAM_WIDTH`]: it is a
+/// card with a picture in it, reached from the picker with no second window
+/// in between, so it takes the picker's width for the reason 6d does.
 fn stage_width(stage: Stage) -> f32 {
     match stage {
         Stage::Picker => PICKER_WIDTH,
         Stage::Manual => MANUAL_WIDTH,
         Stage::Scanning => MODAL_WIDTH,
+        Stage::Webcam => WEBCAM_WIDTH,
     }
 }
 
 /// **The one place that decides which half of this surface is on screen**, so
-/// no caller has to know there are three.
+/// no caller has to know there are four.
+///
+/// # The camera is advanced BEFORE the match, and that is load-bearing
+///
+/// [`advance_webcam`] can change the stage: a code read on this frame moves
+/// the form to 6c, and a camera that has just refused moves it back to the
+/// picker. Running it first means the frame that learns either of those
+/// paints the stage it learned about, rather than painting a preview of a
+/// camera that has already been closed. It is `mod.rs`'s reason for driving
+/// the 6b overlay above the form rather than below it, one level in.
+///
+/// # Why the clock here is an `Instant` and not `now_unix`
+///
+/// `now_unix` is a **wall** clock, and the only thing measured against a
+/// camera is an elapsed duration -- how long it has been open without
+/// sending a picture. A wall clock moved backwards by a time sync would make
+/// that duration negative and the grace period never expire; moved forwards,
+/// it would expire instantly on a camera that was working. So this reads a
+/// monotonic clock, exactly where `region_overlay::show` reads one for the
+/// same kind of question, and hands it to a function that takes it as an
+/// argument so every boundary is drivable from a test.
 pub fn draw_stage(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> TotpAddAction {
+    let frame = (state.stage == Stage::Webcam)
+        .then(|| advance_webcam(state, std::time::Instant::now()))
+        .flatten();
     match state.stage {
         Stage::Picker => draw_picker(ui, state).action,
         Stage::Scanning => {
             draw_scanning(ui, state);
             TotpAddAction::None
         }
+        Stage::Webcam => draw_webcam(ui, state, frame),
         Stage::Manual => draw_add_form(ui, state, now_unix),
     }
 }
@@ -4274,37 +5057,70 @@ mod tests {
         for row in &ROUTES {
             assert!(!row.subtitle.trim().is_empty(), "{} has no line under it", row.title);
         }
-        // **PNG, and not the design's "PNG, JPG".** The dialog's filter says
-        // the same, and the two are held to each other from `file_picker`'s
-        // own test. A row promising a format the decoder cannot read is a
-        // promise broken one click later.
-        assert!(
-            ROUTES[1].subtitle.contains("PNG") && !ROUTES[1].subtitle.contains("JPG"),
-            "the image row offers a format this app cannot decode: {}",
-            ROUTES[1].subtitle
-        );
-        assert_eq!(crate::file_picker::IMAGE_EXTENSION, "png");
+        // **The row names every format the decoder reads, and the design's
+        // "PNG, JPG" is now the narrower of the two.** The dialog's filter
+        // says the same six, and the two are held to each other here rather
+        // than by hope: a row promising a format the decoder cannot read is a
+        // promise broken one click later, and a row hiding one it can read
+        // sends the user off to convert a file that already worked.
+        let spec = crate::file_picker::QR_FILTER_SPEC;
+        for (named, extension) in [
+            ("PNG", "*.png"),
+            ("JPG", "*.jpg"),
+            ("GIF", "*.gif"),
+            ("BMP", "*.bmp"),
+            ("WebP", "*.webp"),
+            ("ICO", "*.ico"),
+        ] {
+            assert!(
+                ROUTES[1].subtitle.contains(named),
+                "the image row does not name {named}, which the dialog offers: {}",
+                ROUTES[1].subtitle
+            );
+            assert!(
+                spec.contains(extension),
+                "the image row names {named} and the dialog's filter does not offer it"
+            );
+        }
+        // The control on the loop above: a format neither of them names.
+        // Without it the assertions pass for a subtitle that names
+        // everything.
+        assert!(!ROUTES[1].subtitle.contains("TIFF"), "{}", ROUTES[1].subtitle);
+        assert!(!spec.contains("*.tif"));
     }
 
-    /// **The webcam row is present and disabled; every other row is not.**
+    /// **Nothing is deferred: all four of design 6a's routes are live.**
     ///
-    /// Both halves matter. A row merely absent from an `enabled` check would
+    /// This test used to say the opposite -- that the webcam row was drawn
+    /// dead and said so -- and it is kept, inverted, rather than deleted:
+    /// what it pins is the same claim either way, which is that this file
+    /// and the picker agree about which routes do something. Both halves
+    /// matter, because a row merely absent from an `enabled` check would
     /// satisfy an assertion written one way round only.
     #[test]
-    fn the_webcam_row_is_the_only_one_that_is_deferred_and_it_says_why() {
+    fn no_route_is_deferred_today() {
         let dead: Vec<Route> = ROUTES.iter().filter(|r| !r.enabled).map(|r| r.route).collect();
-        assert_eq!(dead, vec![Route::Webcam], "the wrong set of routes is disabled");
+        assert!(dead.is_empty(), "a route is drawn dead: {dead:?}");
         let live: Vec<Route> = ROUTES.iter().filter(|r| r.enabled).map(|r| r.route).collect();
         assert_eq!(
             live,
-            vec![Route::ScanRegion, Route::ImageFile, Route::ByHand],
-            "a route this task shipped is drawn dead"
+            vec![Route::ScanRegion, Route::ImageFile, Route::ByHand, Route::Webcam],
+            "the four live routes are not design 6a's four, in its order"
         );
-        assert_eq!(WEBCAM_REASON, "Not in this version");
+        // The webcam row's own line, which is a promise `crate::webcam`
+        // keeps and `PRIVACY.md` repeats.
+        let webcam = ROUTES.iter().find(|r| r.route == Route::Webcam).expect("6a's fourth row");
         assert!(
-            WEBCAM_DETAIL.contains("scan a region"),
-            "the deferred row does not point at the route that replaces it: {WEBCAM_DETAIL}"
+            webcam.subtitle.contains("stays on this PC"),
+            "the camera row does not say where the picture goes: {}",
+            webcam.subtitle
         );
+        assert!(
+            !webcam.subtitle.contains("scan a region"),
+            "the camera row still points at the route that used to replace it"
+        );
+        // And the deferral machinery is still here for the next one.
+        assert_eq!(DEFERRED_REASON, "Not in this version");
     }
 
     /// **The privacy line, verbatim from design 6a.**
@@ -4402,8 +5218,18 @@ mod tests {
         let sources = scan_route_sources();
         let totp = &sources.iter().find(|(n, _)| *n == "totp_add.rs").unwrap().1;
         assert!(totp.contains("let bytes = Zeroizing::new(std::fs::read(path)"));
-        assert!(totp
-            .contains("let mut buf = Zeroizing::new(vec![0u8; reader.output_buffer_size()]);"));
+        // **The decoded picture lands in a buffer THIS file owns.** The line
+        // below is what says so: `image`'s decoder is asked to write into a
+        // `Zeroizing` rather than to hand one back, which is the property the
+        // `png`-only version of this route had and which widening the format
+        // list did not give up. A `DynamicImage` from `image::ImageReader::
+        // decode` would be a full-size copy of the seed's picture in an
+        // ordinary allocation, and this pin is what would notice the change.
+        assert!(
+            totp.contains("let mut buf = Zeroizing::new(vec![0u8; total]);")
+                && totp.contains("decoder.read_image(&mut buf)"),
+            "the picture is no longer decoded into a buffer this file owns and wipes"
+        );
         assert!(totp.contains("let mut rgba = Zeroizing::new(Vec::with_capacity("));
         // And nothing hands pixels back out: the one thing that leaves the
         // image route is a string.
@@ -4533,7 +5359,7 @@ mod tests {
     }
 
     /// The same, as 8-bit greyscale -- the shape a screenshot tool saving a
-    /// black-and-white QR really does produce, and the arm of `png_to_rgba`
+    /// black-and-white QR really does produce, and the arm of `expand_to_rgba`
     /// that has to expand one channel into four.
     fn grey_png(width: u32, height: u32, grey: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -4548,7 +5374,7 @@ mod tests {
     }
 
     /// What the seam below was handed, so a test can assert about the pixels
-    /// the PNG half produced rather than trust that it produced any.
+    /// the decoding half produced rather than trust that it produced any.
     static SEEN: std::sync::Mutex<Option<(Vec<u8>, usize, usize)>> =
         std::sync::Mutex::new(None);
     /// What the seam below answers.
@@ -4618,6 +5444,155 @@ mod tests {
         assert_eq!(rgba, expected, "greyscale was not expanded to opaque RGBA");
     }
 
+    // -- one case per format the route reads ---------------------------
+    //
+    // These run through [`decode_image`] -- the PRODUCTION seam, the real
+    // `qr::decode_qr` -- rather than through the recording seam above,
+    // because the question they answer is end-to-end: does a QR code inside a
+    // JPEG come back out as the URI it was made from. A recording seam would
+    // only say that some pixels arrived.
+    //
+    // The code inside every one of them is `qr::tests::FIXTURE`, rendered
+    // here rather than copied: a matrix generated outside this repository by
+    // a crate that is not a dependency of this app (see `qr.rs` on why that
+    // independence is what makes a decode evidence of anything). What each
+    // case adds on top of that is the FORMAT -- so a failure means the format
+    // arm is missing, or the colour type came back wrong, or the rows are
+    // upside down, and not that a new fixture happens not to decode.
+
+    /// The fixture as the two pixel layouts the encoders below want: RGBA8,
+    /// and RGB8 for JPEG, which has no alpha channel to give.
+    ///
+    /// Returns `(rgba, rgb, width, height)`.
+    fn fixture_pixels(scale: usize) -> (Vec<u8>, Vec<u8>, u32, u32) {
+        let (rgba, width, height) = crate::qr::tests::fixture_rgba(scale);
+        let rgb: Vec<u8> =
+            rgba.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]).collect();
+        (rgba, rgb, width as u32, height as u32)
+    }
+
+    /// **Every format the file dialog offers decodes to the code inside it.**
+    ///
+    /// One table rather than six tests, because the assertion is identical
+    /// for all of them and a table makes a missing row visible where six
+    /// functions would not.
+    #[test]
+    fn every_format_the_dialog_offers_decodes_to_the_code_inside_it() {
+        use image::ExtendedColorType::{Rgb8, Rgba8};
+        use image::ImageEncoder as _;
+
+        // An ICO entry's dimensions are one byte each, so 256 is the whole
+        // container's ceiling. The table is rendered small enough to fit it
+        // rather than testing one format at a size the others are not.
+        let (rgba, rgb, width, height) = fixture_pixels(4);
+        assert!(
+            width <= 256 && height <= 256,
+            "the fixture no longer fits an ICO entry at {width}x{height}"
+        );
+
+        let mut files: Vec<(&str, Vec<u8>)> = Vec::new();
+        // PNG through the `png` crate rather than through `image`'s encoder,
+        // so at least one row of this table is not the same library
+        // agreeing with itself about a container.
+        files.push(("PNG", rgba_png(width, height, &rgba)));
+        {
+            let mut out = Vec::new();
+            image::codecs::bmp::BmpEncoder::new(&mut out)
+                .write_image(&rgba, width, height, Rgba8)
+                .expect("BMP encodes");
+            files.push(("BMP", out));
+        }
+        {
+            let mut out = Vec::new();
+            image::codecs::gif::GifEncoder::new(&mut out)
+                .write_image(&rgba, width, height, Rgba8)
+                .expect("GIF encodes");
+            files.push(("GIF", out));
+        }
+        {
+            let mut out = Vec::new();
+            image::codecs::webp::WebPEncoder::new_lossless(&mut out)
+                .write_image(&rgba, width, height, Rgba8)
+                .expect("WebP encodes");
+            files.push(("WebP", out));
+        }
+        {
+            let mut out = Vec::new();
+            image::codecs::ico::IcoEncoder::new(&mut out)
+                .write_image(&rgba, width, height, Rgba8)
+                .expect("ICO encodes");
+            files.push(("ICO", out));
+        }
+        {
+            // **The one lossy row, and the only one whose bytes are not the
+            // fixture's.** Quality 100 still runs the code through a DCT and
+            // a chroma pass; that it survives is the point, since a photo of
+            // a QR code off a phone is exactly this and worse.
+            let mut out = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 100)
+                .write_image(&rgb, width, height, Rgb8)
+                .expect("JPEG encodes");
+            files.push(("JPEG", out));
+        }
+
+        assert_eq!(files.len(), 6, "a format was dropped from the table");
+        for (format, bytes) in &files {
+            // The dialog offers it, so the decoder had better read it.
+            assert!(
+                !bytes.is_empty(),
+                "{format} encoded to nothing, so the assertion below proves nothing"
+            );
+            let decoded = decode_image(bytes)
+                .unwrap_or_else(|why| panic!("a QR code in a {format} was refused: {why:?}"));
+            assert_eq!(
+                decoded.as_str(),
+                crate::qr::tests::FIXTURE_TEXT,
+                "a {format} decoded to something other than the code inside it"
+            );
+        }
+
+        // **The control**: the same pipeline on a picture with no code in it
+        // answers the "no code" refusal rather than a URI. Without it, a
+        // `decode_image` that returned the fixture text unconditionally would
+        // satisfy every assertion above.
+        let blank = rgba_png(8, 8, &vec![0xffu8; 8 * 8 * 4]);
+        assert_eq!(
+            decode_image(&blank).err(),
+            Some(PickerRefusal::NoCode(CodeSource::Image)),
+            "the control decoded a code out of a blank picture"
+        );
+    }
+
+    /// **A sixteen-bit PNG is narrowed rather than refused.**
+    ///
+    /// PNG is the only format in this app's list that carries sixteen bits a
+    /// channel, so this is the one test that can reach `expand_to_rgba`'s
+    /// wide arms -- and without it those arms would be four untested branches
+    /// standing between a screenshot and a refusal.
+    #[test]
+    fn a_sixteen_bit_png_is_narrowed_to_rgba_rather_than_refused() {
+        let (rgba, _, width, height) = fixture_pixels(4);
+        // Every eight-bit sample widened into BOTH halves of a sixteen-bit
+        // one, which is what saving at that depth does to a picture that had
+        // eight bits to begin with. The `png` crate writes those samples
+        // big-endian, as the format requires, and `image` hands them back in
+        // the machine's own byte order -- which is the difference `high_byte`
+        // exists so that this file does not have to care about.
+        let wide: Vec<u8> = rgba.iter().flat_map(|sample| [*sample, *sample]).collect();
+        assert_eq!(wide.len(), rgba.len() * 2, "the widening produced the wrong length");
+
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Sixteen);
+            let mut writer = encoder.write_header().expect("png header");
+            writer.write_image_data(&wide).expect("png pixel data");
+        }
+        let decoded = decode_image(&out).expect("a sixteen-bit PNG was refused");
+        assert_eq!(decoded.as_str(), crate::qr::tests::FIXTURE_TEXT);
+    }
+
     /// **A picture with no QR in it is the named "no code" refusal**, and a
     /// picture with one is not.
     #[test]
@@ -4644,7 +5619,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_is_not_a_png_is_refused_as_a_file_and_not_as_a_missing_code() {
+    fn a_file_that_is_not_a_picture_is_refused_as_a_file_and_not_as_a_missing_code() {
         for (what, bytes) in [
             ("empty", Vec::new()),
             ("text", b"this is not a picture at all".to_vec()),
@@ -4660,7 +5635,7 @@ mod tests {
             assert!(seen.is_none(), "{what} reached the QR decoder");
         }
         // Control: a real one is NOT refused, so the three above are about the
-        // bytes rather than about `png_to_rgba` refusing everything.
+        // bytes rather than about `image_to_rgba` refusing everything.
         let good = rgba_png(8, 8, &vec![0u8; 8 * 8 * 4]);
         let (out, seen) = with_recording_seam(Some("ok"), |s| decode_image_with(s, &good));
         assert!(out.is_ok());
@@ -5008,7 +5983,12 @@ mod tests {
             "the privacy line is not on the card: {:?}",
             frame.painted.0
         );
-        assert!(frame.painted.has(WEBCAM_REASON), "the dead row does not say it is deferred");
+        // Nothing on this card says a route is deferred, because none is.
+        assert!(
+            !frame.painted.has(DEFERRED_REASON),
+            "a row is drawn dead: {:?}",
+            frame.painted.0
+        );
         // And nothing of 6d is on screen yet: the picker is a picker.
         assert!(!frame.painted.has(CONFIRM_HEADING));
         assert_eq!(frame.rows.len(), ROUTES.len(), "a route was drawn without a hit area");
@@ -5121,20 +6101,22 @@ mod tests {
             }
         }
 
-        // The three one-line rows are all 62 tall -- 6a's own number, which is
-        // 12px of padding either side of the 36px tile plus the 1px border --
-        // and the deferred row is taller because its reason wraps. Asserted
-        // together so a change that grew every row would still red.
-        let live: Vec<f32> =
-            frame.rows.iter().take(3).map(|(_, rect)| rect.height()).collect();
-        for height in &live {
-            assert!((height - 62.0).abs() <= 1.0, "a live row is {height} tall and 6a's is 62");
+        // **All four rows are 62 tall** -- 6a's own number, which is 12px of
+        // padding either side of the 36px tile plus the 1px border. This
+        // used to assert three at 62 and a fourth that was TALLER, because
+        // the webcam row was drawn dead and its two-line reason wrapped;
+        // now that every route is live, four one-line rows is what the
+        // design draws and what this holds. A subtitle long enough to wrap
+        // would grow its row and red this, which is the right way round:
+        // `route_row` measures itself, so a row that got taller did so
+        // because its copy grew rather than because a number was edited.
+        for (route, rect) in &frame.rows {
+            assert!(
+                (rect.height() - 62.0).abs() <= 1.0,
+                "{route:?} is {} tall and 6a's row is 62",
+                rect.height()
+            );
         }
-        assert!(
-            frame.row(Route::Webcam).height() > live[0] + 1.0,
-            "the deferred row is no taller than a one-line row, so its two-line reason is \
-             overflowing rather than fitting"
-        );
     }
 
     /// **6a's two right-hand affordances**: a filled ↵ keycap on the default
@@ -5351,25 +6333,6 @@ mod tests {
             "the by-hand route reported nothing and painted nothing: {:?}",
             painted.0
         );
-    }
-
-    /// **The dead row is dead when pressed, and not merely greyed.**
-    #[test]
-    fn pressing_the_webcam_row_does_nothing_at_all() {
-        let mut state = TotpAdd::opening("id-1", "Git Host", false);
-        let picker = Picker::new();
-        let laid_out = picker.idle(&mut state);
-        let at = laid_out.row(Route::Webcam).center();
-
-        let after = picker.click(&mut state, at);
-        assert_eq!(after.action, TotpAddAction::None);
-        assert_eq!(state.stage, Stage::Picker, "the deferred row moved the form somewhere");
-        assert_eq!(state.refusal, None);
-        // Control: the row IS on screen and IS where this pressed, so the
-        // three assertions above are about a dead control rather than about a
-        // click that landed on nothing.
-        assert!(after.painted.has("Use a webcam"));
-        assert!(laid_out.row(Route::Webcam).width() > 1.0);
     }
 
     /// **A refusal is painted on the picker, as a sentence.**
@@ -6181,5 +7144,664 @@ mod tests {
         assert_eq!(after.action, TotpAddAction::None, "the way back asked the caller to act");
         assert_eq!(state.stage, Stage::Picker, "the second answer did not go back to 6a");
         assert!(state.typed.is_empty(), "a seed was left resident on the way back");
+    }
+
+    // -----------------------------------------------------------------
+    // The webcam route, with no camera anywhere
+    //
+    // Every state this route can be in is reachable here, because the two
+    // calls that need a device are behind `crate::webcam::WebcamSeams` and
+    // the capture loop is an ordinary function pointer. No test below opens a
+    // camera, enumerates one, or would behave differently on a machine that
+    // has one.
+    // -----------------------------------------------------------------
+
+    use crate::webcam::{Device, Sink, WebcamSeams};
+
+    /// What a camera hands back, in this block. A real `otpauth://` URI so
+    /// the confirmation the decode opens has something to confirm.
+    const CAMERA_URI: &str = "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP";
+
+    /// Two cameras, named the way Windows names them.
+    fn two_cameras() -> Vec<Device> {
+        vec![
+            Device { name: "Integrated Camera".to_string(), id: r"\\?\usb#one".to_string() },
+            Device { name: "Logi C920".to_string(), id: r"\\?\usb#two".to_string() },
+        ]
+    }
+
+    fn one_camera() -> Vec<Device> {
+        two_cameras().into_iter().take(1).collect()
+    }
+
+    /// A capture loop that opens nothing and sends nothing, until it is
+    /// stopped. What a camera with the lens cap on looks like from here.
+    fn silent_pump(_: Device, _: crate::webcam::DecodeFn, sink: Sink) {
+        while sink.wanted() {
+            std::thread::yield_now();
+        }
+    }
+
+    /// A capture loop that offers one white frame and then waits.
+    fn one_frame_pump(_: Device, _: crate::webcam::DecodeFn, sink: Sink) {
+        if let Some(frame) =
+            crate::webcam::Frame::new(4, 3, Zeroizing::new(vec![0xffu8; 4 * 3 * 4]))
+        {
+            sink.show(frame);
+        }
+        while sink.wanted() {
+            std::thread::yield_now();
+        }
+    }
+
+    /// A capture loop whose device is already open somewhere else.
+    fn busy_pump(_: Device, _: crate::webcam::DecodeFn, sink: Sink) {
+        sink.refuse(CameraRefusal::Busy);
+    }
+
+    /// A capture loop that reads a code off its first frame.
+    fn reading_pump(_: Device, _: crate::webcam::DecodeFn, sink: Sink) {
+        sink.read(Zeroizing::new(CAMERA_URI.to_string()));
+    }
+
+    fn seams(pump: crate::webcam::PumpFn) -> WebcamSeams {
+        WebcamSeams { pump, ..WebcamSeams::production() }
+    }
+
+    /// Spins until `check` answers, or fails after a bounded wait. See
+    /// `webcam`'s own copy of this for why it is a spin and not a sleep.
+    fn until(what: &str, mut check: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if check() {
+                return;
+            }
+            std::thread::yield_now();
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// **Pressing the webcam row reports it rather than doing it.**
+    #[test]
+    fn the_camera_row_asks_the_caller_to_enumerate() {
+        assert_eq!(action_for(Route::Webcam), TotpAddAction::OpenWebcam);
+        // And it is reachable by pressing, not only by calling `action_for`.
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let at = picker.idle(&mut state).row(Route::Webcam).center();
+        let pressed = picker.click(&mut state, at);
+        assert_eq!(pressed.action, TotpAddAction::OpenWebcam, "the camera row is not reachable");
+        // Nothing was opened by the press itself: the device is the caller's
+        // to enumerate, and until it does there is no camera in this state.
+        assert!(state.webcam.is_none());
+        assert_eq!(state.stage, Stage::Picker);
+    }
+
+    /// **One camera opens straight away; two ask first, and open neither.**
+    ///
+    /// The second half is the privacy-relevant one: a list of cameras must
+    /// not switch any of them on to draw itself.
+    #[test]
+    fn one_camera_opens_at_once_and_several_are_offered_with_none_switched_on() {
+        let seams = seams(silent_pump);
+
+        let mut alone = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut alone, &seams, Ok(one_camera()));
+        assert_eq!(alone.stage, Stage::Webcam);
+        let stage = alone.webcam.as_ref().expect("a camera stage");
+        assert_eq!(stage.chosen, Some(0), "the only camera was not opened");
+        assert!(stage.session.is_some(), "the only camera has no capture loop");
+
+        let mut several = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut several, &seams, Ok(two_cameras()));
+        assert_eq!(several.stage, Stage::Webcam);
+        let stage = several.webcam.as_ref().expect("a camera stage");
+        assert_eq!(stage.chosen, None, "a camera was chosen for the user");
+        assert!(stage.session.is_none(), "a device was opened before anyone picked one");
+        assert_eq!(stage.devices.len(), 2, "the list the user has to choose from is not held");
+    }
+
+    /// **Every refusal from the enumeration lands back on the picker, named.**
+    #[test]
+    fn a_camera_that_will_not_open_sends_the_user_back_to_the_picker_with_the_reason() {
+        let seams = seams(silent_pump);
+        for why in [CameraRefusal::NoCamera, CameraRefusal::Denied, CameraRefusal::Busy] {
+            let mut state = TotpAdd::opening("id-1", "Git Host", false);
+            open_webcam(&mut state, &seams, Err(why));
+            assert_eq!(state.stage, Stage::Picker, "{why:?} left the user on the camera stage");
+            assert_eq!(state.refusal, Some(PickerRefusal::Camera(why)));
+            assert!(state.webcam.is_none(), "{why:?} left a camera stage behind");
+        }
+        // An empty list is the same answer, so a seam that hands one back
+        // cannot produce a stage with nothing in it.
+        let mut empty = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut empty, &seams, Ok(Vec::new()));
+        assert_eq!(empty.stage, Stage::Picker);
+        assert_eq!(empty.refusal, Some(PickerRefusal::Camera(CameraRefusal::NoCamera)));
+    }
+
+    /// **A refusal raised by the capture loop is the same journey**, and the
+    /// device is let go of on the way.
+    #[test]
+    fn a_capture_loop_that_refuses_closes_the_camera_and_says_why() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut state, &seams(busy_pump), Ok(one_camera()));
+        assert_eq!(state.stage, Stage::Webcam, "control: it did not even open");
+
+        until("the refusal to arrive", || {
+            advance_webcam(&mut state, std::time::Instant::now());
+            state.stage == Stage::Picker
+        });
+        assert_eq!(state.refusal, Some(PickerRefusal::Camera(CameraRefusal::Busy)));
+        assert!(state.webcam.is_none(), "the camera stage outlived its refusal");
+    }
+
+    /// **A frame arrives, is handed back for painting, and its size is
+    /// recorded.**
+    #[test]
+    fn a_frame_reaches_the_surface_with_its_dimensions() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut state, &seams(one_frame_pump), Ok(one_camera()));
+
+        let mut seen = None;
+        until("a frame", || {
+            seen = advance_webcam(&mut state, std::time::Instant::now());
+            seen.is_some()
+        });
+        let frame = seen.expect("a frame");
+        assert_eq!((frame.width(), frame.height()), (4, 3));
+        assert_eq!(
+            state.webcam.as_ref().and_then(|s| s.size),
+            Some((4, 3)),
+            "the preview does not know how big the picture is"
+        );
+        assert_eq!(state.stage, Stage::Webcam, "a frame ended the stage");
+    }
+
+    /// **A code read off the camera lands on 6c, with the field filled in and
+    /// NOTHING saved.**
+    ///
+    /// The last clause is the one the owner asked for explicitly: 6c exists so
+    /// the user sees what was extracted before anything is written, and a
+    /// route that saved on a successful decode would skip it.
+    #[test]
+    fn a_code_read_off_the_camera_opens_the_confirmation_and_saves_nothing() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.revealed = true;
+        open_webcam(&mut state, &seams(reading_pump), Ok(one_camera()));
+
+        until("the code", || {
+            advance_webcam(&mut state, std::time::Instant::now());
+            state.stage == Stage::Manual
+        });
+        assert_eq!(&*state.typed, CAMERA_URI, "the decoded URI is not in the field");
+        assert!(state.scanned, "the confirmation will not know this was scanned");
+        assert!(!state.revealed, "a scanned seed opened revealed");
+        assert!(state.refusal.is_none());
+        // **The camera is closed by the same step**, so the light goes out as
+        // the confirmation appears rather than when the modal does.
+        assert!(state.webcam.is_none(), "the camera is still open behind the confirmation");
+        // And the confirmation is reached with the seed unsaved: what a caller
+        // would write is available, but nothing here has asked it to.
+        assert!(uri_to_write(&state).is_some(), "6c has nothing to confirm");
+    }
+
+    /// **A real QR code in front of a camera reaches 6c through the REAL
+    /// decoder.**
+    ///
+    /// Every other test in this block drives the wiring with a stub, which
+    /// says the plumbing is connected and nothing about whether a camera
+    /// frame is a shape `rqrr` can read. This one hands the capture loop
+    /// pixels rendered from `qr::tests::FIXTURE` -- the matrix generated
+    /// outside this repository by a crate that is not a dependency of this
+    /// app -- and lets [`crate::webcam::WebcamSeams::production`]'s own
+    /// decoder read them. The frame is synthetic; the decode is not.
+    ///
+    /// What it cannot say is that a real sensor produces a readable
+    /// picture. Nothing in this crate can say that, and no assertion here
+    /// pretends to.
+    #[test]
+    fn a_real_qr_code_in_front_of_the_camera_reaches_the_confirmation() {
+        fn fixture_pump(_: Device, decode: crate::webcam::DecodeFn, sink: Sink) {
+            let (rgba, width, height) = crate::qr::tests::fixture_rgba(4);
+            if let Some(frame) =
+                crate::webcam::Frame::new(width, height, Zeroizing::new(rgba))
+            {
+                // A cadence of zero so the very first frame is read: this
+                // producer has exactly one to give.
+                let mut cadence =
+                    crate::webcam::DecodeCadence::new(std::time::Duration::ZERO);
+                let now = std::time::Instant::now();
+                if !crate::webcam::offer(&sink, &mut cadence, decode, frame, now) {
+                    return;
+                }
+            }
+            sink.ended();
+        }
+
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        // Production seams but for the capture loop, so the decoder below
+        // is `qr::decode_qr` and not a stub.
+        open_webcam(&mut state, &seams(fixture_pump), Ok(one_camera()));
+        until("the fixture to decode", || {
+            advance_webcam(&mut state, std::time::Instant::now());
+            state.stage != Stage::Webcam
+        });
+
+        assert_eq!(state.stage, Stage::Manual, "a real code did not open 6c");
+        assert_eq!(
+            &*state.typed,
+            crate::qr::tests::FIXTURE_TEXT,
+            "the URI in the field is not the one the code carried"
+        );
+        assert!(state.webcam.is_none(), "the camera outlived the code it read");
+        // And 6c has something to confirm: the parameters survive the trip,
+        // which is what makes this an end-to-end assertion rather than a
+        // string comparison.
+        let Reading::Ok(auth) = read_field(&state.typed, state.digits, state.period) else {
+            panic!("the decoded URI does not read as a one-time code");
+        };
+        assert_eq!(auth.issuer.as_deref(), Some("Git Host"));
+        assert_eq!(auth.digits, 8);
+        assert_eq!(auth.period, 60);
+        // **And nothing was written.** 6c is a card the user has to press
+        // Save on, and a scanned code reaches it exactly as a typed one
+        // does.
+        assert!(uri_to_write(&state).is_some(), "6c has nothing to confirm");
+    }
+
+    /// **A camera that opens and never sends a picture is given up on**, with
+    /// the refusal that names what to check.
+    #[test]
+    fn a_camera_that_says_nothing_is_given_up_on_after_the_grace_period() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut state, &seams(silent_pump), Ok(one_camera()));
+        let start = std::time::Instant::now();
+
+        // Control first: it is NOT given up on immediately, or a camera that
+        // takes two seconds to wake would never be usable.
+        assert!(advance_webcam(&mut state, start).is_none());
+        assert_eq!(state.stage, Stage::Webcam, "a camera was refused before it had a chance");
+
+        assert!(advance_webcam(&mut state, start + crate::webcam::FIRST_FRAME_GRACE).is_none());
+        assert_eq!(state.stage, Stage::Picker, "a silent camera was waited on forever");
+        assert_eq!(state.refusal, Some(PickerRefusal::Camera(CameraRefusal::Silent)));
+        assert!(state.webcam.is_none(), "a silent camera was left open");
+    }
+
+    /// **Picking a camera out of the list opens that one**, and switching
+    /// closes the one before it.
+    #[test]
+    fn choosing_a_camera_opens_it_and_switching_closes_the_one_before() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut state, &seams(silent_pump), Ok(two_cameras()));
+
+        choose_camera(&mut state, &seams(silent_pump), 1);
+        let stage = state.webcam.as_ref().expect("a camera stage");
+        assert_eq!(stage.chosen, Some(1));
+        let first = stage.session.as_ref().expect("a capture loop");
+        assert!(!first.stopped(), "control: the camera it opened is already stopped");
+
+        choose_camera(&mut state, &seams(silent_pump), 0);
+        let stage = state.webcam.as_ref().expect("a camera stage");
+        assert_eq!(stage.chosen, Some(0));
+        assert!(stage.session.is_some());
+
+        // An index the list does not have changes nothing rather than
+        // refusing: only this file can pass one.
+        choose_camera(&mut state, &seams(silent_pump), 9);
+        assert_eq!(state.webcam.as_ref().and_then(|s| s.chosen), Some(0));
+    }
+
+    /// **Every way of leaving this stage closes the camera.**
+    ///
+    /// Driven through the four gestures rather than by calling
+    /// `state.webcam = None`, because what is under test is that each of them
+    /// reaches that line.
+    #[test]
+    fn every_way_out_of_the_camera_stage_releases_the_device() {
+        /// Whether the capture loop is still running, observed from the loop
+        /// itself: `Session::stopped` says what was ASKED for, and this says
+        /// what happened.
+        fn watched_pump(_: Device, _: crate::webcam::DecodeFn, sink: Sink) {
+            RUNNING.store(true, std::sync::atomic::Ordering::Release);
+            while sink.wanted() {
+                std::thread::yield_now();
+            }
+            RUNNING.store(false, std::sync::atomic::Ordering::Release);
+        }
+        static RUNNING: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        /// One test at a time may use the static above.
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        let _held = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let running = || RUNNING.load(std::sync::atomic::Ordering::Acquire);
+
+        for (what, leave) in [
+            ("the way back to the picker", (|s: &mut TotpAdd| s.back_to_picker()) as fn(&mut TotpAdd)),
+            ("a decode landing", |s: &mut TotpAdd| s.accept_decoded(Zeroizing::new(CAMERA_URI.to_string()))),
+        ] {
+            let mut state = TotpAdd::opening("id-1", "Git Host", false);
+            open_webcam(&mut state, &seams(watched_pump), Ok(one_camera()));
+            until("the capture loop to start", running);
+            leave(&mut state);
+            assert!(state.webcam.is_none(), "{what} left a camera stage behind");
+            until(&format!("the device to be released after {what}"), || !running());
+        }
+
+        // **And the modal simply going away**, which is how it ends on Save,
+        // on Cancel, on Escape, when the vault locks and when the window is
+        // destroyed: all five drop the `TotpAdd` that owns the device.
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut state, &seams(watched_pump), Ok(one_camera()));
+        until("the capture loop to start", running);
+        drop(state);
+        until("the device to be released when the form is dropped", || !running());
+    }
+
+    /// **The camera's refusals reach the user as sentences on the picker**,
+    /// each one different from the others and from every other refusal this
+    /// surface has.
+    #[test]
+    fn each_camera_refusal_renders_as_its_own_sentence_on_the_picker() {
+        let camera: Vec<String> = [
+            CameraRefusal::NoCamera,
+            CameraRefusal::Busy,
+            CameraRefusal::Denied,
+            CameraRefusal::Silent,
+            CameraRefusal::Lost,
+            CameraRefusal::Unavailable,
+        ]
+        .iter()
+        .map(|why| PickerRefusal::Camera(*why).sentence())
+        .collect();
+        let others = [
+            PickerRefusal::NoCode(CodeSource::Region).sentence(),
+            PickerRefusal::NoCode(CodeSource::Image).sentence(),
+            PickerRefusal::Capture(CaptureRefusal::Blocked).sentence(),
+            PickerRefusal::NotAnImage.sentence(),
+            PickerRefusal::Unreadable.sentence(),
+        ];
+        let all: Vec<&String> = camera.iter().chain(others.iter()).collect();
+        for (i, one) in all.iter().enumerate() {
+            assert!(!one.trim().is_empty(), "refusal {i} renders as nothing");
+            for (j, other) in all.iter().enumerate() {
+                assert!(i == j || one != other, "refusals {i} and {j} render the same sentence");
+            }
+        }
+        // Positively: the sentence is the camera module's own two clauses and
+        // not a paraphrase invented here.
+        assert_eq!(
+            PickerRefusal::Camera(CameraRefusal::Busy).sentence(),
+            format!("{}. {}", CameraRefusal::Busy.title(), CameraRefusal::Busy.detail())
+        );
+    }
+
+    /// **A refusal is painted on the picker the user comes back to.**
+    #[test]
+    fn the_picker_paints_a_camera_refusal_under_its_rows() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut state, &seams(silent_pump), Err(CameraRefusal::Denied));
+        let frame = Picker::new().idle(&mut state);
+        assert!(
+            frame.painted.has(&PickerRefusal::Camera(CameraRefusal::Denied).sentence()),
+            "the reason the camera did not open is not on screen: {:?}",
+            frame.painted.0
+        );
+    }
+
+    /// **A deferred row still says that it is deferred.**
+    ///
+    /// Nothing in [`ROUTES`] is disabled today -- see [`DEFERRED_REASON`] --
+    /// so this paints a synthetic one, which is what keeps the treatment from
+    /// becoming code nobody has run since the webcam row was lit.
+    #[test]
+    fn a_deferred_row_still_says_that_it_is_deferred() {
+        let dead = RouteRow {
+            route: Route::Webcam,
+            title: "Something later",
+            subtitle: "A route this app does not have yet",
+            enabled: false,
+        };
+        let painted = paint(|ui| {
+            ui.set_max_width(PICKER_WIDTH);
+            let _ = route_row(ui, &dead, 1);
+        });
+        assert!(painted.has(dead.title), "control: the row was not drawn at all");
+        assert!(painted.has(DEFERRED_REASON), "a dead row does not say it is deferred");
+
+        // The control the other way: a LIVE row does not carry the reason.
+        let live = RouteRow { enabled: true, ..dead };
+        let painted = paint(|ui| {
+            ui.set_max_width(PICKER_WIDTH);
+            let _ = route_row(ui, &live, 1);
+        });
+        assert!(painted.has(live.title));
+        assert!(!painted.has(DEFERRED_REASON), "a live row says it is deferred");
+    }
+
+    /// **The preview letterboxes rather than stretching.**
+    ///
+    /// A stretched QR code still looks like a QR code, which is why this is
+    /// arithmetic with a test rather than a value trusted to look right.
+    #[test]
+    fn the_preview_keeps_a_frames_shape() {
+        let into = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(400.0, 200.0));
+
+        // Wider than the box: it fills the width and is centred vertically.
+        let wide = preview_fit(into, (800, 200));
+        assert!((wide.width() - 400.0).abs() < 0.5, "{wide:?}");
+        assert!((wide.height() - 100.0).abs() < 0.5, "{wide:?}");
+        assert!((wide.center() - into.center()).length() < 0.5);
+
+        // Taller than the box: it fills the height instead.
+        let tall = preview_fit(into, (200, 800));
+        assert!((tall.height() - 200.0).abs() < 0.5, "{tall:?}");
+        assert!((tall.width() - 50.0).abs() < 0.5, "{tall:?}");
+
+        // A 4:3 camera on this box, which is the ordinary case.
+        let ordinary = preview_fit(into, (640, 480));
+        assert!(
+            (ordinary.width() / ordinary.height() - 640.0 / 480.0).abs() < 0.01,
+            "the aspect ratio was not kept: {ordinary:?}"
+        );
+        assert!(into.contains_rect(ordinary), "the picture spilled out of the preview");
+
+        // Nonsense in, the box out, rather than a division by zero.
+        assert_eq!(preview_fit(into, (0, 0)), into);
+    }
+
+    // -----------------------------------------------------------------
+    // The camera stage, on screen
+    // -----------------------------------------------------------------
+
+    /// Draws the camera stage once and hands back what it painted.
+    fn paint_webcam(state: &mut TotpAdd) -> Painted {
+        paint(|ui| {
+            ui.set_max_width(stage_width(Stage::Webcam));
+            let _ = draw_webcam(ui, state, None);
+        })
+    }
+
+    /// **The camera stage says what to do, what is happening, and what is
+    /// being done with the picture.**
+    #[test]
+    fn the_camera_stage_paints_its_instruction_its_state_and_its_privacy_line() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut state, &seams(silent_pump), Ok(one_camera()));
+        let painted = paint_webcam(&mut state);
+
+        assert!(painted.has(WEBCAM_HEADING), "the stage does not say what to do");
+        assert!(painted.has(ADDING_TO_LABEL) && painted.has("Git Host"), "{:?}", painted.0);
+        // No picture yet, so it says it is starting rather than showing a
+        // black rectangle and nothing else.
+        assert!(painted.has(WEBCAM_STARTING), "a camera with no picture yet says nothing");
+        assert!(!painted.has(WEBCAM_HINT), "it claims to be reading a picture it has not got");
+        assert!(painted.has(WEBCAM_PRIVACY_LINE), "the camera's privacy line is not on the card");
+        assert!(painted.has(OTHER_WAYS_LABEL), "there is no way back to the picker");
+        // One camera, so no offer to switch to another.
+        assert!(!painted.has(WEBCAM_ANOTHER_LABEL));
+    }
+
+    /// **Once a picture is arriving the line under it changes**, so "starting"
+    /// is a state and not a permanent caption.
+    #[test]
+    fn the_stage_stops_saying_it_is_starting_once_a_picture_arrives() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut state, &seams(one_frame_pump), Ok(one_camera()));
+        let mut frame = None;
+        until("a frame", || {
+            frame = advance_webcam(&mut state, std::time::Instant::now());
+            frame.is_some()
+        });
+        // The frame is handed to the draw call, which is what creates the
+        // texture the preview paints.
+        let painted = paint(|ui| {
+            ui.set_max_width(stage_width(Stage::Webcam));
+            let _ = draw_webcam(ui, &mut state, frame);
+        });
+        assert!(painted.has(WEBCAM_HINT), "a live preview still says it is starting");
+        assert!(!painted.has(WEBCAM_STARTING));
+        assert!(
+            state.webcam.as_ref().is_some_and(|s| s.showing()),
+            "no texture was made for the frame"
+        );
+    }
+
+    /// **With several cameras the stage is a list, and pressing one opens it.**
+    #[test]
+    fn several_cameras_are_offered_by_name_and_pressing_one_opens_it() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut state, &seams(silent_pump), Ok(two_cameras()));
+        let painted = paint_webcam(&mut state);
+
+        assert!(painted.has(WEBCAM_CHOOSE), "the list has no heading");
+        assert!(painted.has(WEBCAM_CHOOSE_HINT), "the list does not say nothing is switched on");
+        for camera in two_cameras() {
+            assert!(painted.has(&camera.name), "{} is not on the list", camera.name);
+        }
+        // The device path is NOT painted: it is a name for Windows, not prose.
+        assert!(
+            !painted.0.iter().any(|t| t.contains("usb#")),
+            "a device path was painted: {:?}",
+            painted.0
+        );
+        assert!(!painted.has(WEBCAM_HEADING), "it is aiming a camera nobody has chosen");
+    }
+
+    /// **Pressing a camera on the list reports which one**, and opens
+    /// nothing by itself.
+    ///
+    /// Driven through a real press rather than by calling
+    /// [`choose_camera`], which is the rule `PickerFrame`'s row rectangles
+    /// exist for: a list whose rows had stopped being clickable would pass
+    /// every assertion written the other way.
+    #[test]
+    fn pressing_a_camera_on_the_list_reports_that_camera_and_opens_nothing() {
+        let ctx = webcam_ctx();
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut state, &seams(silent_pump), Ok(two_cameras()));
+
+        // Two settled frames first, then one that presses: egui needs a
+        // frame in which the row existed before a click on it can land.
+        let at = webcam_text_at(&ctx, &mut state, &two_cameras()[1].name)
+            .expect("the second camera was not painted");
+        let mut action = TotpAddAction::None;
+        let _ = ctx.run_ui(webcam_input(click_at(at)), |ui| {
+            ui.set_max_width(stage_width(Stage::Webcam));
+            action = draw_webcam(ui, &mut state, None);
+        });
+        assert_eq!(action, TotpAddAction::UseCamera(1), "the press named the wrong camera");
+        // **Nothing was opened by the press itself**: the seam belongs to
+        // the caller, so a test can press this row with no camera on the
+        // machine at all -- which is the whole reason it is reported.
+        let stage = state.webcam.as_ref().expect("a camera stage");
+        assert_eq!(stage.chosen, None);
+        assert!(stage.session.is_none(), "the draw call opened a device");
+
+        // And what the caller does with it opens that one.
+        choose_camera(&mut state, &seams(silent_pump), 1);
+        assert_eq!(state.webcam.as_ref().and_then(|s| s.chosen), Some(1));
+    }
+
+    /// The camera stage's own headless context, warmed the way [`Picker`]
+    /// warms its own: two frames so the theme's fonts are in place.
+    fn webcam_ctx() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(webcam_input(Vec::new()), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(webcam_input(Vec::new()), |_ui| {});
+        ctx
+    }
+
+    fn webcam_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(560.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    /// Draws the camera stage twice on `ctx` and answers where `wanted` was
+    /// painted the second time.
+    ///
+    /// Twice because egui settles a surface over a frame, and the rectangle
+    /// read off the first one is the one a click would miss. `Painted`
+    /// cannot report a position, so this walks the frame's own text shapes.
+    fn webcam_text_at(
+        ctx: &egui::Context,
+        state: &mut TotpAdd,
+        wanted: &str,
+    ) -> Option<egui::Pos2> {
+        let mut at = None;
+        for _ in 0..2 {
+            let output = ctx.run_ui(webcam_input(Vec::new()), |ui| {
+                ui.set_max_width(stage_width(Stage::Webcam));
+                let _ = draw_webcam(ui, state, None);
+            });
+            at = None;
+            for clipped in &output.shapes {
+                find_text(&clipped.shape, wanted, &mut at);
+            }
+        }
+        at
+    }
+
+    /// **The way back to the picker closes the camera**, driven through the
+    /// link rather than by calling what the link calls.
+    #[test]
+    fn the_way_back_from_the_camera_closes_it() {
+        let ctx = webcam_ctx();
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        open_webcam(&mut state, &seams(silent_pump), Ok(one_camera()));
+
+        let at = webcam_text_at(&ctx, &mut state, OTHER_WAYS_LABEL)
+            .expect("the way back was not painted");
+        let _ = ctx.run_ui(webcam_input(click_at(at)), |ui| {
+            ui.set_max_width(stage_width(Stage::Webcam));
+            let _ = draw_webcam(ui, &mut state, None);
+        });
+        assert_eq!(state.stage, Stage::Picker, "the way back did not go back");
+        assert!(state.webcam.is_none(), "the way back left the camera open");
+    }
+
+    /// Where a piece of painted text ended up, for a test that has to press
+    /// something the surface does not report a rectangle for.
+    fn find_text(shape: &egui::Shape, wanted: &str, out: &mut Option<egui::Pos2>) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == wanted => {
+                *out = Some(text.pos + text.galley.size() / 2.0);
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    find_text(shape, wanted, out);
+                }
+            }
+            _ => {}
+        }
     }
 }

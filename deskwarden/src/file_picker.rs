@@ -45,13 +45,32 @@
 //! **[`pick_icon_image`] is a fourth on the same terms, and it differs from
 //! the third in exactly one thing that matters: the formats it offers.** Both
 //! answer "an image off disk", and the temptation is to call `pick_qr_image`
-//! and change the title. The reason not to is that the two are gated by two
-//! different decoders. The QR route hands its pixels to `rqrr` through a
-//! `png`-only path and says so in the dialog; the icon route hands its bytes
-//! to `favicon::decode_rgba`, which reads ICO as well and has to, because a
-//! `.ico` is what half the icons on a Windows disk are. A filter that hid
-//! them would be this dialog lying about what the app can read, which is the
-//! same defect as offering a format it cannot -- just pointing the other way.
+//! and change the title.
+//!
+//! The reason not to is that the two are gated by two different decoders, and
+//! **the shape of that difference has inverted.** It used to be that the QR
+//! route was the narrower of the two: it read PNG alone, through the `png`
+//! crate, while `favicon::decode_rgba` read ICO as well because a `.ico` is
+//! what half the icons on a Windows disk are. The owner's rule for the QR
+//! route is now that "all images should work", so
+//! `vault_window::totp_add::image_to_rgba` goes through the `image` crate and
+//! reads PNG, JPEG, GIF, BMP, WebP and ICO -- and the icon route, still on
+//! `favicon::decode_rgba`, is now the narrower one at PNG and ICO.
+//!
+//! So the two filters differ in the other direction than they used to, and
+//! the rule that produced both is untouched: **each dialog offers exactly
+//! what the decoder behind it can read.** A filter that offered more would
+//! hand the user a file and then a refusal; a filter that offered less would
+//! be this app hiding a format it can read. Those are the same defect
+//! pointing opposite ways, and one shared dialog would have to commit the one
+//! or the other. That is why there are two.
+//!
+//! It is worth being plain that this could be closed from the other end --
+//! `favicon.rs` could delegate to `image` too, now that it is in the tree as
+//! a direct dependency -- and that it deliberately is not. The reason is in
+//! `Cargo.toml`'s `png` entry and is about `favicon`'s ICO *directory walk*,
+//! which picks the entry closest above its display target, rather than about
+//! what a decode costs.
 //!
 //! # Blocking
 //!
@@ -143,30 +162,44 @@ unsafe fn show_dialog() -> Option<String> {
 // The QR image dialog
 // ---------------------------------------------------------------------------
 
-/// **The name of the one image format this app can read a QR out of.**
+/// **The formats a QR code can be read out of**, as the two halves of one
+/// filter row.
 ///
-/// Pinned as a constant because it is asserted about from two directions: the
-/// dialog's filter below, and `vault_window::totp_add`'s picker copy, which
-/// tells the user PNG-only *before* they open a dialog that would refuse a
-/// `.jpg`. A filter offering a format the decoder cannot read is a dialog that
-/// hands back a file and then a refusal.
-pub const IMAGE_EXTENSION: &str = "png";
+/// Pinned as constants because they are asserted about from two directions:
+/// the dialog's filter below, and `vault_window::totp_add::ROUTES`' picker
+/// copy, which tells the user what to bring *before* they open a dialog. A
+/// filter offering a format the decoder cannot read hands back a file and
+/// then a refusal; a filter hiding one it can read tells the user to go and
+/// convert a file that would have worked. Both are the same defect and these
+/// two strings are what keeps either from drifting into place.
+///
+/// **Six formats, and the list is `vault_window::totp_add::image_to_rgba`'s
+/// rather than this dialog's preference.** They are the `image` features
+/// named in `Cargo.toml`, which is where the decision about which untrusted
+/// file formats this app parses is actually made.
+pub const QR_FILTER_NAME: &str = "Image (*.png, *.jpg, *.jpeg, *.gif, *.bmp, *.webp, *.ico)";
+pub const QR_FILTER_SPEC: &str = "*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.ico";
 
 /// Opens the shell's file-open dialog for **design 6a's "Open an image file"**
 /// route and returns the chosen path, or `None` if the user cancelled or the
 /// dialog could not be created. Cancel and failure are the same answer, for
 /// [`pick_executable`]'s reason.
 ///
-/// # PNG only, and the filter says so
+/// # Every format the decoder reads, and the filter says so
 ///
-/// Design 6a's row reads *"PNG, JPG"*. This ships PNG. The decoder is handed a
-/// bare RGBA buffer and the only thing in this crate's tree that can produce
-/// one from a file is the `png` crate; JPEG would mean `jpeg-decoder` (or the
-/// `image` crate, which `rqrr`'s `default-features = false` deliberately keeps
-/// out -- see `Cargo.toml`). That is a new dependency parsing an untrusted file
-/// format, and it is not added silently here. So the filter is `*.png` alone:
-/// a dialog that let the user settle on a `.jpg` it cannot decode would turn a
-/// missing feature into a refusal the user reads as a bug.
+/// Design 6a's row reads *"PNG, JPG"* and this ships more: PNG, JPEG, GIF,
+/// BMP, WebP and ICO, per [`QR_FILTER_SPEC`]. That is the owner's rule for
+/// this route -- "all images should work" -- and it is reachable because
+/// `vault_window::totp_add::image_to_rgba` goes through the `image` crate
+/// rather than through `png` alone.
+///
+/// The filter is therefore neither wider nor narrower than the decoder. Wider
+/// would let the user settle on a file the app then refuses, which turns a
+/// missing format into a bug they saw happen; narrower would tell them to go
+/// and convert a screenshot that already worked. The shell will not stop them
+/// typing a name past the filter either way, and a file that gets through is
+/// refused by name -- so this row is about what the dialog *shows*, and
+/// `image_to_rgba` remains the thing that decides.
 ///
 /// # Blocking
 ///
@@ -189,10 +222,12 @@ unsafe fn show_image_dialog() -> Option<String> {
 
     // **One filter and no "All files" row.** The open dialog for a program
     // keeps one because this app cannot know what the user's program looks
-    // like; here it can -- see [`pick_qr_image`] on why that is PNG.
+    // like; here it can -- see [`pick_qr_image`], and [`QR_FILTER_NAME`] and
+    // [`QR_FILTER_SPEC`], which these two literals are held to by a test
+    // because `w!()` takes a literal and cannot be built from a constant.
     let filters = [COMDLG_FILTERSPEC {
-        pszName: w!("PNG image (*.png)"),
-        pszSpec: w!("*.png"),
+        pszName: w!("Image (*.png, *.jpg, *.jpeg, *.gif, *.bmp, *.webp, *.ico)"),
+        pszSpec: w!("*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.ico"),
     }];
     let _ = dialog.SetFileTypes(&filters);
     let _ = dialog.SetFileTypeIndex(1); // 1-based, not 0-based.
@@ -229,7 +264,7 @@ fn image_options(current: FILEOPENDIALOGOPTIONS) -> FILEOPENDIALOGOPTIONS {
 /// **The formats `favicon::decode_rgba` can turn into an icon**, as the two
 /// halves of one filter row.
 ///
-/// Pinned as a constant for [`IMAGE_EXTENSION`]'s reason: the dialog's filter
+/// Pinned as constants for [`QR_FILTER_NAME`]'s reason: the dialog's filter
 /// below and `vault_window::icon_modal`'s copy -- which tells the user what
 /// to bring *before* they open a dialog -- must say the same thing. A filter
 /// and a sentence that disagree is how a user is told to save a JPEG and then
@@ -239,9 +274,18 @@ fn image_options(current: FILEOPENDIALOGOPTIONS) -> FILEOPENDIALOGOPTIONS {
 /// doing rather than a preference.** `favicon::decode_rgba_unscaled`
 /// dispatches on the file's own magic and handles a Windows `.ico` container
 /// (PNG-payload and DIB alike) before it tries the PNG decoder; it has no
-/// JPEG arm at all, and giving it one means a new dependency parsing an
-/// untrusted format -- the same decision `pick_qr_image` records and declines
-/// one dialog up.
+/// JPEG arm at all.
+///
+/// **That used to be an argument about cost and no longer is, which is worth
+/// saying rather than leaving to be inferred.** `pick_qr_image` one dialog up
+/// once declined JPEG on the grounds that it meant a new dependency parsing
+/// an untrusted format; that dependency (`image`) is now in the tree as a
+/// direct one with `jpeg` on, so nothing about a JPEG arm here would cost a
+/// crate. What keeps `favicon` on its own decoder is the ICO *directory
+/// walk*, which picks the entry closest above its display target and breaks
+/// ties on colour depth because its resampler never upscales -- see
+/// `Cargo.toml`'s `png` entry. Until somebody does that work, this filter
+/// says what `favicon::decode_rgba` reads, which is these two.
 pub const ICON_FILTER_NAME: &str = "Icon image (*.png, *.ico)";
 pub const ICON_FILTER_SPEC: &str = "*.png;*.ico";
 
@@ -640,14 +684,16 @@ mod tests {
         );
     }
 
-    /// **The dialog offers exactly the format the decoder can read.**
+    /// **The dialog offers exactly the formats the decoder can read** --
+    /// neither more, which would hand the user a file and then a refusal, nor
+    /// fewer, which would send them off to convert a screenshot that already
+    /// worked.
     ///
-    /// Design 6a's row says "PNG, JPG"; this ships PNG, and the filter and
-    /// the picker's copy both have to say so from the same place. A `*.jpg`
-    /// row on a dialog whose decoder is `png` is how a missing feature
-    /// becomes a refusal the user reads as a bug.
+    /// Design 6a's row says "PNG, JPG"; the route now reads six formats, and
+    /// the filter, [`QR_FILTER_SPEC`] and `totp_add::ROUTES`' copy all have
+    /// to say the same six from the same place.
     #[test]
-    fn the_image_dialog_filters_to_the_one_format_this_app_decodes() {
+    fn the_image_dialog_filters_to_exactly_the_formats_this_app_decodes() {
         // The image dialog's own body, so the executable dialog's "All files"
         // row cannot satisfy or defeat anything below.
         let code = code_under_test();
@@ -659,26 +705,42 @@ mod tests {
             .next()
             .expect("its body ends")
             .to_string();
+        // `w!()` takes a literal, so the dialog cannot be built from the
+        // constants directly -- which leaves exactly the drift they exist to
+        // prevent. This is the pin that makes the two move together.
         assert!(
-            body.contains(r#"pszSpec: w!("*.png")"#),
-            "the image dialog does not filter to PNG at all"
+            body.contains(&format!(r#"pszName: w!("{QR_FILTER_NAME}")"#)),
+            "the image dialog's filter NAME is not {QR_FILTER_NAME:?}"
         );
-        // No *filter* offers anything else. The prose above may name JPEG --
-        // it has to, to say why the format is absent -- so this looks at the
-        // filter syntax and not at the word.
+        assert!(
+            body.contains(&format!(r#"pszSpec: w!("{QR_FILTER_SPEC}")"#)),
+            "the image dialog's filter SPEC is not {QR_FILTER_SPEC:?}"
+        );
+        // ONE row, still. The formats grew; the "no All files row" rule did
+        // not, because this app does know what it can decode.
         assert_eq!(
             body.matches("pszSpec:").count(),
             1,
-            "the image dialog offers more than one file type; the decoder reads one"
+            "the image dialog offers more than one file type; one row names them all"
         );
-        for spec in ["*.jpg", "*.jpeg", "*.JPG", "*.*"] {
+        // Every format `image_to_rgba` is given in `Cargo.toml` is offered,
+        // with JPEG under both of the two spellings a file on a real disk
+        // actually carries.
+        for spec in ["*.png", "*.jpg", "*.jpeg", "*.gif", "*.bmp", "*.webp", "*.ico"] {
             assert!(
-                !body.contains(spec),
-                "a filter offers {spec}, which nothing in this crate can decode into RGBA \
-                 for the QR reader"
+                QR_FILTER_SPEC.contains(spec),
+                "the QR filter hides {spec}, which the decoder reads"
             );
         }
-        assert_eq!(IMAGE_EXTENSION, "png");
+        // And nothing the decoder does NOT read. `image`'s default feature
+        // set would have turned these on; `Cargo.toml` names its formats one
+        // at a time so that it did not.
+        for absent in ["*.tif", "*.tiff", "*.tga", "*.dds", "*.exr", "*.hdr", "*.svg", "*.*"] {
+            assert!(
+                !QR_FILTER_SPEC.contains(absent),
+                "the QR filter offers {absent}, which `image_to_rgba` cannot decode"
+            );
+        }
         // Positive control on the negatives above: the split really did find
         // a body, and the executable dialog's "All files" row -- the thing
         // being ruled out here -- really is spelled the way it is searched

@@ -111,6 +111,15 @@ windows = { version = "0.58", features = [
     # No window is created for it: the registration goes on the hidden helper
     # window the tray icon already owns.
     "Win32_System_RemoteDesktop",
+    # Media Foundation, for reading a QR code off a webcam (src/webcam.rs):
+    # MFStartup/MFEnumDeviceSources/MFCreateDeviceSource and the source reader
+    # that hands back frames. It is the only capture API on Windows that
+    # enumerates cameras, converts their native NV12/MJPG output to RGB for
+    # us, and works on Windows 10 without a package identity -- DirectShow is
+    # deprecated and the WinRT MediaCapture classes want one. The device is
+    # opened on a thread of that module's own and released when the surface
+    # that owns it drops.
+    "Win32_Media_MediaFoundation",
     # SystemTimeToTzSpecificLocalTime, plus the FILETIME/SYSTEMTIME round trip
     # around it (src/local_time.rs). This crate carries no date library and
     # wants none: its own arithmetic covers the civil calendar, but "was
@@ -222,17 +231,26 @@ getrandom = "0.2"
 # sentence under `rqrr` below does NOT apply here**, and borrowing it would
 # have been a rationalisation rather than a reason.
 #
-# It was still refused, on three narrower grounds:
+# It was still refused, on three narrower grounds. **Two of the three have
+# since been overtaken by events** -- the QR image route made `image` a direct
+# dependency of this crate, with `ico` among its features -- and marking that
+# here, rather than leaving a stale argument standing, is the whole point of
+# having written it down:
 #
-#  * It would make this crate a DIRECT dependent of `image`, whose version is
-#    currently chosen entirely by `eframe`. A second constraint on a name this
-#    app does not otherwise talk to means an `eframe` bump that moves `image`
-#    forward either duplicates it in the tree or forces a coordinated edit
-#    here -- recurring cost, for a container format with no compression in it.
-#  * Cargo features are additive and unified, so `image/ico` would be on for
-#    `arboard` too: clipboard image data would start accepting ICO. That is a
-#    different untrusted-input path, widened to fix a favicon.
-#  * The part that actually needed writing is not the container. `favicon.rs`
+#  * SPENT. It would make this crate a DIRECT dependent of `image`, whose
+#    version is currently chosen entirely by `eframe`. A second constraint on
+#    a name this app does not otherwise talk to means an `eframe` bump that
+#    moves `image` forward either duplicates it in the tree or forces a
+#    coordinated edit here -- recurring cost, for a container format with no
+#    compression in it. That cost has since been paid for a caller worth it
+#    (JPEG, GIF and WebP are not container formats with no compression in
+#    them), so it is no longer a reason to refuse anything.
+#  * SPENT. Cargo features are additive and unified, so `image/ico` would be
+#    on for `arboard` too. `ico` is now on, for the QR route; what that
+#    concretely does to the clipboard is argued at the `image` entry below,
+#    and the answer is measured rather than assumed.
+#  * STANDS, and it was always the load-bearing one. The part that actually
+#    needed writing is not the container. `favicon.rs`
 #    picks the entry closest ABOVE its own display target and breaks ties on
 #    colour depth, because its resampler never upscales; a general-purpose
 #    decoder returns one image on its own rule, so the directory walk would
@@ -273,16 +291,68 @@ png = "0.17"
 # form, and a decoder that could not touch a file or a socket is a decoder
 # whose whole failure surface is a wrong answer.
 #
-# `default-features = false` is load-bearing, not tidiness. The default `img`
-# feature pulls in the `image` crate and its format decoders -- a large
-# transitive tree whose entire job is parsing untrusted file formats, and none
-# of which this app needs: `decode_qr` is handed a bare RGBA buffer, and the
-# one file format the image route will ever read is PNG, through the `png`
-# crate already above. Without it, this adds SEVEN crates: `rqrr` itself,
+# `default-features = false` is load-bearing, not tidiness, and the reason
+# survived `image` becoming a direct dependency below -- it just stopped being
+# the reason it was first written for. The default `img` feature would have
+# `rqrr` open and sniff files ITSELF, through an `image` whose format list is
+# then `rqrr`'s default rather than this crate's choice. `decode_qr` is handed
+# a bare RGBA buffer and nothing else, so the decision about which untrusted
+# file formats this app parses is made in exactly ONE place -- the `image`
+# entry below, which names them one at a time -- instead of in two places that
+# can drift. Without it, this adds SEVEN crates: `rqrr` itself,
 # `g2p`/`g2gen`/`g2poly` (its Galois-field arithmetic, for Reed-Solomon), and
 # `lru` + `hashbrown` + `allocator-api2`. `proc-macro2`, `quote`, `syn`,
 # `equivalent` and `foldhash` were already in the tree.
 rqrr = { version = "0.10", default-features = false }
+# Turns the file behind design 6a's "Open an image file" route into the RGBA
+# buffer `rqrr` above reads a QR code out of
+# (`src/vault_window/totp_add.rs::image_to_rgba`). The owner's rule for that
+# route is "all images should work"; a screenshot or a phone photo of a QR
+# code arrives as any of the formats named below, and a PNG-only reader was a
+# feature that refused the file the user actually had.
+#
+# **It is ALREADY in this tree** -- `cargo tree -i image` -- pulled by
+# `arboard` for `egui-winit`'s clipboard image data with `bmp` and `png` on,
+# and by `eframe` with `png`. Naming it here makes it DIRECT rather than
+# transitive, which is a real cost and is the one the `png` entry above
+# declined to pay for `favicon`'s ICO decoding: `image`'s version is otherwise
+# chosen entirely by `eframe`, so an `eframe` bump that moves `image` forward
+# now either duplicates it in the tree or forces a coordinated edit here. That
+# refusal was about a container format with no compression in it. This is
+# about JPEG, GIF and WebP, which nothing in this tree can otherwise read and
+# which no ninety-line hand-written parser is going to cover.
+#
+# `default-features = false` with six formats named one at a time, because the
+# default set is not six. It also turns on TIFF, DDS, TGA, HDR, OpenEXR, PNM,
+# QOI, farbfeld and AVIF -- nine more parsers of a file this app was pointed
+# at by a file dialog, and not one of them a format a screen capture or a
+# phone camera produces. `ico` is `["bmp", "png"]`, both of which are on
+# anyway, so it costs nothing and is here because a `.ico` on a Windows disk
+# is a real picture a user might point at.
+#
+# **Cargo features are additive and unified, so these formats are compiled
+# into `arboard`'s copy of `image` too, and the honest question is what that
+# does to the clipboard.** Measured rather than assumed: `arboard`'s Windows
+# path names `image::codecs::bmp::BmpDecoder` and
+# `image::codecs::png::PngDecoder` by type and never asks `image` to guess a
+# format, so what the clipboard will decode is exactly what it decoded before.
+# The widening is in what is LINKED, not in what is REACHABLE from that path.
+#
+# It adds THREE crates: `gif`, its `color_quant`, and `image-webp`. The JPEG
+# decoder (`zune-jpeg` + `zune-core`) was already in `Cargo.lock`, as were
+# `weezl`, `quick-error`, `byteorder-lite`, `bytemuck` and `moxcms` -- `image`
+# reaches the first four through its `tiff` feature, which `arboard` turns on
+# for macOS, so `Cargo.lock` already carried them for a platform this app does
+# not ship to. All three new crates are `MIT` or `MIT OR Apache-2.0`, already
+# on `deny.toml`'s allow-list; nothing was added to it to make this fit.
+image = { version = "0.25", default-features = false, features = [
+    "bmp",
+    "gif",
+    "ico",
+    "jpeg",
+    "png",
+    "webp",
+] }
 
 # ---- the direct-REST vault backend's cryptography (src/rest/crypto.rs) -----
 #
