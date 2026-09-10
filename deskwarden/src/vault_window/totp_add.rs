@@ -197,8 +197,16 @@ pub const DEFAULT_PERIOD: u16 = 30;
 // Design 6a -- the picker
 // ---------------------------------------------------------------------------
 
-/// 6a's heading over the four routes.
-pub const PICKER_HEADING: &str = "How to add it";
+/// **The title in design 6a's own header band**, verbatim from it.
+///
+/// Not [`HEADING`]'s "Add a TOTP", which is 6d's heading over the by-hand
+/// form, and not the "How to add it" this used to be. That phrase is the
+/// design document's CAPTION for the `id="6a"` panel: it sits in the
+/// badge-and-title row every panel in that file carries, outside the card and
+/// beside the blue "6a" chip, exactly as 6b's "Scanning" caption sits outside
+/// 6b's. Painting it inside the card gave the picker two headings where the
+/// design draws one.
+pub const PICKER_TITLE: &str = "Add a one-time code";
 
 /// The label over the item name at the top of the picker, verbatim from 6a.
 pub const ADDING_TO_LABEL: &str = "Adding to";
@@ -708,14 +716,51 @@ pub fn masked(secret: &str) -> String {
     out
 }
 
-/// The parameters row of the confirmation, spelled out.
+/// The parameters row of the confirmation, spelled out -- **as four separate
+/// chips**, which is how design 6c draws it: `TOTP`, `SHA1`, `6 digits`,
+/// `30 s`, each in its own monospace pill.
+///
+/// Four values rather than one sentence because that is what they are. A card
+/// that is 8 digits over 60 seconds under SHA-256 is exactly the case a
+/// confirmation screen exists to catch, and four pills make the odd one out
+/// findable at a glance in a way a single run of text separated by middots
+/// does not.
+pub fn parameter_chips(auth: &OtpAuth) -> [String; 4] {
+    [
+        "TOTP".to_string(),
+        auth.algorithm.canonical().to_string(),
+        format!("{} digits", auth.digits),
+        format!("{} s", auth.period),
+    ]
+}
+
+/// The same four values joined for anything that wants one string of them --
+/// a refusal, a log line, a test. **Built from [`parameter_chips`]** so the
+/// row the user reads and the sentence anything else prints cannot come to
+/// disagree about what the card said.
 pub fn parameters_line(auth: &OtpAuth) -> String {
-    format!(
-        "TOTP \u{b7} {} \u{b7} {} digits \u{b7} {} s",
-        auth.algorithm.canonical(),
-        auth.digits,
-        auth.period
-    )
+    parameter_chips(auth).join(" \u{b7} ")
+}
+
+/// The line above 6c's countdown track, verbatim from the design: *"refreshes
+/// in 22 s"*.
+pub fn refresh_line(seconds_left: u16) -> String {
+    format!("refreshes in {seconds_left} s")
+}
+
+/// How much of 6c's countdown track is still filled: the seconds left over the
+/// card's own period.
+///
+/// The design draws the track at `width: 73%` beside *"refreshes in 22 s"* on
+/// a 30-second card, and 22/30 is that number -- so the bar is the countdown
+/// rather than a decoration that happens to sit next to it.
+///
+/// A card claiming a zero period reads as empty rather than dividing by it.
+pub fn countdown_fraction(auth: &OtpAuth, unix_seconds: u64) -> f32 {
+    if auth.period == 0 {
+        return 0.0;
+    }
+    f32::from(seconds_left(auth, unix_seconds)) / f32::from(auth.period)
 }
 
 // ---------------------------------------------------------------------------
@@ -1329,26 +1374,347 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
 }
 
 // ---------------------------------------------------------------------------
-// Design 6a's surface
+// Design 6a's surface.
+//
+// **Every number in this section is read off `docs/design/Deskwarden.dc.html`'s
+// `id="6a"` panel**, and each constant names the CSS declaration it came from
+// so the next person to move one can check it against the same source rather
+// than against the last render.
+//
+// # Why this card is not `theme::modal_card`
+//
+// The shared modal frame is a three-band card: a header band filled with the
+// card's accent, a white body, and a footer band carrying a row of answers.
+// 6a is none of those. Its header is the card's own white with a hairline
+// under it, its title is 15px/800 rather than 14px/700 on colour, and its
+// footer is a tinted note with no buttons in it at all -- 6a's only way out
+// is the ✕ in the header. Forcing this surface through `modal_card` would
+// mean painting a coloured band the design does not draw and inventing two
+// answers it does not ask for, so the card is built here. What is NOT built
+// here is anything the design system already owns: the colours are `theme`'s,
+// the ✕ is `theme::close_glyph`, and the keycap is
+// `theme::paint_return_keycap`.
 // ---------------------------------------------------------------------------
 
-/// The height of one route row.
-const ROW_HEIGHT: f32 = 46.0;
+/// The card's width. `#6a` is `width: 470px` and the card is its only child,
+/// so the card is 470 wide.
+const PICKER_WIDTH: f32 = 470.0;
 
-/// The height of the deferred row, which carries two lines rather than one.
+/// `border-radius: 12px` and `border: 1px solid #d7d3d3`
+/// ([`theme::BORDER_STRONG`]) on the card itself.
+const CARD_RADIUS: u8 = 12;
+const CARD_STROKE: f32 = 1.0;
+
+/// How far a band is painted PROUD of the rect it was allocated, so that none
+/// of the card's own fill is left showing between the band and the border.
 ///
-/// Measured against the rendered surface rather than guessed: at
-/// [`MODAL_WIDTH`] [`WEBCAM_DETAIL`] wraps to two lines, and a row sized for
-/// one puts the second on top of whatever is under it. `ui_preview`'s
-/// `totp_add_picker` shot is what this was corrected from.
-const DEAD_ROW_HEIGHT: f32 = 62.0;
+/// `theme::MODAL_BAND_BLEED`'s measurement, restated rather than imported
+/// because it is the same 1pt stroke arrived at from the same geometry: an
+/// `egui::Frame` strokes down the middle of its rect, so a band laid out
+/// inside the frame stops half a point short of the border's inner edge and
+/// leaves a hairline of card showing all the way round. That was reported
+/// twice on the delete modal; it is the same shape here.
+const BAND_BLEED: f32 = CARD_STROKE;
 
-/// How tall `row` is drawn.
-fn row_height(row: &RouteRow) -> f32 {
-    if row.enabled {
-        ROW_HEIGHT
-    } else {
-        DEAD_ROW_HEIGHT
+/// `box-shadow: 0 14px 34px rgba(45, 43, 43, 0.18)`.
+///
+/// Deeper than `theme`'s shared `MODAL_SHADOW` (`0 6px 20px` at the same
+/// colour) because 6a's own declaration is deeper -- this card is taller than
+/// the two-answer modals and the design lifts it further off the scrim to
+/// match. The alpha is 0.18 x 255, rounded.
+const CARD_SHADOW: egui::Shadow = egui::Shadow {
+    offset: [0, 14],
+    blur: 34,
+    spread: 0,
+    color: egui::Color32::from_rgba_unmultiplied_const(45, 43, 43, 46),
+};
+
+/// Every rule on this card: `1px solid #eae7e7` ([`theme::HAIRLINE`]), under
+/// the header band and over the footer's.
+const RULE: f32 = 1.0;
+
+/// The header band: `padding: 15px 18px`, `gap: 10px`, a 17px mark stroked at
+/// 2.2, and a 15px title at `font-weight: 800; letter-spacing: -0.01em`.
+const HEADER_PAD_X: f32 = 18.0;
+const HEADER_PAD_Y: f32 = 15.0;
+const HEADER_GAP: f32 = 10.0;
+const HEADER_GLYPH: f32 = 17.0;
+const HEADER_GLYPH_STROKE: f32 = 2.2;
+const HEADER_TITLE_PX: f32 = 15.0;
+const HEADER_TITLE_TRACKING_EM: f32 = -0.01;
+
+/// **The design's boxes are content-box**, so a declared size is the size
+/// INSIDE the border and every border adds to what is on screen.
+///
+/// Measured rather than assumed: `#6a`'s tile declares `width: 34px` with a
+/// `1px` border and its rectangle on screen is 36 x 36; a row declares
+/// `padding: 12px 13px` with a `1px` border and comes out 62 tall against a
+/// 36px tile. Reading those declarations as border-box -- which is what an
+/// `egui` rect naturally is -- shrinks every one of them by two points and
+/// pulls the whole card 10px short. So each band, row and tile below adds its
+/// own border back.
+const HEADER_HEIGHT: f32 = HEADER_PAD_Y * 2.0 + HEADER_GLYPH + RULE;
+
+/// The tile's rectangle on screen: `width: 34px` plus its `1px` border on
+/// each side. See [`HEADER_HEIGHT`] for why the border is added.
+const TILE_OUTER: f32 = TILE_SIZE + TILE_STROKE * 2.0;
+
+/// The body: `padding: 12px 14px 14px` with `gap: 7px` down its column.
+const BODY_PAD_X: i8 = 14;
+const BODY_PAD_TOP: i8 = 12;
+const BODY_PAD_BOTTOM: i8 = 14;
+const BODY_GAP: f32 = 7.0;
+
+/// The "Adding to" block: `padding: 4px 4px 8px`, `gap: 2px`, a 12px label in
+/// [`theme::TEXT_FAINT`] over a 13px `font-weight: 700` name.
+const SUBJECT_PAD: i8 = 4;
+const SUBJECT_PAD_BOTTOM: i8 = 8;
+const SUBJECT_GAP: f32 = 2.0;
+const SUBJECT_LABEL_PX: f32 = 12.0;
+const SUBJECT_NAME_PX: f32 = 13.0;
+
+/// One route row: `padding: 12px 13px`, `gap: 12px` between its three
+/// children, `border-radius: 10px`, `border: 1px`.
+const ROW_PAD_X: f32 = 13.0;
+const ROW_PAD_Y: f32 = 12.0;
+const ROW_GAP: f32 = 12.0;
+const ROW_RADIUS: u8 = 10;
+const ROW_STROKE: f32 = 1.0;
+
+/// The icon tile at a row's left: `width/height: 34px`, `border-radius: 8px`,
+/// `border: 1px`, holding a 17px mark stroked at 2.
+const TILE_SIZE: f32 = 34.0;
+const TILE_RADIUS: u8 = 8;
+const TILE_STROKE: f32 = 1.0;
+const TILE_GLYPH: f32 = 17.0;
+const TILE_GLYPH_STROKE: f32 = 2.0;
+
+/// A row's two lines: a 13px title, `gap: 2px`, and a 12px subtitle set at
+/// `line-height: 1.45`.
+const ROW_TITLE_PX: f32 = 13.0;
+const ROW_TEXT_GAP: f32 = 2.0;
+const ROW_SUB_PX: f32 = 12.0;
+const ROW_SUB_LINE: f32 = 1.45;
+
+/// **Which row wears 6a's selected treatment**: the first, which is the one
+/// the design draws in blue and hangs the ↵ keycap off.
+///
+/// A constant and not a field on [`TotpAdd`], because nothing moves it. 6a's
+/// blue row is the DEFAULT route -- "ordered by how often they're the right
+/// one on Windows", and this is the one that is -- rather than a cursor the
+/// user drives; there is no key on this surface that moves a selection, and a
+/// highlight that cannot move is a recommendation.
+const DEFAULT_ROW: usize = 0;
+
+/// The gap between a dead row's title and the reason beside it.
+///
+/// The design has no such element -- 6a draws all four routes live. See
+/// [`WEBCAM_REASON`] for why this app draws one of them off and says so, and
+/// [`route_row`] for the inks it says it in.
+const REASON_GAP: f32 = 6.0;
+
+/// The footer: `padding: 12px 18px`, `background: #fbfaf9`
+/// ([`theme::CARD_TINT`]), `gap: 9px`, a 15px mark stroked at 2.2 and pushed
+/// down by its own `margin-top: 1px`, and 12px copy at `line-height: 1.5`.
+const FOOTER_PAD_X: f32 = 18.0;
+const FOOTER_PAD_Y: f32 = 12.0;
+const FOOTER_GAP: f32 = 9.0;
+const FOOTER_GLYPH: f32 = 15.0;
+const FOOTER_GLYPH_STROKE: f32 = 2.2;
+const FOOTER_GLYPH_DROP: f32 = 1.0;
+const FOOTER_TEXT_PX: f32 = 12.0;
+const FOOTER_LINE: f32 = 1.5;
+
+// ---------------------------------------------------------------------------
+// 6a's four marks, in the design's own coordinates.
+// ---------------------------------------------------------------------------
+
+/// The side of the `viewBox="0 0 24 24"` every mark on this card is drawn in.
+const VIEWBOX: f32 = 24.0;
+
+/// One piece of one of 6a's marks, in [`VIEWBOX`] coordinates.
+///
+/// **Deliberately not `theme::MarkShape`.** That family exists so that
+/// `win32_draw` can stroke the same geometry with GDI for the bare-Win32
+/// account picker, and it carries the cost of being renderer-agnostic. Every
+/// mark here is drawn once, by egui, on one modal, so this is the smaller
+/// thing: the three primitives the design's own SVG uses on this panel, and
+/// no indirection.
+enum Svg {
+    /// A polyline through the listed viewBox points, stroked and not closed.
+    Line(&'static [(f32, f32)]),
+    /// A stroked rectangle: `x, y, width, height, corner radius`, which is
+    /// SVG's `<rect>` with its `rx` spelled out.
+    Rect(f32, f32, f32, f32, f32),
+    /// A stroked circle: `cx, cy, r`.
+    Circle(f32, f32, f32),
+    /// A filled dot: `cx, cy, r`. What the design writes as `M12 8h.01` --
+    /// a zero-length segment, which is a dot under the round line cap those
+    /// icon sets are drawn with and nothing at all under SVG's default butt
+    /// cap. egui's strokes have no caps at all, so the intent is painted
+    /// directly rather than hoping a hairline shows.
+    Dot(f32, f32, f32),
+}
+
+// The design writes its rounded corners as arcs (`a2 2 0 0 1 2-2`, and the
+// image mark's tighter `a1 1 0 0 1 1-1`). Every one of them is written out
+// below as its endpoints plus three intermediate samples at 22.5-degree
+// steps, in [`VIEWBOX`] units, rather than sampled at draw time: these paths
+// are constants, and a quarter-arc this small cut to fewer than three steps
+// reads as a mitre at 17px.
+
+/// The header's mark: a QR code's three finder squares and its quiet corner
+/// -- `<rect x=3 y=3 w=7 h=7>` at (3,3), (14,3) and (3,14), then
+/// `M14 14h3v3h-3z`, `M20 14v3` and `M17 20h4`.
+const QR_MARK: &[Svg] = &[
+    Svg::Rect(3.0, 3.0, 7.0, 7.0, 0.0),
+    Svg::Rect(14.0, 3.0, 7.0, 7.0, 0.0),
+    Svg::Rect(3.0, 14.0, 7.0, 7.0, 0.0),
+    Svg::Rect(14.0, 14.0, 3.0, 3.0, 0.0),
+    Svg::Line(&[(20.0, 14.0), (20.0, 17.0)]),
+    Svg::Line(&[(17.0, 20.0), (21.0, 20.0)]),
+];
+
+/// The region-scan mark: four corner brackets, `M3 8V5a2 2 0 0 1 2-2h3` and
+/// its three rotations.
+const REGION_MARK: &[Svg] = &[
+    Svg::Line(&[(3.0, 8.0), (3.0, 5.0), (3.152, 4.235), (3.586, 3.586), (4.235, 3.152), (5.0, 3.0), (8.0, 3.0)]),
+    Svg::Line(&[(16.0, 3.0), (19.0, 3.0), (19.765, 3.152), (20.414, 3.586), (20.848, 4.235), (21.0, 5.0), (21.0, 8.0)]),
+    Svg::Line(&[(21.0, 16.0), (21.0, 19.0), (20.848, 19.765), (20.414, 20.414), (19.765, 20.848), (19.0, 21.0), (16.0, 21.0)]),
+    Svg::Line(&[(8.0, 21.0), (5.0, 21.0), (4.235, 20.848), (3.586, 20.414), (3.152, 19.765), (3.0, 19.0), (3.0, 16.0)]),
+];
+
+/// The image-file mark: a framed picture with a dog-eared sheet behind it --
+/// `M4 7V5a1 1 0 0 1 1-1h2`, `<rect x=3 y=9 w=18 h=12 rx=2>`, and
+/// `M12 3h7a2 2 0 0 1 2 2v2`.
+const IMAGE_MARK: &[Svg] = &[
+    Svg::Line(&[(4.0, 7.0), (4.0, 5.0), (4.293, 4.293), (5.0, 4.0), (7.0, 4.0)]),
+    Svg::Rect(3.0, 9.0, 18.0, 12.0, 2.0),
+    Svg::Line(&[(12.0, 3.0), (19.0, 3.0), (19.765, 3.152), (20.414, 3.586), (20.848, 4.235), (21.0, 5.0), (21.0, 7.0)]),
+];
+
+/// The by-hand mark: three ruled lines inside a card -- `M7 8h10`,
+/// `M7 12h10`, `M7 16h6` and `<rect x=3 y=4 w=18 h=16 rx=2>`.
+const BY_HAND_MARK: &[Svg] = &[
+    Svg::Line(&[(7.0, 8.0), (17.0, 8.0)]),
+    Svg::Line(&[(7.0, 12.0), (17.0, 12.0)]),
+    Svg::Line(&[(7.0, 16.0), (13.0, 16.0)]),
+    Svg::Rect(3.0, 4.0, 18.0, 16.0, 2.0),
+];
+
+/// The webcam mark: a camera body and its lens flare --
+/// `M15 10l4.5-2.6v9.2L15 14` and `<rect x=3 y=6 w=12 h=12 rx=2>`.
+const WEBCAM_MARK: &[Svg] = &[
+    Svg::Line(&[(15.0, 10.0), (19.5, 7.4), (19.5, 16.6), (15.0, 14.0)]),
+    Svg::Rect(3.0, 6.0, 12.0, 12.0, 2.0),
+];
+
+/// The footer's mark: a circled `i` -- `<circle cx=12 cy=12 r=9>`,
+/// `M12 8h.01` and `M11 12h1v5h1`.
+const INFO_MARK: &[Svg] = &[
+    Svg::Circle(12.0, 12.0, 9.0),
+    Svg::Dot(12.0, 8.0, 1.1),
+    Svg::Line(&[(11.0, 12.0), (12.0, 12.0), (12.0, 17.0), (13.0, 17.0)]),
+];
+
+/// Which mark a route wears, in 6a's own order.
+fn mark_for(route: Route) -> &'static [Svg] {
+    match route {
+        Route::ScanRegion => REGION_MARK,
+        Route::ImageFile => IMAGE_MARK,
+        Route::ByHand => BY_HAND_MARK,
+        Route::Webcam => WEBCAM_MARK,
+    }
+}
+
+/// Strokes one mark into `at`, scaling [`VIEWBOX`] coordinates onto that box
+/// and the design's `stroke-width` along with them -- a 2.2 stroke on a 24
+/// box drawn at 17px is 1.56px on screen, which is what the browser paints
+/// and what a hardcoded 2.2 would not be.
+fn paint_svg(
+    painter: &egui::Painter,
+    at: egui::Rect,
+    parts: &[Svg],
+    stroke_units: f32,
+    colour: egui::Color32,
+) {
+    let scale = at.width() / VIEWBOX;
+    let stroke = egui::Stroke::new(stroke_units * scale, colour);
+    let point = |x: f32, y: f32| egui::pos2(at.min.x + x * scale, at.min.y + y * scale);
+    for part in parts {
+        match part {
+            Svg::Line(points) => {
+                let points: Vec<egui::Pos2> =
+                    points.iter().map(|(x, y)| point(*x, *y)).collect();
+                painter.add(egui::Shape::line(points, stroke));
+            }
+            Svg::Rect(x, y, w, h, r) => {
+                painter.rect_stroke(
+                    egui::Rect::from_min_size(point(*x, *y), egui::vec2(w * scale, h * scale)),
+                    CornerRadius::same((r * scale).round() as u8),
+                    stroke,
+                    egui::StrokeKind::Middle,
+                );
+            }
+            Svg::Circle(cx, cy, r) => {
+                painter.circle_stroke(point(*cx, *cy), r * scale, stroke);
+            }
+            Svg::Dot(cx, cy, r) => {
+                painter.circle_filled(point(*cx, *cy), r * scale, colour);
+            }
+        }
+    }
+}
+
+/// One run of text, laid out to a known width so the surface can be measured
+/// before it is allocated.
+///
+/// 6a sizes three of its boxes from their contents -- a row is as tall as its
+/// two lines, the footer as tall as its wrapped sentence -- so every galley
+/// on this card is laid out first and painted second.
+fn lay_out(
+    ui: &egui::Ui,
+    text: &str,
+    wrap_width: f32,
+    format: egui::TextFormat,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap_width;
+    job.append(text, 0.0, format);
+    ui.painter().layout_job(job)
+}
+
+/// A [`lay_out`] format in one of the app's named Archivo faces -- the 600,
+/// 700 and 800 weights 6a asks for.
+fn face(size: f32, family: &str, colour: egui::Color32) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id: egui::FontId::new(size, egui::FontFamily::Name(family.into())),
+        color: colour,
+        ..Default::default()
+    }
+}
+
+/// [`face`] at the body weight, which is [`egui::FontFamily::Proportional`]
+/// and NOT [`theme::REGULAR`] by name: `theme::apply` binds Archivo Regular
+/// as the proportional family itself and registers no named family for it, so
+/// `Name("Archivo-Regular")` resolves to nothing and epaint panics on the
+/// first galley. `theme::regular` says the same thing from the other side.
+fn body_face(size: f32, colour: egui::Color32) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id: egui::FontId::new(size, egui::FontFamily::Proportional),
+        color: colour,
+        ..Default::default()
+    }
+}
+
+/// A [`lay_out`] format in the monospace face 6a sets its right-hand
+/// affordances in (`font-family: ui-monospace...; font-size: 10px`, which is
+/// [`theme::CHIP_TEXT_PX`] -- the same size `theme::kbd_chip` renders).
+fn mono_face(colour: egui::Color32) -> egui::TextFormat {
+    egui::TextFormat {
+        font_id: egui::FontId::new(theme::CHIP_TEXT_PX, egui::FontFamily::Monospace),
+        color: colour,
+        ..Default::default()
     }
 }
 
@@ -1364,6 +1730,11 @@ pub struct PickerFrame {
     /// Every row drawn this frame, with where it was drawn. In [`ROUTES`]'
     /// order.
     pub rows: Vec<(Route, egui::Rect)>,
+    /// Where the header's ✕ was drawn, for the rows' reason exactly: it is
+    /// 6a's only way out of this card, and a test that closes the picker by
+    /// calling the thing the ✕ calls would not notice a ✕ that had stopped
+    /// being reachable.
+    pub close: egui::Rect,
 }
 
 /// What pressing a route means. A pure function so the routing is a thing a
@@ -1381,106 +1752,457 @@ pub fn action_for(route: Route) -> TotpAddAction {
     }
 }
 
-/// One route row: a title, a line under it, and a hit area.
-fn route_row(ui: &mut egui::Ui, row: &RouteRow) -> (egui::Response, egui::Rect) {
+/// **One route row of design 6a**: an icon tile, two lines of type, and the
+/// affordance at the right that says how the row is reached.
+///
+/// # The row measures itself
+///
+/// 6a's row is `align-items: center` around `padding: 12px 13px` inside a
+/// `1px` border, so its height is those plus whichever of its children is
+/// taller -- the tile's 36px rectangle, or the title and subtitle stacked
+/// with 2px between them. On the design's own copy the tile wins and the row
+/// comes out at 62; that is why the height is computed rather than pinned to
+/// a number, and it is also what makes the deferred row work.
+/// [`WEBCAM_DETAIL`] is longer than anything 6a puts on a fourth row and
+/// wraps to two lines, and the pair of hardcoded heights this replaced (46
+/// for a live row, 62 for the dead one) were two guesses that had already
+/// been corrected once against a render.
+///
+/// # The selected treatment
+///
+/// [`DEFAULT_ROW`] takes 6a's blue row exactly: `background: #eef2fc` inside
+/// `border: 1px solid #1b3fa0`, a white tile edged `#b8c7ea` with a `#1b3fa0`
+/// mark in it, a title at `font-weight: 700; color: #14307a`, a subtitle in
+/// `#444141`, and the ↵ keycap. Every other row is `border: 1px solid #eae7e7`
+/// with no fill, a `#f7f6f5` tile edged `#eae7e7` with a `#605d5d` mark, a
+/// title at `font-weight: 600`, a subtitle in `#7d7979`, and its ordinal set
+/// in 10px monospace in `#9b9797`.
+///
+/// **The ordinals are not key bindings and are not drawn as keycaps.** 6a
+/// sets them as bare monospace text where it sets the ↵ in a filled chip, and
+/// the difference is real: `Key::Num2` is the key that OPENS this modal
+/// (`vault_window::ADD_TOTP_KEY`, held to being bound exactly once anywhere
+/// in this crate by `the_add_code_chord_is_a_key_no_other_binding_takes`), so
+/// a picker that also answered a bare 2 would be advertising the digit that
+/// got the user here as the digit that leaves by another door.
+fn route_row(ui: &mut egui::Ui, row: &RouteRow, index: usize) -> (egui::Response, egui::Rect) {
     let width = ui.available_width();
+    let selected = index == DEFAULT_ROW;
+
+    // The affordance is laid out FIRST because 6a's text column is `flex: 1`:
+    // how much room the two lines get is what is left after the tile, the two
+    // 12px gaps and whatever sits at the right. The keycap is the same
+    // monospace character in a box with the design's `padding: 3px 7px`
+    // either side of it, so one galley measures both.
+    let ordinal = lay_out(
+        ui,
+        &(index + 1).to_string(),
+        f32::INFINITY,
+        mono_face(theme::TEXT_GHOST),
+    );
+    let affordance = if selected {
+        ordinal.size().x + theme::RETURN_KEYCAP_PAD_X * 2.0
+    } else {
+        ordinal.size().x
+    };
+
+    let (title_ink, sub_ink, mark_ink) = if !row.enabled {
+        // A dead row is drawn in the ghost ink rather than hidden: the fact
+        // that this route exists and is off is the whole content of the row.
+        (theme::TEXT_GHOST, theme::TEXT_GHOST, theme::TEXT_GHOST)
+    } else if selected {
+        (theme::BLUE_DEEP, theme::TEXT_SECONDARY, theme::BLUE)
+    } else {
+        (theme::INK, theme::TEXT_FAINT, theme::TEXT_MUTED)
+    };
+
+    // What is left for the `flex: 1` column once the border, the two 13px
+    // paddings, the tile and the two 12px gaps have taken theirs.
+    let text_width = (width
+        - ROW_STROKE * 2.0
+        - ROW_PAD_X * 2.0
+        - TILE_OUTER
+        - ROW_GAP * 2.0
+        - affordance)
+        .max(1.0);
+    // The deferred row's reason shares the title's line, so the title wraps
+    // against what is left of it.
+    let reason = (!row.enabled).then(|| {
+        lay_out(ui, WEBCAM_REASON, text_width, body_face(ROW_SUB_PX, sub_ink))
+    });
+    let reason_width = reason.as_ref().map_or(0.0, |g| g.size().x + REASON_GAP);
+    let title = lay_out(
+        ui,
+        row.title,
+        text_width - reason_width,
+        face(
+            ROW_TITLE_PX,
+            if selected { theme::BOLD } else { theme::SEMIBOLD },
+            title_ink,
+        ),
+    );
+    let subtitle = lay_out(
+        ui,
+        row.subtitle,
+        text_width,
+        egui::TextFormat {
+            line_height: Some(ROW_SUB_PX * ROW_SUB_LINE),
+            ..body_face(ROW_SUB_PX, sub_ink)
+        },
+    );
+    let text_height = title.size().y + ROW_TEXT_GAP + subtitle.size().y;
+
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(width, row_height(row)),
+        egui::vec2(
+            width,
+            ROW_STROKE * 2.0 + ROW_PAD_Y * 2.0 + text_height.max(TILE_OUTER),
+        ),
         if row.enabled { egui::Sense::click() } else { egui::Sense::hover() },
     );
-    let painter = ui.painter();
-    if row.enabled && response.hovered() {
-        painter.rect_filled(rect, CornerRadius::same(6), theme::BLUE_WASH);
+
+    // 6a draws no hover state at all -- it is one still frame -- so the fill
+    // a hovered row takes is this app's own, and it is [`theme::CARD_TINT`]
+    // rather than the [`theme::BLUE_WASH`] it used to be. The wash is now the
+    // SELECTED row's own fill, and a hovered row wearing it would be a second
+    // row claiming to be the default one.
+    let (fill, edge) = if selected {
+        (theme::BLUE_WASH, theme::BLUE)
+    } else if row.enabled && response.hovered() {
+        (theme::CARD_TINT, theme::HAIRLINE)
     } else {
-        painter.rect_filled(rect, CornerRadius::same(6), theme::CARD_TINT);
-    }
-    // A dead row is drawn in the muted inks rather than hidden: the fact that
-    // this route exists and is off is the whole content of the row.
-    let (title_ink, sub_ink) = if row.enabled {
-        (theme::INK, theme::TEXT_MUTED)
-    } else {
-        (theme::TEXT_GHOST, theme::TEXT_GHOST)
+        (theme::CARD, theme::HAIRLINE)
     };
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(ROW_RADIUS), fill);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(ROW_RADIUS),
+        egui::Stroke::new(ROW_STROKE, edge),
+        egui::StrokeKind::Inside,
+    );
+
+    let tile = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.left() + ROW_STROKE + ROW_PAD_X,
+            rect.center().y - TILE_OUTER / 2.0,
+        ),
+        egui::Vec2::splat(TILE_OUTER),
+    );
+    painter.rect_filled(
+        tile,
+        CornerRadius::same(TILE_RADIUS),
+        if selected { theme::CARD } else { theme::WINDOW_BG },
+    );
+    painter.rect_stroke(
+        tile,
+        CornerRadius::same(TILE_RADIUS),
+        egui::Stroke::new(TILE_STROKE, if selected { theme::BLUE_EDGE } else { theme::HAIRLINE }),
+        egui::StrokeKind::Inside,
+    );
+    paint_svg(
+        painter,
+        egui::Rect::from_center_size(tile.center(), egui::Vec2::splat(TILE_GLYPH)),
+        mark_for(row.route),
+        TILE_GLYPH_STROKE,
+        mark_ink,
+    );
+
+    let text_left = tile.right() + ROW_GAP;
+    let text_top = rect.center().y - text_height / 2.0;
+    painter.galley(egui::pos2(text_left, text_top), title.clone(), title_ink);
+    if let Some(reason) = reason {
+        // Centred on the title's own line rather than sharing its top edge:
+        // it is a point smaller, and a shared top would hang it high.
+        let reason_y = text_top + (title.size().y - reason.size().y) / 2.0;
+        painter.galley(
+            egui::pos2(text_left + title.size().x + REASON_GAP, reason_y),
+            reason,
+            sub_ink,
+        );
+    }
+    painter.galley(
+        egui::pos2(text_left, text_top + title.size().y + ROW_TEXT_GAP),
+        subtitle,
+        sub_ink,
+    );
+
+    let affordance_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.right() - ROW_STROKE - ROW_PAD_X - affordance,
+            rect.center().y - theme::CHIP_HEIGHT / 2.0,
+        ),
+        egui::vec2(affordance, theme::CHIP_HEIGHT),
+    );
+    if selected {
+        theme::paint_return_keycap(painter, affordance_rect);
+    } else {
+        painter.galley(
+            egui::pos2(
+                affordance_rect.left(),
+                affordance_rect.center().y - ordinal.size().y / 2.0,
+            ),
+            ordinal,
+            theme::TEXT_GHOST,
+        );
+    }
+
+    let response = if row.enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    };
+    (response, rect)
+}
+
+/// 6a's card: white, `border-radius: 12px`, a [`theme::BORDER_STRONG`] hairline
+/// round it, and the shadow that lifts it off the scrim.
+///
+/// The border is stroked twice, on the `Frame` and again over everything, for
+/// `theme::modal_card`'s measured reason: the `Frame`'s own stroke is what
+/// the bands are laid out against, and the footer's tint is painted out over
+/// it so that no sliver of white card shows in the lower corners. Dropping
+/// the first would shrink the layout rect; dropping the second would put the
+/// white line back along the bottom curve.
+fn picker_card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let border = egui::Stroke::new(CARD_STROKE, theme::BORDER_STRONG);
+    let framed = egui::Frame::new()
+        .fill(theme::CARD)
+        .corner_radius(CornerRadius::same(CARD_RADIUS))
+        .stroke(border)
+        .shadow(CARD_SHADOW)
+        .show(ui, |ui| {
+            // The width INSIDE the border, which is what the design's boxes
+            // are measured in: 470 outside, 468 of content, and a body inset
+            // 14 either side of that gives 6a's own 440-wide rows.
+            ui.set_width(PICKER_WIDTH - CARD_STROKE * 2.0);
+            // The three bands butt against each other, so the card's own
+            // stack gets no item spacing at all; the body puts its own 7px
+            // back inside itself.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            add(ui)
+        });
+    ui.painter().rect_stroke(
+        framed.response.rect,
+        CornerRadius::same(CARD_RADIUS),
+        border,
+        egui::StrokeKind::Middle,
+    );
+    framed.inner
+}
+
+/// 6a's header band: the QR mark, the title, and the ✕ that is this card's
+/// only way out. Answers whether the ✕ was pressed, and where it was drawn.
+fn picker_header(ui: &mut egui::Ui) -> (bool, egui::Rect) {
+    let (band, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), HEADER_HEIGHT),
+        egui::Sense::hover(),
+    );
+    // `border-bottom: 1px solid #eae7e7`, run out past the card's own stroke
+    // on both sides so the rule meets the border instead of stopping a point
+    // short of it.
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(band.left() - BAND_BLEED, band.bottom() - RULE),
+            egui::pos2(band.right() + BAND_BLEED, band.bottom()),
+        ),
+        CornerRadius::ZERO,
+        theme::HAIRLINE,
+    );
+    // The row is centred on the padding box, which is the band without its
+    // rule -- see [`HEADER_HEIGHT`] on why the rule is extra rather than
+    // taken out of the padding.
+    let content =
+        egui::Rect::from_min_max(band.min, egui::pos2(band.right(), band.bottom() - RULE));
+
+    let mark = egui::Rect::from_center_size(
+        egui::pos2(content.left() + HEADER_PAD_X + HEADER_GLYPH / 2.0, content.center().y),
+        egui::Vec2::splat(HEADER_GLYPH),
+    );
+    paint_svg(ui.painter(), mark, QR_MARK, HEADER_GLYPH_STROKE, theme::BLUE);
+
+    let title = lay_out(
+        ui,
+        PICKER_TITLE,
+        f32::INFINITY,
+        egui::TextFormat {
+            // `letter-spacing: -0.01em`, which `egui::RichText` cannot
+            // express -- 0.15pt at 15px, and the reason the title is a
+            // `LayoutJob` rather than a label.
+            extra_letter_spacing: HEADER_TITLE_PX * HEADER_TITLE_TRACKING_EM,
+            ..face(HEADER_TITLE_PX, theme::EXTRABOLD, theme::INK)
+        },
+    );
+    ui.painter().galley(
+        egui::pos2(mark.right() + HEADER_GAP, content.center().y - title.size().y / 2.0),
+        title,
+        theme::INK,
+    );
+
+    // The ✕ is `theme::close_glyph` and not a typed U+2715: that codepoint is
+    // in neither Archivo nor egui's fallback stack and reaches the screen as
+    // a tofu box, which is the measurement `theme` records beside it.
     let mut inner = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(rect.shrink2(egui::vec2(10.0, 6.0)))
-            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            .max_rect(egui::Rect::from_min_max(
+                egui::pos2(content.left() + HEADER_PAD_X, content.top() + HEADER_PAD_Y),
+                egui::pos2(content.right() - HEADER_PAD_X, content.bottom() - HEADER_PAD_Y),
+            ))
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
-    inner.horizontal(|ui| {
-        ui.label(egui::RichText::new(row.title).size(12.5).color(title_ink).strong());
-        if !row.enabled {
-            ui.add_space(6.0);
-            note(ui, WEBCAM_REASON, theme::TEXT_GHOST);
-        }
-    });
-    note(&mut inner, row.subtitle, sub_ink);
-    (response, rect)
+    let close = theme::close_glyph(&mut inner);
+    (close.clicked(), close.rect)
+}
+
+/// 6a's `Adding to` block: `padding: 4px 4px 8px` around a faint label and
+/// the item's own name.
+fn picker_subject(ui: &mut egui::Ui, name: &str) {
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: SUBJECT_PAD,
+            right: SUBJECT_PAD,
+            top: SUBJECT_PAD,
+            bottom: SUBJECT_PAD_BOTTOM,
+        })
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = SUBJECT_GAP;
+            ui.label(
+                theme::regular(ADDING_TO_LABEL, SUBJECT_LABEL_PX).color(theme::TEXT_FAINT),
+            );
+            ui.label(theme::bold(name, SUBJECT_NAME_PX).color(theme::INK));
+        });
+}
+
+/// 6a's footer band: the info mark and the privacy line, on the card's tint.
+///
+/// The line is **pinned to the bottom of the card**, below the rows and above
+/// nothing, because that is the last thing read before a route is chosen and
+/// because a claim about what happens to the pixels belongs beside the row
+/// that captures them.
+fn picker_footer(ui: &mut egui::Ui) {
+    let width = ui.available_width();
+    let text = lay_out(
+        ui,
+        PRIVACY_LINE,
+        width - FOOTER_PAD_X * 2.0 - FOOTER_GLYPH - FOOTER_GAP,
+        egui::TextFormat {
+            line_height: Some(FOOTER_TEXT_PX * FOOTER_LINE),
+            ..body_face(FOOTER_TEXT_PX, theme::TEXT_MUTED)
+        },
+    );
+    // `align-items: flex-start`: both children hang off the top padding, so
+    // the band is as tall as the taller of them plus the two 12px paddings
+    // and the rule over them -- see [`HEADER_HEIGHT`] on the border.
+    let content = text.size().y.max(FOOTER_GLYPH + FOOTER_GLYPH_DROP);
+    let (band, _) = ui.allocate_exact_size(
+        egui::vec2(width, RULE + FOOTER_PAD_Y * 2.0 + content),
+        egui::Sense::hover(),
+    );
+
+    let painter = ui.painter();
+    // The tint, bled out to the card's own rect and rounded into its bottom
+    // corners with the card's own radius -- see [`BAND_BLEED`].
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(band.left() - BAND_BLEED, band.top()),
+            egui::pos2(band.right() + BAND_BLEED, band.bottom() + BAND_BLEED),
+        ),
+        CornerRadius { nw: 0, ne: 0, sw: CARD_RADIUS, se: CARD_RADIUS },
+        theme::CARD_TINT,
+    );
+    // `border-top: 1px solid #eae7e7`.
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(band.left() - BAND_BLEED, band.top()),
+            egui::pos2(band.right() + BAND_BLEED, band.top() + RULE),
+        ),
+        CornerRadius::ZERO,
+        theme::HAIRLINE,
+    );
+
+    let mark = egui::Rect::from_min_size(
+        egui::pos2(
+            band.left() + FOOTER_PAD_X,
+            band.top() + RULE + FOOTER_PAD_Y + FOOTER_GLYPH_DROP,
+        ),
+        egui::Vec2::splat(FOOTER_GLYPH),
+    );
+    paint_svg(painter, mark, INFO_MARK, FOOTER_GLYPH_STROKE, theme::TEXT_FAINT);
+    painter.galley(
+        egui::pos2(mark.right() + FOOTER_GAP, band.top() + RULE + FOOTER_PAD_Y),
+        text,
+        theme::TEXT_MUTED,
+    );
 }
 
 /// **Design 6a.** Four routes in the design's order, the reason the fourth is
 /// dead, and the privacy line under all of them.
-///
-/// The privacy line is **pinned to the bottom of the card**, below the rows
-/// and above nothing, because that is the last thing read before a route is
-/// chosen and because a claim about what happens to the pixels belongs beside
-/// the button that captures them.
 pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
     let mut action = TotpAddAction::None;
     let mut rows = Vec::with_capacity(ROUTES.len());
     let mut go_manual = false;
-    card(ui, |ui| {
-        ui.label(egui::RichText::new(HEADING).size(14.0).color(theme::INK).strong());
-        ui.add_space(2.0);
-        ui.horizontal(|ui| {
-            note(ui, ADDING_TO_LABEL, theme::TEXT_FAINT);
-            ui.label(egui::RichText::new(&state.item_name).size(11.0).color(theme::TEXT_MUTED));
-        });
-        ui.add_space(10.0);
-        ui.label(egui::RichText::new(PICKER_HEADING).size(12.0).color(theme::INK).strong());
-        ui.add_space(6.0);
-
-        for row in &ROUTES {
-            let (response, rect) = route_row(ui, row);
-            rows.push((row.route, rect));
-            if response.clicked() {
-                if row.route == Route::ByHand {
-                    go_manual = true;
-                } else {
-                    action = action_for(row.route);
-                }
-            }
-            ui.add_space(6.0);
-        }
-
-        // The last refusal, if any. Above the privacy line rather than below
-        // it, so the sentence that says what went wrong sits next to the rows
-        // that can be pressed again.
-        if let Some(refusal) = state.refusal {
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(refusal.sentence()).size(11.5).color(theme::ERROR));
-        }
-
-        ui.add_space(10.0);
-        ui.label(egui::RichText::new(PRIVACY_LINE).size(11.0).color(theme::TEXT_MUTED));
-
-        ui.add_space(10.0);
-        if ui
-            .add(
-                egui::Button::new(
-                    egui::RichText::new("Cancel").size(12.0).color(theme::TEXT_MUTED),
-                )
-                .min_size(egui::vec2(72.0, BUTTON_HEIGHT)),
-            )
-            .clicked()
-        {
+    let mut close = egui::Rect::NOTHING;
+    picker_card(ui, |ui| {
+        let (dismissed, at) = picker_header(ui);
+        close = at;
+        if dismissed {
             action = TotpAddAction::Cancel;
         }
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: BODY_PAD_X,
+                right: BODY_PAD_X,
+                top: BODY_PAD_TOP,
+                bottom: BODY_PAD_BOTTOM,
+            })
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = BODY_GAP;
+                picker_subject(ui, &state.item_name);
+
+                let mut chosen = None;
+                for (index, row) in ROUTES.iter().enumerate() {
+                    let (response, rect) = route_row(ui, row, index);
+                    rows.push((row.route, rect));
+                    if response.clicked() {
+                        chosen = Some(row.route);
+                    }
+                }
+                // **What the ↵ on the default row means.** The design draws a
+                // keycap and not an ordinal on that one row, and a keycap for
+                // a key nothing answers is the kind of promise this file
+                // refuses elsewhere (see [`ROUTES`] on "PNG, JPG"). Enter is
+                // unbound everywhere else in this window's production, so it
+                // is answered here, by the row the design says it belongs to.
+                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    chosen = Some(ROUTES[DEFAULT_ROW].route);
+                }
+                if let Some(route) = chosen {
+                    if route == Route::ByHand {
+                        go_manual = true;
+                    } else {
+                        action = action_for(route);
+                    }
+                }
+
+                // The last refusal, if any. 6a has no slot for one -- it is
+                // drawn in its clean state -- so this is the app's own, put
+                // under the rows rather than under the privacy line so the
+                // sentence saying what went wrong sits next to the rows that
+                // can be pressed again.
+                if let Some(refusal) = state.refusal {
+                    ui.label(
+                        egui::RichText::new(refusal.sentence())
+                            .size(ROW_SUB_PX)
+                            .color(theme::ERROR),
+                    );
+                }
+            });
+        picker_footer(ui);
     });
     if go_manual {
         state.stage = Stage::Manual;
         state.refusal = None;
     }
-    PickerFrame { action, rows }
+    PickerFrame { action, rows, close }
 }
 
 /// What the card says while the 6b overlay is up in front of it.
@@ -1513,10 +2235,105 @@ pub fn draw_scanning(ui: &mut egui::Ui, state: &mut TotpAdd) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Design 6c's numbers, all of them lifted out of the CSS under `id="6c"`
+// ---------------------------------------------------------------------------
+
+/// The gap between 6c's three blocks -- the live code, the field table and
+/// whatever follows them (`gap: 16px` on the card's body).
+const CONFIRM_GAP: f32 = 16.0;
+
+/// The live-code panel: `padding: 14px 16px; border: 1px solid #b8c7ea;
+/// border-radius: 10px; background: #eef2fc`.
+const CODE_PANEL_PAD_X: i8 = 16;
+/// See [`CODE_PANEL_PAD_X`].
+const CODE_PANEL_PAD_Y: i8 = 14;
+/// See [`CODE_PANEL_PAD_X`].
+const CODE_PANEL_RADIUS: u8 = 10;
+
+/// `Code now`, as 6c sets it: `font-size: 11px; font-weight: 700;
+/// letter-spacing: 0.1em; text-transform: uppercase`.
+const CODE_LABEL_PX: f32 = 11.0;
+/// See [`CODE_LABEL_PX`]. The design's em, which [`theme::letterspaced`] wants
+/// in points.
+const CODE_LABEL_TRACKING: f32 = 0.1;
+
+/// The code itself: monospace at `font-size: 26px; font-weight: 700;
+/// letter-spacing: 0.14em`.
+///
+/// **Six points larger than the detail pane's live code**, which is 6c's whole
+/// argument: this one is being read off the screen and typed into a comparison
+/// against the site, once, before anything is saved.
+const CODE_PX: f32 = 26.0;
+/// See [`CODE_PX`].
+const CODE_TRACKING: f32 = 0.14;
+/// The gap between the label and the code (`gap: 4px`).
+const CODE_LABEL_GAP: f32 = 4.0;
+
+/// The countdown track beside it: `width: 96px; height: 4px;
+/// border-radius: 2px`, `#b8c7ea` under `#1b3fa0`.
+const COUNTDOWN_WIDTH: f32 = 96.0;
+/// See [`COUNTDOWN_WIDTH`].
+const COUNTDOWN_HEIGHT: f32 = 4.0;
+/// See [`COUNTDOWN_WIDTH`].
+const COUNTDOWN_RADIUS: u8 = 2;
+/// The two lines the track sits between: `font-size: 12px; color: #14307a`,
+/// stacked at `gap: 7px` and right-aligned (`align-items: flex-end`).
+const PANEL_SIDE_PX: f32 = 12.0;
+/// See [`PANEL_SIDE_PX`].
+const PANEL_SIDE_GAP: f32 = 7.0;
+
+/// The field table: `border: 1px solid #eae7e7; border-radius: 10px;
+/// overflow: hidden`.
+const TABLE_RADIUS: u8 = 10;
+/// One row of it: `padding: 11px 14px; gap: 14px`, divided from the next by
+/// `1px solid #f3f2f2`.
+const FIELD_PAD_X: f32 = 14.0;
+/// See [`FIELD_PAD_X`].
+const FIELD_PAD_Y: f32 = 11.0;
+/// See [`FIELD_PAD_X`].
+const FIELD_GAP: f32 = 14.0;
+/// The label column's `width: 92px`, at `font-size: 12px; color: #7d7979`.
+const FIELD_LABEL_W: f32 = 92.0;
+/// See [`FIELD_LABEL_W`].
+const FIELD_LABEL_PX: f32 = 12.0;
+/// The values beside it (`font-size: 13px`), and the tracking 6c gives the
+/// masked secret alone (`letter-spacing: 0.08em`).
+const FIELD_VALUE_PX: f32 = 13.0;
+/// See [`FIELD_VALUE_PX`].
+const SECRET_TRACKING: f32 = 0.08;
+/// The control at the end of the secret's row: `font-size: 12px;
+/// font-weight: 600; color: #14307a`.
+const FIELD_ACTION_PX: f32 = 12.0;
+
+/// One parameter chip: monospace `font-size: 11px` on `#f3f2f2` at
+/// `border-radius: 5px; padding: 2px 7px`, with `gap: 7px` between them.
+const PARAM_CHIP_PX: f32 = 11.0;
+/// See [`PARAM_CHIP_PX`].
+const PARAM_CHIP_PAD_X: f32 = 7.0;
+/// See [`PARAM_CHIP_PX`].
+const PARAM_CHIP_PAD_Y: f32 = 2.0;
+/// See [`PARAM_CHIP_PX`].
+const PARAM_CHIP_RADIUS: u8 = 5;
+/// See [`PARAM_CHIP_PX`].
+const PARAM_CHIP_GAP: f32 = 7.0;
+
 /// **Design 6c**, and the half every later route shares.
 ///
 /// Split out of [`draw_add_form`] so the scanned routes of tasks 4--7 paint
 /// the same card from the same function rather than a second one that drifts.
+///
+/// **What of 6c is here and what is deliberately not.** 6c is drawn as a card
+/// of its own, and this app folds it into the bottom of 6d's -- the two are
+/// one surface here, reached by typing as well as by scanning. So the three
+/// blocks 6c puts inside its body are all below, in its order and with its
+/// measurements; its card *chrome* is 6d's, and two of its controls are not
+/// drawn at all because this app has no action behind them: the `Change`
+/// beside "Saving to" (the record was chosen before this modal opened, and the
+/// card already names it at the top) and the greyed `Edit` beside the
+/// parameters (6d's own digit and period controls are the live version of
+/// that, a few rows up, and they already go dead when a pasted URI has spoken
+/// for them).
 fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now_unix: u64) {
     ui.label(egui::RichText::new(CONFIRM_HEADING).size(12.0).color(theme::INK).strong());
     ui.add_space(6.0);
@@ -1525,50 +2342,253 @@ fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now
     // confirmation that buries it under four label rows is a confirmation
     // nobody makes.
     if let Some(code) = code_at(auth, now_unix) {
-        ui.horizontal(|ui| {
-            ui.allocate_ui(egui::vec2(84.0, 16.0), |ui| {
-                note(ui, CODE_ROW_LABEL, theme::TEXT_FAINT);
-            });
-            ui.label(
-                egui::RichText::new(grouped_code(&code).to_string())
-                    .size(20.0)
-                    .color(theme::BLUE)
-                    .strong(),
-            );
-            ui.add_space(8.0);
-            note(
-                ui,
-                &format!("refreshes in {} s", seconds_left(auth, now_unix)),
-                theme::TEXT_MUTED,
-            );
-        });
-        ui.add_space(2.0);
-        note(ui, MATCH_QUESTION, theme::TEXT_MUTED);
-        ui.add_space(8.0);
+        draw_code_panel(ui, auth, &code, now_unix);
+        ui.add_space(CONFIRM_GAP);
     }
 
-    field_row(ui, ISSUER_ROW_LABEL, auth.issuer.as_deref().unwrap_or("\u{2014}"));
-    field_row(ui, ACCOUNT_ROW_LABEL, auth.account.as_deref().unwrap_or("\u{2014}"));
+    draw_field_table(ui, auth, state);
+}
 
-    ui.horizontal(|ui| {
-        ui.allocate_ui(egui::vec2(84.0, 16.0), |ui| {
-            note(ui, SECRET_ROW_LABEL, theme::TEXT_FAINT);
+/// **6c's live-code panel.** The label and the code down the left, the
+/// countdown stack right-aligned beside them.
+fn draw_code_panel(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) {
+    egui::Frame::new()
+        .fill(theme::BLUE_WASH)
+        .stroke(egui::Stroke::new(1.0, theme::BLUE_EDGE))
+        .corner_radius(CornerRadius::same(CODE_PANEL_RADIUS))
+        .inner_margin(egui::Margin::symmetric(CODE_PANEL_PAD_X, CODE_PANEL_PAD_Y))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    // Uppercased here rather than stored uppercased, because
+                    // `CODE_ROW_LABEL` is the design's own "Code now" and the
+                    // capitals are `text-transform`, a rendering of it.
+                    ui.label(theme::letterspaced(
+                        &CODE_ROW_LABEL.to_uppercase(),
+                        CODE_LABEL_PX,
+                        theme::BOLD,
+                        CODE_LABEL_PX * CODE_LABEL_TRACKING,
+                        theme::BLUE_DEEP,
+                    ));
+                    ui.add_space(CODE_LABEL_GAP);
+                    ui.label(theme::letterspaced_mono(
+                        &grouped_code(code),
+                        CODE_PX,
+                        CODE_PX * CODE_TRACKING,
+                        theme::BLUE_DEEP,
+                    ));
+                });
+                // The right-hand stack takes what the code left and hangs off
+                // the panel's right edge, which is 6c's `align-items:
+                // flex-end` on a column with `flex: 1` to its left.
+                let rest = ui.available_width().max(0.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(rest, 0.0),
+                    egui::Layout::top_down(egui::Align::RIGHT),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        ui.label(
+                            egui::RichText::new(refresh_line(seconds_left(auth, now_unix)))
+                                .size(PANEL_SIDE_PX)
+                                .color(theme::BLUE_DEEP),
+                        );
+                        ui.add_space(PANEL_SIDE_GAP);
+                        draw_countdown(ui, countdown_fraction(auth, now_unix));
+                        ui.add_space(PANEL_SIDE_GAP);
+                        ui.label(
+                            egui::RichText::new(MATCH_QUESTION)
+                                .size(PANEL_SIDE_PX)
+                                .color(theme::BLUE_DEEP),
+                        );
+                    },
+                );
+            });
         });
-        let shown = if state.revealed {
-            auth.secret.to_string()
-        } else {
-            masked(&auth.secret)
-        };
-        ui.label(egui::RichText::new(shown).size(12.0).color(theme::INK));
-        ui.add_space(8.0);
-        if theme::link_label(ui, if state.revealed { HIDE_LABEL } else { REVEAL_LABEL }, 11.0)
-            .clicked()
-        {
-            state.revealed = !state.revealed;
-        }
-    });
+}
 
-    field_row(ui, PARAMETERS_ROW_LABEL, &parameters_line(auth));
+/// 6c's countdown track: a 96 by 4 rail of [`theme::BLUE_EDGE`] with
+/// `fraction` of it filled in [`theme::BLUE`] from the left.
+fn draw_countdown(ui: &mut egui::Ui, fraction: f32) {
+    let (track, _) = ui.allocate_exact_size(
+        egui::vec2(COUNTDOWN_WIDTH, COUNTDOWN_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let radius = CornerRadius::same(COUNTDOWN_RADIUS);
+    ui.painter().rect_filled(track, radius, theme::BLUE_EDGE);
+    let filled = egui::Rect::from_min_size(
+        track.min,
+        egui::vec2(track.width() * fraction.clamp(0.0, 1.0), track.height()),
+    );
+    if filled.width() > 0.0 {
+        ui.painter().rect_filled(filled, radius, theme::BLUE);
+    }
+}
+
+/// **6c's field table**: a bordered, rounded block whose rows are divided by
+/// hairlines rather than spaced apart.
+fn draw_field_table(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd) {
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, theme::HAIRLINE))
+        .corner_radius(CornerRadius::same(TABLE_RADIUS))
+        .inner_margin(egui::Margin::ZERO)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let width = ui.available_width();
+            ui.set_min_width(width);
+
+            table_row(
+                ui,
+                ISSUER_ROW_LABEL,
+                |ui| {
+                    ui.label(
+                        theme::semibold(
+                            auth.issuer.as_deref().unwrap_or("\u{2014}"),
+                            FIELD_VALUE_PX,
+                        )
+                        .color(theme::INK),
+                    );
+                },
+                |_| {},
+            );
+            table_seam(ui);
+
+            table_row(
+                ui,
+                ACCOUNT_ROW_LABEL,
+                |ui| {
+                    ui.label(
+                        egui::RichText::new(auth.account.as_deref().unwrap_or("\u{2014}"))
+                            .size(FIELD_VALUE_PX)
+                            .color(theme::INK),
+                    );
+                },
+                |_| {},
+            );
+            table_seam(ui);
+
+            let mut toggle = false;
+            table_row(
+                ui,
+                SECRET_ROW_LABEL,
+                |ui| {
+                    let shown = if state.revealed {
+                        auth.secret.to_string()
+                    } else {
+                        masked(&auth.secret)
+                    };
+                    // The tracking is 6c's and it is the mask's, not the
+                    // seed's: `••••••••` set solid is one grey block, and the
+                    // groups of four exist to say how much seed there is.
+                    ui.label(theme::letterspaced_mono(
+                        &shown,
+                        FIELD_VALUE_PX,
+                        FIELD_VALUE_PX * SECRET_TRACKING,
+                        theme::INK,
+                    ));
+                },
+                |ui| {
+                    toggle = row_action(ui, if state.revealed { HIDE_LABEL } else { REVEAL_LABEL })
+                        .clicked();
+                },
+            );
+            if toggle {
+                state.revealed = !state.revealed;
+            }
+            table_seam(ui);
+
+            table_row(
+                ui,
+                PARAMETERS_ROW_LABEL,
+                |ui| {
+                    // `flex-wrap: wrap` on the design's chip row: on a modal
+                    // narrower than 6c's 470px card the four chips have to be
+                    // allowed onto a second line rather than pushing the row
+                    // wider than the card holding it.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(PARAM_CHIP_GAP, PARAM_CHIP_GAP);
+                        for chip in parameter_chips(auth) {
+                            param_chip(ui, &chip);
+                        }
+                    });
+                },
+                |_| {},
+            );
+        });
+}
+
+/// One row of [`draw_field_table`]: the label column, the value, and an
+/// optional control hung off the right-hand edge.
+fn table_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: impl FnOnce(&mut egui::Ui),
+    trailing: impl FnOnce(&mut egui::Ui),
+) {
+    ui.add_space(FIELD_PAD_Y);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.add_space(FIELD_PAD_X);
+        ui.allocate_ui(egui::vec2(FIELD_LABEL_W, 0.0), |ui| {
+            ui.label(
+                egui::RichText::new(label).size(FIELD_LABEL_PX).color(theme::TEXT_FAINT),
+            );
+        });
+        ui.add_space(FIELD_GAP);
+        value(ui);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(FIELD_PAD_X);
+            trailing(ui);
+        });
+    });
+    ui.add_space(FIELD_PAD_Y);
+}
+
+/// The `1px solid #f3f2f2` between two rows. Full-bleed, because 6c's rows are
+/// divided rather than spaced: the line runs the whole width of the table and
+/// is clipped by its rounded border.
+fn table_seam(ui: &mut egui::Ui) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, theme::CANVAS);
+}
+
+/// 6c's row-end control -- `Reveal`, and `Hide` once it has been pressed.
+///
+/// Laid out by hand rather than taken from [`theme::link_label`] because 6c
+/// sets this one two shades deeper and a weight heavier than this app's links
+/// (`font-weight: 600; color: #14307a`, against a link's 400 in `#1b3fa0`):
+/// it sits inside a table of values rather than in running text, and the
+/// design leans on weight to separate it from the row it ends.
+fn row_action(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::new(FIELD_ACTION_PX, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+        theme::BLUE_DEEP,
+    );
+    theme::link_galley(ui, galley)
+}
+
+/// One parameter chip, as 6c draws them.
+fn param_chip(ui: &mut egui::Ui, text: &str) {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::new(PARAM_CHIP_PX, egui::FontFamily::Monospace),
+        theme::TEXT_SECONDARY,
+    );
+    let size = galley.size() + egui::vec2(PARAM_CHIP_PAD_X * 2.0, PARAM_CHIP_PAD_Y * 2.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same(PARAM_CHIP_RADIUS),
+        theme::CANVAS,
+    );
+    ui.painter().galley(
+        rect.min + egui::vec2(PARAM_CHIP_PAD_X, PARAM_CHIP_PAD_Y),
+        galley,
+        theme::TEXT_SECONDARY,
+    );
 }
 
 /// [`draw_add_form`] over a dimmed scrim, centred, for `vault_window::mod` to
@@ -1600,10 +2620,24 @@ pub fn draw_add_modal(
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
         .show(ctx, |ui| {
-            ui.set_max_width(MODAL_WIDTH);
+            ui.set_max_width(stage_width(state.stage));
             draw_stage(ui, state, now_unix)
         })
         .inner
+}
+
+/// How wide the card is at each stage.
+///
+/// 6a's panel is 470 and 6d's composer column is [`MODAL_WIDTH`], and the two
+/// are genuinely different surfaces rather than one surface measured twice:
+/// the picker carries a 34px tile, two columns of type and an affordance on
+/// every one of four rows, where the by-hand form is a single field. Sizing
+/// the picker to 380 is what put its subtitles on two lines.
+fn stage_width(stage: Stage) -> f32 {
+    match stage {
+        Stage::Picker => PICKER_WIDTH,
+        Stage::Scanning | Stage::Manual => MODAL_WIDTH,
+    }
 }
 
 /// **The one place that decides which half of this surface is on screen**, so
@@ -2122,6 +3156,101 @@ mod tests {
         assert!(painted.has("60 s"), "the period is not spelled out");
         assert!(painted.has("Git Host"), "the issuer is not shown");
         assert!(painted.has("anovak"), "the account is not shown");
+    }
+
+    /// **Every measurement the confirmation paints with is design 6c's**,
+    /// quoted here beside the CSS it came from, in the order the card stacks.
+    #[test]
+    fn the_confirmations_numbers_are_the_designs_own() {
+        // The body's `gap: 16px` between its blocks.
+        assert_eq!(CONFIRM_GAP, 16.0);
+
+        // The live-code panel: `padding: 14px 16px; border-radius: 10px`.
+        assert_eq!((CODE_PANEL_PAD_X, CODE_PANEL_PAD_Y), (16, 14));
+        assert_eq!(CODE_PANEL_RADIUS, 10);
+        // `Code now` at `11px/700`, `letter-spacing: 0.1em`, over the code at
+        // `26px/700`, `letter-spacing: 0.14em`, `gap: 4px` between them.
+        assert_eq!((CODE_LABEL_PX, CODE_LABEL_TRACKING), (11.0, 0.1));
+        assert_eq!((CODE_PX, CODE_TRACKING), (26.0, 0.14));
+        assert_eq!(CODE_LABEL_GAP, 4.0);
+        // The track: `width: 96px; height: 4px; border-radius: 2px`, between
+        // two `12px` lines at `gap: 7px`.
+        assert_eq!((COUNTDOWN_WIDTH, COUNTDOWN_HEIGHT), (96.0, 4.0));
+        assert_eq!(COUNTDOWN_RADIUS, 2);
+        assert_eq!((PANEL_SIDE_PX, PANEL_SIDE_GAP), (12.0, 7.0));
+
+        // The field table: `border-radius: 10px`, rows at `padding: 11px 14px;
+        // gap: 14px`, a `92px` label column at `12px` and values at `13px`.
+        assert_eq!(TABLE_RADIUS, 10);
+        assert_eq!((FIELD_PAD_X, FIELD_PAD_Y, FIELD_GAP), (14.0, 11.0, 14.0));
+        assert_eq!((FIELD_LABEL_W, FIELD_LABEL_PX), (92.0, 12.0));
+        assert_eq!(FIELD_VALUE_PX, 13.0);
+        // The masked secret alone is tracked (`letter-spacing: 0.08em`), and
+        // the control that unmasks it is `12px/600`.
+        assert_eq!(SECRET_TRACKING, 0.08);
+        assert_eq!(FIELD_ACTION_PX, 12.0);
+
+        // The parameter chips: monospace `11px`, `padding: 2px 7px`,
+        // `border-radius: 5px`, `gap: 7px`.
+        assert_eq!(PARAM_CHIP_PX, 11.0);
+        assert_eq!((PARAM_CHIP_PAD_X, PARAM_CHIP_PAD_Y), (7.0, 2.0));
+        assert_eq!(PARAM_CHIP_RADIUS, 5);
+        assert_eq!(PARAM_CHIP_GAP, 7.0);
+    }
+
+    /// **The parameters are four separate chips**, which is what 6c draws, and
+    /// the one-line form anything else prints is built from those four rather
+    /// than written out a second time.
+    #[test]
+    fn the_parameters_are_four_chips_and_the_sentence_is_built_from_them() {
+        // The design's own card: `TOTP`, `SHA1`, `6 digits`, `30 s`.
+        let plain = auth("otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP");
+        assert_eq!(
+            parameter_chips(&plain),
+            ["TOTP", "SHA1", "6 digits", "30 s"].map(str::to_string)
+        );
+        // And the unusual card, which is the one this row exists to catch.
+        assert_eq!(
+            parameter_chips(&auth(UNUSUAL)),
+            ["TOTP", "SHA256", "8 digits", "60 s"].map(str::to_string)
+        );
+        // The joined form is the chips and cannot drift from them.
+        assert_eq!(parameters_line(&plain), parameter_chips(&plain).join(" \u{b7} "));
+        assert_eq!(parameters_line(&auth(UNUSUAL)), "TOTP \u{b7} SHA256 \u{b7} 8 digits \u{b7} 60 s");
+    }
+
+    /// **The countdown track is the countdown**, not a decoration beside it.
+    ///
+    /// 6c draws the fill at `width: 73%` next to the words *"refreshes in
+    /// 22 s"* on a thirty-second card, and 22/30 is 73% -- so the design's own
+    /// frame is the assertion, and a track wired to anything else fails here.
+    #[test]
+    fn the_countdown_track_is_the_seconds_left_over_the_period() {
+        let card = auth("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&period=30");
+        // Eight seconds into a step leaves the design's twenty-two.
+        let at = BOUNDARY + 8;
+        assert_eq!(seconds_left(&card, at), 22);
+        assert_eq!(refresh_line(seconds_left(&card, at)), "refreshes in 22 s");
+        assert_eq!(
+            (countdown_fraction(&card, at) * 100.0).round() as i32,
+            73,
+            "the track is not the design's 73%"
+        );
+
+        // Both ends, so the assertion above is about the arithmetic and not
+        // about one lucky instant: a full track at the start of a step, and
+        // the smallest one it ever shows at the end.
+        assert_eq!(countdown_fraction(&card, BOUNDARY), 1.0);
+        assert!((countdown_fraction(&card, BOUNDARY + 29) - 1.0 / 30.0).abs() < f32::EPSILON);
+        // A sixty-second card halves at thirty, which a fraction hardcoded to
+        // a thirty-second period would get wrong.
+        let long = auth("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&period=60");
+        assert_eq!(countdown_fraction(&long, BOUNDARY + 30), 0.5);
+        // And a made-up zero period is an empty track rather than a division
+        // by zero on the UI thread.
+        let mut broken = card.clone();
+        broken.period = 0;
+        assert_eq!(countdown_fraction(&broken, at), 0.0);
     }
 
     #[test]
@@ -2783,11 +3912,57 @@ mod tests {
         ctx: egui::Context,
     }
 
+    /// One rectangle the surface really painted, carrying the four things
+    /// design 6a specifies for one: where, what fill, what border and what
+    /// radius.
+    ///
+    /// The text collector above cannot see any of these, and the whole of
+    /// this design pass is boxes: a card, three bands, four rows, four tiles
+    /// and a keycap. Read off the shapes rather than off the constants, so a
+    /// row that took the right colour from the right constant and then was
+    /// painted somewhere else still reds.
+    #[derive(Clone, Copy, Debug)]
+    struct PaintedRect {
+        rect: egui::Rect,
+        fill: egui::Color32,
+        stroke: egui::Color32,
+        stroke_width: f32,
+        radius: u8,
+    }
+
+    fn collect_rects(shape: &egui::Shape, out: &mut Vec<PaintedRect>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push(PaintedRect {
+                rect: rect.rect,
+                fill: rect.fill,
+                stroke: rect.stroke.color,
+                stroke_width: rect.stroke.width,
+                // Every corner on this card is one radius, so the first is
+                // the whole answer -- and a shape that squared one corner
+                // (the footer's tint does) is identified by its fill instead.
+                radius: rect.corner_radius.nw,
+            }),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_rects(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether two rectangles are the same one, within half a point.
+    fn same_rect(a: egui::Rect, b: egui::Rect) -> bool {
+        (a.min - b.min).length() < 0.5 && (a.max - b.max).length() < 0.5
+    }
+
     /// One frame of [`Picker`].
     struct PickerRun {
         action: TotpAddAction,
         rows: Vec<(Route, egui::Rect)>,
+        close: egui::Rect,
         painted: Painted,
+        rects: Vec<PaintedRect>,
     }
 
     impl PickerRun {
@@ -2797,6 +3972,23 @@ mod tests {
                 .find(|(r, _)| *r == route)
                 .unwrap_or_else(|| panic!("{route:?} was not drawn at all"))
                 .1
+        }
+
+        /// Every rectangle painted exactly at `at`. A filled box and its
+        /// border are two shapes at one rect, so this answers both.
+        fn at(&self, at: egui::Rect) -> Vec<PaintedRect> {
+            self.rects.iter().copied().filter(|r| same_rect(r.rect, at)).collect()
+        }
+
+        /// Every rectangle painted wholly inside `outer` and smaller than it
+        /// -- a row's tile and its keycap, found without knowing where the
+        /// row put them.
+        fn inside(&self, outer: egui::Rect) -> Vec<PaintedRect> {
+            self.rects
+                .iter()
+                .copied()
+                .filter(|r| outer.contains_rect(r.rect) && !same_rect(r.rect, outer))
+                .collect()
         }
     }
 
@@ -2813,7 +4005,9 @@ mod tests {
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    egui::vec2(420.0, 900.0),
+                    // Room for [`PICKER_WIDTH`] and its shadow. Widened with
+                    // the 6a design pass: the card was 380 and is 470.
+                    egui::vec2(560.0, 900.0),
                 )),
                 events,
                 ..Default::default()
@@ -2823,20 +4017,33 @@ mod tests {
         fn frame(&self, state: &mut TotpAdd, events: Vec<egui::Event>) -> PickerRun {
             let mut reported: Option<PickerFrame> = None;
             let output = self.ctx.run_ui(Self::input(events), |ui| {
-                ui.set_max_width(MODAL_WIDTH);
+                ui.set_max_width(stage_width(Stage::Picker));
                 reported = Some(draw_picker(ui, state));
             });
             let reported = reported.expect("run_ui runs the closure once");
             let mut painted = Painted(Vec::new());
+            let mut rects = Vec::new();
             for clipped in &output.shapes {
                 collect(&clipped.shape, &mut painted);
+                collect_rects(&clipped.shape, &mut rects);
             }
             assert!(
                 !painted.0.is_empty(),
                 "the picker painted no text at all, so every assertion over this list would \
                  pass against nothing"
             );
-            PickerRun { action: reported.action, rows: reported.rows, painted }
+            assert!(
+                !rects.is_empty(),
+                "the picker painted no rectangles at all, so every assertion over that list \
+                 would pass against nothing either"
+            );
+            PickerRun {
+                action: reported.action,
+                rows: reported.rows,
+                close: reported.close,
+                painted,
+                rects,
+            }
         }
 
         fn idle(&self, state: &mut TotpAdd) -> PickerRun {
@@ -2855,13 +4062,22 @@ mod tests {
         let picker = Picker::new();
         let frame = picker.idle(&mut state);
 
-        assert!(frame.painted.has(HEADING), "the card has no heading");
+        // **6a's own header title, and not 6d's.** Updated deliberately with
+        // the design pass that gave this card 6a's header band: the picker
+        // used to paint `HEADING` ("Add a TOTP", which is the by-hand form's)
+        // over a second heading reading "How to add it", and 6a draws one
+        // title and it is this one. See [`PICKER_TITLE`].
+        assert!(frame.painted.has(PICKER_TITLE), "the card has no heading");
+        assert!(
+            !frame.painted.has(HEADING),
+            "the picker paints 6d's heading as well as its own: {:?}",
+            frame.painted.0
+        );
         assert!(
             frame.painted.has(ADDING_TO_LABEL),
             "the picker does not say what it is adding to"
         );
         assert!(frame.painted.has("Git Host"), "the item it is adding to is not named");
-        assert!(frame.painted.has(PICKER_HEADING));
         for row in &ROUTES {
             assert!(frame.painted.has(row.title), "route {:?} is not on screen", row.route);
             assert!(
@@ -2879,6 +4095,242 @@ mod tests {
         // And nothing of 6d is on screen yet: the picker is a picker.
         assert!(!frame.painted.has(CONFIRM_HEADING));
         assert_eq!(frame.rows.len(), ROUTES.len(), "a route was drawn without a hit area");
+    }
+
+    // -----------------------------------------------------------------
+    // Design 6a's geometry, read off the painted shapes.
+    //
+    // Every number asserted below was measured in a browser against
+    // `docs/design/Deskwarden.dc.html`'s own `id="6a"` panel -- the card's
+    // rectangle is 470 x 455, its rows 440 x 62, its tiles 36 x 36 -- rather
+    // than derived from the constants these tests are meant to hold. A test
+    // that recomputed `ROW_PAD_Y * 2.0 + ...` would agree with any value
+    // those constants ever took.
+    // -----------------------------------------------------------------
+
+    /// **The card is 6a's card**: 470 wide, radius 12, a `#d7d3d3` hairline
+    /// round it, a white header band ruled off in `#eae7e7`, and a `#fbfaf9`
+    /// footer.
+    #[test]
+    fn the_picker_card_is_the_designs_own_box() {
+        let mut state = TotpAdd::opening("id-1", "Git Host \u{b7} anovak", false);
+        let picker = Picker::new();
+        let frame = picker.idle(&mut state);
+
+        let card = frame
+            .rects
+            .iter()
+            .find(|r| r.radius == CARD_RADIUS && r.fill == theme::CARD)
+            .copied()
+            .unwrap_or_else(|| panic!("no 12px-radius white card was painted: {:?}", frame.rects));
+        assert!(
+            (card.rect.width() - PICKER_WIDTH).abs() <= 1.0,
+            "the card is {} wide and 6a's is {PICKER_WIDTH}",
+            card.rect.width()
+        );
+        assert_eq!(card.stroke, theme::BORDER_STRONG, "6a's card is bordered #d7d3d3");
+        assert!((card.stroke_width - CARD_STROKE).abs() < f32::EPSILON);
+
+        // The footer's tint, which is the one band on this card that is not
+        // the card's own white, and which squares its top corners so the
+        // three bands read as one card.
+        let footer = frame
+            .rects
+            .iter()
+            .find(|r| r.fill == theme::CARD_TINT)
+            .copied()
+            .expect("6a's footer band is #fbfaf9 and none was painted");
+        assert_eq!(footer.radius, 0, "the footer's TOP corners are square");
+        assert!(
+            (footer.rect.bottom() - card.rect.bottom()).abs() <= 2.0,
+            "the footer band does not reach the bottom of the card"
+        );
+
+        // Two hairline rules, one under the header and one over the footer.
+        let rules: Vec<_> = frame
+            .rects
+            .iter()
+            .filter(|r| r.fill == theme::HAIRLINE && (r.rect.height() - RULE).abs() < 0.5)
+            .collect();
+        assert_eq!(rules.len(), 2, "6a rules the header off and the footer on: {rules:?}");
+    }
+
+    /// **Every route row is 6a's row**, and the first one is 6a's blue one.
+    #[test]
+    fn every_route_row_is_the_designs_own_box() {
+        let mut state = TotpAdd::opening("id-1", "Git Host \u{b7} anovak", false);
+        let picker = Picker::new();
+        let frame = picker.idle(&mut state);
+
+        for (index, (route, rect)) in frame.rows.iter().enumerate() {
+            // 440 = 6a's 470 card, less its border and the body's 14px
+            // margins.
+            assert!(
+                (rect.width() - 440.0).abs() <= 1.0,
+                "{route:?} is {} wide and 6a's row is 440",
+                rect.width()
+            );
+            let painted = frame.at(*rect);
+            let fill = painted
+                .iter()
+                .find(|r| r.fill != egui::Color32::TRANSPARENT)
+                .unwrap_or_else(|| panic!("{route:?} painted no fill: {painted:?}"));
+            let edge = painted
+                .iter()
+                .find(|r| r.stroke_width > 0.0)
+                .unwrap_or_else(|| panic!("{route:?} painted no border: {painted:?}"));
+            assert_eq!(fill.radius, ROW_RADIUS, "{route:?} is not 6a's 10px radius");
+            assert!(
+                (edge.stroke_width - 1.0).abs() < f32::EPSILON,
+                "{route:?}'s border is not 6a's 1px"
+            );
+
+            // The tile: `width: 34px` inside a 1px border is 36 on screen.
+            let tile = frame
+                .inside(*rect)
+                .into_iter()
+                .find(|r| (r.rect.width() - 36.0).abs() < 0.5 && r.radius == TILE_RADIUS)
+                .unwrap_or_else(|| panic!("{route:?} has no 36px 8px-radius icon tile"));
+            assert!((tile.rect.height() - 36.0).abs() < 0.5, "{route:?}'s tile is not square");
+
+            if index == DEFAULT_ROW {
+                assert_eq!(fill.fill, theme::BLUE_WASH, "6a's first row is #eef2fc");
+                assert_eq!(edge.stroke, theme::BLUE, "6a's first row is bordered #1b3fa0");
+                assert_eq!(tile.fill, theme::CARD, "the selected row's tile is white");
+            } else {
+                assert_eq!(fill.fill, theme::CARD, "6a's other rows carry no fill of their own");
+                assert_eq!(edge.stroke, theme::HAIRLINE, "6a's other rows are bordered #eae7e7");
+                assert_eq!(tile.fill, theme::WINDOW_BG, "an unselected tile is #f7f6f5");
+            }
+        }
+
+        // The three one-line rows are all 62 tall -- 6a's own number, which is
+        // 12px of padding either side of the 36px tile plus the 1px border --
+        // and the deferred row is taller because its reason wraps. Asserted
+        // together so a change that grew every row would still red.
+        let live: Vec<f32> =
+            frame.rows.iter().take(3).map(|(_, rect)| rect.height()).collect();
+        for height in &live {
+            assert!((height - 62.0).abs() <= 1.0, "a live row is {height} tall and 6a's is 62");
+        }
+        assert!(
+            frame.row(Route::Webcam).height() > live[0] + 1.0,
+            "the deferred row is no taller than a one-line row, so its two-line reason is \
+             overflowing rather than fitting"
+        );
+    }
+
+    /// **6a's two right-hand affordances**: a filled ↵ keycap on the default
+    /// row, and a bare ordinal on each of the others.
+    #[test]
+    fn the_default_row_wears_the_keycap_and_the_rest_wear_their_ordinal() {
+        let mut state = TotpAdd::opening("id-1", "Git Host \u{b7} anovak", false);
+        let picker = Picker::new();
+        let frame = picker.idle(&mut state);
+
+        let default = frame.row(ROUTES[DEFAULT_ROW].route);
+        let keycap = frame
+            .inside(default)
+            .into_iter()
+            .find(|r| r.fill == theme::BLUE && r.radius == 5)
+            .unwrap_or_else(|| panic!("the default row has no #1b3fa0 5px-radius keycap"));
+        assert!(
+            (keycap.rect.height() - theme::CHIP_HEIGHT).abs() < 0.5,
+            "the keycap is {} tall; 6a's `padding: 3px` around a 10px line is 18",
+            keycap.rect.height()
+        );
+        assert!(
+            keycap.rect.right() < default.right() && keycap.rect.right() > default.right() - 20.0,
+            "the keycap is not against the row's right padding"
+        );
+
+        // The ordinals are painted as text and the default row's is not: 6a
+        // sets 2, 3 and 4 in monospace and gives the first row the cap
+        // instead. `has` is a substring test, so "1" is looked for on its own
+        // line rather than inside another string.
+        for ordinal in ["2", "3", "4"] {
+            assert!(
+                frame.painted.0.iter().any(|t| t == ordinal),
+                "6a's ordinal {ordinal} is not on the card: {:?}",
+                frame.painted.0
+            );
+        }
+        assert!(
+            !frame.painted.0.iter().any(|t| t == "1"),
+            "the default row painted an ordinal as well as its keycap"
+        );
+        // And no other row painted a keycap.
+        for (route, rect) in &frame.rows {
+            if *route == ROUTES[DEFAULT_ROW].route {
+                continue;
+            }
+            assert!(
+                !frame.inside(*rect).iter().any(|r| r.fill == theme::BLUE),
+                "{route:?} painted a filled blue box, so the assertion above says nothing \
+                 about which row is the default one"
+            );
+        }
+    }
+
+    /// **The ↵ the default row advertises is a key that really answers.**
+    ///
+    /// Pressed rather than called, and with the idle frame as the control:
+    /// a picker that reported `ScanRegion` every frame would satisfy an
+    /// assertion written one way round.
+    #[test]
+    fn enter_takes_the_designs_default_route() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        assert_eq!(
+            picker.idle(&mut state).action,
+            TotpAddAction::None,
+            "the picker asks for something with nothing pressed"
+        );
+
+        let pressed = picker.frame(
+            &mut state,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert_eq!(
+            pressed.action,
+            action_for(ROUTES[DEFAULT_ROW].route),
+            "Enter did not take the route 6a hangs its ↵ keycap off"
+        );
+    }
+
+    /// **The ✕ in 6a's header is the way out of this card**, and it is the
+    /// only one: 6a draws no Cancel button, and the one this used to carry
+    /// was removed with the design pass.
+    #[test]
+    fn the_header_cross_closes_the_picker() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let laid_out = picker.idle(&mut state);
+        assert!(
+            laid_out.close.width() > 1.0,
+            "the header painted no ✕ at all, so pressing it below proves nothing"
+        );
+        assert!(
+            !laid_out.painted.has("Cancel"),
+            "the picker still carries the Cancel button 6a does not draw: {:?}",
+            laid_out.painted.0
+        );
+
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let laid_out = picker.idle(&mut state);
+        let at = laid_out.close.center();
+        assert_eq!(
+            picker.click(&mut state, at).action,
+            TotpAddAction::Cancel,
+            "pressing 6a's ✕ did not close the modal"
+        );
     }
 
     /// **Pressing "Scan a region of my screen" is what opens design 6b.**
@@ -3055,7 +4507,7 @@ mod tests {
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut painted);
         }
-        assert!(painted.has(PICKER_HEADING), "the modal did not open on 6a: {:?}", painted.0);
+        assert!(painted.has(PICKER_TITLE), "the modal did not open on 6a: {:?}", painted.0);
         assert!(painted.has(PRIVACY_LINE), "the modal dropped the privacy line");
         assert!(painted.has(ROUTES[0].title));
         assert!(!painted.has(SECRET_HINT), "the modal opened straight into the by-hand form");

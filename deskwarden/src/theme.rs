@@ -1379,6 +1379,34 @@ pub fn kbd_chip_on_card(ui: &mut Ui, text: &str) {
     paint_chip(ui, text, CARD, BLUE, 5, 7.0);
 }
 
+// --- design 6a's ↵ keycap (added by the TOTP picker's design pass) ---------
+
+/// The corner radius and the horizontal padding of the keycap design 6a hangs
+/// off its default row (`border-radius: 5px; padding: 3px 7px`), which is
+/// [`kbd_chip_on_card`]'s 3h geometry in [`kbd_chip`]'s on-primary colours —
+/// white ink on [`BLUE`], and so neither of the two treatments above.
+///
+/// `RETURN_KEYCAP_PAD_X` is `pub` because the caller has to know how wide the
+/// cap will be *before* it lays the row out: 6a's text column is `flex: 1`,
+/// so the room the two lines of type get is what the affordance leaves.
+const RETURN_KEYCAP_RADIUS: u8 = 5;
+pub const RETURN_KEYCAP_PAD_X: f32 = 7.0;
+
+/// Paints that keycap into `rect`, which the caller has already measured and
+/// placed.
+///
+/// A painter and not a `Ui` widget, unlike the three chips above, because the
+/// picker's rows are painted into rects they allocated for themselves rather
+/// than laid out by egui — and the arrow is DRAWN rather than typed for
+/// [`primary_button`]'s measured reason: U+21B5 is carried by neither Archivo
+/// nor egui's fallback stack and reaches the screen as a tofu box.
+pub fn paint_return_keycap(painter: &egui::Painter, rect: Rect) {
+    painter.rect_filled(rect, CornerRadius::same(RETURN_KEYCAP_RADIUS), BLUE);
+    paint_return_arrow(painter, rect.center(), RETURN_GLYPH_SIZE, Color32::WHITE);
+}
+
+// --- end of design 6a's keycap --------------------------------------------
+
 // ---------------------------------------------------------------------------
 // The indeterminate progress indicator (design turn 7).
 // ---------------------------------------------------------------------------
