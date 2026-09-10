@@ -5796,7 +5796,7 @@ fn rebuild_after_vault_window(tray: &mut tray::AppTray, state: Option<&accounts:
 ///
 /// **The rule is not "discard whatever is queued".** A click asking for the
 /// window that was ALREADY on screen has been served -- it was shown, and
-/// `foreground::raise_window` brought it to the front on its first frame, so
+/// `foreground::raise_window` brought it to the front on its first visible
 /// "show me the window" is precisely what happened. A click asking for
 /// anything else -- Quit, Preferences, Sync, an account switch -- was served by
 /// nothing and is still owed an answer; dropping those would trade one report

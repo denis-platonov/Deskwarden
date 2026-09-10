@@ -602,11 +602,22 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
     let mut filter = String::new();
     let mut selected_id: Option<String> = None;
     let mut styled = false;
+    let mut window_reveal = crate::window_host::Reveal::hidden();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 540.0])
             .with_position(centered_position(440.0, 540.0))
+            // **Created hidden, shown once it has drawn a list.** Between
+            // creating a window and egui's first frame Windows shows the
+            // window's own background, which is the white box the user reported
+            // blinking. See `crate::window_host::Reveal`.
+            //
+            // Not `with_transparent(true)`: this window opens no child viewport
+            // and so keeps `eframe`'s ordinary clear colour -- see
+            // `crate::window_host`, which argues why only the two vault hosts
+            // take a transparent one.
+            .with_visible(false)
             .with_icon(theme::window_icon()),
         ..Default::default()
     };
@@ -620,14 +631,19 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
             // starts on the next one, once the fonts are actually live.
             theme::paint_window_background(ui);
             theme::apply(ui.ctx());
-            // The OS window exists by this first painted frame, and this is
-            // where it is brought to the front. See `foreground`: a refusal
-            // from Windows flashes the taskbar button rather than being
-            // ignored.
-            crate::foreground::raise_window(PICK_ITEM_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;
+        }
+
+        // **The raise moved out of the block above**, because the window is
+        // created hidden and `foreground::pick` skips invisible windows: on the
+        // styling frame there is nothing for a raise to find. `advance` asks to
+        // be shown on this, the first frame that draws the list, and answers
+        // `true` on the next one. See `foreground`: a refusal from Windows
+        // flashes the taskbar button rather than being ignored.
+        if window_reveal.advance(ui.ctx()) {
+            crate::foreground::raise_window(PICK_ITEM_TITLE);
         }
 
         egui::CentralPanel::default()
@@ -1109,6 +1125,7 @@ pub fn run_picker(
     // row once, here, and it is that row's handle the window carries.
     let mut selected_hwnd: Option<isize> = default_window.map(|w| w.hwnd);
     let mut styled = false;
+    let mut window_reveal = crate::window_host::Reveal::hidden();
 
     // Read once, before the loop: the match this item already carries, if it
     // names a window host. See `existing_host_match_notice` for why this is
@@ -1187,6 +1204,12 @@ pub fn run_picker(
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([440.0, 560.0])
             .with_position(centered_position(440.0, 560.0))
+            // Hidden until it has drawn something, for the reason the item
+            // picker above gives -- and this window needs it more than that
+            // one does: its first frame registers fonts and paints NOTHING at
+            // all, so the window Windows was showing in the meantime stayed the
+            // bare white one for a frame longer.
+            .with_visible(false)
             .with_icon(theme::window_icon()),
         ..Default::default()
     };
@@ -1199,14 +1222,19 @@ pub fn run_picker(
             // exist yet and panic. Skip drawing this frame; the real UI
             // starts on the next one, once the fonts are actually live.
             theme::apply(ui.ctx());
-            // The OS window exists by this first painted frame, and this is
-            // where it is brought to the front. See `foreground`: a refusal
-            // from Windows flashes the taskbar button rather than being
-            // ignored.
-            crate::foreground::raise_window(ADD_APP_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;
+        }
+
+        // **The raise moved out of the block above**, because the window is
+        // created hidden and `foreground::pick` skips invisible windows: on the
+        // styling frame there is nothing for a raise to find. `advance` asks to
+        // be shown on this, the first frame that draws the form, and answers
+        // `true` on the next one. See `foreground`: a refusal from Windows
+        // flashes the taskbar button rather than being ignored.
+        if window_reveal.advance(ui.ctx()) {
+            crate::foreground::raise_window(ADD_APP_TITLE);
         }
 
         // Non-blocking, like every other background-thread drain in this

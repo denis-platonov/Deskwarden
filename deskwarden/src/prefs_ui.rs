@@ -5927,12 +5927,24 @@ pub fn run(settings: Settings) -> Settings {
     let state = Rc::new(RefCell::new(PrefsState::with_scan_history(settings)));
     let state_for_closure = state.clone();
     let mut styled = false;
+    let mut window_reveal = crate::window_host::Reveal::hidden();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(WINDOW_SIZE)
             .with_resizable(false)
             .with_decorations(false)
+            // **Created hidden, shown once the page is actually drawn.** The
+            // guard below already deals with the near-black first frame; what
+            // it cannot reach is the frame BEFORE egui's first, where Windows
+            // shows the new window painted with its own background. That white
+            // box is what the user reported blinking. See
+            // `crate::window_host::Reveal`.
+            //
+            // Not `with_transparent(true)`: no child viewport is opened from
+            // this window, so it keeps `eframe`'s ordinary clear colour. See
+            // `crate::window_host`.
+            .with_visible(false)
             .with_icon(theme::window_icon()),
         ..Default::default()
     };
@@ -5949,14 +5961,23 @@ pub fn run(settings: Settings) -> Settings {
             theme::paint_window_background(ui);
             theme::apply(ui.ctx());
             round_window_corners(WINDOW_TITLE);
-            // The OS window exists by this first painted frame (the same
-            // hook `round_window_corners` uses), and this is where it is
-            // brought to the front. See `foreground`: a refusal from Windows
-            // flashes the taskbar button rather than being ignored.
-            crate::foreground::raise_window(WINDOW_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;
+        }
+
+        // **The raise moved out of the block above.** `round_window_corners`
+        // can stay there -- it resolves the window through
+        // `foreground::own_window_titled`, which deliberately does NOT skip
+        // invisible windows, and a corner preference set before a window
+        // appears is applied when it does. A raise is the opposite:
+        // `foreground::pick` skips invisible windows, so on the styling frame
+        // there is nothing for it to find. `advance` asks to be shown on this,
+        // the first frame that draws the page, and answers `true` on the next
+        // one. See `foreground`: a refusal from Windows flashes the taskbar
+        // button rather than being ignored.
+        if window_reveal.advance(ui.ctx()) {
+            crate::foreground::raise_window(WINDOW_TITLE);
         }
 
         match draw_prefs_window(ui, &mut state_for_closure.borrow_mut()) {

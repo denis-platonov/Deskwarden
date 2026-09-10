@@ -219,11 +219,26 @@ pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T
             // the heading this body now draws there would otherwise be two
             // titlebars stacked on this one: the OS's and the app's.
             .with_decorations(false)
+            // **Created hidden, shown once it has drawn a spinner.** The window
+            // Windows puts up between `CreateWindowExW` and egui's first frame
+            // is painted with its own background, and that white box blinking
+            // open is what the user reported -- three times over, because the
+            // sign-in card, this spinner and the vault open in sequence. See
+            // `crate::window_host::Reveal`, which also records why an invisible
+            // window still gets frames at all.
+            //
+            // **Not `with_transparent(true)`, unlike the two vault hosts.**
+            // Nothing opens a child viewport from this window, so it has
+            // nothing to gain from an alpha channel, and it keeps `eframe`'s
+            // ordinary clear colour rather than a transparent one -- see
+            // `crate::window_host`, which argues that trade.
+            .with_visible(false)
             .with_icon(theme::window_icon()),
         ..Default::default()
     };
 
     let mut styled = false;
+    let mut window_reveal = crate::window_host::Reveal::hidden();
 
     let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
         if !styled {
@@ -236,16 +251,28 @@ pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T
             theme::apply(ui.ctx());
             // Frameless windows in this app ask DWM for the rounded corners and
             // shadow the OS frame would have given them. The OS window exists by
-            // this first painted frame, which is the hook both this and the
-            // raise below rely on.
+            // this first painted frame, which is the hook this relies on -- and
+            // it is enough for THIS call even though the window is not visible
+            // yet: `foreground::own_window_titled`, which resolves it, does not
+            // skip invisible windows, and a corner preference set before a
+            // window appears is applied when it does. The raise below cannot
+            // say the same, which is why it is below.
             round_window_corners(WINDOW_TITLE);
-            // This is where the window is brought to the front. See
-            // `foreground`: a refusal from Windows flashes the taskbar button
-            // rather than being ignored.
-            crate::foreground::raise_window(WINDOW_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;
+        }
+
+        // **The raise used to sit in the block above and cannot any more.**
+        // The window is created hidden now, and `foreground::pick` skips
+        // invisible windows -- so on the styling frame there is nothing for a
+        // raise to find and it would report `Raised::NoWindow`. `advance` asks
+        // to be shown on this, the first frame that draws a spinner, and
+        // answers `true` on the next one, which is the first frame there is a
+        // window to bring forward. See `foreground`: a refusal from Windows
+        // flashes the taskbar button rather than being ignored.
+        if window_reveal.advance(ui.ctx()) {
+            crate::foreground::raise_window(WINDOW_TITLE);
         }
 
         if let Ok(value) = rx.try_recv() {

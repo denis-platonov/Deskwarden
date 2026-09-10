@@ -221,5 +221,12 @@ pub mod vault_window;
 /// never on the UI thread; see its own docs for how it is released.
 pub mod webcam;
 pub mod win32_draw;
+/// The `eframe::App` `eframe::run_ui_native` keeps private, and the state
+/// machine that lets a window created hidden appear only once it has painted.
+/// **It opens no window of its own** -- no title, no geometry, no frame
+/// closure. Every window still opens at its own `run_ui_native(TITLE, ..)` and
+/// raises itself there, which is what `foreground`'s census counts; see that
+/// module's `OPENS_NO_WINDOW` entry for the argument.
+pub mod window_host;
 pub mod window_list;
 pub mod window_watch;

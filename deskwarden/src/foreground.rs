@@ -184,9 +184,18 @@ pub fn raise_on<D: Desktop + ?Sized>(desktop: &D, target: Target<'_>) -> Raised 
 
 /// Bring this process's window titled `title` to the front.
 ///
-/// Called from the first painted frame of every window this crate opens,
-/// beside `login_ui::round_window_corners`, which is the same "the OS window
-/// exists now" hook.
+/// **Called from the first VISIBLE frame of every window this crate opens**,
+/// which is no longer its first painted frame. Every one of them is created
+/// `with_visible(false)` and shown by `crate::window_host::Reveal` once it has
+/// drawn its real content -- see that type for why, and for the white flash it
+/// removes. [`pick`] skips invisible windows, so a raise issued before the show
+/// finds nothing and reports [`Raised::NoWindow`]; the reveal and the raise are
+/// therefore a frame apart, deliberately.
+///
+/// `login_ui::round_window_corners` still runs on the first painted frame,
+/// beside the styling, and can: it resolves the window through
+/// [`own_window_titled`], which does NOT skip invisible windows, and a corner
+/// preference set before a window appears is applied when it does.
 pub fn raise_window(title: &str) -> Raised {
     raise_on(&Win32Desktop, Target::Titled(title))
 }
@@ -1086,9 +1095,17 @@ mod tests {
     /// [`RAISING_SITES`].)
     ///
     /// What it can see: the call is present, once per window. What it cannot:
-    /// that it runs on the frame the window first exists on rather than
-    /// somewhere unreachable. That much is visible in any diff touching these
-    /// lines, and is what the comment at each call site is for.
+    /// that it runs on the frame the window first BECOMES VISIBLE on rather
+    /// than somewhere unreachable. That much is visible in any diff touching
+    /// these lines, and is what the comment at each call site is for.
+    ///
+    /// ("first exists on" is what this said while every window raised itself
+    /// from its `!styled` block. They are all created `with_visible(false)`
+    /// now and shown by [`crate::window_host::Reveal`] a frame later, and the
+    /// raise had to move with the show: [`pick`] skips invisible windows, so a
+    /// raise on the frame the window first exists on would find nothing at all.
+    /// The count is unchanged -- one call per window -- which is the whole of
+    /// what this test was ever able to hold.)
     ///
     /// The list itself is [`RAISING_SITES`], and a module missing from it is
     /// not merely unchecked here -- it fails
@@ -1325,7 +1342,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 78] = [
+        const OPENS_NO_WINDOW: [&str; 79] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1616,6 +1633,36 @@ mod tests {
             // own; whatever HWND it draws into was already created by its
             // caller.
             "win32_draw",
+            // **Judgement call, recorded rather than assumed** -- the same
+            // shape as `file_picker`'s above, and the harder of the two.
+            //
+            // This module DOES call `eframe::run_native`. What it does not
+            // have is a window: no title constant, no `ViewportBuilder`, no
+            // geometry and no frame closure. It is the `eframe::App` impl that
+            // `eframe::run_ui_native` builds privately, exported so this crate
+            // can override `clear_color` on it, plus the little state machine
+            // that decides when a window created `with_visible(false)` may
+            // appear. The window it runs belongs to whichever module called
+            // it, under that module's own title.
+            //
+            // A row in `OPENS_WINDOWS` would need a matching row in a raise
+            // table, and every one of those tables is keyed on a title
+            // constant in the module's own source -- `RAISING_SITES` greps
+            // `run_ui_native(TITLE,`, `OPENS_A_VIEWPORT_AND_RAISES_IT` greps
+            // `with_title(TITLE)`, the Win32 table greps
+            // `&HSTRING::from(TITLE)`. This file has none and can be given
+            // none, because it is called by two modules with two different
+            // titles and would have to hold both.
+            //
+            // So the guard stays where it can see something: `vault_window`
+            // and `app_window` each still open at their own
+            // `run_ui_native(WINDOW_TITLE,` and raise `WINDOW_TITLE` in their
+            // own source, exactly as they did when they called `eframe`
+            // directly, and both are still held by `RAISING_SITES`. That is
+            // the whole reason this module's function is named
+            // `run_ui_native` rather than anything more descriptive -- see
+            // its own doc comment.
+            "window_host",
             "window_list",
             "window_watch",
         ];

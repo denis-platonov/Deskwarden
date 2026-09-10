@@ -3746,6 +3746,21 @@ pub fn build_login_frame(
             // controls), drawn by draw_window_chrome; the native frame
             // can't be themed into it.
             .with_decorations(false)
+            // **Created hidden, shown by `window_host::Reveal` once the card
+            // has actually been drawn.** What Windows shows between creating a
+            // window and egui's first frame is the window's own background --
+            // a white box, blinking open while the GL context and the font
+            // atlas are built. That is what the user reported, and this window
+            // is the first of the three it happened to at startup.
+            //
+            // Only `run_login_flow_for` uses these options; `app_window` builds
+            // its own and hands this builder's frame closure `pre_styled`, so
+            // the flag and the `Reveal` below travel together.
+            //
+            // Not `with_transparent(true)`: no child viewport is ever opened
+            // from this window, so it keeps `eframe`'s ordinary clear colour.
+            // See `crate::window_host`.
+            .with_visible(false)
             // The taskbar icon (there is no native titlebar to show one);
             // eframe windows don't inherit the exe's icon resource.
             .with_icon(theme::window_icon());
@@ -3758,6 +3773,15 @@ pub fn build_login_frame(
     // -- see this function's doc. `false` is `run_login_flow_for`'s own value
     // and the behaviour this window has always had.
     let mut styled = pre_styled;
+    // And the reveal belongs to whoever owns that first frame, for the same
+    // reason: under `pre_styled` the window is `app_window`'s, it is already
+    // visible, and `app_window` has a `Reveal` of its own. A second one here
+    // would re-raise that window on every stage change.
+    let mut window_reveal = if pre_styled {
+        crate::window_host::Reveal::already_visible()
+    } else {
+        crate::window_host::Reveal::hidden()
+    };
 
     let login_frame_fn = move |ui: &mut egui::Ui, _frame: &mut eframe::Frame| {
         if !styled {
@@ -3769,17 +3793,24 @@ pub fn build_login_frame(
             theme::paint_window_background(ui);
             theme::apply(ui.ctx());
             round_window_corners(WINDOW_TITLE);
-            // Same hook, same reason as every other window this app opens:
-            // this is the first frame on which the OS window exists, so it
-            // is the first moment it can be asked to come forward. Without
-            // it the login window can land behind whatever the user was
-            // doing while `bw serve` started -- and the Hello prompt this
-            // window raises is itself parented to nothing, so a login
-            // window that is already behind takes the prompt down with it.
-            let _ = crate::foreground::raise_window(WINDOW_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;
+        }
+
+        // **The raise, moved down out of the block above.** The reason it has
+        // to happen at all is unchanged: without it the login window can land
+        // behind whatever the user was doing while `bw serve` started -- and
+        // the Hello prompt this window raises is itself parented to nothing, so
+        // a login window that is already behind takes the prompt down with it.
+        //
+        // What changed is WHEN. The window is created hidden now, and
+        // `foreground::pick` skips invisible windows, so a raise on the styling
+        // frame would be looking for a window Windows has not shown yet.
+        // `advance` asks for the show on this, the first frame that draws the
+        // card, and answers `true` on the next one.
+        if window_reveal.advance(ui.ctx()) {
+            let _ = crate::foreground::raise_window(WINDOW_TITLE);
         }
 
         // **The vault window's own titlebar, not this window's.** Same

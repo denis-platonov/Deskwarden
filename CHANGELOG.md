@@ -15,6 +15,21 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### Windows appear finished, and the screen scan shows your desktop again
+
+**"When loading there is some white box first and it blinks a few times."**
+That was Windows showing each new window painted with its own background
+while Deskwarden was still building it -- and because signing in opens the
+card, then the spinner, then the vault, it happened three times in a row.
+Every window now stays out of sight until it has actually drawn itself, so
+it appears finished rather than assembling.
+
+**Scan a code on my screen** showed a solid black screen instead of your
+dimmed desktop, with no way to see where to drag the box. The overlay was
+being handed an opaque window and filling it in before it ever got to the
+dimming. It is see-through now, the way it was meant to be: your desktop,
+dimmed, with the region you drag shown at full brightness.
+
 ### The one-time-code picker reads any ordinary picture
 
 **Open an image file** used to read PNG and nothing else, and said so; a

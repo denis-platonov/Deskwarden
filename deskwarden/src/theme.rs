@@ -433,6 +433,31 @@ fn letterspaced_in(
 ///
 /// Painting a plain rect needs no fonts, so it is safe on that first frame
 /// and turns the flash into the window's own colour.
+///
+/// # And on every frame, for the two windows that can host the region overlay
+///
+/// The reasoning above is about the FIRST frame, and it was written when
+/// leaving later frames unpainted was harmless: `eframe` cleared them to
+/// `epi::App::clear_color`'s near-black default, and the two windows in
+/// question paint over essentially all of it anyway. That is no longer true of
+/// the vault window (`vault_window::run`) or of the single startup window it
+/// grows out of (`app_window::run_the_one_window`). Both now open
+/// `with_transparent(true)` and clear to nothing at all -- see
+/// [`crate::window_host`] for why design 6b's region overlay needs that -- so
+/// on those two windows an unpainted pixel is a SEE-THROUGH pixel.
+///
+/// The reasoning is unchanged and extended rather than replaced: the first
+/// frame still paints this because the fonts are not live yet, and every later
+/// frame paints it because the window's opacity is now the window's own
+/// responsibility rather than a side effect of what `eframe` happened to clear
+/// to. Hoisted to the top of both closures so it covers the first frame and the
+/// rest with one call -- one `rect_filled` per frame, which is nothing beside
+/// the item list drawn on top of it.
+///
+/// The other five `eframe` windows in this crate still call this on their first
+/// frame only. They are not transparent, they still get the near-black clear,
+/// and giving them a transparent clear is what [`crate::window_host`] argues
+/// against.
 pub fn paint_window_background(ui: &Ui) {
     ui.painter()
         .rect_filled(ui.max_rect(), CornerRadius::ZERO, WINDOW_BG);

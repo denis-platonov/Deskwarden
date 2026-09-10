@@ -669,10 +669,19 @@ pub struct StartupOutcome<P> {
 /// of the next frame, not the one that calls `set_fonts` -- drawing
 /// Archivo-styled text in this same frame would look up a family that does not
 /// exist yet and panic. The OS window does exist by this first painted frame
-/// (the same hook `round_window_corners` uses), which is why the raise is here
-/// and why both sub-frames are built `pre_styled`: a vault frame raising the
-/// window again would yank forward a window the user may have deliberately
-/// sent behind something while `bw serve` started.
+/// (the same hook `round_window_corners` uses), which is why the styling is
+/// here -- and why both sub-frames are built `pre_styled`: a vault frame
+/// styling, revealing or raising the window again would yank forward a window
+/// the user may have deliberately sent behind something while `bw serve`
+/// started.
+///
+/// **The raise is one frame further down, and no longer in that block.** The
+/// window is created `with_visible(false)` -- see `the_vault_windows_viewport`
+/// and `crate::window_host::Reveal` -- and `foreground::pick` skips invisible
+/// windows, so a raise on the styling frame would be searching for a window
+/// Windows has not been asked to show yet and would find nothing. Existing and
+/// being visible are two different hooks; the corner preference wants the
+/// first, the raise wants the second.
 /// **The viewport every host in this module opens, which is the VAULT
 /// window's.**
 ///
@@ -713,6 +722,25 @@ fn the_vault_windows_viewport() -> eframe::NativeOptions {
             crate::settings::MIN_VAULT_WINDOW_SIZE.1 as f32,
         ])
         .with_decorations(false)
+        // **The same two flags `vault_window::build_frame_with_search` sets,
+        // and for the same two reasons** -- because this window BECOMES that
+        // window, and the third stage it shows is `vault_window::build_frame`'s
+        // own UI. Whatever the vault window can open from a frame closure, this
+        // one can open too, and design 6b's region overlay is that.
+        //
+        // `with_transparent(true)`: `eframe` decides the GL config's alpha
+        // capability once, at startup, from the ROOT viewport -- so a child
+        // viewport asking for transparency later is refused, and the overlay
+        // that should dim the desktop is cleared to near-black instead. The
+        // cost to this window is nothing, because `run_the_one_window` paints
+        // its own background on every frame.
+        //
+        // `with_visible(false)`: the white box the user watched blink through
+        // three windows at startup is Windows showing a new window with its own
+        // background while the GL context and the font atlas come up. This one
+        // is shown by `window_host::Reveal` once it has painted something.
+        .with_transparent(true)
+        .with_visible(false)
         .with_icon(theme::window_icon());
     if let Some((x, y)) = placement.position {
         viewport = viewport.with_position([x as f32, y as f32]);
@@ -725,15 +753,40 @@ fn run_the_one_window(
     mut draw: impl FnMut(&mut egui::Ui, &mut eframe::Frame) + 'static,
 ) {
     let mut styled = false;
-    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, frame| {
+    // This host opens its own window, and `the_vault_windows_viewport` opens it
+    // hidden -- so this host is the one that shows it. The frame closures it
+    // hands `draw` are all built `pre_styled`, and their own `Reveal`s are
+    // inert for exactly that reason. See `crate::window_host::Reveal`.
+    let mut window_reveal = crate::window_host::Reveal::hidden();
+    // **`window_host::run_ui_native`, not `eframe`'s.** One difference: the app
+    // clears to nothing instead of to `epi::App::clear_color`'s near-black
+    // default. The vault stage this window ends up showing can open design 6b's
+    // region overlay as a child viewport, and a child viewport is cleared with
+    // its app's colour -- a near-black clear there is a black screen where a
+    // dimmed desktop should be. See `crate::window_host`.
+    let _ = crate::window_host::run_ui_native(WINDOW_TITLE, options, move |ui, frame| {
+        // **EVERY frame.** With a transparent clear, an unpainted pixel is a
+        // see-through pixel; this window's opacity is now this window's own
+        // doing. Hoisted above the guard so the one call covers the first
+        // frame -- which paints this and nothing else, because egui makes a new
+        // font set live only at the start of the following frame -- and every
+        // frame after it. See `theme::paint_window_background`.
+        theme::paint_window_background(ui);
         if !styled {
-            theme::paint_window_background(ui);
             theme::apply(ui.ctx());
             login_ui::round_window_corners(WINDOW_TITLE);
-            let _ = foreground::raise_window(WINDOW_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;
+        }
+        // **The raise moved out of the `!styled` block**, because the window is
+        // created hidden and `foreground::pick` skips invisible windows: on the
+        // styling frame there is nothing for a raise to find. `advance` asks to
+        // be shown on the first frame that paints real content and answers
+        // `true` on the next one. See `foreground`: a refusal from Windows
+        // flashes the taskbar button rather than being ignored.
+        if window_reveal.advance(ui.ctx()) {
+            let _ = foreground::raise_window(WINDOW_TITLE);
         }
         draw(ui, frame);
     });
@@ -4351,7 +4404,9 @@ mod startup_window_tests {
         assert_eq!(
             production.matches(concat!("raise_window(", "WINDOW_TITLE)")).count(),
             1,
-            "this window must ask to be brought to the front exactly once, on its first frame"
+            "this window must ask to be brought to the front exactly once -- on the first frame \
+             it is actually VISIBLE on, which is not its first frame: it is created hidden and \
+             `window_host::Reveal` shows it once it has painted something"
         );
         // Both sub-frames are built `pre_styled`, which is what stops them
         // raising the window again from inside it. Spelled as the argument

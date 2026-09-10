@@ -1420,6 +1420,16 @@ pub fn build_frame_with_search(
     // -- see this function's doc. `false` is `run`'s own value and the
     // behaviour this window has always had.
     let mut styled = pre_styled;
+    // **And it owns the reveal for exactly the same reason it owns the
+    // styling.** `run` opens its window `with_visible(false)` and this closure
+    // is what shows it; `app_window` opened its own and has its own `Reveal`,
+    // so under `pre_styled` this one is inert. Two live `Reveal`s over one
+    // window would re-raise `app_window`'s window on every stage change.
+    let mut window_reveal = if pre_styled {
+        crate::window_host::Reveal::already_visible()
+    } else {
+        crate::window_host::Reveal::hidden()
+    };
     // Where this window was when it was last closed, re-homed onto the
     // monitors that exist right now. Read here, on the main thread, before
     // the window exists -- `Settings::load` is a small file read and every
@@ -1527,6 +1537,32 @@ pub fn build_frame_with_search(
             crate::settings::MIN_VAULT_WINDOW_SIZE.1 as f32,
         ])
         .with_decorations(false)
+        // **This window is opaque and asks for transparency anyway**, and the
+        // reason is entirely about a DIFFERENT window: design 6b's region
+        // overlay, which `totp_add` opens as a deferred viewport of this one.
+        //
+        // `eframe`'s glow backend decides whether the GL config has an alpha
+        // channel ONCE, at startup, from the ROOT viewport's `NativeOptions` --
+        // a child viewport's own `with_transparent(true)` is read too late to
+        // affect it, and is answered with `Cannot create transparent window:
+        // the GL config does not support it` in the log. The overlay then gets
+        // an opaque window, `eframe` clears it to `clear_color`'s near-black
+        // default, and the "dimmed desktop" the user is supposed to drag a box
+        // on is a solid black screen. That was the bug.
+        //
+        // What it costs this window is nothing, PROVIDED this window paints
+        // its own background on every frame rather than relying on the clear
+        // colour -- which is exactly what the frame closure below now does, and
+        // why `theme::paint_window_background`'s doc grew a second half. See
+        // `crate::window_host`.
+        .with_transparent(true)
+        // **Created hidden, shown by `Reveal` once it has painted something.**
+        // Windows shows a new window with its own background while the GL
+        // context and the font atlas are still being built, and that is the
+        // white box the user reported blinking at startup. See
+        // `crate::window_host::Reveal`, which also records why an invisible
+        // window still gets frames at all.
+        .with_visible(false)
         .with_icon(theme::window_icon());
     if let Some((x, y)) = placement.position {
         viewport = viewport.with_position([x as f32, y as f32]);
@@ -1625,19 +1661,37 @@ pub fn build_frame_with_search(
                 &remove_account_for_closure,
             );
         }
+        // **EVERY frame, and no longer only the first.** This window is opened
+        // `with_transparent(true)` so that the region overlay's own
+        // transparency is possible at all, and `window_host` clears it to
+        // nothing -- so a pixel this window does not paint is see-through
+        // rather than near-black. Its opacity is its own business now. Hoisted
+        // above the `!styled` guard so one call covers both the first frame's
+        // no-fonts-yet case (which is what this function was written for) and
+        // every frame after it. See `theme::paint_window_background`.
+        theme::paint_window_background(ui);
         if !styled {
             log::info!("vault window: first frame {:?} after eframe was asked", eframe_handoff.elapsed());
-            theme::paint_window_background(ui);
             theme::apply(ui.ctx());
             round_window_corners(WINDOW_TITLE);
-            // The OS window exists by this first painted frame (the same
-            // hook `round_window_corners` uses), and this is where it is
-            // brought to the front. See `foreground`: a refusal from Windows
-            // flashes the taskbar button rather than being ignored.
-            crate::foreground::raise_window(WINDOW_TITLE);
             styled = true;
             ui.ctx().request_repaint();
             return;
+        }
+        // **The raise moved down here from the `!styled` block above**, and it
+        // had to: this window is created hidden, `foreground::pick` skips
+        // invisible windows, and the frame that styles it is a frame on which
+        // Windows has not been asked to show it yet. `advance` asks on the
+        // first frame that paints real content and answers `true` on the one
+        // after, which is the first frame there is anything to bring forward.
+        // See `foreground`: a refusal from Windows flashes the taskbar button
+        // rather than being ignored.
+        //
+        // Above every early return below for the same reason the resize
+        // handles are: the loading and unavailable pages are still windows the
+        // user has to be shown.
+        if window_reveal.advance(ui.ctx()) {
+            crate::foreground::raise_window(WINDOW_TITLE);
         }
 
         // The eight grabbable edges/corners. FIRST, before anything else this
@@ -6677,7 +6731,14 @@ pub fn run(
     // by this call; a hide implemented by returning here and running again
     // would be a window that never comes back. That is why hiding happens
     // inside the closure, as a viewport command.
-    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| frame_fn(ui));
+    // **`window_host::run_ui_native`, not `eframe`'s.** Identical in every
+    // respect but one: the app it builds clears to nothing instead of to
+    // `epi::App::clear_color`'s near-black default, which is what design 6b's
+    // region overlay -- a child viewport of THIS window, sharing this app's
+    // clear colour -- needs in order to dim a desktop rather than cover it.
+    // The window itself is unaffected because the frame closure above paints
+    // its background on every frame. See `crate::window_host`.
+    let _ = crate::window_host::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| frame_fn(ui));
 
     let result = handles.finish();
     // **The effect sits here and the decision sits in
@@ -13103,12 +13164,20 @@ pub(crate) fn webbrowser_open(url: &str) {
 mod hide_shape_tests {
     /// **Hiding happens inside the running app, and this pin says so.**
     ///
-    /// `eframe::run_ui_native` consumes winit's event loop. A second call in
+    /// The eframe host consumes winit's event loop. A second call in
     /// the same process does not open a second window -- it fails -- so a
     /// "hide" implemented by returning from `run` and calling it again would
     /// be a window that never comes back, and it would look perfectly
     /// reasonable in review. The hide must be a viewport command sent from
     /// inside the update closure, and the host must be entered exactly once.
+    ///
+    /// **The needle names `window_host` and no longer `eframe`.** This window
+    /// goes through `crate::window_host`'s shim, which is `eframe`'s own
+    /// `run_ui_native` with one override -- a transparent clear colour, which
+    /// the region overlay needs and `eframe` does not offer through that entry
+    /// point. Counting `eframe::run_ui_native(` here would now count zero and
+    /// pass for the wrong reason, which is the shape of guard this crate keeps
+    /// finding; the count below is over the call that is really made.
     #[test]
     fn the_hide_is_a_viewport_command_and_the_host_is_entered_once() {
         let source = include_str!("mod.rs");
@@ -13127,10 +13196,10 @@ mod hide_shape_tests {
              keep a window that can come back"
         );
         assert_eq!(
-            // The CALL, not the prose: four doc comments in this file name
+            // The CALL, not the prose: several doc comments in this file name
             // the host without calling it, and a pin that counted those
             // would fail on a comment and pass on a second call.
-            production.matches(concat!("eframe::run_ui_", "native(")).count(),
+            production.matches(concat!("window_host::run_ui_", "native(")).count(),
             1,
             "the eframe host is entered more than once, which winit does not support: the \
              second window never opens and the user's Open Vault does nothing"
@@ -22956,7 +23025,13 @@ mod frame_host_tests {
         // several doc comments, and a needle that matched those would fail
         // here for the wrong reason and, worse, would pass the count below
         // only by accident of how much prose happened to be written.
-        const CALL: &str = concat!("eframe::run_ui_", "native(");
+        //
+        // `window_host::` and no longer `eframe::`: this window is opened
+        // through `crate::window_host`'s shim, whose one difference from
+        // `eframe::run_ui_native` is a transparent clear colour. See that
+        // module, and `hide_shape_tests` above, which had to follow the same
+        // rename.
+        const CALL: &str = concat!("window_host::run_ui_", "native(");
         assert!(
             !build_body.contains(CALL),
             "`build_frame` opens its own event loop, so the single-window host calling it \
