@@ -58,9 +58,10 @@ machine and thrown away; nothing is recorded and nothing is sent anywhere.
 **Scan the code on my screen** -- the row that used to read *Scan a region of
 my screen* -- no longer begins by asking you to drag a box. Choosing it looks
 at every monitor you have and reads the QR code sitting on it. If there is
-exactly one, you go straight to the confirmation card, with what was
-extracted, a live code and its countdown, and no overlay ever appears.
-**Nothing is saved until you press Save**, exactly as before.
+exactly one, Deskwarden **shows you the one it found**: the screen dims for a
+moment, a blue box and a tick appear around the code where it is sitting, and
+then you land on the confirmation card with what was extracted, a live code and
+its countdown. **Nothing is saved until you press Save**, exactly as before.
 
 The box is still there for when the scan cannot answer. If no code was found
 -- it is very small, or low-contrast, or half-covered -- the dimmed overlay

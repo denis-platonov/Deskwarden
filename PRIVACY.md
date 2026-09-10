@@ -100,11 +100,22 @@ reach. Not opening it is the switch. Windows' own camera permission
 (Settings → Privacy & security → Camera) applies on top and can refuse
 Deskwarden the camera outright, in which case the screen says so.
 
-The same screen offers three other ways in, and the picture they read is
-handled the same way: a region of your own screen that you drag a box
-around, a picture file that you choose, and typing the key by hand. The
-first two read only what you point them at, decode it here, and keep
-nothing but the code.
+The same screen offers three other ways in, and what they read is handled
+the same way: your own screen, a picture file that you choose, and typing
+the key by hand.
+
+**The screen route reads your whole desktop, not just a box you drew.**
+Choosing it takes one picture of each monitor and looks for a QR code
+anywhere on any of them, so that you do not have to find the code and
+frame it yourself. Deskwarden's own window is hidden from that picture
+while it is taken, and shown again straight after. If the scan finds
+exactly one code it draws a mark around it so you can see what it read;
+if it finds none, or more than one, it asks you to drag a box around the
+one you mean.
+
+Every one of those pictures is decoded on this machine and thrown away --
+within the same moment, never written to disk, never sent anywhere, and
+never drawn on screen. What is kept is the code, and nothing else.
 
 ## What leaves your machine, and to whom
 

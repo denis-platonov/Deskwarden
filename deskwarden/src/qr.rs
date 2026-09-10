@@ -8,6 +8,18 @@
 //! unit-tested; everything downstream of it, including this, is lifted out so
 //! that it can be.
 //!
+//! # Why this file names [`crate::screen_capture`]
+//!
+//! It imports two things from it and calls no OS API through either: the
+//! [`ScreenRect`] type and [`crate::screen_capture::rect_around`], the pure
+//! arithmetic that builds one out of four corner points. [`codes_in`] reports
+//! **where** in the picture a code was, so the whole-screen scan can ring it
+//! on the overlay, and a rectangle is what that answer is -- so it is this
+//! crate's rectangle rather than a second one declared here. See
+//! [`Codes::One`] for what space the numbers are in, which is the part worth
+//! reading before using them. Nothing about this module's purity changes: a
+//! type and a `min`/`max` are not I/O.
+//!
 //! # The pixels ARE the secret
 //!
 //! A QR code of an `otpauth://` URI is the seed in visual form. So the string
@@ -25,6 +37,8 @@
 //! URL to fetch, a path, or a command.
 
 use zeroize::Zeroizing;
+
+use crate::screen_capture::{rect_around, ScreenRect};
 
 /// The largest buffer [`decode_qr`] will look at, in pixels.
 ///
@@ -80,7 +94,7 @@ pub const MAX_PIXELS: usize = 64 * 1024 * 1024;
 /// it never leaves the machine, because this decoder has no I/O at all.
 pub fn decode_qr(rgba: &[u8], width: usize, height: usize) -> Option<Zeroizing<String>> {
     let mut first = None;
-    walk_codes(rgba, width, height, |text| {
+    walk_codes(rgba, width, height, |text, _where| {
         first = Some(text);
         // The FIRST grid, which is this function's whole contract: three
         // routes ask "what does this picture say" and none of them has a use
@@ -99,10 +113,30 @@ pub fn decode_qr(rgba: &[u8], width: usize, height: usize) -> Option<Zeroizing<S
 pub enum Codes {
     /// Nothing in the buffer decoded.
     None,
-    /// Exactly one distinct payload, however many grids carried it.
-    One(Zeroizing<String>),
+    /// Exactly one distinct payload, however many grids carried it, and the
+    /// box it occupied.
+    ///
+    /// **The rectangle is a [`ScreenRect`] and it is not on the screen.** The
+    /// type is this crate's one rectangle and it is reused rather than a
+    /// second one being invented, because a crate with two rectangle types is
+    /// a crate where one of them eventually gets passed where the other was
+    /// meant. What [`codes_in`] fills in is the code's box **in the picture it
+    /// was handed**, with `(0, 0)` at that picture's top-left.
+    ///
+    /// For a capture of one monitor that is the monitor's own pixels, and
+    /// [`crate::screen_capture::place_in_capture`] is what moves it onto the
+    /// desktop -- which the whole-screen scan does per monitor, before it
+    /// folds two monitors' answers together, precisely so that the rectangle a
+    /// caller finally reads is in one known space rather than in whichever
+    /// monitor happened to answer.
+    ///
+    /// It is **not a secret**, unlike the string beside it: it is where on a
+    /// screen the user's own code was, which the user is looking at.
+    One(Zeroizing<String>, ScreenRect),
     /// Two or more **different** payloads. Deliberately carries none of them
-    /// -- see [`codes_in`].
+    /// -- see [`codes_in`] -- and therefore no place either: the answer is
+    /// "Deskwarden will not choose", and a place is only useful for pointing
+    /// at the one code that was chosen.
     Several,
 }
 
@@ -110,7 +144,13 @@ impl std::fmt::Debug for Codes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Codes::None => write!(f, "None"),
-            Codes::One(text) => write!(f, "One({} chars not shown)", text.len()),
+            // The rectangle is printed and the payload is not. It is not a
+            // secret -- it is where on a screen a code was, which the user is
+            // looking at -- and it is the one thing about a `One` worth
+            // having in a failure message.
+            Codes::One(text, at) => {
+                write!(f, "One({} chars not shown, at {at:?})", text.len())
+            }
             Codes::Several => write!(f, "Several"),
         }
     }
@@ -150,7 +190,7 @@ impl std::fmt::Debug for Codes {
 /// walks the same grids through the same helper.
 pub fn codes_in(rgba: &[u8], width: usize, height: usize) -> Codes {
     let mut tally = Tally::new();
-    walk_codes(rgba, width, height, |text| tally.saw(text));
+    walk_codes(rgba, width, height, |text, at| tally.saw(text, at));
     tally.finish()
 }
 
@@ -172,8 +212,15 @@ pub fn codes_in(rgba: &[u8], width: usize, height: usize) -> Codes {
 /// **At most one payload is ever held.** A second, different one does not
 /// join a list; it drops the one being held and latches [`Self::several`], so
 /// the widest this can get is a single seed plus a boolean.
+///
+/// **The payload and its place are one field, not two.** They are answers to
+/// the same sighting and they have to move together: two `Option`s that must
+/// agree is a state with a fourth combination in it -- a place with no
+/// payload, or the place of a code that was dropped as a duplicate -- and the
+/// fourth combination is the one that reaches the user as a blue box drawn
+/// round the wrong thing.
 pub struct Tally {
-    seen: Option<Zeroizing<String>>,
+    seen: Option<(Zeroizing<String>, ScreenRect)>,
     several: bool,
 }
 
@@ -205,12 +252,21 @@ impl Tally {
     /// to compare against, so a caller that kept feeding this -- a merge loop
     /// that ignored the `false`, say -- would find `seen` empty, take the
     /// first branch below, and quietly turn "more than one" back into "one".
-    pub fn saw(&mut self, text: Zeroizing<String>) -> bool {
+    ///
+    /// `at` is where that payload was, in whatever space the caller is
+    /// working in -- see [`Codes::One`]. **The FIRST sighting's place is the
+    /// one kept**, matching the payload it is the place of: a code that turns
+    /// up a second time on another monitor is the same secret, but it is not
+    /// in the same place, and a mark drawn at the later place would point at
+    /// a copy of the code rather than at the code the user is looking at. The
+    /// first is no better a guess than the second, and it is the one that
+    /// belongs to the string being held.
+    pub fn saw(&mut self, text: Zeroizing<String>, at: ScreenRect) -> bool {
         if self.several {
             return false;
         }
         let differs = match self.seen.as_ref() {
-            Some(first) => first.as_str() != text.as_str(),
+            Some((first, _)) => first.as_str() != text.as_str(),
             None => false,
         };
         if differs {
@@ -220,7 +276,7 @@ impl Tally {
             return false;
         }
         if self.seen.is_none() {
-            self.seen = Some(text);
+            self.seen = Some((text, at));
         }
         true
     }
@@ -233,7 +289,7 @@ impl Tally {
         }
         match codes {
             Codes::None => true,
-            Codes::One(text) => self.saw(text),
+            Codes::One(text, at) => self.saw(text, at),
             Codes::Several => {
                 self.several = true;
                 self.seen = None;
@@ -246,15 +302,26 @@ impl Tally {
     /// than copied.
     pub fn finish(self) -> Codes {
         match self.seen {
-            Some(text) => Codes::One(text),
+            Some((text, at)) => Codes::One(text, at),
             None if self.several => Codes::Several,
             None => Codes::None,
         }
     }
 }
 
-/// Walks the QR grids in an RGBA buffer, handing each decoded payload to
-/// `visit` until it answers `false`.
+/// Walks the QR grids in an RGBA buffer, handing each decoded payload **and
+/// the box it sat in** to `visit` until it answers `false`.
+///
+/// The box comes from `rqrr::Grid::bounds`, which this is the only place in
+/// the crate that reads. It is four corner points in the buffer's own pixels,
+/// listed top-left, top-right, bottom-right, bottom-left, and it is turned
+/// into a rectangle by [`crate::screen_capture::rect_around`] rather than by
+/// arithmetic here -- rectangles are built in one module in this crate, for
+/// the reason `region_overlay`'s `Drag::rect` gives at greater length.
+///
+/// **It is read whether or not the caller wants it**, because the alternative
+/// is two walks. It costs four `i32` copies per grid and [`decode_qr`] throws
+/// it away.
 ///
 /// **The one place in this crate that talks to `rqrr`**, and it is one place
 /// on purpose. The buffer discipline documented at length on [`decode_qr`] --
@@ -273,7 +340,7 @@ fn walk_codes(
     rgba: &[u8],
     width: usize,
     height: usize,
-    mut visit: impl FnMut(Zeroizing<String>) -> bool,
+    mut visit: impl FnMut(Zeroizing<String>, ScreenRect) -> bool,
 ) {
     if width == 0 || height == 0 {
         return;
@@ -310,6 +377,10 @@ fn walk_codes(
         if grid.decode_to(&mut *out).is_err() || out.is_empty() {
             continue;
         }
+        // Read after the decode succeeded, so a grid that was detected but
+        // could not be read never produces a place -- there is no payload for
+        // it to be the place of.
+        let at = rect_around(grid.bounds.map(|point| (point.x, point.y)));
         // `take` moves the buffer out so `from_utf8` can re-use its
         // allocation; the `Zeroizing` left behind holds an empty `Vec`, and
         // the seed's one and only buffer is now inside the `Zeroizing<String>`
@@ -318,7 +389,7 @@ fn walk_codes(
         let bytes = std::mem::take(&mut *out);
         match String::from_utf8(bytes) {
             Ok(text) => {
-                if !visit(Zeroizing::new(text)) {
+                if !visit(Zeroizing::new(text), at) {
                     return;
                 }
             }
@@ -720,9 +791,103 @@ pub(crate) mod tests {
     fn a_page_with_one_code_reports_exactly_one() {
         let (page, w, h) = fixture_row(1, 4);
         match codes_in(&page, w, h) {
-            Codes::One(text) => assert_eq!(&*text, FIXTURE_TEXT),
+            Codes::One(text, _) => assert_eq!(&*text, FIXTURE_TEXT),
             other => panic!("one code on the page came back as {other:?}"),
         }
+    }
+
+    /// **The box comes back with the payload, and it is where the code
+    /// actually is.**
+    ///
+    /// The claim design 6b's reveal is drawn from: after a whole-screen scan
+    /// the overlay rings the code, and a ring in the wrong place is worse than
+    /// no ring at all. `rqrr` extrapolates a grid's corners from its three
+    /// finder patterns rather than measuring them, so this is deliberately
+    /// **not** an exact-pixel assertion -- it is the two properties that
+    /// matter: the box is inside the picture, and it covers the modules rather
+    /// than the quiet zone or the page.
+    ///
+    /// [`fixture_rgba`] renders [`FIXTURE`]'s 45 modules at `scale` pixels
+    /// each with a four-module quiet zone, so the code itself occupies exactly
+    /// `[4 * scale, (4 + 45) * scale)` on both axes and every number below is
+    /// derived from that rather than typed in.
+    #[test]
+    fn the_box_that_comes_back_is_where_the_code_is() {
+        const QUIET: usize = 4;
+        for scale in [3usize, 4, 6] {
+            let (rgba, w, h) = fixture_rgba(scale);
+            let at = match codes_in(&rgba, w, h) {
+                Codes::One(_, at) => at,
+                other => panic!("the fixture came back as {other:?} at scale {scale}"),
+            };
+            let modules_from = (QUIET * scale) as i32;
+            let modules_to = ((QUIET + FIXTURE.len()) * scale) as i32;
+
+            // Inside the picture it was found in, on every side.
+            assert!(
+                at.left >= 0 && at.top >= 0 && at.right <= w as i32 && at.bottom <= h as i32,
+                "scale {scale}: {at:?} is not inside the {w}x{h} picture it was found in"
+            );
+            // And covering the code rather than the page: the box starts in
+            // the quiet zone or on the code, and ends on the code or in the
+            // quiet zone past it.
+            //
+            // **Two modules of slack on each side**, and the tolerance is in
+            // modules rather than pixels so that it does not silently tighten
+            // as `scale` grows. It is not padding for a wrong answer: `rqrr`
+            // fits the grid to the three finder patterns and extrapolates the
+            // fourth corner, so the far edges come back a module or so past
+            // the last dark module while the top-left, which sits on a finder
+            // pattern, is exact. Measured at these scales the overshoot is
+            // about a module and a third. Anything within two modules is the
+            // right code; anything outside it is a different rectangle
+            // altogether -- the whole picture, the quiet zone, or nothing.
+            let slack = 2 * scale as i32;
+            assert!(
+                (at.left - modules_from).abs() <= slack && (at.top - modules_from).abs() <= slack,
+                "scale {scale}: {at:?} does not start at the code's top-left ({modules_from})"
+            );
+            assert!(
+                (at.right - modules_to).abs() <= slack && (at.bottom - modules_to).abs() <= slack,
+                "scale {scale}: {at:?} does not end at the code's bottom-right ({modules_to})"
+            );
+            // Positive control on the whole assertion: the box is a real,
+            // positive rectangle roughly the size of the code and not a
+            // degenerate one that would satisfy nothing above by accident.
+            assert!(at.width() > 0 && at.height() > 0, "scale {scale}: {at:?} is empty");
+        }
+    }
+
+    /// **The box moves with the code.** The test above pins it against the
+    /// one layout `fixture_rgba` produces, where the code is always in the
+    /// same place; this renders the same code twice at two different offsets
+    /// on one page and requires the two answers to differ by the offset --
+    /// which a decoder that reported a constant, or the whole picture, would
+    /// fail.
+    #[test]
+    fn a_code_further_down_the_page_reports_a_box_further_down_the_page() {
+        // `fixture_row` lays copies out left to right with a gap, so the
+        // second copy's box must be to the right of the first's by at least
+        // the code's own width and must not overlap it.
+        let (page, w, h) = fixture_row(2, 4);
+        let mut boxes = Vec::new();
+        walk_codes(&page, w, h, |_, at| {
+            boxes.push(at);
+            true
+        });
+        assert!(boxes.len() >= 2, "only {} copies decoded", boxes.len());
+        boxes.sort_by_key(|b| b.left);
+        let (first, second) = (boxes[0], boxes[boxes.len() - 1]);
+        assert!(
+            second.left >= first.right,
+            "two copies side by side reported overlapping boxes: {first:?} and {second:?}"
+        );
+        // Same code, same size, different place -- which is the point.
+        assert!(
+            (first.width() as i64 - second.width() as i64).abs() <= 4,
+            "the same code reported two very different sizes: {first:?} and {second:?}"
+        );
+        assert!(second.top < h as i32 && first.bottom <= h as i32);
     }
 
     /// **The same code twice is ONE answer, not two.**
@@ -741,7 +906,7 @@ pub(crate) mod tests {
     fn the_same_code_twice_in_one_picture_is_one_answer() {
         let (page, w, h) = fixture_row(2, 4);
         let mut decoded = 0usize;
-        walk_codes(&page, w, h, |text| {
+        walk_codes(&page, w, h, |text, _at| {
             assert_eq!(&*text, FIXTURE_TEXT);
             decoded += 1;
             true
@@ -751,7 +916,7 @@ pub(crate) mod tests {
             "only {decoded} of the two copies decoded, so the de-duplication below is untested"
         );
         match codes_in(&page, w, h) {
-            Codes::One(text) => assert_eq!(&*text, FIXTURE_TEXT),
+            Codes::One(text, _) => assert_eq!(&*text, FIXTURE_TEXT),
             other => panic!("two copies of one code came back as {other:?}"),
         }
     }
@@ -763,7 +928,7 @@ pub(crate) mod tests {
         let white = vec![0xffu8; 300 * 300 * 4];
         assert!(matches!(codes_in(&white, 300, 300), Codes::None));
         let (page, w, h) = fixture_row(1, 4);
-        assert!(matches!(codes_in(&page, w, h), Codes::One(_)));
+        assert!(matches!(codes_in(&page, w, h), Codes::One(..)));
     }
 
     /// The same bounds [`decode_qr`] refuses, refused the same way: a
@@ -804,10 +969,15 @@ pub(crate) mod tests {
     /// `Outcome`'s is.
     #[test]
     fn the_debug_of_a_found_code_does_not_print_it() {
-        let shown = format!("{:?}", Codes::One(Zeroizing::new(FIXTURE_TEXT.to_string())));
+        let at = ScreenRect { left: 10, top: 20, right: 210, bottom: 220 };
+        let shown = format!("{:?}", Codes::One(Zeroizing::new(FIXTURE_TEXT.to_string()), at));
         assert!(!shown.contains("JBSWY3DPEHPK3PXP"), "{shown}");
         assert!(!shown.contains("otpauth"), "{shown}");
         assert!(shown.contains("not shown"), "{shown}");
+        // The place IS printed. It is not a secret -- it is where on their own
+        // screen the user's code was -- and it is the one thing about a `One`
+        // that is worth having in a failure message.
+        assert!(shown.contains("left: 10"), "{shown}");
         assert_eq!(format!("{:?}", Codes::None), "None");
         assert_eq!(format!("{:?}", Codes::Several), "Several");
     }
@@ -822,7 +992,7 @@ pub(crate) mod tests {
             let (rgba, w, h) = fixture_rgba(scale);
             let one = decode_qr(&rgba, w, h).expect("decode_qr reads it");
             match codes_in(&rgba, w, h) {
-                Codes::One(other) => assert_eq!(&*one, &*other),
+                Codes::One(other, _) => assert_eq!(&*one, &*other),
                 other => panic!("codes_in disagreed at scale {scale}: {other:?}"),
             }
         }
@@ -846,8 +1016,11 @@ pub(crate) mod tests {
     fn two_different_payloads_are_several_and_several_carries_nothing() {
         fn fold(payloads: &[&str]) -> Codes {
             let mut tally = Tally::new();
-            for payload in payloads {
-                if !tally.saw(Zeroizing::new((*payload).to_string())) {
+            for (nth, payload) in payloads.iter().enumerate() {
+                // A different place per sighting, so the place assertions
+                // below are about which one was kept and not about them all
+                // being the same anyway.
+                if !tally.saw(Zeroizing::new((*payload).to_string()), somewhere(nth as i32)) {
                     break;
                 }
             }
@@ -859,8 +1032,15 @@ pub(crate) mod tests {
         assert!(matches!(fold(&[other, FIXTURE_TEXT]), Codes::Several));
         // The de-duplication, in the type the picture walk uses: repeats are
         // one, however many of them arrive.
-        assert!(matches!(fold(&[FIXTURE_TEXT, FIXTURE_TEXT, FIXTURE_TEXT]), Codes::One(_)));
-        assert!(matches!(fold(&[FIXTURE_TEXT]), Codes::One(_)));
+        assert!(matches!(fold(&[FIXTURE_TEXT, FIXTURE_TEXT, FIXTURE_TEXT]), Codes::One(..)));
+        assert!(matches!(fold(&[FIXTURE_TEXT]), Codes::One(..)));
+        // **The FIRST sighting's place is the one kept**, matching the payload
+        // it belongs to. Three sightings at three places answer with the
+        // first.
+        match fold(&[FIXTURE_TEXT, FIXTURE_TEXT, FIXTURE_TEXT]) {
+            Codes::One(_, at) => assert_eq!(at, somewhere(0)),
+            other => panic!("three sightings of one code came back as {other:?}"),
+        }
         assert!(matches!(fold(&[]), Codes::None));
         // And `Several` carries nothing: the `Debug` has no room for a
         // payload, and the value it was holding was dropped at the moment the
@@ -876,13 +1056,28 @@ pub(crate) mod tests {
     fn a_tally_that_has_seen_two_codes_cannot_be_talked_back_down_to_one() {
         let other = "otpauth://totp/Other:b?secret=MFRGGZDFMZTWQ2LK";
         let mut tally = Tally::new();
-        assert!(tally.saw(Zeroizing::new(FIXTURE_TEXT.to_string())));
-        assert!(!tally.saw(Zeroizing::new(other.to_string())), "the second code did not stop it");
+        assert!(tally.saw(Zeroizing::new(FIXTURE_TEXT.to_string()), somewhere(0)));
+        assert!(
+            !tally.saw(Zeroizing::new(other.to_string()), somewhere(1)),
+            "the second code did not stop it"
+        );
         // Six more sightings of the same payload, all ignored.
-        for _ in 0..6 {
-            assert!(!tally.saw(Zeroizing::new(FIXTURE_TEXT.to_string())));
+        for nth in 0..6 {
+            assert!(!tally.saw(Zeroizing::new(FIXTURE_TEXT.to_string()), somewhere(nth)));
         }
         assert!(matches!(tally.finish(), Codes::Several));
+    }
+
+    /// A distinct rectangle per `nth`, so a test can tell which sighting's
+    /// place a tally kept. Nothing about the numbers matters beyond their
+    /// being different from each other.
+    fn somewhere(nth: i32) -> ScreenRect {
+        ScreenRect {
+            left: nth * 100,
+            top: nth * 50,
+            right: nth * 100 + 80,
+            bottom: nth * 50 + 80,
+        }
     }
 
     /// **A whole picture's answer folds in the same way one payload does**,
@@ -891,25 +1086,31 @@ pub(crate) mod tests {
     #[test]
     fn merging_whole_pictures_follows_the_same_rule_as_merging_payloads() {
         let other = "otpauth://totp/Other:b?secret=MFRGGZDFMZTWQ2LK";
-        let one = || Codes::One(Zeroizing::new(FIXTURE_TEXT.to_string()));
+        let one = |nth| Codes::One(Zeroizing::new(FIXTURE_TEXT.to_string()), somewhere(nth));
 
         // Empty pictures change nothing.
         let mut tally = Tally::new();
         assert!(tally.merge(Codes::None));
-        assert!(tally.merge(one()));
+        assert!(tally.merge(one(0)));
         assert!(tally.merge(Codes::None));
-        assert!(matches!(tally.finish(), Codes::One(_)));
+        assert!(matches!(tally.finish(), Codes::One(..)));
 
-        // The same code on two monitors is one code.
+        // The same code on two monitors is one code -- and it is the FIRST
+        // monitor's place that survives, because that is the monitor the
+        // payload being held came off. A mark drawn at the second would point
+        // at a copy of the code rather than at the code.
         let mut tally = Tally::new();
-        assert!(tally.merge(one()));
-        assert!(tally.merge(one()));
-        assert!(matches!(tally.finish(), Codes::One(_)));
+        assert!(tally.merge(one(0)));
+        assert!(tally.merge(one(1)));
+        match tally.finish() {
+            Codes::One(_, at) => assert_eq!(at, somewhere(0)),
+            other => panic!("one code on two monitors came back as {other:?}"),
+        }
 
         // Different codes on two monitors are several.
         let mut tally = Tally::new();
-        assert!(tally.merge(one()));
-        assert!(!tally.merge(Codes::One(Zeroizing::new(other.to_string()))));
+        assert!(tally.merge(one(0)));
+        assert!(!tally.merge(Codes::One(Zeroizing::new(other.to_string()), somewhere(1))));
         assert!(matches!(tally.finish(), Codes::Several));
 
         // And one monitor that held two on its own settles it by itself.
@@ -918,7 +1119,7 @@ pub(crate) mod tests {
         assert!(matches!(tally.finish(), Codes::Several));
         // Including when a code had already been found somewhere else.
         let mut tally = Tally::new();
-        assert!(tally.merge(one()));
+        assert!(tally.merge(one(0)));
         assert!(!tally.merge(Codes::Several));
         assert!(matches!(tally.finish(), Codes::Several));
     }

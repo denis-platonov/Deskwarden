@@ -22,11 +22,21 @@
 //! So [`RegionOverlay::show`]'s first act is [`scan_screen_with`] over every
 //! monitor, and 6b opens only when that cannot answer:
 //!
-//! * **exactly one code** -- the overlay never appears at all. The outcome is
-//!   [`Outcome::Decoded`] before a window exists, and the caller lands on the
-//!   same 6c confirmation card every other route lands on. **Nothing is
-//!   saved**: 6c holds the code and its countdown, and Save is a press the
-//!   user makes.
+//! * **exactly one code** -- the overlay opens for less than half a second,
+//!   rings the code **where it actually is on the user's screen** with 6b's
+//!   own blue ring, brackets and tick, and closes. The outcome is
+//!   [`Outcome::Decoded`], and the caller lands on the same 6c confirmation
+//!   card every other route lands on. **Nothing is saved**: 6c holds the code
+//!   and its countdown, and Save is a press the user makes.
+//!
+//!   That half-second is [`REVEAL_DWELL`] and it is there because the route
+//!   shipped without it and was worse: the press did something invisible and
+//!   then a card appeared holding the user's secret, with no account of where
+//!   it had come from. The owner asked for the missing half in these words --
+//!   *"when captured - draw blue line around QR code and V sign like in
+//!   design, so user sees it captured automatically"*. It is a statement and
+//!   not a screen: no bar, no chips, no input read, and it ends on a clock
+//!   rather than on anything the user does. See [`Reveal`].
 //! * **none** -- 6b opens, and its bottom bar says why, because a full-screen
 //!   dim that arrives with no account of itself is a surface the user has to
 //!   reverse-engineer.
@@ -81,6 +91,9 @@
 //!   and a monitor too large to decode, all through the same seams;
 //! * [`RegionOverlay::prescan_step`] -- that the scan runs **once** and then
 //!   never again, driven by a clock a test supplies;
+//! * [`RegionOverlay::reveal_step`] -- that the reveal starts once, ends on
+//!   the clock and never restarts, and that the code's box arrives in the
+//!   right place on a monitor whose origin is not `(0, 0)`;
 //! * [`RegionOverlay::chip_gesture`] -- that a press on a bar chip belongs to
 //!   that chip and does not also become a one-pixel drag.
 //!
@@ -88,6 +101,10 @@
 //!
 //! * that Windows grants this window the foreground when it opens. The raise
 //!   is asked for; the OS may refuse it and flash a taskbar button instead.
+//! * that the window is see-through at all. [`let_the_desktop_through`] makes
+//!   the DWM call `winit` skips, and whether the compositor honours it is a
+//!   fact about a real desktop with a real driver. What is asserted is that
+//!   the call is made, on the frame the window first exists.
 //! * that the viewport covers **every** monitor. The rectangle handed to the
 //!   builder is computed from [`crate::screen_capture::monitor_bounds`], and
 //!   that computation is tested -- but whether the window manager honours a
@@ -163,6 +180,25 @@ pub const DRAG_HINT: &str = "Deskwarden reads it the moment you let go. Nothing 
 
 /// 6b's lock-on badge, shown **while the button is still down**.
 pub const LOCKED_ON: &str = "Code found \u{b7} release to read";
+
+/// **The reveal's badge**: what the overlay says on the half-second it spends
+/// showing the user the code its scan just read.
+///
+/// **Not [`LOCKED_ON`], and the difference is the whole point.** That
+/// sentence ends in an instruction -- *release to read* -- and on the reveal
+/// there is nothing to release and nothing left to do: the code has already
+/// been read, the button was never down, and the next thing the user sees is
+/// 6c. A badge that told them to release would be asking for a gesture that
+/// does not exist.
+///
+/// The words are **design 6c's own card header**, verbatim. That is
+/// deliberate rather than convenient: the last thing this surface says and
+/// the first thing the card says are then the same two words, so the handoff
+/// between a window that vanishes and a card that appears reads as one event
+/// instead of two. It is also the shortest true sentence available, which
+/// matters on a badge that is on screen for less time than it takes to read a
+/// long one.
+pub const SCAN_FOUND: &str = "Code read";
 
 /// 6b's two shortcut affordances, at the right-hand end of the bottom bar.
 /// Each is a bordered chip carrying its label and, in the design's monospace,
@@ -251,6 +287,21 @@ pub fn scan_miss_line(miss: ScanMiss) -> String {
 /// the design's, because the design's wash is the app's ink and carries its
 /// warmth. The selection itself is left entirely unpainted, which is what
 /// "stays lit" means on a transparent viewport.
+///
+/// **Re-examined once the window was actually see-through, and left alone.**
+/// It is worth saying why, because the temptation to re-tune it here is
+/// strong and would be a mistake. Until
+/// [`let_the_desktop_through`] this viewport was opaque and cleared to
+/// near-black, so 173 was being composited over black rather than over the
+/// desktop -- and the result was black whatever the number was. Every
+/// judgement anyone could have formed about this value was formed against
+/// that, so *none of them was about this value*. What the arithmetic above
+/// says is unchanged and is now true for the first time: at 68% the desktop
+/// comes through at the design's own 32%. Lightening it because 68% "looks
+/// heavy" in isolation would be substituting a guess for the design's
+/// measurement, and the only honest reason to move it would be a real desktop
+/// where the selection cannot be told from the dim -- which is the opposite
+/// complaint.
 pub const DIM_ALPHA: u8 = 173;
 
 /// The solid ring around the selection: `box-shadow: 0 0 0 2px #1b3fa0`.
@@ -513,6 +564,50 @@ pub const DECODE_INTERVAL: Duration = Duration::from_millis(150);
 /// see the module header's list of what a real desktop is needed for.
 pub const PRESCAN_SETTLE: Duration = Duration::from_millis(80);
 
+/// **How long the overlay shows the user the code it just found, before it
+/// closes and 6c appears.**
+///
+/// # Why there is a pause at all
+///
+/// The scan shipped without one and the route was worse for it. The user
+/// presses *Scan the code on my screen*, nothing visible happens for as long
+/// as the decode takes, and then a card appears with their secret already in
+/// it. Every step of that is correct and the middle of it is invisible, so
+/// the only account the user has of where the code came from is that the app
+/// says so. The owner asked for the missing half in these words: *"when
+/// captured - draw blue line around QR code and V sign like in design, so
+/// user sees it captured automatically"*. The point is not decoration; it is
+/// that the app **shows its working** -- there is the code, on your screen,
+/// that is the one I read.
+///
+/// # Why 450 ms
+///
+/// Bounded on both sides by things that are not taste.
+///
+/// Below, by what it takes to be *seen* rather than glimpsed. The mark
+/// appears wherever the code happens to be, which is not where the pointer is
+/// and not where the user was looking -- so the eye has to move to it. A
+/// saccade to an unexpected target plus the fixation that follows is around a
+/// quarter of a second before anything has been looked at at all, which is
+/// also the "reads as immediate" threshold [`DECODE_INTERVAL`] is argued
+/// against. A reveal near that number is a flash the user notices and cannot
+/// describe. 450 ms is comfortably past it with the badge still on screen.
+///
+/// Above, by when a fixed wait stops reading as an answer and starts reading
+/// as the app thinking. That is somewhere near a second, and 450 ms is under
+/// half of it.
+///
+/// # Why it does not dominate the route
+///
+/// It must not be the longest thing between the press and the card, or the
+/// feature would have been made slower to look faster. It is not: the scan in
+/// front of it is [`PRESCAN_SETTLE`] plus a full binarisation and grid search
+/// over **every monitor**, which is hundreds of milliseconds on one 4K screen
+/// and more on two. The reveal is a fraction of what the user was already
+/// waiting through, and it is the only part of that wait with anything on
+/// screen.
+pub const REVEAL_DWELL: Duration = Duration::from_millis(450);
+
 /// Bounds how often a lock-on decode runs.
 ///
 /// **Two gates, and the second one matters more than the first.** Time alone
@@ -696,8 +791,19 @@ pub enum ScanMiss {
 /// **Hand-written `Debug`**, for [`Outcome`]'s reason exactly: `Found` holds
 /// a seed.
 pub enum ScreenScan {
-    /// Exactly one distinct code across every monitor.
-    Found(Zeroizing<String>),
+    /// Exactly one distinct code across every monitor, and **where on the
+    /// desktop it was** -- in virtual-screen physical pixels, the space every
+    /// other rectangle in this module and in [`crate::screen_capture`] is in.
+    ///
+    /// Not the buffer-relative box [`crate::qr::Codes::One`] carries:
+    /// [`scan_screen_with`] moves each monitor's answer onto the desktop
+    /// before it folds them together, precisely so that this one value cannot
+    /// be in "whichever monitor happened to answer first"'s coordinates. See
+    /// [`crate::screen_capture::place_in_capture`].
+    ///
+    /// The rectangle is what the reveal rings. It is not a secret and does
+    /// not wipe -- it is where on their own screen the user's code is.
+    Found(Zeroizing<String>, ScreenRect),
     /// It could not answer. See [`ScanMiss`].
     Missed(ScanMiss),
 }
@@ -705,7 +811,9 @@ pub enum ScreenScan {
 impl std::fmt::Debug for ScreenScan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ScreenScan::Found(text) => write!(f, "Found({} chars not shown)", text.len()),
+            ScreenScan::Found(text, at) => {
+                write!(f, "Found({} chars not shown, at {at:?})", text.len())
+            }
             ScreenScan::Missed(miss) => write!(f, "Missed({miss:?})"),
         }
     }
@@ -771,18 +879,35 @@ pub fn scan_screen_with(seams: &RegionSeams, monitors: &[ScreenRect]) -> ScreenS
         };
         captured_any = true;
         let (width, height) = (pixels.width() as usize, pixels.height() as usize);
-        let keep_looking = tally.merge((seams.scan)(pixels.pixels(), width, height));
+        let found = (seams.scan)(pixels.pixels(), width, height);
         // Dropped here explicitly, which is what wipes it -- including on the
         // early exit below, where it would otherwise live to the end of the
         // loop body anyway but where the intent is worth stating.
         drop(pixels);
+        // **Placed on the desktop BEFORE it is folded in**, which is the one
+        // line in this loop that has to be here and not anywhere else. The
+        // box `codes_in` reports is in *this monitor's* pixels; the tally
+        // keeps the first sighting and forgets which monitor it came from, so
+        // a box folded in unplaced could only be interpreted against a
+        // monitor nobody recorded. On the primary monitor the placement is
+        // the identity, which is exactly why leaving it out would pass every
+        // trial on one screen -- see
+        // `crate::screen_capture::place_in_capture`, which is where that
+        // argument and its assertions live.
+        let found = match found {
+            qr::Codes::One(text, at) => {
+                qr::Codes::One(text, screen_capture::place_in_capture(*monitor, at))
+            }
+            other => other,
+        };
+        let keep_looking = tally.merge(found);
         if !keep_looking {
             break;
         }
     }
 
     match tally.finish() {
-        qr::Codes::One(text) => ScreenScan::Found(text),
+        qr::Codes::One(text, at) => ScreenScan::Found(text, at),
         qr::Codes::Several => ScreenScan::Missed(ScanMiss::Several),
         // Nothing found, and which "nothing" it is depends on whether there
         // were any pixels to look at. A desktop that was read and held no
@@ -826,6 +951,16 @@ pub struct RegionView {
     /// anything is painted, because the only way to a painted 6b is a scan
     /// that could not answer.
     pub reason: Option<ScanMiss>,
+    /// **The code the scan found, in points relative to this viewport**, for
+    /// as long as the reveal lasts. `Some` means this frame belongs to the
+    /// reveal and to nothing else: [`draw`] paints the mark and no bar, and
+    /// the viewport callback reads no input.
+    ///
+    /// Mutually exclusive with `selection` in practice -- a reveal begins
+    /// from a scan, and a scan that answers ends the overlay before any drag
+    /// can start -- but not by construction, so [`draw`] settles it by taking
+    /// the reveal first.
+    pub reveal: Option<egui::Rect>,
 }
 
 /// Everything the overlay holds, behind the `Arc<Mutex<_>>` that
@@ -857,6 +992,8 @@ struct Inner {
     masked: bool,
     /// Why 6b opened. `None` until the scan has answered.
     reason: Option<ScanMiss>,
+    /// How far the reveal has got. See [`Reveal`].
+    reveal: Reveal,
     /// The bar's two chips in points, as [`draw`] last painted them.
     /// `Rect::NOTHING` before the first paint, which contains no point, so a
     /// press on the frame before there are chips hits none of them.
@@ -884,6 +1021,51 @@ enum Prescan {
     /// frame at or after this instant.
     Settling { at: Instant },
     /// The scan has run, or was never going to.
+    Done,
+}
+
+/// **How far the reveal has got**: the short, fixed stretch during which the
+/// overlay rings the code its scan found before closing on 6c.
+///
+/// **Deliberately the same shape as [`Prescan`]**, for the same reason and
+/// with the same one property that matters: every transition is forwards and
+/// the last state is absorbing. `Nothing` is where an overlay that has not
+/// found anything stays; a scan that finds one code moves it to `Due` **once**
+/// and nothing moves it back; the first frame that paints it becomes
+/// `Showing` with a deadline; the first frame at or after that deadline is
+/// `Done`, which ends the overlay and is never left.
+///
+/// # Why `Due` exists rather than the deadline being set by the scan
+///
+/// Because the clock has to start when the user can *see* something, and at
+/// the moment the scan answers there is no window: `show` has not registered
+/// the viewport yet, so the OS has not created it and egui has not painted
+/// it. A deadline set then would spend part -- on a slow first frame,
+/// possibly all -- of [`REVEAL_DWELL`] on a window that is not on screen, and
+/// the reveal the user got would be shorter than the one that was argued for,
+/// by an amount that varies with their machine. `Due` carries the rectangle
+/// and no time; the frame that first paints it is the frame that starts the
+/// clock.
+///
+/// # Why this cannot become the hang
+///
+/// The defect this module was fixed for was a viewport callback that redid
+/// work every repaint with no exit. This is the opposite by construction: the
+/// only thing that advances it is a clock the caller reads, it advances in one
+/// direction, and the state it advances into ends the overlay. A repaint that
+/// arrives during `Showing` re-reads the same deadline and either waits or
+/// finishes; there is no input it waits for, so a user who walks away still
+/// gets 6c. See [`RegionOverlay::reveal_step`].
+#[derive(Debug, Clone, Copy)]
+enum Reveal {
+    /// No code has been found, so there is nothing to show.
+    Nothing,
+    /// A code is at `at` -- **virtual-screen physical pixels** -- and the
+    /// clock has not started.
+    Due { at: ScreenRect },
+    /// Being shown; the overlay closes on the first frame at or after `until`.
+    Showing { at: ScreenRect, until: Instant },
+    /// Shown, and the overlay is finished with it.
     Done,
 }
 
@@ -934,6 +1116,7 @@ impl RegionOverlay {
                 prescan: Prescan::Due,
                 masked: false,
                 reason: None,
+                reveal: Reveal::Nothing,
                 chips: [egui::Rect::NOTHING; 2],
                 chip_press: None,
             })),
@@ -958,23 +1141,25 @@ impl RegionOverlay {
         } else {
             1.0
         };
+        // The one conversion this window owns, in the direction `to_screen`
+        // does not go: screen pixels back into the points the painter works
+        // in. Written once here and used by both the drag and the reveal, so
+        // the mark round a found code and the box round a dragged one cannot
+        // end up a scale factor apart.
+        let to_points = |rect: ScreenRect| {
+            let at = |x: i32, y: i32| {
+                egui::pos2(
+                    (x - held.origin.0) as f32 / scale,
+                    (y - held.origin.1) as f32 / scale,
+                )
+            };
+            egui::Rect::from_min_max(at(rect.left, rect.top), at(rect.right, rect.bottom))
+        };
         let (selection, size) = match held.drag {
             None => (None, None),
             Some(drag) => {
                 let rect = drag.rect();
-                let to_points = |x: i32, y: i32| {
-                    egui::pos2(
-                        (x - held.origin.0) as f32 / scale,
-                        (y - held.origin.1) as f32 / scale,
-                    )
-                };
-                (
-                    Some(egui::Rect::from_min_max(
-                        to_points(rect.left, rect.top),
-                        to_points(rect.right, rect.bottom),
-                    )),
-                    Some((rect.width(), rect.height())),
-                )
+                (Some(to_points(rect)), Some((rect.width(), rect.height())))
             }
         };
         RegionView {
@@ -982,6 +1167,14 @@ impl RegionOverlay {
             size,
             found: held.found,
             reason: held.reason,
+            // `Due` reports the rectangle as readily as `Showing` does: the
+            // frame that paints it is the frame that starts its clock, so a
+            // `Due` that painted nothing would be a frame of dim with no mark
+            // on it before the mark appeared.
+            reveal: match held.reveal {
+                Reveal::Due { at } | Reveal::Showing { at, .. } => Some(to_points(at)),
+                Reveal::Nothing | Reveal::Done => None,
+            },
         }
     }
 
@@ -1030,20 +1223,92 @@ impl RegionOverlay {
     /// **Applies a scan's answer**, whether it came from the one taken before
     /// the window opened or from the *Whole screen* chip pressed on it.
     ///
-    /// One code ends the overlay with [`Outcome::Decoded`] -- and therefore
-    /// lands on 6c, which is where every route lands and where the only Save
-    /// in this feature lives. Anything else leaves the overlay up and records
-    /// why, which is what the bar's first line then says.
+    /// One code records [`Outcome::Decoded`] -- and therefore lands on 6c,
+    /// which is where every route lands and where the only Save in this
+    /// feature lives -- but **does not close the overlay yet**: it opens the
+    /// reveal, which holds the answer on screen for [`REVEAL_DWELL`] and then
+    /// closes. Anything else leaves the overlay up and records why, which is
+    /// what the bar's first line then says.
     ///
     /// The stale lock-on is cleared with it: a rescan that found nothing must
     /// not leave "Code found" above a rectangle from before it.
+    ///
+    /// **It takes no clock**, which is worth noticing: the reveal's deadline
+    /// is set by the first frame that paints it, not by the frame that found
+    /// the code. See [`Reveal::Due`].
     fn apply_scan(&self, scan: ScreenScan) {
         match scan {
-            ScreenScan::Found(text) => self.finish(Outcome::Decoded(text)),
+            ScreenScan::Found(text, at) => {
+                let mut held = locked(&self.inner);
+                // **Forwards only.** A second answer -- the *Whole screen*
+                // chip pressed twice quickly, or a repaint that got past the
+                // guard -- must not restart a reveal that is already running
+                // or reopen one that has finished, which would be a window
+                // that refuses to close. `Nothing` is the only state a reveal
+                // may begin from.
+                if !matches!(held.reveal, Reveal::Nothing) {
+                    return;
+                }
+                held.reveal = Reveal::Due { at };
+                // The lock-on badge's flag, cleared rather than set: the
+                // reveal paints its own mark with its own words, and a
+                // `found` left true would put "release to read" over a
+                // selection nobody is dragging if a frame ever painted both.
+                held.found = false;
+                // Recorded now, taken later. `open` stays true, so
+                // `take_outcome` -- which the caller only reaches once `show`
+                // has answered `false` -- cannot see it until the reveal has
+                // run. It is a `Zeroizing`, so an overlay dropped mid-reveal
+                // wipes it rather than leaking it.
+                if held.outcome.is_none() {
+                    held.outcome = Some(Outcome::Decoded(text));
+                }
+            }
             ScreenScan::Missed(miss) => {
                 let mut held = locked(&self.inner);
                 held.reason = Some(miss);
                 held.found = false;
+            }
+        }
+    }
+
+    /// **Advances the reveal by one frame**, and says what to paint.
+    ///
+    /// `Some(rect)` -- in virtual-screen pixels -- means this frame belongs to
+    /// the reveal: paint the mark, read no input, and come back. `None` means
+    /// there is no reveal, either because nothing was found or because the one
+    /// there was has just ended -- and in that second case **the overlay is
+    /// closed by this call**, which is what makes the reveal end on a clock
+    /// rather than on anything the user does.
+    ///
+    /// `now` is an argument for [`RegionOverlay::prescan_step`]'s reason
+    /// exactly. Every call moves forwards or stands still; see [`Reveal`].
+    fn reveal_step(&self, now: Instant) -> Option<ScreenRect> {
+        let mut held = locked(&self.inner);
+        match held.reveal {
+            Reveal::Nothing | Reveal::Done => None,
+            // The first painted frame is what starts the clock, so the user
+            // gets the whole dwell rather than whatever is left of it after
+            // the OS has made a window.
+            Reveal::Due { at } => {
+                held.reveal = Reveal::Showing {
+                    at,
+                    until: now + REVEAL_DWELL,
+                };
+                Some(at)
+            }
+            Reveal::Showing { at, until } => {
+                if now < until {
+                    Some(at)
+                } else {
+                    // Marked `Done` and closed in the same breath, before
+                    // anything else can run: `Done` is absorbing and `open`
+                    // is false, so every later frame takes the callback's own
+                    // finished guard and does nothing at all.
+                    held.reveal = Reveal::Done;
+                    held.open = false;
+                    None
+                }
             }
         }
     }
@@ -1216,10 +1481,14 @@ impl RegionOverlay {
         // **The whole-screen scan, before this module has a window at all.**
         //
         // This is the departure the module header argues for: choosing the
-        // route is asking for the scan, so the scan happens here and 6b opens
-        // only if it cannot answer. Nothing below this block runs on the
-        // frames it takes, so no viewport is registered and no dim appears --
-        // a user whose code is found never sees this surface.
+        // route is asking for the scan, so the scan happens here and the
+        // *draggable* 6b opens only if it cannot answer. Nothing below this
+        // block runs on the frames the scan itself takes, so while it is
+        // running no viewport is registered and no dim appears -- what the
+        // user has on screen is the picker's own "Scanning your screen" card.
+        // Once it has answered a window opens either way: with the bar and
+        // the box to drag if it could not answer, or with the reveal if it
+        // could. See `apply_scan`.
         //
         // It is bounded three ways, and the bound is the point: `prescan_step`
         // only ever moves forwards and ends at `Done`; the capture happens on
@@ -1244,11 +1513,17 @@ impl RegionOverlay {
                 // without one.
                 let monitors = screen_capture::monitor_bounds();
                 self.apply_scan(scan_screen_with(&RegionSeams::production(), &monitors));
-                if !self.is_open() {
-                    // One code, and the overlay is over before it began.
-                    self.mask_own_window(false);
-                    return false;
-                }
+                // **The overlay opens either way now, and that is the
+                // change.** It used to end here when the scan found one code
+                // -- no window was ever registered and the user went from the
+                // modal straight to 6c, with nothing between the press and
+                // the card to say where the code had come from. `apply_scan`
+                // now opens the reveal instead: the window is registered
+                // below like any other 6b, paints the code it found ringed
+                // where it sits, and closes itself on a clock. The outcome is
+                // the same `Outcome::Decoded` it always was, and `take_outcome`
+                // still cannot be reached until `show` answers `false`.
+                //
                 // The mask stays on for the life of the overlay. 6b is
                 // about to open, the user may press *Whole screen* on it, and
                 // its own release-capture is better off not seeing the vault
@@ -1297,6 +1572,26 @@ impl RegionOverlay {
                 .with_decorations(false)
                 .with_always_on_top()
                 .with_taskbar(false)
+                // **Asked for, and NOT what makes this window see-through.**
+                // `glutin_winit::finalize_window` -- which `eframe` calls to
+                // create every window -- strips this flag whenever the GL
+                // config answers `supports_transparency() == Some(false)`,
+                // and on Windows/WGL that answer is read off
+                // `WGL_TRANSPARENT_ARB`, a *colour-key* attribute essentially
+                // no driver advertises. So it is always stripped, `eframe`
+                // logs `Cannot create transparent window: the GL config does
+                // not support it`, and `winit` never makes the DWM call the
+                // flag exists to trigger. `let_the_desktop_through` makes
+                // that call itself.
+                //
+                // It stays anyway, and not out of superstition: it is the
+                // correct declaration of intent for this window on every
+                // platform and backend where it is honoured, it is what
+                // `egui_winit` reads to decide this viewport's own clear
+                // behaviour, and it costs nothing here -- unlike the same
+                // flag on the ROOT viewport, which feeds the GL config
+                // template and was removed from `vault_window` for that
+                // reason.
                 .with_transparent(true),
             move |root, _class| {
                 // **The overlay is over the moment an outcome is recorded, and
@@ -1343,41 +1638,103 @@ impl RegionOverlay {
                     // `foreground::OPENS_A_VIEWPORT_AND_RAISES_IT`.
                     crate::foreground::raise_window(REGION_TITLE);
                     exclude_from_capture(REGION_TITLE);
+                    // And the one call that makes this window see-through at
+                    // all. It has to be here rather than in the builder
+                    // above, because it is a call on an HWND that does not
+                    // exist until the builder has been honoured. See
+                    // `let_the_desktop_through`.
+                    let_the_desktop_through(REGION_TITLE);
                 }
 
-                let (pointer, pressed, down) = root.input(|i| {
-                    (
-                        i.pointer.latest_pos().map(|p| (p.x, p.y)),
-                        i.pointer.primary_pressed(),
-                        i.pointer.primary_down(),
-                    )
-                });
-                // Taken before anything else looks at the pointer: a press
-                // that landed on a chip is that chip's for the whole gesture,
-                // and `advance` must not see it as a selection. See
-                // `chip_gesture`.
-                let chip = mine.chip_gesture(pointer, pressed, down);
-                if root.input(|i| i.key_pressed(egui::Key::Escape))
-                    || root.input(|i| i.viewport().close_requested())
-                    || chip == Some(CHIP_CANCEL)
-                {
-                    mine.finish(Outcome::Cancelled);
-                } else if chip == Some(CHIP_WHOLE_SCREEN)
-                    || root.input(|i| i.key_pressed(egui::Key::A))
-                {
-                    // **The same scan the route already ran**, on demand: the
-                    // user may have moved a window, closed one of two codes,
-                    // or zoomed the page since. One press is one scan -- a key
-                    // press and a release are single events, so this is
-                    // bounded by the user rather than by the frame rate -- and
-                    // when it finds one code it ends the overlay on 6c exactly
-                    // as the first scan would have.
-                    mine.apply_scan(scan_screen_with(
-                        &RegionSeams::production(),
-                        &screen_capture::monitor_bounds(),
-                    ));
-                } else if !mine.in_chip_press() {
-                    mine.advance(&RegionSeams::production(), pointer, down, Instant::now());
+                // **The reveal owns its frames entirely.**
+                //
+                // While it is running the surface is a statement, not a
+                // control: there is nothing to drag, nothing to choose and
+                // nothing to cancel, because the code has already been read
+                // and the only thing left is for the user to see it. So no
+                // input is read on these frames -- not the pointer, not
+                // Escape, not the chips -- which also happens to be what
+                // stops a click landing in the half-second before 6c from
+                // starting a drag on a surface that is about to vanish.
+                //
+                // The repaint request is what makes it end on its own. This
+                // window is always-on-top over every monitor, so the desktop
+                // behind it produces no events and nothing else would wake
+                // it; without this the deadline would be reached only if the
+                // user happened to move the mouse. It is bounded by the
+                // deadline itself, not by a user: see `Reveal`.
+                if mine.reveal_step(Instant::now()).is_some() {
+                    root.request_repaint_of(region_viewport());
+                    let view = mine.view();
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(root, |ui| draw(ui, &view));
+                    return;
+                }
+
+                // Guarded, because the call above can have closed the overlay
+                // on the frame the reveal's deadline passed. Reading input
+                // into a surface that has already answered is what the whole
+                // finished-overlay guard at the top of this callback exists to
+                // prevent, and this is the one path that reaches here with an
+                // answer already recorded.
+                if mine.is_open() {
+                    let (pointer, pressed, down) = root.input(|i| {
+                        (
+                            i.pointer.latest_pos().map(|p| (p.x, p.y)),
+                            i.pointer.primary_pressed(),
+                            i.pointer.primary_down(),
+                        )
+                    });
+                    // Taken before anything else looks at the pointer: a press
+                    // that landed on a chip is that chip's for the whole
+                    // gesture, and `advance` must not see it as a selection.
+                    // See `chip_gesture`.
+                    let chip = mine.chip_gesture(pointer, pressed, down);
+                    if root.input(|i| i.key_pressed(egui::Key::Escape))
+                        || root.input(|i| i.viewport().close_requested())
+                        || chip == Some(CHIP_CANCEL)
+                    {
+                        mine.finish(Outcome::Cancelled);
+                    } else if chip == Some(CHIP_WHOLE_SCREEN)
+                        || root.input(|i| i.key_pressed(egui::Key::A))
+                    {
+                        // **The same scan the route already ran**, on demand:
+                        // the user may have moved a window, closed one of two
+                        // codes, or zoomed the page since. One press is one
+                        // scan -- a key press and a release are single events,
+                        // so this is bounded by the user rather than by the
+                        // frame rate -- and when it finds one code it reveals
+                        // it and lands on 6c exactly as the first scan does.
+                        mine.apply_scan(scan_screen_with(
+                            &RegionSeams::production(),
+                            &screen_capture::monitor_bounds(),
+                        ));
+                        // **And ask for the frame that starts its clock.**
+                        //
+                        // This is the one place a reveal can be opened from
+                        // inside the callback, and the frame that opens it is
+                        // past `reveal_step` already -- so the reveal is
+                        // `Due`, carrying a rectangle and no deadline, and
+                        // nothing has asked to be called again. The press
+                        // that got here was the last input this window will
+                        // ever see: it is always-on-top over every monitor,
+                        // the reveal reads no input, and the desktop behind
+                        // it produces no events. Without this request the
+                        // next frame never comes, the clock never starts, and
+                        // a full-screen window sits there until the app is
+                        // killed. That is the same shape as the hang this
+                        // module was fixed for, reached from a different
+                        // direction, and one request is the whole of the fix:
+                        // the frame it buys takes the reveal branch, which
+                        // asks for the next one itself.
+                        //
+                        // Harmless when the scan missed -- an extra repaint
+                        // of a surface that repaints on input anyway.
+                        root.request_repaint_of(region_viewport());
+                    } else if !mine.in_chip_press() {
+                        mine.advance(&RegionSeams::production(), pointer, down, Instant::now());
+                    }
                 }
 
                 // Whichever of the three above ended the overlay, this is the
@@ -1461,6 +1818,15 @@ pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> [egui::Rect; 2] {
     let painter = ui.painter().clone();
     let dim = egui::Color32::from_rgba_unmultiplied(0x20, 0x1e, 0x1d, DIM_ALPHA);
 
+    // **The reveal is the whole surface while it lasts**, and it takes
+    // precedence over everything below because everything below is about a
+    // drag that is not happening. It returns before the bar is drawn: see
+    // `paint_reveal` for why this state has no bar and therefore no chips.
+    if let Some(found) = view.reveal {
+        paint_reveal(&painter, full, found, dim);
+        return [egui::Rect::NOTHING; 2];
+    }
+
     match view.selection {
         // Nothing selected yet: the whole desktop dims.
         None => {
@@ -1471,22 +1837,13 @@ pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> [egui::Rect; 2] {
         // bands around it dim.
         Some(sel) => {
             let sel = sel.intersect(full);
-            for band in [
-                egui::Rect::from_min_max(full.left_top(), egui::pos2(full.right(), sel.top())),
-                egui::Rect::from_min_max(egui::pos2(full.left(), sel.bottom()), full.right_bottom()),
-                egui::Rect::from_min_max(egui::pos2(full.left(), sel.top()), sel.left_bottom()),
-                egui::Rect::from_min_max(sel.right_top(), egui::pos2(full.right(), sel.bottom())),
-            ] {
-                if band.is_positive() {
-                    painter.rect_filled(band, 0.0, dim);
-                }
-            }
+            paint_dim_around(&painter, full, sel, dim);
             paint_selection_edge(&painter, sel);
             if let Some((w, h)) = view.size {
                 paint_size_readout(&painter, sel, w, h);
             }
             if lockon_badge(view.found).is_some() {
-                paint_lockon_badge(&painter, full, sel);
+                paint_badge(&painter, full, sel, LOCKED_ON);
             }
         }
     }
@@ -1503,6 +1860,82 @@ pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> [egui::Rect; 2] {
         }
     }
     chips
+}
+
+/// **The four bands of dim around a lit rectangle**, leaving the rectangle
+/// itself entirely unpainted -- which is what "stays lit" means on a window
+/// that is genuinely see-through.
+///
+/// Extracted rather than written twice, because there are now two lit
+/// rectangles on this surface -- the box the user drags and the code the scan
+/// found -- and the four-band arithmetic is exactly the kind of thing that
+/// gets corrected in one copy. A band with no area is skipped rather than
+/// painted inverted: a selection flush with an edge produces one, and an
+/// inverted `Rect` fills nothing in egui but says something wrong here.
+fn paint_dim_around(
+    painter: &egui::Painter,
+    full: egui::Rect,
+    lit: egui::Rect,
+    dim: egui::Color32,
+) {
+    for band in [
+        egui::Rect::from_min_max(full.left_top(), egui::pos2(full.right(), lit.top())),
+        egui::Rect::from_min_max(egui::pos2(full.left(), lit.bottom()), full.right_bottom()),
+        egui::Rect::from_min_max(egui::pos2(full.left(), lit.top()), lit.left_bottom()),
+        egui::Rect::from_min_max(lit.right_top(), egui::pos2(full.right(), lit.bottom())),
+    ] {
+        if band.is_positive() {
+            painter.rect_filled(band, 0.0, dim);
+        }
+    }
+}
+
+/// **The reveal**: the code the whole-screen scan just read, ringed where it
+/// actually sits on the user's desktop, with the design's tick beside it.
+///
+/// # It is 6b's own marks, not a new picture
+///
+/// Every stroke here is already in design 6b and is painted by the same two
+/// functions the drag uses: the dim with the code left lit, the solid ring
+/// and its halo, the four corner brackets, and the badge with `M20 6 9 17l-5-5`
+/// in it. Only the words differ -- [`SCAN_FOUND`] rather than [`LOCKED_ON`],
+/// for the reason that constant gives. The owner asked for "blue line around
+/// QR code and V sign like in design"; this is that, with nothing invented to
+/// go with it.
+///
+/// # Why there is no bottom bar
+///
+/// 6b's bar carries an instruction, a promise and two chips, and on this
+/// stretch of frames all three would be wrong. There is nothing to drag, so
+/// the instruction describes a gesture the user is not being asked for; the
+/// callback reads no input while the reveal runs, so *Whole screen* and
+/// *Cancel* would be bordered pills that do nothing when clicked -- the "lie
+/// in the shape of a button" [`RegionOverlay::chip_gesture`] argues against
+/// at length. The reveal is a statement and lasts less than half a second;
+/// what it needs on screen is the mark and the tick.
+///
+/// The promise the bar carries is the one thing worth missing, and it is not
+/// missed: *nothing is saved yet* is still true and is about to be said by
+/// 6c, which is the card the user lands on and the only place a Save exists.
+///
+/// # The code is not painted, only ringed
+///
+/// Worth stating where the drawing is, because it is the constraint this
+/// whole feature is built around: what is inside the ring is the **live
+/// desktop showing through a transparent window**, not a picture of it. The
+/// capture that found the code was decoded and dropped, and nothing here has
+/// or wants a copy. See this module's header and
+/// `nothing_in_this_module_uploads_a_capture_to_a_texture`.
+fn paint_reveal(
+    painter: &egui::Painter,
+    full: egui::Rect,
+    found: egui::Rect,
+    dim: egui::Color32,
+) {
+    let lit = found.intersect(full);
+    paint_dim_around(painter, full, lit, dim);
+    paint_selection_edge(painter, lit);
+    paint_badge(painter, full, lit, SCAN_FOUND);
 }
 
 /// The two rings 6b draws around the selection, plus its four corner
@@ -1615,12 +2048,18 @@ fn paint_tick(painter: &egui::Painter, at: egui::Rect, colour: egui::Color32, sv
     painter.line_segment([point(9.0, 17.0), point(4.0, 12.0)], stroke);
 }
 
-/// 6b's lock-on badge: a blue pill above the selection's top-left carrying a
-/// tick and [`LOCKED_ON`].
-fn paint_lockon_badge(painter: &egui::Painter, full: egui::Rect, sel: egui::Rect) {
-    let Some(words) = lockon_badge(true) else {
-        return;
-    };
+/// **6b's badge**: a blue pill above a rectangle's top-left carrying the
+/// design's tick and `words`.
+///
+/// The words are an argument rather than [`LOCKED_ON`] baked in, because the
+/// surface now has two states that want this exact pill and they say different
+/// things: the drag's lock-on, and the reveal's [`SCAN_FOUND`]. Everything
+/// else about it -- the height, the padding, the radius, the gap, the tick's
+/// box and its stroke, the type -- is one set of numbers from one design, and
+/// a second copy of the pill would be a second set to keep in step with it.
+/// The width follows the words, which is what the design's `padding: 0 10px`
+/// on a flex row means.
+fn paint_badge(painter: &egui::Painter, full: egui::Rect, sel: egui::Rect, words: &str) {
     let galley = painter.layout_no_wrap(
         words.to_owned(),
         egui::FontId::new(BADGE_TEXT_PX, egui::FontFamily::Name(theme::BOLD.into())),
@@ -1879,6 +2318,110 @@ fn exclude_from_capture(title: &str) {
     set_capture_exclusion(title, true);
 }
 
+/// **Makes this window's per-pixel alpha real**, which is the whole of why
+/// the overlay is a dimmed desktop rather than a solid black screen.
+///
+/// # The bug, all the way down
+///
+/// The viewport above asks for `with_transparent(true)` and the vault window
+/// used to as well, and neither was enough, because of one line in
+/// `glutin_winit::finalize_window` -- the function `eframe` calls to create
+/// every window it opens:
+///
+/// ```text
+/// // Disable transparency if the end config doesn't support it.
+/// if gl_config.supports_transparency() == Some(false) {
+///     attributes = attributes.with_transparent(false);
+/// }
+/// ```
+///
+/// On Windows/WGL `supports_transparency()` is `glutin`'s reading of
+/// `WGL_TRANSPARENT_ARB`, and that attribute is about **colour-key**
+/// transparency -- "treat this exact colour as a hole" -- which essentially no
+/// Windows driver advertises. So the answer is always `Some(false)`, the flag
+/// is always stripped, and `eframe` logs `Cannot create transparent window:
+/// the GL config does not support it` and carries on. It reads like a warning
+/// and is in fact fatal to this surface.
+///
+/// What the stripped flag costs is one call. `winit`'s Windows backend makes
+/// `DwmEnableBlurBehindWindow` on window creation **only** when
+/// `attributes.transparent` is true, and without it DWM never composites the
+/// window's alpha channel at all: the framebuffer's zero-alpha pixels are
+/// shown as opaque black, `window_host::FULLY_TRANSPARENT` clears to nothing
+/// visible, and the "dim" is the only thing on screen.
+///
+/// Two things were **not** the problem and are deliberately left alone. The
+/// framebuffer really does have an alpha channel -- `glutin`'s
+/// `ConfigTemplate` defaults `alpha_size: 8` unconditionally, with no
+/// reference to the transparency flag -- and
+/// `window_host::clear_color` already returns a fully transparent clear.
+/// Everything was in place except the one call.
+///
+/// # So this makes the call `winit` skipped
+///
+/// An **empty** blur region is the documented Windows idiom for "do not blur
+/// anything, just honour this window's per-pixel alpha", and it is exactly
+/// what `winit` builds: `CreateRectRgn(0, 0, -1, -1)` is a region with no
+/// area. `DWM_BB_BLURREGION` is what makes DWM read `hRgnBlur` at all, so
+/// leaving it out would ask for the *whole window* to be blurred, which is a
+/// frosted-glass desktop rather than a dimmed one.
+///
+/// **The region is ours to delete.** DWM copies what it is given rather than
+/// taking ownership -- the `DWM_BLURBEHIND` documentation describes `hRgnBlur`
+/// as a handle to the region *specifying* the blur area, with no transfer of
+/// ownership stated, and `winit`'s own implementation of this same call
+/// deletes it on the next line. Leaking one region per overlay would be a
+/// small, permanent GDI handle leak in a window the user may open many times,
+/// so it is deleted here too, after the call, in both the success and failure
+/// paths.
+///
+/// # Why here and not in the viewport builder
+///
+/// Because it is a call on an `HWND`, and there is no `HWND` until `eframe`
+/// has honoured the builder. This runs on the overlay's first painted frame,
+/// beside [`exclude_from_capture`], and resolves the window the way every
+/// other Win32 call in this crate does: by title, scoped to this process,
+/// through [`crate::foreground::own_window_titled`]. See
+/// `login_ui::round_window_corners` for the same pattern and the longer
+/// argument about why the lookup must be process-scoped.
+///
+/// # Not tested, and cannot be
+///
+/// There is no window in a test process, so this is a no-op there and no
+/// assertion in this crate says the compositor accepted anything. It belongs
+/// with the other real-desktop facts in this module's header: what a test can
+/// hold is that the call is made on the frame the window first exists, which
+/// is what `the_overlay_asks_dwm_to_composite_its_alpha` pins by source.
+fn let_the_desktop_through(title: &str) {
+    use windows::Win32::Foundation::{FALSE, HWND, TRUE};
+    use windows::Win32::Graphics::Dwm::{
+        DwmEnableBlurBehindWindow, DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND,
+    };
+    use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject};
+
+    let Some(hwnd) = crate::foreground::own_window_titled(title) else {
+        return;
+    };
+    unsafe {
+        // Empty by construction: right and bottom are BEFORE left and top.
+        let region = CreateRectRgn(0, 0, -1, -1);
+        let blur = DWM_BLURBEHIND {
+            dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
+            fEnable: TRUE,
+            hRgnBlur: region,
+            fTransitionOnMaximized: FALSE,
+        };
+        // Ignored for `set_capture_exclusion`'s reason: there is nothing
+        // useful to do about a refusal, and the failure the user sees is the
+        // one they were already seeing.
+        let _ = DwmEnableBlurBehindWindow(HWND(hwnd as *mut _), &blur);
+        // Deleted whether or not the call succeeded -- see this function's
+        // note on ownership. A region DWM has copied is ours; a region it
+        // never looked at certainly is.
+        let _ = DeleteObject(region);
+    }
+}
+
 /// [`exclude_from_capture`]'s undoable form: `WDA_EXCLUDEFROMCAPTURE` when
 /// `exclude`, `WDA_NONE` when not.
 ///
@@ -1970,11 +2513,30 @@ mod tests {
     /// and two of the same size hold the same one -- which is exactly the
     /// distinctness rule under test, expressed without a shared counter that
     /// two tests running in parallel could race each other on.
+    ///
+    /// The place it reports is [`FOUND_AT`], **buffer-relative** exactly as
+    /// `codes_in`'s is, so a test can tell whether `scan_screen_with` moved it
+    /// onto the desktop.
     fn code_naming_the_size(_: &[u8], w: usize, h: usize) -> qr::Codes {
-        qr::Codes::One(Zeroizing::new(format!(
-            "otpauth://totp/Git%20Host:anovak{w}x{h}?secret=JBSWY3DPEHPK3PXP"
-        )))
+        qr::Codes::One(
+            Zeroizing::new(format!(
+                "otpauth://totp/Git%20Host:anovak{w}x{h}?secret=JBSWY3DPEHPK3PXP"
+            )),
+            FOUND_AT,
+        )
     }
+
+    /// Where every scanning stub above says it found its code, in the
+    /// **captured buffer's own pixels**. Deliberately not at the origin and
+    /// not square, so an implementation that dropped the offset, swapped the
+    /// axes, or handed back the whole monitor is a different rectangle from
+    /// this one.
+    const FOUND_AT: ScreenRect = ScreenRect {
+        left: 300,
+        top: 200,
+        right: 460,
+        bottom: 380,
+    };
 
     /// A capture that applies the **real** size bound without the
     /// allocation: `clamp_to_monitors` is what production's `capture_rect`
@@ -2705,7 +3267,7 @@ mod tests {
     fn miss(scan: ScreenScan) -> ScanMiss {
         match scan {
             ScreenScan::Missed(miss) => miss,
-            ScreenScan::Found(_) => panic!("the scan found a code where it should not have"),
+            ScreenScan::Found(..) => panic!("the scan found a code where it should not have"),
         }
     }
 
@@ -2718,8 +3280,74 @@ mod tests {
     fn one_code_anywhere_on_the_desktop_is_the_answer() {
         let monitors = [rect(0, 0, 1920, 1080)];
         match scan_screen_with(&scan_seams(flat_capture, code_naming_the_size), &monitors) {
-            ScreenScan::Found(text) => assert_eq!(&*text, "otpauth://totp/Git%20Host:anovak1920x1080?secret=JBSWY3DPEHPK3PXP"),
+            ScreenScan::Found(text, at) => {
+                assert_eq!(&*text, "otpauth://totp/Git%20Host:anovak1920x1080?secret=JBSWY3DPEHPK3PXP");
+                // On the primary monitor the placement is the identity, which
+                // is why the second-monitor test below is the one that
+                // matters.
+                assert_eq!(at, FOUND_AT);
+            }
             other => panic!("one code came back as {other:?}"),
+        }
+    }
+
+    /// **A code found on a monitor whose origin is not `(0, 0)` comes back
+    /// placed on the desktop, not in that monitor's own pixels.**
+    ///
+    /// The arithmetic most likely to be wrong in this whole feature, and the
+    /// one that no amount of use on a single screen can exercise: the box
+    /// `qr::codes_in` reports starts at the captured buffer's top-left, and
+    /// the overlay draws in virtual-screen coordinates. On the primary
+    /// monitor the two are the same. On any other monitor a box left unplaced
+    /// is drawn a monitor's width away from the code it is pointing at -- and
+    /// on a monitor left of the primary it is drawn on the primary, which is
+    /// where the user is looking, so it would look like a mark round nothing.
+    ///
+    /// Both directions are asserted, because a sign error passes one and
+    /// fails the other.
+    #[test]
+    fn a_code_found_on_a_second_monitor_is_reported_where_it_is_on_the_desktop() {
+        fn only_on_the_second(_: &[u8], w: usize, _: usize) -> qr::Codes {
+            if w == 1280 {
+                qr::Codes::One(
+                    Zeroizing::new("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP".into()),
+                    FOUND_AT,
+                )
+            } else {
+                qr::Codes::None
+            }
+        }
+        let placed = |monitors: &[ScreenRect]| {
+            match scan_screen_with(&scan_seams(flat_capture, only_on_the_second), monitors) {
+                ScreenScan::Found(_, at) => at,
+                other => panic!("the code was not found at all: {other:?}"),
+            }
+        };
+
+        // To the right of the primary: the commonest two-monitor desktop.
+        assert_eq!(
+            placed(&[rect(0, 0, 1920, 1080), rect(1920, 0, 3200, 720)]),
+            rect(2220, 200, 2380, 380)
+        );
+        // Left of and above it, where the origin is negative -- the case a
+        // `saturating_add` of an unsigned offset, or a forgotten offset, both
+        // get wrong.
+        assert_eq!(
+            placed(&[rect(-1280, -200, 0, 520), rect(0, 0, 1920, 1080)]),
+            rect(-980, 0, -820, 180)
+        );
+        // The size is the code's in every arrangement: a placement that
+        // changed it would be a mark the wrong size in the right place.
+        for monitors in [
+            vec![rect(0, 0, 1920, 1080), rect(1920, 0, 3200, 720)],
+            vec![rect(-1280, -200, 0, 520), rect(0, 0, 1920, 1080)],
+        ] {
+            let at = placed(&monitors);
+            assert_eq!(
+                (at.width(), at.height()),
+                (FOUND_AT.width(), FOUND_AT.height()),
+                "{monitors:?}"
+            );
         }
     }
 
@@ -2738,7 +3366,10 @@ mod tests {
         // scan that read a bounding box would clamp to the first and miss it.
         fn only_on_the_small_one(_: &[u8], w: usize, _: usize) -> qr::Codes {
             if w == 1280 {
-                qr::Codes::One(Zeroizing::new("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP".into()))
+                qr::Codes::One(
+                    Zeroizing::new("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP".into()),
+                    FOUND_AT,
+                )
             } else {
                 qr::Codes::None
             }
@@ -2746,7 +3377,7 @@ mod tests {
         let monitors = [rect(0, 0, 1920, 1080), rect(1920, 0, 3200, 720)];
         assert!(matches!(
             scan_screen_with(&scan_seams(flat_capture, only_on_the_small_one), &monitors),
-            ScreenScan::Found(_)
+            ScreenScan::Found(..)
         ));
         // The control on the same seam: with only the large monitor plugged
         // in there is nothing to find, so the pass above is about the second
@@ -2790,10 +3421,15 @@ mod tests {
 
         // Same size, so the same payload -- one code seen twice.
         let same = [rect(0, 0, 1920, 1080), rect(1920, 0, 3840, 1080)];
-        assert!(matches!(
-            scan_screen_with(&scan_seams(flat_capture, code_naming_the_size), &same),
-            ScreenScan::Found(_)
-        ));
+        match scan_screen_with(&scan_seams(flat_capture, code_naming_the_size), &same) {
+            // And it comes back at the FIRST monitor's place, not the
+            // second's. Both monitors reported the code at the same offset
+            // into their own buffers, so the two placed boxes are a monitor's
+            // width apart -- and the one that belongs to the payload being
+            // held is the first. A mark at the second would ring the copy.
+            ScreenScan::Found(_, at) => assert_eq!(at, FOUND_AT),
+            other => panic!("one code on two monitors came back as {other:?}"),
+        }
 
         // And one monitor that held two on its own settles it by itself, with
         // no second monitor needed.
@@ -2854,7 +3490,7 @@ mod tests {
                 &scan_seams(bounded_capture, code_naming_the_size),
                 &[huge, rect(9_000, 0, 10_600, 900)]
             ),
-            ScreenScan::Found(_)
+            ScreenScan::Found(..)
         ));
         // Control on `bounded_capture` itself: an ordinary monitor is not
         // refused by it, so the refusal above is about the size.
@@ -2871,10 +3507,17 @@ mod tests {
     #[test]
     fn the_debug_of_a_scan_does_not_print_the_secret() {
         let secret = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP";
-        let shown = format!("{:?}", ScreenScan::Found(Zeroizing::new(secret.to_string())));
+        let shown = format!(
+            "{:?}",
+            ScreenScan::Found(Zeroizing::new(secret.to_string()), FOUND_AT)
+        );
         assert!(!shown.contains("JBSWY3DPEHPK3PXP"), "{shown}");
         assert!(!shown.contains("otpauth"), "{shown}");
         assert!(shown.contains("not shown"), "{shown}");
+        // The place is printed: it is where on the user's own screen their
+        // code is, not a secret, and it is the one useful thing in a failure
+        // message about a scan that found something.
+        assert!(shown.contains("left: 300"), "{shown}");
         assert_eq!(
             format!("{:?}", ScreenScan::Missed(ScanMiss::Several)),
             "Missed(Several)"
@@ -2931,17 +3574,32 @@ mod tests {
             .contains("the one you want"));
     }
 
-    /// **A scan that found a code ends the overlay on 6c; one that did not
-    /// leaves it up with a reason.**
+    /// **A scan that found a code reveals it and then answers 6c; one that
+    /// did not leaves the overlay up with a reason.**
     ///
-    /// The two halves of `apply_scan`, and the second is the one that matters
-    /// for the surface: the overlay stays open, the drag still works, and the
-    /// bar now has something to say.
+    /// The two halves of `apply_scan`. The first used to end the overlay on
+    /// the spot; it now opens the reveal and the overlay stays up until the
+    /// clock runs out -- which is the change, and the outcome underneath it is
+    /// the same `Decoded` it always was.
     #[test]
     fn a_scan_either_answers_or_explains_itself() {
         let found = RegionOverlay::open(&[rect(0, 0, 1920, 1080)], 1.0).expect("opens");
-        found.apply_scan(ScreenScan::Found(Zeroizing::new("otpauth://totp/x".into())));
-        assert!(!found.is_open(), "a code did not end the overlay");
+        found.apply_scan(ScreenScan::Found(
+            Zeroizing::new("otpauth://totp/x".into()),
+            FOUND_AT,
+        ));
+        // Still up, and holding the answer back: `take_outcome` is only
+        // reached by a caller once `show` has answered `false`, and it has
+        // not.
+        assert!(found.is_open(), "the reveal did not keep the overlay up");
+        assert_eq!(found.view().reveal, Some(rect_pts(300.0, 200.0, 460.0, 380.0)));
+        // The clock runs, and then it is over -- with the outcome it recorded
+        // when it found the code.
+        let t0 = Instant::now();
+        assert!(found.reveal_step(t0).is_some());
+        assert!(found.is_open());
+        assert!(found.reveal_step(t0 + REVEAL_DWELL).is_none());
+        assert!(!found.is_open(), "the reveal did not end the overlay");
         assert!(matches!(found.take_outcome(), Some(Outcome::Decoded(_))));
 
         for missed in [
@@ -3134,13 +3792,20 @@ mod tests {
             "nothing puts the vault window back into screen captures when the overlay is \
              dropped rather than closed"
         );
-        // `show` unmasks on all three of its ways out -- the guard that
-        // finds a finished overlay, the scan that answered before a window
-        // existed, and the frame the overlay ends on -- and `Drop` is the
-        // backstop under all of them.
+        // `show` unmasks on both of its ways out -- the guard at the top that
+        // finds a finished overlay, and the frame the overlay ends on -- and
+        // `Drop` is the backstop under both.
+        //
+        // **There used to be a third**, and its removal is the reveal's doing
+        // rather than an oversight. `show` had an early return for "the scan
+        // found one code, so the overlay is over before it began"; a found
+        // code now opens the reveal and leaves the overlay up, so that branch
+        // could never be taken and a dead unmask with a comment claiming a
+        // reason is worse than no unmask. Every ending still runs through one
+        // of the two below.
         assert_eq!(
             code.matches("self.mask_own_window(false);").count(),
-            3,
+            2,
             "`show` no longer puts the vault window back on every way out of it"
         );
         assert_eq!(
@@ -3152,6 +3817,322 @@ mod tests {
         // modal that started this is drawn in.
         assert_eq!(crate::vault_window::WINDOW_TITLE, "Deskwarden");
         assert_ne!(crate::vault_window::WINDOW_TITLE, REGION_TITLE);
+    }
+
+    // -- the reveal --------------------------------------------------------
+
+    /// A found scan, ready to be revealed, on an overlay covering `monitors`.
+    fn found_on(monitors: &[ScreenRect], scale: f32, at: ScreenRect) -> RegionOverlay {
+        let overlay = RegionOverlay::open(monitors, scale).expect("opens");
+        overlay.apply_scan(ScreenScan::Found(
+            Zeroizing::new("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP".into()),
+            at,
+        ));
+        overlay
+    }
+
+    /// **The reveal starts once, ends on the clock, and never restarts.**
+    ///
+    /// The property that keeps it out of the defect class this module was
+    /// fixed for. It is the same argument `the_screen_is_scanned_once_and_the
+    /// _state_never_goes_back` makes about the prescan, and it is made
+    /// separately because this is a second timed machine and the two share no
+    /// code.
+    #[test]
+    fn the_reveal_runs_once_on_a_clock_and_then_never_again() {
+        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        let t0 = Instant::now();
+        // The first painted frame starts the clock and shows the mark.
+        assert_eq!(overlay.reveal_step(t0), Some(FOUND_AT));
+        // Frames inside the dwell keep showing the same rectangle -- it does
+        // not drift, and the overlay stays up.
+        for after in [0_u64, 1, 16, 200, 449] {
+            assert_eq!(
+                overlay.reveal_step(t0 + Duration::from_millis(after)),
+                Some(FOUND_AT),
+                "the mark moved or vanished {after} ms in"
+            );
+            assert!(overlay.is_open(), "the overlay closed {after} ms in");
+        }
+        // Exactly the dwell is enough -- "at least", as every other bound in
+        // this module is -- and it is what closes the overlay.
+        assert_eq!(overlay.reveal_step(t0 + REVEAL_DWELL), None);
+        assert!(!overlay.is_open(), "the reveal did not end the overlay");
+        // And from there, nothing: not on the next frame, not an hour later,
+        // not with the clock going backwards.
+        for after in [0_u64, 1, 16, 5_000, 3_600_000] {
+            assert_eq!(
+                overlay.reveal_step(t0 + REVEAL_DWELL + Duration::from_millis(after)),
+                None,
+                "the reveal came back {after} ms later"
+            );
+        }
+        assert_eq!(overlay.reveal_step(t0), None);
+        assert_eq!(overlay.view().reveal, None, "a finished reveal is still being painted");
+    }
+
+    /// **A second answer cannot restart a reveal, or reopen a finished one.**
+    ///
+    /// The *Whole screen* chip can be pressed while a reveal is running only
+    /// if the input guard fails, and a repaint can re-enter the callback at
+    /// any time -- so the state machine refuses rather than relying on the
+    /// caller. A reveal that could be restarted is a window that never closes,
+    /// which is the shape of the hang this module has already shipped once.
+    #[test]
+    fn a_second_scan_cannot_restart_or_reopen_the_reveal() {
+        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        let t0 = Instant::now();
+        assert_eq!(overlay.reveal_step(t0), Some(FOUND_AT));
+
+        // A second `Found`, somewhere else, mid-reveal: ignored entirely.
+        let elsewhere = rect(900, 900, 1000, 1000);
+        overlay.apply_scan(ScreenScan::Found(
+            Zeroizing::new("otpauth://totp/second".into()),
+            elsewhere,
+        ));
+        assert_eq!(
+            overlay.reveal_step(t0 + Duration::from_millis(1)),
+            Some(FOUND_AT),
+            "a second scan moved the mark mid-reveal"
+        );
+        // Including its payload: the answer is the code that was found first.
+        assert_eq!(overlay.reveal_step(t0 + REVEAL_DWELL), None);
+        match overlay.take_outcome() {
+            Some(Outcome::Decoded(text)) => assert_eq!(&*text, "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP"),
+            other => panic!("the reveal answered with {other:?}"),
+        }
+
+        // And after it is over, a `Found` cannot reopen the window.
+        overlay.apply_scan(ScreenScan::Found(
+            Zeroizing::new("otpauth://totp/third".into()),
+            elsewhere,
+        ));
+        assert!(!overlay.is_open(), "a scan reopened a closed overlay");
+        assert_eq!(overlay.reveal_step(t0 + REVEAL_DWELL * 2), None);
+        assert!(overlay.take_outcome().is_none(), "a closed overlay recorded a second answer");
+    }
+
+    /// **The reveal ends whether or not anything else happens.**
+    ///
+    /// The requirement that separates it from every other state on this
+    /// surface: a drag waits for the user, and this must not. A clock that
+    /// never reaches the deadline never ends it, and a clock that does ends it
+    /// with no pointer, no key and no press anywhere in the sequence.
+    #[test]
+    fn the_reveal_does_not_wait_for_the_user() {
+        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        let t0 = Instant::now();
+        // Two hundred frames inside the dwell, with no input of any kind. The
+        // first of them starts the clock; the rest are the repaints an idle
+        // desktop produces, and none of them may either end it early or
+        // restart it.
+        for _ in 0..200 {
+            assert!(overlay.reveal_step(t0 + Duration::from_millis(1)).is_some());
+            assert!(overlay.is_open());
+        }
+        // The clock alone closes it, at one dwell after the frame that
+        // started it -- not after the two hundredth, which is what a deadline
+        // pushed forward by each frame would give.
+        assert_eq!(
+            overlay.reveal_step(t0 + Duration::from_millis(1) + REVEAL_DWELL),
+            None
+        );
+        assert!(!overlay.is_open());
+
+        // **And a frame is always asked for**, which is the half of "does not
+        // wait for the user" that lives inside the viewport callback and can
+        // only be pinned from here by source.
+        //
+        // The reveal reads no input and this window is always-on-top over
+        // every monitor, so nothing else would ever wake it. Two places have
+        // to ask: the reveal branch, on every frame it paints, and the
+        // on-demand scan, which is the one place a reveal can be opened by a
+        // frame that has already passed `reveal_step` and would otherwise
+        // leave a `Due` reveal with no frame coming to start its clock.
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        let callback = code
+            .split("move |root, _class| {")
+            .nth(1)
+            .expect("the viewport callback was restructured");
+        assert_eq!(
+            callback.matches("root.request_repaint_of(region_viewport());").count(),
+            2,
+            "the reveal no longer asks for the frames it needs to end on its own"
+        );
+        // The second of them is the on-demand scan's, immediately after it.
+        let after_scan = callback
+            .split("&screen_capture::monitor_bounds(),")
+            .nth(1)
+            .expect("the on-demand scan was restructured");
+        assert!(
+            after_scan
+                .split("} else if")
+                .next()
+                .unwrap()
+                .contains("root.request_repaint_of(region_viewport());"),
+            "a reveal opened by the Whole screen chip has no frame coming to start its clock"
+        );
+    }
+
+    /// **The mark lands where the code is, in the painter's own units.**
+    ///
+    /// The last leg of the coordinate chain: `qr` reports a box in the
+    /// captured buffer's pixels, `scan_screen_with` places it on the virtual
+    /// screen, and this converts it into points inside a viewport whose origin
+    /// is the desktop's top-left. Every step of that is a subtraction or a
+    /// division that is the identity on a single 100% monitor, so this is
+    /// driven on a desktop that is neither.
+    #[test]
+    fn the_mark_is_drawn_over_the_code_and_not_beside_it() {
+        // Origin at (-1280, -200) -- a monitor left of and above the primary
+        // -- at 200% scaling, so both the offset and the scale factor have to
+        // be taken out for the answer to be right.
+        let monitors = [rect(-1280, -200, 0, 520), rect(0, 0, 1920, 1080)];
+        let at = rect(-1080, 0, -880, 200);
+        let overlay = found_on(&monitors, 2.0, at);
+        // In screen pixels the code runs from (-1080, 0) to (-880, 200); the
+        // viewport's origin is (-1280, -200), so that is 200..400 by 200..400
+        // pixels in, and at 2.0 that is 100..200 by 100..200 points.
+        assert_eq!(
+            overlay.view().reveal,
+            Some(rect_pts(100.0, 100.0, 200.0, 200.0))
+        );
+        // The same code on a plain 100% single-monitor desktop is reported at
+        // its own pixels, which is the control that says the arithmetic above
+        // is the offset and the scale and not a coincidence.
+        let plain = found_on(&[rect(0, 0, 1920, 1080)], 1.0, rect(300, 200, 460, 380));
+        assert_eq!(
+            plain.view().reveal,
+            Some(rect_pts(300.0, 200.0, 460.0, 380.0))
+        );
+    }
+
+    /// **Nothing else is painted while the reveal is up**, and nothing else
+    /// is on screen to be clicked.
+    ///
+    /// `draw` answers with the two chips' rectangles, and the pointer handling
+    /// tests a press against whichever it was last told about. During the
+    /// reveal there is no bar and therefore no chips: the reveal returns
+    /// `Rect::NOTHING` for both, which contains no point, so even a frame that
+    /// somehow reached the pointer handling could not press one.
+    #[test]
+    fn the_reveal_paints_no_bar_and_therefore_no_chips() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        // `draw` takes the reveal first and returns before `paint_bar`.
+        let drawn = code.split("pub fn draw(").nth(1).expect("`draw` was renamed");
+        let reveal = drawn.find("paint_reveal(").expect("`draw` no longer paints the reveal");
+        let bar = drawn.find("paint_bar(").expect("`draw` no longer paints the bar");
+        assert!(reveal < bar, "the bar is painted before the reveal returns");
+        assert!(
+            drawn[reveal..bar].contains("return [egui::Rect::NOTHING; 2];"),
+            "the reveal no longer returns before the bar, or no longer answers with no chips"
+        );
+        // And the callback reads no input on those frames: the reveal branch
+        // returns before the pointer is ever looked at.
+        let callback = code
+            .split("if mine.reveal_step(Instant::now()).is_some() {")
+            .nth(1)
+            .expect("the callback no longer has a reveal branch");
+        let ends = callback.find("return;").expect("the reveal branch does not return");
+        assert!(
+            !callback[..ends].contains("i.pointer") && !callback[..ends].contains("key_pressed"),
+            "the reveal branch reads input before it returns"
+        );
+    }
+
+    /// Production's dwell is the documented one: long enough to be seen,
+    /// short enough not to be sat through, and shorter than the scan in front
+    /// of it. A `REVEAL_DWELL` dropped to zero would be the reveal not
+    /// happening; raised to seconds it would be the feature made slower to
+    /// look faster.
+    #[test]
+    fn the_production_reveal_dwell_is_the_documented_one() {
+        assert_eq!(REVEAL_DWELL, Duration::from_millis(450));
+        // Past the quarter-second at which a mark that appeared away from the
+        // pointer has only just been looked at -- and past the "reads as
+        // immediate" threshold `DECODE_INTERVAL` is argued against, which is
+        // the same number and is checked against the constant rather than
+        // written out again.
+        assert!(REVEAL_DWELL > DECODE_INTERVAL * 2);
+        // And under half the second at which a fixed wait starts reading as
+        // the app thinking.
+        assert!(REVEAL_DWELL < Duration::from_millis(500));
+        // The badge it carries is 6c's own words and is NOT the drag's, which
+        // ends in an instruction for a gesture the reveal does not have.
+        assert_eq!(SCAN_FOUND, "Code read");
+        assert_ne!(SCAN_FOUND, LOCKED_ON);
+        assert!(!SCAN_FOUND.contains("release"));
+    }
+
+    /// **The window asks DWM to composite its alpha, on the frame it first
+    /// exists.**
+    ///
+    /// Not a proof that the overlay is see-through -- that needs a real
+    /// compositor and is in this module's list of things a test cannot hold.
+    /// It is a pin on the one thing that can be checked from here: that the
+    /// call `winit` skips is made at all, and made where an HWND exists.
+    ///
+    /// The flag alone is not enough and that is the whole point of the
+    /// function: `glutin_winit::finalize_window` strips `with_transparent`
+    /// whenever the GL config says it cannot do colour-key transparency, which
+    /// on Windows is always, and `winit` only makes the DWM call when the flag
+    /// survived. A future edit that deleted this call because "the viewport
+    /// already asks for transparency" would be re-introducing the black
+    /// screen, so the argument is pinned next to the call.
+    #[test]
+    fn the_overlay_asks_dwm_to_composite_its_alpha() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        assert!(
+            code.contains("DwmEnableBlurBehindWindow(HWND(hwnd as *mut _), &blur)"),
+            "nothing makes the DWM call that makes this window transparent"
+        );
+        // An EMPTY region: `DWM_BB_BLURREGION` with a region that has no area
+        // is "honour per-pixel alpha, blur nothing". A region with area would
+        // frost the desktop instead of dimming it.
+        assert!(
+            code.contains("CreateRectRgn(0, 0, -1, -1)"),
+            "the blur region is no longer empty, so the desktop would be blurred rather than \
+             merely showing through"
+        );
+        assert!(
+            code.contains("dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION"),
+            "the blur region is no longer read, so per-pixel alpha is not honoured"
+        );
+        // And the region is freed. DWM copies it; leaking one per overlay is
+        // a permanent GDI handle leak in a window the user may open often.
+        assert!(
+            code.contains("DeleteObject(region)"),
+            "the blur region is never deleted"
+        );
+        // It happens on the first painted frame, beside the capture
+        // exclusion, because that is the first moment there is a window to
+        // call it on.
+        let first = code
+            .split("if first_frame {")
+            .nth(1)
+            .expect("the callback no longer has a first-frame hook");
+        let first = first.split("\n                }").next().unwrap();
+        assert!(
+            first.contains("let_the_desktop_through(REGION_TITLE);"),
+            "the DWM call is not made on the frame the window first exists"
+        );
+        // The vault window's root viewport does NOT ask for transparency: on
+        // Windows that flag only reaches the GL config template, where it
+        // asks for a colour-key pixel format no driver has and a strict
+        // driver may answer with no formats at all -- which is a startup
+        // panic inside `eframe`'s config picker.
+        let vault = include_str!("vault_window/mod.rs").replace("\r\n", "\n");
+        let vault = vault.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            !vault.contains(".with_transparent(true)"),
+            "the vault window asks for transparency again; see `let_the_desktop_through`"
+        );
     }
 
     /// **The scan is decode-only: nothing paints it.**

@@ -1465,14 +1465,20 @@ impl TotpAdd {
 /// a dismissed dialog.
 ///
 /// **Unchanged by the whole-screen scan, and that is the design.** The scan
-/// runs inside `region_overlay` before the overlay opens, and the two answers
-/// it can give that this file has no words for -- "nothing on any monitor" and
-/// "more than one code, choose which" -- never arrive here at all: they open
-/// 6b with a line in its bar saying so, and the user then drags. What reaches
-/// this function is still exactly what a drag can produce. So a code the scan
-/// found and a code the user framed by hand land on the same
-/// [`TotpAdd::accept_decoded`], and from there on 6c's confirmation card,
-/// where nothing is written until Save is pressed.
+/// runs inside `region_overlay`, and the two answers it can give that this
+/// file has no words for -- "nothing on any monitor" and "more than one code,
+/// choose which" -- never arrive here at all: they open 6b with a line in its
+/// bar saying so, and the user then drags. What reaches this function is still
+/// exactly what a drag can produce. So a code the scan found and a code the
+/// user framed by hand land on the same [`TotpAdd::accept_decoded`], and from
+/// there on 6c's confirmation card, where nothing is written until Save is
+/// pressed.
+///
+/// **Unchanged by the reveal, too.** A found code now spends
+/// `region_overlay::REVEAL_DWELL` on screen, ringed where it sits, before the
+/// overlay closes. That is entirely inside the overlay: it arrives here at the
+/// same moment it always did relative to `show` answering `false`, as the same
+/// [`Outcome::Decoded`], and it still saves nothing.
 pub fn apply_region_outcome(state: &mut TotpAdd, outcome: Outcome) {
     match outcome {
         Outcome::Decoded(text) => state.accept_decoded(text),
@@ -3611,8 +3617,14 @@ pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
 /// nothing to drag a box on yet -- and it is left that way rather than given
 /// a second state, because the alternative is a card that changes its own
 /// sentence twice inside a second on the way to a surface that replaces it.
-/// When the scan finds one code this card is never painted at all: the
-/// outcome is applied before the frame that would have drawn it.
+///
+/// **How long it is the only thing on screen has changed, and the wording has
+/// not had to.** A scan that finds one code used to end the overlay before a
+/// window existed, so this card was the last thing the user saw before 6c;
+/// the overlay now opens for `region_overlay::REVEAL_DWELL` to show them the
+/// code it found, and covers this card while it does. Either way this is what
+/// is up while the scan itself runs, and *"Scanning your screen"* is the right
+/// heading for exactly that.
 pub fn draw_scanning(ui: &mut egui::Ui, state: &mut TotpAdd) {
     let mut go_back = false;
     card(ui, |ui| {

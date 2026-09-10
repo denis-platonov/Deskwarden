@@ -1537,25 +1537,42 @@ pub fn build_frame_with_search(
             crate::settings::MIN_VAULT_WINDOW_SIZE.1 as f32,
         ])
         .with_decorations(false)
-        // **This window is opaque and asks for transparency anyway**, and the
-        // reason is entirely about a DIFFERENT window: design 6b's region
-        // overlay, which `totp_add` opens as a deferred viewport of this one.
+        // **This window asked for transparency it did not need, and no longer
+        // does.** The removal is worth a note, because the flag was added on
+        // purpose and the reasoning behind it was half right.
         //
-        // `eframe`'s glow backend decides whether the GL config has an alpha
-        // channel ONCE, at startup, from the ROOT viewport's `NativeOptions` --
-        // a child viewport's own `with_transparent(true)` is read too late to
-        // affect it, and is answered with `Cannot create transparent window:
-        // the GL config does not support it` in the log. The overlay then gets
-        // an opaque window, `eframe` clears it to `clear_color`'s near-black
-        // default, and the "dimmed desktop" the user is supposed to drag a box
-        // on is a solid black screen. That was the bug.
+        // It was added for a DIFFERENT window -- design 6b's region overlay,
+        // which `totp_add` opens as a deferred viewport of this one -- on the
+        // theory that the ROOT viewport's `NativeOptions` is what decides
+        // whether the GL config has an alpha channel, so a child asking for
+        // transparency was asking too late. The overlay was indeed opaque and
+        // the "dimmed desktop" was indeed a solid black screen; that part was
+        // real. The theory was not.
         //
-        // What it costs this window is nothing, PROVIDED this window paints
-        // its own background on every frame rather than relying on the clear
-        // colour -- which is exactly what the frame closure below now does, and
-        // why `theme::paint_window_background`'s doc grew a second half. See
+        // The alpha channel is **unconditional**: `glutin`'s `ConfigTemplate`
+        // defaults `alpha_size: 8` with no reference to transparency at all.
+        // What `NativeOptions::viewport.transparent` actually feeds is
+        // `ConfigTemplateBuilder::with_transparency`, which sets
+        // `WGL_TRANSPARENT_ARB` in the pixel-format request -- **colour-key**
+        // transparency, which essentially no Windows driver advertises. Asking
+        // for it buys nothing here and is not free: `wglChoosePixelFormatARB`
+        // is entitled to return no formats at all for an attribute list it
+        // cannot satisfy, and `eframe`'s config picker is a
+        // `.next().expect("failed to find a matching configuration for
+        // creating glutin config")`. That is a startup panic, on the driver
+        // that takes the request literally, in exchange for a flag that the
+        // window-creation path strips again anyway.
+        //
+        // What actually fixed the overlay is
+        // `region_overlay::let_the_desktop_through`, which makes on the
+        // overlay's own HWND the `DwmEnableBlurBehindWindow` call `winit`
+        // skips whenever the transparent attribute has been stripped. That is
+        // a fix on the window that needs it, and it leaves this one alone.
+        //
+        // This window is opaque, paints its own background on every frame
+        // rather than relying on the clear colour, and is unaffected either
+        // way -- see `theme::paint_window_background` and
         // `crate::window_host`.
-        .with_transparent(true)
         // **Created hidden, shown by `Reveal` once it has painted something.**
         // Windows shows a new window with its own background while the GL
         // context and the font atlas are still being built, and that is the

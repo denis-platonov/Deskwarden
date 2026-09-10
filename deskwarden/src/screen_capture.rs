@@ -122,6 +122,103 @@ pub fn rect_from_drag(anchor: (i32, i32), cursor: (i32, i32)) -> ScreenRect {
     }
 }
 
+/// The smallest rectangle containing four corner **points**, with the
+/// right/bottom edges pushed one past the furthest point so the corner pixel
+/// itself is inside the rectangle.
+///
+/// [`rect_from_drag`]'s sibling, and here for the same reason that one is
+/// here: this is the second place in the crate that turns loose points into a
+/// rectangle, and the first one was written twice before it was written once.
+/// Its caller is [`crate::qr`], which gets a code's four corners out of
+/// `rqrr` -- listed top-left, top-right, bottom-right, bottom-left, and
+/// therefore **not** guaranteed to be axis-aligned: a code photographed off a
+/// screen at an angle, or a page at a browser zoom that lands on a half
+/// pixel, gives four points that form a slightly rotated quadrilateral. The
+/// rectangle around it is what gets drawn, because design 6b's mark is an
+/// axis-aligned box with a ring and four brackets and there is nothing in it
+/// that could be rotated to match.
+///
+/// The `+ 1` is the exclusive-edge convention this module's rectangles carry
+/// everywhere else: `right - left` is the width, so a code whose furthest
+/// column is 195 occupies columns up to and including 195 and its rectangle
+/// ends at 196. Without it a one-module-wide overlap is lost on each of two
+/// sides, which is invisible on a 200-pixel code and wrong on every one.
+pub fn rect_around(corners: [(i32, i32); 4]) -> ScreenRect {
+    let mut out = ScreenRect {
+        left: corners[0].0,
+        top: corners[0].1,
+        right: corners[0].0,
+        bottom: corners[0].1,
+    };
+    for (x, y) in corners {
+        out.left = out.left.min(x);
+        out.top = out.top.min(y);
+        out.right = out.right.max(x);
+        out.bottom = out.bottom.max(y);
+    }
+    out.right = out.right.saturating_add(1);
+    out.bottom = out.bottom.saturating_add(1);
+    out
+}
+
+/// **Puts a rectangle found *inside* a captured buffer back on the virtual
+/// screen.**
+///
+/// `captured` is the rectangle that was blitted, so its top-left is where
+/// that buffer's pixel `(0, 0)` sits on the desktop. `found` is a rectangle in
+/// the buffer's **own** pixels -- the space `rqrr` reports a code's corners
+/// in, and therefore the space [`crate::qr::Codes`] carries one out in.
+///
+/// # The whole of this function is the second monitor
+///
+/// On the primary monitor the origin is `(0, 0)` and this is the identity,
+/// which is exactly what makes it easy to leave out and impossible to notice:
+/// every test on one screen passes without it, and so does every hand trial by
+/// a developer with one laptop. A monitor placed left of or above the primary
+/// has a **negative** origin -- see [`ScreenRect`] -- so a code found 300
+/// pixels into that monitor's buffer is at `-1280 + 300` on the desktop and
+/// not at `300`. Drawn without this the highlight lands on the wrong screen
+/// entirely, roughly a monitor's width away from the code it is pointing at.
+/// `region_overlay` asserts the negative-origin case rather than only the
+/// flattering one.
+///
+/// # Clipped to the buffer, deliberately
+///
+/// Nothing found inside a buffer can be outside the rectangle that buffer is,
+/// and `rqrr`'s corners are **extrapolated** from the three finder patterns
+/// rather than measured off the image -- so on a code that runs to the very
+/// edge of a monitor they can land a pixel or two past it. Left unclipped
+/// that is a mark drawn over the neighbouring screen; clipped it is a mark
+/// flush with the edge, which is where the code is.
+pub fn place_in_capture(captured: ScreenRect, found: ScreenRect) -> ScreenRect {
+    // `max` then `min` rather than `clamp`, which panics when the bounds are
+    // inverted -- and `captured` comes from an enumeration this module does
+    // not control.
+    let into = |v: i32, low: i32, high: i32| v.max(low).min(high);
+    ScreenRect {
+        left: into(
+            captured.left.saturating_add(found.left),
+            captured.left,
+            captured.right,
+        ),
+        top: into(
+            captured.top.saturating_add(found.top),
+            captured.top,
+            captured.bottom,
+        ),
+        right: into(
+            captured.left.saturating_add(found.right),
+            captured.left,
+            captured.right,
+        ),
+        bottom: into(
+            captured.top.saturating_add(found.bottom),
+            captured.top,
+            captured.bottom,
+        ),
+    }
+}
+
 /// The smallest side [`capture_rect`] will blit, in pixels.
 ///
 /// This is a guard on the GDI call and on pointless work, **not** a judgement
@@ -573,6 +670,107 @@ mod tests {
             }
         );
         assert_eq!((r.width(), r.height()), (1300, 200));
+    }
+
+    // -- 1b. placing a code found inside a capture -------------------------
+
+    /// **Four corner points become the box around them**, whichever order and
+    /// whichever shape they arrive in.
+    ///
+    /// `rqrr` lists a grid's bounds top-left, top-right, bottom-right,
+    /// bottom-left, but nothing makes them axis-aligned: they are
+    /// extrapolated from three finder patterns, so a code drawn at a
+    /// fractional zoom or photographed off a screen gives a quadrilateral
+    /// that leans. The box is what gets drawn, so the box has to contain all
+    /// four.
+    #[test]
+    fn four_corners_become_the_box_that_contains_all_of_them() {
+        // Square and axis-aligned: the ordinary case.
+        assert_eq!(
+            rect_around([(10, 20), (109, 20), (109, 119), (10, 119)]),
+            ScreenRect { left: 10, top: 20, right: 110, bottom: 120 }
+        );
+        // The exclusive edge: the furthest column is 109 and the rectangle
+        // ends at 110, so the width covers the corner pixel itself.
+        assert_eq!(
+            rect_around([(10, 20), (109, 20), (109, 119), (10, 119)]).width(),
+            100
+        );
+        // Leaning: every corner is outside the box the two "opposite" ones
+        // alone would give, and all four are inside the answer.
+        let leaning = [(12, 20), (110, 26), (104, 124), (6, 118)];
+        let box_ = rect_around(leaning);
+        assert_eq!(box_, ScreenRect { left: 6, top: 20, right: 111, bottom: 125 });
+        for (x, y) in leaning {
+            assert!(
+                x >= box_.left && x < box_.right && y >= box_.top && y < box_.bottom,
+                "corner ({x}, {y}) fell outside the box drawn around it"
+            );
+        }
+        // A degenerate grid -- four identical points -- is one pixel rather
+        // than an empty rectangle that would silently draw nothing.
+        assert_eq!((rect_around([(5, 5); 4]).width(), rect_around([(5, 5); 4]).height()), (1, 1));
+        // And `i32::MAX` on an edge saturates rather than wrapping to a
+        // rectangle that measures zero.
+        assert_eq!(rect_around([(0, 0), (i32::MAX, 0), (i32::MAX, 4), (0, 4)]).right, i32::MAX);
+    }
+
+    /// **A code found on a monitor whose origin is not `(0, 0)` lands where
+    /// the code is, not a monitor's width away from it.**
+    ///
+    /// The one case this function exists for. A buffer's coordinates start at
+    /// its own top-left, so on the primary monitor the placement is the
+    /// identity and no test on one screen can tell whether it happens at all.
+    #[test]
+    fn a_code_found_in_a_capture_is_placed_where_the_capture_was() {
+        // The primary monitor: the identity, which is the trap.
+        let primary = ScreenRect { left: 0, top: 0, right: 1920, bottom: 1080 };
+        let found = ScreenRect { left: 300, top: 200, right: 500, bottom: 400 };
+        assert_eq!(place_in_capture(primary, found), found);
+
+        // A monitor left of and above it, where the origin is negative.
+        let left_of = ScreenRect { left: -1280, top: -200, right: 0, bottom: 520 };
+        assert_eq!(
+            place_in_capture(left_of, found),
+            ScreenRect { left: -980, top: 0, right: -780, bottom: 200 }
+        );
+        // A monitor to the right, the commonest second-monitor arrangement.
+        let right_of = ScreenRect { left: 1920, top: 0, right: 3200, bottom: 720 };
+        assert_eq!(
+            place_in_capture(right_of, found),
+            ScreenRect { left: 2220, top: 200, right: 2420, bottom: 400 }
+        );
+        // The size survives every one of those: a placement that changed it
+        // would be a mark the wrong size in the right place.
+        for monitor in [primary, left_of, right_of] {
+            let placed = place_in_capture(monitor, found);
+            assert_eq!((placed.width(), placed.height()), (200, 200), "{monitor:?}");
+        }
+    }
+
+    /// **Nothing found inside a buffer is drawn outside it.** `rqrr`
+    /// extrapolates a grid's corners rather than measuring them, so a code
+    /// flush with the edge of a monitor can report a corner a pixel or two
+    /// past it -- and an unclipped mark for that code is drawn over the
+    /// neighbouring screen.
+    #[test]
+    fn a_code_reported_past_the_edge_of_its_monitor_is_pulled_back_onto_it() {
+        let monitor = ScreenRect { left: 1920, top: 0, right: 3200, bottom: 720 };
+        let overhanging = ScreenRect { left: -3, top: -2, right: 1284, bottom: 723 };
+        assert_eq!(place_in_capture(monitor, overhanging), monitor);
+        // Positive control: a rectangle comfortably inside is not clipped, so
+        // the clamp above is about the overhang and not about clipping
+        // everything to the monitor.
+        let inside = ScreenRect { left: 10, top: 10, right: 110, bottom: 110 };
+        assert_eq!(
+            place_in_capture(monitor, inside),
+            ScreenRect { left: 1930, top: 10, right: 2030, bottom: 110 }
+        );
+        // An inverted `captured` -- which this module cannot rule out, since
+        // the monitor list comes from an enumeration it does not control --
+        // answers rather than panicking on `clamp`'s inverted bounds.
+        let inverted = ScreenRect { left: 500, top: 500, right: 100, bottom: 100 };
+        let _ = place_in_capture(inverted, inside);
     }
 
     /// A click that never became a drag is a zero-area rectangle, and an
