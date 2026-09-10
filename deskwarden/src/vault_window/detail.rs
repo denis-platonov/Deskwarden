@@ -1754,19 +1754,34 @@ pub fn draw_out_of_vault_read(
                                     continue;
                                 };
                                 // **The permanent delete keeps its red
-                                // words**, which is the one thing this menu
-                                // does not take from the shared list: that
-                                // list carries a label and a command, and the
-                                // live pane's own Delete has spent this
-                                // app's whole life in `theme::ERROR`. The
-                                // click still opens the same confirmation
-                                // modal the row menu's entry opens.
+                                // words, and no longer keeps them by
+                                // hand.** This arm used to build its own
+                                // `Button::new(RichText::new(..).color(
+                                // theme::ERROR))` because the shared list
+                                // carried a label and a command and nothing
+                                // that said "this one destroys something";
+                                // `RowCommand::is_destructive` says it now,
+                                // so the red arrives through
+                                // `menu_command_button` exactly as it does
+                                // for the row menu's own Delete forever, and
+                                // the two surfaces cannot drift into
+                                // disagreeing about which entries are red.
+                                //
+                                // What is still special here, and the only
+                                // reason this is not a plain `menu_command`
+                                // call, is the hover sentence: `MenuCommand`
+                                // carries a reason for a DISABLED entry and
+                                // nothing for an enabled one, and this
+                                // pane's entries have always explained
+                                // themselves on hover. So it takes the
+                                // button back and hangs the tooltip on it.
+                                // The click still opens the same
+                                // confirmation modal the row menu's entry
+                                // opens.
                                 let clicked = if entry.command
                                     == super::item_list::RowCommand::PurgeForever
                                 {
-                                    let button = ui.add(egui::Button::new(
-                                        RichText::new(&entry.label).color(theme::ERROR),
-                                    ));
+                                    let button = super::item_list::menu_command_button(ui, &entry);
                                     if button
                                         .on_hover_text("Delete this item permanently")
                                         .clicked()
@@ -3642,27 +3657,45 @@ pub fn draw_detail_read(
                     // vault refuses the write. The entry keeps its red words
                     // and its hover; the arming label, the red kebab and the
                     // menu-stays-open rule are gone with the arm.
-                    let (delete_label, delete_hover) = ("Delete", "Delete this item");
                     //
-                    // **The red is on the WORDS and nothing else.** This
-                    // entry used to carry `.fill(theme::CARD)`, which is the
-                    // background the header strip's Delete button sat on
-                    // before the entry moved in here -- and inside a menu it
-                    // did two things, neither of them wanted. `Button::fill`
-                    // is documented to "override any on-hover effects", so
-                    // the theme's `widgets.hovered.bg_fill` never reached
-                    // this row: Edit, Clone and Move to folder each lit up
-                    // under the pointer and Delete alone stayed flat, which
-                    // is the "delete item doesn't get hovered in menu"
-                    // half of the report. And `CARD` is the menu's own
-                    // background colour, so the fill it pinned was
-                    // invisible -- it cost the hover and bought nothing.
-                    // Dropping it leaves an `ui.add(Button)` that is
-                    // `ui.button` with a coloured label, which is what every
-                    // sibling above already is.
-                    let delete = ui
-                        .add(egui::Button::new(RichText::new(delete_label).color(theme::ERROR)));
-                    if delete.on_hover_text(delete_hover).clicked() {
+                    // **The red is on the WORDS and nothing else**, and that
+                    // rule now lives in one place for both menus rather than
+                    // being restated here. This entry used to carry
+                    // `.fill(theme::CARD)`, which is the background the
+                    // header strip's Delete button sat on before the entry
+                    // moved in here -- and inside a menu it did two things,
+                    // neither of them wanted. `Button::fill` is documented to
+                    // "override any on-hover effects", so the theme's
+                    // `widgets.hovered.bg_fill` never reached this row: Edit,
+                    // Clone and Move to folder each lit up under the pointer
+                    // and Delete alone stayed flat, which is the "delete item
+                    // doesn't get hovered in menu" half of the report. And
+                    // `CARD` is the menu's own background colour, so the fill
+                    // it pinned was invisible -- it cost the hover and bought
+                    // nothing.
+                    //
+                    // **So this is now the row menu's own renderer**, given a
+                    // `MenuCommand` for the very command the click reports.
+                    // `item_list::menu_command_button` paints an entry whose
+                    // `RowCommand::is_destructive` is true in `theme::ERROR`
+                    // and touches nothing else -- no fill, so the hover
+                    // survives, which is the whole of what the paragraph
+                    // above defends. The reason to route through it rather
+                    // than keep the two hand-coloured lines is that the row
+                    // menu's Delete had to become red too, and "a destructive
+                    // entry is red" written twice is the pair that drifts:
+                    // the kebab was red and the row menu was not for exactly
+                    // as long as the fact lived in this file alone.
+                    //
+                    // It is `menu_command_button` and not `menu_command`
+                    // because the tooltip and the reported action are this
+                    // pane's, not the list's -- see that function's doc.
+                    let entry = super::item_list::plain_command(
+                        super::item_list::DELETE_LABEL,
+                        super::item_list::RowCommand::Delete,
+                    );
+                    let delete = super::item_list::menu_command_button(ui, &entry);
+                    if delete.on_hover_text("Delete this item").clicked() {
                         action = DetailAction::Delete;
                         // Closes, like Edit and Clone above it. The one
                         // entry in this menu that deliberately did NOT close
@@ -9666,6 +9699,54 @@ mod tests {
             })
         }
 
+        /// The colour `label`'s glyphs were laid out in.
+        ///
+        /// [`texts`](Self::texts) keeps the run and its box and throws the
+        /// colour away, and `painted_colours` further down this module reads
+        /// colours off an IDLE pane rather than off a frame -- neither can
+        /// answer anything about a menu, which exists only while one is open.
+        /// This walks [`shapes`](Self::shapes), the frame's own tree, so it
+        /// answers about whatever that frame really painted, popup included.
+        ///
+        /// The override wins over the layout job's section colour, in that
+        /// order, because that is the order egui resolves them in when it
+        /// renders -- reading only the section would report the styled colour
+        /// of a run that was then drawn in another.
+        fn text_colour_of(&self, label: &str) -> egui::Color32 {
+            fn walk(shape: &egui::Shape, label: &str, out: &mut Vec<egui::Color32>) {
+                match shape {
+                    egui::Shape::Text(text) => {
+                        if text.galley.text() == label {
+                            out.push(text.override_text_color.unwrap_or_else(|| {
+                                text.galley
+                                    .job
+                                    .sections
+                                    .first()
+                                    .map(|s| s.format.color)
+                                    .unwrap_or(text.fallback_color)
+                            }));
+                        }
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            walk(shape, label, out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut found = Vec::new();
+            walk(&self.shapes, label, &mut found);
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one {label:?} in the frame, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0]
+        }
+
         /// The header's favourite star. Exactly one, in either state.
         fn star(&self) -> theme::icon_probe::Star {
             assert_eq!(
@@ -10595,6 +10676,91 @@ mod tests {
                  paints {sibling:?} -- one menu, two hover treatments"
             );
         }
+    }
+
+    /// **The kebab's Delete is red in its WORDS, and its siblings are not.**
+    ///
+    /// This entry was hand-drawn here for the app's whole life and is now
+    /// painted by `item_list::menu_command_button`, the renderer the row
+    /// menu's entries go through, so that "a destructive menu entry is red"
+    /// has one definition instead of one per surface. This is the assertion
+    /// that the fold kept the colour: a `menu_command_button` that lost the
+    /// `RowCommand::is_destructive` arm would leave this row looking like
+    /// Edit, and every other test on it -- the click, the row width, the
+    /// hover tint -- would still pass.
+    ///
+    /// **The siblings are the other half**, for the reason the row menu's
+    /// twin of this test gives: the colour is now applied inside a shared
+    /// renderer, so "Delete is `ERROR`" on its own would also be satisfied by
+    /// a menu that had turned every line red.
+    ///
+    /// It is deliberately NOT an assertion about the row's fill. That is
+    /// `the_pointer_tints_the_kebabs_delete_the_way_it_tints_its_siblings`
+    /// above, and the two together are what the entry's comment defends: red
+    /// words, an untouched background, and therefore a hover that still
+    /// works.
+    #[test]
+    fn the_kebabs_delete_is_painted_as_an_alarm_and_its_siblings_are_not() {
+        for kind in EVERY_KIND {
+            let item = an_item(item_type_for(kind));
+            let mut pane = Pane::new();
+            let open = pane.open_kebab(&item, &TotpState::NoSecret);
+            assert_eq!(
+                open.text_colour_of("Delete"),
+                theme::ERROR,
+                "{kind:?}: the kebab's Delete is painted {:?}",
+                open.text_colour_of("Delete")
+            );
+            // The two entries this kebab draws for EVERY kind. "Edit" is
+            // deliberately not among them: it is absent from an SSH key's
+            // menu (see `kind_offers_edit`), so naming it here would make
+            // this loop fail on that kind for a reason that has nothing to
+            // do with colour.
+            for sibling in [
+                crate::vault_window::item_list::ICON_LABEL,
+                crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL,
+            ] {
+                assert_ne!(
+                    open.text_colour_of(sibling),
+                    theme::ERROR,
+                    "{kind:?}: {sibling:?} is painted in the alarm colour too, so the menu \
+                     is uniformly red and says nothing about Delete"
+                );
+            }
+        }
+    }
+
+    /// The same, on the pane a TRASHED item gets: "Delete forever" is red and
+    /// Restore, the only other entry that menu has, is not.
+    ///
+    /// That entry also stopped hand-rolling its colour -- it comes off
+    /// `out_of_vault_entries` and is drawn through the shared renderer now --
+    /// and it is the app's one irreversible act, so the surface it is offered
+    /// on is worth pinning separately from the live pane's.
+    #[test]
+    fn the_trashed_panes_delete_forever_is_painted_as_an_alarm_and_restore_is_not() {
+        let item = out_of_vault_item("Ledgerline");
+        let (_, first) = painted_out_of_vault_in(&item, OutOfVault::Trash, None);
+        assert_eq!(first.kebab_dots.len(), 3, "the pane painted no kebab to click");
+        let at = first.kebab_dots[1].0.center();
+        let (_, open) = out_of_vault_frames(
+            &item,
+            OutOfVault::Trash,
+            None,
+            &[out_of_vault_click(at), Vec::new()],
+        );
+        assert_eq!(
+            open.text_colour_of("Delete forever"),
+            theme::ERROR,
+            "the app's one irreversible entry is painted {:?}",
+            open.text_colour_of("Delete forever")
+        );
+        assert_ne!(
+            open.text_colour_of("Restore"),
+            theme::ERROR,
+            "Restore is painted in the alarm colour, so this menu is uniformly red and \
+             says nothing about Delete forever"
+        );
     }
 
     /// **The report, reproduced end to end**: the kebab's Delete row really

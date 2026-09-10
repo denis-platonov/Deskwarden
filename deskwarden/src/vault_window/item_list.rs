@@ -162,6 +162,36 @@ pub enum RowCommand {
     PurgeForever,
 }
 
+impl RowCommand {
+    /// Whether this command **destroys something**, and so should be drawn in
+    /// [`theme::ERROR`] wherever a menu offers it -- see [`menu_command`].
+    ///
+    /// **Derived from the command rather than carried as a field on
+    /// [`MenuCommand`],** which is the whole point of putting it here. Four
+    /// separate places build a `MenuCommand` -- [`plain_command`],
+    /// [`enabled_command`], [`move_menu`]'s two arms and [`icon_menu`]'s
+    /// three rows -- and a `destructive: bool` they each had to set would be
+    /// a field one of them eventually got wrong, silently, in the direction
+    /// that matters: a Delete that forgot to say so looks like Copy username
+    /// and is one misclick from the modal. Deriving it means a new
+    /// destructive variant is red in every menu that offers it the moment it
+    /// is added to this match, and cannot be red in one surface and plain in
+    /// another.
+    ///
+    /// **Two variants, and the line is "this ends the item", not "this
+    /// writes".** [`Self::Archive`] takes an item out of the working vault
+    /// and [`Self::ClearIcon`] throws away a chosen picture, and neither is
+    /// here: both are one menu click from being undone, and a menu whose
+    /// every consequential row is red is a menu with no warning colour left.
+    /// The two that are here are the two that go through
+    /// `super::delete_modal` -- the app already treats "needs a sentence and
+    /// a confirmation" and "is destructive" as the same set, and this keeps
+    /// the colour on that same set rather than inventing a second one.
+    pub(super) fn is_destructive(&self) -> bool {
+        matches!(self, Self::Delete | Self::PurgeForever)
+    }
+}
+
 /// What an item row puts on egui's drag-and-drop clipboard while it is being
 /// dragged, and what the sidebar's folder rows read back.
 ///
@@ -327,7 +357,12 @@ const ALREADY_IN_NO_FOLDER: &str = "This item is not in a folder";
 /// ("Delete? Click to confirm") that this entry re-labelled itself with for
 /// three seconds -- see that module's doc for why a menu is the wrong place
 /// to hold a state.
-const DELETE_LABEL: &str = "Delete";
+///
+/// `pub(super)` since the detail pane's kebab builds its own Delete entry
+/// from it rather than repeating the word: that pane had `("Delete", "Delete
+/// this item")` typed into it, so the row menu and the kebab were two
+/// spellings of one label and a rename would have moved only one of them.
+pub(super) const DELETE_LABEL: &str = "Delete";
 
 /// The Trash row's permanent delete. Also one label, through the same modal,
 /// which says "forever" in its heading, its sentence and its button.
@@ -634,7 +669,13 @@ pub(super) fn icon_menu(item: &VaultItem) -> Option<Vec<MenuCommand>> {
 /// inside a submenu of this menu opens a further one -- so the two shapes are
 /// built by one function each over a single definition of what "plain" means,
 /// rather than by two spellings of the same four fields.
-fn plain_command(label: &str, command: RowCommand) -> MenuCommand {
+///
+/// `pub(super)` for [`menu_command_button`]'s reason: the detail pane's kebab
+/// has one entry -- the live item's Delete -- that no list in this file
+/// produces, and building it here is what puts it under the same
+/// [`RowCommand::is_destructive`] rule as every entry that does come from a
+/// list, instead of under a hand-rolled red of its own.
+pub(super) fn plain_command(label: &str, command: RowCommand) -> MenuCommand {
     MenuCommand {
         label: label.to_string(),
         command,
@@ -2475,20 +2516,63 @@ fn drag_ghost(ui: &egui::Ui, name: &str) {
 /// greying it rather than dropping it (see [`MenuCommand::enabled`]), so the
 /// two are set together here and cannot be drawn apart.
 ///
+/// A destructive entry is painted in [`theme::ERROR`] -- see
+/// [`menu_command_button`], which does the drawing, and
+/// [`RowCommand::is_destructive`], which decides. That is here and not at the
+/// four call sites that build entries, so this file's Delete and the detail
+/// pane's are the same red by construction rather than by two people
+/// remembering.
+///
 /// `pub(super)` for [`move_menu`]'s reason: the detail pane's kebab draws the
 /// same [`MenuCommand`]s and must grey them, and state their reason, exactly
 /// as this does.
 pub(super) fn menu_command(ui: &mut egui::Ui, entry: &MenuCommand) -> bool {
-    let button = ui.add_enabled(entry.enabled, egui::Button::new(entry.label.as_str()));
-    let button = match entry.disabled_reason {
-        Some(reason) => button.on_disabled_hover_text(reason),
-        None => button,
-    };
-    if button.clicked() {
+    if menu_command_button(ui, entry).clicked() {
         ui.close();
         return true;
     }
     false
+}
+
+/// [`menu_command`] without the click handling: **what a menu entry LOOKS
+/// like**, handed back as its `Response` so the caller can still hang an
+/// enabled-state tooltip on it.
+///
+/// It exists because the detail pane's kebab draws two entries this file's
+/// lists do not reach -- the live item's own Delete, which is built there and
+/// not from [`menu_entries`], and the trashed pane's "Delete forever",
+/// which comes from [`out_of_vault_entries`] but wants a hover sentence of
+/// its own. Both used to hand-roll `Button::new(RichText::new(..).color(
+/// theme::ERROR))`, which made two definitions of "a destructive menu entry
+/// is red" that nothing kept in step; folding them onto this one is what lets
+/// the row menu's Delete become red by changing one match arm rather than
+/// three call sites.
+///
+/// **The red goes on the WORDS and on nothing else**, which is not a detail
+/// but the entire lesson of the entry this replaced: that one carried a
+/// `.fill(theme::CARD)`, `Button::fill` is documented to "override any
+/// on-hover effects", and the result was the one row in the menu that never
+/// lit up under the pointer -- the "delete item doesn't get hovered in menu"
+/// report. A [`RichText`] colour touches the galley and leaves
+/// `widgets.hovered.bg_fill` alone, so every entry drawn through here, red or
+/// not, takes the theme's hover exactly as its siblings do. See
+/// `detail::tests::the_pointer_tints_the_kebabs_delete_the_way_it_tints_its_siblings`,
+/// which is the assertion that keeps it that way.
+pub(super) fn menu_command_button(ui: &mut egui::Ui, entry: &MenuCommand) -> egui::Response {
+    // Plain `&str` for the ordinary entry rather than a `RichText` with the
+    // theme's own colour in it: an uncoloured label is the one that inherits
+    // `widgets.*.fg_stroke`, so disabled entries keep egui's greying and a
+    // theme change reaches them without passing through this file.
+    let label = if entry.command.is_destructive() {
+        egui::WidgetText::from(RichText::new(entry.label.as_str()).color(theme::ERROR))
+    } else {
+        egui::WidgetText::from(entry.label.as_str())
+    };
+    let button = ui.add_enabled(entry.enabled, egui::Button::new(label));
+    match entry.disabled_reason {
+        Some(reason) => button.on_disabled_hover_text(reason),
+        None => button,
+    }
 }
 
 /// `box-shadow: 0 1px 2px rgba(45, 43, 43, 0.06)` -- the design's selected
@@ -8651,6 +8735,101 @@ mod row_tile_tests {
         }
         for entry in ["Restore", "Unarchive", PURGE_LABEL] {
             assert!(!painted.contains(&entry), "a live row offered {entry:?}");
+        }
+    }
+
+    /// Every colour the frame painted `label` in, in paint order.
+    ///
+    /// A `Vec` rather than one colour, and a `panic!` on an empty one: a
+    /// colour assertion whose label was never painted is the failure mode
+    /// this file's `MENU_VOCABULARY` doc is entirely about -- a test that
+    /// reads as coverage while asking nothing -- and an `unwrap_or_default`
+    /// here would turn "the menu drew no Delete at all" into a comparison
+    /// against `Color32::default()` that could pass or fail for reasons
+    /// nobody could read off the message.
+    fn painted_colours_of(p: &Painted, label: &str) -> Vec<egui::Color32> {
+        let found: Vec<egui::Color32> = p
+            .texts
+            .iter()
+            .filter(|(text, _, _)| text == label)
+            .map(|(_, _, colour)| *colour)
+            .collect();
+        assert!(
+            !found.is_empty(),
+            "{label:?} was never painted, so nothing about its colour can be asserted; \
+             the menu drew {:?}",
+            menu_labels(p)
+        );
+        found
+    }
+
+    /// **Delete is red in the row menu, and its neighbours are not.**
+    ///
+    /// The user's report was that the row menu's Delete looked like every
+    /// other entry while the detail pane's kebab had spent the app's whole
+    /// life painting the same act in `theme::ERROR` -- one item, two menus,
+    /// two answers to "is this the dangerous one".
+    ///
+    /// **The neighbours are half the assertion.** "Delete is `ERROR`" alone
+    /// passes against a menu that painted every line red, which is not a
+    /// warning colour but a theme change, and it is a real failure mode here
+    /// because the colour is applied inside the shared `menu_command_button`
+    /// that draws all of them. Archive is the entry directly above Delete and
+    /// the closest thing the menu has to a decoy -- it also takes the item
+    /// out of the working vault -- so it is the one worth naming; Edit is
+    /// there as an ordinary line well away from the lifecycle pair.
+    #[test]
+    fn the_row_menus_delete_is_painted_as_an_alarm_and_its_neighbours_are_not() {
+        let items = vec![full_login("Ledgerline"), full_login("Vantage")];
+        let p = open_menu(&items, vec![folder("f1", "Work")], 0);
+        for colour in painted_colours_of(&p, DELETE_LABEL) {
+            assert_eq!(
+                colour,
+                theme::ERROR,
+                "the row menu's Delete is painted {colour:?}; the kebab's Delete is \
+                 {:?}, and one item's two menus disagree about which act is destructive",
+                theme::ERROR
+            );
+        }
+        for neighbour in ["Archive", "Edit"] {
+            for colour in painted_colours_of(&p, neighbour) {
+                assert_ne!(
+                    colour, theme::ERROR,
+                    "{neighbour:?} is painted in the alarm colour too, so the menu is \
+                     uniformly red and says nothing about Delete"
+                );
+            }
+        }
+    }
+
+    /// The same rule one level down, on the menu a TRASHED row gets: the
+    /// permanent delete is red and Restore, the only other entry that menu
+    /// has, is not.
+    ///
+    /// Worth its own test rather than a second loop in the one above,
+    /// because "Delete forever" reaches the painter down a different path --
+    /// `out_of_vault_entries`, not `menu_entries` -- and the colour is
+    /// derived from `RowCommand::is_destructive` precisely so that both
+    /// paths get it without either list saying so. A rule that held only on
+    /// the live menu would leave the app's one irreversible act as the
+    /// plainest line in its menu.
+    #[test]
+    fn a_trashed_rows_delete_forever_is_painted_as_an_alarm_and_restore_is_not() {
+        let items = vec![full_login("Ledgerline")];
+        let p = open_menu_under(&items, vec![], 0, SidebarFilter::Trash);
+        for colour in painted_colours_of(&p, PURGE_LABEL) {
+            assert_eq!(
+                colour,
+                theme::ERROR,
+                "the app's one irreversible entry is painted {colour:?}"
+            );
+        }
+        for colour in painted_colours_of(&p, "Restore") {
+            assert_ne!(
+                colour, theme::ERROR,
+                "Restore is painted in the alarm colour, so the trash menu is uniformly \
+                 red and says nothing about Delete forever"
+            );
         }
     }
 
