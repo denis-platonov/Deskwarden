@@ -333,11 +333,27 @@ pub const DEFERRED_REASON: &str = "Not in this version";
 /// [`image_to_rgba`] can actually decode say one thing, and a row that hid a
 /// format the app reads would be the same defect as one that offered a format
 /// it does not.
+/// **The first row's copy is a deliberate departure from 6a**, and it follows
+/// a change to what the row does rather than a change of mind about how to
+/// say it. 6a's row is *"Scan a region of my screen"* over *"Drag a box
+/// around the QR code in any window"*, and both sentences were exactly right
+/// while pressing the row opened a surface to drag a box on. It no longer
+/// does: [`crate::region_overlay`] scans every monitor first and opens design
+/// 6b only when it cannot answer -- the owner's *"would be nice if it could
+/// recognize the QR itself without drawing a box"*. A row that still promised
+/// a box to drag would describe the fallback and not the route.
+///
+/// The rule the rewrite follows is the same one that widened the image row's
+/// format list: this row, the surface it opens and what that surface really
+/// does say **one** thing. The drag is still named, because it is still what
+/// happens when the scan misses, and a route that turned out to want a
+/// gesture the row never mentioned would be the same broken promise one click
+/// later.
 pub const ROUTES: [RouteRow; 4] = [
     RouteRow {
         route: Route::ScanRegion,
-        title: "Scan a region of my screen",
-        subtitle: "Drag a box around the QR code in any window",
+        title: "Scan the code on my screen",
+        subtitle: "Deskwarden looks for it in every window \u{b7} drag a box if it misses",
         enabled: true,
     },
     RouteRow {
@@ -1447,6 +1463,16 @@ impl TotpAdd {
 /// sentence explaining that to them is an app narrating their own action back
 /// at them, which is the thing `apply_export_action` already refuses to do for
 /// a dismissed dialog.
+///
+/// **Unchanged by the whole-screen scan, and that is the design.** The scan
+/// runs inside `region_overlay` before the overlay opens, and the two answers
+/// it can give that this file has no words for -- "nothing on any monitor" and
+/// "more than one code, choose which" -- never arrive here at all: they open
+/// 6b with a line in its bar saying so, and the user then drags. What reaches
+/// this function is still exactly what a drag can produce. So a code the scan
+/// found and a code the user framed by hand land on the same
+/// [`TotpAdd::accept_decoded`], and from there on 6c's confirmation card,
+/// where nothing is written until Save is pressed.
 pub fn apply_region_outcome(state: &mut TotpAdd, outcome: Outcome) {
     match outcome {
         Outcome::Decoded(text) => state.accept_decoded(text),
@@ -3577,6 +3603,16 @@ pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
 /// window is the way back, and the outcome that really ends it arrives from
 /// the overlay through [`apply_region_outcome`]. A Cancel here would be a
 /// second way to close a surface whose other window is still up.
+///
+/// **This card is also what is on screen for the moment before the overlay
+/// exists**, while `region_overlay` takes and decodes its whole-screen scan,
+/// and its heading is the one word for both: *"Scanning your screen"*. The
+/// instruction under it is the overlay's and is a beat early -- there is
+/// nothing to drag a box on yet -- and it is left that way rather than given
+/// a second state, because the alternative is a card that changes its own
+/// sentence twice inside a second on the way to a surface that replaces it.
+/// When the scan finds one code this card is never painted at all: the
+/// outcome is applied before the frame that would have drawn it.
 pub fn draw_scanning(ui: &mut egui::Ui, state: &mut TotpAdd) {
     let mut go_back = false;
     card(ui, |ui| {
@@ -5050,7 +5086,25 @@ mod tests {
             vec![Route::ScanRegion, Route::ImageFile, Route::ByHand, Route::Webcam],
             "the routes are not in design 6a's order"
         );
-        assert_eq!(ROUTES[0].title, "Scan a region of my screen");
+        // **6a's first row, rewritten with the route.** See `ROUTES`: the
+        // row now scans before it offers a box to drag, so the design's
+        // "Scan a region of my screen" over "Drag a box around the QR code in
+        // any window" would describe the fallback rather than the route. Both
+        // halves of the replacement are pinned, because both are claims: it
+        // says the app looks, and it still names the drag.
+        assert_eq!(ROUTES[0].title, "Scan the code on my screen");
+        assert_eq!(
+            ROUTES[0].subtitle,
+            "Deskwarden looks for it in every window \u{b7} drag a box if it misses"
+        );
+        assert!(
+            !ROUTES[0].title.contains("region") && !ROUTES[0].subtitle.starts_with("Drag"),
+            "the scan row still leads with the box the user no longer has to draw"
+        );
+        assert!(
+            ROUTES[0].subtitle.contains("drag a box"),
+            "the scan row no longer names the fallback the overlay still is"
+        );
         assert_eq!(ROUTES[1].title, "Open an image file");
         assert_eq!(ROUTES[2].title, "Enter the secret by hand");
         assert_eq!(ROUTES[3].title, "Use a webcam");

@@ -1,4 +1,5 @@
-//! **6b -- the dimmed full-screen surface the user drags a box on.**
+//! **6b -- the dimmed full-screen surface the user drags a box on, and the
+//! whole-screen scan that usually means the user never sees it.**
 //!
 //! The desktop dims, the selection stays lit, and the overlay **locks on
 //! before the user releases**: *"Code found · release to read"*. That last
@@ -6,6 +7,37 @@
 //! you whether it worked after you let go teaches the user to drag, release,
 //! read a refusal, and drag again; one that says "found" while the button is
 //! still down turns the same drag into a single, confident gesture.
+//!
+//! # The scan comes first, and the drag is the fallback
+//!
+//! **This is a deliberate departure from the design**, asked for by the owner
+//! in those words: *"would be nice if it could recognize the QR itself without
+//! drawing a box - is it possible? Should be I think"*. Design 6a's row leads
+//! straight to 6b, and 6b is a rectangle the user has to draw. But the reason
+//! it asked for a rectangle was never that the decoder needs one --
+//! [`crate::qr`] finds a code anywhere in a picture, and always could -- it
+//! was that the capture is the user's screen and the design would not take one
+//! they had not framed. Choosing the route **is** asking for it.
+//!
+//! So [`RegionOverlay::show`]'s first act is [`scan_screen_with`] over every
+//! monitor, and 6b opens only when that cannot answer:
+//!
+//! * **exactly one code** -- the overlay never appears at all. The outcome is
+//!   [`Outcome::Decoded`] before a window exists, and the caller lands on the
+//!   same 6c confirmation card every other route lands on. **Nothing is
+//!   saved**: 6c holds the code and its countdown, and Save is a press the
+//!   user makes.
+//! * **none** -- 6b opens, and its bottom bar says why, because a full-screen
+//!   dim that arrives with no account of itself is a surface the user has to
+//!   reverse-engineer.
+//! * **more than one distinct code** -- 6b opens and says *that*. Picking one
+//!   of two seeds on the user's behalf is the one thing this feature must not
+//!   do, and there is no honest tie-break available: the codes are on a screen
+//!   this app did not lay out.
+//!
+//! Everything below the scan is unchanged -- the drag, the lock-on, Escape,
+//! the release that reads. The scan is a way of not needing them, not a
+//! replacement for them.
 //!
 //! # What this module is, and what it deliberately is not
 //!
@@ -44,7 +76,13 @@
 //!   virtual-screen pixels;
 //! * [`lockon_badge`] -- the found/not-found label decision;
 //! * [`DecodeThrottle`] -- the bound on how often a decode is attempted;
-//! * [`read_region_with`] -- every outcome, through seams.
+//! * [`read_region_with`] -- every outcome, through seams;
+//! * [`scan_screen_with`] -- one code, none, several, a monitor that refused
+//!   and a monitor too large to decode, all through the same seams;
+//! * [`RegionOverlay::prescan_step`] -- that the scan runs **once** and then
+//!   never again, driven by a clock a test supplies;
+//! * [`RegionOverlay::chip_gesture`] -- that a press on a bar chip belongs to
+//!   that chip and does not also become a one-pixel drag.
 //!
 //! **Not testable, and no assertion below pretends otherwise:**
 //!
@@ -57,8 +95,9 @@
 //!   real desktop.
 //! * that the dimming composites correctly over other windows. That needs a
 //!   transparent, always-on-top window over a real compositor.
-//! * that the overlay itself is excluded from the blit. See
-//!   [`exclude_from_capture`].
+//! * that the overlay itself is excluded from the blit, and that the vault
+//!   window is out of the scan's way in time. See [`exclude_from_capture`]
+//!   and [`PRESCAN_SETTLE`].
 //!
 //! Every mechanism here is a *necessary condition* for those four, never a
 //! proof of them.
@@ -71,6 +110,19 @@
 //! `debug_leak_guard` has nothing to catch. Escape cancels and captures
 //! nothing at all -- [`Outcome::Cancelled`] carries no buffer, because there
 //! was never one to carry.
+//!
+//! **The whole-screen scan is a bigger version of the same object and is held
+//! to the same rules, with one added.** Each monitor's pixels live in an
+//! [`crate::screen_capture::Rgba`] that wipes on drop and dies inside
+//! [`scan_screen_with`] before the next monitor is read; nothing is written,
+//! logged, or handed out. The added rule is that **the capture is never
+//! displayed**: it is not uploaded to an `egui` texture and not painted as
+//! this overlay's background, however much a frozen desktop would improve the
+//! dim. `egui`'s texture manager holds ordinary allocations this crate cannot
+//! wipe, so painting the desktop would put the user's whole screen -- every
+//! window and every secret on it -- into memory with no owner and no end. The
+//! scan is capture, decode, drop, and the overlay stays transparent over the
+//! live desktop exactly as it always has.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -123,6 +175,61 @@ pub const WHOLE_SCREEN_KEY: &str = "A";
 pub const CANCEL_HINT: &str = "Cancel";
 /// See [`WHOLE_SCREEN_HINT`]. Matched as [`egui::Key::Escape`].
 pub const CANCEL_KEY: &str = "ESC";
+
+/// The chips' positions in the bar, left to right, and therefore the indices
+/// [`RegionOverlay::chip_gesture`] answers with.
+///
+/// Named rather than `0` and `1` at the call sites because the pair is drawn
+/// from one array and read back by index: a chip inserted in front of these
+/// two would silently make Cancel mean "scan the whole screen".
+/// `the_chips_are_drawn_in_the_order_their_indices_name` pins the array
+/// against them.
+pub const CHIP_WHOLE_SCREEN: usize = 0;
+/// See [`CHIP_WHOLE_SCREEN`].
+pub const CHIP_CANCEL: usize = 1;
+
+/// **The line 6b's bar gains, saying why this surface opened.**
+///
+/// Design 6b has no such line and did not need one: in the design the user
+/// chose "drag a box" and got a box to drag. They now choose a route that
+/// scans, so every 6b the product shows is a 6b that opened **after something
+/// did not work out** -- and a full-screen dim that arrives with no account
+/// of itself is a surface the user has to reverse-engineer. The rest of the
+/// bar is the design's, unchanged: its instruction, its "nothing is saved
+/// yet", its two chips.
+/// **Every one of them ends by naming the drag**, because in every one of
+/// them the drag is what the user does next and it is the thing 6b was always
+/// for. They do **not** share a clause, though it would be tidier: "drag a
+/// box around the one you want" is right when there are two codes to choose
+/// between and wrong when there were none to find, and a single sentence
+/// stretched to cover both would be the generic refusal
+/// `totp_add::PickerRefusal` already refuses to write.
+pub const SCAN_NO_CODE: &str = "No QR code found on your screen. Drag a box around it instead.";
+/// See [`SCAN_NO_CODE`]. The case the owner was explicit about: **do not
+/// guess.** Two codes on a desktop are two secrets, and there is no tie-break
+/// this app is entitled to invent -- so this is the one sentence here that
+/// asks the user to choose, because they are the only one who can.
+pub const SCAN_SEVERAL: &str =
+    "More than one QR code is on your screen. Drag a box around the one you want.";
+/// See [`SCAN_NO_CODE`]. A refusal's second clause. It says "the code"
+/// because a screen that could not be read tells us nothing about how many
+/// codes are on it.
+pub const SCAN_REFUSED_ADVICE: &str = "Drag a box around the code instead.";
+
+/// The bar's reason line, from what the scan came back with.
+///
+/// A refusal keeps [`CaptureRefusal::title`]'s own words rather than being
+/// flattened into a third sentence here, for the reason
+/// `totp_add::PickerRefusal` gives for the same choice: the thing that knows
+/// why Windows would not hand over a screen is the thing that asked it for
+/// one.
+pub fn scan_miss_line(miss: ScanMiss) -> String {
+    match miss {
+        ScanMiss::NoCode => SCAN_NO_CODE.to_string(),
+        ScanMiss::Several => SCAN_SEVERAL.to_string(),
+        ScanMiss::Refused(why) => format!("{}. {SCAN_REFUSED_ADVICE}", why.title()),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The numbers, all of them lifted out of design 6b's CSS
@@ -210,8 +317,23 @@ pub const BAR_HINT_PX: f32 = 12.0;
 /// See [`BAR_HINT_PX`]. Not one of `theme`'s inks: it is a grey chosen for a
 /// dark ground and this is the only dark ground in the product.
 pub const BAR_HINT_INK: egui::Color32 = egui::Color32::from_rgb(0xba, 0xb6, 0xb6);
-/// The gap between those two lines (`gap: 3px`).
+/// The gap between those two lines (`gap: 3px`), and between either of them
+/// and [`scan_miss_line`]'s line above.
 pub const BAR_LINE_GAP: f32 = 3.0;
+/// [`scan_miss_line`]'s type: the same 12 points as the hint under it,
+/// because it is a sentence of the same weight. Setting it larger would make
+/// the reason for the surface louder than the instruction on it.
+pub const BAR_REASON_PX: f32 = 12.0;
+/// [`scan_miss_line`]'s ink.
+///
+/// **[`theme::BLUE_SOFT`] rather than a new colour or the hint's grey.** This
+/// surface has exactly one accent -- the blue of the selection ring, the halo
+/// and the lock-on badge -- and the reason line is the one piece of type on
+/// it that is neither the instruction nor the small print, so it has to be
+/// distinguishable from both without introducing a second accent to a screen
+/// that has one. `BLUE_SOFT` is that same blue, lightened for a dark ground,
+/// which is what this bar is.
+pub const BAR_REASON_INK: egui::Color32 = theme::BLUE_SOFT;
 
 /// A shortcut chip's height (`height: 28px`).
 pub const CHIP_HEIGHT: f32 = 28.0;
@@ -366,6 +488,31 @@ pub fn size_label(rect: &ScreenRect) -> String {
 /// without a window.
 pub const DECODE_INTERVAL: Duration = Duration::from_millis(150);
 
+/// **How long the whole-screen scan waits after masking Deskwarden's own
+/// window before it captures anything.**
+///
+/// The scan is taken from behind the vault window: the user pressed the row
+/// in a modal on it, so it is by construction the window most likely to be
+/// sitting on top of the code. [`exclude_from_capture`] is what takes it out
+/// of the blit, and the problem this constant exists for is that the flag is
+/// a message to the **compositor**, not to `BitBlt`. `BitBlt` from the screen
+/// DC reads what DWM last composed, so a capture taken in the same breath as
+/// the call can still show the window that has just been excluded -- and what
+/// the user would see is a scan that fails on a code plainly on screen, every
+/// time, with no way to tell why.
+///
+/// So the scan is spread over two frames: mask, wait, capture. **80 ms**
+/// rather than one frame's 16, because "one frame" is a claim about a
+/// refresh rate this app does not know and a compositor it does not drive; at
+/// 80 ms even a 30 Hz desktop has composed twice. It is short enough that the
+/// card underneath does not visibly stall -- the decode that follows is
+/// longer -- and it is a bound rather than a poll: the deadline is set once
+/// and the next frame at or after it captures, whatever happened in between.
+///
+/// **Not a proof.** Nothing in this crate can assert the compositor acted;
+/// see the module header's list of what a real desktop is needed for.
+pub const PRESCAN_SETTLE: Duration = Duration::from_millis(80);
+
 /// Bounds how often a lock-on decode runs.
 ///
 /// **Two gates, and the second one matters more than the first.** Time alone
@@ -483,6 +630,12 @@ impl Outcome {
 pub struct RegionSeams {
     pub capture: fn(ScreenRect) -> Result<Rgba, CaptureRefusal>,
     pub decode: fn(&[u8], usize, usize) -> Option<Zeroizing<String>>,
+    /// [`crate::qr::codes_in`] in production, and a **third** seam rather
+    /// than a widening of `decode`: the drag reads one framed rectangle and
+    /// has no use for a count, while the scan reads a desktop nobody framed
+    /// and has no use for anything else. One pointer answering both would
+    /// make every drag pay for a question it never asks.
+    pub scan: fn(&[u8], usize, usize) -> qr::Codes,
 }
 
 impl RegionSeams {
@@ -492,6 +645,7 @@ impl RegionSeams {
         RegionSeams {
             capture: screen_capture::capture_rect,
             decode: qr::decode_qr,
+            scan: qr::codes_in,
         }
     }
 }
@@ -510,6 +664,137 @@ pub fn read_region_with(seams: &RegionSeams, rect: ScreenRect) -> Outcome {
     match (seams.decode)(pixels.pixels(), width, height) {
         Some(text) => Outcome::Decoded(text),
         None => Outcome::NoCode,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reading the whole screen
+// ---------------------------------------------------------------------------
+
+/// Why the scan could not simply answer, and therefore why 6b opened.
+///
+/// Every variant is a sentence in the bar -- see [`scan_miss_line`] -- and a
+/// **fallback**, never a dead end: in all three cases the drag is still there
+/// and still works.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanMiss {
+    /// No monitor held a code. Much the commonest: the code is small, or
+    /// low-contrast, or half-covered by something.
+    NoCode,
+    /// More than one **distinct** code was on screen. See
+    /// [`crate::qr::codes_in`] for what "distinct" means, and why the same
+    /// code appearing twice is not this.
+    Several,
+    /// Nothing could be captured at all, and this is what the first monitor
+    /// to refuse said. A monitor larger than [`crate::qr::MAX_PIXELS`] lands
+    /// here as [`CaptureRefusal::TooLarge`].
+    Refused(CaptureRefusal),
+}
+
+/// What a whole-screen scan came to.
+///
+/// **Hand-written `Debug`**, for [`Outcome`]'s reason exactly: `Found` holds
+/// a seed.
+pub enum ScreenScan {
+    /// Exactly one distinct code across every monitor.
+    Found(Zeroizing<String>),
+    /// It could not answer. See [`ScanMiss`].
+    Missed(ScanMiss),
+}
+
+impl std::fmt::Debug for ScreenScan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScreenScan::Found(text) => write!(f, "Found({} chars not shown)", text.len()),
+            ScreenScan::Missed(miss) => write!(f, "Missed({miss:?})"),
+        }
+    }
+}
+
+/// **Looks for a QR code on every monitor, and refuses to choose between
+/// two.**
+///
+/// # One monitor at a time, not one bounding box
+///
+/// [`whole_screen`] exists and is deliberately not used here.
+/// [`crate::screen_capture::capture_rect`] clamps whatever it is given down
+/// to *the monitor it overlaps most*, so a bounding box across a two-monitor
+/// desktop reads the larger monitor and silently ignores the other -- which
+/// on the commonest two-monitor arrangement is exactly the wrong one, because
+/// the user pressed the row in the vault window on the monitor they are
+/// looking at and the code is on the other. Feeding each monitor's own
+/// rectangle in turn is the only way to cover the desktop, and it costs
+/// nothing: the clamp is a no-op on a rectangle that is already a monitor.
+///
+/// It also keeps the memory honest. One monitor's pixels exist at a time and
+/// die -- and wipe -- before the next monitor is read, rather than a single
+/// buffer the size of the whole virtual desktop.
+///
+/// # The bound is [`crate::qr::MAX_PIXELS`], and it is checked rather than
+/// # assumed
+///
+/// 64 megapixels. A 4K monitor is 8.3 of them and an 8K one is 33, so a
+/// single monitor is comfortably inside it -- but nothing here skips the
+/// check on that reasoning. `clamp_to_monitors` applies the bound per
+/// monitor, and a monitor somehow past it refuses with
+/// [`CaptureRefusal::TooLarge`] **without sinking the scan**: the loop keeps
+/// going and another monitor can still hold the code. A refusal is only the
+/// answer when *nothing anywhere* was captured.
+///
+/// # What it does not do
+///
+/// It does not save anything, and it does not pick. `Found` is a string
+/// handed to the caller, which puts it on 6c's confirmation card with its
+/// live code and its countdown; the write happens when the user presses Save
+/// and at no other time.
+pub fn scan_screen_with(seams: &RegionSeams, monitors: &[ScreenRect]) -> ScreenScan {
+    // The same accumulator `codes_in` folds one picture's grids with, so "the
+    // same code on two monitors is one code" and "the same code twice in one
+    // window is one code" are one rule rather than two that drift apart.
+    let mut tally = qr::Tally::new();
+    let mut captured_any = false;
+    let mut first_refusal: Option<CaptureRefusal> = None;
+
+    for monitor in monitors {
+        if monitor.width() < MIN_SIDE || monitor.height() < MIN_SIDE {
+            // A degenerate entry in the enumeration. `capture_rect` would
+            // refuse it as `TooSmall`, and recording that as the reason the
+            // scan failed would describe a monitor the user does not have.
+            continue;
+        }
+        let pixels = match (seams.capture)(*monitor) {
+            Ok(pixels) => pixels,
+            Err(why) => {
+                first_refusal.get_or_insert(why);
+                continue;
+            }
+        };
+        captured_any = true;
+        let (width, height) = (pixels.width() as usize, pixels.height() as usize);
+        let keep_looking = tally.merge((seams.scan)(pixels.pixels(), width, height));
+        // Dropped here explicitly, which is what wipes it -- including on the
+        // early exit below, where it would otherwise live to the end of the
+        // loop body anyway but where the intent is worth stating.
+        drop(pixels);
+        if !keep_looking {
+            break;
+        }
+    }
+
+    match tally.finish() {
+        qr::Codes::One(text) => ScreenScan::Found(text),
+        qr::Codes::Several => ScreenScan::Missed(ScanMiss::Several),
+        // Nothing found, and which "nothing" it is depends on whether there
+        // were any pixels to look at. A desktop that was read and held no
+        // code is `NoCode` and the user drags; a desktop that could not be
+        // read at all is the refusal in Windows' own words, because "no code
+        // found" would be a claim about a screen nobody managed to look at.
+        qr::Codes::None if captured_any => ScreenScan::Missed(ScanMiss::NoCode),
+        qr::Codes::None => ScreenScan::Missed(ScanMiss::Refused(
+            // No monitors at all is `OffScreen` -- the same answer
+            // `RegionOverlay::open` gives for the same desktop.
+            first_refusal.unwrap_or(CaptureRefusal::OffScreen),
+        )),
     }
 }
 
@@ -536,6 +821,11 @@ pub struct RegionView {
     pub size: Option<(u32, u32)>,
     /// Whether a lock-on has succeeded for the current rectangle.
     pub found: bool,
+    /// Why this surface opened, painted as the bar's first line. `None`
+    /// before the scan has run -- and in production it is `Some` by the time
+    /// anything is painted, because the only way to a painted 6b is a scan
+    /// that could not answer.
+    pub reason: Option<ScanMiss>,
 }
 
 /// Everything the overlay holds, behind the `Arc<Mutex<_>>` that
@@ -558,6 +848,56 @@ struct Inner {
     /// OS window first exists.
     raised: bool,
     open: bool,
+    /// How far the whole-screen scan has got. See [`Prescan`].
+    prescan: Prescan,
+    /// Whether the vault window is currently masked out of screen captures.
+    /// The flag rather than a second call: `SetWindowDisplayAffinity` is an
+    /// OS call, and this is what makes masking and unmasking idempotent and
+    /// what [`Inner::drop`] reads to guarantee the mask comes off.
+    masked: bool,
+    /// Why 6b opened. `None` until the scan has answered.
+    reason: Option<ScanMiss>,
+    /// The bar's two chips in points, as [`draw`] last painted them.
+    /// `Rect::NOTHING` before the first paint, which contains no point, so a
+    /// press on the frame before there are chips hits none of them.
+    chips: [egui::Rect; 2],
+    /// Which chip the primary button went down on, while it is still down.
+    /// See [`RegionOverlay::chip_gesture`].
+    chip_press: Option<usize>,
+}
+
+/// How far [`scan_screen_with`] has got on this overlay's behalf.
+///
+/// **A state machine and not a `bool`**, because the scan is deliberately
+/// spread over two frames -- see [`PRESCAN_SETTLE`] -- and because the one
+/// property that matters most here is that it **ends**. Every transition is
+/// forwards: `Due` masks and sets a deadline, `Settling` waits for a clock
+/// that only moves one way, and `Done` is absorbing. There is no path back to
+/// `Due`, so no repaint can re-run a capture -- which is the shape of the
+/// hang this module was fixed for, and the reason this is a type a test can
+/// drive rather than a flag read inside a viewport callback.
+#[derive(Debug, Clone, Copy)]
+enum Prescan {
+    /// Nothing has happened yet.
+    Due,
+    /// Deskwarden's own window is masked; the capture happens on the first
+    /// frame at or after this instant.
+    Settling { at: Instant },
+    /// The scan has run, or was never going to.
+    Done,
+}
+
+/// What [`RegionOverlay::prescan_step`] wants the caller to do this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrescanStep {
+    /// Mask Deskwarden's own window and come back after [`PRESCAN_SETTLE`].
+    Mask,
+    /// Still settling; come back after this long.
+    Settling(Duration),
+    /// Capture and decode now.
+    Scan,
+    /// Nothing to do, now or ever again.
+    Done,
 }
 
 /// The 6b overlay. Cheap to clone -- every clone is the same window.
@@ -591,6 +931,11 @@ impl RegionOverlay {
                 outcome: None,
                 raised: false,
                 open: true,
+                prescan: Prescan::Due,
+                masked: false,
+                reason: None,
+                chips: [egui::Rect::NOTHING; 2],
+                chip_press: None,
             })),
         })
     }
@@ -636,6 +981,142 @@ impl RegionOverlay {
             selection,
             size,
             found: held.found,
+            reason: held.reason,
+        }
+    }
+
+    /// Why 6b opened, once the scan has said. `None` before then.
+    pub fn reason(&self) -> Option<ScanMiss> {
+        locked(&self.inner).reason
+    }
+
+    /// **Advances the whole-screen scan by one frame**, and says what the
+    /// caller should do.
+    ///
+    /// `now` is an argument for [`DecodeThrottle::should_attempt`]'s reason:
+    /// it is what lets a test walk the settle's boundary exactly, and walk
+    /// past it, without sleeping and without a window.
+    ///
+    /// **Every call moves forwards or stands still; none moves back.** That
+    /// is the whole of the safety argument -- see [`Prescan`] -- and it is
+    /// why the capture this drives cannot become the per-frame loop the
+    /// viewport callback was once fixed for.
+    fn prescan_step(&self, now: Instant) -> PrescanStep {
+        let mut held = locked(&self.inner);
+        match held.prescan {
+            Prescan::Due => {
+                held.prescan = Prescan::Settling {
+                    at: now + PRESCAN_SETTLE,
+                };
+                PrescanStep::Mask
+            }
+            Prescan::Settling { at } => {
+                let left = at.saturating_duration_since(now);
+                if left > Duration::ZERO {
+                    PrescanStep::Settling(left)
+                } else {
+                    // Marked `Done` BEFORE the scan runs, not after: the scan
+                    // is the slow part, and a state that only advanced on the
+                    // way out would let a re-entrant repaint start a second
+                    // one.
+                    held.prescan = Prescan::Done;
+                    PrescanStep::Scan
+                }
+            }
+            Prescan::Done => PrescanStep::Done,
+        }
+    }
+
+    /// **Applies a scan's answer**, whether it came from the one taken before
+    /// the window opened or from the *Whole screen* chip pressed on it.
+    ///
+    /// One code ends the overlay with [`Outcome::Decoded`] -- and therefore
+    /// lands on 6c, which is where every route lands and where the only Save
+    /// in this feature lives. Anything else leaves the overlay up and records
+    /// why, which is what the bar's first line then says.
+    ///
+    /// The stale lock-on is cleared with it: a rescan that found nothing must
+    /// not leave "Code found" above a rectangle from before it.
+    fn apply_scan(&self, scan: ScreenScan) {
+        match scan {
+            ScreenScan::Found(text) => self.finish(Outcome::Decoded(text)),
+            ScreenScan::Missed(miss) => {
+                let mut held = locked(&self.inner);
+                held.reason = Some(miss);
+                held.found = false;
+            }
+        }
+    }
+
+    /// Takes Deskwarden's own window out of screen captures, or puts it back.
+    ///
+    /// Idempotent through [`Inner::masked`], so the callers can say what they
+    /// want rather than track what they have already asked for -- and so the
+    /// OS call happens exactly on the transitions.
+    fn mask_own_window(&self, on: bool) {
+        {
+            let mut held = locked(&self.inner);
+            if held.masked == on {
+                return;
+            }
+            held.masked = on;
+        }
+        set_capture_exclusion(crate::vault_window::WINDOW_TITLE, on);
+    }
+
+    /// Records where [`draw`] painted the bar's chips, so the next frame's
+    /// pointer handling can tell a press on one from a drag.
+    fn remember_chips(&self, chips: [egui::Rect; 2]) {
+        locked(&self.inner).chips = chips;
+    }
+
+    /// Whether the button is down on a chip, in which case this frame's
+    /// pointer belongs to the chip and not to a selection.
+    fn in_chip_press(&self) -> bool {
+        locked(&self.inner).chip_press.is_some()
+    }
+
+    /// **One frame of the bar's chips**: `Some(index)` on the frame a press
+    /// that began on a chip is released over that same chip.
+    ///
+    /// # Why the chips are pressed rather than merely printed
+    ///
+    /// 6b already names both shortcuts on screen, which is most of what a
+    /// discoverable action needs -- but a bordered pill that says *Whole
+    /// screen* and does nothing when it is clicked is a lie in the shape of a
+    /// button, and the whole-screen scan is now the primary way this feature
+    /// works rather than a corner shortcut. The key still works and is still
+    /// printed beside the label; this adds the press people will try first.
+    ///
+    /// # Why the whole gesture is swallowed and not just the click
+    ///
+    /// This surface reads the raw pointer: any press is the start of a
+    /// selection and any release ends one, so a press on a chip that only got
+    /// *taken* on release would still have begun a drag on the way down, and
+    /// the release would then read the one-pixel rectangle under the chip and
+    /// end the overlay with "that region is too small". So the press is
+    /// remembered, and `advance` is skipped for as long as it is held.
+    ///
+    /// # Why release and not press
+    ///
+    /// The convention every button in this app follows, and it is the one
+    /// that lets a user who pressed the wrong chip slide off it and let go.
+    fn chip_gesture(&self, pointer: Option<(f32, f32)>, pressed: bool, down: bool) -> Option<usize> {
+        let at = pointer.map(|(x, y)| egui::pos2(x, y));
+        let mut held = locked(&self.inner);
+        if pressed {
+            held.chip_press = at.and_then(|p| held.chips.iter().position(|chip| chip.contains(p)));
+            return None;
+        }
+        if down {
+            return None;
+        }
+        let started_on = held.chip_press.take()?;
+        let over = at.is_some_and(|p| held.chips[started_on].contains(p));
+        if over {
+            Some(started_on)
+        } else {
+            None
         }
     }
 
@@ -728,8 +1209,58 @@ impl RegionOverlay {
     /// overlay; answers `false` when there is nothing left to show.
     pub fn show(&self, ctx: &egui::Context) -> bool {
         if !self.is_open() {
+            self.mask_own_window(false);
             return false;
         }
+
+        // **The whole-screen scan, before this module has a window at all.**
+        //
+        // This is the departure the module header argues for: choosing the
+        // route is asking for the scan, so the scan happens here and 6b opens
+        // only if it cannot answer. Nothing below this block runs on the
+        // frames it takes, so no viewport is registered and no dim appears --
+        // a user whose code is found never sees this surface.
+        //
+        // It is bounded three ways, and the bound is the point: `prescan_step`
+        // only ever moves forwards and ends at `Done`; the capture happens on
+        // exactly one frame; and the repaints asked for below are asked for
+        // against a deadline that a clock reaches on its own. This is not the
+        // per-frame capture the viewport callback was fixed for -- the two
+        // differ precisely in that this one has an exit.
+        match self.prescan_step(Instant::now()) {
+            PrescanStep::Mask => {
+                self.mask_own_window(true);
+                ctx.request_repaint_after(PRESCAN_SETTLE);
+                return true;
+            }
+            PrescanStep::Settling(left) => {
+                ctx.request_repaint_after(left);
+                return true;
+            }
+            PrescanStep::Scan => {
+                // `monitor_bounds()` enumerates the real desktop -- the one
+                // production call, exactly as `RegionOverlay::open` takes its
+                // monitors as an argument so the arithmetic can be tested
+                // without one.
+                let monitors = screen_capture::monitor_bounds();
+                self.apply_scan(scan_screen_with(&RegionSeams::production(), &monitors));
+                if !self.is_open() {
+                    // One code, and the overlay is over before it began.
+                    self.mask_own_window(false);
+                    return false;
+                }
+                // The mask stays on for the life of the overlay. 6b is
+                // about to open, the user may press *Whole screen* on it, and
+                // its own release-capture is better off not seeing the vault
+                // window either -- a box dragged over a window Deskwarden is
+                // sitting on top of should read what the user can see behind
+                // it, which is the same reason the overlay excludes itself.
+                // Every way out of `show` puts it back, and `Inner`'s `Drop`
+                // covers the ways that do not come through `show` at all.
+            }
+            PrescanStep::Done => {}
+        }
+
         let (origin, scale) = {
             let held = locked(&self.inner);
             (held.origin, held.points_per_pixel)
@@ -814,25 +1345,38 @@ impl RegionOverlay {
                     exclude_from_capture(REGION_TITLE);
                 }
 
-                let (pointer, down) = root.input(|i| {
+                let (pointer, pressed, down) = root.input(|i| {
                     (
                         i.pointer.latest_pos().map(|p| (p.x, p.y)),
+                        i.pointer.primary_pressed(),
                         i.pointer.primary_down(),
                     )
                 });
+                // Taken before anything else looks at the pointer: a press
+                // that landed on a chip is that chip's for the whole gesture,
+                // and `advance` must not see it as a selection. See
+                // `chip_gesture`.
+                let chip = mine.chip_gesture(pointer, pressed, down);
                 if root.input(|i| i.key_pressed(egui::Key::Escape))
                     || root.input(|i| i.viewport().close_requested())
+                    || chip == Some(CHIP_CANCEL)
                 {
                     mine.finish(Outcome::Cancelled);
-                } else if root.input(|i| i.key_pressed(egui::Key::A)) {
-                    let rect = whole_screen(&screen_capture::monitor_bounds());
-                    match rect {
-                        Some(rect) => {
-                            mine.finish(read_region_with(&RegionSeams::production(), rect))
-                        }
-                        None => mine.finish(Outcome::Refused(CaptureRefusal::OffScreen)),
-                    }
-                } else {
+                } else if chip == Some(CHIP_WHOLE_SCREEN)
+                    || root.input(|i| i.key_pressed(egui::Key::A))
+                {
+                    // **The same scan the route already ran**, on demand: the
+                    // user may have moved a window, closed one of two codes,
+                    // or zoomed the page since. One press is one scan -- a key
+                    // press and a release are single events, so this is
+                    // bounded by the user rather than by the frame rate -- and
+                    // when it finds one code it ends the overlay on 6c exactly
+                    // as the first scan would have.
+                    mine.apply_scan(scan_screen_with(
+                        &RegionSeams::production(),
+                        &screen_capture::monitor_bounds(),
+                    ));
+                } else if !mine.in_chip_press() {
                     mine.advance(&RegionSeams::production(), pointer, down, Instant::now());
                 }
 
@@ -849,12 +1393,49 @@ impl RegionOverlay {
                 }
 
                 let view = mine.view();
-                egui::CentralPanel::default()
+                let chips = egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
-                    .show(root, |ui| draw(ui, &view));
+                    .show(root, |ui| draw(ui, &view))
+                    .inner;
+                // Where the chips landed, for the NEXT frame's pointer
+                // handling. A frame late by construction -- the bar's height
+                // depends on the type it carries, which is not known until it
+                // is laid out -- and that costs nothing: on the first frame
+                // there is nothing to have clicked, and after it the
+                // rectangles only move if the reason line does.
+                mine.remember_chips(chips);
             },
         );
-        self.is_open()
+        let still_open = self.is_open();
+        if !still_open {
+            // Whatever ended it, the vault window goes back into screen
+            // captures here. `Inner`'s `Drop` is the backstop for the paths
+            // that do not come through this line -- the form closing under a
+            // live overlay, or a panic unwinding past it.
+            self.mask_own_window(false);
+        }
+        still_open
+    }
+}
+
+/// **The mask comes off however the overlay ends.**
+///
+/// `show` takes it off on the frame it answers `false`, which covers every
+/// ordinary ending. This covers the rest: the caller drops the overlay
+/// because the form closed under it, the vault locks, or a panic unwinds
+/// through the frame. `WDA_EXCLUDEFROMCAPTURE` outlives whoever set it, and a
+/// vault window left permanently invisible to the user's own screenshots and
+/// to a support call's screen share would be a side effect of a scan they
+/// took once -- exactly the kind of thing a `Drop` exists to make impossible
+/// to forget.
+///
+/// It is on `Inner` rather than on [`RegionOverlay`] because the overlay is an
+/// `Arc` handle that is cloned per frame; this runs when the last one goes.
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if self.masked {
+            set_capture_exclusion(crate::vault_window::WINDOW_TITLE, false);
+        }
     }
 }
 
@@ -869,7 +1450,13 @@ impl RegionOverlay {
 /// last -- so a selection dragged down over the bar is covered by it rather
 /// than punching a lit hole through the one part of this surface that has to
 /// stay readable.
-pub fn draw(ui: &mut egui::Ui, view: &RegionView) {
+///
+/// **Returns the two chips' rectangles**, which is the one thing the painter
+/// knows and the pointer handling needs. They cannot be computed ahead of the
+/// paint: the bar's height follows the type it carries, and the type includes
+/// a reason line that is there or not. See
+/// [`RegionOverlay::remember_chips`].
+pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> [egui::Rect; 2] {
     let full = ui.max_rect();
     let painter = ui.painter().clone();
     let dim = egui::Color32::from_rgba_unmultiplied(0x20, 0x1e, 0x1d, DIM_ALPHA);
@@ -904,7 +1491,18 @@ pub fn draw(ui: &mut egui::Ui, view: &RegionView) {
         }
     }
 
-    paint_bar(&painter, full);
+    let chips = paint_bar(&painter, full, view.reason);
+    // The one hover affordance the chips get. A fill that changed under the
+    // pointer would have to be painted from the PREVIOUS frame's rectangles,
+    // and a pill that lights up a frame after the pointer reaches it is worse
+    // than one that does not light up at all; the cursor is the browser's own
+    // answer to the same problem and it needs no state.
+    if let Some(at) = ui.ctx().pointer_latest_pos() {
+        if chips.iter().any(|chip| chip.contains(at)) {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+    chips
 }
 
 /// The two rings 6b draws around the selection, plus its four corner
@@ -1090,8 +1688,18 @@ fn chip_width(painter: &egui::Painter, label: &str, key: &str) -> f32 {
     CHIP_PAD_X * 2.0 + label_width + CHIP_GAP + key_width
 }
 
-/// Draws the chip [`chip_width`] measured, with its left edge at `left`.
-fn paint_chip(painter: &egui::Painter, left: f32, middle: f32, label: &str, key: &str) -> f32 {
+/// Draws the chip [`chip_width`] measured, with its left edge at `left`, and
+/// hands back the rectangle it drew -- which is what
+/// [`RegionOverlay::chip_gesture`] later tests a press against, so the shape
+/// the user aims at and the shape that answers are the same one by
+/// construction rather than by two agreeing calculations.
+fn paint_chip(
+    painter: &egui::Painter,
+    left: f32,
+    middle: f32,
+    label: &str,
+    key: &str,
+) -> egui::Rect {
     let width = chip_width(painter, label, key);
     let rect = egui::Rect::from_min_size(
         egui::pos2(left, middle - CHIP_HEIGHT / 2.0),
@@ -1128,16 +1736,38 @@ fn paint_chip(painter: &egui::Painter, left: f32, middle: f32, label: &str, key:
         key_galley,
         theme::TEXT_GHOST,
     );
-    width
+    rect
 }
 
-/// **6b's bottom bar**: the instruction, the sentence that says nothing has
-/// been saved, and the two shortcut chips.
+/// **6b's bottom bar**: why this surface opened, the instruction, the
+/// sentence that says nothing has been saved, and the two shortcut chips.
 ///
 /// Drawn on every frame and in every state -- see [`DRAG_TITLE`]. It is also
 /// the only place on this surface that names Escape, so a user who opened the
 /// overlay by accident always has the way out in front of them.
-fn paint_bar(painter: &egui::Painter, full: egui::Rect) {
+///
+/// The first line is [`scan_miss_line`] and is the design's one addition here
+/// -- see [`SCAN_NO_CODE`] for why 6b needs one. It is laid out first and
+/// measured into the bar's height rather than overlaid, so the bar grows by a
+/// line instead of the instruction moving to make room.
+///
+/// Returns the two chips' rectangles, in the order [`CHIP_WHOLE_SCREEN`] and
+/// [`CHIP_CANCEL`] name.
+fn paint_bar(
+    painter: &egui::Painter,
+    full: egui::Rect,
+    reason: Option<ScanMiss>,
+) -> [egui::Rect; 2] {
+    let lead = reason.map(|miss| {
+        painter.layout_no_wrap(
+            scan_miss_line(miss),
+            egui::FontId::new(
+                BAR_REASON_PX,
+                egui::FontFamily::Name(theme::SEMIBOLD.into()),
+            ),
+            BAR_REASON_INK,
+        )
+    });
     let title = painter.layout_no_wrap(
         DRAG_TITLE.to_owned(),
         egui::FontId::new(BAR_TITLE_PX, egui::FontFamily::Name(theme::BOLD.into())),
@@ -1149,7 +1779,9 @@ fn paint_bar(painter: &egui::Painter, full: egui::Rect) {
         BAR_HINT_INK,
     );
     let (title_size, hint_size) = (title.size(), hint.size());
-    let bar = bar_rect(full, title_size.y + BAR_LINE_GAP + hint_size.y);
+    let lead_height = lead.as_ref().map_or(0.0, |lead| lead.size().y + BAR_LINE_GAP);
+    let block = lead_height + title_size.y + BAR_LINE_GAP + hint_size.y;
+    let bar = bar_rect(full, block);
 
     painter.rect_filled(
         bar,
@@ -1161,8 +1793,16 @@ fn paint_bar(painter: &egui::Painter, full: egui::Rect) {
         egui::Stroke::new(1.0, BAR_EDGE),
     );
 
-    let block = title_size.y + BAR_LINE_GAP + hint_size.y;
-    let top = bar.center().y - block / 2.0;
+    let mut top = bar.center().y - block / 2.0;
+    if let Some(lead) = lead {
+        let height = lead.size().y;
+        painter.galley(
+            egui::pos2(bar.left() + BAR_PAD_X, top),
+            lead,
+            BAR_REASON_INK,
+        );
+        top += height + BAR_LINE_GAP;
+    }
     painter.galley(egui::pos2(bar.left() + BAR_PAD_X, top), title, theme::CARD);
     painter.galley(
         egui::pos2(bar.left() + BAR_PAD_X, top + title_size.y + BAR_LINE_GAP),
@@ -1172,20 +1812,25 @@ fn paint_bar(painter: &egui::Painter, full: egui::Rect) {
 
     // The pair is right-aligned as a group, in the design's order: whole
     // screen first, cancel last and therefore nearest the corner the pointer
-    // travels to.
-    let chips = [
+    // travels to. That order is also `CHIP_WHOLE_SCREEN` and `CHIP_CANCEL`,
+    // which is what the returned rectangles are indexed by.
+    let faces = [
         (WHOLE_SCREEN_HINT, WHOLE_SCREEN_KEY),
         (CANCEL_HINT, CANCEL_KEY),
     ];
-    let total: f32 = chips
+    let total: f32 = faces
         .iter()
         .map(|(label, key)| chip_width(painter, label, key))
         .sum::<f32>()
-        + CHIP_GAP * (chips.len() as f32 - 1.0);
+        + CHIP_GAP * (faces.len() as f32 - 1.0);
     let mut left = bar.right() - BAR_PAD_X - total;
-    for (label, key) in chips {
-        left += paint_chip(painter, left, bar.center().y, label, key) + CHIP_GAP;
+    let mut drawn = [egui::Rect::NOTHING; 2];
+    for (at, (label, key)) in faces.into_iter().enumerate() {
+        let rect = paint_chip(painter, left, bar.center().y, label, key);
+        drawn[at] = rect;
+        left = rect.right() + CHIP_GAP;
     }
+    drawn
 }
 
 /// **Asks Windows to leave this window out of screen captures.**
@@ -1207,24 +1852,64 @@ fn paint_bar(painter: &egui::Painter, full: egui::Rect) {
 /// that is plainly on screen. A silent failure is also the *safe* direction:
 /// nothing is captured that the user did not drag over either way.
 ///
-/// The alternative -- capturing the whole desktop once when the overlay opens
-/// and cropping from that frozen frame -- was rejected. It would make the
-/// lock-on decode cheaper, and it would mean this feature takes a full-screen
-/// capture the user never asked for, which is exactly the third security
-/// property of the design ("capture only the rectangle the user dragged").
+/// # The rejected alternative, and the one that replaced it
+///
+/// This note used to end by rejecting a whole-desktop capture outright: it
+/// "would mean this feature takes a full-screen capture the user never asked
+/// for, which is exactly the third security property of the design (capture
+/// only the rectangle the user dragged)". **The premise of that has changed
+/// and the conclusion with it.** The user now asks for a whole-screen capture
+/// by choosing the route -- see the module header -- so [`scan_screen_with`]
+/// takes one, once, per monitor, and drops it.
+///
+/// What was rejected then and is still rejected now is the *reason* the old
+/// note gave for wanting one: **freezing that capture and painting it as this
+/// overlay's background**. That is a copy of the user's entire screen living
+/// in `egui`'s texture manager for as long as the overlay is up, in memory
+/// this crate cannot wipe, to make a dim look slightly better. The scan
+/// decodes and drops; nothing displays it.
+///
+/// [`set_capture_exclusion`] is what this delegates to, and the reason it
+/// takes a flag is the vault window: that one is masked only for the length
+/// of the scan and is put back, because a window left permanently missing
+/// from the user's own screenshots is not a change this feature is entitled
+/// to make. This overlay is different -- it is masked and then destroyed, so
+/// there is nothing to put back.
 fn exclude_from_capture(title: &str) {
+    set_capture_exclusion(title, true);
+}
+
+/// [`exclude_from_capture`]'s undoable form: `WDA_EXCLUDEFROMCAPTURE` when
+/// `exclude`, `WDA_NONE` when not.
+///
+/// **`WDA_NONE` and not "whatever it was before".** Reading the previous
+/// affinity back would look more careful and would be worse: the only window
+/// this is ever pointed at is the vault window, which sets no affinity of its
+/// own -- deliberately, because it is a window the user is entitled to
+/// screenshot and screen-share -- so `WDA_NONE` *is* what it was. Preserving
+/// a value nothing sets would be machinery in place of the one fact that
+/// matters.
+fn set_capture_exclusion(title: &str, exclude: bool) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE,
     };
 
     let Some(hwnd) = crate::foreground::own_window_titled(title) else {
         return;
     };
+    let affinity = if exclude {
+        WDA_EXCLUDEFROMCAPTURE
+    } else {
+        WDA_NONE
+    };
     // Failure is ignored on purpose: see this function's note. There is
-    // nothing useful to do about it and nothing secret is at risk.
+    // nothing useful to do about it and nothing secret is at risk -- a mask
+    // that was refused leaves a window in the capture, and an unmask that was
+    // refused leaves a window out of other people's captures, which is the
+    // safe direction of the two.
     unsafe {
-        let _ = SetWindowDisplayAffinity(HWND(hwnd as *mut _), WDA_EXCLUDEFROMCAPTURE);
+        let _ = SetWindowDisplayAffinity(HWND(hwnd as *mut _), affinity);
     }
 }
 
@@ -1271,11 +1956,60 @@ mod tests {
         ))
     }
 
+    fn no_codes(_: &[u8], _: usize, _: usize) -> qr::Codes {
+        qr::Codes::None
+    }
+
+    fn several_codes(_: &[u8], _: usize, _: usize) -> qr::Codes {
+        qr::Codes::Several
+    }
+
+    /// A scan whose payload **names the size of the picture it was given**.
+    ///
+    /// Two monitors of different sizes therefore hold two different codes,
+    /// and two of the same size hold the same one -- which is exactly the
+    /// distinctness rule under test, expressed without a shared counter that
+    /// two tests running in parallel could race each other on.
+    fn code_naming_the_size(_: &[u8], w: usize, h: usize) -> qr::Codes {
+        qr::Codes::One(Zeroizing::new(format!(
+            "otpauth://totp/Git%20Host:anovak{w}x{h}?secret=JBSWY3DPEHPK3PXP"
+        )))
+    }
+
+    /// A capture that applies the **real** size bound without the
+    /// allocation: `clamp_to_monitors` is what production's `capture_rect`
+    /// runs before it blits, and `qr::MAX_PIXELS` is the number it applies.
+    /// A monitor past it is refused here exactly as it would be there, and
+    /// nothing tries to reserve 64 megapixels of RGBA to prove it.
+    fn bounded_capture(r: ScreenRect) -> Result<Rgba, CaptureRefusal> {
+        let clamped = screen_capture::clamp_to_monitors(r, &[r])?;
+        flat_capture(clamped)
+    }
+
     fn seams(
         capture: fn(ScreenRect) -> Result<Rgba, CaptureRefusal>,
         decode: fn(&[u8], usize, usize) -> Option<Zeroizing<String>>,
     ) -> RegionSeams {
-        RegionSeams { capture, decode }
+        RegionSeams {
+            capture,
+            decode,
+            scan: no_codes,
+        }
+    }
+
+    /// The scanning half of the same seam. `decode` is the drag's and is
+    /// never reached by [`scan_screen_with`], so it is pointed at the stub
+    /// that finds nothing -- a scan that quietly went through the drag's
+    /// decoder would show up as an answer of `NoCode` rather than as a pass.
+    fn scan_seams(
+        capture: fn(ScreenRect) -> Result<Rgba, CaptureRefusal>,
+        scan: fn(&[u8], usize, usize) -> qr::Codes,
+    ) -> RegionSeams {
+        RegionSeams {
+            capture,
+            decode: no_code,
+            scan,
+        }
     }
 
     // -- the geometry ------------------------------------------------------
@@ -1533,6 +2267,18 @@ mod tests {
         assert!(std::ptr::fn_addr_eq(
             production.decode,
             qr::decode_qr as fn(&[u8], usize, usize) -> Option<Zeroizing<String>>
+        ));
+        assert!(std::ptr::fn_addr_eq(
+            production.scan,
+            qr::codes_in as fn(&[u8], usize, usize) -> qr::Codes
+        ));
+        // The drag's decoder and the scan's counter are DIFFERENT functions.
+        // A `scan` quietly pointed at `decode_qr`'s wrapper would answer
+        // "one code" for a desktop holding two, which is the one answer this
+        // feature must never give.
+        assert!(!std::ptr::fn_addr_eq(
+            production.scan,
+            no_codes as fn(&[u8], usize, usize) -> qr::Codes
         ));
         // Negative control on `fn_addr_eq` itself: it can tell two functions
         // apart, so the two assertions above are claims and not tautologies.
@@ -1795,6 +2541,35 @@ mod tests {
         assert!(code.len() < source.len(), "the test module marker was not found");
         assert!(code.contains("i.key_pressed(egui::Key::Escape)"));
         assert!(code.contains("i.key_pressed(egui::Key::A)"));
+        // And the chips are pressable, not merely printed: the callback acts
+        // on both indices. A chip that looked like a button and did nothing
+        // when clicked would be the same class of lie as one naming a key
+        // nothing watches.
+        assert!(code.contains("chip == Some(CHIP_CANCEL)"));
+        assert!(code.contains("chip == Some(CHIP_WHOLE_SCREEN)"));
+    }
+
+    /// **The chips are drawn in the order their indices name.**
+    ///
+    /// `chip_gesture` answers with a position in the array `paint_bar` drew,
+    /// and the callback turns that position into an action. A chip inserted
+    /// in front of these two would make Cancel scan the screen and the scan
+    /// cancel, with nothing else failing.
+    #[test]
+    fn the_chips_are_drawn_in_the_order_their_indices_name() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let faces = code
+            .split("let faces = [")
+            .nth(1)
+            .expect("`paint_bar` no longer builds its chips from one array");
+        let faces = faces.split("];").next().unwrap();
+        let whole = faces.find("WHOLE_SCREEN_HINT").expect("no whole-screen chip");
+        let cancel = faces.find("CANCEL_HINT").expect("no cancel chip");
+        assert!(whole < cancel, "the chips are no longer in the design's order");
+        assert_eq!(CHIP_WHOLE_SCREEN, 0);
+        assert_eq!(CHIP_CANCEL, 1);
+        assert_ne!(CHIP_WHOLE_SCREEN, CHIP_CANCEL);
     }
 
     /// The badge sits at the selection's **top-left**, one `BADGE_OFFSET`
@@ -1923,5 +2698,485 @@ mod tests {
             code.contains("if !mine.is_open() {"),
             "the callback no longer guards on a finished overlay"
         );
+    }
+
+    // -- the whole-screen scan ---------------------------------------------
+
+    fn miss(scan: ScreenScan) -> ScanMiss {
+        match scan {
+            ScreenScan::Missed(miss) => miss,
+            ScreenScan::Found(_) => panic!("the scan found a code where it should not have"),
+        }
+    }
+
+    /// **One code on the desktop is answered without a window.**
+    ///
+    /// The whole point of the feature: the user chose the route and the route
+    /// answered. What comes back is the payload, which is what the caller
+    /// puts on 6c.
+    #[test]
+    fn one_code_anywhere_on_the_desktop_is_the_answer() {
+        let monitors = [rect(0, 0, 1920, 1080)];
+        match scan_screen_with(&scan_seams(flat_capture, code_naming_the_size), &monitors) {
+            ScreenScan::Found(text) => assert_eq!(&*text, "otpauth://totp/Git%20Host:anovak1920x1080?secret=JBSWY3DPEHPK3PXP"),
+            other => panic!("one code came back as {other:?}"),
+        }
+    }
+
+    /// **Every monitor is read, not just the biggest one.**
+    ///
+    /// This is the reason `scan_screen_with` walks monitors instead of
+    /// handing `whole_screen`'s bounding box to one capture:
+    /// `capture_rect` clamps to the monitor it overlaps most, so a bounding
+    /// box would read the large monitor and never look at the small one --
+    /// and the small one is where the code is here, exactly as it is when the
+    /// user has the vault window on their laptop screen and the setup page on
+    /// the external display.
+    #[test]
+    fn a_code_on_the_second_monitor_is_found_as_readily_as_one_on_the_first() {
+        // The code is only on the second, and the second is the smaller: a
+        // scan that read a bounding box would clamp to the first and miss it.
+        fn only_on_the_small_one(_: &[u8], w: usize, _: usize) -> qr::Codes {
+            if w == 1280 {
+                qr::Codes::One(Zeroizing::new("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP".into()))
+            } else {
+                qr::Codes::None
+            }
+        }
+        let monitors = [rect(0, 0, 1920, 1080), rect(1920, 0, 3200, 720)];
+        assert!(matches!(
+            scan_screen_with(&scan_seams(flat_capture, only_on_the_small_one), &monitors),
+            ScreenScan::Found(_)
+        ));
+        // The control on the same seam: with only the large monitor plugged
+        // in there is nothing to find, so the pass above is about the second
+        // monitor being read and not about the stub answering everything.
+        assert_eq!(
+            miss(scan_screen_with(
+                &scan_seams(flat_capture, only_on_the_small_one),
+                &monitors[..1]
+            )),
+            ScanMiss::NoCode
+        );
+    }
+
+    /// **A desktop with no code on it falls back to the drag, and says so.**
+    #[test]
+    fn a_desktop_with_no_code_falls_back_to_the_drag() {
+        let monitors = [rect(0, 0, 1920, 1080), rect(1920, 0, 3840, 1080)];
+        assert_eq!(
+            miss(scan_screen_with(&scan_seams(flat_capture, no_codes), &monitors)),
+            ScanMiss::NoCode
+        );
+    }
+
+    /// **Two different codes are not guessed between.**
+    ///
+    /// The owner's rule, and the one behaviour here that is a refusal on
+    /// purpose rather than a failure: two codes on a desktop are two secrets,
+    /// and the app has no basis for preferring either. Both halves are
+    /// asserted -- two DIFFERENT codes are `Several`, and the same code on
+    /// two monitors is one code, which is what stops a mirrored or duplicated
+    /// display from making this feature refuse to work at all.
+    #[test]
+    fn two_different_codes_are_refused_but_the_same_code_twice_is_not() {
+        // Different sizes, so `code_naming_the_size` yields different
+        // payloads.
+        let different = [rect(0, 0, 1920, 1080), rect(1920, 0, 3200, 1800)];
+        assert_eq!(
+            miss(scan_screen_with(&scan_seams(flat_capture, code_naming_the_size), &different)),
+            ScanMiss::Several
+        );
+
+        // Same size, so the same payload -- one code seen twice.
+        let same = [rect(0, 0, 1920, 1080), rect(1920, 0, 3840, 1080)];
+        assert!(matches!(
+            scan_screen_with(&scan_seams(flat_capture, code_naming_the_size), &same),
+            ScreenScan::Found(_)
+        ));
+
+        // And one monitor that held two on its own settles it by itself, with
+        // no second monitor needed.
+        assert_eq!(
+            miss(scan_screen_with(&scan_seams(flat_capture, several_codes), &same[..1])),
+            ScanMiss::Several
+        );
+    }
+
+    /// **A capture that refuses is reported in the capture's own words** --
+    /// but only when nothing anywhere could be read.
+    #[test]
+    fn a_desktop_that_cannot_be_captured_at_all_reports_why() {
+        let monitors = [rect(0, 0, 1920, 1080)];
+        assert_eq!(
+            miss(scan_screen_with(&scan_seams(refusing_capture, code_naming_the_size), &monitors)),
+            ScanMiss::Refused(CaptureRefusal::Blocked)
+        );
+        // No monitors at all is `OffScreen`, the same answer `open` gives for
+        // the same desktop.
+        assert_eq!(
+            miss(scan_screen_with(&scan_seams(flat_capture, code_naming_the_size), &[])),
+            ScanMiss::Refused(CaptureRefusal::OffScreen)
+        );
+        // A degenerate monitor is skipped rather than reported: it would
+        // refuse as `TooSmall`, and telling the user their screen is too
+        // small would describe a monitor they do not have.
+        assert_eq!(
+            miss(scan_screen_with(
+                &scan_seams(flat_capture, no_codes),
+                &[rect(0, 0, 1, 1), rect(10, 10, 20, 20)]
+            )),
+            ScanMiss::NoCode
+        );
+    }
+
+    /// **A monitor too large to decode does not sink the scan.**
+    ///
+    /// `qr::MAX_PIXELS` is a real bound and `clamp_to_monitors` applies it per
+    /// monitor, so this goes through the production check rather than a
+    /// number written out again here. Alone, such a monitor is the refusal;
+    /// beside a readable one, the readable one still answers.
+    #[test]
+    fn a_monitor_too_large_to_decode_is_refused_without_sinking_the_scan() {
+        // 9000 x 9000 is 81 megapixels, past the 64 the decoder will look at.
+        let huge = rect(0, 0, 9_000, 9_000);
+        assert!(
+            huge.area() > qr::MAX_PIXELS as u64,
+            "the fixture monitor is no longer past the bound it is here to cross"
+        );
+        assert_eq!(
+            miss(scan_screen_with(&scan_seams(bounded_capture, code_naming_the_size), &[huge])),
+            ScanMiss::Refused(CaptureRefusal::TooLarge)
+        );
+        // Beside a monitor that can be read, the code is still found.
+        assert!(matches!(
+            scan_screen_with(
+                &scan_seams(bounded_capture, code_naming_the_size),
+                &[huge, rect(9_000, 0, 10_600, 900)]
+            ),
+            ScreenScan::Found(_)
+        ));
+        // Control on `bounded_capture` itself: an ordinary monitor is not
+        // refused by it, so the refusal above is about the size.
+        assert_eq!(
+            miss(scan_screen_with(
+                &scan_seams(bounded_capture, no_codes),
+                &[rect(0, 0, 1920, 1080)]
+            )),
+            ScanMiss::NoCode
+        );
+    }
+
+    /// **The scanned secret never reaches a formatter.**
+    #[test]
+    fn the_debug_of_a_scan_does_not_print_the_secret() {
+        let secret = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP";
+        let shown = format!("{:?}", ScreenScan::Found(Zeroizing::new(secret.to_string())));
+        assert!(!shown.contains("JBSWY3DPEHPK3PXP"), "{shown}");
+        assert!(!shown.contains("otpauth"), "{shown}");
+        assert!(shown.contains("not shown"), "{shown}");
+        assert_eq!(
+            format!("{:?}", ScreenScan::Missed(ScanMiss::Several)),
+            "Missed(Several)"
+        );
+    }
+
+    /// **What the bar says, for each way the scan can fail to answer.**
+    ///
+    /// Every one of them names the drag, and no two of them name it the same
+    /// way: "the one you want" is a real choice only when there is more than
+    /// one code, and offering it to a user who has none would be the generic
+    /// refusal this crate keeps refusing to write.
+    #[test]
+    fn the_bar_says_why_it_opened() {
+        assert_eq!(
+            scan_miss_line(ScanMiss::NoCode),
+            "No QR code found on your screen. Drag a box around it instead."
+        );
+        assert_eq!(
+            scan_miss_line(ScanMiss::Several),
+            "More than one QR code is on your screen. Drag a box around the one you want."
+        );
+        // A refusal keeps the capture's own headline rather than a third
+        // sentence invented here.
+        assert_eq!(
+            scan_miss_line(ScanMiss::Refused(CaptureRefusal::Blocked)),
+            "Screen capture is blocked. Drag a box around the code instead."
+        );
+        for why in [
+            CaptureRefusal::OffScreen,
+            CaptureRefusal::TooSmall,
+            CaptureRefusal::TooLarge,
+            CaptureRefusal::GdiFailed,
+            CaptureRefusal::Blocked,
+        ] {
+            let line = scan_miss_line(ScanMiss::Refused(why));
+            assert!(line.starts_with(why.title()), "{line}");
+            assert!(line.ends_with(SCAN_REFUSED_ADVICE), "{line}");
+        }
+        // Each of the three says the drag, and only the one with a choice in
+        // it offers one.
+        for miss in [
+            ScanMiss::NoCode,
+            ScanMiss::Several,
+            ScanMiss::Refused(CaptureRefusal::GdiFailed),
+        ] {
+            let line = scan_miss_line(miss);
+            assert!(line.contains("Drag a box"), "{miss:?} does not name the fallback: {line}");
+            assert!(line.ends_with('.'), "{line}");
+        }
+        assert!(scan_miss_line(ScanMiss::Several).contains("the one you want"));
+        assert!(!scan_miss_line(ScanMiss::NoCode).contains("the one you want"));
+        assert!(!scan_miss_line(ScanMiss::Refused(CaptureRefusal::Blocked))
+            .contains("the one you want"));
+    }
+
+    /// **A scan that found a code ends the overlay on 6c; one that did not
+    /// leaves it up with a reason.**
+    ///
+    /// The two halves of `apply_scan`, and the second is the one that matters
+    /// for the surface: the overlay stays open, the drag still works, and the
+    /// bar now has something to say.
+    #[test]
+    fn a_scan_either_answers_or_explains_itself() {
+        let found = RegionOverlay::open(&[rect(0, 0, 1920, 1080)], 1.0).expect("opens");
+        found.apply_scan(ScreenScan::Found(Zeroizing::new("otpauth://totp/x".into())));
+        assert!(!found.is_open(), "a code did not end the overlay");
+        assert!(matches!(found.take_outcome(), Some(Outcome::Decoded(_))));
+
+        for missed in [
+            ScanMiss::NoCode,
+            ScanMiss::Several,
+            ScanMiss::Refused(CaptureRefusal::GdiFailed),
+        ] {
+            let overlay = RegionOverlay::open(&[rect(0, 0, 1920, 1080)], 1.0).expect("opens");
+            overlay.apply_scan(ScreenScan::Missed(missed));
+            assert!(overlay.is_open(), "{missed:?} closed the overlay");
+            assert!(overlay.take_outcome().is_none(), "{missed:?} recorded an outcome");
+            assert_eq!(overlay.reason(), Some(missed));
+            assert_eq!(overlay.view().reason, Some(missed));
+        }
+
+        // A rescan that finds nothing clears a stale lock-on: "Code found"
+        // must not stay over a rectangle that has not been re-read.
+        let overlay = RegionOverlay::open(&[rect(0, 0, 1920, 1080)], 1.0).expect("opens");
+        let t0 = Instant::now();
+        overlay.advance(&seams(flat_capture, a_code), Some((10.0, 10.0)), true, t0);
+        overlay.advance(
+            &seams(flat_capture, a_code),
+            Some((300.0, 300.0)),
+            true,
+            t0 + DECODE_INTERVAL,
+        );
+        assert!(overlay.view().found, "control: it locked on");
+        overlay.apply_scan(ScreenScan::Missed(ScanMiss::NoCode));
+        assert!(!overlay.view().found, "the stale lock-on survived a rescan");
+    }
+
+    /// **The scan runs once, and then never again.**
+    ///
+    /// The property the module was fixed for once already: a repaint must not
+    /// be able to start another capture. Every transition here is forwards,
+    /// `Done` is absorbing, and a hundred further frames after it ask for
+    /// nothing.
+    #[test]
+    fn the_screen_is_scanned_once_and_the_state_never_goes_back() {
+        let overlay = RegionOverlay::open(&[rect(0, 0, 1920, 1080)], 1.0).expect("opens");
+        let t0 = Instant::now();
+        // The first frame masks and asks to be called back.
+        assert_eq!(overlay.prescan_step(t0), PrescanStep::Mask);
+        // Frames inside the settle wait, and say how long is left.
+        assert_eq!(
+            overlay.prescan_step(t0 + Duration::from_millis(1)),
+            PrescanStep::Settling(PRESCAN_SETTLE - Duration::from_millis(1))
+        );
+        assert_eq!(
+            overlay.prescan_step(t0 + PRESCAN_SETTLE - Duration::from_millis(1)),
+            PrescanStep::Settling(Duration::from_millis(1))
+        );
+        // Exactly the settle is enough -- the bound is "at least", as the
+        // decode throttle's is.
+        assert_eq!(overlay.prescan_step(t0 + PRESCAN_SETTLE), PrescanStep::Scan);
+        // And from there, nothing. Not on the next frame, not an hour later,
+        // not with the clock going backwards.
+        for after in [0_u64, 1, 16, 5_000, 3_600_000] {
+            assert_eq!(
+                overlay.prescan_step(t0 + PRESCAN_SETTLE + Duration::from_millis(after)),
+                PrescanStep::Done,
+                "the scan was asked for again {after} ms later"
+            );
+        }
+        assert_eq!(overlay.prescan_step(t0), PrescanStep::Done);
+    }
+
+    /// A clock that never reaches the deadline never scans -- which is the
+    /// other half of the bound: the settle is a wait, not a spin that gives
+    /// up and captures anyway.
+    #[test]
+    fn the_settle_is_a_wait_and_not_a_countdown_of_frames() {
+        let overlay = RegionOverlay::open(&[rect(0, 0, 800, 600)], 1.0).expect("opens");
+        let t0 = Instant::now();
+        assert_eq!(overlay.prescan_step(t0), PrescanStep::Mask);
+        for _ in 0..200 {
+            assert!(matches!(
+                overlay.prescan_step(t0 + Duration::from_millis(1)),
+                PrescanStep::Settling(_)
+            ));
+        }
+        assert_eq!(overlay.prescan_step(t0 + PRESCAN_SETTLE), PrescanStep::Scan);
+    }
+
+    /// Production's settle is the documented one, and it is a real wait
+    /// rather than zero -- which would be the same race the constant exists
+    /// to avoid.
+    #[test]
+    fn the_production_settle_is_the_documented_one() {
+        assert_eq!(PRESCAN_SETTLE, Duration::from_millis(80));
+        assert!(PRESCAN_SETTLE > Duration::ZERO);
+        // Short enough that a user does not sit through it: it is under the
+        // same fifth of a second the lock-on interval is argued against.
+        assert!(PRESCAN_SETTLE < Duration::from_millis(200));
+    }
+
+    /// **A press on a chip is that chip's, and does not also become a
+    /// drag.**
+    ///
+    /// The defect this prevents is specific: this surface reads the raw
+    /// pointer, so a press taken only on release would already have started a
+    /// selection on the way down, and the release would then read the
+    /// one-pixel rectangle under the chip and end the overlay with "that
+    /// region is too small".
+    #[test]
+    fn a_press_on_a_chip_belongs_to_the_chip_for_the_whole_gesture() {
+        let overlay = RegionOverlay::open(&[rect(0, 0, 1920, 1080)], 1.0).expect("opens");
+        let whole = rect_pts(1500.0, 1000.0, 1620.0, 1028.0);
+        let cancel = rect_pts(1630.0, 1000.0, 1720.0, 1028.0);
+        locked(&overlay.inner).chips = [whole, cancel];
+
+        // Down on the whole-screen chip: nothing yet, and the overlay knows
+        // the gesture is the chip's.
+        assert_eq!(overlay.chip_gesture(Some((1550.0, 1010.0)), true, true), None);
+        assert!(overlay.in_chip_press());
+        // Held: still nothing.
+        assert_eq!(overlay.chip_gesture(Some((1552.0, 1012.0)), false, true), None);
+        assert!(overlay.in_chip_press());
+        // Up, over the same chip: the press lands.
+        assert_eq!(
+            overlay.chip_gesture(Some((1552.0, 1012.0)), false, false),
+            Some(CHIP_WHOLE_SCREEN)
+        );
+        assert!(!overlay.in_chip_press(), "the gesture was not released");
+
+        // The other chip, by its own index.
+        assert_eq!(overlay.chip_gesture(Some((1680.0, 1010.0)), true, true), None);
+        assert_eq!(
+            overlay.chip_gesture(Some((1680.0, 1010.0)), false, false),
+            Some(CHIP_CANCEL)
+        );
+
+        // Pressed on a chip, released off it: nothing happens, which is how
+        // a user takes back a press they did not mean.
+        assert_eq!(overlay.chip_gesture(Some((1550.0, 1010.0)), true, true), None);
+        assert_eq!(overlay.chip_gesture(Some((400.0, 400.0)), false, false), None);
+        assert!(!overlay.in_chip_press());
+
+        // A press anywhere else is not a chip's at all, so the drag gets it.
+        assert_eq!(overlay.chip_gesture(Some((400.0, 400.0)), true, true), None);
+        assert!(!overlay.in_chip_press(), "an ordinary drag was swallowed as a chip press");
+        assert_eq!(overlay.chip_gesture(Some((500.0, 500.0)), false, false), None);
+
+        // And with no chips painted yet -- the first frame -- a press hits
+        // none of them, because `Rect::NOTHING` contains no point.
+        let fresh = RegionOverlay::open(&[rect(0, 0, 1920, 1080)], 1.0).expect("opens");
+        assert_eq!(fresh.chip_gesture(Some((1550.0, 1010.0)), true, true), None);
+        assert!(!fresh.in_chip_press());
+    }
+
+    /// The bar grows by the reason line rather than the instruction moving to
+    /// make room for it, so 6b's own two lines sit where they always did
+    /// relative to each other.
+    #[test]
+    fn the_reason_line_makes_the_bar_taller_rather_than_displacing_the_instruction() {
+        let full = rect_pts(0.0, 0.0, 1920.0, 1080.0);
+        // Three lines of type at the design's gap, against two.
+        let two = bar_rect(full, 20.0 + BAR_LINE_GAP + 18.0);
+        let three = bar_rect(full, 15.0 + BAR_LINE_GAP + 20.0 + BAR_LINE_GAP + 18.0);
+        assert!(three.height() > two.height(), "the reason line did not make room for itself");
+        assert_eq!(three.height() - two.height(), 15.0 + BAR_LINE_GAP);
+        assert_eq!(three.bottom(), full.bottom(), "the bar left the bottom edge");
+        assert_eq!(BAR_REASON_PX, BAR_HINT_PX);
+        assert_eq!(BAR_REASON_INK, theme::BLUE_SOFT);
+    }
+
+    /// **The vault window is masked for the scan and put back afterwards.**
+    ///
+    /// The mask is a `SetWindowDisplayAffinity` on a real window and cannot be
+    /// asserted from here -- there is no window in a test process. What can be
+    /// asserted is the bookkeeping that decides when the OS call happens: it
+    /// is idempotent, so the calls land on the transitions, and `Inner`'s
+    /// `Drop` is what guarantees the mask comes off for the paths that do not
+    /// run through `show`.
+    #[test]
+    fn the_mask_is_bookkept_so_that_it_always_comes_back_off() {
+        let overlay = RegionOverlay::open(&[rect(0, 0, 800, 600)], 1.0).expect("opens");
+        assert!(!locked(&overlay.inner).masked, "a fresh overlay has masked nothing");
+        // `mask_own_window` is not called here: it would reach Win32. What is
+        // asserted is that the flag is what gates it, and that `Drop` reads
+        // the same flag.
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            code.contains("if held.masked == on {"),
+            "the mask is no longer idempotent, so the OS call no longer lands on transitions"
+        );
+        assert!(
+            code.contains("impl Drop for Inner {") && code.contains("if self.masked {"),
+            "nothing puts the vault window back into screen captures when the overlay is \
+             dropped rather than closed"
+        );
+        // `show` unmasks on all three of its ways out -- the guard that
+        // finds a finished overlay, the scan that answered before a window
+        // existed, and the frame the overlay ends on -- and `Drop` is the
+        // backstop under all of them.
+        assert_eq!(
+            code.matches("self.mask_own_window(false);").count(),
+            3,
+            "`show` no longer puts the vault window back on every way out of it"
+        );
+        assert_eq!(
+            code.matches("self.mask_own_window(true);").count(),
+            1,
+            "the vault window is masked from somewhere other than the one scan that needs it"
+        );
+        // And the window it masks is the vault window, which is the one the
+        // modal that started this is drawn in.
+        assert_eq!(crate::vault_window::WINDOW_TITLE, "Deskwarden");
+        assert_ne!(crate::vault_window::WINDOW_TITLE, REGION_TITLE);
+    }
+
+    /// **The scan is decode-only: nothing paints it.**
+    ///
+    /// The one security property of this feature that is a *negative* about
+    /// the UI rather than about the buffers. A frozen desktop would make the
+    /// dim composite perfectly and would put a picture of the user's whole
+    /// screen into `egui`'s texture manager, which this crate cannot wipe.
+    /// The overlay stays transparent over the live desktop instead.
+    #[test]
+    fn nothing_in_this_module_uploads_a_capture_to_a_texture() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        for needle in ["load_texture", "TextureHandle", "ColorImage", "tex_manager"] {
+            assert!(
+                !code.contains(needle),
+                "`{needle}` appears in this module: a capture of the user's screen must not \
+                 reach `egui`'s texture manager, which holds allocations this crate cannot wipe"
+            );
+        }
+        // Positive control: the capture really is in this file, so the
+        // absences above are about textures and not about an empty haystack.
+        assert!(code.contains("(seams.capture)(*monitor)"));
+        // And it is dropped rather than kept.
+        assert!(code.contains("drop(pixels);"));
     }
 }

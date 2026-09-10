@@ -79,15 +79,216 @@ pub const MAX_PIXELS: usize = 64 * 1024 * 1024;
 /// anything on this path -- no temp file, no debug artifact, no log line -- and
 /// it never leaves the machine, because this decoder has no I/O at all.
 pub fn decode_qr(rgba: &[u8], width: usize, height: usize) -> Option<Zeroizing<String>> {
+    let mut first = None;
+    walk_codes(rgba, width, height, |text| {
+        first = Some(text);
+        // The FIRST grid, which is this function's whole contract: three
+        // routes ask "what does this picture say" and none of them has a use
+        // for a second answer. `false` stops the walk, so no further grid is
+        // decoded and no further payload is ever built.
+        false
+    });
+    first
+}
+
+/// What [`codes_in`] found.
+///
+/// **No derived `Debug`**, and it must stay hand-written: [`Codes::One`]
+/// holds a seed inside a [`Zeroizing<String>`], whose own `Debug` prints it.
+/// `debug_leak_guard` refuses a derive here and is right to.
+pub enum Codes {
+    /// Nothing in the buffer decoded.
+    None,
+    /// Exactly one distinct payload, however many grids carried it.
+    One(Zeroizing<String>),
+    /// Two or more **different** payloads. Deliberately carries none of them
+    /// -- see [`codes_in`].
+    Several,
+}
+
+impl std::fmt::Debug for Codes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Codes::None => write!(f, "None"),
+            Codes::One(text) => write!(f, "One({} chars not shown)", text.len()),
+            Codes::Several => write!(f, "Several"),
+        }
+    }
+}
+
+/// **How many distinct QR codes a buffer holds, and the payload when there is
+/// exactly one.**
+///
+/// [`decode_qr`]'s sibling rather than a replacement for it, and the split is
+/// the point. Three routes -- the drag overlay, the image file, the webcam --
+/// ask what a picture says, and widening their answer to carry a count would
+/// make each of them handle a case it has no use for: a user who dragged a
+/// box around one code, or opened a screenshot of one, has already chosen.
+/// This is for the one caller that has **not** been given a choice and must
+/// refuse to invent one -- the whole-screen scan, which looks at a desktop it
+/// did not frame and can perfectly well find two.
+///
+/// # Distinct by payload, not by grid
+///
+/// Two detections of the same code are **one** answer: a page open in two
+/// windows, a thumbnail beside its own preview, the same setup page reloaded
+/// in a second tab. What a user would be asked to choose between is the
+/// *secret*, and in those cases there is only one. Only two genuinely
+/// different payloads are [`Codes::Several`].
+///
+/// # `Several` carries nothing, and that is a security decision
+///
+/// The obvious signature is `Vec<Zeroizing<String>>`, and it would put every
+/// seed on the desktop into one value in order to describe a situation whose
+/// entire response is "Deskwarden will not choose for you". At most **one**
+/// payload is alive inside this function at any moment: a second, different
+/// one ends the walk immediately and the one being held is dropped -- and so
+/// wiped -- before the answer leaves.
+///
+/// Everything [`decode_qr`] documents about `rqrr`'s own un-wiped
+/// intermediates applies here unchanged. This function widens nothing: it
+/// walks the same grids through the same helper.
+pub fn codes_in(rgba: &[u8], width: usize, height: usize) -> Codes {
+    let mut tally = Tally::new();
+    walk_codes(rgba, width, height, |text| tally.saw(text));
+    tally.finish()
+}
+
+/// **The running answer to "how many distinct codes so far", and the rule for
+/// combining sightings.**
+///
+/// Extracted rather than written inline in [`codes_in`] because there are two
+/// places that need exactly this fold and they are in different modules:
+/// [`codes_in`] runs it over the grids of **one** picture, and the
+/// whole-screen scan runs it over the answers from **each monitor in turn**.
+/// Written twice, the two would disagree the first time either was corrected
+/// -- most likely about whether the same code appearing on two monitors is
+/// one code or two, which is precisely the question the user's experience
+/// turns on. Written once, a test can drive every transition by hand, which
+/// is the other half of why it is a type: the two-different-payloads case
+/// cannot be built out of the single committed QR fixture, and this is the
+/// seam that makes it assertable anyway.
+///
+/// **At most one payload is ever held.** A second, different one does not
+/// join a list; it drops the one being held and latches [`Self::several`], so
+/// the widest this can get is a single seed plus a boolean.
+pub struct Tally {
+    seen: Option<Zeroizing<String>>,
+    several: bool,
+}
+
+impl Default for Tally {
+    fn default() -> Self {
+        Tally::new()
+    }
+}
+
+impl Tally {
+    /// An empty tally: nothing seen.
+    pub fn new() -> Self {
+        Tally {
+            seen: None,
+            several: false,
+        }
+    }
+
+    /// Records one decoded payload. Answers **whether it is still worth
+    /// looking**: `false` once a second distinct code has been seen, because
+    /// from that point no further sighting can change the answer and every
+    /// one of them would be another seed pulled out of a picture for nothing.
+    ///
+    /// A repeat of what is already held is dropped -- and so wiped -- as this
+    /// returns.
+    ///
+    /// **The latch is checked first, and that is not belt-and-braces.** Once
+    /// a second distinct code has been seen there is no payload left in here
+    /// to compare against, so a caller that kept feeding this -- a merge loop
+    /// that ignored the `false`, say -- would find `seen` empty, take the
+    /// first branch below, and quietly turn "more than one" back into "one".
+    pub fn saw(&mut self, text: Zeroizing<String>) -> bool {
+        if self.several {
+            return false;
+        }
+        let differs = match self.seen.as_ref() {
+            Some(first) => first.as_str() != text.as_str(),
+            None => false,
+        };
+        if differs {
+            self.several = true;
+            // Both die here: the one being held, and the one just handed in.
+            self.seen = None;
+            return false;
+        }
+        if self.seen.is_none() {
+            self.seen = Some(text);
+        }
+        true
+    }
+
+    /// Folds one whole picture's answer in, for the caller scanning several
+    /// pictures. Same return as [`Self::saw`].
+    pub fn merge(&mut self, codes: Codes) -> bool {
+        if self.several {
+            return false;
+        }
+        match codes {
+            Codes::None => true,
+            Codes::One(text) => self.saw(text),
+            Codes::Several => {
+                self.several = true;
+                self.seen = None;
+                false
+            }
+        }
+    }
+
+    /// The answer, consuming the tally so the payload is moved out rather
+    /// than copied.
+    pub fn finish(self) -> Codes {
+        match self.seen {
+            Some(text) => Codes::One(text),
+            None if self.several => Codes::Several,
+            None => Codes::None,
+        }
+    }
+}
+
+/// Walks the QR grids in an RGBA buffer, handing each decoded payload to
+/// `visit` until it answers `false`.
+///
+/// **The one place in this crate that talks to `rqrr`**, and it is one place
+/// on purpose. The buffer discipline documented at length on [`decode_qr`] --
+/// a `Zeroizing` reserved at `rqrr::MAX_PAYLOAD_SIZE` so that writing a
+/// payload into it cannot re-allocate and hand a half-written seed back to
+/// the allocator, rebuilt inside the loop so a failed decode's partial bytes
+/// cannot bleed into the next grid's attempt -- is the kind of thing that
+/// must exist once. A second copy of it beside [`codes_in`] would be a second
+/// thing to keep right, and this crate has already lost a rectangle to
+/// exactly that.
+///
+/// The bounds checks are here rather than in the callers for the same reason:
+/// a caller that forgot one would walk past the end of the buffer, and there
+/// are now two callers.
+fn walk_codes(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    mut visit: impl FnMut(Zeroizing<String>) -> bool,
+) {
     if width == 0 || height == 0 {
-        return None;
+        return;
     }
-    let pixels = width.checked_mul(height)?;
+    let Some(pixels) = width.checked_mul(height) else {
+        return;
+    };
     if pixels > MAX_PIXELS {
-        return None;
+        return;
     }
-    if rgba.len() < pixels.checked_mul(4)? {
-        return None;
+    let Some(bytes) = pixels.checked_mul(4) else {
+        return;
+    };
+    if rgba.len() < bytes {
+        return;
     }
 
     // `prepare_from_greyscale` pulls each pixel through this closure, so no
@@ -112,15 +313,18 @@ pub fn decode_qr(rgba: &[u8], width: usize, height: usize) -> Option<Zeroizing<S
         // `take` moves the buffer out so `from_utf8` can re-use its
         // allocation; the `Zeroizing` left behind holds an empty `Vec`, and
         // the seed's one and only buffer is now inside the `Zeroizing<String>`
-        // returned below. A QR payload need not be UTF-8 -- an `otpauth://`
+        // handed to `visit`. A QR payload need not be UTF-8 -- an `otpauth://`
         // URI is, so anything that is not is not what this is looking for.
         let bytes = std::mem::take(&mut *out);
         match String::from_utf8(bytes) {
-            Ok(text) => return Some(Zeroizing::new(text)),
+            Ok(text) => {
+                if !visit(Zeroizing::new(text)) {
+                    return;
+                }
+            }
             Err(bad) => drop(Zeroizing::new(bad.into_bytes())),
         }
     }
-    None
 }
 
 /// Rec. 601 luma, the weighting every QR decoder uses.
@@ -484,5 +688,238 @@ pub(crate) mod tests {
         let decoded: Zeroizing<String> = decode_qr(&rgba, w, h).expect("decodes");
         assert!(decoded.contains("JBSWY3DPEHPK3PXP"), "the decode did not carry the seed");
         assert_eq!(decoded.len(), FIXTURE_TEXT.len());
+    }
+
+    // -- how many, for the caller that must not guess -----------------------
+
+    /// Renders `copies` of [`FIXTURE`] in a row on one white page, separated
+    /// by a wide gutter so each keeps the quiet zone a detector needs.
+    ///
+    /// Returns `(rgba, width, height)`.
+    fn fixture_row(copies: usize, scale: usize) -> (Vec<u8>, usize, usize) {
+        const GUTTER: usize = 48;
+        let (code, side, _) = fixture_rgba(scale);
+        let width = copies * side + (copies + 1) * GUTTER;
+        let height = side + 2 * GUTTER;
+        let mut page = vec![0xffu8; width * height * 4];
+        for copy in 0..copies {
+            let ox = GUTTER + copy * (side + GUTTER);
+            for y in 0..side {
+                for x in 0..side {
+                    let from = (y * side + x) * 4;
+                    let to = ((y + GUTTER) * width + x + ox) * 4;
+                    page[to..to + 4].copy_from_slice(&code[from..from + 4]);
+                }
+            }
+        }
+        (page, width, height)
+    }
+
+    /// **One code on a page is one code, and its payload comes back.**
+    #[test]
+    fn a_page_with_one_code_reports_exactly_one() {
+        let (page, w, h) = fixture_row(1, 4);
+        match codes_in(&page, w, h) {
+            Codes::One(text) => assert_eq!(&*text, FIXTURE_TEXT),
+            other => panic!("one code on the page came back as {other:?}"),
+        }
+    }
+
+    /// **The same code twice is ONE answer, not two.**
+    ///
+    /// The rule [`codes_in`] is built on: what a user would be asked to choose
+    /// between is the *secret*, and a page open in two windows -- or a
+    /// thumbnail beside its own preview -- holds one of those. Refusing to
+    /// scan such a desktop would be a refusal with nothing behind it.
+    ///
+    /// The control is the interesting half. Asserting `One` proves nothing on
+    /// its own: a detector that found only the left-hand copy would satisfy it
+    /// while the de-duplication below stayed unexercised. So the walk is run
+    /// directly first and both copies are required to have been *decoded*
+    /// before the answer is asked for.
+    #[test]
+    fn the_same_code_twice_in_one_picture_is_one_answer() {
+        let (page, w, h) = fixture_row(2, 4);
+        let mut decoded = 0usize;
+        walk_codes(&page, w, h, |text| {
+            assert_eq!(&*text, FIXTURE_TEXT);
+            decoded += 1;
+            true
+        });
+        assert!(
+            decoded >= 2,
+            "only {decoded} of the two copies decoded, so the de-duplication below is untested"
+        );
+        match codes_in(&page, w, h) {
+            Codes::One(text) => assert_eq!(&*text, FIXTURE_TEXT),
+            other => panic!("two copies of one code came back as {other:?}"),
+        }
+    }
+
+    /// A page with nothing on it reports nothing -- with the usual control, so
+    /// the `None` is about the page and not about a broken walk.
+    #[test]
+    fn a_page_with_no_code_reports_none() {
+        let white = vec![0xffu8; 300 * 300 * 4];
+        assert!(matches!(codes_in(&white, 300, 300), Codes::None));
+        let (page, w, h) = fixture_row(1, 4);
+        assert!(matches!(codes_in(&page, w, h), Codes::One(_)));
+    }
+
+    /// The same bounds [`decode_qr`] refuses, refused the same way: a
+    /// truncated buffer, an overflowing pixel count and a picture larger than
+    /// [`MAX_PIXELS`] are all `None` rather than a walk past the end of a
+    /// buffer.
+    ///
+    /// **[`MAX_PIXELS`] is the bound the whole-screen scan runs into**, so it
+    /// is checked here against the real constant rather than against a number
+    /// copied beside it.
+    #[test]
+    fn codes_in_refuses_exactly_what_decode_qr_refuses() {
+        for (rgba, w, h) in [
+            (vec![], 0usize, 0usize),
+            (vec![], 10, 10),
+            (vec![0xffu8; 10 * 10 * 4 - 1], 10, 10),
+            (vec![0xff; 16], usize::MAX, usize::MAX),
+            (vec![0xff; 16], MAX_PIXELS + 1, 1),
+            (vec![0xff; 16], 4, 0),
+            (vec![0xff; 16], 0, 4),
+        ] {
+            assert!(
+                matches!(codes_in(&rgba, w, h), Codes::None),
+                "{w}x{h} was walked rather than refused"
+            );
+            assert!(decode_qr(&rgba, w, h).is_none(), "{w}x{h} disagreed with codes_in");
+        }
+        // A picture one pixel under the bound is walked rather than refused --
+        // so the comparison above is off by nothing. `MAX_PIXELS` pixels of
+        // RGBA is more memory than a test should ask for, so the buffer is
+        // deliberately short: `walk_codes` gets past the pixel-count gate and
+        // is stopped by the length gate, which is the boundary being pinned.
+        assert!(matches!(codes_in(&[], MAX_PIXELS, 1), Codes::None));
+    }
+
+    /// **Neither the payload nor its length reaches a formatter as a
+    /// secret.** `Codes`' `Debug` is hand-written for the reason
+    /// `Outcome`'s is.
+    #[test]
+    fn the_debug_of_a_found_code_does_not_print_it() {
+        let shown = format!("{:?}", Codes::One(Zeroizing::new(FIXTURE_TEXT.to_string())));
+        assert!(!shown.contains("JBSWY3DPEHPK3PXP"), "{shown}");
+        assert!(!shown.contains("otpauth"), "{shown}");
+        assert!(shown.contains("not shown"), "{shown}");
+        assert_eq!(format!("{:?}", Codes::None), "None");
+        assert_eq!(format!("{:?}", Codes::Several), "Several");
+    }
+
+    /// **The two entry points agree**, which is what makes it safe for the
+    /// scan to use one and every other route to use the other. A refactor
+    /// that gave `codes_in` its own copy of the grid walk and let the two
+    /// drift is what this would catch.
+    #[test]
+    fn decode_qr_and_codes_in_read_the_same_code() {
+        for scale in [3usize, 5] {
+            let (rgba, w, h) = fixture_rgba(scale);
+            let one = decode_qr(&rgba, w, h).expect("decode_qr reads it");
+            match codes_in(&rgba, w, h) {
+                Codes::One(other) => assert_eq!(&*one, &*other),
+                other => panic!("codes_in disagreed at scale {scale}: {other:?}"),
+            }
+        }
+    }
+
+    /// **Two DIFFERENT payloads are `Several`, and `Several` carries
+    /// neither.**
+    ///
+    /// This is the one claim in this file that cannot be made from
+    /// [`FIXTURE`]: a second payload needs a second real QR matrix, and the
+    /// standing rule beside the fixture is that no second one is committed --
+    /// its independence from `rqrr` is what makes it evidence, and an
+    /// invented sibling would be a second thing to keep correct. So the
+    /// accumulation is driven directly, through the same walk `codes_in`
+    /// runs, with the decoder replaced by a hand-fed sequence of payloads.
+    ///
+    /// The whole-screen scan's own "more than one code on this desktop" case
+    /// is asserted end to end in `region_overlay`, through its seams -- and
+    /// it is the same [`Tally`] being driven there.
+    #[test]
+    fn two_different_payloads_are_several_and_several_carries_nothing() {
+        fn fold(payloads: &[&str]) -> Codes {
+            let mut tally = Tally::new();
+            for payload in payloads {
+                if !tally.saw(Zeroizing::new((*payload).to_string())) {
+                    break;
+                }
+            }
+            tally.finish()
+        }
+
+        let other = "otpauth://totp/Other:b?secret=MFRGGZDFMZTWQ2LK";
+        assert!(matches!(fold(&[FIXTURE_TEXT, other]), Codes::Several));
+        assert!(matches!(fold(&[other, FIXTURE_TEXT]), Codes::Several));
+        // The de-duplication, in the type the picture walk uses: repeats are
+        // one, however many of them arrive.
+        assert!(matches!(fold(&[FIXTURE_TEXT, FIXTURE_TEXT, FIXTURE_TEXT]), Codes::One(_)));
+        assert!(matches!(fold(&[FIXTURE_TEXT]), Codes::One(_)));
+        assert!(matches!(fold(&[]), Codes::None));
+        // And `Several` carries nothing: the `Debug` has no room for a
+        // payload, and the value it was holding was dropped at the moment the
+        // second one arrived.
+        assert_eq!(format!("{:?}", fold(&[FIXTURE_TEXT, other])), "Several");
+    }
+
+    /// **The latch is one-way.** A caller that ignores [`Tally::saw`]'s
+    /// `false` and keeps feeding it must not be able to talk it back down to
+    /// one code -- which is exactly what would happen if the emptied `seen`
+    /// were allowed to be filled again.
+    #[test]
+    fn a_tally_that_has_seen_two_codes_cannot_be_talked_back_down_to_one() {
+        let other = "otpauth://totp/Other:b?secret=MFRGGZDFMZTWQ2LK";
+        let mut tally = Tally::new();
+        assert!(tally.saw(Zeroizing::new(FIXTURE_TEXT.to_string())));
+        assert!(!tally.saw(Zeroizing::new(other.to_string())), "the second code did not stop it");
+        // Six more sightings of the same payload, all ignored.
+        for _ in 0..6 {
+            assert!(!tally.saw(Zeroizing::new(FIXTURE_TEXT.to_string())));
+        }
+        assert!(matches!(tally.finish(), Codes::Several));
+    }
+
+    /// **A whole picture's answer folds in the same way one payload does**,
+    /// which is what lets the screen scan run this over monitors rather than
+    /// over grids.
+    #[test]
+    fn merging_whole_pictures_follows_the_same_rule_as_merging_payloads() {
+        let other = "otpauth://totp/Other:b?secret=MFRGGZDFMZTWQ2LK";
+        let one = || Codes::One(Zeroizing::new(FIXTURE_TEXT.to_string()));
+
+        // Empty pictures change nothing.
+        let mut tally = Tally::new();
+        assert!(tally.merge(Codes::None));
+        assert!(tally.merge(one()));
+        assert!(tally.merge(Codes::None));
+        assert!(matches!(tally.finish(), Codes::One(_)));
+
+        // The same code on two monitors is one code.
+        let mut tally = Tally::new();
+        assert!(tally.merge(one()));
+        assert!(tally.merge(one()));
+        assert!(matches!(tally.finish(), Codes::One(_)));
+
+        // Different codes on two monitors are several.
+        let mut tally = Tally::new();
+        assert!(tally.merge(one()));
+        assert!(!tally.merge(Codes::One(Zeroizing::new(other.to_string()))));
+        assert!(matches!(tally.finish(), Codes::Several));
+
+        // And one monitor that held two on its own settles it by itself.
+        let mut tally = Tally::new();
+        assert!(!tally.merge(Codes::Several));
+        assert!(matches!(tally.finish(), Codes::Several));
+        // Including when a code had already been found somewhere else.
+        let mut tally = Tally::new();
+        assert!(tally.merge(one()));
+        assert!(!tally.merge(Codes::Several));
+        assert!(matches!(tally.finish(), Codes::Several));
     }
 }

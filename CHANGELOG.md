@@ -53,6 +53,31 @@ none of them switched on until you pick. Every picture is read on this
 machine and thrown away; nothing is recorded and nothing is sent anywhere.
 `PRIVACY.md` has the long version, under **The camera**.
 
+### The screen scan finds the code by itself
+
+**Scan the code on my screen** -- the row that used to read *Scan a region of
+my screen* -- no longer begins by asking you to drag a box. Choosing it looks
+at every monitor you have and reads the QR code sitting on it. If there is
+exactly one, you go straight to the confirmation card, with what was
+extracted, a live code and its countdown, and no overlay ever appears.
+**Nothing is saved until you press Save**, exactly as before.
+
+The box is still there for when the scan cannot answer. If no code was found
+-- it is very small, or low-contrast, or half-covered -- the dimmed overlay
+opens as it always did. So does it if there is more than one code on your
+screen, because two codes are two different secrets and Deskwarden will not
+guess which you meant. Either way the overlay's bottom bar now says which of
+those happened, so a full-screen dim never arrives without a reason. Its
+**Whole screen** button can be clicked as well as pressed with `A`, so you can
+ask for another look after closing a window or moving one out of the way.
+
+Deskwarden's own window is taken out of the picture for the length of the scan
+and put straight back afterwards, so the vault window cannot hide the code
+from the very scan you asked for, and your own screenshots and screen sharing
+are left exactly as they were. What the scan captures is read on this machine
+and thrown away: it is never shown on screen, never written to disk and never
+sent anywhere.
+
 ## 0.15.19 - 2026-09-09
 
 ### Shortcuts, on a page of their own
