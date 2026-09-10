@@ -97,8 +97,11 @@ use crate::theme;
 /// distinctness rather than trusting this comment.
 pub const REGION_TITLE: &str = "Deskwarden \u{2014} scan a region";
 
-/// 6b's instruction, shown until a drag starts and again after one is
-/// abandoned.
+/// 6b's instruction. **On screen the whole time**, not only while the pointer
+/// is idle: the design puts it in a bar pinned to the bottom of the surface
+/// that no state removes, because the sentence beside it is the one that says
+/// nothing has been saved, and a user mid-drag is exactly the user who wants
+/// to read that.
 pub const DRAG_TITLE: &str = "Drag a box around the QR code";
 
 /// 6b's sub-line. **"Nothing is saved yet" has to stay true of the code**:
@@ -109,14 +112,120 @@ pub const DRAG_HINT: &str = "Deskwarden reads it the moment you let go. Nothing 
 /// 6b's lock-on badge, shown **while the button is still down**.
 pub const LOCKED_ON: &str = "Code found \u{b7} release to read";
 
-/// 6b's two shortcut affordances, bottom right.
+/// 6b's two shortcut affordances, at the right-hand end of the bottom bar.
+/// Each is a bordered chip carrying its label and, in the design's monospace,
+/// the key that does the same thing.
 pub const WHOLE_SCREEN_HINT: &str = "Whole screen";
+/// See [`WHOLE_SCREEN_HINT`]. The key printed inside that chip, and the key
+/// the callback really matches on -- [`egui::Key::A`].
+pub const WHOLE_SCREEN_KEY: &str = "A";
+/// See [`WHOLE_SCREEN_HINT`].
 pub const CANCEL_HINT: &str = "Cancel";
+/// See [`WHOLE_SCREEN_HINT`]. Matched as [`egui::Key::Escape`].
+pub const CANCEL_KEY: &str = "ESC";
 
-/// How dark the desktop goes outside the selection. Alpha over black; the
-/// selection itself is left entirely unpainted, which is what "stays lit"
-/// means on a transparent viewport.
-pub const DIM_ALPHA: u8 = 140;
+// ---------------------------------------------------------------------------
+// The numbers, all of them lifted out of design 6b's CSS
+// ---------------------------------------------------------------------------
+//
+// 6b draws its mock desktop as `#201e1d` with the desktop content over it at
+// `opacity: 0.32`, and everything else on the surface is positioned in the
+// same CSS pixels. Those pixels are points here: the overlay is a full-screen
+// viewport at the desktop's own scale factor, so a 26-point badge is the
+// design's 26px badge on a 100% monitor and grows with the user's scaling the
+// way every other surface in this app does.
+
+/// How dark the desktop goes outside the selection.
+///
+/// **Ink at 68%, not black at 55%.** 6b composites the desktop at
+/// `opacity: 0.32` over `#201e1d`, which over a real desktop is the same
+/// arithmetic as painting that ink at `1 - 0.32` -- `0.68 * 255`, rounded.
+/// Black was what this drew before and it read as a colder, flatter dim than
+/// the design's, because the design's wash is the app's ink and carries its
+/// warmth. The selection itself is left entirely unpainted, which is what
+/// "stays lit" means on a transparent viewport.
+pub const DIM_ALPHA: u8 = 173;
+
+/// The solid ring around the selection: `box-shadow: 0 0 0 2px #1b3fa0`.
+pub const SELECTION_RING: f32 = 2.0;
+/// The soft ring outside that one: the second shadow, `0 0 0 8px`, is six
+/// further points beyond the first two.
+pub const SELECTION_HALO: f32 = 6.0;
+/// The halo's `rgba(27, 63, 160, 0.28)`, as an alpha over [`theme::BLUE`].
+pub const HALO_ALPHA: u8 = 71;
+
+/// The arm length of 6b's four corner brackets (`width`/`height: 14px`).
+pub const CORNER_ARM: f32 = 14.0;
+/// Their thickness (`border-left: 3px solid #1b3fa0`).
+pub const CORNER_THICK: f32 = 3.0;
+
+/// The lock-on badge's height (`height: 26px`).
+pub const BADGE_HEIGHT: f32 = 26.0;
+/// Its horizontal padding (`padding: 0 10px`).
+pub const BADGE_PAD_X: f32 = 10.0;
+/// Its corner radius (`border-radius: 6px`).
+pub const BADGE_RADIUS: u8 = 6;
+/// The gap between the tick and the words (`gap: 8px`).
+pub const BADGE_GAP: f32 = 8.0;
+/// The tick's box (`<svg width="13" height="13">`) and the stroke width it
+/// carries in that svg's own 24-unit viewBox.
+pub const BADGE_TICK: f32 = 13.0;
+/// See [`BADGE_TICK`].
+pub const BADGE_TICK_STROKE: f32 = 2.8;
+/// The words in the badge (`font-size: 12px; font-weight: 700`).
+pub const BADGE_TEXT_PX: f32 = 12.0;
+/// How far above the selection's **top-left** the badge sits: `left: 0; top:
+/// -34px`, so its own bottom clears the selection by eight points.
+pub const BADGE_OFFSET: f32 = 34.0;
+
+/// The size readout's inset from the selection's bottom-right corner
+/// (`right: 6px; bottom: 6px`).
+pub const SIZE_INSET: f32 = 6.0;
+/// Its padding (`padding: 3px 7px`).
+pub const SIZE_PAD_X: f32 = 7.0;
+/// See [`SIZE_PAD_X`].
+pub const SIZE_PAD_Y: f32 = 3.0;
+/// Its corner radius (`border-radius: 5px`).
+pub const SIZE_RADIUS: u8 = 5;
+/// Its type (`font-family: ui-monospace...; font-size: 11px`).
+pub const SIZE_TEXT_PX: f32 = 11.0;
+/// Its plate, `rgba(32, 30, 29, 0.86)` -- ink at `0.86 * 255`, rounded.
+pub const SIZE_BG_ALPHA: u8 = 219;
+
+/// The bottom bar's padding (`padding: 14px 18px`).
+pub const BAR_PAD_X: f32 = 18.0;
+/// See [`BAR_PAD_X`].
+pub const BAR_PAD_Y: f32 = 14.0;
+/// Its ground, `rgba(32, 30, 29, 0.92)` -- ink at `0.92 * 255`, rounded.
+/// **Not opaque**, and that matters on this window: the bar sits over the
+/// desktop like everything else here, and an opaque one would read as a strip
+/// of chrome bolted on rather than as part of the dim.
+pub const BAR_BG_ALPHA: u8 = 235;
+/// Its `border-top: 1px solid #3a3736`.
+pub const BAR_EDGE: egui::Color32 = egui::Color32::from_rgb(0x3a, 0x37, 0x36);
+/// The bar's title (`font-size: 13px; font-weight: 700; color: #ffffff`).
+pub const BAR_TITLE_PX: f32 = 13.0;
+/// The line under it (`font-size: 12px; color: #bab6b6`).
+pub const BAR_HINT_PX: f32 = 12.0;
+/// See [`BAR_HINT_PX`]. Not one of `theme`'s inks: it is a grey chosen for a
+/// dark ground and this is the only dark ground in the product.
+pub const BAR_HINT_INK: egui::Color32 = egui::Color32::from_rgb(0xba, 0xb6, 0xb6);
+/// The gap between those two lines (`gap: 3px`).
+pub const BAR_LINE_GAP: f32 = 3.0;
+
+/// A shortcut chip's height (`height: 28px`).
+pub const CHIP_HEIGHT: f32 = 28.0;
+/// Its horizontal padding (`padding: 0 11px`).
+pub const CHIP_PAD_X: f32 = 11.0;
+/// Its corner radius (`border-radius: 7px`).
+pub const CHIP_RADIUS: u8 = 7;
+/// The gap inside a chip, and between the two of them (`gap: 8px` in both
+/// places).
+pub const CHIP_GAP: f32 = 8.0;
+/// A chip's label (`font-size: 12px; font-weight: 600; color: #f7f6f5`).
+pub const CHIP_TEXT_PX: f32 = 12.0;
+/// The key beside it (`font-size: 10px; color: #9b9797`, monospace).
+pub const CHIP_KEY_PX: f32 = 10.0;
 
 // ---------------------------------------------------------------------------
 // The geometry that is this module's own
@@ -208,15 +317,15 @@ pub fn to_screen(origin: (i32, i32), points_per_pixel: f32, at: (f32, f32)) -> (
 // The label decision
 // ---------------------------------------------------------------------------
 
-/// The badge over the selection, or `None` for "keep showing the
-/// instruction".
+/// The badge above the selection, or `None` for "no badge this frame".
 ///
 /// **`None` and not a second sentence.** 6b shows the badge only once a code
 /// is found; while the overlay is still searching it shows nothing extra,
 /// because a "searching..." that appears on every drag would be on screen
 /// almost all the time and would say nothing the user cannot already see. The
 /// absence of the badge *is* the not-found state, and that is the whole
-/// decision this function makes.
+/// decision this function makes -- the instruction it used to displace is now
+/// in the bottom bar, where 6b keeps it whatever the drag is doing.
 pub fn lockon_badge(found: bool) -> Option<&'static str> {
     if found {
         Some(LOCKED_ON)
@@ -556,6 +665,16 @@ impl RegionOverlay {
         // released, because a decode must not be run while holding it.
         let candidate = {
             let mut held = locked(&self.inner);
+            // **An overlay that has answered captures nothing more.** The
+            // released drag is still recorded in `drag` -- deliberately, so
+            // the outcome and the rectangle it came from stay consistent --
+            // which means every later call would take the release arm again
+            // and re-capture the same region. See the guard at the top of the
+            // viewport callback for what that cost when the window kept
+            // repainting after the release.
+            if !held.open {
+                return;
+            }
             let Some(at) = pointer else {
                 return;
             };
@@ -649,6 +768,36 @@ impl RegionOverlay {
                 .with_taskbar(false)
                 .with_transparent(true),
             move |root, _class| {
+                // **The overlay is over the moment an outcome is recorded, and
+                // from then on this callback must do nothing at all.**
+                //
+                // Only the *parent* viewport can take this window down: it
+                // stops re-registering the deferred viewport once `show`
+                // answers `false`. Until the parent runs a frame and does
+                // that, egui keeps repainting this one -- and `show` asks it
+                // to, once per frame, so that a lock-on cannot go stale under
+                // a pointer held still. Without this guard those repaints ran
+                // the whole callback again on a drag that had already been
+                // released: `advance` found the same released drag every
+                // frame and captured and decoded the same rectangle over and
+                // over on the UI thread, with no exit. **That is the hang.** A
+                // plain click was enough to reach it -- press and release with
+                // no movement is a released drag like any other -- and Escape
+                // could not get out of it, because `finish` is deliberately a
+                // no-op once an outcome exists.
+                //
+                // The repaint request is the other half of the fix, and it is
+                // aimed at the ROOT viewport rather than at this one. The root
+                // is the only thing that can close this window, and nothing
+                // else is going to wake it: an always-on-top window covering
+                // every monitor means the vault window sees no input of its
+                // own, so it can sit idle indefinitely with a finished overlay
+                // still on screen in front of it.
+                if !mine.is_open() {
+                    root.request_repaint_of(egui::ViewportId::ROOT);
+                    return;
+                }
+
                 let first_frame = {
                     let mut held = locked(&mine.inner);
                     let first = !held.raised;
@@ -675,9 +824,7 @@ impl RegionOverlay {
                     || root.input(|i| i.viewport().close_requested())
                 {
                     mine.finish(Outcome::Cancelled);
-                    return;
-                }
-                if root.input(|i| i.key_pressed(egui::Key::A)) {
+                } else if root.input(|i| i.key_pressed(egui::Key::A)) {
                     let rect = whole_screen(&screen_capture::monitor_bounds());
                     match rect {
                         Some(rect) => {
@@ -685,9 +832,21 @@ impl RegionOverlay {
                         }
                         None => mine.finish(Outcome::Refused(CaptureRefusal::OffScreen)),
                     }
+                } else {
+                    mine.advance(&RegionSeams::production(), pointer, down, Instant::now());
+                }
+
+                // Whichever of the three above ended the overlay, this is the
+                // one place that wakes the root so it can close the window.
+                // Nothing is painted on the frame that ends it: the dim
+                // vanishing the instant the button comes up is the honest
+                // picture of what happened, and one more painted frame of a
+                // surface that has already answered is a surface the user can
+                // still try to drag on.
+                if !mine.is_open() {
+                    root.request_repaint_of(egui::ViewportId::ROOT);
                     return;
                 }
-                mine.advance(&RegionSeams::production(), pointer, down, Instant::now());
 
                 let view = mine.view();
                 egui::CentralPanel::default()
@@ -702,11 +861,18 @@ impl RegionOverlay {
 /// **Paints 6b.** Pure in the sense that matters here: everything it decides
 /// comes out of `view`, so what it draws for a given state is the same every
 /// time. It is not unit-tested beyond that -- painting is checked by looking
-/// at it, and `RegionView` is what the tests below pin instead.
+/// at it, and `RegionView`, the placement helpers below and the constants
+/// above are what the tests pin instead.
+///
+/// **Painting order is the design's DOM order and is load-bearing.** 6b
+/// stacks the dim, then the selection and its furniture, then the bottom bar
+/// last -- so a selection dragged down over the bar is covered by it rather
+/// than punching a lit hole through the one part of this surface that has to
+/// stay readable.
 pub fn draw(ui: &mut egui::Ui, view: &RegionView) {
     let full = ui.max_rect();
-    let painter = ui.painter();
-    let dim = egui::Color32::from_black_alpha(DIM_ALPHA);
+    let painter = ui.painter().clone();
+    let dim = egui::Color32::from_rgba_unmultiplied(0x20, 0x1e, 0x1d, DIM_ALPHA);
 
     match view.selection {
         // Nothing selected yet: the whole desktop dims.
@@ -728,72 +894,298 @@ pub fn draw(ui: &mut egui::Ui, view: &RegionView) {
                     painter.rect_filled(band, 0.0, dim);
                 }
             }
-            painter.rect_stroke(
-                sel,
-                0.0,
-                egui::Stroke::new(1.0, theme::CARD),
-                egui::StrokeKind::Outside,
-            );
+            paint_selection_edge(&painter, sel);
+            if let Some((w, h)) = view.size {
+                paint_size_readout(&painter, sel, w, h);
+            }
+            if lockon_badge(view.found).is_some() {
+                paint_lockon_badge(&painter, full, sel);
+            }
         }
     }
 
-    let centre = view
-        .selection
-        .map(|sel| sel.center())
-        .unwrap_or_else(|| full.center());
+    paint_bar(&painter, full);
+}
 
-    // The badge, or the instruction. See `lockon_badge` for why there is no
-    // third "searching" state.
-    match lockon_badge(view.found) {
-        Some(badge) => {
-            painter.text(
-                centre,
-                egui::Align2::CENTER_CENTER,
-                badge,
-                egui::FontId::proportional(12.0),
-                theme::CARD,
-            );
-        }
-        None => {
-            painter.text(
-                egui::pos2(full.center().x, full.top() + 64.0),
-                egui::Align2::CENTER_CENTER,
-                DRAG_TITLE,
-                egui::FontId::proportional(18.0),
-                theme::CARD,
-            );
-            painter.text(
-                egui::pos2(full.center().x, full.top() + 90.0),
-                egui::Align2::CENTER_CENTER,
-                DRAG_HINT,
-                egui::FontId::proportional(12.0),
-                theme::TOGGLE_OFF,
-            );
-        }
-    }
-
-    if let Some((w, h)) = view.size {
-        painter.text(
-            egui::pos2(centre.x, centre.y + 20.0),
-            egui::Align2::CENTER_CENTER,
-            size_label(&ScreenRect {
-                left: 0,
-                top: 0,
-                right: w as i32,
-                bottom: h as i32,
-            }),
-            egui::FontId::monospace(11.0),
-            theme::TOGGLE_OFF,
-        );
-    }
-
-    painter.text(
-        full.right_bottom() + egui::vec2(-24.0, -24.0),
-        egui::Align2::RIGHT_BOTTOM,
-        format!("{WHOLE_SCREEN_HINT}   A\n{CANCEL_HINT}   ESC"),
-        egui::FontId::proportional(11.0),
-        theme::TOGGLE_OFF,
+/// The two rings 6b draws around the selection, plus its four corner
+/// brackets.
+///
+/// Both rings are painted **outside** the lit rectangle -- `box-shadow` in the
+/// design, which is drawn beyond the border box -- so neither of them covers a
+/// pixel the user framed. That is not only fidelity: the rectangle the ring
+/// encloses is the rectangle that gets captured, and a ring painted over the
+/// selection's own edge would hide the two rows of quiet zone that decide
+/// whether the code reads.
+fn paint_selection_edge(painter: &egui::Painter, sel: egui::Rect) {
+    // The soft ring first, then the solid one over its inner edge:
+    // `0 0 0 8px rgba(27, 63, 160, 0.28)` occupies the two to eight point
+    // band, so a six-point stroke centred five points out is exactly it.
+    let halo = egui::Color32::from_rgba_unmultiplied(0x1b, 0x3f, 0xa0, HALO_ALPHA);
+    painter.rect_stroke(
+        sel.expand(SELECTION_RING + SELECTION_HALO / 2.0),
+        0.0,
+        egui::Stroke::new(SELECTION_HALO, halo),
+        egui::StrokeKind::Middle,
     );
+    painter.rect_stroke(
+        sel,
+        0.0,
+        egui::Stroke::new(SELECTION_RING, theme::BLUE),
+        egui::StrokeKind::Outside,
+    );
+
+    // The brackets sit at `left/top: -2px` from the selection, which is the
+    // outer edge of the solid ring, and each is an L of two filled arms rather
+    // than two strokes: a stroke would need its own half-width offsets to land
+    // on the same pixels the design's borders do.
+    let outer = sel.expand(SELECTION_RING);
+    let arm = egui::vec2(CORNER_ARM, CORNER_THICK);
+    let post = egui::vec2(CORNER_THICK, CORNER_ARM);
+    for (corner, towards) in [
+        (outer.left_top(), egui::vec2(1.0, 1.0)),
+        (outer.right_top(), egui::vec2(-1.0, 1.0)),
+        (outer.left_bottom(), egui::vec2(1.0, -1.0)),
+        (outer.right_bottom(), egui::vec2(-1.0, -1.0)),
+    ] {
+        for reach in [arm, post] {
+            let away = egui::vec2(reach.x * towards.x, reach.y * towards.y);
+            painter.rect_filled(
+                egui::Rect::from_two_pos(corner, corner + away),
+                0.0,
+                theme::BLUE,
+            );
+        }
+    }
+}
+
+/// Where 6b puts the lock-on badge: `left: 0; top: -34px` relative to the
+/// selection, at `height: 26px`.
+///
+/// **Clamped into `full`, which the design has no need to say.** 6b draws one
+/// selection in the middle of a mock desktop; a real drag can start two points
+/// from the top of the screen, and a badge honestly placed 34 points above
+/// that is a badge nobody sees -- on the one screen whose whole point is
+/// telling the user, before they let go, that the code was found. So the
+/// design's offset is the *preferred* position and this is what happens when
+/// it does not fit.
+pub fn badge_rect(full: egui::Rect, selection: egui::Rect, width: f32) -> egui::Rect {
+    let wanted = egui::Rect::from_min_size(
+        egui::pos2(selection.left(), selection.top() - BADGE_OFFSET),
+        egui::vec2(width, BADGE_HEIGHT),
+    );
+    let x = wanted.left().clamp(full.left(), (full.right() - width).max(full.left()));
+    let y = wanted
+        .top()
+        .clamp(full.top(), (full.bottom() - BADGE_HEIGHT).max(full.top()));
+    egui::Rect::from_min_size(egui::pos2(x, y), wanted.size())
+}
+
+/// Where 6b puts the size readout: `right: 6px; bottom: 6px`, **inside** the
+/// selection, so the number never sits on the desktop the user is reading
+/// around it.
+pub fn size_readout_rect(selection: egui::Rect, size: egui::Vec2) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            selection.right() - SIZE_INSET - size.x,
+            selection.bottom() - SIZE_INSET - size.y,
+        ),
+        size,
+    )
+}
+
+/// 6b's bar: `left: 0; right: 0; bottom: 0`, so it is the full width of the
+/// surface and flush with its bottom edge. The height is the taller of its two
+/// contents plus `padding: 14px 18px` top and bottom -- the design's own
+/// `align-items: center` on a flex row, rather than a number copied off a
+/// rendered screenshot.
+pub fn bar_rect(full: egui::Rect, content_height: f32) -> egui::Rect {
+    let height = BAR_PAD_Y * 2.0 + content_height.max(CHIP_HEIGHT);
+    egui::Rect::from_min_max(
+        egui::pos2(full.left(), (full.bottom() - height).max(full.top())),
+        full.right_bottom(),
+    )
+}
+
+/// The `M20 6 9 17l-5-5` of 6b's badge, drawn into `box` from the svg's own
+/// 24-unit viewBox so the shape scales with the badge rather than with a
+/// second set of hand-converted coordinates.
+fn paint_tick(painter: &egui::Painter, at: egui::Rect, colour: egui::Color32, svg_stroke: f32) {
+    let scale = at.width() / 24.0;
+    let point = |x: f32, y: f32| at.min + egui::vec2(x * scale, y * scale);
+    let stroke = egui::Stroke::new(svg_stroke * scale, colour);
+    painter.line_segment([point(20.0, 6.0), point(9.0, 17.0)], stroke);
+    painter.line_segment([point(9.0, 17.0), point(4.0, 12.0)], stroke);
+}
+
+/// 6b's lock-on badge: a blue pill above the selection's top-left carrying a
+/// tick and [`LOCKED_ON`].
+fn paint_lockon_badge(painter: &egui::Painter, full: egui::Rect, sel: egui::Rect) {
+    let Some(words) = lockon_badge(true) else {
+        return;
+    };
+    let galley = painter.layout_no_wrap(
+        words.to_owned(),
+        egui::FontId::new(BADGE_TEXT_PX, egui::FontFamily::Name(theme::BOLD.into())),
+        theme::CARD,
+    );
+    let width = BADGE_PAD_X * 2.0 + BADGE_TICK + BADGE_GAP + galley.size().x;
+    let rect = badge_rect(full, sel, width);
+    painter.rect_filled(rect, egui::CornerRadius::same(BADGE_RADIUS), theme::BLUE);
+
+    let tick = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + BADGE_PAD_X, rect.center().y - BADGE_TICK / 2.0),
+        egui::Vec2::splat(BADGE_TICK),
+    );
+    paint_tick(painter, tick, theme::CARD, BADGE_TICK_STROKE);
+    let text_height = galley.size().y;
+    painter.galley(
+        egui::pos2(tick.right() + BADGE_GAP, rect.center().y - text_height / 2.0),
+        galley,
+        theme::CARD,
+    );
+}
+
+/// 6b's `250 × 250` plate, tucked into the selection's bottom-right corner.
+fn paint_size_readout(painter: &egui::Painter, sel: egui::Rect, width: u32, height: u32) {
+    let words = size_label(&ScreenRect {
+        left: 0,
+        top: 0,
+        right: width as i32,
+        bottom: height as i32,
+    });
+    let ink = theme::WINDOW_BG;
+    let galley = painter.layout_no_wrap(words, egui::FontId::monospace(SIZE_TEXT_PX), ink);
+    let plate = size_readout_rect(
+        sel,
+        galley.size() + egui::vec2(SIZE_PAD_X * 2.0, SIZE_PAD_Y * 2.0),
+    );
+    painter.rect_filled(
+        plate,
+        egui::CornerRadius::same(SIZE_RADIUS),
+        egui::Color32::from_rgba_unmultiplied(0x20, 0x1e, 0x1d, SIZE_BG_ALPHA),
+    );
+    painter.galley(
+        plate.min + egui::vec2(SIZE_PAD_X, SIZE_PAD_Y),
+        galley,
+        ink,
+    );
+}
+
+/// One shortcut chip: a bordered pill carrying a label and, in the design's
+/// monospace, the key that does the same thing. Returns its width, so the pair
+/// can be right-aligned as a group before either is drawn.
+fn chip_width(painter: &egui::Painter, label: &str, key: &str) -> f32 {
+    let label_width = painter
+        .layout_no_wrap(
+            label.to_owned(),
+            egui::FontId::new(CHIP_TEXT_PX, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+            theme::WINDOW_BG,
+        )
+        .size()
+        .x;
+    let key_width = painter
+        .layout_no_wrap(key.to_owned(), egui::FontId::monospace(CHIP_KEY_PX), theme::TEXT_GHOST)
+        .size()
+        .x;
+    CHIP_PAD_X * 2.0 + label_width + CHIP_GAP + key_width
+}
+
+/// Draws the chip [`chip_width`] measured, with its left edge at `left`.
+fn paint_chip(painter: &egui::Painter, left: f32, middle: f32, label: &str, key: &str) -> f32 {
+    let width = chip_width(painter, label, key);
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(left, middle - CHIP_HEIGHT / 2.0),
+        egui::vec2(width, CHIP_HEIGHT),
+    );
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(CHIP_RADIUS),
+        egui::Stroke::new(1.0, theme::TEXT_MUTED),
+        egui::StrokeKind::Inside,
+    );
+    let label_galley = painter.layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::new(CHIP_TEXT_PX, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+        theme::WINDOW_BG,
+    );
+    let label_size = label_galley.size();
+    painter.galley(
+        egui::pos2(rect.left() + CHIP_PAD_X, middle - label_size.y / 2.0),
+        label_galley,
+        theme::WINDOW_BG,
+    );
+    let key_galley = painter.layout_no_wrap(
+        key.to_owned(),
+        egui::FontId::monospace(CHIP_KEY_PX),
+        theme::TEXT_GHOST,
+    );
+    let key_size = key_galley.size();
+    painter.galley(
+        egui::pos2(
+            rect.left() + CHIP_PAD_X + label_size.x + CHIP_GAP,
+            middle - key_size.y / 2.0,
+        ),
+        key_galley,
+        theme::TEXT_GHOST,
+    );
+    width
+}
+
+/// **6b's bottom bar**: the instruction, the sentence that says nothing has
+/// been saved, and the two shortcut chips.
+///
+/// Drawn on every frame and in every state -- see [`DRAG_TITLE`]. It is also
+/// the only place on this surface that names Escape, so a user who opened the
+/// overlay by accident always has the way out in front of them.
+fn paint_bar(painter: &egui::Painter, full: egui::Rect) {
+    let title = painter.layout_no_wrap(
+        DRAG_TITLE.to_owned(),
+        egui::FontId::new(BAR_TITLE_PX, egui::FontFamily::Name(theme::BOLD.into())),
+        theme::CARD,
+    );
+    let hint = painter.layout_no_wrap(
+        DRAG_HINT.to_owned(),
+        egui::FontId::proportional(BAR_HINT_PX),
+        BAR_HINT_INK,
+    );
+    let (title_size, hint_size) = (title.size(), hint.size());
+    let bar = bar_rect(full, title_size.y + BAR_LINE_GAP + hint_size.y);
+
+    painter.rect_filled(
+        bar,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0x20, 0x1e, 0x1d, BAR_BG_ALPHA),
+    );
+    painter.line_segment(
+        [bar.left_top(), bar.right_top()],
+        egui::Stroke::new(1.0, BAR_EDGE),
+    );
+
+    let block = title_size.y + BAR_LINE_GAP + hint_size.y;
+    let top = bar.center().y - block / 2.0;
+    painter.galley(egui::pos2(bar.left() + BAR_PAD_X, top), title, theme::CARD);
+    painter.galley(
+        egui::pos2(bar.left() + BAR_PAD_X, top + title_size.y + BAR_LINE_GAP),
+        hint,
+        BAR_HINT_INK,
+    );
+
+    // The pair is right-aligned as a group, in the design's order: whole
+    // screen first, cancel last and therefore nearest the corner the pointer
+    // travels to.
+    let chips = [
+        (WHOLE_SCREEN_HINT, WHOLE_SCREEN_KEY),
+        (CANCEL_HINT, CANCEL_KEY),
+    ];
+    let total: f32 = chips
+        .iter()
+        .map(|(label, key)| chip_width(painter, label, key))
+        .sum::<f32>()
+        + CHIP_GAP * (chips.len() as f32 - 1.0);
+    let mut left = bar.right() - BAR_PAD_X - total;
+    for (label, key) in chips {
+        left += paint_chip(painter, left, bar.center().y, label, key) + CHIP_GAP;
+    }
 }
 
 /// **Asks Windows to leave this window out of screen captures.**
@@ -849,6 +1241,12 @@ mod tests {
             right,
             bottom,
         }
+    }
+
+    /// The same in the space the painter works in: egui points inside the
+    /// viewport, which is what every placement helper takes and returns.
+    fn rect_pts(left: f32, top: f32, right: f32, bottom: f32) -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
     }
 
     /// A capture seam that hands back a buffer of one colour, so the decode
@@ -1306,5 +1704,224 @@ mod tests {
         assert_ne!(REGION_TITLE, crate::vault_window::rehearsal::SCRATCH_TITLE);
         assert_ne!(REGION_TITLE, crate::preflight_card::PREFLIGHT_CARD_TITLE);
         assert!(!REGION_TITLE.is_empty());
+    }
+
+    // -- the paint, pinned where it is a number and not a picture -----------
+
+    /// **Every measurement `draw` uses is design 6b's, quoted here with the
+    /// CSS it came from.**
+    ///
+    /// Painting itself is checked by looking at it; what a test can hold is
+    /// that nobody has quietly rounded one of these to a nicer number. Each
+    /// assertion below is the declaration in `Deskwarden.dc.html` under
+    /// `id="6b"`, in the order the surface stacks.
+    #[test]
+    fn the_overlays_numbers_are_the_designs_own() {
+        // `background: #201e1d` with the desktop over it at `opacity: 0.32`,
+        // which is this ink at 68%: 0.68 * 255 = 173.4.
+        assert_eq!(DIM_ALPHA, 173);
+
+        // `box-shadow: 0 0 0 2px #1b3fa0, 0 0 0 8px rgba(27, 63, 160, 0.28)`
+        // -- so two points solid and six more soft, at 0.28 * 255 = 71.4.
+        assert_eq!(SELECTION_RING, 2.0);
+        assert_eq!(SELECTION_HALO, 6.0);
+        assert_eq!(HALO_ALPHA, 71);
+        assert_eq!(SELECTION_RING + SELECTION_HALO, 8.0, "the halo no longer ends at 8px");
+
+        // `width: 14px; height: 14px; border-left: 3px solid #1b3fa0`.
+        assert_eq!((CORNER_ARM, CORNER_THICK), (14.0, 3.0));
+
+        // `height: 26px; padding: 0 10px; border-radius: 6px; gap: 8px`, a
+        // `13`-pixel tick at `stroke-width="2.8"`, `font-size: 12px`, and
+        // `top: -34px`.
+        assert_eq!(BADGE_HEIGHT, 26.0);
+        assert_eq!(BADGE_PAD_X, 10.0);
+        assert_eq!(BADGE_RADIUS, 6);
+        assert_eq!(BADGE_GAP, 8.0);
+        assert_eq!((BADGE_TICK, BADGE_TICK_STROKE), (13.0, 2.8));
+        assert_eq!(BADGE_TEXT_PX, 12.0);
+        assert_eq!(BADGE_OFFSET, 34.0);
+        assert!(
+            BADGE_OFFSET > BADGE_HEIGHT,
+            "the badge would overlap the selection it is announcing"
+        );
+
+        // `right: 6px; bottom: 6px; padding: 3px 7px; border-radius: 5px;
+        // font-size: 11px`, on `rgba(32, 30, 29, 0.86)` -- 0.86 * 255 = 219.3.
+        assert_eq!(SIZE_INSET, 6.0);
+        assert_eq!((SIZE_PAD_X, SIZE_PAD_Y), (7.0, 3.0));
+        assert_eq!(SIZE_RADIUS, 5);
+        assert_eq!(SIZE_TEXT_PX, 11.0);
+        assert_eq!(SIZE_BG_ALPHA, 219);
+
+        // `padding: 14px 18px`, `rgba(32, 30, 29, 0.92)` -- 0.92 * 255 = 234.6
+        // -- `border-top: 1px solid #3a3736`, `13px/700` over `12px #bab6b6`
+        // at `gap: 3px`.
+        assert_eq!((BAR_PAD_X, BAR_PAD_Y), (18.0, 14.0));
+        assert_eq!(BAR_BG_ALPHA, 235);
+        assert_eq!(BAR_EDGE, egui::Color32::from_rgb(0x3a, 0x37, 0x36));
+        assert_eq!((BAR_TITLE_PX, BAR_HINT_PX), (13.0, 12.0));
+        assert_eq!(BAR_HINT_INK, egui::Color32::from_rgb(0xba, 0xb6, 0xb6));
+        assert_eq!(BAR_LINE_GAP, 3.0);
+
+        // `height: 28px; padding: 0 11px; border-radius: 7px; gap: 8px`, with
+        // a `12px/600` label and a `10px` monospace key.
+        assert_eq!(CHIP_HEIGHT, 28.0);
+        assert_eq!(CHIP_PAD_X, 11.0);
+        assert_eq!(CHIP_RADIUS, 7);
+        assert_eq!(CHIP_GAP, 8.0);
+        assert_eq!((CHIP_TEXT_PX, CHIP_KEY_PX), (12.0, 10.0));
+
+        // The bar is never shorter than the chips it carries, which is what
+        // `align-items: center` on the design's flex row means.
+        assert_eq!(bar_rect(rect_pts(0.0, 0.0, 800.0, 600.0), 0.0).height(), 56.0);
+    }
+
+    /// **The chips say the keys the callback really matches on.** A chip
+    /// promising `A` beside a handler watching some other key is the class of
+    /// lie `ADD_TOTP_SHORTCUT` is pinned against elsewhere in this crate.
+    #[test]
+    fn the_shortcut_chips_name_the_keys_that_work() {
+        assert_eq!(WHOLE_SCREEN_HINT, "Whole screen");
+        assert_eq!(WHOLE_SCREEN_KEY, "A");
+        assert_eq!(CANCEL_HINT, "Cancel");
+        assert_eq!(CANCEL_KEY, "ESC");
+
+        // And the callback really watches those two, which is only assertable
+        // from here by source -- the closure is inside a viewport builder no
+        // harness in this crate can call.
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        assert!(code.contains("i.key_pressed(egui::Key::Escape)"));
+        assert!(code.contains("i.key_pressed(egui::Key::A)"));
+    }
+
+    /// The badge sits at the selection's **top-left**, one `BADGE_OFFSET`
+    /// above it -- and is pulled back onto the screen when the drag started
+    /// too near an edge for the design's placement to be visible at all.
+    #[test]
+    fn the_badge_is_above_the_selections_top_left_and_never_off_screen() {
+        let full = rect_pts(0.0, 0.0, 1920.0, 1080.0);
+        let sel = rect_pts(300.0, 400.0, 550.0, 650.0);
+        let placed = badge_rect(full, sel, 180.0);
+        assert_eq!(placed.min, egui::pos2(300.0, 400.0 - BADGE_OFFSET));
+        assert_eq!(placed.size(), egui::vec2(180.0, BADGE_HEIGHT));
+        assert!(
+            placed.bottom() < sel.top(),
+            "the badge overlapped the selection it announces"
+        );
+
+        // A drag begun two points from the top: the design's -34 is off the
+        // screen, so the badge lands on it instead.
+        let high = badge_rect(full, rect_pts(10.0, 2.0, 260.0, 252.0), 180.0);
+        assert_eq!(high.top(), 0.0);
+        // And one begun near the right edge is pulled left far enough to fit.
+        let wide = badge_rect(full, rect_pts(1900.0, 500.0, 1910.0, 560.0), 180.0);
+        assert_eq!(wide.right(), 1920.0);
+        assert_eq!(wide.left(), 1740.0);
+    }
+
+    /// The readout is `right: 6px; bottom: 6px` **inside** the selection, so
+    /// the number sits on the region being framed rather than on the dim
+    /// beside it.
+    #[test]
+    fn the_size_readout_is_tucked_into_the_selections_bottom_right() {
+        let sel = rect_pts(100.0, 100.0, 400.0, 400.0);
+        let plate = size_readout_rect(sel, egui::vec2(60.0, 18.0));
+        assert_eq!(plate.max, egui::pos2(400.0 - SIZE_INSET, 400.0 - SIZE_INSET));
+        assert_eq!(plate.size(), egui::vec2(60.0, 18.0));
+        assert!(sel.contains_rect(plate), "the readout hung outside the selection");
+    }
+
+    /// The bar spans the whole surface and is flush with its bottom edge --
+    /// `left: 0; right: 0; bottom: 0` -- and grows with the type it carries
+    /// rather than being a height copied off a screenshot.
+    #[test]
+    fn the_bar_spans_the_bottom_of_the_surface() {
+        let full = rect_pts(0.0, 0.0, 1920.0, 1080.0);
+        let bar = bar_rect(full, 40.0);
+        assert_eq!(bar.left(), full.left());
+        assert_eq!(bar.right(), full.right());
+        assert_eq!(bar.bottom(), full.bottom());
+        assert_eq!(bar.height(), 40.0 + BAR_PAD_Y * 2.0);
+        // Two lines of type shorter than a chip still leave the chips room:
+        // the taller of the two decides, which is the flex row's own rule.
+        assert_eq!(bar_rect(full, 10.0).height(), CHIP_HEIGHT + BAR_PAD_Y * 2.0);
+    }
+
+    /// **The hang, pinned.**
+    ///
+    /// A released drag stays recorded, so every later `advance` used to take
+    /// the release arm again and capture the same rectangle -- and the
+    /// viewport kept repainting after the release, so "every later" meant
+    /// forever, on the UI thread, with Escape unable to break out because the
+    /// outcome was already set. A plain click on the overlay was enough: press
+    /// and release without moving is a released drag like any other.
+    ///
+    /// The capture seam here panics, so a single re-capture fails the test
+    /// rather than merely being slow.
+    #[test]
+    fn an_overlay_that_has_answered_never_captures_again() {
+        fn never_called(_: ScreenRect) -> Result<Rgba, CaptureRefusal> {
+            panic!("a finished overlay captured pixels again");
+        }
+        let overlay = RegionOverlay::open(&[rect(0, 0, 1920, 1080)], 1.0).expect("opens");
+        let t0 = Instant::now();
+        // A click: down, then up in the same place. It really does reach the
+        // release arm and really does try to read the degenerate rectangle it
+        // made -- which `screen_capture` refuses as `TooSmall` -- and that is
+        // the control that makes the panicking seam below meaningful.
+        overlay.advance(&seams(flat_capture, no_code), Some((40.0, 40.0)), true, t0);
+        overlay.advance(
+            &seams(flat_capture, no_code),
+            Some((40.0, 40.0)),
+            false,
+            t0 + DECODE_INTERVAL,
+        );
+        assert!(!overlay.is_open(), "the release did not end the overlay");
+
+        // Every frame the window paints between the release and the parent
+        // taking it down. None of them may capture anything.
+        for frame in 1..=10 {
+            overlay.advance(
+                &seams(never_called, no_code),
+                Some((40.0, 40.0)),
+                false,
+                t0 + DECODE_INTERVAL * (1 + frame),
+            );
+        }
+        // Nor may a button pressed again on a surface that has answered start
+        // a fresh drag on it.
+        overlay.advance(
+            &seams(never_called, no_code),
+            Some((900.0, 900.0)),
+            true,
+            t0 + DECODE_INTERVAL * 20,
+        );
+        // The one answer it did record survived all of that, unchanged.
+        assert!(matches!(overlay.take_outcome(), Some(Outcome::Refused(_))));
+    }
+
+    /// The other half of the same fix: the viewport callback returns before it
+    /// does anything at all once the outcome is in, and asks the **root**
+    /// viewport to repaint so that the parent can close this window. Nothing
+    /// else wakes the parent -- an always-on-top window over every monitor
+    /// means the vault window sees no input of its own -- so a missing request
+    /// leaves a finished overlay on screen indefinitely.
+    #[test]
+    fn the_callback_wakes_the_root_viewport_when_it_is_finished() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        assert_eq!(
+            code.matches("root.request_repaint_of(egui::ViewportId::ROOT);").count(),
+            2,
+            "the callback no longer wakes the root on both the guard and the finishing frame"
+        );
+        assert!(
+            code.contains("if !mine.is_open() {"),
+            "the callback no longer guards on a finished overlay"
+        );
     }
 }
