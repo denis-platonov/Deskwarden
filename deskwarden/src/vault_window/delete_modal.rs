@@ -398,7 +398,17 @@ mod tests {
             let found: Vec<egui::Rect> = self
                 .rects
                 .iter()
-                .filter(|r| r.fill == fill && (r.rect.width() - CARD_WIDTH).abs() < 0.5)
+                // **`CARD_WIDTH` plus the border on each side.** The bands are
+                // painted out over the card's border rather than stopping
+                // inside it, so that none of the card's own fill shows past
+                // them -- see `theme::MODAL_BAND_BLEED`, which is the fix for
+                // "there is some white line along the curve".
+                .filter(|r| {
+                    r.fill == fill
+                        && (r.rect.width() - (CARD_WIDTH + 2.0 * theme::MODAL_BAND_BLEED))
+                            .abs()
+                            < 0.5
+                })
                 .map(|r| r.rect)
                 .collect();
             assert_eq!(
@@ -584,7 +594,11 @@ mod tests {
 
             let band = painted.band(theme::ERROR);
             assert!(
-                (band.height() - theme::MODAL_HEADER_HEIGHT).abs() < 0.5,
+                // The band's own height plus the point it bleeds upward over
+                // the card's border -- see `theme::MODAL_BAND_BLEED`.
+                (band.height() - (theme::MODAL_HEADER_HEIGHT + theme::MODAL_BAND_BLEED))
+                    .abs()
+                    < 0.5,
                 "{kind:?}: the red band is {} tall, so it is not the header",
                 band.height()
             );

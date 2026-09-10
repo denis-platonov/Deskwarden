@@ -4321,25 +4321,35 @@ const MODAL_SCRIM_ALPHA: u8 = 90;
 /// read as one card rather than as three cards in a pile.
 const MODAL_RADIUS: u8 = 10;
 
-/// The card's border, and the reason [`MODAL_INNER_RADIUS`] is not
+/// The card's border, and the reason [`MODAL_BAND_BLEED`] is not
 /// [`MODAL_RADIUS`].
 const MODAL_STROKE: f32 = 1.0;
 
-/// The radius the two coloured bands round their outer corners by.
+/// How far a coloured band is painted PROUD of the rect it was allocated, so
+/// that it covers the card's own fill instead of stopping short of it.
 ///
-/// **One less than the card's, because they sit one point inside it.** Two
-/// rounded rectangles are only concentric when the inner one's radius is the
-/// outer one's minus the gap between them; give the inner rect the SAME
-/// radius and its arc turns tighter than the edge it is supposed to follow,
-/// so the card's own fill shows between the two along the curve and nowhere
-/// else.
+/// # The white line, measured
 ///
-/// It was invisible while the card's stroke was [`BORDER`] -- a white
-/// hairline between white and near-white -- and became a white line along
-/// the corner the moment the stroke took the accent. Reported against the
-/// delete confirmation, whose accent is [`ERROR`]: "there is some white line
-/// along the curve".
-const MODAL_INNER_RADIUS: u8 = MODAL_RADIUS - MODAL_STROKE as u8;
+/// `egui::Frame` paints its rectangle expanded by its stroke and strokes it
+/// down the middle, so with a 1pt border the card's fill runs to the rect's
+/// edge and the border covers only the outer HALF of that last point. A band
+/// laid out inside the frame stops one full point short. What is left is
+/// half a point of the card's fill, uncovered, all the way round.
+///
+/// It was invisible for as long as that fill was white behind a [`BORDER`]
+/// stroke -- white against near-white -- and became a white line the moment
+/// the stroke took the accent. Reported twice: once as "some white line along
+/// the curve", and again after a first fix that only made it uniform. That
+/// fix shrank the bands' corner radius so their arcs were concentric with the
+/// card's, which was true and was not the problem: concentric arcs one point
+/// apart still leave the gap, just evenly.
+///
+/// So the bands are painted OUT to the card's own rect, with the card's own
+/// radius, and the border is drawn over them. Nothing is left to show
+/// through, at a corner or anywhere else.
+/// `pub` because both modals' test harnesses find a band by its width, and
+/// that width is the card's plus this on each side.
+pub const MODAL_BAND_BLEED: f32 = MODAL_STROKE;
 
 /// The coloured header band's height.
 pub const MODAL_HEADER_HEIGHT: f32 = 40.0;
@@ -4580,8 +4590,14 @@ fn modal_header_band(ui: &mut Ui, card: &ModalCard<'_>) {
     // trick: one shape, and no second rectangle to keep in step with the
     // first when the radius moves.
     painter.rect_filled(
-        band,
-        CornerRadius { nw: MODAL_INNER_RADIUS, ne: MODAL_INNER_RADIUS, sw: 0, se: 0 },
+        // Out to the card's edge on the three sides that touch it, and left
+        // alone on the fourth: the body begins where this band's allocated
+        // rect ends, so bleeding downward would put the accent under it.
+        Rect::from_min_max(
+            Pos2::new(band.left() - MODAL_BAND_BLEED, band.top() - MODAL_BAND_BLEED),
+            Pos2::new(band.right() + MODAL_BAND_BLEED, band.bottom()),
+        ),
+        CornerRadius { nw: MODAL_RADIUS, ne: MODAL_RADIUS, sw: 0, se: 0 },
         card.accent,
     );
 
@@ -4752,14 +4768,14 @@ fn modal_footer_band(
     ui.painter().rect_filled(rule, CornerRadius::ZERO, HAIRLINE);
 
     let mut press = ModalPress::default();
-    egui::Frame::new()
-        .fill(CARD_TINT)
-        .corner_radius(CornerRadius {
-            nw: 0,
-            ne: 0,
-            sw: MODAL_INNER_RADIUS,
-            se: MODAL_INNER_RADIUS,
-        })
+    // **Painted behind, not by the `Frame`**, so the band can bleed out to
+    // the card's edge the way the header does -- see [`MODAL_BAND_BLEED`]. A
+    // `Frame`'s own fill is confined to the rect layout gives it, which is
+    // one point inside the card and is exactly what left a line showing. The
+    // reserved-index idiom is `Frame`'s own: claim a slot before the
+    // contents, fill it in once their rect is known.
+    let band = ui.painter().add(egui::Shape::Noop);
+    let laid_out = egui::Frame::new()
         .inner_margin(Margin::symmetric(MODAL_PAD_X, MODAL_FOOTER_PAD_Y))
         .show(ui, |ui| {
             let inner = ui.available_width();
@@ -4783,6 +4799,21 @@ fn modal_footer_band(
                 confirm,
             );
         });
+    // The band, now that its rect is known: out to the card's edge on the
+    // three sides it touches, and stopping at its own top where the hairline
+    // above it already separates it from the body.
+    let rect = laid_out.response.rect;
+    ui.painter().set(
+        band,
+        egui::epaint::RectShape::filled(
+            Rect::from_min_max(
+                Pos2::new(rect.left() - MODAL_BAND_BLEED, rect.top()),
+                Pos2::new(rect.right() + MODAL_BAND_BLEED, rect.bottom() + MODAL_BAND_BLEED),
+            ),
+            CornerRadius { nw: 0, ne: 0, sw: MODAL_RADIUS, se: MODAL_RADIUS },
+            CARD_TINT,
+        ),
+    );
     press
 }
 
@@ -8255,7 +8286,7 @@ mod modal_card_tests {
             let found: Vec<&RectShape> = self
                 .rects
                 .iter()
-                .filter(|r| r.fill == fill && (r.rect.width() - WIDTH).abs() < 0.5)
+                .filter(|r| r.fill == fill && (r.rect.width() - (WIDTH + 2.0)).abs() < 0.5)
                 .collect();
             assert_eq!(
                 found.len(),
@@ -8452,58 +8483,61 @@ mod modal_card_tests {
     /// footer only its bottom pair, and the card behind them carries the
     /// radius on all four. Get any of those wrong and the card reads as three
     /// cards in a pile.
-    /// **The bands' corners are concentric with the card's, so nothing shows
-    /// between them.**
+    /// **The bands cover the card's fill, edge to edge, so nothing shows past
+    /// them.**
     ///
-    /// Reported against the running build: "there is some white line along
-    /// the curve". Two rounded rectangles are only concentric when the inner
-    /// one's radius is the outer one's minus the gap; the bands sit one point
-    /// inside the card and were rounded by the card's own radius, so their
-    /// arcs turned tighter than the edge they follow and the card's white
-    /// fill showed through along the corner -- and only along the corner.
+    /// Reported twice. First as "there is some white line along the curve",
+    /// and again after a fix that only made it uniform.
     ///
-    /// It was invisible for as long as the stroke was `BORDER`, because a
-    /// white hairline between white and near-white is nothing to see. It
-    /// appeared the moment the stroke took the accent.
+    /// `egui::Frame` paints its rectangle expanded by its stroke and strokes
+    /// it down the middle, so with a 1pt border the card's fill runs to the
+    /// rect's edge and the border covers only the outer HALF of that last
+    /// point. A band laid out inside the frame stops a full point short, and
+    /// what was left was half a point of the card's fill, uncovered, all the
+    /// way round -- invisible while that fill was white behind a pale border,
+    /// and a white line the moment the border took the accent.
     ///
-    /// Asserted as the arithmetic rather than by sampling pixels: the seam is
-    /// sub-pixel and anti-aliased, so a colour probe at a corner reads a
-    /// blend either way and would pass against the bug. What is actually
-    /// wrong in that state is the radius, and this is that.
+    /// The first fix shrank the bands' radius so their arcs were concentric
+    /// with the card's. That was true and was not the problem: concentric
+    /// arcs one point apart still leave the gap, just evenly. The measurement
+    /// that settled it came off a real frame -- card fill at
+    /// `[279,274]-[621,426]`, band at `[280,275]-[620,315]`.
+    ///
+    /// Asserted as the bleed's arithmetic rather than by sampling pixels: the
+    /// gap is sub-pixel and anti-aliased, so a colour probe at a corner reads
+    /// a blend either way and would pass against the bug.
     #[test]
-    fn the_bands_round_their_corners_concentrically_with_the_card() {
+    fn the_bands_are_painted_out_to_the_cards_own_edge() {
         assert_eq!(
-            u8::from(MODAL_RADIUS) - MODAL_INNER_RADIUS,
-            MODAL_STROKE as u8,
-            "the bands' radius is not the card's minus the border between them, so their \
-             corners cut inside the card's and its fill shows along the curve"
+            MODAL_BAND_BLEED, MODAL_STROKE,
+            "the bands bleed by something other than the border they have to cover, so a              fraction of the card's fill is left showing past them"
         );
-        // Both directions, because equality alone is satisfied by a border of
-        // zero -- which would be a card with no outline at all, and the
-        // arithmetic would then be trivially true while saying nothing.
-        assert!(MODAL_STROKE > 0.0, "the card has no border for the bands to sit inside");
-        assert!(MODAL_INNER_RADIUS < MODAL_RADIUS);
+        // A bleed of zero is what the bug WAS, and it would satisfy an
+        // equality against a border of zero -- so the border is asserted to
+        // exist as well.
+        assert!(MODAL_STROKE > 0.0, "the card has no border for the bands to cover");
     }
 
-    /// **And the bands really are inset by exactly that border**, which is
-    /// what makes the radius above the right one.
+    /// **And the geometry the arithmetic describes**: the band really does
+    /// start at the card's own edge, not one border inside it.
     ///
-    /// The arithmetic is a claim about two numbers; this is the claim about
-    /// the geometry they describe. Without it the constants could agree with
-    /// each other while the bands were laid out somewhere else entirely.
+    /// The constant above is a claim about two numbers; without this they
+    /// could agree with each other while the band was painted somewhere else
+    /// entirely. This test asserted the opposite until the white line was
+    /// tracked down -- it required the inset that WAS the bug.
     #[test]
-    fn the_bands_sit_exactly_one_border_inside_the_card() {
+    fn the_bands_start_at_the_cards_own_edge() {
         let (_harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
         let card = drawn.painted.card();
         let header = drawn.painted.band(ERROR, "header band");
         assert!(
-            (header.rect.left() - (card.rect.left() + MODAL_STROKE)).abs() < 0.5,
-            "the header starts {} from the card's edge, not {MODAL_STROKE}",
+            (header.rect.left() - card.rect.left()).abs() < 0.5,
+            "the header starts {} from the card's edge, so the fill shows down its side",
             header.rect.left() - card.rect.left()
         );
         assert!(
-            (header.rect.top() - (card.rect.top() + MODAL_STROKE)).abs() < 0.5,
-            "the header starts {} below the card's top, not {MODAL_STROKE}",
+            (header.rect.top() - card.rect.top()).abs() < 0.5,
+            "the header starts {} below the card's top, so the fill shows above it",
             header.rect.top() - card.rect.top()
         );
     }
@@ -8523,44 +8557,46 @@ mod modal_card_tests {
             card.rect.width()
         );
 
-        // **`MODAL_INNER_RADIUS`, not `MODAL_RADIUS`.** These read the
-        // card's own radius until "there is some white line along the curve"
-        // was reported: the bands sit one point inside the card, so rounding
-        // them by the card's radius turns their arcs tighter than the edge
-        // they follow and the card's fill shows through at the corner. The
-        // rounded-ness of the INNER pair is what these assertions are about
-        // and is unchanged; only the number moved, and
-        // `the_bands_round_their_corners_concentrically_with_the_card` is
-        // what holds the two in step.
+        // The card's own radius, because the bands sit ON the card's rect now
+        // rather than inside it, and two rounded rectangles sharing an edge
+        // share a radius. A first attempt at the white line made these
+        // `MODAL_RADIUS - 1`, on the reasoning that arcs one point apart are
+        // concentric and so cannot cross. True, and not the problem: a gap
+        // that is even is still a gap.
         assert_eq!(
             header.corner_radius,
-            CornerRadius { nw: MODAL_INNER_RADIUS, ne: MODAL_INNER_RADIUS, sw: 0, se: 0 },
+            CornerRadius { nw: MODAL_RADIUS, ne: MODAL_RADIUS, sw: 0, se: 0 },
             "the header band's bottom corners are rounded, so the body begins under a curve"
         );
         assert_eq!(
             footer.corner_radius,
-            CornerRadius { nw: 0, ne: 0, sw: MODAL_INNER_RADIUS, se: MODAL_INNER_RADIUS },
+            CornerRadius { nw: 0, ne: 0, sw: MODAL_RADIUS, se: MODAL_RADIUS },
             "the footer band's top corners are rounded, so it reads as a card of its own"
         );
 
-        // Edge to edge inside the border ring, top band flush with the top of
-        // the card and bottom band flush with its bottom.
-        let inside = card.rect.shrink(1.0);
+        // **Out to the card's own edge, not inside its border ring.** They
+        // used to stop one point short, which left half a point of the card's
+        // fill showing past them once the border took the accent -- see
+        // `MODAL_BAND_BLEED`. They cover it now, and the border is drawn over
+        // them.
         for (band, name) in [(&header, "header"), (&footer, "footer")] {
             assert!(
-                (band.rect.width() - inside.width()).abs() < 0.5,
-                "the {name} band is {} wide against a card {} wide inside its border, so it \
-                 does not run edge to edge",
+                (band.rect.width() - card.rect.width()).abs() < 0.5,
+                "the {name} band is {} wide against a card {} wide, so the card's fill shows \
+                 past it",
                 band.rect.width(),
-                inside.width()
+                card.rect.width()
             );
         }
-        assert!((header.rect.top() - inside.top()).abs() < 0.5);
-        assert!((header.rect.height() - MODAL_HEADER_HEIGHT).abs() < 0.5);
         assert!(
-            (footer.rect.bottom() - inside.bottom()).abs() < 0.5,
+            (header.rect.top() - card.rect.top()).abs() < 0.5,
+            "the header starts {} below the card's top, so the fill shows above it",
+            header.rect.top() - card.rect.top()
+        );
+        assert!(
+            (footer.rect.bottom() - card.rect.bottom()).abs() < 0.5,
             "the footer stops {} short of the card's bottom edge",
-            inside.bottom() - footer.rect.bottom()
+            card.rect.bottom() - footer.rect.bottom()
         );
 
         // The body is the gap between them, and it is a real band rather than
@@ -8607,7 +8643,12 @@ mod modal_card_tests {
         let (_harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
         // The footer band's own edges, which are the card's inside edges --
         // the card's rect is the border ring around them.
-        let inside = drawn.painted.band(CARD_TINT, "footer band").rect;
+        // **The card's CONTENT edge, not the footer band's.** The band is
+        // painted out past it, over the border, so that nothing of the card's
+        // fill shows past it -- see `MODAL_BAND_BLEED`. The margins the
+        // answers are laid out against are the content's, which is the band's
+        // rect shrunk back by that same bleed.
+        let inside = drawn.painted.band(CARD_TINT, "footer band").rect.shrink(MODAL_BAND_BLEED);
         let dismiss = drawn.painted.outlined_answer();
         let confirm = drawn.confirm;
 
@@ -8835,7 +8876,12 @@ mod modal_card_tests {
             "the glyph-less header drew an outline or a dot anyway"
         );
         assert!(
-            (plain.painted.rect_of(TITLE).left() - (band.left() + f32::from(MODAL_PAD_X))).abs()
+            // From the band's CONTENT edge: it is painted out over the
+            // border (see `MODAL_BAND_BLEED`), and the title is laid out
+            // inside it.
+            (plain.painted.rect_of(TITLE).left()
+                - (band.left() + MODAL_BAND_BLEED + f32::from(MODAL_PAD_X)))
+            .abs()
                 < 1.0,
             "the title on a glyph-less header is indented as if a glyph were there"
         );
