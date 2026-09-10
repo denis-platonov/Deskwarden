@@ -4737,7 +4737,14 @@ const WARNING_DOT_DROP: f32 = 0.58;
 /// the path is the fix [`STAR_STROKE`]'s own history records for the same
 /// defect, and it carries the point count clear of the flap's three at the
 /// same time, so the constraint and the design agree here rather than trade.
-fn paint_warning_glyph(painter: &egui::Painter, rect: Rect, color: Color32) {
+///
+/// **Public for the caution bands that are not [`modal_card`]'s**, which is
+/// design 6c's -- a `#fef6e7` strip over the footer of the one-time-code
+/// card, drawn in `vault_window::totp_add` because that card is built there
+/// rather than out of the shared modal. `color` is the caller's for the same
+/// reason: this band strokes the sign in the design's `#8a5a06` on its own
+/// tint where the modal's header band strokes it white on [`ERROR`].
+pub fn paint_warning_glyph(painter: &egui::Painter, rect: Rect, color: Color32) {
     let stroke = Stroke::new(WARNING_STROKE, color);
     painter.add(egui::Shape::Path(egui::epaint::PathShape {
         points: warning_outline(rect),

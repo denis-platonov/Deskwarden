@@ -69,18 +69,35 @@ use crate::theme;
 use eframe::egui::{self, CornerRadius};
 use zeroize::Zeroizing;
 
-/// Height of every button on this form, matching `record_ui`'s.
-const BUTTON_HEIGHT: f32 = 26.0;
+// The 26px button height this form used to declare is gone with the two bare
+// `egui::Button`s it sized. 6d's footer answers are `theme`'s own -- see
+// `manual_footer` -- and `theme::BUTTON_HEIGHT` is 6d's declared 32.
 
 /// The card's width, matching the record composer's narrow column.
+///
+/// [`Stage::Scanning`]'s alone now. See [`stage_width`]: the by-hand form
+/// took this until the 6d design pass measured `#6d` at 470.
 const MODAL_WIDTH: f32 = 380.0;
 
 // ---------------------------------------------------------------------------
 // The copy
 // ---------------------------------------------------------------------------
 
-/// The heading over the whole surface.
-pub const HEADING: &str = "Add a TOTP";
+/// **The card's header band while the secret is being typed**, verbatim from
+/// design 6d's own (`Enter the secret`, set `font-size: 14px; font-weight:
+/// 700` over a `1px solid #eae7e7` rule).
+///
+/// **Not the "Add a TOTP" this used to say.** That phrase is
+/// [`ADD_TOTP_LABEL`] -- the name of the *control that opens this modal* --
+/// and a card headed with the name of the button that opened it says nothing
+/// about what the card is for. 6d's own header says what to do next, and the
+/// same band switches to 6c's [`CODE_READ_LABEL`] when a decoder has already
+/// done the typing.
+///
+/// `PICKER_TITLE`'s note applies here from the other side: "Manual entry &
+/// failures" is the design document's CAPTION for the `id="6d"` panel, in the
+/// badge-and-title row outside the card, and is not painted anywhere.
+pub const HEADING: &str = "Enter the secret";
 
 /// What the control that opens this form is CALLED, and the chord that also
 /// opens it.
@@ -104,7 +121,16 @@ pub const ADD_TOTP_LABEL: &str = "Add a TOTP";
 /// See [`ADD_TOTP_LABEL`].
 pub const ADD_TOTP_SHORTCUT: &str = "CTRL+SHIFT+2";
 
-/// The hint in the one field, verbatim from design 6d.
+/// **The caption over the one field**, verbatim from design 6d.
+///
+/// It is drawn where 6d draws it -- in a `div` above the box, at
+/// `SECRET_LABEL_PX` in [`theme::TEXT_MUTED`] -- and not as the
+/// `TextEdit::hint_text` it used to be. See `SECRET_BLOCK_GAP` on why the
+/// difference is not cosmetic: a placeholder is gone by the second character,
+/// and what this sentence says is that the box takes *either* form.
+///
+/// The name is kept because it is what every test in this file asks for the
+/// field by.
 pub const SECRET_HINT: &str = "Secret key or otpauth:// URI";
 
 /// **What replaces the field when the payload was scanned**, verbatim from
@@ -148,6 +174,13 @@ pub const SAVE_LABEL: &str = "Save code";
 /// A **different word** from [`SAVE_LABEL`] deliberately: the button that
 /// destroys something says so on its face, not only in the paragraph above it.
 pub const REPLACE_LABEL: &str = "Replace code";
+
+/// **What the footer says at its right-hand end**, verbatim from design 6c's
+/// footer row, and it is a promise about a key that really answers:
+/// [`draw_add_modal`] returns [`TotpAddAction::Cancel`] on Escape at every
+/// stage but [`Stage::Scanning`]. See `manual_footer` for why this line is
+/// drawn *instead of* 6d's second button rather than beside it.
+pub const DISMISS_HINT: &str = "Esc discards";
 
 /// The control that unmasks the secret.
 pub const REVEAL_LABEL: &str = "Reveal";
@@ -1217,155 +1250,984 @@ fn note(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
     ui.label(egui::RichText::new(text).size(11.0).color(colour));
 }
 
-/// One `Label   Value` row of the confirmation.
-fn field_row(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.allocate_ui(egui::vec2(84.0, 16.0), |ui| {
-            note(ui, label, theme::TEXT_FAINT);
-        });
-        ui.label(egui::RichText::new(value).size(12.0).color(theme::INK));
+// ---------------------------------------------------------------------------
+// Design 6d's surface.
+//
+// **Every number in this section was measured in a browser against
+// `docs/design/Deskwarden.dc.html`'s own `id="6d"` panel**, and each constant
+// names the CSS declaration it came from so the next person to move one can
+// check it against the same source rather than against the last render.
+//
+// # Measured, because the design page is content-box
+//
+// A declared size on that page is the size INSIDE the border and every border
+// adds to what is on screen -- `HEADER_HEIGHT` records the same trap for 6a.
+// It bites twice here: 6d's secondary answer declares `height: 32px` inside a
+// `1px` border and its rectangle is 34 tall, and every one of the parameter
+// cells declares `padding: 5px 0` inside a run whose border is its own. The
+// card as a whole is 470 x 345.8 with a 468 x 44 header, a 468 x 240.8 body
+// and a 468 x 59 footer, and the numbers below are what add up to that.
+//
+// # Which card this is
+//
+// `#6d`'s own card is drawn flat -- `border: 1px solid #dedbd9`, no shadow --
+// because that panel is a spec vignette rather than a modal on a scrim. The
+// thing on screen is a modal, and it is **the same card 6c declares**
+// (`border: 1px solid #d7d3d3` under `box-shadow: 0 14px 34px rgba(45, 43,
+// 43, 0.18)`), because 6c is not a second card here: this app reaches the
+// confirmation by typing as well as by scanning, so [`draw_confirmation`]
+// renders into the bottom of this card's body. One card, one chrome, and it
+// is [`stage_card`] -- 6a's, which declares those two rules identically.
+//
+// # The helpers are 6a's
+//
+// `lay_out`, `face`, `body_face`, `paint_svg` and [`Svg`] are defined in 6a's
+// section below and shared rather than restated. The two stages are one card
+// a step apart, and a second set of text and mark helpers is how the two come
+// to round, wrap and stroke differently.
+// ---------------------------------------------------------------------------
+
+/// `#6d` declares `width: 470px` and the card is its only child.
+///
+/// The same number as [`PICKER_WIDTH`] and deliberately a separate constant,
+/// for `theme::HEADER_BUTTON_HEIGHT`'s reason: two things the same size today
+/// for different reasons are two constants, and folding them together is how
+/// one silently follows the other when the design moves. What this replaces
+/// is [`MODAL_WIDTH`]'s 380, which is still [`Stage::Scanning`]'s -- that
+/// stage is four short lines and has no design panel asking it to be wider.
+const MANUAL_WIDTH: f32 = 470.0;
+
+/// The header band: `padding: 14px 16px` over a `1px solid #eae7e7` rule,
+/// carrying a 14px `font-weight: 700` title. 468 x 44 on screen.
+const MANUAL_HEADER_PAD_X: f32 = 16.0;
+/// See [`MANUAL_HEADER_PAD_X`].
+const MANUAL_HEADER_PAD_Y: f32 = 14.0;
+/// See [`MANUAL_HEADER_PAD_X`].
+const MANUAL_HEADER_TITLE_PX: f32 = 14.0;
+
+/// What 6c hangs in the same band once a decoder has spoken: a 16px check
+/// stroked at 2.6, `gap: 10px` from the title, and the kind of payload that
+/// was read set at the far right in `font-size: 12px; color: #9b9797`.
+const MANUAL_HEADER_GAP: f32 = 10.0;
+/// See [`MANUAL_HEADER_GAP`].
+const MANUAL_HEADER_MARK: f32 = 16.0;
+/// See [`MANUAL_HEADER_GAP`].
+const MANUAL_HEADER_MARK_STROKE: f32 = 2.6;
+/// See [`MANUAL_HEADER_GAP`].
+const MANUAL_HEADER_KIND_PX: f32 = 12.0;
+
+/// The body: `padding: 16px` with `gap: 14px` down its column, which is what
+/// leaves 6d's own 436-wide field inside a 470 card.
+const MANUAL_BODY_PAD: i8 = 16;
+/// See [`MANUAL_BODY_PAD`].
+const MANUAL_BODY_GAP: f32 = 14.0;
+
+/// The field's block: `gap: 7px` between the caption, the box and the line
+/// under it, with the caption at `font-size: 12px; color: #605d5d`.
+///
+/// **A caption and not a placeholder.** 6d draws [`SECRET_HINT`] as a `div`
+/// ABOVE the box and puts the typed seed inside it; this form used to hand
+/// the same string to `TextEdit::hint_text`, where it is painted only while
+/// the box is empty. The two are not interchangeable: the sentence says what
+/// the box will accept -- *either* a bare key *or* a whole URI, which is the
+/// one thing about this field a user cannot guess -- and a placeholder
+/// deletes that as soon as the first character is typed, which is exactly
+/// when a half-pasted URI needs it.
+const SECRET_BLOCK_GAP: f32 = 7.0;
+/// See [`SECRET_BLOCK_GAP`].
+const SECRET_LABEL_PX: f32 = 12.0;
+
+/// The box itself: `border-radius: 8px; padding: 9px 11px` inside a `1px`
+/// border, around monospace `font-size: 13px` set at `letter-spacing: 0.1em;
+/// line-height: 1.6` -- 40.8 tall on screen, and 6d draws it focused, in
+/// `border: 1px solid #1b3fa0` under `box-shadow: 0 0 0 3px #dbe4f7`
+/// ([`theme::BLUE`] and [`theme::FOCUS_RING`], which is the halo every other
+/// field in this app already wears).
+const SECRET_BOX_RADIUS: u8 = 8;
+/// See [`SECRET_BOX_RADIUS`].
+const SECRET_BOX_STROKE: f32 = 1.0;
+/// See [`SECRET_BOX_RADIUS`].
+const SECRET_BOX_PAD_X: f32 = 11.0;
+/// See [`SECRET_BOX_RADIUS`].
+const SECRET_BOX_PAD_Y: f32 = 9.0;
+/// See [`SECRET_BOX_RADIUS`].
+const SECRET_TEXT_PX: f32 = 13.0;
+/// See [`SECRET_BOX_RADIUS`]. The design's em, which egui wants in points.
+const SECRET_TEXT_TRACKING: f32 = 0.1;
+/// See [`SECRET_BOX_RADIUS`].
+const SECRET_TEXT_LINE: f32 = 1.6;
+/// The halo's width, from `box-shadow: 0 0 0 3px`.
+const SECRET_FOCUS_RING: f32 = 3.0;
+
+/// The line under the box: a 13px check stroked at 2.8, `gap: 8px`, and 12px
+/// copy beside it.
+const VALIDITY_GAP: f32 = 8.0;
+/// See [`VALIDITY_GAP`].
+const VALIDITY_MARK: f32 = 13.0;
+/// See [`VALIDITY_GAP`].
+const VALIDITY_MARK_STROKE: f32 = 2.8;
+/// See [`VALIDITY_GAP`].
+const VALIDITY_PX: f32 = 12.0;
+
+/// The green 6d strokes its check in (`stroke="#1b7a3f"`, which is also 6c's
+/// header check), and the deeper one it sets the sentence beside it in
+/// (`color: #17673a`).
+///
+/// Declared here rather than in `theme` for `loading_ui`'s reason, which
+/// keeps design 7b's amber next to the badge that spends it: neither green is
+/// a design-system role this app names anywhere -- there is no "success"
+/// anything in `theme`, and the one other copy of `#1b7a3f` in this crate is
+/// `scratch_window`'s own private `CHECK_GREEN`. A `theme` constant is for a
+/// colour more than one surface reaches for by name, and these two are read
+/// off one panel.
+const VALID_MARK_INK: egui::Color32 = egui::Color32::from_rgb(0x1b, 0x7a, 0x3f);
+/// See [`VALID_MARK_INK`].
+const VALID_TEXT_INK: egui::Color32 = egui::Color32::from_rgb(0x17, 0x67, 0x3a);
+
+/// The two parameter controls: a `gap: 12px` pair of `flex: 1` columns, each
+/// a 12px `#605d5d` caption over its run at `gap: 6px`.
+const CHOICE_COLUMN_GAP: f32 = 12.0;
+/// See [`CHOICE_COLUMN_GAP`].
+const CHOICE_LABEL_GAP: f32 = 6.0;
+/// See [`CHOICE_COLUMN_GAP`].
+const CHOICE_LABEL_PX: f32 = 12.0;
+
+/// One run: `border: 1px solid #d7d3d3; border-radius: 7px; overflow: hidden`
+/// around cells of `padding: 5px 0` at `font-size: 12px`, the one in force
+/// filled `#1b3fa0` with white `font-weight: 600` type and the rest divided
+/// from it by `border-left: 1px solid #d7d3d3`. 212 x 26 on screen.
+const CHOICE_RADIUS: u8 = 7;
+/// See [`CHOICE_RADIUS`].
+const CHOICE_STROKE: f32 = 1.0;
+/// See [`CHOICE_RADIUS`].
+const CHOICE_PAD_Y: f32 = 5.0;
+/// See [`CHOICE_RADIUS`].
+const CHOICE_TEXT_PX: f32 = 12.0;
+
+/// The footer band: `padding: 12px 16px` under a `1px solid #eae7e7` rule on
+/// `background: #fbfaf9` ([`theme::CARD_TINT`]), with `gap: 9px` between its
+/// answers. 468 x 59 on screen, which is that padding around the 34 the
+/// outlined answer's border makes of its declared 32.
+const MANUAL_FOOTER_PAD_X: f32 = 16.0;
+/// See [`MANUAL_FOOTER_PAD_X`].
+const MANUAL_FOOTER_PAD_Y: f32 = 12.0;
+/// See [`MANUAL_FOOTER_PAD_X`].
+const MANUAL_FOOTER_GAP: f32 = 9.0;
+/// The hint at the band's right-hand end: `font-size: 12px; color: #9b9797`.
+const DISMISS_HINT_PX: f32 = 12.0;
+
+/// How much of the window is left round the card before its BODY scrolls,
+/// and the floor under what the body is given.
+///
+/// **The design never drew these two panels fused and this app does.** `#6d`
+/// is 345.8 tall and `#6c` is 560; the card that carries both -- with a
+/// record that already has a code, so the caution band is up as well -- comes
+/// out around 760 against `vault_window::WINDOW_SIZE`'s 740. Something has to
+/// give on a window that size, and the bands are what must not: the header
+/// says what the card is, and the footer holds both answers and the line
+/// naming the key that closes it. So the body scrolls under them.
+///
+/// That is `draw_add_modal`'s own note answered rather than a new idea: it
+/// records a card whose only way out could sit off the bottom of a
+/// centre-anchored `Area` that does not scroll, reported as a hang. Escape is
+/// the other half of that answer and is unchanged.
+///
+/// `MODAL_BREATHING` is 16 of scrim above and below, so a card at its limit
+/// does not read as one pinned to the window's edges. The floor exists for
+/// the window `settings::MIN_VAULT_WINDOW_SIZE` allows: below it the body
+/// would be given a negative height and egui would lay the card out inside
+/// out.
+const MODAL_BREATHING: f32 = 32.0;
+/// See [`MODAL_BREATHING`].
+const MIN_BODY_HEIGHT: f32 = 160.0;
+
+/// 6c's caution band, which sits between the body and the footer:
+/// `border-top: 1px solid #eae7e7` over `background: #fef6e7`, a 15px warning
+/// triangle stroked in `#8a5a06` and dropped by its own `margin-top: 1px`,
+/// `gap: 9px`, and 12px copy in `#7a4f05` at `line-height: 1.5`.
+///
+/// The mark's size, stroke, drop, gap, type size and line height are 6a's
+/// footer numbers to the point -- the design sets both bands from the same
+/// declarations -- so they are [`FOOTER_GLYPH`] and its neighbours rather
+/// than a second copy. Only the three colours and the padding are this
+/// band's own, and the padding is 6d's 16 rather than 6c's 18 because this is
+/// 6d's card and every other band on it is inset 16.
+const CAUTION_FILL: egui::Color32 = egui::Color32::from_rgb(0xfe, 0xf6, 0xe7);
+/// See [`CAUTION_FILL`].
+const CAUTION_MARK_INK: egui::Color32 = egui::Color32::from_rgb(0x8a, 0x5a, 0x06);
+/// See [`CAUTION_FILL`].
+const CAUTION_TEXT_INK: egui::Color32 = egui::Color32::from_rgb(0x7a, 0x4f, 0x05);
+
+/// The check 6d sets under its field and 6c sets in its header, in the
+/// design's own `viewBox` coordinates: `<path d="M20 6 9 17l-5-5">`.
+const CHECK_MARK: &[Svg] = &[Svg::Line(&[(20.0, 6.0), (9.0, 17.0), (4.0, 12.0)])];
+
+/// 6d's header band. Answers nothing: this card's ways out are its footer and
+/// the Escape [`draw_add_modal`] already binds, and neither 6d nor 6c draws
+/// the ✕ that 6a's header carries.
+///
+/// **Two states, one band.** While the user is typing it is 6d's own
+/// [`HEADING`] alone. Once a decoder has filled the field it is 6c's header
+/// instead -- a green check, [`CODE_READ_LABEL`], and [`CODE_READ_KIND`] at
+/// the far right -- which is the same pair this form used to draw as a row
+/// inside the body, put where the design puts it. The privacy decision that
+/// pair encodes is unchanged and is [`CODE_READ_LABEL`]'s own: a scanned
+/// payload is a URI with `secret=` in the middle of it and must not be poured
+/// into a box that paints what it holds.
+///
+/// The type is 6d's 14px/700 in both states rather than 6c's 15px/800,
+/// because this is 6d's card: a header that grew a point and a weight when
+/// the field below it was replaced would read as a different card rather than
+/// as the same one a step on.
+///
+/// Reports the band's height, which is what the body under it has to be
+/// measured against -- see [`MODAL_BREATHING`].
+fn manual_header(ui: &mut egui::Ui, scanned: bool) -> f32 {
+    let title = lay_out(
+        ui,
+        if scanned { CODE_READ_LABEL } else { HEADING },
+        f32::INFINITY,
+        face(MANUAL_HEADER_TITLE_PX, theme::BOLD, theme::INK),
+    );
+    let kind = scanned.then(|| {
+        lay_out(
+            ui,
+            CODE_READ_KIND,
+            f32::INFINITY,
+            body_face(MANUAL_HEADER_KIND_PX, theme::TEXT_GHOST),
+        )
+    });
+    // The band is as tall as its padding around the taller of the title and
+    // the mark, plus the rule -- see [`HEADER_HEIGHT`] on why the rule is
+    // extra rather than taken out of the padding.
+    let content = title.size().y.max(MANUAL_HEADER_MARK);
+    let (band, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), MANUAL_HEADER_PAD_Y * 2.0 + content + RULE),
+        egui::Sense::hover(),
+    );
+
+    let painter = ui.painter();
+    // `border-bottom: 1px solid #eae7e7`, run out past the card's own stroke
+    // on both sides so the rule meets the border instead of stopping a point
+    // short of it. [`BAND_BLEED`].
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(band.left() - BAND_BLEED, band.bottom() - RULE),
+            egui::pos2(band.right() + BAND_BLEED, band.bottom()),
+        ),
+        CornerRadius::ZERO,
+        theme::HAIRLINE,
+    );
+
+    // Centred on the padding box, which is the band without its rule.
+    let middle = band.center().y - RULE / 2.0;
+    let mut left = band.left() + MANUAL_HEADER_PAD_X;
+    if scanned {
+        let mark = egui::Rect::from_center_size(
+            egui::pos2(left + MANUAL_HEADER_MARK / 2.0, middle),
+            egui::Vec2::splat(MANUAL_HEADER_MARK),
+        );
+        paint_svg(painter, mark, CHECK_MARK, MANUAL_HEADER_MARK_STROKE, VALID_MARK_INK);
+        left = mark.right() + MANUAL_HEADER_GAP;
+    }
+    painter.galley(
+        egui::pos2(left, middle - title.size().y / 2.0),
+        title,
+        theme::INK,
+    );
+    if let Some(kind) = kind {
+        painter.galley(
+            egui::pos2(
+                band.right() - MANUAL_HEADER_PAD_X - kind.size().x,
+                middle - kind.size().y / 2.0,
+            ),
+            kind,
+            theme::TEXT_GHOST,
+        );
+    }
+    band.height()
+}
+
+/// **Which item this is being written to**, at the top of the body.
+///
+/// 6d draws no such block -- its panel is one field and two controls -- and
+/// it is here because [`draw_confirmation`] declined to build 6c's "Saving
+/// to" row on the grounds that *"the card already names it at the top"*.
+/// That sentence has to stay true of this card, and a modal that can rewrite
+/// a record's second factor and never names the record is the one thing this
+/// surface must not be. So it is 6a's own `Adding to` block, in 6a's type
+/// ([`SUBJECT_LABEL_PX`] over [`SUBJECT_NAME_PX`] at [`SUBJECT_GAP`]) --
+/// which is what the user read one screen ago -- and without 6a's `padding:
+/// 4px 4px 8px`, because that padding exists to separate the block from rows
+/// packed 7px apart and this body already spaces its children 14.
+fn manual_subject(ui: &mut egui::Ui, name: &str) {
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = SUBJECT_GAP;
+        ui.label(theme::regular(ADDING_TO_LABEL, SUBJECT_LABEL_PX).color(theme::TEXT_FAINT));
+        ui.label(theme::bold(name, SUBJECT_NAME_PX).color(theme::INK));
     });
 }
 
-/// The manual-entry field, the two controls, the 6c confirmation and the
-/// buttons.
+/// **6d's one field**, monospaced and tracked as the design sets it.
+///
+/// # Why this is not `theme::text_field`
+///
+/// The shared field is 38 tall and paints its contents in 14px proportional
+/// type with no tracking. 6d's is 40.8 tall and sets what is in it in
+/// `ui-monospace` at `font-size: 13px; letter-spacing: 0.1em`, and that is
+/// not decoration on this one field: what is typed here is a base32 key read
+/// off a card or a screen, character by character, and the two mistakes it
+/// invites -- a 0 for an O, an I for a 1 -- are the two a proportional face
+/// hides and a monospaced one separates. The box, its radius and its focused
+/// halo ARE the shared field's, painted from the same [`theme`] colours in
+/// the same order, so this differs from every other field in the app in
+/// exactly the way the design says and in no other.
+///
+/// The face is carried in through `TextEdit::layouter` and not `.font()`,
+/// which takes a `FontId` and can express no letter spacing -- the same
+/// reason `detail::title_text` reaches for a layouter.
+fn secret_field(ui: &mut egui::Ui, typed: &mut String) -> egui::Response {
+    // A placeholder in the paint list, so the box lands UNDER the text egui
+    // draws for the `TextEdit`. `theme::field_box`'s own trick.
+    let under = ui.painter().add(egui::Shape::Noop);
+    let line = SECRET_TEXT_PX * SECRET_TEXT_LINE;
+    let (outer, _) = ui.allocate_exact_size(
+        egui::vec2(
+            ui.available_width(),
+            SECRET_BOX_STROKE * 2.0 + SECRET_BOX_PAD_Y * 2.0 + line,
+        ),
+        egui::Sense::hover(),
+    );
+    let inset = egui::vec2(
+        SECRET_BOX_STROKE + SECRET_BOX_PAD_X,
+        SECRET_BOX_STROKE + SECRET_BOX_PAD_Y,
+    );
+    let inner = egui::Rect::from_min_max(outer.min + inset, outer.max - inset);
+
+    let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _wrap: f32| {
+        let mut job = egui::text::LayoutJob::default();
+        // `no_max_width`, because this is a single-line field: 6d's box says
+        // `word-break: break-all` for a URI too long to show, but a wrap
+        // inside a one-line `TextEdit` puts the caret on a row the box is not
+        // tall enough to paint. The overflow scrolls instead, which is what
+        // every other field in this app does with a long value.
+        job.wrap = egui::text::TextWrapping::no_max_width();
+        job.append(
+            buffer.as_str(),
+            0.0,
+            egui::TextFormat {
+                extra_letter_spacing: SECRET_TEXT_PX * SECRET_TEXT_TRACKING,
+                line_height: Some(line),
+                font_id: egui::FontId::new(SECRET_TEXT_PX, egui::FontFamily::Monospace),
+                color: theme::INK,
+                ..Default::default()
+            },
+        );
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
+    let response = ui.put(
+        inner,
+        egui::TextEdit::singleline(typed)
+            .frame(egui::Frame::NONE)
+            .margin(egui::Margin::ZERO)
+            .desired_width(inner.width())
+            .layouter(&mut layouter),
+    );
+
+    let radius = CornerRadius::same(SECRET_BOX_RADIUS);
+    let border = if response.has_focus() {
+        // `expand(2.0)` under a 3px stroke covers 0.5..3.5 outside the rect,
+        // flush against the border's outer edge -- `theme::field_box`'s
+        // measurement of the same `box-shadow`.
+        ui.painter().rect_stroke(
+            outer.expand(2.0),
+            radius,
+            egui::Stroke::new(SECRET_FOCUS_RING, theme::FOCUS_RING),
+            egui::StrokeKind::Middle,
+        );
+        egui::Stroke::new(SECRET_BOX_STROKE, theme::BLUE)
+    } else {
+        egui::Stroke::new(SECRET_BOX_STROKE, theme::BORDER_STRONG)
+    };
+    ui.painter().set(
+        under,
+        egui::epaint::RectShape::new(
+            outer,
+            radius,
+            theme::CARD,
+            border,
+            egui::StrokeKind::Middle,
+        ),
+    );
+    response
+}
+
+/// **6d's line under the field**: the check and *"Valid base32 · 16
+/// characters · spaces ignored"*, or the reason it is not.
+///
+/// **The check is drawn only when there is something to check off.** 6d has
+/// one state and it is the valid one; a refusal keeps the sentence
+/// [`refusal_sentence`] wrote and takes [`theme::ERROR`], with no mark at
+/// all. A green tick beside "that isn't a one-time code" would be this
+/// surface's single worst frame, and a red one is not in the design.
+fn validity_row(ui: &mut egui::Ui, reading: &Reading) {
+    let Some(line) = validity_line(reading) else {
+        return;
+    };
+    let refused = matches!(reading, Reading::Refused(_));
+    let ink = if refused { theme::ERROR } else { VALID_TEXT_INK };
+    let indent = if refused { 0.0 } else { VALIDITY_MARK + VALIDITY_GAP };
+    let width = ui.available_width();
+    let text = lay_out(ui, &line, width - indent, body_face(VALIDITY_PX, ink));
+    let (row, _) = ui.allocate_exact_size(
+        egui::vec2(width, text.size().y.max(VALIDITY_MARK)),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    if !refused {
+        paint_svg(
+            painter,
+            egui::Rect::from_center_size(
+                egui::pos2(row.left() + VALIDITY_MARK / 2.0, row.center().y),
+                egui::Vec2::splat(VALIDITY_MARK),
+            ),
+            CHECK_MARK,
+            VALIDITY_MARK_STROKE,
+            VALID_MARK_INK,
+        );
+    }
+    painter.galley(
+        egui::pos2(row.left() + indent, row.center().y - text.size().y / 2.0),
+        text,
+        ink,
+    );
+}
+
+/// **6d's two parameter controls**, side by side. Answers whichever of them
+/// was pressed this frame.
+///
+/// The columns are `flex: 1` either side of a 12px gap, so each is exactly
+/// half of what is left of the body -- 212 on 6d's own card -- and each run
+/// fills its column with equal cells. That is the whole reason this is not
+/// `theme::segmented_control`: that control sizes every cell to its own
+/// label, which is right for the Preferences window's rows of prose and
+/// wrong here, where the design draws two runs of the same width holding
+/// cells of the same width and the labels are one character long. Everything
+/// else about the run IS the shared control's -- [`CHOICE_RADIUS`] is its
+/// `SEGMENT_RADIUS`, the cell in force takes [`theme::BLUE`] behind white and
+/// the dead run takes [`theme::BLUE_WASH`] behind [`theme::TEXT_GHOST`],
+/// which is `segmented_control_disabled`'s own answer to "you have this one
+/// and cannot change it".
+fn parameter_controls(
+    ui: &mut egui::Ui,
+    digits: u8,
+    period: u16,
+    live: bool,
+) -> (Option<u8>, Option<u16>) {
+    let digit_faces: Vec<String> = DIGITS_CHOICES.iter().map(|d| d.to_string()).collect();
+    let period_faces: Vec<String> =
+        PERIOD_CHOICES.iter().map(|p| format!("{p} s")).collect();
+
+    let caption = lay_out(
+        ui,
+        DIGITS_LABEL,
+        f32::INFINITY,
+        body_face(CHOICE_LABEL_PX, theme::TEXT_MUTED),
+    );
+    let run_height = CHOICE_STROKE * 2.0 + CHOICE_PAD_Y * 2.0 + caption.size().y;
+    let width = ui.available_width();
+    let (row, _) = ui.allocate_exact_size(
+        egui::vec2(width, caption.size().y + CHOICE_LABEL_GAP + run_height),
+        egui::Sense::hover(),
+    );
+    let column = (width - CHOICE_COLUMN_GAP) / 2.0;
+    let run_top = row.top() + caption.size().y + CHOICE_LABEL_GAP;
+
+    let mut chosen_digits = None;
+    let mut chosen_period = None;
+    for (index, (label, faces)) in
+        [(DIGITS_LABEL, &digit_faces), (PERIOD_LABEL, &period_faces)].into_iter().enumerate()
+    {
+        let left = row.left() + (column + CHOICE_COLUMN_GAP) * index as f32;
+        let caption = lay_out(
+            ui,
+            label,
+            column,
+            body_face(CHOICE_LABEL_PX, theme::TEXT_MUTED),
+        );
+        ui.painter().galley(egui::pos2(left, row.top()), caption, theme::TEXT_MUTED);
+        let run = egui::Rect::from_min_size(
+            egui::pos2(left, run_top),
+            egui::vec2(column, run_height),
+        );
+        let selected = if index == 0 {
+            DIGITS_CHOICES.iter().position(|d| *d == digits)
+        } else {
+            PERIOD_CHOICES.iter().position(|p| *p == period)
+        };
+        let pressed = choice_run(ui, run, faces, selected, live, ui.id().with(label));
+        match (index, pressed) {
+            (0, Some(at)) => chosen_digits = Some(DIGITS_CHOICES[at]),
+            (_, Some(at)) => chosen_period = Some(PERIOD_CHOICES[at]),
+            (_, None) => {}
+        }
+    }
+    (chosen_digits, chosen_period)
+}
+
+/// One run of [`parameter_controls`]: equal cells filling `run`, joined into
+/// one pill. Answers the index of the cell pressed this frame.
+///
+/// `selected` is an `Option` because it can genuinely be none of them: a
+/// pasted URI states its own parameters and [`controls_for`] hands them
+/// straight through, and `parse_otpauth` will read a `period` this control
+/// does not offer. A run with nothing lit says that honestly; a run that
+/// defaulted to lighting the first cell would claim the card was 30 seconds
+/// when it was 45.
+fn choice_run(
+    ui: &mut egui::Ui,
+    run: egui::Rect,
+    faces: &[String],
+    selected: Option<usize>,
+    live: bool,
+    id: egui::Id,
+) -> Option<usize> {
+    let response = ui.interact(
+        run,
+        id,
+        if live { egui::Sense::click() } else { egui::Sense::hover() },
+    );
+    let pointer = if live { response.hover_pos() } else { None };
+    // The cells are laid out INSIDE the run's border, which is the box the
+    // design's `flex: 1` children divide between them.
+    let inside = run.shrink(CHOICE_STROKE);
+    let count = faces.len();
+    let edge = |index: usize| inside.left() + inside.width() * index as f32 / count as f32;
+
+    let mut hovered = None;
+    let mut chosen = None;
+    for (index, face_text) in faces.iter().enumerate() {
+        let cell = egui::Rect::from_min_max(
+            egui::pos2(edge(index), inside.top()),
+            egui::pos2(edge(index + 1), inside.bottom()),
+        );
+        let over = pointer.is_some_and(|at| cell.contains(at));
+        if over {
+            hovered = Some(index);
+        }
+        let lit = selected == Some(index);
+        let (fill, ink) = match (lit, live, over) {
+            (true, true, _) => (theme::BLUE, egui::Color32::WHITE),
+            (true, false, _) => (theme::BLUE_WASH, theme::TEXT_GHOST),
+            (false, true, true) => (theme::CANVAS, theme::INK),
+            (false, true, false) => (theme::CARD, theme::INK),
+            (false, false, _) => (theme::CARD, theme::TEXT_GHOST),
+        };
+        // **The rounding belongs to the run and not the cell**, exactly as
+        // `theme::segment_corners` puts it: the first cell rounds its left
+        // corners, the last its right ones, and the square edges between them
+        // are what make the interior lines read as seams.
+        let first = if index == 0 { CHOICE_RADIUS } else { 0 };
+        let last = if index + 1 == count { CHOICE_RADIUS } else { 0 };
+        ui.painter().rect_filled(
+            cell,
+            CornerRadius { nw: first, sw: first, ne: last, se: last },
+            fill,
+        );
+        if index > 0 {
+            // `border-left: 1px solid #d7d3d3` between one cell and the next.
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(
+                    cell.min,
+                    egui::pos2(cell.left() + CHOICE_STROKE, cell.bottom()),
+                ),
+                CornerRadius::ZERO,
+                theme::BORDER_STRONG,
+            );
+        }
+        let galley = ui.painter().layout_no_wrap(
+            face_text.clone(),
+            egui::FontId::new(
+                CHOICE_TEXT_PX,
+                if lit {
+                    egui::FontFamily::Name(theme::SEMIBOLD.into())
+                } else {
+                    egui::FontFamily::Proportional
+                },
+            ),
+            ink,
+        );
+        ui.painter().galley(
+            egui::pos2(
+                cell.center().x - galley.size().x / 2.0,
+                cell.center().y - galley.size().y / 2.0,
+            ),
+            galley,
+            ink,
+        );
+    }
+    // The outline last, over the cells, so a lit cell's fill cannot paint out
+    // the run's own border where the two meet.
+    ui.painter().rect_stroke(
+        run,
+        CornerRadius::same(CHOICE_RADIUS),
+        egui::Stroke::new(CHOICE_STROKE, theme::BORDER_STRONG),
+        egui::StrokeKind::Inside,
+    );
+    if hovered.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.clicked() {
+        chosen = hovered;
+    }
+    chosen
+}
+
+/// [`REPLACE_WARNING`] laid out to the width the caution band leaves it, once
+/// per frame. See [`caution_band`] on why this is not done inside it.
+fn caution_text(ui: &egui::Ui, width: f32) -> std::sync::Arc<egui::Galley> {
+    lay_out(
+        ui,
+        REPLACE_WARNING,
+        width - MANUAL_FOOTER_PAD_X * 2.0 - FOOTER_GLYPH - FOOTER_GAP,
+        egui::TextFormat {
+            line_height: Some(FOOTER_TEXT_PX * FOOTER_LINE),
+            ..body_face(FOOTER_TEXT_PX, CAUTION_TEXT_INK)
+        },
+    )
+}
+
+/// How tall the caution band comes out around `text`.
+///
+/// `align-items: flex-start` on 6c's band: both children hang off the top
+/// padding, so it is as tall as the taller of them plus the two paddings and
+/// the rule over them.
+fn caution_band_height(text: &egui::Galley) -> f32 {
+    RULE + MANUAL_FOOTER_PAD_Y * 2.0
+        + text.size().y.max(FOOTER_GLYPH + FOOTER_GLYPH_DROP)
+}
+
+/// How tall the footer band comes out. A constant of the design rather than
+/// of its contents: both answers are `theme::BUTTON_HEIGHT`, which is 6d's
+/// declared `height: 32px`, and the band is `padding: 12px` and its rule
+/// around the 34 the outlined one's border makes of that.
+fn manual_footer_height() -> f32 {
+    RULE + MANUAL_FOOTER_PAD_Y * 2.0 + theme::BUTTON_HEIGHT + CHOICE_STROKE * 2.0
+}
+
+/// **6c's caution band**, between the body and the footer.
+///
+/// The sentence is [`REPLACE_WARNING`] and it has not changed; where it is
+/// drawn has. It used to be a red label inside the body, which put the one
+/// irreversible fact on this card in the same column as the field and the
+/// controls, at the same weight as a validation message. 6c gives it a band
+/// of its own on `#fef6e7` directly over the button that does the thing --
+/// the last thing crossed on the way to pressing it -- and that is card
+/// chrome, so it is built here with the rest of the chrome.
+///
+/// **Amber and not [`theme::ERROR`]**, which is the design's own choice and
+/// the right one: nothing has gone wrong yet. The red belongs to
+/// [`validity_row`]'s refusals, where something has.
+///
+/// The sentence is laid out by [`caution_text`] and handed in rather than
+/// measured here, because the body above this band has to be given its room
+/// **before** either is drawn -- see [`MODAL_BREATHING`] -- and a second
+/// layout of the same wrapping paragraph is a second answer waiting to
+/// disagree with the first by a point.
+fn caution_band(ui: &mut egui::Ui, text: std::sync::Arc<egui::Galley>) {
+    let width = ui.available_width();
+    let (band, _) = ui.allocate_exact_size(
+        egui::vec2(width, caution_band_height(&text)),
+        egui::Sense::hover(),
+    );
+
+    let painter = ui.painter();
+    // Square at both ends: the footer is below this one, so neither edge of
+    // it is the card's corner. Bled sideways for [`BAND_BLEED`]'s reason.
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(band.left() - BAND_BLEED, band.top()),
+            egui::pos2(band.right() + BAND_BLEED, band.bottom()),
+        ),
+        CornerRadius::ZERO,
+        CAUTION_FILL,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(band.left() - BAND_BLEED, band.top()),
+            egui::pos2(band.right() + BAND_BLEED, band.top() + RULE),
+        ),
+        CornerRadius::ZERO,
+        theme::HAIRLINE,
+    );
+
+    // The triangle is `theme`'s and not a fourth mark in this file's own
+    // `Svg` vocabulary: 6c's is a rounded path, `Svg::Line` strokes open
+    // polylines, and `theme::paint_warning_glyph` already draws exactly this
+    // sign at exactly this 15px for exactly the reason it records -- U+26A0
+    // is in neither Archivo nor egui's fallback stack.
+    theme::paint_warning_glyph(
+        painter,
+        egui::Rect::from_min_size(
+            egui::pos2(
+                band.left() + MANUAL_FOOTER_PAD_X,
+                band.top() + RULE + MANUAL_FOOTER_PAD_Y + FOOTER_GLYPH_DROP,
+            ),
+            egui::Vec2::splat(FOOTER_GLYPH),
+        ),
+        CAUTION_MARK_INK,
+    );
+    painter.galley(
+        egui::pos2(
+            band.left() + MANUAL_FOOTER_PAD_X + FOOTER_GLYPH + FOOTER_GAP,
+            band.top() + RULE + MANUAL_FOOTER_PAD_Y,
+        ),
+        text,
+        CAUTION_TEXT_INK,
+    );
+}
+
+/// **The card's answers**, in one band. Reports `(save, back to the picker)`.
+///
+/// # One row for both of the design's two
+///
+/// 6d draws `Save code / Cancel` and 6c draws `Replace code ↵ / Scan again`
+/// with `Esc discards` pushed to the far right, and they are the same band at
+/// two moments rather than two bands: same `padding`, same `gap: 9px`, same
+/// `border-top` on the same tint, same two answers in the same order. So it
+/// is built once, and what varies is what the design says varies -- the
+/// primary's face, which is [`submit_label`], and whether it may be pressed
+/// at all, which is [`can_save`].
+///
+/// # Why the second button is the way back and not `Cancel`
+///
+/// The design gives this band a primary, ONE secondary and an optional hint,
+/// and this app has three answers to fit in it: save, cancel, and the route
+/// back to 6a. 6c settles which two: where the hint is drawn, the secondary
+/// is the way back (its *"Scan again"*) and the hint carries the cancel.
+/// That is not a trade here, it is a strict improvement -- Escape is answered
+/// from anywhere on the card, including from inside the field, where a button
+/// has to be reached; and it is the fix `draw_add_modal`'s own note records
+/// for a card whose only way out could sit off the bottom of a short window.
+///
+/// The label is [`OTHER_WAYS_LABEL`] and not 6c's literal *"Scan again"*,
+/// because this app's way back is 6a -- four routes, of which scanning is
+/// one. A button reading "Scan again" that opened a picker would be the kind
+/// of promise this file refuses elsewhere.
+///
+/// # What is NOT drawn: 6c's ↵ keycap
+///
+/// 6c hangs a `↵` off its primary. Nothing in this crate answers Enter at
+/// this stage -- the picker binds it to its own default row and that is the
+/// only binding -- so drawing the cap would advertise a key that does
+/// nothing, which is `ROUTES`' rule about the ordinals restated. Binding it
+/// instead was the other option and is worse: with the field focused, Enter
+/// is the key a user presses to finish typing, and on an item that already
+/// has a code the action behind this button destroys a seed that cannot be
+/// recovered. `theme::destructive_button` refuses a shortcut for the same
+/// reason in the delete modal.
+fn manual_footer(ui: &mut egui::Ui, primary: &str, enabled: bool) -> (bool, bool) {
+    let width = ui.available_width();
+    let (band, _) =
+        ui.allocate_exact_size(egui::vec2(width, manual_footer_height()), egui::Sense::hover());
+
+    let painter = ui.painter();
+    // The tint, rounded into the card's bottom corners with the card's own
+    // radius and bled out to its rect -- [`BAND_BLEED`].
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(band.left() - BAND_BLEED, band.top()),
+            egui::pos2(band.right() + BAND_BLEED, band.bottom() + BAND_BLEED),
+        ),
+        CornerRadius { nw: 0, ne: 0, sw: CARD_RADIUS, se: CARD_RADIUS },
+        theme::CARD_TINT,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(band.left() - BAND_BLEED, band.top()),
+            egui::pos2(band.right() + BAND_BLEED, band.top() + RULE),
+        ),
+        CornerRadius::ZERO,
+        theme::HAIRLINE,
+    );
+
+    let mut inner = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(egui::Rect::from_min_max(
+                egui::pos2(
+                    band.left() + MANUAL_FOOTER_PAD_X,
+                    band.top() + RULE + MANUAL_FOOTER_PAD_Y,
+                ),
+                egui::pos2(
+                    band.right() - MANUAL_FOOTER_PAD_X,
+                    band.bottom() - MANUAL_FOOTER_PAD_Y,
+                ),
+            ))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    inner.spacing_mut().item_spacing.x = MANUAL_FOOTER_GAP;
+    // The app's own button family rather than two boxes measured off this
+    // panel: `theme::BUTTON_HEIGHT` IS 6d's declared `height: 32px`, the fill,
+    // the outline and the disabled fade are the design system's, and the one
+    // number that differs is the radius -- 7 against 6d's 8 -- which is a
+    // point, against a footer whose answers would otherwise round differently
+    // from every other footer in this app.
+    let save = theme::primary_button_enabled(&mut inner, primary, None, enabled).clicked();
+    let back = theme::secondary_button(&mut inner, OTHER_WAYS_LABEL).clicked();
+    inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.label(
+            egui::RichText::new(DISMISS_HINT)
+                .size(DISMISS_HINT_PX)
+                .color(theme::TEXT_GHOST),
+        );
+    });
+    (save, back)
+}
+
+/// **Design 6d**, with 6c fused into the bottom of the same card: the header
+/// band, the field and its line, the two parameter controls, the confirmation
+/// once there is something to confirm, and the answers.
 ///
 /// `now_unix` is the clock, passed in rather than read here: the live code is
 /// the one thing on this surface that changes without the user touching it,
 /// and a `SystemTime::now()` inside this function would make every assertion
 /// about the code untestable. `vault_window::mod` reads the clock once per
 /// frame and hands it down.
+///
+/// **What 6d draws that this does not.** Its panel carries a compact live-code
+/// strip of its own -- a 22px code, a `flex: 1` track and `22 s`, on
+/// `#eef2fc` -- and that is 6c's [`draw_code_panel`] said smaller. Drawing
+/// both would put two live codes and two countdowns for one seed on one card,
+/// so the fused card keeps 6c's, which is the larger of the two and the one
+/// carrying the question the confirmation exists to ask. 6d's second panel,
+/// *"When it doesn't work"*, is a documentation list of 6b's three capture
+/// failures and not a control: those sentences are [`PickerRefusal`]'s, they
+/// are painted one at a time on 6a where the route that failed can be pressed
+/// again, and a permanent list of everything that could go wrong is not
+/// something this app has anywhere.
 pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> TotpAddAction {
     let mut action = TotpAddAction::None;
     // Deferred to after the card, because `state` is borrowed inside it and
     // `back_to_picker` replaces the very `Zeroizing` the field is editing.
     let mut back_to_picker = false;
-    card(ui, |ui| {
-        ui.label(egui::RichText::new(HEADING).size(14.0).color(theme::INK).strong());
-        ui.add_space(2.0);
-        note(ui, &state.item_name, theme::TEXT_MUTED);
-        ui.add_space(10.0);
+    stage_card(ui, MANUAL_WIDTH, |ui| {
+        // The bands are measured before the body is drawn, because what is
+        // left of the window after them is what the body may have -- see
+        // [`MODAL_BREATHING`]. The caution band's sentence is laid out once
+        // here and handed on to the band itself.
+        let header = manual_header(ui, state.scanned);
+        let caution = state
+            .already_has_code
+            .then(|| caution_text(ui, ui.available_width()));
+        let bands = header
+            + caution.as_ref().map_or(0.0, |text| caution_band_height(text))
+            + manual_footer_height();
+        let room = (ui.ctx().content_rect().height() - MODAL_BREATHING - bands)
+            .max(MIN_BODY_HEIGHT);
 
-        // **A scanned payload is NOT put in a text field.** See
-        // [`CODE_READ_LABEL`]: a `TextEdit` paints what it holds, and what a
-        // decoder hands over holds `secret=` in the middle of it. The row 6c
-        // draws instead says what was read without saying what it was.
-        if state.scanned {
-            field_row(ui, CODE_READ_LABEL, CODE_READ_KIND);
-        } else {
-            ui.add(
-                egui::TextEdit::singleline(&mut *state.typed)
-                    .hint_text(SECRET_HINT)
-                    .desired_width(f32::INFINITY),
-            );
+        // The body reports what it read, because the two bands under it are
+        // decided by it: whether the primary may be pressed is `can_save`.
+        //
+        // `auto_shrink` is `[false, true]`: the card keeps its 470 whatever is
+        // in it -- a modal that narrowed as the confirmation appeared would be
+        // a different card -- and the body is only as tall as its contents
+        // until it reaches `room`, so the short states of 6d do not open a
+        // window-tall card round a single field.
+        let reading = egui::ScrollArea::vertical()
+            .max_height(room)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::same(MANUAL_BODY_PAD))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = MANUAL_BODY_GAP;
+                        manual_subject(ui, &state.item_name);
+
+                        // **A scanned payload is NOT put in a text field.** See
+                        // [`CODE_READ_LABEL`]: a `TextEdit` paints what it holds, and
+                        // what a decoder hands over holds `secret=` in the middle of
+                        // it. What says it was read is [`manual_header`]'s band.
+                        //
+                        // The reading is taken AFTER the field has been drawn, not
+                        // before: what the user typed this frame is in the buffer by
+                        // then, so the line under the box is about the keystroke that
+                        // just landed rather than the one before it.
+                        let reading = if state.scanned {
+                            let reading = read_field(&state.typed, state.digits, state.period);
+                            // The scanned card's own line, and only when there is
+                            // something wrong. A hostile QR reaches `parse_otpauth`
+                            // exactly as a hostile paste does, and its refusal has to
+                            // be on screen; the valid case has already said so in the
+                            // header and would only be repeating itself -- with the
+                            // seed's length, which nothing on a scanned card asked
+                            // to know.
+                            if matches!(reading, Reading::Refused(_)) {
+                                validity_row(ui, &reading);
+                            }
+                            reading
+                        } else {
+                            let mut reading = None;
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = SECRET_BLOCK_GAP;
+                                ui.label(
+                                    theme::regular(SECRET_HINT, SECRET_LABEL_PX)
+                                        .color(theme::TEXT_MUTED),
+                                );
+                                secret_field(ui, &mut state.typed);
+                                let read = read_field(&state.typed, state.digits, state.period);
+                                validity_row(ui, &read);
+                                reading = Some(read);
+                            });
+                            reading.expect("the field's column runs exactly once")
+                        };
+
+                        let (shown_digits, shown_period, controls_live) =
+                            controls_for(&reading, &state.typed, state.digits, state.period);
+                        let (chose_digits, chose_period) =
+                            parameter_controls(ui, shown_digits, shown_period, controls_live);
+                        if let Some(digits) = chose_digits {
+                            state.digits = digits;
+                        }
+                        if let Some(period) = chose_period {
+                            state.period = period;
+                        }
+                        if !controls_live {
+                            // Why the runs are dead. 6d draws them live and has no
+                            // slot for this, so it is the app's own sentence, put
+                            // directly under the controls it is about -- the same
+                            // place, and for the same reason, that 6a's refusal goes
+                            // under the rows rather than under the privacy line.
+                            ui.label(
+                                theme::regular(PARAMETERS_FROM_URI, CHOICE_LABEL_PX)
+                                    .color(theme::TEXT_FAINT),
+                            );
+                        }
+
+                        if let Reading::Ok(auth) = &reading {
+                            draw_confirmation(ui, auth, state, now_unix);
+                        }
+                        reading
+                    })
+                    .inner
+            })
+            .inner;
+
+        if let Some(text) = caution {
+            caution_band(ui, text);
         }
-
-        let reading = read_field(&state.typed, state.digits, state.period);
-        if let Some(line) = validity_line(&reading) {
-            ui.add_space(4.0);
-            let colour = match reading {
-                Reading::Refused(_) => theme::ERROR,
-                _ => theme::TEXT_MUTED,
-            };
-            ui.label(egui::RichText::new(line).size(11.0).color(colour));
+        let (save, back) =
+            manual_footer(ui, submit_label(state.already_has_code), can_save(&reading));
+        if save {
+            action = TotpAddAction::Save;
         }
-
-        ui.add_space(10.0);
-        let (shown_digits, shown_period, controls_live) =
-            controls_for(&reading, &state.typed, state.digits, state.period);
-        ui.horizontal(|ui| {
-            note(ui, DIGITS_LABEL, theme::TEXT_FAINT);
-            for choice in DIGITS_CHOICES {
-                if ui
-                    .add_enabled(
-                        controls_live,
-                        egui::Button::new(
-                            egui::RichText::new(choice.to_string()).size(12.0).color(theme::INK),
-                        )
-                        .selected(shown_digits == choice)
-                        .min_size(egui::vec2(34.0, 22.0)),
-                    )
-                    .clicked()
-                {
-                    state.digits = choice;
-                }
-            }
-            ui.add_space(10.0);
-            note(ui, PERIOD_LABEL, theme::TEXT_FAINT);
-            for choice in PERIOD_CHOICES {
-                if ui
-                    .add_enabled(
-                        controls_live,
-                        egui::Button::new(
-                            egui::RichText::new(format!("{choice} s"))
-                                .size(12.0)
-                                .color(theme::INK),
-                        )
-                        .selected(shown_period == choice)
-                        .min_size(egui::vec2(40.0, 22.0)),
-                    )
-                    .clicked()
-                {
-                    state.period = choice;
-                }
-            }
-            if !controls_live {
-                ui.add_space(8.0);
-                note(ui, PARAMETERS_FROM_URI, theme::TEXT_FAINT);
-            }
-        });
-
-        if let Reading::Ok(auth) = &reading {
-            ui.add_space(12.0);
-            draw_confirmation(ui, auth, state, now_unix);
+        // **The way back to 6a**, and the reason this form is not a dead end
+        // when the user arrived at it by scanning: a decode that produced the
+        // wrong card, or a seed typed off the wrong line, is fixed by
+        // choosing a route again rather than by cancelling out of the whole
+        // feature and re-opening it.
+        if back {
+            back_to_picker = true;
         }
-
-        if state.already_has_code {
-            ui.add_space(10.0);
-            // The error colour and the same size as everything else on the
-            // card, not fine print: it is the sentence that decides whether
-            // the button below it is a mistake.
-            ui.label(egui::RichText::new(REPLACE_WARNING).size(12.0).color(theme::ERROR));
-        }
-
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    can_save(&reading),
-                    egui::Button::new(
-                        egui::RichText::new(submit_label(state.already_has_code))
-                            .size(12.0)
-                            .color(theme::INK),
-                    )
-                    .min_size(egui::vec2(112.0, BUTTON_HEIGHT)),
-                )
-                .clicked()
-            {
-                action = TotpAddAction::Save;
-            }
-            ui.add_space(8.0);
-            if ui
-                .add(
-                    egui::Button::new(
-                        egui::RichText::new("Cancel").size(12.0).color(theme::TEXT_MUTED),
-                    )
-                    .min_size(egui::vec2(72.0, BUTTON_HEIGHT)),
-                )
-                .clicked()
-            {
-                action = TotpAddAction::Cancel;
-            }
-            // **The way back to 6a**, and the reason this form is not a dead
-            // end when the user arrived at it by scanning: a decode that
-            // produced the wrong card, or a seed typed off the wrong line, is
-            // fixed by choosing a route again rather than by cancelling out
-            // of the whole feature and re-opening it.
-            ui.add_space(8.0);
-            if theme::link_label(ui, OTHER_WAYS_LABEL, 11.0).clicked() {
-                back_to_picker = true;
-            }
-        });
     });
     if back_to_picker {
         state.back_to_picker();
@@ -1954,8 +2816,17 @@ fn route_row(ui: &mut egui::Ui, row: &RouteRow, index: usize) -> (egui::Response
     (response, rect)
 }
 
-/// 6a's card: white, `border-radius: 12px`, a [`theme::BORDER_STRONG`] hairline
-/// round it, and the shadow that lifts it off the scrim.
+/// **The card both stages of this modal are drawn in**: white,
+/// `border-radius: 12px`, a [`theme::BORDER_STRONG`] hairline round it, and
+/// the shadow that lifts it off the scrim.
+///
+/// One function and not one per stage, because 6a and 6c declare it
+/// identically -- `border: 1px solid #d7d3d3` under `box-shadow: 0 14px 34px
+/// rgba(45, 43, 43, 0.18)` -- and it is genuinely one card: the by-hand form
+/// is what the picker becomes when its third row is pressed, and a second
+/// card built beside this one is two cards that round, shadow and bleed two
+/// ways. `width` is the caller's because that is the one thing the design
+/// does vary panel to panel; today both callers are 470.
 ///
 /// The border is stroked twice, on the `Frame` and again over everything, for
 /// `theme::modal_card`'s measured reason: the `Frame`'s own stroke is what
@@ -1963,7 +2834,7 @@ fn route_row(ui: &mut egui::Ui, row: &RouteRow, index: usize) -> (egui::Response
 /// it so that no sliver of white card shows in the lower corners. Dropping
 /// the first would shrink the layout rect; dropping the second would put the
 /// white line back along the bottom curve.
-fn picker_card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+fn stage_card<R>(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let border = egui::Stroke::new(CARD_STROKE, theme::BORDER_STRONG);
     let framed = egui::Frame::new()
         .fill(theme::CARD)
@@ -1974,7 +2845,7 @@ fn picker_card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R 
             // The width INSIDE the border, which is what the design's boxes
             // are measured in: 470 outside, 468 of content, and a body inset
             // 14 either side of that gives 6a's own 440-wide rows.
-            ui.set_width(PICKER_WIDTH - CARD_STROKE * 2.0);
+            ui.set_width(width - CARD_STROKE * 2.0);
             // The three bands butt against each other, so the card's own
             // stack gets no item spacing at all; the body puts its own 7px
             // back inside itself.
@@ -2141,7 +3012,7 @@ pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
     let mut rows = Vec::with_capacity(ROUTES.len());
     let mut go_manual = false;
     let mut close = egui::Rect::NOTHING;
-    picker_card(ui, |ui| {
+    stage_card(ui, PICKER_WIDTH, |ui| {
         let (dismissed, at) = picker_header(ui);
         close = at;
         if dismissed {
@@ -2660,15 +3531,22 @@ pub fn draw_add_modal(
 
 /// How wide the card is at each stage.
 ///
-/// 6a's panel is 470 and 6d's composer column is [`MODAL_WIDTH`], and the two
-/// are genuinely different surfaces rather than one surface measured twice:
-/// the picker carries a 34px tile, two columns of type and an affordance on
-/// every one of four rows, where the by-hand form is a single field. Sizing
-/// the picker to 380 is what put its subtitles on two lines.
+/// **6d is 470, and not the [`MODAL_WIDTH`] it was.** `#6a` and `#6d` both
+/// declare `width: 470px`, which they would: they are one card a step apart,
+/// and a modal that narrowed by ninety points when its third row was pressed
+/// would read as a different window opening. The 380 the by-hand form used to
+/// take was the record composer's narrow column, borrowed before either panel
+/// had been read off the design, and at that width 6d's own two `flex: 1`
+/// parameter columns are 167 apiece and 6c's four parameter chips wrap.
+///
+/// [`Stage::Scanning`] keeps [`MODAL_WIDTH`]: it is four short lines with no
+/// design panel of its own asking it to be wider, and widening it as a side
+/// effect of this would make the card jump on the way to 6b and back.
 fn stage_width(stage: Stage) -> f32 {
     match stage {
         Stage::Picker => PICKER_WIDTH,
-        Stage::Scanning | Stage::Manual => MODAL_WIDTH,
+        Stage::Manual => MANUAL_WIDTH,
+        Stage::Scanning => MODAL_WIDTH,
     }
 }
 
@@ -4100,8 +4978,15 @@ mod tests {
         // over a second heading reading "How to add it", and 6a draws one
         // title and it is this one. See [`PICKER_TITLE`].
         assert!(frame.painted.has(PICKER_TITLE), "the card has no heading");
+        // **Equality and not `has`**, updated deliberately with the 6d design
+        // pass: [`HEADING`] is now 6d's own "Enter the secret", and 6a's third
+        // row is titled "Enter the secret by hand", so the substring test this
+        // used to be would find 6d's heading inside a row title that has
+        // always been there. What it is asking is unchanged -- that the picker
+        // paints one title and it is 6a's -- and this is the only spelling of
+        // it that still asks it.
         assert!(
-            !frame.painted.has(HEADING),
+            !frame.painted.0.iter().any(|t| t == HEADING),
             "the picker paints 6d's heading as well as its own: {:?}",
             frame.painted.0
         );
@@ -4776,5 +5661,525 @@ mod tests {
             });
             action
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Design 6d's geometry, read off the painted shapes.
+    //
+    // Every number asserted below was measured in a browser against
+    // `docs/design/Deskwarden.dc.html`'s own `id="6d"` panel -- the card is
+    // 470 x 345.8, its field 436 x 40.8, each parameter run 212 x 26 and its
+    // footer 468 x 59 -- rather than derived from the constants these tests
+    // are meant to hold. A test that recomputed `MANUAL_FOOTER_PAD_Y * 2.0 +
+    // ...` would agree with any value those constants ever took.
+    // -----------------------------------------------------------------
+
+    /// One frame of design 6d, with its rectangles as well as its text.
+    ///
+    /// A harness of its own rather than [`paint`], for [`Picker`]'s reason:
+    /// the questions below are about where things were drawn and how big they
+    /// came out, and `paint` reads only the text shapes.
+    struct Manual {
+        ctx: egui::Context,
+    }
+
+    struct ManualRun {
+        action: TotpAddAction,
+        painted: Painted,
+        rects: Vec<PaintedRect>,
+    }
+
+    impl ManualRun {
+        /// Every rectangle matching `pick`, in paint order.
+        fn all(&self, pick: impl Fn(&PaintedRect) -> bool) -> Vec<PaintedRect> {
+            self.rects.iter().copied().filter(|r| pick(r)).collect()
+        }
+
+        /// Every rectangle painted wholly inside `outer` and smaller than it.
+        fn inside(&self, outer: egui::Rect) -> Vec<PaintedRect> {
+            self.all(|r| outer.contains_rect(r.rect) && !same_rect(r.rect, outer))
+        }
+
+        /// The footer's answers, left to right: the primary and the way back.
+        ///
+        /// Found by their height inside the footer band rather than by their
+        /// fill, because the primary's fill is not [`theme::BLUE`] when the
+        /// field holds nothing -- `theme::primary_button_enabled` runs a
+        /// disabled button inside a faded `Ui`, and that fade IS the signal
+        /// the action is off.
+        fn answers(&self) -> Vec<PaintedRect> {
+            let band = self.only("footer band", |r| r.fill == theme::CARD_TINT);
+            let mut found: Vec<PaintedRect> = self
+                .inside(band.rect)
+                .into_iter()
+                .filter(|r| (r.rect.height() - theme::BUTTON_HEIGHT).abs() <= 1.0)
+                .collect();
+            found.sort_by(|a, b| a.rect.left().total_cmp(&b.rect.left()));
+            assert_eq!(
+                found.len(),
+                2,
+                "6d's footer draws two answers and {} were painted: {found:?}",
+                found.len()
+            );
+            found
+        }
+
+        /// The one rectangle matching `pick`, or a panic naming what was
+        /// there instead -- so a test that finds nothing says so rather than
+        /// passing over an empty iterator.
+        fn only(&self, what: &str, pick: impl Fn(&PaintedRect) -> bool) -> PaintedRect {
+            let found = self.all(pick);
+            assert!(!found.is_empty(), "6d painted no {what}: {:?}", self.rects);
+            found[0]
+        }
+    }
+
+    impl Manual {
+        fn new() -> Self {
+            let ctx = egui::Context::default();
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            crate::theme::apply(&ctx);
+            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
+            Manual { ctx }
+        }
+
+        fn input(events: Vec<egui::Event>) -> egui::RawInput {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    // Room for [`MANUAL_WIDTH`] and its shadow, and for the
+                    // whole card with 6c fused into it.
+                    egui::vec2(560.0, 1200.0),
+                )),
+                events,
+                ..Default::default()
+            }
+        }
+
+        fn frame(&self, state: &mut TotpAdd, events: Vec<egui::Event>) -> ManualRun {
+            let mut action = TotpAddAction::None;
+            let output = self.ctx.run_ui(Self::input(events), |ui| {
+                ui.set_max_width(stage_width(state.stage));
+                action = draw_stage(ui, state, BOUNDARY);
+            });
+            let mut painted = Painted(Vec::new());
+            let mut rects = Vec::new();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut painted);
+                collect_rects(&clipped.shape, &mut rects);
+            }
+            assert!(
+                !painted.0.is_empty(),
+                "6d painted no text at all, so every assertion over this list would pass \
+                 against nothing"
+            );
+            assert!(
+                !rects.is_empty(),
+                "6d painted no rectangles at all, so every assertion over that list would \
+                 pass against nothing either"
+            );
+            ManualRun { action, painted, rects }
+        }
+
+        fn idle(&self, state: &mut TotpAdd) -> ManualRun {
+            self.frame(state, Vec::new())
+        }
+
+        fn click(&self, state: &mut TotpAdd, at: egui::Pos2) -> ManualRun {
+            self.frame(state, click_at(at))
+        }
+
+        /// A form on 6d with `seed` typed into it, as the by-hand route
+        /// leaves it.
+        fn typing(seed: &str) -> TotpAdd {
+            let mut state = TotpAdd::opening("id-1", "Git Host \u{b7} anovak", false);
+            state.stage = Stage::Manual;
+            state.typed = Zeroizing::new(seed.to_string());
+            state
+        }
+    }
+
+    /// **6d is 470 wide, and [`Stage::Scanning`] is not.**
+    ///
+    /// `#6a` and `#6d` both declare `width: 470px`; the by-hand form took
+    /// `MODAL_WIDTH`'s 380 until this pass. Asserted through `stage_width`
+    /// AND off the painted card, because the two are different claims: the
+    /// first is what the modal asks its `Area` for, the second is what the
+    /// card actually came out as.
+    #[test]
+    fn the_by_hand_stage_is_the_designs_470_and_the_scan_is_left_alone() {
+        assert_eq!(stage_width(Stage::Manual), 470.0, "6d declares width: 470px");
+        assert_eq!(stage_width(Stage::Picker), 470.0, "6a declares width: 470px");
+        assert_eq!(
+            stage_width(Stage::Scanning),
+            MODAL_WIDTH,
+            "the scanning card was widened as a side effect of 6d's pass"
+        );
+
+        let mut state = Manual::typing("");
+        let frame = Manual::new().idle(&mut state);
+        let card = frame.only("12px-radius white card", |r| {
+            r.radius == CARD_RADIUS && r.fill == theme::CARD
+        });
+        assert!(
+            (card.rect.width() - 470.0).abs() <= 1.0,
+            "the card is {} wide and 6d's is 470",
+            card.rect.width()
+        );
+        assert_eq!(card.stroke, theme::BORDER_STRONG, "6c's card is bordered #d7d3d3");
+    }
+
+    /// **The card is the three-band card 6a and 6c declare**: a header ruled
+    /// off, a body, and a `#fbfaf9` footer over a second rule.
+    #[test]
+    fn the_manual_card_carries_the_designs_bands() {
+        let mut state = Manual::typing("");
+        let frame = Manual::new().idle(&mut state);
+
+        let card = frame.only("card", |r| r.radius == CARD_RADIUS && r.fill == theme::CARD);
+        let footer = frame.only("#fbfaf9 footer band", |r| r.fill == theme::CARD_TINT);
+        assert_eq!(footer.radius, 0, "the footer's TOP corners are square");
+        assert!(
+            (footer.rect.bottom() - card.rect.bottom()).abs() <= 2.0,
+            "the footer band does not reach the bottom of the card"
+        );
+        // As wide as the card, because the tint is painted PROUD of the rect
+        // it was allocated -- [`BAND_BLEED`], so no hairline of white card is
+        // left showing between the band and the border. 6d's own band is 468
+        // inside a 470 card, which is the same band.
+        assert!(
+            (footer.rect.width() - card.rect.width()).abs() <= 1.0,
+            "the footer band is {} wide against a {} card",
+            footer.rect.width(),
+            card.rect.width()
+        );
+        // 59 tall: `padding: 12px` and the rule around the 34 the outlined
+        // answer's border makes of its declared 32.
+        assert!(
+            (footer.rect.height() - 59.0).abs() <= 1.0,
+            "the footer band is {} tall and 6d's is 59",
+            footer.rect.height()
+        );
+
+        // Two rules on a card with nothing to overwrite: under the header and
+        // over the footer. The caution band brings a third, which is the next
+        // test's business.
+        let rules = frame.all(|r| r.fill == theme::HAIRLINE && (r.rect.height() - RULE).abs() < 0.5);
+        assert_eq!(rules.len(), 2, "6d rules the header off and the footer on: {rules:?}");
+    }
+
+    /// **6d's field is 6d's box**: 436 x 40.8 at `border-radius: 8px`.
+    ///
+    /// The width is what makes the rest of the card's arithmetic real -- 470
+    /// less the card's border and the body's 16px padding either side -- and
+    /// the height is the design's `padding: 9px 11px` around a 13px line set
+    /// at 1.6, which is the measurement a border-box reading of the same
+    /// declarations gets wrong by two points.
+    #[test]
+    fn the_secret_field_is_the_designs_own_box() {
+        let mut state = Manual::typing("");
+        let frame = Manual::new().idle(&mut state);
+        let field = frame.only("8px-radius field box", |r| {
+            r.radius == SECRET_BOX_RADIUS && (r.rect.width() - 436.0).abs() <= 1.0
+        });
+        assert!(
+            (field.rect.height() - 40.8).abs() <= 0.5,
+            "the field is {} tall and 6d's is 40.8",
+            field.rect.height()
+        );
+        assert_eq!(field.stroke, theme::BORDER_STRONG, "an unfocused field is bordered #d7d3d3");
+        assert!(
+            frame.painted.has(SECRET_HINT),
+            "the caption over the field is missing: {:?}",
+            frame.painted.0
+        );
+    }
+
+    /// **The two parameter runs are `flex: 1` columns**: 212 apiece either
+    /// side of 6d's 12px gap, each at `border-radius: 7px`.
+    #[test]
+    fn the_parameter_runs_split_the_body_between_them() {
+        let mut state = Manual::typing("");
+        let frame = Manual::new().idle(&mut state);
+        let runs = frame.all(|r| {
+            r.radius == CHOICE_RADIUS
+                && r.stroke == theme::BORDER_STRONG
+                && (r.rect.width() - 212.0).abs() <= 1.0
+        });
+        assert_eq!(runs.len(), 2, "6d draws two 212-wide runs: {:?}", frame.rects);
+        assert!(
+            (runs[0].rect.height() - 26.0).abs() <= 2.0,
+            "a run is {} tall and 6d's is 26",
+            runs[0].rect.height()
+        );
+        assert!(
+            (runs[1].rect.left() - runs[0].rect.right() - CHOICE_COLUMN_GAP).abs() <= 1.0,
+            "the two runs are not 6d's 12px apart"
+        );
+        assert!(frame.painted.has(DIGITS_LABEL) && frame.painted.has(PERIOD_LABEL));
+
+        // Exactly one cell of each run is filled `#1b3fa0`, which is the one
+        // thing on this control the user reads. Counted INSIDE each run: the
+        // footer's primary answer is the same blue, and a count taken over
+        // the whole card would be a count of three.
+        for run in &runs {
+            let lit = frame
+                .inside(run.rect)
+                .into_iter()
+                .filter(|r| r.fill == theme::BLUE)
+                .count();
+            assert_eq!(lit, 1, "a run lit {lit} cells rather than one: {:?}", run.rect);
+        }
+    }
+
+    /// **Pressing a cell moves the control**, which is what makes the runs a
+    /// control rather than a picture of one.
+    ///
+    /// Pressed rather than called: the whole run is one `interact` rect
+    /// dividing itself into cells by hand, so a cell that were drawn in the
+    /// wrong place would still light and still never be reachable.
+    #[test]
+    fn pressing_a_cell_changes_the_parameter_it_names() {
+        let manual = Manual::new();
+        let mut state = Manual::typing("JBSWY3DPEHPK3PXP");
+        assert_eq!(state.digits, DEFAULT_DIGITS);
+        assert_eq!(state.period, DEFAULT_PERIOD);
+        let laid_out = manual.idle(&mut state);
+
+        let runs = laid_out.all(|r| {
+            r.radius == CHOICE_RADIUS
+                && r.stroke == theme::BORDER_STRONG
+                && (r.rect.width() - 212.0).abs() <= 1.0
+        });
+        // The last cell of the digits run is 8, and of the period run 60 s.
+        let last_cell = |run: egui::Rect, count: usize| {
+            egui::pos2(
+                run.left() + run.width() * (count as f32 - 0.5) / count as f32,
+                run.center().y,
+            )
+        };
+
+        let _ = manual.click(&mut state, last_cell(runs[0].rect, DIGITS_CHOICES.len()));
+        assert_eq!(
+            state.digits,
+            DIGITS_CHOICES[DIGITS_CHOICES.len() - 1],
+            "pressing the last digits cell did not take"
+        );
+        let _ = manual.click(&mut state, last_cell(runs[1].rect, PERIOD_CHOICES.len()));
+        assert_eq!(
+            state.period,
+            PERIOD_CHOICES[PERIOD_CHOICES.len() - 1],
+            "pressing the last period cell did not take"
+        );
+    }
+
+    /// **A pasted URI states its own parameters, and the runs go inert.**
+    #[test]
+    fn a_pasted_uri_leaves_the_runs_dead_and_says_why() {
+        let manual = Manual::new();
+        let mut typed = Manual::typing("JBSWY3DPEHPK3PXP");
+        assert!(
+            !manual.idle(&mut typed).painted.has(PARAMETERS_FROM_URI),
+            "a bare seed's controls already claimed to come from a URI"
+        );
+
+        let mut pasted = Manual::typing(UNUSUAL);
+        let frame = manual.idle(&mut pasted);
+        assert!(
+            frame.painted.has(PARAMETERS_FROM_URI),
+            "nothing on the card says why the controls cannot be pressed: {:?}",
+            frame.painted.0
+        );
+        // `segmented_control_disabled`'s treatment: the answer in force stays
+        // identifiable in the wash rather than every cell greying alike.
+        let runs = frame.all(|r| {
+            r.radius == CHOICE_RADIUS
+                && r.stroke == theme::BORDER_STRONG
+                && (r.rect.width() - 212.0).abs() <= 1.0
+        });
+        assert_eq!(runs.len(), 2, "the dead controls are not on the card at all");
+        for run in &runs {
+            let cells = frame.inside(run.rect);
+            assert!(
+                !cells.iter().any(|r| r.fill == theme::BLUE),
+                "a dead run painted the live control's #1b3fa0 fill"
+            );
+            assert!(
+                cells.iter().any(|r| r.fill == theme::BLUE_WASH),
+                "a dead run lit nothing at all, so it says the card has no parameters"
+            );
+        }
+
+        // And pressing one does nothing, which is the half a fill cannot say.
+        let before = pasted.digits;
+        let _ = manual.click(&mut pasted, runs[0].rect.center());
+        assert_eq!(pasted.digits, before, "a dead cell was pressable after all");
+    }
+
+    /// **6d's line under the field**, in both of its states.
+    #[test]
+    fn the_validity_line_checks_off_a_seed_and_names_a_refusal() {
+        let manual = Manual::new();
+        let mut good = Manual::typing("JBSW Y3DP EHPK 3PXP");
+        let valid = manual.idle(&mut good);
+        assert!(
+            valid.painted.has("Valid base32"),
+            "6d's own line is not under the field: {:?}",
+            valid.painted.0
+        );
+
+        let mut bad = Manual::typing("https://example.com");
+        let refused = manual.idle(&mut bad);
+        assert!(refused.painted.has("plain URL"), "the refusal is not on screen");
+        assert!(
+            !refused.painted.has("Valid base32"),
+            "a refused field still claimed to be valid base32"
+        );
+        assert!(
+            !refused.painted.has(CONFIRM_HEADING),
+            "a refused field still painted a confirmation to save from"
+        );
+    }
+
+    /// **The header says what the card is for, and switches when a decoder
+    /// did the typing.**
+    #[test]
+    fn the_header_band_carries_6d_typed_and_6c_scanned() {
+        let manual = Manual::new();
+        let mut typed = Manual::typing("JBSWY3DPEHPK3PXP");
+        let by_hand = manual.idle(&mut typed);
+        assert!(by_hand.painted.has(HEADING), "6d's header is not on the card");
+        assert!(!by_hand.painted.has(CODE_READ_KIND), "a typed seed claimed to have been read");
+
+        let mut scanned = TotpAdd::opening("id-1", "Git Host", false);
+        scanned.accept_decoded(Zeroizing::new(UNUSUAL.to_string()));
+        let read = manual.idle(&mut scanned);
+        assert!(
+            read.painted.has(CODE_READ_LABEL) && read.painted.has(CODE_READ_KIND),
+            "the scanned card's header is not 6c's: {:?}",
+            read.painted.0
+        );
+        assert!(
+            !read.painted.0.iter().any(|t| t == HEADING),
+            "the scanned card still asks for a secret to be entered"
+        );
+        assert!(
+            !read.painted.has(SECRET_HINT),
+            "the editable field was drawn for a scanned payload"
+        );
+    }
+
+    /// **The replace warning is 6c's caution band and not a red label.**
+    ///
+    /// The sentence is unchanged -- it is pinned by content in
+    /// `the_replace_warning_is_the_designs_own_sentence` -- and where it is
+    /// drawn is what this pass moved: onto `#fef6e7`, directly over the
+    /// button that does the thing, which is 6c's own arrangement.
+    #[test]
+    fn the_replace_warning_is_drawn_in_the_designs_caution_band() {
+        let manual = Manual::new();
+        let mut clean = Manual::typing("JBSWY3DPEHPK3PXP");
+        let safe = manual.idle(&mut clean);
+        assert!(!safe.painted.has("cannot be recovered"));
+        assert!(
+            safe.all(|r| r.fill == CAUTION_FILL).is_empty(),
+            "a card with nothing to overwrite drew the caution band anyway"
+        );
+
+        let mut existing = Manual::typing("JBSWY3DPEHPK3PXP");
+        existing.already_has_code = true;
+        let frame = manual.idle(&mut existing);
+        assert!(frame.painted.has(REPLACE_WARNING), "the warning is not on the card");
+        let band = frame.only("#fef6e7 caution band", |r| r.fill == CAUTION_FILL);
+        let footer = frame.only("footer band", |r| r.fill == theme::CARD_TINT);
+        assert!(
+            (band.rect.bottom() - footer.rect.top()).abs() <= 1.0,
+            "the caution band does not sit directly over the footer it warns about"
+        );
+        assert!(frame.painted.has(REPLACE_LABEL), "the destructive face is not on the button");
+        assert!(!frame.painted.has(SAVE_LABEL), "both button faces were painted at once");
+    }
+
+    /// **The footer is one row for both of the design's two**: the primary,
+    /// the way back to 6a, and the Escape hint at the far right.
+    #[test]
+    fn the_footer_carries_the_primary_the_way_back_and_the_escape_hint() {
+        let manual = Manual::new();
+        let mut state = Manual::typing("JBSWY3DPEHPK3PXP");
+        let frame = manual.idle(&mut state);
+        assert!(frame.painted.has(SAVE_LABEL), "the primary answer is missing");
+        assert!(frame.painted.has(OTHER_WAYS_LABEL), "the way back to 6a is missing");
+        assert!(
+            frame.painted.has(DISMISS_HINT),
+            "6c's Esc hint is not on the footer: {:?}",
+            frame.painted.0
+        );
+        // The hint carries the cancel, so there is no second button saying the
+        // same thing. See [`manual_footer`].
+        assert!(
+            !frame.painted.0.iter().any(|t| t == "Cancel"),
+            "the footer draws both the Esc hint and a Cancel button for one action"
+        );
+
+        // And the key the hint names really answers, through the modal that
+        // binds it -- pinned already by
+        // `escape_closes_the_picker_and_the_manual_form`, restated here as the
+        // control this assertion needs: a hint for a dead key is the thing
+        // this file refuses.
+        let modal = Modal::new();
+        let mut state = Manual::typing("JBSWY3DPEHPK3PXP");
+        let _ = modal.frame(&mut state, Vec::new());
+        assert_eq!(modal.frame(&mut state, Modal::escape()), TotpAddAction::Cancel);
+    }
+
+    /// **The primary is dead until there is something to save**, and reports
+    /// [`TotpAddAction::Save`] when it is pressed.
+    #[test]
+    fn the_primary_answers_only_once_the_field_reads_as_a_code() {
+        let manual = Manual::new();
+        let mut empty = Manual::typing("");
+        let blank = manual.idle(&mut empty);
+        let primary = blank.answers()[0];
+        assert_ne!(
+            primary.fill,
+            theme::BLUE,
+            "the primary is at full strength with nothing to save, so it does not look off"
+        );
+        assert_eq!(
+            manual.click(&mut empty, primary.rect.center()).action,
+            TotpAddAction::None,
+            "the primary saved an empty field"
+        );
+
+        let mut state = Manual::typing("JBSWY3DPEHPK3PXP");
+        let laid_out = manual.idle(&mut state);
+        let primary = laid_out.answers()[0];
+        assert_eq!(primary.fill, theme::BLUE, "a live primary is not the design's #1b3fa0");
+        assert_eq!(
+            manual.click(&mut state, primary.rect.center()).action,
+            TotpAddAction::Save,
+            "the primary did not report a save"
+        );
+    }
+
+    /// **The way back is a button in the footer**, and it really goes back.
+    ///
+    /// It was a text link in the old button row. 6c draws it as an outlined
+    /// answer beside the primary, which is where a second answer belongs, and
+    /// pressing it must still empty the field -- see [`TotpAdd::back_to_picker`],
+    /// which is the reason this is asserted through a press rather than by
+    /// calling the thing the press calls.
+    #[test]
+    fn the_footers_second_answer_goes_back_to_the_picker() {
+        let manual = Manual::new();
+        let mut state = Manual::typing("JBSWY3DPEHPK3PXP");
+        let laid_out = manual.idle(&mut state);
+        let back = laid_out.answers()[1];
+        assert_eq!(back.stroke, theme::BORDER_STRONG, "the second answer is not outlined");
+
+        let after = manual.click(&mut state, back.rect.center());
+        assert_eq!(after.action, TotpAddAction::None, "the way back asked the caller to act");
+        assert_eq!(state.stage, Stage::Picker, "the second answer did not go back to 6a");
+        assert!(state.typed.is_empty(), "a seed was left resident on the way back");
     }
 }
