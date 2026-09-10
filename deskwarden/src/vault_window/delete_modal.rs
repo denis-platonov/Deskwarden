@@ -38,6 +38,7 @@
 //! lists this window keeps.
 
 use crate::theme;
+use crate::vault_bridge::VaultItem;
 use eframe::egui::{self, RichText};
 
 /// Which of the two deletes is being confirmed.
@@ -105,9 +106,14 @@ pub struct DeleteConfirmState {
     /// across frames, a sync can replace the snapshot under it, and the
     /// handler looks the item up fresh when it acts.
     pub item_id: String,
-    /// The row's name, for the sentence. Copied because it is only ever
-    /// shown, never written back.
-    pub item_name: String,
+    /// The row the card shows: the item's tile, its name and its username,
+    /// copied at the moment the modal opened.
+    ///
+    /// **Still a copy and still not the item**, which is the rule above
+    /// applied to the rest of what is drawn rather than an exception to it --
+    /// see [`super::ModalSubject`], which owns that argument and the
+    /// texture-handle half of it.
+    pub subject: super::ModalSubject,
     /// Which delete this is.
     pub kind: DeleteKind,
     /// The refusal to show when the vault write fails.
@@ -120,9 +126,22 @@ pub struct DeleteConfirmState {
 }
 
 impl DeleteConfirmState {
-    /// Opens the modal for one item.
-    pub fn new(item_id: String, item_name: String, kind: DeleteKind) -> Self {
-        Self { item_id, item_name, kind, error: None }
+    /// Opens the modal for one item, with `icon` the caller's
+    /// `icons.textures.get(item.id.as_str())`.
+    ///
+    /// **Takes the item and copies out of it here, rather than taking the
+    /// three or four strings the card shows.** Four call sites open this
+    /// modal -- two row commands and two detail-pane actions -- and each of
+    /// them already holds the item; a constructor spelling out what a subject
+    /// line consists of would spell it out four times, and the next field the
+    /// line grows would be added to three of them.
+    pub fn new(item: &VaultItem, icon: Option<&egui::TextureHandle>, kind: DeleteKind) -> Self {
+        Self {
+            item_id: item.id.clone(),
+            subject: super::ModalSubject::of(item, icon),
+            kind,
+            error: None,
+        }
     }
 }
 
@@ -185,11 +204,14 @@ pub fn draw_delete_modal(
             dismiss: "Cancel",
         },
         |ui| {
-            // The row this is about, named and wearing its own tile. The menu
-            // that opened this is gone from the screen by now, and a
-            // confirmation that did not say which item it was about would be
-            // one click away from deleting the wrong credential.
-            theme::modal_subject(ui, &state.item_name);
+            // The row this is about, drawn as the results list draws it --
+            // its own icon, its own name, its own username. The menu that
+            // opened this is gone from the screen by now, and a confirmation
+            // that did not say which item it was about would be one click
+            // away from deleting the wrong credential; two logins at the same
+            // bank differ by their username and nothing else, which is why
+            // the second line is not decoration.
+            state.subject.draw(ui);
             ui.add_space(12.0);
             // Wrapped, not truncated: this is the sentence that says what the
             // button does, and half of it is worse than none.
@@ -238,6 +260,41 @@ pub fn draw_delete_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One vault item, with whatever the test needs on it.
+    ///
+    /// `item_type` and `username` are both arguments because the subject line
+    /// reads both: the username is its second line, and the kind is what
+    /// decides which mark the tile falls back to when no favicon has been
+    /// fetched.
+    fn item(name: &str, username: Option<&str>, item_type: Option<i64>) -> VaultItem {
+        VaultItem {
+            id: "i1".into(),
+            name: name.into(),
+            fields: vec![],
+            login: username.map(|u| crate::vault_bridge::LoginData {
+                username: Some(u.to_string()),
+                password: None,
+                totp: None,
+                uris: vec![],
+                other: serde_json::Map::new(),
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// A login with a username, which is the row every test here opens
+    /// against unless it is testing one of the other shapes.
+    fn login() -> VaultItem {
+        item("Ledgerline", Some("a.novak@ledgerline.com"), Some(1))
+    }
 
     /// **The two deletes never share a sentence.** Every string this modal
     /// can show differs between the two kinds, which is the whole reason
@@ -290,11 +347,10 @@ mod tests {
     /// that has not been attempted.
     #[test]
     fn a_freshly_opened_modal_shows_no_refusal() {
-        let state =
-            DeleteConfirmState::new("id".into(), "Bank".into(), DeleteKind::ToTrash);
+        let state = DeleteConfirmState::new(&login(), None, DeleteKind::ToTrash);
         assert_eq!(state.error, None);
-        assert_eq!(state.item_id, "id");
-        assert_eq!(state.item_name, "Bank");
+        assert_eq!(state.item_id, "i1");
+        assert_eq!(state.subject.name(), "Ledgerline");
         assert_eq!(state.kind, DeleteKind::ToTrash);
     }
     // -- what it paints, and what a click on it reports ----------------------
@@ -314,6 +370,23 @@ mod tests {
     impl Painted {
         fn strings(&self) -> Vec<&str> {
             self.texts.iter().map(|(t, _)| t.as_str()).collect()
+        }
+
+        /// Where each PICTURE landed.
+        ///
+        /// A favicon reaches the shape list as an ordinary `Shape::Rect`
+        /// carrying a texture in its `brush` -- `egui::Image::paint_at` with
+        /// a corner radius takes that path rather than emitting a mesh -- so
+        /// the texture id is what tells a drawn image from every plain
+        /// rectangle on the card. Nothing else here paints one, which makes
+        /// this the only way a test can see that the subject line is drawing
+        /// the item's real picture instead of its monogram.
+        fn images(&self) -> Vec<egui::Rect> {
+            self.rects
+                .iter()
+                .filter(|r| r.fill_texture_id() != egui::TextureId::default())
+                .map(|r| r.rect)
+                .collect()
         }
 
         /// The one band that runs the card's whole width in `fill`.
@@ -506,8 +579,7 @@ mod tests {
     fn the_header_band_is_the_destructive_colour_and_carries_the_heading() {
         for kind in [DeleteKind::ToTrash, DeleteKind::Forever] {
             let ctx = styled_context();
-            let mut state =
-                DeleteConfirmState::new("i1".into(), "Ledgerline".into(), kind);
+            let mut state = DeleteConfirmState::new(&login(), None, kind);
             let painted = opened(&ctx, &mut state);
 
             let band = painted.band(theme::ERROR);
@@ -547,10 +619,19 @@ mod tests {
     fn it_paints_the_heading_the_item_and_both_buttons() {
         for kind in [DeleteKind::ToTrash, DeleteKind::Forever] {
             let ctx = styled_context();
-            let mut state =
-                DeleteConfirmState::new("i1".into(), "Ledgerline".into(), kind);
+            let mut state = DeleteConfirmState::new(&login(), None, kind);
             let painted = opened(&ctx, &mut state);
-            for expected in [kind.heading(), "Ledgerline", kind.confirm_label(), "Cancel"] {
+            // The username joined this list when the subject line became the
+            // item's row. Two logins at the same bank differ by it and by
+            // nothing else, so a card naming only "Ledgerline" is a card that
+            // cannot tell the reader which of the two is about to go.
+            for expected in [
+                kind.heading(),
+                "Ledgerline",
+                "a.novak@ledgerline.com",
+                kind.confirm_label(),
+                "Cancel",
+            ] {
                 assert!(
                     painted.strings().contains(&expected),
                     "{kind:?}: the modal never painted {expected:?}; it painted: {:?}",
@@ -558,6 +639,92 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **The subject line is the item's ROW, tile and all.**
+    ///
+    /// Three branches, because the tile has three: the item's favicon when
+    /// the icon cache has one, the item's KIND mark when it does not, and the
+    /// name's monogram when the kind has no mark of its own. That branch is
+    /// `vault_window::ModalSubject`'s and it is the whole point of this
+    /// change -- the card used to draw a monogram for every item, including
+    /// the ones the reader had just picked out of the list BY their logo.
+    ///
+    /// The favicon half is asserted as a painted `Shape::Image`, because a
+    /// texture is the one thing on this card with no string and no fill to
+    /// find it by; the fallbacks are asserted as the absence of that image
+    /// plus, for the monogram, its two letters.
+    #[test]
+    fn the_subject_line_is_the_items_row() {
+        // With a picture: the item's own artwork, and no monogram under it.
+        let ctx = styled_context();
+        let texture = ctx.load_texture(
+            "delete-modal-test-icon",
+            egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]),
+            egui::TextureOptions::default(),
+        );
+        let mut state =
+            DeleteConfirmState::new(&login(), Some(&texture), DeleteKind::ToTrash);
+        let painted = opened(&ctx, &mut state);
+        assert_eq!(
+            painted.images().len(),
+            1,
+            "the card painted {} pictures; the item's favicon is the only one it draws",
+            painted.images().len()
+        );
+        assert!(
+            !painted.strings().contains(&"LE"),
+            "the card drew the name's monogram over an item that has a favicon: {:?}",
+            painted.strings()
+        );
+        let tile = painted.images()[0];
+        let name = painted.lowest_rect_of("Ledgerline");
+        assert!(
+            tile.right() <= name.left(),
+            "the tile at {tile:?} is not in front of the name at {name:?}"
+        );
+
+        // With no picture and no kind mark -- a login -- the monogram.
+        let ctx = styled_context();
+        let mut state = DeleteConfirmState::new(&login(), None, DeleteKind::ToTrash);
+        let painted = opened(&ctx, &mut state);
+        assert!(
+            painted.images().is_empty(),
+            "the card painted a picture for an item the icon cache has none for"
+        );
+        assert_eq!(
+            theme::initials("Ledgerline"),
+            "LE",
+            "the monogram this test looks for is not the one `theme` would draw"
+        );
+        assert!(
+            painted.strings().contains(&"LE"),
+            "a login with no favicon lost its monogram tile; it painted: {:?}",
+            painted.strings()
+        );
+
+        // With no picture and a kind that HAS a mark -- a secure note --
+        // neither: `kind_mark::avatar` strokes the note rather than typing
+        // two letters, exactly as the row does.
+        let ctx = styled_context();
+        let note = item("Recovery codes", None, Some(2));
+        let mut state = DeleteConfirmState::new(&note, None, DeleteKind::ToTrash);
+        let painted = opened(&ctx, &mut state);
+        assert!(
+            painted.images().is_empty(),
+            "the card painted a picture for a secure note the cache has none for"
+        );
+        assert!(
+            !painted.strings().contains(&"RC"),
+            "a secure note got the name's monogram instead of the kind mark the row draws; \
+             it painted: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.strings().contains(&"Recovery codes"),
+            "the note's name is missing, so the negative above proves nothing: {:?}",
+            painted.strings()
+        );
     }
 
     /// **The red button reports a confirm, and the grey one a cancel.**
@@ -573,8 +740,7 @@ mod tests {
                 ("Cancel", DeleteConfirmAction::Cancel),
             ] {
                 let ctx = styled_context();
-                let mut state =
-                    DeleteConfirmState::new("i1".into(), "Ledgerline".into(), kind);
+                let mut state = DeleteConfirmState::new(&login(), None, kind);
                 let painted = opened(&ctx, &mut state);
                 let at = painted.lowest_rect_of(label).center();
                 let (action, _) = frame(&ctx, &mut state, &click(at));
@@ -595,8 +761,7 @@ mod tests {
     #[test]
     fn escape_cancels_and_enter_does_nothing() {
         let ctx = styled_context();
-        let mut state =
-            DeleteConfirmState::new("i1".into(), "Ledgerline".into(), DeleteKind::Forever);
+        let mut state = DeleteConfirmState::new(&login(), None, DeleteKind::Forever);
         let _ = opened(&ctx, &mut state);
 
         let enter = vec![egui::Event::Key {
@@ -624,8 +789,7 @@ mod tests {
     #[test]
     fn a_refusal_written_into_the_state_reaches_the_card() {
         let ctx = styled_context();
-        let mut state =
-            DeleteConfirmState::new("i1".into(), "Ledgerline".into(), DeleteKind::ToTrash);
+        let mut state = DeleteConfirmState::new(&login(), None, DeleteKind::ToTrash);
         let clean = opened(&ctx, &mut state);
         let sentence = "Couldn't delete this. It's still in your vault.";
         assert!(!clean.strings().contains(&sentence));
@@ -646,8 +810,7 @@ mod tests {
     #[test]
     fn the_scrim_is_the_one_the_keyboard_gate_looks_for() {
         let ctx = styled_context();
-        let mut state =
-            DeleteConfirmState::new("i1".into(), "Ledgerline".into(), DeleteKind::ToTrash);
+        let mut state = DeleteConfirmState::new(&login(), None, DeleteKind::ToTrash);
         let _ = opened(&ctx, &mut state);
         assert!(
             ctx.memory(|m| m.areas().is_visible(&egui::LayerId::new(

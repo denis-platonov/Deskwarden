@@ -2460,6 +2460,28 @@ pub const ENVELOPE_FLAP_VERTICES: usize = 3;
 /// guard on it rather than this sentence.
 pub const FOLDER_VERTICES: usize = 6;
 
+/// Corners in the modal header's warning triangle, and the samples each of
+/// them is rounded across -- [`star_outline`]'s scheme and, endpoints
+/// included, its arithmetic.
+const WARNING_CORNERS: usize = 3;
+const WARNING_ROUND_SEGMENTS: usize = 3;
+
+/// Vertices in the warning triangle's outline: one rounding arc per
+/// [`WARNING_CORNERS`].
+///
+/// **Declared with this family rather than beside its painter, because what
+/// the number has to satisfy is this family's rule and not the modal's.** A
+/// triangle drawn with the three points its geometry actually has is an
+/// unfilled closed path of [`ENVELOPE_FLAP_VERTICES`] points, which is
+/// exactly what `icon_probe::envelopes` anchors on -- and that probe *panics*
+/// on a flap it cannot find a four-point body around, so the collision would
+/// not have been a misreport but a crash in any test walking a frame that
+/// carried both marks. That is the hazard the old hand-drawn glyph dodged by
+/// stroking three loose segments, at the cost of its own corners; rounding
+/// them puts the count at twelve, which nothing else in this crate closes
+/// over. [`no_two_drawn_icons_share_a_vertex_count`] is the live guard.
+pub const WARNING_VERTICES: usize = WARNING_CORNERS * (WARNING_ROUND_SEGMENTS + 1);
+
 /// Half the folder mark's width: the outline spans 9px, sized against a 12px
 /// subtitle rather than against the 34px header controls -- this is the only
 /// mark in this file that sits INSIDE a run of text.
@@ -4336,8 +4358,27 @@ const MODAL_TITLE_PX: f32 = 14.0;
 /// The gap between the header's glyph and its title.
 const MODAL_GLYPH_GAP: f32 = 8.0;
 
-/// The monogram tile beside the body's subject line.
+/// The item tile beside the body's subject line.
+///
+/// Smaller than `item_list::AVATAR_SIZE`'s 40 and larger than nothing: the
+/// card is 340-360 wide against a list pane of 390, so a tile at the row's
+/// own size would be the same tile at very nearly the same width, and the
+/// modal would read as a row that had been lifted rather than as a card about
+/// one. 28 is a tile that is recognisably the row's, at the scale the card's
+/// other content is set in.
 const MODAL_SUBJECT_TILE: f32 = 28.0;
+
+/// The subject line's two type sizes and the gap between them.
+///
+/// `item_list`'s `TITLE_SIZE`, `SUBTITLE_SIZE` and `TITLE_GAP_Y`, restated
+/// here rather than imported: this file is under `item_list` in the
+/// dependency order and reaching up into it for three numbers would put the
+/// design system behind the window that uses it. The numbers agreeing is what
+/// makes the line read as the same line; `the_subject_line_is_the_items_row`
+/// in `delete_modal` is what notices when it stops.
+const MODAL_SUBJECT_NAME_PX: f32 = 13.0;
+const MODAL_SUBJECT_USERNAME_PX: f32 = 11.0;
+const MODAL_SUBJECT_GAP_Y: f32 = 2.0;
 
 /// `box-shadow: 0 6px 20px rgba(45, 43, 43, 0.18)`, and the one thing on this
 /// card that is not also on a card somewhere else in the app.
@@ -4369,8 +4410,24 @@ pub enum ModalGlyph {
 
 /// Everything the frame needs to know that is not the card's own content.
 pub struct ModalCard<'a> {
-    /// The header band's fill. [`ERROR`] for a destructive question, [`BLUE`]
-    /// for an ordinary one.
+    /// The header band's fill **and the card's own outline**. [`ERROR`] for a
+    /// destructive question, [`BLUE`] for an ordinary one.
+    ///
+    /// The report was "red modal should have red frame", about the delete
+    /// confirmation, and it does not by itself say whether the blue card gets
+    /// a blue one. It does, and the argument is that the alternative is two
+    /// rules where the shape has one. The frame is not an alarm signal that
+    /// happens to be painted on an edge -- it is the card's edge taking the
+    /// card's own accent, the same way the header band, the confirm button
+    /// and (on the delete card) the refusal sentence already do. Read the
+    /// other way round, a rule saying "the outline is [`BORDER`] unless the
+    /// accent is [`ERROR`]" makes the icon modal the one card in the app
+    /// whose accent stops at the band, and leaves the next accent anybody
+    /// adds -- an amber caution, say -- with no answer at all.
+    ///
+    /// It also costs nothing on the quiet card: at 1px, [`BLUE`] against the
+    /// scrim is very nearly [`BORDER`] against it, and what the eye reads is
+    /// the header it continues.
     pub accent: Color32,
     /// The mark beside the title.
     pub glyph: ModalGlyph,
@@ -4462,7 +4519,10 @@ pub fn modal_card(
             egui::Frame::new()
                 .fill(CARD)
                 .corner_radius(CornerRadius::same(MODAL_RADIUS))
-                .stroke(Stroke::new(1.0, BORDER))
+                // The accent and not [`BORDER`] -- see [`ModalCard::accent`]
+                // for why every card gets its own colour here and not just
+                // the destructive one.
+                .stroke(Stroke::new(1.0, card.accent))
                 .shadow(MODAL_SHADOW)
                 .show(ui, |ui| {
                     ui.set_width(card.width);
@@ -4523,40 +4583,137 @@ fn modal_header_band(ui: &mut Ui, card: &ModalCard<'_>) {
     );
 }
 
+/// An equilateral triangle's height as a fraction of its base, which is the
+/// one number that makes this mark the shape the design names rather than
+/// "a triangle". sqrt(3)/2, written out because `f32::sqrt` is not const.
+const WARNING_EQUILATERAL: f32 = 0.866_025_4;
+
+/// How much of each edge a corner's rounding eats, as a fraction of that
+/// edge. The triangle is equilateral, so all three edges are the same length
+/// and a fraction of the vector to a neighbouring corner IS a fraction of the
+/// edge -- the identity [`star_outline`] leans on for the same purpose.
+///
+/// Just under a sixth. Enough to take the chip off the 60-degree apex, which
+/// is the sharpest corner anything in this app strokes and the one the eye
+/// lands on first; more than this and the mark stops reading as a triangle at
+/// [`MODAL_GLYPH_SIZE`].
+const WARNING_ROUND: f32 = 0.16;
+
+/// The warning triangle's stroke, and the bang's inside it.
+///
+/// Heavier than [`ICON_STROKE`], and deliberately not part of that family:
+/// every mark that wears 1.3 is grey ink on a white card, where this one is
+/// white ink on a saturated band. A light stroke on a strong ground loses
+/// perceived weight to the colour bleeding around it, and this is also the
+/// only mark in the app that has to hold its own beside 14px bold type.
+const WARNING_STROKE: f32 = 1.6;
+
+/// The bang's dot, as a radius.
+///
+/// **A circle rather than the filled square this used to be.** The square was
+/// chosen to stay clear of `icon_probe`, and it worked, but a 1.6px square is
+/// visibly a square at 100% scaling and the design draws a dot. The radius is
+/// what keeps the probe clear now, and it is a constraint and not a taste:
+/// `icon_probe::kebab_dots` matches a circle on radius alone, so a dot at
+/// [`KEBAB_DOT_RADIUS`] would be counted by every "the header paints exactly
+/// three dots" assertion in `detail.rs`.
+/// [`the_drawn_circles_do_not_share_a_radius`] is the live guard.
+const WARNING_DOT_RADIUS: f32 = 1.15;
+
+/// Where the bang's bar begins and ends, and where its dot sits, as signed
+/// fractions of the triangle's half-height measured from its centre --
+/// negative is up.
+///
+/// Not symmetric about the centre, because the triangle is not: its ink
+/// crowds the bottom edge and thins to nothing at the apex, so a bang centred
+/// on the geometric middle sits visibly high. At [`MODAL_GLYPH_SIZE`] these
+/// put the bang's own ink around y = +1.5 against the triangle's centroid at
+/// +2.2, which is as close as the mark gets to balanced while leaving the dot
+/// clear of the base by more than half the base's own stroke and the bar's
+/// gap wider than the stroke it is a gap in.
+const WARNING_BAR_TOP: f32 = -0.30;
+const WARNING_BAR_BOTTOM: f32 = 0.22;
+const WARNING_DOT_DROP: f32 = 0.58;
+
 /// The warning triangle, **stroked rather than typed**.
 ///
 /// U+26A0 is not in Archivo and is not in egui's fallback stack either, which
 /// is the same measurement [`close_glyph`] records for U+2715 and the same
 /// answer: a codepoint this app's face does not carry renders as a tofu box.
-/// Line segments and not an `egui::Shape::Path`, because `icon_probe` tells
-/// this crate's drawn marks apart by the point count of their closed paths
-/// and a fourth three-point path would be findable as the envelope's flap.
+///
+/// **One closed path and not three line segments, which is most of what "does
+/// not match the design" was.** The segments were how the first version kept
+/// clear of `icon_probe::envelopes` -- see [`WARNING_VERTICES`] for that
+/// hazard, which is real and unchanged -- and they cost the mark its corners:
+/// `egui::Stroke` carries no join style, so three flat-capped segments meeting
+/// at a 60-degree apex leave the point chipped open. Rounding the corners in
+/// the path is the fix [`STAR_STROKE`]'s own history records for the same
+/// defect, and it carries the point count clear of the flap's three at the
+/// same time, so the constraint and the design agree here rather than trade.
 fn paint_warning_glyph(painter: &egui::Painter, rect: Rect, color: Color32) {
-    let stroke = Stroke::new(1.4, color);
-    let apex = Pos2::new(rect.center().x, rect.top());
-    let left = Pos2::new(rect.left(), rect.bottom());
-    let right = Pos2::new(rect.right(), rect.bottom());
-    painter.line_segment([apex, right], stroke);
-    painter.line_segment([right, left], stroke);
-    painter.line_segment([left, apex], stroke);
-    // The bang inside it: a bar, then a gap, then a dot. The dot is a filled
-    // square and not a circle because `icon_probe` reads circle radii too,
-    // and at 1.6px across nobody can tell the two apart anyway.
+    let stroke = Stroke::new(WARNING_STROKE, color);
+    painter.add(egui::Shape::Path(egui::epaint::PathShape {
+        points: warning_outline(rect),
+        closed: true,
+        // The mark is an outline, so this is what it draws -- and it is also
+        // what keeps it in the half of `icon_probe` that walks UNFILLED
+        // closed paths, where a triangle belongs, rather than making the
+        // point count the only thing standing between it and a filled
+        // family. The folder mark and the envelope's flap state the same
+        // rule for the same reason.
+        fill: Color32::TRANSPARENT,
+        stroke: stroke.into(),
+    }));
+    // The bang inside it: a bar, then a gap, then a dot.
+    let half_height = rect.width() * WARNING_EQUILATERAL / 2.0;
+    let bang_x = rect.center().x;
+    let at = |fraction: f32| rect.center().y + half_height * fraction;
     painter.line_segment(
-        [
-            Pos2::new(rect.center().x, rect.top() + rect.height() * 0.36),
-            Pos2::new(rect.center().x, rect.bottom() - rect.height() * 0.32),
-        ],
+        [Pos2::new(bang_x, at(WARNING_BAR_TOP)), Pos2::new(bang_x, at(WARNING_BAR_BOTTOM))],
         stroke,
     );
-    painter.rect_filled(
-        Rect::from_center_size(
-            Pos2::new(rect.center().x, rect.bottom() - rect.height() * 0.17),
-            Vec2::splat(1.6),
-        ),
-        CornerRadius::ZERO,
+    painter.circle_filled(
+        Pos2::new(bang_x, at(WARNING_DOT_DROP)),
+        WARNING_DOT_RADIUS,
         color,
     );
+}
+
+/// The triangle's rounded outline: an equilateral triangle as wide as `rect`,
+/// point up, centred in it, with every corner cut back by [`WARNING_ROUND`]
+/// and carried across the cut by a quadratic Bezier.
+///
+/// **It is inscribed in the width and centred in the height, rather than
+/// filling the box.** The version this replaces put its apex on the box's top
+/// edge and its base on the bottom one, which at [`MODAL_GLYPH_SIZE`] is a
+/// triangle 15 wide and 15 tall -- 15% taller than equilateral, and beside a
+/// 14px title it read as a narrow wedge rather than as the sign it is meant
+/// to be. Taking the height from the width is what makes "equilateral" a
+/// property of the mark instead of a property of the box it happens to be
+/// handed.
+fn warning_outline(rect: Rect) -> Vec<Pos2> {
+    let half_base = rect.width() / 2.0;
+    let half_height = rect.width() * WARNING_EQUILATERAL / 2.0;
+    let corners = [
+        Vec2::new(0.0, -half_height),
+        Vec2::new(half_base, half_height),
+        Vec2::new(-half_base, half_height),
+    ];
+    let mut points: Vec<Vec2> = Vec::with_capacity(WARNING_VERTICES);
+    for i in 0..WARNING_CORNERS {
+        let here = corners[i];
+        let before = corners[(i + WARNING_CORNERS - 1) % WARNING_CORNERS];
+        let after = corners[(i + 1) % WARNING_CORNERS];
+        let from = here + (before - here) * WARNING_ROUND;
+        let to = here + (after - here) * WARNING_ROUND;
+        for step in 0..=WARNING_ROUND_SEGMENTS {
+            let t = step as f32 / WARNING_ROUND_SEGMENTS as f32;
+            let u = 1.0 - t;
+            points.push(from * (u * u) + here * (2.0 * u * t) + to * (t * t));
+        }
+    }
+    debug_assert_eq!(points.len(), WARNING_VERTICES);
+    points.into_iter().map(|p| rect.center() + p).collect()
 }
 
 /// The footer: a hairline, then the tinted band, then the two answers filling
@@ -4620,8 +4777,9 @@ fn modal_answer(ui: &mut Ui, at: Rect, add: impl FnOnce(&mut Ui) -> Response) ->
     add(&mut slot).clicked()
 }
 
-/// The body's opening line: the monogram tile for `name`, and `name` beside
-/// it.
+/// The body's opening line: the item's own tile, its name, and `username`
+/// under the name -- **the row the results list draws, at the top of the card
+/// that is asking about it**.
 ///
 /// Both modals that use the frame are about one vault item, and both used to
 /// name it in a faint 11px line under the heading -- which is where a caption
@@ -4629,10 +4787,48 @@ fn modal_answer(ui: &mut Ui, at: Rect, add: impl FnOnce(&mut Ui) -> Response) ->
 /// own tile in front of its own name and sets the name in the body's weight,
 /// so that the thing about to be deleted (or given a picture) is the first
 /// thing on the card that is read.
-pub fn modal_subject(ui: &mut Ui, name: &str) {
+///
+/// **And it is the SAME line the list draws, not a smaller echo of it.** The
+/// first version drew a monogram tile and the name alone, so a card opened
+/// from a row carrying a bank's favicon and a login name showed neither --
+/// which asks the reader to match a name against a row they can no longer
+/// see, when the row itself is what they recognised in the first place. The
+/// two sizes and the two colours below are `item_list`'s `TITLE_SIZE` /
+/// `SUBTITLE_SIZE` and its [`INK`] / [`TEXT_FAINT`], and the gap is its
+/// `TITLE_GAP_Y`.
+///
+/// **The tile is a closure, and that is the module boundary rather than a
+/// style.** What goes in it -- the favicon when the icon cache has one, the
+/// item's KIND mark when it does not, the name's monogram when the kind has
+/// none -- is a decision about vault items, and this file knows nothing about
+/// vault items and should not start now. `vault_window::ModalSubject` is
+/// where that branch is made, once, for both cards.
+pub fn modal_subject(ui: &mut Ui, name: &str, username: &str, tile: impl FnOnce(&mut Ui, f32)) {
     ui.horizontal(|ui| {
-        avatar(ui, &initials(name), MODAL_SUBJECT_TILE, false);
-        ui.add(egui::Label::new(semibold(name, 13.0).color(INK)).truncate());
+        tile(ui, MODAL_SUBJECT_TILE);
+        // A vertical of its own rather than two labels in the horizontal:
+        // `ui.horizontal` centres its children on the cross axis, so the
+        // column of one or two lines is centred against the tile exactly as
+        // `item_row`'s is -- and a one-line subject (an item with no login)
+        // stays centred rather than riding up to the tile's top edge.
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = MODAL_SUBJECT_GAP_Y;
+            ui.add(egui::Label::new(semibold(name, MODAL_SUBJECT_NAME_PX).color(INK)).truncate());
+            // Truncated and not wrapped, and skipped entirely when there is
+            // none: a card is a fixed width, and a second line that wrapped
+            // would push the sentence under it -- the sentence that says what
+            // the button does -- down by a line for some items and not others.
+            if !username.is_empty() {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(username)
+                            .size(MODAL_SUBJECT_USERNAME_PX)
+                            .color(TEXT_FAINT),
+                    )
+                    .truncate(),
+                );
+            }
+        });
     });
 }
 
@@ -6535,6 +6731,26 @@ mod drawn_icon_family_tests {
                 ENVELOPE_FLAP_VERTICES,
                 "the envelope's own flap",
             ),
+            // The modal header's triangle joined this list when it stopped
+            // being three loose segments. Every pair, and the flap's pair
+            // first: three points is the count it would have had if its
+            // corners were left sharp, and `icon_probe::envelopes` PANICS on
+            // an unfilled three-point path it cannot find a body around.
+            (
+                WARNING_VERTICES,
+                "the warning triangle",
+                ENVELOPE_FLAP_VERTICES,
+                "the envelope's flap",
+            ),
+            (
+                WARNING_VERTICES,
+                "the warning triangle",
+                ENVELOPE_VERTICES,
+                "the envelope's body",
+            ),
+            (WARNING_VERTICES, "the warning triangle", FOLDER_VERTICES, "the folder mark"),
+            (WARNING_VERTICES, "the warning triangle", EYE_VERTICES, "the eye"),
+            (WARNING_VERTICES, "the warning triangle", STAR_VERTICES, "the star"),
         ] {
             assert_ne!(
                 a, b,
@@ -6968,6 +7184,12 @@ mod drawn_icon_family_tests {
             (KEBAB_DOT_RADIUS, "the kebab dot"),
             (EYE_PUPIL_RADIUS, "the eye's pupil"),
             (CLOCK_RADIUS, "the one-time code clock's face"),
+            // The warning bang's dot joined this list when it stopped being a
+            // filled square. It is drawn on a modal rather than on the detail
+            // header, so no frame carries it and a kebab at once today -- but
+            // that is a fact about where two widgets happen to be used, and
+            // this list is about what `icon_probe` can tell apart.
+            (WARNING_DOT_RADIUS, "the warning bang's dot"),
         ];
         // The premise, stated so this cannot pass by comparing an empty set:
         // every radius above is really in the list, and the loop below really
@@ -7987,6 +8209,11 @@ mod modal_card_tests {
         texts: Vec<(String, Rect)>,
         rects: Vec<RectShape>,
         segments: Vec<[Pos2; 2]>,
+        /// Closed outlines, kept whole rather than as bounding boxes: the
+        /// warning triangle is identified by its point count, which is the
+        /// only thing that keeps it out of `icon_probe::envelopes`.
+        paths: Vec<egui::epaint::PathShape>,
+        circles: Vec<egui::epaint::CircleShape>,
     }
 
     impl Painted {
@@ -8058,6 +8285,8 @@ mod modal_card_tests {
             )),
             egui::Shape::Rect(rect) => painted.rects.push(rect.clone()),
             egui::Shape::LineSegment { points, .. } => painted.segments.push(*points),
+            egui::Shape::Path(path) => painted.paths.push(path.clone()),
+            egui::Shape::Circle(circle) => painted.circles.push(*circle),
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     walk(shape, painted);
@@ -8399,40 +8628,106 @@ mod modal_card_tests {
         }
     }
 
-    /// **The warning triangle is strokes, and an ordinary header has no mark
-    /// at all.** U+26A0 is not in this app's face -- the same measurement
+    /// **The warning triangle is drawn, and an ordinary header has no mark at
+    /// all.** U+26A0 is not in this app's face -- the same measurement
     /// `close_glyph` records for U+2715 -- so drawn it must be; and the slot
     /// stays empty on a card that is asking rather than refusing, because a
     /// symbol invented to fill it would mean nothing in particular.
+    ///
+    /// **This used to count four line segments and look for a small filled
+    /// rectangle**, which is what the mark was when it was three loose sides
+    /// and a square dot. Both moved, and neither loosened: the triangle is
+    /// now one closed [`WARNING_VERTICES`]-point path (asserted on the count,
+    /// because the count is what keeps it out of `icon_probe::envelopes`) and
+    /// the dot is a circle at [`WARNING_DOT_RADIUS`] (asserted on the radius,
+    /// because the radius is what keeps it out of `icon_probe::kebab_dots`).
+    /// The bang's bar is the one segment left.
     #[test]
-    fn the_warning_glyph_is_strokes_and_an_ordinary_header_has_none() {
+    fn the_warning_glyph_is_a_drawn_triangle_and_an_ordinary_header_has_none() {
         let (_harness, warned) = Harness::opened(ERROR, ModalGlyph::Warning);
         let band = warned.painted.band(ERROR, "header band").rect;
-        let in_band = warned
+
+        let triangles: Vec<&egui::epaint::PathShape> = warned
+            .painted
+            .paths
+            .iter()
+            .filter(|p| band.contains_rect(p.visual_bounding_rect()))
+            .collect();
+        assert_eq!(
+            triangles.len(),
+            1,
+            "the header band carries {} closed outlines, not the one triangle",
+            triangles.len()
+        );
+        let triangle = triangles[0];
+        assert!(triangle.closed, "the warning triangle is an open path, so its apex is a gap");
+        assert_eq!(
+            triangle.points.len(),
+            WARNING_VERTICES,
+            "the triangle closes over {} points; at {ENVELOPE_FLAP_VERTICES} it is findable \
+             as an envelope flap, and `icon_probe::envelopes` panics on a flap with no body",
+            triangle.points.len()
+        );
+        assert_eq!(
+            triangle.fill,
+            Color32::TRANSPARENT,
+            "the triangle is filled, so it is an outline no longer"
+        );
+
+        // Equilateral, which is the design's word for it and the one thing
+        // the shape this replaced got wrong -- that one was as tall as the
+        // square box it was handed.
+        let ink = triangle.visual_bounding_rect();
+        let stroke_slop = WARNING_STROKE + 0.5;
+        assert!(
+            (ink.height() - ink.width() * WARNING_EQUILATERAL).abs() < stroke_slop,
+            "the triangle's ink is {}x{}; equilateral at that width is {} tall",
+            ink.width(),
+            ink.height(),
+            ink.width() * WARNING_EQUILATERAL
+        );
+
+        // The bang: one vertical bar and one dot, both inside the triangle.
+        let bars: Vec<&[Pos2; 2]> = warned
             .painted
             .segments
             .iter()
             .filter(|[a, b]| band.contains(*a) && band.contains(*b))
-            .count();
+            .collect();
         assert_eq!(
-            in_band, 4,
-            "the triangle's three sides and the bang's bar are 4 segments; the band has {in_band}"
+            bars.len(),
+            1,
+            "the band carries {} line segments; the bang's bar is the only one left now that \
+             the triangle is a path",
+            bars.len()
         );
+        assert!(
+            (bars[0][0].x - bars[0][1].x).abs() < 0.01,
+            "the bang's bar is not vertical: {:?}",
+            bars[0]
+        );
+        let dots: Vec<&egui::epaint::CircleShape> = warned
+            .painted
+            .circles
+            .iter()
+            .filter(|c| band.contains(c.center))
+            .collect();
+        assert_eq!(dots.len(), 1, "the warning glyph has a bar with no dot under it");
+        assert!(
+            (dots[0].radius - WARNING_DOT_RADIUS).abs() < 0.01,
+            "the bang's dot is radius {}, not {WARNING_DOT_RADIUS} -- at {KEBAB_DOT_RADIUS} it \
+             would be counted by every kebab assertion in `detail.rs`",
+            dots[0].radius
+        );
+        assert!(
+            dots[0].center.y > bars[0][0].y.max(bars[0][1].y),
+            "the dot is not below the bar, so the bang reads upside down"
+        );
+
         assert_eq!(
             warned.painted.texts.iter().filter(|(_, r)| band.contains_rect(*r)).count(),
             1,
             "the header paints something besides its title, so the glyph is being typed"
-        );
-        // The bang's dot, which is a filled square rather than a circle
-        // because `icon_probe` reads circle radii to tell this crate's drawn
-        // marks apart.
-        assert!(
-            warned
-                .painted
-                .rects
-                .iter()
-                .any(|r| band.contains_rect(r.rect) && r.rect.width() < 3.0),
-            "the warning glyph has a bar with no dot under it"
         );
 
         let (_plain_harness, plain) = Harness::opened(BLUE, ModalGlyph::None);
@@ -8446,49 +8741,138 @@ mod modal_card_tests {
             "the glyph-less header drew a mark anyway"
         );
         assert!(
+            plain.painted.paths.is_empty() && plain.painted.circles.is_empty(),
+            "the glyph-less header drew an outline or a dot anyway"
+        );
+        assert!(
             (plain.painted.rect_of(TITLE).left() - (band.left() + f32::from(MODAL_PAD_X))).abs()
                 < 1.0,
             "the title on a glyph-less header is indented as if a glyph were there"
         );
     }
 
-    /// **The subject line is the item's own tile in front of the item's own
-    /// name.** Both cards that use the frame are about one vault item, and
-    /// the name is the first thing on them that has to be read -- a tile with
-    /// nothing beside it, or a name with no tile, is half of that.
+    /// **The card's outline is the accent, on every card and not only the red
+    /// one.** The report was "red modal should have red frame"; the rule the
+    /// shape carries is that the frame is the card's own edge in the card's
+    /// own colour, so the blue card gets a blue one -- see
+    /// [`ModalCard::accent`] for why the alternative is two rules where the
+    /// shape has one. Both accents are driven, because "the red card's frame
+    /// is red" alone passes just as well against a frame hard-coded to
+    /// [`ERROR`].
     #[test]
-    fn the_subject_line_is_the_items_tile_in_front_of_its_name() {
+    fn the_cards_outline_carries_the_accent_whatever_the_accent_is() {
+        for (accent, name) in [(ERROR, "the destructive card"), (BLUE, "the ordinary card")] {
+            let (_harness, drawn) = Harness::opened(accent, ModalGlyph::None);
+            let card = drawn.painted.card();
+            assert_eq!(
+                card.stroke.color, accent,
+                "{name}'s outline is {:?}, not its own accent {accent:?}",
+                card.stroke.color
+            );
+            assert!(
+                card.stroke.width > 0.0,
+                "{name} has an accent-coloured outline of zero width, which is no outline"
+            );
+            // And the outline really is the card's, not the header band's:
+            // the band it continues starts inside it.
+            let band = drawn.painted.band(accent, "header band").rect;
+            assert!(
+                card.rect.contains_rect(band),
+                "{name}'s outline at {:?} does not enclose its header band at {band:?}",
+                card.rect
+            );
+        }
+    }
+
+    /// **The subject line is the item's own row: its tile, its name, and its
+    /// username under the name.** Both cards that use the frame are about one
+    /// vault item, and the row is what the reader recognised in the list a
+    /// moment ago -- a name on its own asks them to match it against a row
+    /// they can no longer see.
+    ///
+    /// **This used to assert a monogram tile**, which is what the line drew
+    /// before the tile became the caller's to draw. The monogram is now one
+    /// of three things that can go in the slot (favicon, kind mark, initials)
+    /// and which one is `vault_window::ModalSubject`'s decision, so what is
+    /// pinned here is the slot's size and the two lines beside it; the branch
+    /// itself is pinned in `delete_modal`.
+    #[test]
+    fn the_subject_line_is_the_items_row() {
         // A panel rather than the card, because the subject line is a
-        // stand-alone widget: what is under test is the tile and the name,
-        // not where in a modal they land.
+        // stand-alone widget: what is under test is the tile and the two
+        // lines, not where in a modal they land.
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(raw_input(&[], 0.1), |_ui| {});
         apply(&ctx);
         let _ = ctx.run_ui(raw_input(&[], 0.2), |_ui| {});
         let mut painted = Painted::default();
+        let asked = std::cell::Cell::new(0.0_f32);
         let output = ctx.run_ui(raw_input(&[], 0.3), |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 ui.set_width(300.0);
-                modal_subject(ui, "Ledgerline Bank");
+                modal_subject(ui, "Ledgerline Bank", "a.novak@ledgerline.com", |ui, size| {
+                    asked.set(size);
+                    // The monogram tile stands in for whatever the caller
+                    // draws: it allocates the same square every branch of
+                    // `ModalSubject` allocates.
+                    avatar(ui, &initials("Ledgerline Bank"), size, false);
+                });
             });
         });
         for clipped in &output.shapes {
             walk(&clipped.shape, &mut painted);
         }
-        assert_eq!(initials("Ledgerline Bank"), "LB");
-        let monogram = painted.rect_of("LB");
-        let name = painted.rect_of("Ledgerline Bank");
         assert!(
-            monogram.right() <= name.left(),
-            "the monogram at {monogram:?} is not in front of the name at {name:?}"
+            (asked.get() - MODAL_SUBJECT_TILE).abs() < f32::EPSILON,
+            "the tile closure was handed {}, not the line's own {MODAL_SUBJECT_TILE}",
+            asked.get()
+        );
+        let tile = painted.rect_of("LB");
+        let name = painted.rect_of("Ledgerline Bank");
+        let username = painted.rect_of("a.novak@ledgerline.com");
+        assert!(
+            tile.right() <= name.left(),
+            "the tile at {tile:?} is not in front of the name at {name:?}"
+        );
+        assert!(
+            username.top() >= name.top(),
+            "the username at {username:?} is not under the name at {name:?}"
+        );
+        assert!(
+            (username.left() - name.left()).abs() < 1.0,
+            "the two lines start at {} and {}, so they are not one column",
+            name.left(),
+            username.left()
         );
         assert!(
             painted.rects.iter().any(|r| {
                 (r.rect.width() - r.rect.height()).abs() < 0.5
                     && (r.rect.width() - MODAL_SUBJECT_TILE).abs() < 0.5
             }),
-            "there is no square tile around the monogram; it painted {:?}",
+            "there is no square tile beside the name; it painted {:?}",
             painted.rects.iter().map(|r| r.rect).collect::<Vec<_>>()
+        );
+
+        // An item with no login has nothing to put on the second line, and
+        // draws no second line rather than an empty one -- a blank row would
+        // push the sentence under it down by a line for some items only.
+        let mut alone = Painted::default();
+        let output = ctx.run_ui(raw_input(&[], 0.4), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.set_width(300.0);
+                modal_subject(ui, "Recovery codes", "", |ui, size| {
+                    avatar(ui, &initials("Recovery codes"), size, false);
+                });
+            });
+        });
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut alone);
+        }
+        assert_eq!(
+            alone.texts.iter().filter(|(t, _)| t != "RC").count(),
+            1,
+            "a subject with no username painted more than its name: {:?}",
+            alone.texts
         );
     }
 }

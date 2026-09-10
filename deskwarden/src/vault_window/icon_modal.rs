@@ -28,6 +28,7 @@
 
 use crate::item_icon::{IconChoice, IconRefusal};
 use crate::theme;
+use crate::vault_bridge::VaultItem;
 use eframe::egui::{self, RichText};
 
 /// The modal's per-open state.
@@ -37,10 +38,21 @@ pub struct IconPickState {
     /// and the handler looks the item up fresh when it acts -- the same rule
     /// `RowCommand::RefreshIcon` follows for the domain it forgets.
     pub item_id: String,
-    /// The row's name, for the heading. Copied because it is only ever shown,
-    /// never written back, and the alternative -- looking the item up to
-    /// draw a title -- would put a vault read in a draw closure.
-    pub item_name: String,
+    /// The row the card shows: the item's tile, its name and its username,
+    /// copied at the moment the modal opened.
+    ///
+    /// Copied for the reason above and for one more that is this card's own:
+    /// the alternative -- looking the item up to draw its subject line --
+    /// would put a vault read in a draw closure. See [`super::ModalSubject`],
+    /// which is shared with [`super::delete_modal`].
+    ///
+    /// **The tile it draws is the icon the item has NOW**, which on this card
+    /// is the thing being changed. That is deliberate: "Select icon" opened
+    /// on an item that already has a picture should show which picture it is
+    /// replacing. It does not follow the choice being made in the box below,
+    /// because nothing has been fetched yet -- see this file's doc on why no
+    /// request is made here.
+    pub subject: super::ModalSubject,
     /// The URL box. Seeded with the item's chosen URL when it has one, so
     /// "the address I set is slightly wrong" is an edit rather than a
     /// retype -- and empty for an item whose choice is a stored picture,
@@ -59,10 +71,22 @@ pub struct IconPickState {
 
 impl IconPickState {
     /// Opens the modal for `item`, seeded from whatever it already has.
-    pub fn new(item_id: String, item_name: String, existing: Option<&IconChoice>) -> Self {
+    ///
+    /// `icon` is the caller's `icons.textures.get(item.id.as_str())` -- the
+    /// picture the row is showing right now, which is what the subject line
+    /// draws. `existing` stays a separate argument rather than being read off
+    /// the item here, because it is the item's *stored choice* and not its
+    /// rendered picture: the two disagree for an item whose chosen URL has
+    /// never answered, and the box has to show the address that was set even
+    /// when nothing was fetched from it.
+    pub fn new(
+        item: &VaultItem,
+        icon: Option<&egui::TextureHandle>,
+        existing: Option<&IconChoice>,
+    ) -> Self {
         Self {
-            item_id,
-            item_name,
+            item_id: item.id.clone(),
+            subject: super::ModalSubject::of(item, icon),
             url: existing.and_then(IconChoice::url).unwrap_or_default().to_string(),
             error: None,
         }
@@ -188,11 +212,13 @@ pub fn draw_icon_modal(ctx: &egui::Context, state: &mut IconPickState) -> IconPi
             dismiss: "Cancel",
         },
         |ui| {
-            // The row this is about, named and wearing its own tile. The menu
-            // that opened this is long gone from the screen by now, and a
-            // modal that did not say which item it was about would be one
-            // click away from putting a logo on the wrong credential.
-            theme::modal_subject(ui, &state.item_name);
+            // The row this is about, drawn as the results list draws it --
+            // and on this card the tile is doing a second job, because the
+            // picture in it is the one about to be replaced. The menu that
+            // opened this is long gone from the screen by now, and a modal
+            // that did not say which item it was about would be one click
+            // away from putting a logo on the wrong credential.
+            state.subject.draw(ui);
 
             ui.add_space(12.0);
             theme::field_label(ui, "Image file");
@@ -457,8 +483,33 @@ mod tests {
         }]
     }
 
+    /// One vault item. A login with a username, because that is the row the
+    /// subject line has both of its lines to draw for.
+    fn item() -> VaultItem {
+        VaultItem {
+            id: "i1".into(),
+            name: "Chase".into(),
+            fields: vec![],
+            login: Some(crate::vault_bridge::LoginData {
+                username: Some("a.novak@chase.com".into()),
+                password: None,
+                totp: None,
+                uris: vec![],
+                other: serde_json::Map::new(),
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
     fn state() -> IconPickState {
-        IconPickState::new("i1".into(), "Chase".into(), None)
+        IconPickState::new(&item(), None, None)
     }
 
     /// Runs the modal idle until it is painting, and hands back what it
@@ -499,13 +550,13 @@ mod tests {
     #[test]
     fn the_url_box_is_seeded_from_a_url_choice_and_only_from_one() {
         let url = IconChoice::Url { url: "https://example.com/logo.png".into() };
-        let seeded = IconPickState::new("i1".into(), "Chase".into(), Some(&url));
+        let seeded = IconPickState::new(&item(), None, Some(&url));
         assert_eq!(seeded.url, "https://example.com/logo.png");
         assert_eq!(seeded.item_id, "i1");
         assert_eq!(seeded.error, None);
 
         let png = IconChoice::Png { png: "AAAA".into() };
-        let from_png = IconPickState::new("i1".into(), "Chase".into(), Some(&png));
+        let from_png = IconPickState::new(&item(), None, Some(&png));
         assert_eq!(
             from_png.url, "",
             "the URL box was seeded from a stored picture, so it holds base64"
@@ -524,7 +575,17 @@ mod tests {
         let ctx = styled_context();
         let mut state = state();
         let painted = opened(&ctx, &mut state);
-        for needle in ["Select icon", "Chase", "Choose a file\u{2026}", "Use this address"] {
+        // The username joined this list when the subject line became the
+        // item's own row -- see `theme::modal_subject`. Two logins at the
+        // same bank differ by it and by nothing else, and this card is one
+        // click from putting a logo on whichever of them was not meant.
+        for needle in [
+            "Select icon",
+            "Chase",
+            "a.novak@chase.com",
+            "Choose a file\u{2026}",
+            "Use this address",
+        ] {
             assert!(
                 painted.has(needle),
                 "the modal did not paint {needle:?}; painted: {:?}",

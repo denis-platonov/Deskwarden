@@ -29,7 +29,7 @@ use crate::login_ui::{
 };
 use crate::settings::AutoLock;
 use crate::theme;
-use crate::vault_bridge::{Folder, VaultError, VaultItem};
+use crate::vault_bridge::{Folder, ItemKind, VaultError, VaultItem};
 use crate::vault_cache::{PopulateOutcome, VaultCache, VaultEra, VaultSnapshot, VaultUnavailable};
 use detail::{draw_detail_read, DetailAction, LaunchPlan, TotpState};
 use detail_edit::{draw_detail_edit, EditAction, EditDraft};
@@ -52,6 +52,96 @@ use std::time::{Duration, Instant};
 /// loud also means the one place this window can tell you the vault will not
 /// lock itself is the same place it otherwise tells you when it will.
 const AUTO_LOCK_OFF_LABEL: &str = "Auto-lock is off";
+
+/// What a modal shows about the item it is asking about: **the very row the
+/// results list draws for it** -- the item's own tile, its name, and its
+/// username under the name.
+///
+/// # Why a copy, and never a borrow
+///
+/// [`delete_modal::DeleteConfirmState`] and
+/// [`icon_modal::IconPickState`] each carry one of these, and both hold it by
+/// value for the reason their ids are ids and not items: a modal is open
+/// across frames, a sync can replace the snapshot under it, and a card
+/// holding `&VaultItem` would be holding a row that no longer exists. Every
+/// field here is owned -- including the [`egui::TextureHandle`], which is a
+/// reference-counted handle to the icon cache's texture and costs a pointer
+/// to keep alive, not a copy of the picture.
+///
+/// # Why it lives here and not in `theme`
+///
+/// The branch it carries is a decision about vault items: the favicon when
+/// the icon cache has one, the item's KIND mark when it does not, and the
+/// name's monogram when the kind has no mark of its own. `theme` knows
+/// nothing about [`crate::vault_bridge::ItemKind`] and is under `item_list`
+/// in the dependency order, so it draws the LINE -- the tile's size, the two
+/// type sizes, the gap -- and takes what goes in the tile as a closure. This
+/// is the one place that closure is written, which is the same rule
+/// `theme::modal_card` exists to enforce one level up: a layout written out
+/// again at every call site is a design that drifts one modal at a time.
+///
+/// `kind_mark::avatar` is in turn the one place the kind-versus-monogram half
+/// of the branch is made, so this reproduces neither of the two decisions
+/// `item_list::item_row` makes -- it calls both of them.
+pub struct ModalSubject {
+    name: String,
+    /// The login's username, or `""` for an item that has no login block at
+    /// all. Empty rather than `Option`, because that is the shape
+    /// `item_row` reads it in and `theme::modal_subject` answers to.
+    username: String,
+    kind: ItemKind,
+    icon: Option<egui::TextureHandle>,
+}
+
+impl ModalSubject {
+    /// Copies out of `item` everything the card will draw, at the moment the
+    /// modal opens.
+    ///
+    /// `icon` is the caller's `icons.textures.get(item.id.as_str())` -- the
+    /// same lookup the row and the detail header make, passed in rather than
+    /// made here for the reason the modals do not read the vault: this runs
+    /// where the cache is in hand, and the card that draws it runs where
+    /// nothing is.
+    pub fn of(item: &VaultItem, icon: Option<&egui::TextureHandle>) -> Self {
+        Self {
+            name: item.name.clone(),
+            username: item
+                .login
+                .as_ref()
+                .and_then(|l| l.username.as_deref())
+                .unwrap_or_default()
+                .to_string(),
+            kind: ItemKind::of(item),
+            icon: icon.cloned(),
+        }
+    }
+
+    /// The item's name, for the one caller that needs the words rather than
+    /// the line -- a refusal sentence naming what could not be deleted.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Draws the line.
+    ///
+    /// Never emphasized: `item_row`'s `selected` argument is what turns a
+    /// tile's edge blue, and on a card there is nothing to be selected
+    /// against -- the modal is about exactly one item, so a treatment that
+    /// distinguishes it from its neighbours has no neighbours to do it among.
+    pub fn draw(&self, ui: &mut egui::Ui) {
+        theme::modal_subject(ui, &self.name, &self.username, |ui, size| match &self.icon {
+            // `avatar_artwork_tile` then `avatar_image`, which is
+            // `item_row`'s pair and not a second way of saying it: the tile
+            // is drawn unfilled and the artwork fills it, clipped to the
+            // tile's own radius, with the border re-drawn on top.
+            Some(texture) => {
+                let tile = theme::avatar_artwork_tile(ui, size, false);
+                theme::avatar_image(ui, tile, texture, false);
+            }
+            None => crate::kind_mark::avatar(ui, self.kind, &self.name, size, false),
+        });
+    }
+}
 
 
 /// Which auto-lock policy a frame of the open window must honour.
@@ -3329,8 +3419,8 @@ pub fn build_frame_with_search(
                     // is an edit rather than a retype.
                     item_list::RowCommand::SelectIcon => {
                         icon_pick = Some(icon_modal::IconPickState::new(
-                            item.id.clone(),
-                            item.name.clone(),
+                            &item,
+                            icons.textures.get(item.id.as_str()),
                             crate::item_icon::chosen_icon(&item).as_ref(),
                         ));
                     }
@@ -3426,14 +3516,17 @@ pub fn build_frame_with_search(
                     // **Asks, and does nothing else.** The delete itself is
                     // in one place -- the `delete_confirm` block after the
                     // panels -- and this arm's whole job is to open the
-                    // question against this row's item. Both the id and the
-                    // name are copied because the modal outlives this frame
-                    // and a sync can replace the snapshot under it; the
-                    // handler looks the item up fresh by id when it acts.
+                    // question against this row's item. The id and the row
+                    // the card will show are both COPIED out of the item
+                    // here, because the modal outlives this frame and a sync
+                    // can replace the snapshot under it; the handler looks
+                    // the item up fresh by id when it acts. The texture is
+                    // the one the row beside this menu is drawing, and it has
+                    // to be read here because the modal reads nothing.
                     item_list::RowCommand::Delete => {
                         delete_confirm = Some(delete_modal::DeleteConfirmState::new(
-                            item.id.clone(),
-                            item.name.clone(),
+                            &item,
+                            icons.textures.get(item.id.as_str()),
                             delete_modal::DeleteKind::ToTrash,
                         ));
                     }
@@ -3575,8 +3668,8 @@ pub fn build_frame_with_search(
                     // by its `DeleteKind`, in every sentence it shows.
                     item_list::RowCommand::PurgeForever => {
                         delete_confirm = Some(delete_modal::DeleteConfirmState::new(
-                            item.id.clone(),
-                            item.name.clone(),
+                            &item,
+                            icons.textures.get(item.id.as_str()),
                             delete_modal::DeleteKind::Forever,
                         ));
                     }
@@ -4097,8 +4190,8 @@ pub fn build_frame_with_search(
                             // for it.
                             detail::DetailAction::PurgeForever => {
                                 delete_confirm = Some(delete_modal::DeleteConfirmState::new(
-                                    item.id.clone(),
-                                    item.name.clone(),
+                                    item,
+                                    icons.textures.get(item.id.as_str()),
                                     delete_modal::DeleteKind::Forever,
                                 ));
                             }
@@ -4619,8 +4712,8 @@ pub fn build_frame_with_search(
                                 DetailAction::Delete => {
                                     delete_confirm =
                                         Some(delete_modal::DeleteConfirmState::new(
-                                            item.id.clone(),
-                                            item.name.clone(),
+                                            item,
+                                            icons.textures.get(item.id.as_str()),
                                             delete_modal::DeleteKind::ToTrash,
                                         ));
                                 }
@@ -5189,7 +5282,7 @@ pub fn build_frame_with_search(
                     None
                 }
                 delete_modal::DeleteConfirmAction::Confirm => {
-                    Some((state.kind, state.item_id.clone(), state.item_name.clone()))
+                    Some((state.kind, state.item_id.clone(), state.subject.name().to_string()))
                 }
             };
             if let Some((kind, id, name)) = asked {
