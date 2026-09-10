@@ -4321,6 +4321,26 @@ const MODAL_SCRIM_ALPHA: u8 = 90;
 /// read as one card rather than as three cards in a pile.
 const MODAL_RADIUS: u8 = 10;
 
+/// The card's border, and the reason [`MODAL_INNER_RADIUS`] is not
+/// [`MODAL_RADIUS`].
+const MODAL_STROKE: f32 = 1.0;
+
+/// The radius the two coloured bands round their outer corners by.
+///
+/// **One less than the card's, because they sit one point inside it.** Two
+/// rounded rectangles are only concentric when the inner one's radius is the
+/// outer one's minus the gap between them; give the inner rect the SAME
+/// radius and its arc turns tighter than the edge it is supposed to follow,
+/// so the card's own fill shows between the two along the curve and nowhere
+/// else.
+///
+/// It was invisible while the card's stroke was [`BORDER`] -- a white
+/// hairline between white and near-white -- and became a white line along
+/// the corner the moment the stroke took the accent. Reported against the
+/// delete confirmation, whose accent is [`ERROR`]: "there is some white line
+/// along the curve".
+const MODAL_INNER_RADIUS: u8 = MODAL_RADIUS - MODAL_STROKE as u8;
+
 /// The coloured header band's height.
 pub const MODAL_HEADER_HEIGHT: f32 = 40.0;
 
@@ -4522,7 +4542,7 @@ pub fn modal_card(
                 // The accent and not [`BORDER`] -- see [`ModalCard::accent`]
                 // for why every card gets its own colour here and not just
                 // the destructive one.
-                .stroke(Stroke::new(1.0, card.accent))
+                .stroke(Stroke::new(MODAL_STROKE, card.accent))
                 .shadow(MODAL_SHADOW)
                 .show(ui, |ui| {
                     ui.set_width(card.width);
@@ -4561,7 +4581,7 @@ fn modal_header_band(ui: &mut Ui, card: &ModalCard<'_>) {
     // first when the radius moves.
     painter.rect_filled(
         band,
-        CornerRadius { nw: MODAL_RADIUS, ne: MODAL_RADIUS, sw: 0, se: 0 },
+        CornerRadius { nw: MODAL_INNER_RADIUS, ne: MODAL_INNER_RADIUS, sw: 0, se: 0 },
         card.accent,
     );
 
@@ -4734,7 +4754,12 @@ fn modal_footer_band(
     let mut press = ModalPress::default();
     egui::Frame::new()
         .fill(CARD_TINT)
-        .corner_radius(CornerRadius { nw: 0, ne: 0, sw: MODAL_RADIUS, se: MODAL_RADIUS })
+        .corner_radius(CornerRadius {
+            nw: 0,
+            ne: 0,
+            sw: MODAL_INNER_RADIUS,
+            se: MODAL_INNER_RADIUS,
+        })
         .inner_margin(Margin::symmetric(MODAL_PAD_X, MODAL_FOOTER_PAD_Y))
         .show(ui, |ui| {
             let inner = ui.available_width();
@@ -8427,6 +8452,62 @@ mod modal_card_tests {
     /// footer only its bottom pair, and the card behind them carries the
     /// radius on all four. Get any of those wrong and the card reads as three
     /// cards in a pile.
+    /// **The bands' corners are concentric with the card's, so nothing shows
+    /// between them.**
+    ///
+    /// Reported against the running build: "there is some white line along
+    /// the curve". Two rounded rectangles are only concentric when the inner
+    /// one's radius is the outer one's minus the gap; the bands sit one point
+    /// inside the card and were rounded by the card's own radius, so their
+    /// arcs turned tighter than the edge they follow and the card's white
+    /// fill showed through along the corner -- and only along the corner.
+    ///
+    /// It was invisible for as long as the stroke was `BORDER`, because a
+    /// white hairline between white and near-white is nothing to see. It
+    /// appeared the moment the stroke took the accent.
+    ///
+    /// Asserted as the arithmetic rather than by sampling pixels: the seam is
+    /// sub-pixel and anti-aliased, so a colour probe at a corner reads a
+    /// blend either way and would pass against the bug. What is actually
+    /// wrong in that state is the radius, and this is that.
+    #[test]
+    fn the_bands_round_their_corners_concentrically_with_the_card() {
+        assert_eq!(
+            u8::from(MODAL_RADIUS) - MODAL_INNER_RADIUS,
+            MODAL_STROKE as u8,
+            "the bands' radius is not the card's minus the border between them, so their \
+             corners cut inside the card's and its fill shows along the curve"
+        );
+        // Both directions, because equality alone is satisfied by a border of
+        // zero -- which would be a card with no outline at all, and the
+        // arithmetic would then be trivially true while saying nothing.
+        assert!(MODAL_STROKE > 0.0, "the card has no border for the bands to sit inside");
+        assert!(MODAL_INNER_RADIUS < MODAL_RADIUS);
+    }
+
+    /// **And the bands really are inset by exactly that border**, which is
+    /// what makes the radius above the right one.
+    ///
+    /// The arithmetic is a claim about two numbers; this is the claim about
+    /// the geometry they describe. Without it the constants could agree with
+    /// each other while the bands were laid out somewhere else entirely.
+    #[test]
+    fn the_bands_sit_exactly_one_border_inside_the_card() {
+        let (_harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
+        let card = drawn.painted.card();
+        let header = drawn.painted.band(ERROR, "header band");
+        assert!(
+            (header.rect.left() - (card.rect.left() + MODAL_STROKE)).abs() < 0.5,
+            "the header starts {} from the card's edge, not {MODAL_STROKE}",
+            header.rect.left() - card.rect.left()
+        );
+        assert!(
+            (header.rect.top() - (card.rect.top() + MODAL_STROKE)).abs() < 0.5,
+            "the header starts {} below the card's top, not {MODAL_STROKE}",
+            header.rect.top() - card.rect.top()
+        );
+    }
+
     #[test]
     fn the_card_is_three_bands_rounded_as_one_piece() {
         let (_harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
@@ -8442,14 +8523,23 @@ mod modal_card_tests {
             card.rect.width()
         );
 
+        // **`MODAL_INNER_RADIUS`, not `MODAL_RADIUS`.** These read the
+        // card's own radius until "there is some white line along the curve"
+        // was reported: the bands sit one point inside the card, so rounding
+        // them by the card's radius turns their arcs tighter than the edge
+        // they follow and the card's fill shows through at the corner. The
+        // rounded-ness of the INNER pair is what these assertions are about
+        // and is unchanged; only the number moved, and
+        // `the_bands_round_their_corners_concentrically_with_the_card` is
+        // what holds the two in step.
         assert_eq!(
             header.corner_radius,
-            CornerRadius { nw: MODAL_RADIUS, ne: MODAL_RADIUS, sw: 0, se: 0 },
+            CornerRadius { nw: MODAL_INNER_RADIUS, ne: MODAL_INNER_RADIUS, sw: 0, se: 0 },
             "the header band's bottom corners are rounded, so the body begins under a curve"
         );
         assert_eq!(
             footer.corner_radius,
-            CornerRadius { nw: 0, ne: 0, sw: MODAL_RADIUS, se: MODAL_RADIUS },
+            CornerRadius { nw: 0, ne: 0, sw: MODAL_INNER_RADIUS, se: MODAL_INNER_RADIUS },
             "the footer band's top corners are rounded, so it reads as a card of its own"
         );
 
