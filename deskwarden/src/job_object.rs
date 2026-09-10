@@ -2638,7 +2638,30 @@ mod tests {
             // against the PREVIOUS pinned pair and reproduced
             // (23088, 0xa691_2605_703d_bf71) exactly, so it is measuring
             // what this test measures.
-            (27355, 0x58f0_eccf_6d63_741f_u64),
+            //
+            // **27355 bytes, new hash: the 0.15.20 release, and nothing
+            // else.** `version = "0.15.19"` became `"0.15.20"` -- the same
+            // seven characters, which is why the LENGTH does not move and
+            // the hash is the only half of the pair that notices. That is
+            // worth saying out loud: a length-preserving edit is exactly
+            // the shape a pin of length alone would miss, and it is why
+            // this pair carries a hash at all.
+            //
+            // No dependency was added, removed, re-pointed or re-featured,
+            // no `[patch]`/`[replace]`/`[workspace.dependencies]` table
+            // appeared, no path or fork appeared, and
+            // `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"` -- the only things this pair exists to
+            // notice.
+            //
+            // Recomputed the way every hop above records -- FNV-1a/64 over
+            // the file with CRLF normalised to LF, in a separate
+            // implementation outside this crate -- rather than copied out
+            // of the failure message. That implementation was first run
+            // against the PREVIOUS pinned pair and reproduced
+            // (27355, 0x58f0_eccf_6d63_741f) exactly, so it is measuring
+            // what this test measures.
+            (27355, 0x9be2_c855_07e3_05d3_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
