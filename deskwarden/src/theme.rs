@@ -4546,12 +4546,22 @@ pub fn modal_card(
     area.order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
         .show(ctx, |ui| {
-            egui::Frame::new()
+            let framed = egui::Frame::new()
                 .fill(CARD)
                 .corner_radius(CornerRadius::same(MODAL_RADIUS))
                 // The accent and not [`BORDER`] -- see [`ModalCard::accent`]
                 // for why every card gets its own colour here and not just
                 // the destructive one.
+                //
+                // Set here for the GEOMETRY -- `egui::Frame` expands its own
+                // rect by its stroke, and the bands are laid out against
+                // that -- and drawn again below for the PAINT. A `Frame`
+                // strokes before its contents, and the bands are painted out
+                // over the border so that none of the card's fill shows past
+                // them (see [`MODAL_BAND_BLEED`]); the footer's tint is not
+                // the accent, so it covered the border along the bottom and
+                // the lower corners. Reported: "the red frame should go all
+                // the way around and not stop at the bottom."
                 .stroke(Stroke::new(MODAL_STROKE, card.accent))
                 .shadow(MODAL_SHADOW)
                 .show(ui, |ui| {
@@ -4575,6 +4585,19 @@ pub fn modal_card(
                         });
                     press = modal_footer_band(ui, &card, confirm);
                 });
+            // **The border again, over everything.** Same rect, same colour,
+            // same width as the one the `Frame` drew -- this is not a second
+            // border, it is the same one painted where the bands cannot
+            // reach it. Drawing it twice is cheaper than the alternatives:
+            // dropping the `Frame`'s stroke would shrink the rect the bands
+            // are laid out against, and un-bleeding the bands would put the
+            // white line back.
+            ui.painter().rect_stroke(
+                framed.response.rect,
+                CornerRadius::same(MODAL_RADIUS),
+                Stroke::new(MODAL_STROKE, card.accent),
+                egui::StrokeKind::Middle,
+            );
         });
     press
 }
@@ -8483,6 +8506,54 @@ mod modal_card_tests {
     /// footer only its bottom pair, and the card behind them carries the
     /// radius on all four. Get any of those wrong and the card reads as three
     /// cards in a pile.
+    /// **The border is painted ABOVE the bands, so it runs all the way
+    /// round.**
+    ///
+    /// Reported: "the red frame should go all the way around and not stop at
+    /// the bottom." The bands are painted out over the border so that none of
+    /// the card's fill shows past them, and an `egui::Frame` strokes BEFORE
+    /// its contents -- so the footer, whose tint is not the accent, painted
+    /// the border out along the bottom edge and the two lower corners. The
+    /// header did the same at the top and nobody could tell, because its fill
+    /// is the accent.
+    ///
+    /// Asserted as paint ORDER rather than as "a stroke of the accent
+    /// exists": the `Frame`'s own stroke has always existed and was always
+    /// the accent, and it was covered. What is actually required is that a
+    /// stroke of the card's colour, on the card's rect, comes after every
+    /// band -- and the last index wins in a painter's list.
+    #[test]
+    fn the_border_is_drawn_over_the_bands_and_not_under_them() {
+        let (_harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
+        let card = drawn.painted.card();
+
+        let last_band = drawn
+            .painted
+            .rects
+            .iter()
+            .rposition(|r| {
+                (r.rect.width() - card.rect.width()).abs() < 0.5
+                    && (r.fill == ERROR || r.fill == CARD_TINT)
+            })
+            .expect("neither band was painted");
+        let border = drawn
+            .painted
+            .rects
+            .iter()
+            .rposition(|r| {
+                r.stroke.color == ERROR
+                    && (r.rect.width() - card.rect.width()).abs() < 0.5
+                    && (r.rect.height() - card.rect.height()).abs() < 0.5
+            })
+            .expect("no stroke of the accent covers the whole card");
+
+        assert!(
+            border > last_band,
+            "the card's border is painted at {border} and a band at {last_band}, so the band \
+             covers it -- the frame stops wherever that band's fill is not the accent"
+        );
+    }
+
     /// **The bands cover the card's fill, edge to edge, so nothing shows past
     /// them.**
     ///
