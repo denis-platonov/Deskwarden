@@ -1880,6 +1880,16 @@ impl RegionOverlay {
         let waiting = matches!(locked(&self.inner).appearing, Appearing::Waiting);
         let exists = waiting && crate::foreground::own_window_titled(REGION_TITLE).is_some();
         let display = locked(&self.inner).display;
+        // **Every waiting frame, and before anything else touches the
+        // window.** See [`hide_and_place`]: the builder's `with_visible(false)`
+        // is not the only thing that decides whether this window is on screen,
+        // and the owner watched a small white window appear and then move. This
+        // takes it down and puts it where it belongs while nobody is looking,
+        // and it runs on every frame of `Waiting` rather than once so that the
+        // last thing to happen before the show is always this.
+        if waiting {
+            hide_and_place(REGION_TITLE, display);
+        }
         if locked(&self.inner).appearing.compose(exists) {
             let_the_desktop_through(REGION_TITLE);
             exclude_from_capture(REGION_TITLE);
@@ -3011,23 +3021,50 @@ fn exclude_from_capture(title: &str) {
 /// `window_host::clear_color` already returns a fully transparent clear.
 /// Everything was in place except the one call.
 ///
-/// # So this makes the call `winit` skipped
+/// # So this makes the call `winit` skipped -- but NOT the one `winit` makes
 ///
-/// An **empty** blur region is the documented Windows idiom for "do not blur
-/// anything, just honour this window's per-pixel alpha", and it is exactly
-/// what `winit` builds: `CreateRectRgn(0, 0, -1, -1)` is a region with no
-/// area. `DWM_BB_BLURREGION` is what makes DWM read `hRgnBlur` at all, so
-/// leaving it out would ask for the *whole window* to be blurred, which is a
-/// frosted-glass desktop rather than a dimmed one.
+/// `winit` asks for per-pixel alpha with `DwmEnableBlurBehindWindow` and an
+/// empty blur region (`CreateRectRgn(0, 0, -1, -1)`, right and bottom before
+/// left and top). For twenty years that has been the documented idiom for "do
+/// not blur anything, just honour this window's alpha": `DWM_BB_BLURREGION`
+/// makes DWM read `hRgnBlur`, and a region with no area names nothing to blur.
 ///
-/// **The region is ours to delete.** DWM copies what it is given rather than
-/// taking ownership -- the `DWM_BLURBEHIND` documentation describes `hRgnBlur`
-/// as a handle to the region *specifying* the blur area, with no transfer of
-/// ownership stated, and `winit`'s own implementation of this same call
-/// deletes it on the next line. Leaking one region per overlay would be a
-/// small, permanent GDI handle leak in a window the user may open many times,
-/// so it is deleted here too, after the call, in both the success and failure
-/// paths.
+/// **On Windows 11 build 26200 it blurs the whole window anyway, and this
+/// module shipped that to the owner twice.**
+///
+/// This is the most expensive thing in this file's history to have got wrong,
+/// so the evidence is written down rather than summarised. The owner's reports
+/// were *"black screen"*, *"pitch dark"* and *"no way I can guess where the QR
+/// code is"*. Three separate probe runs came back `SEE-THROUGH`, mean absolute
+/// error **0.37** against `backdrop * (1 - a) + dim * a` versus **59.88**
+/// against `dim * a`, correlation **1.0000**. Both were true. The desktop
+/// really was coming through at `DIM_ALPHA`, and it really was unusable,
+/// because DWM was blurring it on the way. A photograph taken with a phone --
+/// the overlay wears `WDA_EXCLUDEFROMCAPTURE`, so the owner could not take a
+/// screenshot of it -- shows the bar at the bottom pin-sharp and legible and
+/// everything above it a lavender haze with no recoverable detail.
+///
+/// # Which is why it is `DwmExtendFrameIntoClientArea` now
+///
+/// The other documented way to get per-pixel alpha on a composited window, and
+/// the one with **no blur region and no blur concept in it at all**. Margins of
+/// `-1` extend the composited frame through the entire client area -- the
+/// sheet-of-glass case, the same call every app with a custom title bar makes
+/// -- and DWM then honours the window's alpha channel across the whole surface.
+/// The Aero blur that this call carried on Vista and 7 was removed in Windows
+/// 8; there is nothing left in it that can soften what is behind the window.
+///
+/// **The guarantee is structural, and it has to be.** See "Not measured, and
+/// cannot be" below: this process cannot photograph its own effect on the
+/// display. So the argument is not "the blur was measured gone" -- it is that
+/// nothing here asks for a blur any more. That is a weaker kind of claim than
+/// this file usually makes and it is the strongest one available.
+///
+/// The two things that were **not** the problem are still not the problem and
+/// are still left alone: the framebuffer really does have an alpha channel
+/// (`glutin`'s `ConfigTemplate` defaults `alpha_size: 8` unconditionally, with
+/// no reference to the transparency flag) and `window_host::clear_color`
+/// already returns a fully transparent clear.
 ///
 /// # Why here and not in the viewport builder
 ///
@@ -3094,59 +3131,100 @@ fn exclude_from_capture(title: &str) {
 /// the window appearing, which is the 1315 ms regression [`Appearing`] carries
 /// the measurement for.
 ///
-/// # Not tested, and cannot be
+/// # Not tested, and cannot be -- and NOT measurable either, which is new
 ///
 /// There is no window in a test process, so this is a no-op there and no
 /// assertion in this crate says the compositor accepted anything. It belongs
 /// with the other real-desktop facts in this module's header: what a test can
 /// hold is that the call is made on the frame the window first exists, which
 /// is what `the_overlay_asks_dwm_to_composite_its_alpha` pins by source.
+///
+/// **The stronger statement, learned the hard way: a screen capture cannot
+/// answer this question at all.** The probe in `scratchpad/dimprobe` gained a
+/// spatial-detail measure built specifically to catch the blur above -- mean
+/// absolute neighbour difference, which a per-pixel blend scales by exactly
+/// `1 - DIM_ALPHA/255` and a blur collapses toward zero. Run against the
+/// blurring code, on the machine that was visibly blurring, on the same
+/// rectangle, it reported backdrop detail **6.30**, after detail **3.46**,
+/// expected **3.46**, sharpness **1.000 -- SHARP**. Every edge intact, at
+/// precisely the right contrast, in a capture of a display that a photograph
+/// shows as a haze.
+///
+/// So DWM applies the blur when it composites for the **monitor**, and a GDI
+/// `BitBlt` of the desktop reads a composition that does not include it. The
+/// capture path and the display path are different pictures, and this module's
+/// whole verification loop was on the wrong one. Nothing measurable from
+/// inside this process distinguishes a blurred overlay from a sharp one; only
+/// a camera pointed at the screen does. Any future change here that claims
+/// "measured, no blur" on the strength of a capture is claiming something its
+/// instrument cannot see.
+/// `dwmapi.dll`'s margin struct, declared here because the `windows` crate's
+/// copy of it lives behind a feature this crate does not turn on.
+///
+/// **`Cargo.toml` is a whole-file byte pin with a ledger in
+/// `crate::job_object`**, so "add `Win32_UI_Controls` to the features list" is
+/// not a two-line change -- it is a change to a file this crate deliberately
+/// makes expensive to touch, for a struct that is four `i32`s in declaration
+/// order. `MARGINS` has been stable since Windows Vista and is
+/// `{ cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight }`, all `c_int`.
+/// `#[repr(C)]` is what makes that layout a promise rather than a hope.
+#[repr(C)]
+struct Margins {
+    cx_left_width: i32,
+    cx_right_width: i32,
+    cy_top_height: i32,
+    cy_bottom_height: i32,
+}
+
+// The one function, from the library this crate already links -- the
+// `Win32_Graphics_Dwm` feature is on, so `dwmapi` is on the link line and this
+// adds a symbol to it rather than a dependency. `HRESULT` is `i32`; the
+// `windows` crate's own binding for this call has exactly this shape.
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmExtendFrameIntoClientArea(
+        hwnd: windows::Win32::Foundation::HWND,
+        p_mar_inset: *const Margins,
+    ) -> windows::core::HRESULT;
+}
+
 fn let_the_desktop_through(title: &str) {
-    use windows::Win32::Foundation::{FALSE, HWND, TRUE};
-    use windows::Win32::Graphics::Dwm::{
-        DwmEnableBlurBehindWindow, DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND,
-    };
-    use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject};
+    use windows::Win32::Foundation::HWND;
 
     let Some(hwnd) = crate::foreground::own_window_titled(title) else {
         log::warn!(
-            "region overlay: no window titled {title:?} to make see-through, so it will be a \
-             solid dim rectangle. This is the defect that shipped through 0.15.21: the caller \
-             is meant to wait for the window to exist"
+            "region overlay: no window titled {title:?} to make see-through, so it will be a              solid dim rectangle. This is the defect that shipped through 0.15.21: the caller              is meant to wait for the window to exist"
         );
         return;
     };
-    unsafe {
-        // Empty by construction: right and bottom are BEFORE left and top.
-        let region = CreateRectRgn(0, 0, -1, -1);
-        let blur = DWM_BLURBEHIND {
-            dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION,
-            fEnable: TRUE,
-            hRgnBlur: region,
-            fTransitionOnMaximized: FALSE,
-        };
-        let result = DwmEnableBlurBehindWindow(HWND(hwnd as *mut _), &blur);
-        // **Logged, not discarded, and that is a deliberate reversal.** This
-        // line used to read `let _ = ..`, on the reasoning that there is
-        // nothing useful to do about a refusal. True, and beside the point: the
-        // cost of discarding it was that nobody could tell a call that was
-        // never made from one that failed from one that succeeded and did
-        // nothing -- and for two rounds of fixes, nobody could. One line in
-        // `deskwarden.log` per overlay settles which.
-        match result {
-            Ok(()) => log::info!(
-                "region overlay: DwmEnableBlurBehindWindow accepted on {hwnd:#x}; the dim \
-                 composites over the desktop"
-            ),
-            Err(e) => log::warn!(
-                "region overlay: DwmEnableBlurBehindWindow refused on {hwnd:#x} ({e}); the \
-                 overlay will be a solid dim rectangle rather than a dimmed desktop"
-            ),
-        }
-        // Deleted whether or not the call succeeded -- see this function's
-        // note on ownership. A region DWM has copied is ours; a region it
-        // never looked at certainly is.
-        let _ = DeleteObject(region);
+    // **-1 on every side is the documented "whole client area" value**, not a
+    // sentinel this module invented: `DwmExtendFrameIntoClientArea` treats a
+    // negative margin as "extend the frame through the entire window", which is
+    // the sheet-of-glass case. Any non-negative set of margins would extend the
+    // composited frame only that many pixels in from each edge and leave the
+    // middle of a full-screen overlay opaque.
+    let margins = Margins {
+        cx_left_width: -1,
+        cx_right_width: -1,
+        cy_top_height: -1,
+        cy_bottom_height: -1,
+    };
+    let result = unsafe { DwmExtendFrameIntoClientArea(HWND(hwnd as *mut _), &margins) };
+    // **Logged, not discarded, and that is a deliberate reversal.** This line
+    // used to read `let _ = ..`, on the reasoning that there is nothing useful
+    // to do about a refusal. True, and beside the point: the cost of discarding
+    // it was that nobody could tell a call that was never made from one that
+    // failed from one that succeeded and did nothing -- and for two rounds of
+    // fixes, nobody could. One line in `deskwarden.log` per overlay settles
+    // which.
+    if result.is_ok() {
+        log::info!(
+            "region overlay: DwmExtendFrameIntoClientArea accepted on {hwnd:#x} with margins              -1 on every side; the dim composites over the desktop, unblurred"
+        );
+    } else {
+        log::warn!(
+            "region overlay: DwmExtendFrameIntoClientArea refused on {hwnd:#x} ({result:?});              the overlay will be a solid dim rectangle rather than a dimmed desktop"
+        );
     }
 }
 
@@ -3319,6 +3397,99 @@ fn own_window_centre() -> Option<(i32, i32)> {
 /// geometry before the user does; on the frame it is shown it is the record of
 /// what they saw. A mismatch is a `warn` with both rectangles in it, which is
 /// the line the next multi-monitor report will be answered from.
+/// **Takes the overlay's window down and puts it exactly where it belongs,
+/// before anyone has seen it** -- `ShowWindow(SW_HIDE)` and then
+/// `SetWindowPos`, in that order, on a window this module has not shown yet.
+///
+/// # The popup this exists to remove, in the owner's words
+///
+/// > 1. White small popup shows up
+/// > 2. Same popup moves position
+///
+/// That is a window created at `CW_USEDEFAULT`, shown before it has painted
+/// anything, and then sized and moved -- which is exactly the order `winit`'s
+/// `on_create` runs in (`platform_impl/windows/window.rs`, with its own
+/// comment "Set visible before setting the size"): `set_visible`, then
+/// `request_inner_size`, then `set_outer_position`. Everything after the
+/// `set_visible` is a step the user watches.
+///
+/// # Why `with_visible(false)` was not enough
+///
+/// It should have been, and on the machine this was measured on it is:
+/// `egui_winit::create_winit_window_attributes` really does apply
+/// `.with_visible(visible.unwrap_or(true))`, `winit` really does leave
+/// `WindowFlags::VISIBLE` out of the initial style, and a probe sampling the
+/// real overlay every ~9 ms saw the window hidden at its final rectangle for
+/// 1.8 s and then shown once, at that rectangle, with **0 samples** at any
+/// other size. The owner saw the popup anyway.
+///
+/// Rather than keep arguing with three crates about who is allowed to show a
+/// window, this module takes the window. It already resolves its own `HWND` by
+/// title and already makes Win32 calls on it -- the DWM call, the capture
+/// mask, the minimise -- so one more is in keeping rather than a new kind of
+/// thing. `SW_HIDE` undoes any show that has happened, whoever made it, and
+/// `SetWindowPos` on the hidden window makes the move step happen where nobody
+/// can see it. Both are idempotent: on a window that is already hidden and
+/// already placed, which is what the builder should have produced, they are
+/// no-ops that cost two system calls.
+///
+/// # Run on every frame until the overlay shows itself, not once
+///
+/// The window is created by `eframe` between frames, so the earliest this can
+/// run is the first root frame after that -- and anything that showed the
+/// window did it before then. One call would leave whatever happened in that
+/// gap on screen until the next one. Driving it from every `Appearing::Waiting`
+/// frame bounds the exposure at one frame and, more importantly, guarantees
+/// that the *last* thing to happen before `Visible(true)` is this: hidden, and
+/// at the right rectangle.
+///
+/// `SWP_NOACTIVATE` and `SWP_NOZORDER` because neither is this call's business:
+/// the raise is [`crate::foreground::raise_window`]'s job and happens after the
+/// show, and activating a hidden window is how the overlay would lose the
+/// keyboard before it ever had it.
+///
+/// Logged either way, like every other Win32 call here.
+fn hide_and_place(title: &str, display: ScreenRect) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsWindowVisible, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE,
+    };
+
+    let Some(hwnd) = crate::foreground::own_window_titled(title) else {
+        return;
+    };
+    let handle = HWND(hwnd as *mut _);
+    // Read BEFORE hiding, because "was it visible when we got here" is the
+    // whole question the owner's report asks and the only place it can be
+    // answered is this line.
+    let was_visible = unsafe { IsWindowVisible(handle) }.as_bool();
+    if was_visible {
+        log::warn!(
+            "region overlay: {title:?} was ALREADY VISIBLE before this module showed it -- \
+             something other than `Appearing` put it on screen. Hiding it again; the user may \
+             have seen a frame of it. This is the popup the owner reported"
+        );
+    }
+    // The return is the PREVIOUS visibility, which was just read properly.
+    let _ = unsafe { ShowWindow(handle, SW_HIDE) };
+    if let Err(e) = unsafe {
+        SetWindowPos(
+            handle,
+            HWND_TOP,
+            display.left,
+            display.top,
+            display.width() as i32,
+            display.height() as i32,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        )
+    } {
+        log::warn!(
+            "region overlay: SetWindowPos refused on {title:?} ({hwnd:#x}) for {display:?}: \
+             {e}; the window keeps whatever rectangle it was given"
+        );
+    }
+}
+
 fn log_window_rect(title: &str, step: &str, asked_for: ScreenRect) {
     use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
@@ -5168,10 +5339,46 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // **The vault window is never hidden**, and the check is now scoped to
+        // the function that touches it rather than to the whole file, because
+        // this module *does* hide one window: its own, in `hide_and_place`,
+        // before it has ever been shown. The two are opposites. Hiding the
+        // user's application is how it becomes unreachable; hiding the
+        // overlay's own window, which the user has not seen and which this
+        // module shows itself a frame later, is how the popup stops happening.
+        let down = code
+            .split("fn send_window_down(title: &str) {")
+            .nth(1)
+            .expect("`send_window_down` is gone")
+            .split("\n}")
+            .next()
+            .unwrap();
         assert!(
-            !code.contains("SW_HIDE"),
+            !down.contains("SW_HIDE"),
             "this module hides the vault window; a hidden window that fails to come back is \
              unreachable, which is the one outcome the minimise exists to avoid"
+        );
+        // And `SW_HIDE` appears in exactly one place in the whole module: the
+        // overlay's own window, before it is shown. A second use is a window
+        // this module put away without a way back.
+        // Twice: `hide_and_place`'s `use` line and its one call.
+        assert_eq!(
+            code.matches("SW_HIDE").count(),
+            2,
+            "`SW_HIDE` is named somewhere other than `hide_and_place`'s import and its one \
+             call. The only window this module may hide is its own, and only before it has \
+             ever been visible"
+        );
+        let placer = code
+            .split("fn hide_and_place(title: &str, display: ScreenRect) {")
+            .nth(1)
+            .expect("`hide_and_place` is gone")
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(
+            placer.contains("SW_HIDE"),
+            "the one permitted `SW_HIDE` is not the one in `hide_and_place`"
         );
         // **`Visible` is allowed now, and in exactly one shape.**
         //
@@ -5633,6 +5840,68 @@ mod tests {
         );
     }
 
+    /// **The window is taken down and placed by hand before it is ever
+    /// shown**, and the owner's popup is what this is about.
+    ///
+    /// > 1. White small popup shows up
+    /// > 2. Same popup moves position
+    ///
+    /// `with_visible(false)` on the viewport builder should make that
+    /// impossible and, measured on one machine, does. It did not on the
+    /// owner's, so this module stopped relying on it: see [`hide_and_place`].
+    /// What a test can hold is that the call is made, that it is made on every
+    /// waiting frame rather than once, and that it is made **before** the show
+    /// -- a hide after the show is a flicker rather than a fix.
+    #[test]
+    fn the_window_is_hidden_and_placed_before_anyone_can_see_it() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        let appear = code
+            .split("fn appear(&self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("`appear` is gone")
+            .split("\n    }")
+            .next()
+            .unwrap();
+        let hide = appear
+            .find("hide_and_place(REGION_TITLE, display);")
+            .expect("nothing hides and places the window before it is shown");
+        let shown = appear
+            .find("ViewportCommand::Visible(true)")
+            .expect("the overlay is never shown");
+        assert!(
+            hide < shown,
+            "the window is hidden and placed AFTER it is shown, which is a flicker rather than \
+             a fix -- the whole point is that the move happens where nobody can see it"
+        );
+        // Gated on `Waiting`, so it stops the moment this module shows the
+        // window itself. Without the gate it would hide the overlay on every
+        // frame of its life, which is a window the user never sees at all.
+        assert!(
+            appear.contains("if waiting {\n            hide_and_place(REGION_TITLE, display);"),
+            "the hide is no longer gated on `Appearing::Waiting`, so it either runs once (and \
+             leaves anything that showed the window early on screen until the next frame) or \
+             runs for ever (and the overlay never appears)"
+        );
+        // `SW_HIDE` and not a viewport command: the point is to undo a show
+        // this module did not make, which egui does not know about.
+        let placer = code
+            .split("fn hide_and_place(title: &str, display: ScreenRect) {")
+            .nth(1)
+            .expect("`hide_and_place` is gone");
+        assert!(
+            placer.contains("ShowWindow(handle, SW_HIDE)"),
+            "`hide_and_place` no longer hides the window"
+        );
+        assert!(
+            placer.contains("SWP_NOACTIVATE | SWP_NOZORDER"),
+            "the placement activates or restacks the window; activating a hidden window is how \
+             the overlay loses the keyboard before it ever has it, and the z-order is the \
+             raise's business"
+        );
+    }
+
     /// **The window asks DWM to composite its alpha, on the frame it first
     /// exists.**
     ///
@@ -5654,27 +5923,61 @@ mod tests {
         let code = source.split("#[cfg(test)]").next().unwrap();
         assert!(code.len() < source.len(), "the test module marker was not found");
         assert!(
-            code.contains("DwmEnableBlurBehindWindow(HWND(hwnd as *mut _), &blur)"),
+            code.contains("DwmExtendFrameIntoClientArea(HWND(hwnd as *mut _), &margins)"),
             "nothing makes the DWM call that makes this window transparent"
         );
-        // An EMPTY region: `DWM_BB_BLURREGION` with a region that has no area
-        // is "honour per-pixel alpha, blur nothing". A region with area would
-        // frost the desktop instead of dimming it.
-        assert!(
-            code.contains("CreateRectRgn(0, 0, -1, -1)"),
-            "the blur region is no longer empty, so the desktop would be blurred rather than \
-             merely showing through"
-        );
-        assert!(
-            code.contains("dwFlags: DWM_BB_ENABLE | DWM_BB_BLURREGION"),
-            "the blur region is no longer read, so per-pixel alpha is not honoured"
-        );
-        // And the region is freed. DWM copies it; leaking one per overlay is
-        // a permanent GDI handle leak in a window the user may open often.
-        assert!(
-            code.contains("DeleteObject(region)"),
-            "the blur region is never deleted"
-        );
+        // **And it is NOT `DwmEnableBlurBehindWindow`.** That call, with the
+        // empty region `winit` uses and twenty years of documentation behind
+        // it, blurs the whole window on Windows 11 build 26200 -- established
+        // not by this crate, which cannot see it, but by a photograph of the
+        // owner's monitor showing the bar pin-sharp and everything above it an
+        // unrecoverable haze. Three capture-based probe runs called the same
+        // screen SEE-THROUGH at a model error of 0.37, and a spatial-detail
+        // measure built specifically to catch the blur called it SHARP at
+        // 1.000, because DWM applies the blur when it composites for the
+        // display and a BitBlt of the desktop reads a composition without it.
+        //
+        // So this loop is the load-bearing part of this test: the guarantee
+        // that the overlay does not blur the desktop is that nothing here asks
+        // for a blur, and there is no instrument in this process that can
+        // notice if that stops being true.
+        //
+        // Comments are cut off first: every needle in this loop is a negative
+        // one, and the prose above names all four of them while explaining why
+        // the code does not use them.
+        let statements: String = code
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for gone in [
+            "DwmEnableBlurBehindWindow",
+            "DWM_BB_BLURREGION",
+            "DWM_BLURBEHIND",
+            "CreateRectRgn",
+        ] {
+            assert!(
+                !statements.contains(gone),
+                "`{gone}` is back. `DwmEnableBlurBehindWindow` with an empty blur region is the                  documented per-pixel-alpha idiom and on Windows 11 26200 it blurs the entire                  window; the owner could not see their own screen through it. See                  `let_the_desktop_through`"
+            );
+        }
+        // Margins of -1 on every side: the whole client area, which is what
+        // makes DWM honour this window's alpha across the surface rather than
+        // in a border.
+        for margin in [
+            "cx_left_width: -1",
+            "cx_right_width: -1",
+            "cy_top_height: -1",
+            "cy_bottom_height: -1",
+        ] {
+            assert!(
+                code.contains(margin),
+                "`{margin}` is gone, so the composited frame no longer covers the whole client                  area and the middle of a full-screen overlay is opaque"
+            );
+        }
         // It happens on the frame the window first exists, beside the
         // capture exclusion, because that is the first moment there is a
         // window to call it on -- and BEFORE the window is shown, which is the
