@@ -979,8 +979,10 @@ struct Inner {
     /// `None` while the overlay is still up. Set once, by the frame that ends
     /// it.
     outcome: Option<Outcome>,
-    /// Whether `raise_window` has been asked for yet. Once, on the frame the
-    /// OS window first exists.
+    /// Whether the first-frame hook has run yet. Once, on the first frame the
+    /// OS window really exists -- which is **not** the callback's first frame,
+    /// and is checked rather than assumed. See the hook itself in
+    /// [`RegionOverlay::show`].
     raised: bool,
     open: bool,
     /// How far the whole-screen scan has got. See [`Prescan`].
@@ -1624,11 +1626,55 @@ impl RegionOverlay {
                     return;
                 }
 
+                // **"The first frame on which this window EXISTS", which is not
+                // the first frame this callback runs, and the difference is the
+                // whole of why the overlay was a solid black screen.**
+                //
+                // This used to be `!held.raised`, set on the very first
+                // invocation. Measured -- `examples/overlay_transparency_probe
+                // --shape real`, which drives this module's own `open` and
+                // `show` and lists every top-level window of the process on each
+                // of the callback's first frames:
+                //
+                // ```text
+                // real overlay frame 1: hwnd by REGION_TITLE = None   (8 windows, none ours)
+                // real overlay frame 2: hwnd by REGION_TITLE = None   (8 windows, none ours)
+                // real overlay frame 3: hwnd by REGION_TITLE = Some(..)  ("Deskwarden - scan a region")
+                // ```
+                //
+                // `eframe` runs a deferred viewport's callback for two frames
+                // before it creates the OS window: the viewport is registered
+                // out of the parent's frame output, and the window and its GL
+                // surface are built on a later pass. So all three calls below
+                // ran against an HWND that did not exist, every one of them
+                // resolved the window by title and returned `None`, and every
+                // one of them did nothing -- silently, because all three
+                // discard their result. `raised` was set anyway, so none of
+                // them was ever tried again.
+                //
+                // That is one bug with three faces, and only one of them was
+                // being chased: the missing `DwmEnableBlurBehindWindow` is the
+                // black screen, the missing `SetWindowDisplayAffinity` means a
+                // dragged rectangle is captured THROUGH this overlay's own dim
+                // (see `exclude_from_capture`), and the missing raise is why
+                // the window relies on `with_always_on_top` alone to be in
+                // front.
+                //
+                // The fix is to claim the frame only when there is something to
+                // claim it for. The lookup is one `EnumWindows` per frame until
+                // the window appears -- two or three of them, once per overlay
+                // -- and none at all afterwards, because `raised` short-circuits
+                // it.
                 let first_frame = {
                     let mut held = locked(&mine.inner);
-                    let first = !held.raised;
-                    held.raised = true;
-                    first
+                    if held.raised {
+                        false
+                    } else if crate::foreground::own_window_titled(REGION_TITLE).is_some() {
+                        held.raised = true;
+                        true
+                    } else {
+                        false
+                    }
                 };
                 if first_frame {
                     // The OS window exists by here -- the same hook every
@@ -2400,6 +2446,11 @@ fn let_the_desktop_through(title: &str) {
     use windows::Win32::Graphics::Gdi::{CreateRectRgn, DeleteObject};
 
     let Some(hwnd) = crate::foreground::own_window_titled(title) else {
+        log::warn!(
+            "region overlay: no window titled {title:?} to make see-through, so it will be a \
+             solid dim rectangle. This is the defect that shipped through 0.15.21: the caller \
+             is meant to wait for the window to exist"
+        );
         return;
     };
     unsafe {
@@ -2411,10 +2462,24 @@ fn let_the_desktop_through(title: &str) {
             hRgnBlur: region,
             fTransitionOnMaximized: FALSE,
         };
-        // Ignored for `set_capture_exclusion`'s reason: there is nothing
-        // useful to do about a refusal, and the failure the user sees is the
-        // one they were already seeing.
-        let _ = DwmEnableBlurBehindWindow(HWND(hwnd as *mut _), &blur);
+        let result = DwmEnableBlurBehindWindow(HWND(hwnd as *mut _), &blur);
+        // **Logged, not discarded, and that is a deliberate reversal.** This
+        // line used to read `let _ = ..`, on the reasoning that there is
+        // nothing useful to do about a refusal. True, and beside the point: the
+        // cost of discarding it was that nobody could tell a call that was
+        // never made from one that failed from one that succeeded and did
+        // nothing -- and for two rounds of fixes, nobody could. One line in
+        // `deskwarden.log` per overlay settles which.
+        match result {
+            Ok(()) => log::info!(
+                "region overlay: DwmEnableBlurBehindWindow accepted on {hwnd:#x}; the dim \
+                 composites over the desktop"
+            ),
+            Err(e) => log::warn!(
+                "region overlay: DwmEnableBlurBehindWindow refused on {hwnd:#x} ({e}); the \
+                 overlay will be a solid dim rectangle rather than a dimmed desktop"
+            ),
+        }
         // Deleted whether or not the call succeeded -- see this function's
         // note on ownership. A region DWM has copied is ours; a region it
         // never looked at certainly is.
@@ -2439,6 +2504,10 @@ fn set_capture_exclusion(title: &str, exclude: bool) {
     };
 
     let Some(hwnd) = crate::foreground::own_window_titled(title) else {
+        log::warn!(
+            "region overlay: no window titled {title:?} to {} screen captures",
+            if exclude { "take out of" } else { "put back into" }
+        );
         return;
     };
     let affinity = if exclude {
@@ -2446,13 +2515,28 @@ fn set_capture_exclusion(title: &str, exclude: bool) {
     } else {
         WDA_NONE
     };
-    // Failure is ignored on purpose: see this function's note. There is
-    // nothing useful to do about it and nothing secret is at risk -- a mask
-    // that was refused leaves a window in the capture, and an unmask that was
+    // **The outcome is logged rather than ignored**, for
+    // `let_the_desktop_through`'s reason: nothing useful can be DONE about a
+    // refusal, which is not the same as nothing useful being learned from one.
+    // A mask that was silently skipped is a capture taken through this
+    // overlay's own dim, and the user sees that as "no code in that region"
+    // for a code that is plainly on screen -- a symptom with no trail at all
+    // until this line existed.
+    //
+    // The safety argument is unchanged and still holds either way: a mask that
+    // was refused leaves a window in the capture, and an unmask that was
     // refused leaves a window out of other people's captures, which is the
     // safe direction of the two.
-    unsafe {
-        let _ = SetWindowDisplayAffinity(HWND(hwnd as *mut _), affinity);
+    let result = unsafe { SetWindowDisplayAffinity(HWND(hwnd as *mut _), affinity) };
+    match result {
+        Ok(()) => log::info!(
+            "region overlay: {title:?} is now {} screen captures",
+            if exclude { "out of" } else { "back in" }
+        ),
+        Err(e) => log::warn!(
+            "region overlay: SetWindowDisplayAffinity refused on {title:?} ({e}); a capture \
+             taken now will include that window"
+        ),
     }
 }
 
@@ -4121,6 +4205,34 @@ mod tests {
         assert!(
             first.contains("let_the_desktop_through(REGION_TITLE);"),
             "the DWM call is not made on the frame the window first exists"
+        );
+        // **And `first_frame` means "the window exists", not "the callback has
+        // not run before".** This is the defect that shipped through 0.15.21
+        // and it is invisible in a diff: the call was made, on a window that
+        // did not exist yet, and returned `None` and did nothing. `eframe` runs
+        // a deferred viewport's callback for two frames before it creates the
+        // OS window -- measured, on the real `open`/`show`, by the probe this
+        // module's history records -- so a hook that fires on the first
+        // callback fires into nothing and never fires again.
+        let gate = code
+            .split("let first_frame = {")
+            .nth(1)
+            .expect("the first-frame gate is gone");
+        let gate = gate.split("};").next().unwrap();
+        assert!(
+            gate.contains("own_window_titled(REGION_TITLE).is_some()"),
+            "the first-frame hook no longer waits for the window to exist, so the DWM call, the \
+             capture exclusion and the raise all run against an HWND that is not there yet -- \
+             which is a black overlay, a capture taken through its own dim, and no raise, all \
+             three silently"
+        );
+        // The flag is set INSIDE that check rather than unconditionally, or the
+        // hook is spent on the frame it could not do anything.
+        let before_flag = gate.split("held.raised = true;").next().unwrap();
+        assert!(
+            before_flag.contains("own_window_titled(REGION_TITLE).is_some()"),
+            "`raised` is set before the window has been found, so the one chance to make these \
+             calls is spent on a frame that cannot make them"
         );
         // The vault window's root viewport does NOT ask for transparency: on
         // Windows that flag only reaches the GL config template, where it
