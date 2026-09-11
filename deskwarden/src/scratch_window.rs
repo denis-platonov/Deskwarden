@@ -548,6 +548,42 @@ pub fn show_open_rehearsal(ctx: &egui::Context) {
 
 // ---------------------------------------------------------------------------
 // The surface (design 4d)
+//
+// What of 4d is here and what is deliberately not.
+//
+// The chrome, the type and the three bands are 4d's: a 470-wide card at
+// `border-radius: 12px`, a header rule carrying the green check and
+// `Rehearsal finished · 2.1 s` with `scratch window` right-aligned in
+// `TEXT_GHOST`, the dark `#201e1d` transcript panel under a tracked mono
+// `WHAT ARRIVED`, the two invisible keys in `#7fa4ef`, a label/value list at
+// 4d's own 96pt label column, and a tinted footer. What is NOT here, and why:
+//
+//  * **"Dropped keys", "Focus changes" and "Slowest field".** 4d fills its
+//    lower list with three MEASUREMENTS of the run. This crate cannot make
+//    any of them. `Injector::fill_sequence` reports one `FillOutcome` for a
+//    whole plan, not a per-key acknowledgement, so "dropped keys" has no
+//    observation behind it; nothing watches the foreground *during* a
+//    rehearsal, so "focus changes" would be a count of nothing; and "ready
+//    after 190 ms" is a round trip to a control this window owns and does not
+//    instrument. Three rows of confident-looking numbers with no measurement
+//    under them is the worst thing this surface could show, because the whole
+//    point of a rehearsal is that the user believes what it says. So the list
+//    reports what IS known -- exactly what the sender was handed, act by act,
+//    from `rehearsal::transcript` -- under a heading that says so.
+//  * **"Your 250 ms wait has 60 ms of headroom. Deskwarden can trim it to
+//    200 ms."** The same gap, one step further on: it is advice derived from
+//    the "slowest field" measurement that is not taken, plus an edit to the
+//    sequence applied from a window that does not hold the draft.
+//  * **"Save rule" and "Rehearse again" in the footer.** The footer answers
+//    with one `Close`. *Save rule* belongs to the editor -- this is a separate
+//    OS window, opened from a form that still holds the unsaved draft, and a
+//    Save here would be a second writer of the same item reachable while the
+//    first one is on screen. *Rehearse again* would need the substituted plan
+//    kept alive after the run, and `Inner::plan` is deliberately taken by the
+//    frame that starts the send precisely so a rehearsal cannot be started
+//    twice from one window. Closing and pressing *Rehearse with fake data*
+//    again is the path, and it re-reads the sequence as it now stands, which
+//    is what a user who has just edited it wants anyway.
 // ---------------------------------------------------------------------------
 
 /// Design 4d's own check-mark green. A one-off, and named as one: 4e says the

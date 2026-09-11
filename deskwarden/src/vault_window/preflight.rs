@@ -272,6 +272,22 @@ pub const HOLD_HINT: &str = "Hold Space to send";
 pub const CANCEL_LABEL: &str = "Cancel \u{b7} Esc";
 pub const COPY_INSTEAD_LABEL: &str = "Copy instead";
 pub const DISMISS_LABEL: &str = "Dismiss";
+/// The line under the two answers -- **4b's first sentence, and deliberately
+/// not its second.**
+///
+/// The design writes "Sending stops the moment focus leaves this window. Skip
+/// this step for SAP Logon in Preferences." The second sentence names a
+/// preference that does not exist: nothing in [`crate::settings::Settings`]
+/// can turn this card off for a rule or for an app, and [`verdict`] takes no
+/// settings argument at all, so there is no gate a preference could be wired
+/// to. Shipping the sentence anyway would send a user to a Preferences window
+/// to look for a switch that is not there -- and, worse, would advertise an
+/// escape from the one confirmation that stands between a stored sequence and
+/// a real password. A card that offers to stop asking is a card whose asking
+/// means less.
+///
+/// If that preference is ever built the sentence comes back here, because the
+/// surface paints this constant and nothing else.
 pub const FOOTNOTE: &str = "Sending stops the moment focus leaves this window.";
 pub const REFUSED_HEADING: &str = "Nothing sent";
 /// The label on the masked step, in the design's words.

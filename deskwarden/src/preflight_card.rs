@@ -66,6 +66,42 @@
 //! before `DispatchMessageW`, and never reaches a control. On this card the
 //! space bar is the hold and nothing else; the two footer buttons are pressed
 //! with the mouse, or with Enter while they hold focus.
+//!
+//! # What of 4b is here, and what is deliberately not
+//!
+//! Four things the design draws are not on this card, and each is a decision
+//! rather than an omission:
+//!
+//! * **The 470-wide card.** This one is [`WIDTH`], which is
+//!   `picker_prompt::WIDTH`, because two frameless daemon cards of different
+//!   widths read as two different programs. Everything inside it is measured
+//!   against that column instead.
+//! * **Keycaps on the Key steps.** 4b draws `Ctrl+A`, `Tab` and `Enter` as
+//!   boxed caps with a heavier bottom border. `win32_draw` has one chip
+//!   painter, [`crate::win32_draw::draw_hint_chip`], and it is the *shortcut
+//!   hint* chip -- a uniform 1px outline in `BORDER_STRONG`, right-aligned in
+//!   a lane, and already carrying a meaning on five other surfaces ("press
+//!   this to do the thing this row is"). Reusing it here would say the user
+//!   can press Tab to send. Drawing a second chip shape for one card is what
+//!   this design system exists to stop, so the keys are named in the label
+//!   lane instead and the one thing that *is* redrawn is the step that
+//!   matters -- the secret's band. See [`SECRET_FILL`].
+//! * **The refusal's red header band.** 4b's refused card puts "Nothing sent"
+//!   in white on a `#b42318` band across the top. This card's top is the brand
+//!   lockup, which is not optional on a frameless always-on-top window that is
+//!   about to type a password -- four cards in this crate lost their lockup in
+//!   porting and had to have it put back. The refusal is said in
+//!   `theme::ERROR` at the heading's own weight instead, and the card still
+//!   differs structurally from the allowed one in the way that counts: it lays
+//!   out no hold affordance at all.
+//! * **"Pick a window".** 4b's refused card offers it beside *Dismiss*. There
+//!   is no such action in this crate: [`Event`] has four arms and
+//!   [`PreflightAction`] three, `window_list::list_windows` is reached only
+//!   from the "Add app" picker in the editor, and a window chosen here would
+//!   have to be re-verdicted, re-focused and re-targeted from a card that owns
+//!   none of that. What is offered instead is *Copy instead*, which is the
+//!   same escape -- put the value where the user can place it themselves --
+//!   and which this card can actually perform.
 
 use crate::vault_window::preflight::{
     self, PreflightAction, PreflightState, Refusal, Verdict,
@@ -448,9 +484,51 @@ const STEP_GAP: i32 = 4;
 const STEP_LABEL_W: i32 = 78;
 const STEP_PAYLOAD_W: i32 = 96;
 
+/// How far a secret row's lanes move in from the edges of its band. 4b's
+/// tinted box is `padding: 7px 9px` and this is the 9.
+///
+/// **The 7 is not taken with it, and that is a departure worth naming.** Read
+/// border-box, 4b's password row is `7 + 19 + 7` inside a 1px border, so 35
+/// tall against the 20 every other row on that card gets. Growing one row by
+/// fifteen points on a frameless, unscrollable, always-on-top window pushes
+/// the hold affordance -- the only way to send -- fifteen points nearer the
+/// bottom edge, which is the exact failure `layout`'s own doc comment exists
+/// to prevent. The band therefore fills the row's own 20pt lane: the tint, the
+/// border, the radius and the red ink all arrive, and the extra air does not.
+const SECRET_PAD_X: i32 = 9;
+
+/// The secret row's tint, its edge and its ink -- 4b's `#fdf3f2`, `#f2dedb`
+/// and `#8c3c33`.
+///
+/// **Named here and nowhere else.** These are not `theme` tokens and must not
+/// become them: 4e's rule is that red appears on exactly one thing in this
+/// product, and a constant in the shared palette is an invitation for a second
+/// surface to reach for it. `scratch_window` names its own band's two colours
+/// locally for the same reason.
+const SECRET_FILL: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0xfd, 0xf3, 0xf2);
+const SECRET_EDGE: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0xf2, 0xde, 0xdb);
+const SECRET_INK: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0x8c, 0x3c, 0x33);
+
+/// The secret band's corner radius. 4b's `border-radius: 8px`, which is the
+/// same 8 the hold affordance and the two footer answers are.
+const SECRET_RADIUS: i32 = 8;
+
 /// The hold affordance. Full content width, so nothing else can be put beside
 /// the one control on this card that sends.
-const HOLD_H: i32 = 30;
+///
+/// **38, which is 4b's own number and is taller than [`BUTTON_H`] on purpose.**
+/// The design draws the hold at `height: 38px` over two `height: 32px` footer
+/// answers, and the six points are the whole hierarchy of this card: the one
+/// thing that sends is bigger than the two things that do not. This was 30 --
+/// *shorter* than the answers beside it -- which inverted that.
+const HOLD_H: i32 = 38;
+
+/// The hold affordance's corner radius, and the footer buttons'.
+///
+/// 4b gives both `border-radius: 8px`. The hold was drawn at 6 while the two
+/// buttons under it were already drawn at 8, so the one control that sends was
+/// the only rounding on the card that belonged to nothing.
+const HOLD_RADIUS: i32 = 8;
 
 /// Button height. `theme::BUTTON_HEIGHT`, pinned by
 /// [`tests::the_cards_dimensions_are_the_themes`].
@@ -527,9 +605,24 @@ impl Box2 {
     }
 }
 
-/// The four lanes of one step row.
+/// The four lanes of one step row, and the tinted box a secret one sits in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepBoxes {
+    /// **The band behind a secret step, and `None` for every other step.**
+    ///
+    /// 4b draws the password row -- and only the password row -- inside
+    /// `padding: 7px 9px; border-radius: 8px; background: #fdf3f2; border: 1px
+    /// solid #f2dedb`, with its words in `#8c3c33`. 4e names that as the one
+    /// deliberate departure from the palette in the whole product: "Secrets
+    /// are the only thing rendered in red ... so the hatched password step
+    /// cannot be mistaken for ordinary UI." A card that listed the password
+    /// step in the same greys as the Tab above it would be spending that
+    /// departure and getting nothing for it.
+    ///
+    /// It is in the layout rather than being painted from the row's own rect
+    /// because everything else on this card that has a position is, and a box
+    /// computed inside the paint path is a box no test can measure.
+    pub band: Option<Box2>,
     pub number: Box2,
     pub label: Box2,
     pub payload: Box2,
@@ -608,9 +701,18 @@ pub fn layout(text: &CardText) -> Layout {
         cursor = caption.bottom() + 4;
 
         let mut boxes = Vec::with_capacity(text.steps.len());
-        for i in 0..text.steps.len() {
+        for (i, step) in text.steps.iter().enumerate() {
             let y = cursor + i as i32 * STEP_H;
-            let number = Box2 { x: MARGIN_X, y, w: STEP_NUM_W, h: STEP_H };
+            // **The secret row's lanes move in, and nothing else's does.** The
+            // band is the content column, so a row drawn at the column's own
+            // left edge would have its number sitting on the tint's border.
+            // 4b's box insets its contents by `9px`, which is [`SECRET_PAD_X`].
+            let (band, inset) = if step.secret {
+                (Some(Box2 { x: MARGIN_X, y, w: content_w, h: STEP_H }), SECRET_PAD_X)
+            } else {
+                (None, 0)
+            };
+            let number = Box2 { x: MARGIN_X + inset, y, w: STEP_NUM_W, h: STEP_H };
             let label =
                 Box2 { x: number.right() + STEP_GAP, y, w: STEP_LABEL_W, h: STEP_H };
             let payload =
@@ -618,10 +720,10 @@ pub fn layout(text: &CardText) -> Layout {
             let tail = Box2 {
                 x: payload.right() + STEP_GAP,
                 y,
-                w: WIDTH - MARGIN_X - (payload.right() + STEP_GAP),
+                w: WIDTH - MARGIN_X - inset - (payload.right() + STEP_GAP),
                 h: STEP_H,
             };
-            boxes.push(StepBoxes { number, label, payload, tail });
+            boxes.push(StepBoxes { band, number, label, payload, tail });
         }
         cursor += text.steps.len() as i32 * STEP_H;
 
@@ -725,8 +827,9 @@ static TEXT: std::sync::Mutex<Option<CardText>> = std::sync::Mutex::new(None);
 /// here exhausts the table over a keystroke rather than over a session.
 mod win32 {
     use super::{
-        dropped_line, Box2, CardText, Event, PreflightWindow, GONE, PENDING,
-        PREFLIGHT_CARD_LABEL, PREFLIGHT_CARD_TITLE, TEXT,
+        dropped_line, Box2, CardText, Event, PreflightWindow, GONE, HOLD_RADIUS, PENDING,
+        PREFLIGHT_CARD_LABEL, PREFLIGHT_CARD_TITLE, SECRET_EDGE, SECRET_FILL, SECRET_INK,
+        SECRET_RADIUS, TEXT,
     };
     use crate::vault_window::preflight::{
         advance_hold, hold_complete, CANCEL_LABEL, COPY_INSTEAD_LABEL, DISMISS_LABEL, FOOTNOTE,
@@ -853,6 +956,12 @@ mod win32 {
         caption: HFONT,
         body: HFONT,
         button: HFONT,
+        /// The hold affordance's own face. **Its own, and not `button`.** 4b
+        /// sets the two footer answers at `font-size: 12px; font-weight: 600`
+        /// and the hold at `13px / 700`, which is the same hierarchy the bar's
+        /// extra six points of height say: one control on this card sends, and
+        /// it is not one of the two that are drawn as buttons.
+        hold: HFONT,
     }
 
     impl Fonts {
@@ -864,12 +973,15 @@ mod win32 {
                 caption: font(REGULAR, 11),
                 body: font(REGULAR, 12),
                 button: font(SEMIBOLD, 12),
+                hold: font(BOLD, 13),
             }
         }
 
         fn destroy(&self) {
             unsafe {
-                for f in [self.brand, self.title, self.caption, self.body, self.button] {
+                for f in
+                    [self.brand, self.title, self.caption, self.body, self.button, self.hold]
+                {
                     let _ = DeleteObject(f);
                 }
             }
@@ -1533,31 +1645,46 @@ mod win32 {
                     run(mem, fonts.caption, at, HEADING_STEPS, crate::theme::TEXT_MUTED);
                 }
                 for (step, boxes) in text.steps.iter().zip(l.steps.iter()) {
+                    // **The secret row, in 4b's one red.** Painted first so
+                    // the three runs land on the tint rather than under it,
+                    // and gated on `band` rather than on `step.secret` a
+                    // second time -- `layout` already made that decision and
+                    // two readings of it are two things that can disagree.
+                    if let Some(band) = boxes.band {
+                        rounded(
+                            mem,
+                            band,
+                            SECRET_RADIUS,
+                            SECRET_FILL,
+                            Some((1, SECRET_EDGE)),
+                        );
+                    }
+                    let secret = boxes.band.is_some();
                     run(
                         mem,
                         fonts.caption,
                         boxes.number,
                         &step.number,
-                        crate::theme::TEXT_MUTED,
+                        if secret { SECRET_INK } else { crate::theme::TEXT_MUTED },
                     );
-                    run(mem, fonts.body, boxes.label, &step.label, crate::theme::INK);
+                    run(
+                        mem,
+                        if secret { fonts.button } else { fonts.body },
+                        boxes.label,
+                        &step.label,
+                        if secret { SECRET_INK } else { crate::theme::INK },
+                    );
                     if !step.payload.is_empty() {
                         run(
                             mem,
                             fonts.body,
                             boxes.payload,
                             &step.payload,
-                            crate::theme::TEXT_SECONDARY,
+                            if secret { SECRET_INK } else { crate::theme::TEXT_SECONDARY },
                         );
                     }
                     if step.secret {
-                        run(
-                            mem,
-                            fonts.caption,
-                            boxes.tail,
-                            MASKED_ONLY,
-                            crate::theme::TEXT_MUTED,
-                        );
+                        run(mem, fonts.caption, boxes.tail, MASKED_ONLY, SECRET_INK);
                     }
                 }
                 if let Some(at) = l.dropped {
@@ -1575,7 +1702,7 @@ mod win32 {
                 }
 
                 if let Some(at) = l.hold {
-                    paint_hold(mem, at, fonts.button);
+                    paint_hold(mem, at, fonts.hold);
                 }
 
                 if let Some(at) = l.footnote {
@@ -1596,23 +1723,39 @@ mod win32 {
 
     /// **The hold affordance, and it is not a button.**
     ///
-    /// A wash with a filled portion that grows while the key is down, and the
+    /// A track with a filled portion that grows while the key is down, and the
     /// design's own words across it. It is painted here rather than being a
     /// `BUTTON` child precisely so that it cannot be clicked: there is no
     /// control under it to receive a click and nothing in `clicked` that could
     /// answer one.
+    ///
+    /// # The track is [`crate::theme::BLUE`] and the words are white
+    ///
+    /// 4b paints this bar `background: #1b3fa0` behind `color: #ffffff` at
+    /// `font-weight: 700`, and fills it from the left in `#14307a` as the hold
+    /// runs. What was here instead was the *wash* -- `BLUE_WASH` behind
+    /// `BLUE_EDGE` behind `BLUE` text -- which is three tints of the accent
+    /// and no accent, and it put the card's single most consequential control
+    /// at a lighter weight than the two grey answers below it. That is not a
+    /// stylistic difference: on a frameless always-on-top window that is about
+    /// to type a password, the thing that sends has to be the thing the eye
+    /// lands on.
+    ///
+    /// The progress is [`crate::theme::BLUE_DEEP`] over [`crate::theme::BLUE`]
+    /// rather than a lighter tint over a darker one, so the bar reads as
+    /// filling rather than as draining -- which is what a hold does.
     fn paint_hold(hdc: HDC, at: Box2, font: HFONT) {
-        rounded(hdc, at, 6, crate::theme::BLUE_WASH, None);
+        rounded(hdc, at, HOLD_RADIUS, crate::theme::BLUE, None);
         let per_mille = HELD_PER_MILLE.load(Ordering::SeqCst).clamp(0, 1000);
         if per_mille > 0 {
             let filled = Box2 { w: at.w * per_mille / 1000, ..at };
             if filled.w > 0 {
-                rounded(hdc, filled, 6, crate::theme::BLUE_EDGE, None);
+                rounded(hdc, filled, HOLD_RADIUS, crate::theme::BLUE_DEEP, None);
             }
         }
         unsafe {
             let old = SelectObject(hdc, font);
-            SetTextColor(hdc, rgb(crate::theme::BLUE));
+            SetTextColor(hdc, rgb(eframe::egui::Color32::WHITE));
             let mut rc = RECT {
                 left: scale(at.x),
                 top: scale(at.y),
@@ -2230,6 +2373,9 @@ mod tests {
             boxes.push(("optional", at));
         }
         for step in &l.steps {
+            if let Some(band) = step.band {
+                boxes.push(("step.band", band));
+            }
             boxes.push(("step.number", step.number));
             boxes.push(("step.label", step.label));
             boxes.push(("step.payload", step.payload));
@@ -2331,6 +2477,104 @@ mod tests {
                 assert!(pair[0].number.bottom() <= pair[1].number.y, "two steps overlap");
             }
         }
+    }
+
+    /// **4b's hold bar is taller than the answers under it, and it is the one
+    /// thing on this card that is.**
+    ///
+    /// `height: 38px` over two `height: 32px`, both at `border-radius: 8px`.
+    /// Measured off the layout rather than off the constants so a bar that
+    /// took the right height and was then laid out somewhere else still reds,
+    /// and the relation is asserted rather than the two numbers: what the
+    /// design says is that the control that sends outweighs the controls that
+    /// do not, and a pass that shrank both by four points would keep that.
+    #[test]
+    fn the_hold_affordance_outweighs_the_two_answers_under_it() {
+        let l = layout(&card_text(&allowed_state()));
+        let hold = l.hold.expect("an allowed card lays out a hold affordance");
+        assert_eq!(hold.h, 38, "4b's hold bar is 38 tall");
+        assert!(
+            hold.h > l.dismiss.h && hold.h > l.copy.h,
+            "the hold is {} tall and the answers beside it are {} -- the one control on this \
+             card that types a password into someone else's window is drawn at less weight \
+             than the two that do nothing",
+            hold.h,
+            l.dismiss.h
+        );
+        assert_eq!(
+            HOLD_RADIUS, SECRET_RADIUS,
+            "4b rounds the hold bar, the two answers and the secret band at one 8"
+        );
+        // Full content width: nothing may be put beside the only way to send.
+        assert_eq!(hold.x, l.heading.x);
+        assert_eq!(hold.w, l.heading.w);
+    }
+
+    /// **The password step wears 4b's band, and no other step does.**
+    ///
+    /// 4e calls the red the one deliberate departure from the palette in the
+    /// whole product, and its whole value is that it appears on one thing. So
+    /// this asserts both halves: the secret row has a band, and the count of
+    /// bands equals the count of secret rows rather than merely being
+    /// non-zero. A card that tinted every row would pass "the password row is
+    /// tinted" and would have spent the departure for nothing.
+    #[test]
+    fn only_the_secret_step_is_drawn_in_the_one_red() {
+        let text = card_text(&allowed_state());
+        let l = layout(&text);
+        let secrets = text.steps.iter().filter(|s| s.secret).count();
+        assert_eq!(secrets, 1, "the fixture no longer types exactly one secret: {text:?}");
+        let banded: Vec<&StepBoxes> = l.steps.iter().filter(|s| s.band.is_some()).collect();
+        assert_eq!(
+            banded.len(),
+            secrets,
+            "{} of {} rows are banded; the band belongs to the secret row and to nothing else",
+            banded.len(),
+            l.steps.len()
+        );
+        for (step, boxes) in text.steps.iter().zip(l.steps.iter()) {
+            assert_eq!(
+                step.secret,
+                boxes.band.is_some(),
+                "the band and the secret flag disagree on step {}",
+                step.number
+            );
+        }
+
+        // The band is the content column, and the row's words sit inside it
+        // rather than on its border -- which is the only reason the lanes of a
+        // secret row move at all.
+        let band = banded[0].band.unwrap();
+        assert_eq!(band.x, l.heading.x, "the band is not the content column");
+        assert_eq!(band.w, l.heading.w, "the band is not the content column");
+        assert_eq!(
+            banded[0].number.x - band.x,
+            SECRET_PAD_X,
+            "the secret row's number sits on the band's border"
+        );
+        assert!(
+            band.right() - banded[0].tail.right() >= SECRET_PAD_X,
+            "the secret row's note runs into the band's right border"
+        );
+
+        // The positive control: an ordinary row is NOT inset, so the whole
+        // list does not quietly move nine points right.
+        let plain = l.steps.iter().find(|s| s.band.is_none()).expect("the fixture has plain rows");
+        assert_eq!(plain.number.x, l.heading.x, "a non-secret row was inset too");
+    }
+
+    /// A sequence that types nothing secret gets no band anywhere -- the
+    /// control on the test above that makes "only the secret row" mean
+    /// something.
+    #[test]
+    fn a_sequence_with_no_secret_in_it_has_no_band_at_all() {
+        let text = card_text(&state_for("saplogon.exe", true, "{USERNAME}{TAB}{ENTER}"));
+        assert!(text.steps.iter().all(|s| !s.secret), "the fixture types a secret after all");
+        let l = layout(&text);
+        assert!(
+            l.steps.iter().all(|s| s.band.is_none()),
+            "a sequence that types no secret was still drawn with 4b's red on it"
+        );
     }
 
     /// The card's dimensions come from `theme`, not from numbers invented here.

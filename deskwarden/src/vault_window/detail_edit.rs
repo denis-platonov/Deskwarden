@@ -4658,12 +4658,44 @@ enum ChipEdit {
     Remove(usize),
 }
 
-/// The badge's ink. One accent hue: the understood kinds wear the blue, and
-/// the two that are carried rather than acted on wear the faint ink -- the
-/// same distinction the chips drew, said in colour rather than in fill.
+/// **The secret step's tint, edge and ink -- 4a's and 4c's `#fdf3f2`,
+/// `#e8a9a2` and `#8c3c33`.**
+///
+/// 4e names this the one deliberate departure from the palette in the whole
+/// product: "The product is blue. Secrets are the only thing rendered in red
+/// ... so the hatched password step cannot be mistaken for ordinary UI." What
+/// this list drew instead was [`theme::CARD_TINT`] -- `#fbfaf9`, a near-white
+/// that is one step off the card behind it -- so the step that types a
+/// password read as the same kind of thing as the Tab above it.
+///
+/// **Named here and not in [`theme`].** They are deliberately not tokens: the
+/// value of one red is that exactly one kind of thing wears it, and a constant
+/// in the shared palette is an invitation for a second surface to reach for a
+/// colour that then means nothing. `scratch_window` and `preflight_card` each
+/// name their own band's colours locally for the same reason. (If a later pass
+/// wants one home for these, it should be a named *secret-step* primitive with
+/// the rule attached, not three loose `Color32`s.)
+///
+/// **The hatch is not reproduced.** 4a fills the password row with a
+/// `repeating-linear-gradient` of two pinks at 135°. egui has no tiling brush;
+/// drawing one would mean a mesh of clipped parallelograms per row, rebuilt
+/// every frame, for a texture the flat tint and the red edge already say. The
+/// colour carries the meaning and the stripes carry none of it.
+const SECRET_STEP_FILL: egui::Color32 = egui::Color32::from_rgb(0xfd, 0xf3, 0xf2);
+const SECRET_STEP_EDGE: egui::Color32 = egui::Color32::from_rgb(0xe8, 0xa9, 0xa2);
+const SECRET_STEP_INK: egui::Color32 = egui::Color32::from_rgb(0x8c, 0x3c, 0x33);
+
+/// The badge's ink. One accent hue and one exception: the understood kinds
+/// wear the blue, the two that are carried rather than acted on wear the faint
+/// ink -- the same distinction the chips drew, said in colour rather than in
+/// fill -- and a step that types a secret wears [`theme::ERROR`], which is
+/// 4a's own `#b42318` badge.
 fn badge_ink(row: &StepRow) -> egui::Color32 {
     match row.kind {
         _ if !row.understood => theme::TEXT_FAINT,
+        // Before the two arms below, because a secret step is a `Text` step
+        // and would otherwise take the blue with everything else.
+        _ if row.secret => theme::ERROR,
         StepKind::Rate | StepKind::Raw => theme::TEXT_MUTED,
         _ => theme::BLUE,
     }
@@ -4688,8 +4720,11 @@ fn sequence_steps(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option
     let mut edit = None;
     for row in rows {
         egui::Frame::new()
-            .fill(if row.secret { theme::CARD_TINT } else { theme::CARD })
-            .stroke(Stroke::new(1.0, theme::HAIRLINE))
+            .fill(if row.secret { SECRET_STEP_FILL } else { theme::CARD })
+            .stroke(Stroke::new(
+                1.0,
+                if row.secret { SECRET_STEP_EDGE } else { theme::HAIRLINE },
+            ))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(Margin::symmetric(8, 5))
             .show(ui, |ui| {
@@ -4711,10 +4746,14 @@ fn sequence_steps(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option
                     );
                     ui.label(theme::semibold(row.kind.badge(), 10.0).color(badge_ink(row)));
                     let label = ui.label(
-                        theme::semibold(row.label.clone(), 12.0).color(if row.understood {
-                            theme::INK
-                        } else {
-                            theme::TEXT_FAINT
+                        theme::semibold(row.label.clone(), 12.0).color(match row.kind {
+                            _ if !row.understood => theme::TEXT_FAINT,
+                            // 4a sets the word "Password" in white on the red
+                            // chip; on a tint this pale the design's own
+                            // `#8c3c33` is what stays legible, and it is the
+                            // ink 4c gives the same chip.
+                            _ if row.secret => SECRET_STEP_INK,
+                            _ => theme::INK,
                         }),
                     );
                     if !row.understood {
@@ -4723,9 +4762,11 @@ fn sequence_steps(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option
                     if !row.payload.is_empty() {
                         // A mask is not a value and must not be drawn like
                         // one: the accent ink is reserved for something the
-                        // user can actually read.
+                        // user can actually read. A secret's mask takes the
+                        // row's own red instead -- it is part of the one thing
+                        // on this list that is not ordinary UI, not a value.
                         ui.label(RichText::new(row.payload.clone()).size(12.0).color(
-                            if row.secret { theme::TEXT_MUTED } else { theme::BLUE },
+                            if row.secret { SECRET_STEP_INK } else { theme::BLUE },
                         ));
                     }
                     if editable {
@@ -4754,29 +4795,48 @@ fn sequence_steps(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option
 
 /// The Steps / Template toggle. Returns the view asked for, or `None`.
 ///
-/// Two buttons rather than a segmented control, because egui has no segmented
-/// control and a painted one would be hit-testing built by hand for no gain --
-/// the state is already visible in which of the two is drawn as the current
-/// one.
+/// **[`theme::segmented_control`], and the doc comment that used to stand here
+/// said it could not be.** It claimed "egui has no segmented control and a
+/// painted one would be hit-testing built by hand for no gain", and what this
+/// function drew instead was two independent `Button`s with the current one
+/// washed in `BLUE_WASH`. Both halves of that claim have since stopped being
+/// true: the crate grew one painted multiple-choice row in `theme`, with the
+/// hit-testing already built and already tested, and `prefs_ui`, `record_ui`
+/// and `send_ui` all draw theirs through it. A second spelling of the same
+/// control here would be the thing this design system exists to prevent --
+/// and it is also not what 4a and 4c draw.
+///
+/// 4a and 4c draw ONE pill: `border: 1px solid #d7d3d3; border-radius: 7px;
+/// overflow: hidden` round a run whose cells are `padding: 4px 11px`, with the
+/// view in force filled `#1b3fa0` behind white `font-weight: 600` and the
+/// other left on white. That is [`theme::segmented_control`] exactly -- the
+/// run's radius is `SEGMENT_RADIUS` 7, the selected cell is `BLUE` behind
+/// white, the rest is `CARD` behind `INK`, and the seam is one pixel because
+/// the cells overlap by [`theme::SEGMENT_SEAM`]. The wash this function used
+/// to paint is the weight the design system reserves for a nav row, which is
+/// the opposite situation: the view in force here is the answer to a question
+/// with exactly two answers, sitting a point away from the other one.
+///
+/// **The height is the control's 28 and not the design's 26.** 4a's cells
+/// measure `4px + 16px line + 4px` inside a 1px border, which is 26 border-box.
+/// [`theme::SEGMENT_HEIGHT`] is 28, because every other multiple-choice row in
+/// the app is 28 and a run two points shorter in this one form would read as a
+/// mismeasurement rather than as a decision. One control, one height.
 fn view_toggle(ui: &mut egui::Ui, template_view: bool) -> Option<bool> {
-    let mut asked = None;
-    ui.horizontal(|ui| {
-        for (caption, is_template) in [(VIEW_STEPS, false), (VIEW_TEMPLATE, true)] {
-            let current = template_view == is_template;
-            let button = egui::Button::new(theme::semibold(caption, 11.0).color(if current {
-                theme::INK
-            } else {
-                theme::TEXT_MUTED
-            }))
-            .fill(if current { theme::BLUE_WASH } else { theme::CARD })
-            .stroke(Stroke::new(1.0, if current { theme::BLUE_EDGE } else { theme::BORDER }))
-            .corner_radius(CornerRadius::same(7));
-            if ui.add(button).clicked() && !current {
-                asked = Some(is_template);
-            }
-        }
-    });
-    asked
+    let cells = [
+        theme::Segment { label: VIEW_STEPS, selected: !template_view },
+        theme::Segment { label: VIEW_TEMPLATE, selected: template_view },
+    ];
+    // **A press on the cell already in force is reported and then dropped.**
+    // `segmented_control` hands back every press, including the one that asks
+    // for the view already on screen; answering `Some` there would re-seed
+    // `template_draft` from `sequence` on every click of the lit cell, which
+    // is an edit the user did not make. See the caller.
+    match theme::segmented_control(ui, &cells) {
+        Some(0) if template_view => Some(false),
+        Some(1) if !template_view => Some(true),
+        _ => None,
+    }
 }
 
 /// The tip on a step this build carries but does not understand.
@@ -5222,7 +5282,13 @@ fn app_block(
     }
     ui.add_space(6.0);
 
-    ui.horizontal(|ui| {
+    // **Wrapped, not `horizontal`** -- the same reason the generator row, the
+    // websites block and the keystroke chip row all are: an unwrapped row does
+    // not shrink to fit, it pushes the card past the pane and inflates every
+    // `available_width()` measured after it. That is `aae9429`'s defect, and
+    // this row is one of the narrower escapes from it: "Choose a running
+    // app..." is the longest button caption on the whole form.
+    ui.horizontal_wrapped(|ui| {
         if theme::secondary_button(ui, "Choose a running app\u{2026}").clicked() {
             app.picking = !app.picking;
             if app.picking {
@@ -5230,9 +5296,37 @@ fn app_block(
                 app.windows = running_app_rows();
             }
         }
-        let browse = egui::Button::new("Browse\u{2026}");
+        // **Browse comes from the theme, and that is the point.**
+        //
+        // It was a bare `egui::Button` sitting immediately beside a
+        // `theme::secondary_button`, and the two are not the same control.
+        // `theme::apply` gives `TextStyle::Button` Archivo *Regular* at 13pt
+        // and sets no height floor, while `theme::secondary_button` is
+        // `theme::semibold(_, 13.0)` with `min_size(0, BUTTON_HEIGHT)` -- so
+        // the pair drew at two different weights, and Browse came out short of
+        // its neighbour's 32pt, its bottom edge stopping several points above
+        // it. The fill, the stroke and the 7pt radius already agreed (the
+        // visuals in `theme::apply` set `inactive` to `CARD` / `BORDER_STRONG`
+        // / radius 7), which is precisely why the mismatch was easy to miss:
+        // it read as emphasis rather than as two spellings of one control.
+        //
+        // This is the footer's own defect restated one row up. See
+        // `draw_detail_edit`'s action strip, where Save was a bare `Button`
+        // beside a themed Cancel for the same reason and the user reported it
+        // as "one bold and not bold now for some reason" -- pinned there by
+        // `the_two_footer_buttons_are_set_in_one_face`, and pinned here by
+        // `the_two_app_path_buttons_are_set_in_one_face`.
+        //
+        // `add_enabled_ui` around the theme's own button rather than a new
+        // `theme::secondary_button_enabled`: that is exactly the body
+        // `theme::primary_button_enabled` runs (see its doc), so the disabled
+        // fade is egui's same `Style::disabled` and `theme` does not gain a
+        // second outlined-button spelling for a later design change to move
+        // only half of.
+        let editable = matches!(path_row, AppPathRow::Editable);
         if ui
-            .add_enabled(matches!(path_row, AppPathRow::Editable), browse)
+            .add_enabled_ui(editable, |ui| theme::secondary_button(ui, "Browse\u{2026}"))
+            .inner
             .clicked()
         {
             action = Some(EditAction::PickAppFile);
@@ -10726,10 +10820,26 @@ mod sequence_builder_tests {
         - crate::vault_window::SIDEBAR_WIDTH
         - crate::vault_window::LIST_WIDTH;
 
+    /// One filled box, as the frame really painted it.
+    ///
+    /// **Text alone is not enough to hold a design claim.** This harness used
+    /// to collect only `Shape::Text`, so "the Steps/Template toggle is the
+    /// design system's segmented control" could be satisfied by two bare
+    /// labels drawn at zero size with no box round them at all -- which is
+    /// exactly the shape of the regression the boxes below exist to catch.
+    #[derive(Clone, Copy, Debug)]
+    struct PaintedRect {
+        rect: Rect,
+        fill: egui::Color32,
+        stroke: egui::Color32,
+        radius: egui::CornerRadius,
+    }
+
     #[derive(Default)]
     struct Painted {
         texts: Vec<(String, Rect)>,
         rendered: Vec<(String, String, Rect)>,
+        rects: Vec<PaintedRect>,
     }
 
     impl Painted {
@@ -10752,6 +10862,21 @@ mod sequence_builder_tests {
             );
             found[0]
         }
+
+        /// Every filled box that wholly contains `inner` and is no more than
+        /// `slack` bigger than it on any side -- the box drawn *round* a
+        /// label, found without knowing where its owner put it.
+        fn boxes_around(&self, inner: Rect, slack: f32) -> Vec<PaintedRect> {
+            self.rects
+                .iter()
+                .copied()
+                .filter(|r| {
+                    r.rect.contains_rect(inner)
+                        && r.rect.width() - inner.width() <= slack
+                        && r.rect.height() - inner.height() <= slack
+                })
+                .collect()
+        }
     }
 
     fn walk(shape: &egui::Shape, painted: &mut Painted) {
@@ -10767,6 +10892,12 @@ mod sequence_builder_tests {
                 painted.texts.push((text.galley.text().to_string(), rect));
                 painted.rendered.push((text.galley.text().to_string(), rendered, rect));
             }
+            egui::Shape::Rect(rect) => painted.rects.push(PaintedRect {
+                rect: rect.rect,
+                fill: rect.fill,
+                stroke: rect.stroke.color,
+                radius: rect.corner_radius,
+            }),
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     walk(shape, painted);
@@ -11946,6 +12077,201 @@ mod sequence_builder_tests {
         assert!(draft.is_valid(), "the fixture lost its name");
     }
 
+    /// **The password step is drawn in the one red, and nothing else is.**
+    ///
+    /// 4e: "The product is blue. Secrets are the only thing rendered in red,
+    /// and caution is the only thing in amber -- two semantic colours that
+    /// appear nowhere else, so the hatched password step cannot be mistaken
+    /// for ordinary UI." This list used to tint the secret row
+    /// `theme::CARD_TINT`, which is `#fbfaf9` -- one step off the card behind
+    /// it, and the same tint the app uses for every footer strip.
+    ///
+    /// Asserted on the FILLS and not on the strings, because a row that said
+    /// "Password" in whatever colour was to hand would satisfy any test that
+    /// only read text; and asserted as a COUNT, because a list that tinted
+    /// every row red would spend the one departure and buy nothing with it.
+    #[test]
+    fn the_secret_step_is_the_only_row_in_the_one_red() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        // Five rows, one of which types a secret.
+        let mut draft = draft_for(&item, "{ESC}{USERNAME}{TAB}{PASSWORD}{ENTER}");
+        let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+
+        let rows = step_rows(
+            &draft.app.as_ref().unwrap().sequence,
+            &rows_source(&item, &live_code()),
+            false,
+        );
+        assert_eq!(rows.len(), 5, "the fixture changed shape");
+        assert_eq!(rows.iter().filter(|r| r.secret).count(), 1, "the fixture lost its secret");
+
+        let red: Vec<&PaintedRect> =
+            open.rects.iter().filter(|r| r.fill == SECRET_STEP_FILL).collect();
+        assert_eq!(
+            red.len(),
+            1,
+            "{} boxes on this form are filled 4a's #fdf3f2; exactly one step types a secret",
+            red.len()
+        );
+        assert_eq!(red[0].stroke, SECRET_STEP_EDGE, "the secret row is not edged #e8a9a2");
+        assert_eq!(
+            red[0].radius.nw, 10,
+            "the secret row is not the same 10pt card the other steps are"
+        );
+
+        // **The positive control on the count.** The other four rows are still
+        // drawn, as ordinary cards -- so "exactly one red box" cannot be
+        // satisfied by a list that stopped drawing rows at all.
+        let plain = open
+            .rects
+            .iter()
+            .filter(|r| r.fill == theme::CARD && r.stroke == theme::HAIRLINE && r.radius.nw == 10)
+            .count();
+        assert!(
+            plain >= 4,
+            "only {plain} ordinary step cards were painted; the list has four non-secret steps"
+        );
+
+        // And the word on the red row is in the red ink rather than in the
+        // form's ordinary INK, which is what makes the row read as one thing.
+        assert!(
+            open.strings().contains(&"Password"),
+            "the secret step lost its label: {:?}",
+            open.strings()
+        );
+    }
+
+    /// A sequence with no secret in it paints no red at all. Without this, the
+    /// count above would pass on a build that tinted a row red for some reason
+    /// other than the row being a secret.
+    #[test]
+    fn a_sequence_that_types_no_secret_paints_none_of_the_one_red() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "{ESC}{USERNAME}{TAB}{ENTER}");
+        let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+        assert!(
+            !open.rects.iter().any(|r| r.fill == SECRET_STEP_FILL),
+            "a sequence that types no secret was still drawn with 4a's red on it"
+        );
+    }
+
+    // -- 4a/4c: the Steps/Template toggle ----------------------------------
+
+    /// **One pill, and the view in force is the filled cell.**
+    ///
+    /// 4a and 4c draw this toggle identically: a run outlined `#d7d3d3` at
+    /// `border-radius: 7px`, with the current view `background: #1b3fa0;
+    /// color: #ffffff` and the other on white. That is
+    /// [`theme::segmented_control`] and nothing else in the app, which is the
+    /// whole reason this is asserted in colour rather than only in position:
+    /// this function used to draw two independent `egui::Button`s with the
+    /// current one washed in `BLUE_WASH`, and a test that only found the two
+    /// captions could not tell that apart from the control the design asks
+    /// for.
+    ///
+    /// The fill is read off the box painted AROUND each caption, so a run that
+    /// took the right colours from the right constants and then laid its cells
+    /// out somewhere else still reds.
+    #[test]
+    fn the_view_toggle_is_one_segmented_run_with_the_current_view_filled() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "{USERNAME}{TAB}{PASSWORD}");
+        let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+
+        // The builder opens on Steps, so Steps is the cell in force.
+        let cell = |painted: &Painted, caption: &str| -> PaintedRect {
+            let label = painted.rect_of(caption);
+            let found = painted.boxes_around(label, theme::SEGMENT_PADDING + 4.0);
+            assert_eq!(
+                found.len(),
+                1,
+                "{caption:?} has {} boxes drawn round it rather than one cell",
+                found.len()
+            );
+            found[0]
+        };
+
+        let steps = cell(&open, VIEW_STEPS);
+        let template = cell(&open, VIEW_TEMPLATE);
+        assert_eq!(
+            steps.fill,
+            theme::BLUE,
+            "the view in force is not filled #1b3fa0. `BLUE_WASH` is the weight this design \
+             system reserves for a nav row, and this is a two-answer question"
+        );
+        assert_eq!(template.fill, theme::CARD, "the view NOT in force is not left on white");
+        assert_eq!(template.stroke, theme::BORDER, "the run is not outlined #dedbd9");
+
+        // **One pill and not two buttons.** The cells are joined -- they touch
+        // to within `SEGMENT_SEAM` -- and they are the same height, which is
+        // what says "two positions of one control" rather than "two things you
+        // might press".
+        assert!(
+            (template.rect.left() - steps.rect.right()).abs() <= theme::SEGMENT_SEAM + 0.5,
+            "the two cells are {} apart; a segmented run has no gap at its seam",
+            template.rect.left() - steps.rect.right()
+        );
+        assert!(
+            (steps.rect.height() - theme::SEGMENT_HEIGHT).abs() <= 0.5
+                && (template.rect.height() - theme::SEGMENT_HEIGHT).abs() <= 0.5,
+            "a cell is {} tall and the app's one segmented control is {}",
+            steps.rect.height(),
+            theme::SEGMENT_HEIGHT
+        );
+
+        // **The rounding belongs to the run.** The first cell rounds its left
+        // corners only and the last its right corners only, which is the
+        // geometric difference between a pill and two rounded buttons.
+        assert_eq!(steps.radius.ne, 0, "the first cell rounds its interior corner");
+        assert_eq!(template.radius.nw, 0, "the last cell rounds its interior corner");
+        assert!(steps.radius.nw > 0 && template.radius.ne > 0, "the run has no outer rounding");
+
+        // And it still *works*: pressing the unlit cell moves the control, and
+        // the lit cell is then the other one.
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(template.rect.center()));
+        let after = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        assert!(draft.app.as_ref().unwrap().template_view, "pressing Template did not take");
+        assert_eq!(
+            cell(&after, VIEW_TEMPLATE).fill,
+            theme::BLUE,
+            "the control moved but the fill did not follow it"
+        );
+        assert_eq!(cell(&after, VIEW_STEPS).fill, theme::CARD);
+    }
+
+    /// **Pressing the cell already in force changes nothing.**
+    ///
+    /// `theme::segmented_control` reports every press, the lit cell included;
+    /// `view_toggle` drops that one. It has to: the caller re-seeds
+    /// `template_draft` from `sequence` on every `Some(true)`, so a press that
+    /// answered would quietly throw away an edit in progress in the box the
+    /// user is looking at.
+    #[test]
+    fn pressing_the_view_already_on_screen_does_not_reseed_the_template_box() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = draft_for(&item, "{USERNAME}");
+        let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
+        let to_template = open.rect_of(VIEW_TEMPLATE).center();
+        let template = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(to_template));
+
+        // An edit the user has made in the box but not yet committed anywhere
+        // a re-seed would preserve.
+        draft.app.as_mut().unwrap().template_draft = "{USERNAME}{ENTER}".to_string();
+        let at = template.rect_of(VIEW_TEMPLATE).center();
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
+        assert!(draft.app.as_ref().unwrap().template_view, "the lit cell switched the view off");
+        assert_eq!(
+            draft.app.as_ref().unwrap().template_draft,
+            "{USERNAME}{ENTER}",
+            "pressing the cell already in force re-seeded the box from the stored string, \
+             throwing away what the user had typed into it"
+        );
+    }
+
     // -- 4c: the bridge ----------------------------------------------------
 
     /// **The round trip, byte for byte.** Opening the template view, looking
@@ -13034,6 +13360,117 @@ mod edit_pane_layout_tests {
             );
         }
     }
+
+    /// **The app block's two path buttons are set in ONE face, at one height.**
+    ///
+    /// [`the_two_footer_buttons_are_set_in_one_face`]'s defect, found a second
+    /// time one row up. "Browse..." was a bare `egui::Button` standing
+    /// immediately beside `theme::secondary_button`'s "Choose a running
+    /// app...", and the two are not the same control even though three of
+    /// their four visual properties agreed: `theme::apply` already sets
+    /// `widgets.inactive` to `CARD` fill, a `BORDER_STRONG` stroke and a 7pt
+    /// radius, so the fill, the outline and the corners matched by accident.
+    /// What did not match was the type -- `TextStyle::Button` is Archivo
+    /// *Regular* at 13pt, against `theme::secondary_button`'s
+    /// `theme::semibold(_, 13.0)` -- and the height, because a bare `Button`
+    /// takes no `min_size` and came out short of its neighbour's
+    /// [`theme::BUTTON_HEIGHT`], its bottom edge stopping several points
+    /// above it. That is exactly the pair the user reported in the footer as
+    /// "one bold and not bold now for some reason": two font stacks, read as
+    /// emphasis.
+    ///
+    /// Asserted on the `FontId` the layout job carried and on the painted
+    /// FRAME's height, because neither is what was already green while this
+    /// was wrong -- ink width was. Both halves of the face check, for the
+    /// footer test's reason: they must match each other, AND the face they
+    /// share must be the theme's semibold, positively named, so regressing
+    /// "Choose a running app..." to a bare button too could not satisfy it.
+    #[test]
+    fn the_two_app_path_buttons_are_set_in_one_face() {
+        let ctx = styled_context(ROOMY_PANE);
+        // `tallest_draft` carries a bound, non-hosted app match, which is the
+        // state that draws the path row editable and both of its buttons.
+        let mut draft = tallest_draft();
+        let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+        let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+
+        let expected = egui::FontId::new(13.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+        let browse = painted.font_of(BROWSE);
+        let choose = painted.font_of(CHOOSE_RUNNING_APP);
+        assert_eq!(
+            browse, choose,
+            "{BROWSE:?} is laid out in {browse:?} beside {CHOOSE_RUNNING_APP:?}'s {choose:?} -- \
+             the app block's two buttons come from different font stacks, which is the footer's \
+             own defect one row up"
+        );
+        assert_eq!(
+            browse, expected,
+            "{BROWSE:?} is laid out in {browse:?}, which is not the theme's semibold \
+             ({expected:?}) -- both buttons agreeing on egui's default face would satisfy the \
+             check above while taking BOTH of them out of the design system"
+        );
+
+        // ... and the frames they paint are the same height, which is the
+        // half of the report the face check cannot see.
+        for label in [BROWSE, CHOOSE_RUNNING_APP] {
+            let frame_rect = painted.frame_around(painted.rect_of(label));
+            assert!(
+                (frame_rect.height() - theme::BUTTON_HEIGHT).abs() <= 0.5,
+                "{label:?} paints a {}pt-tall frame, not theme::BUTTON_HEIGHT ({}) -- a button \
+                 with no height floor sits short of the themed one beside it",
+                frame_rect.height(),
+                theme::BUTTON_HEIGHT
+            );
+        }
+    }
+
+    /// **Both app-path buttons are reachable at the app's MINIMUM width, and
+    /// legible as themselves.**
+    ///
+    /// The cost side of the fix above. `theme::secondary_button` is wider than
+    /// the bare `egui::Button` it replaced, and "Choose a running app..." is
+    /// the longest button caption on this form -- so the row it shares with
+    /// Browse is one of the narrower escapes from `aae9429`, where an
+    /// unwrapped `ui.horizontal` pushed the card out past a 298pt pane and
+    /// inflated every `available_width()` measured after it. That is why the
+    /// row is `horizontal_wrapped`, and this is the assertion that says so.
+    ///
+    /// Both halves, for [`assert_reachable`]'s reason: the rect must be inside
+    /// the pane, and the glyphs really drawn must be the whole caption --
+    /// a "Choose a running\u{2026}" elided down to fit is in bounds and says
+    /// nothing.
+    #[test]
+    fn both_app_path_buttons_are_reachable_at_the_apps_minimum_width() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let mut draft = tallest_draft();
+        let _ = frame(&ctx, pane, &mut draft, true, &[]);
+        let painted = frame(&ctx, pane, &mut draft, true, &[]);
+        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+
+        for label in [BROWSE, CHOOSE_RUNNING_APP] {
+            let rect = painted.rect_of(label);
+            assert!(
+                bounds.contains_rect(rect),
+                "{label:?} is painted at {rect:?}, off a {}x{}pt pane -- this pane does not \
+                 scroll horizontally",
+                pane.x,
+                pane.y
+            );
+            assert_eq!(
+                painted.rendered_glyphs(label),
+                label,
+                "{label:?} DREW an elision of itself -- it is on the pane and unreadable"
+            );
+        }
+    }
+
+    /// The app block's two path-row button captions, spelled once so the two
+    /// tests above cannot measure a control the form no longer draws under
+    /// the name they were written with.
+    const BROWSE: &str = "Browse\u{2026}";
+    /// See [`BROWSE`].
+    const CHOOSE_RUNNING_APP: &str = "Choose a running app\u{2026}";
 
     /// **A Save that cannot be pressed does not look like one that can.**
     ///
