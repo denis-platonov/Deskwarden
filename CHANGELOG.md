@@ -15,6 +15,8 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.21 - 2026-09-10
+
 ### The Send screens use the app's own buttons again
 
 The two screens that publish a Send -- **Send a record**, and the **New
