@@ -57,29 +57,33 @@
 //! replacing is the one step in this whole feature that can destroy data the
 //! user already had, so it is never the answer to a question nobody was asked.
 //!
-//! # Design §5a, and the four blocks of it that are deliberately not built
+//! # Design §5a, and the three blocks of it that are deliberately not built
 //!
 //! [`draw_export_form`] **is** design §5a — "Compose a Send", captioned
-//! FIELD-LEVEL, NOT WHOLE-RECORD — and after the 2026-09 design pass it
+//! FIELD-LEVEL, NOT WHOLE-RECORD — and after the 2026-09 design passes it
 //! carries §5a's `RECORD` chip, its `INCLUDE` block with the running count,
-//! its boxed tick list and its primary/secondary footer. Four things §5a
-//! draws are still not here, and each is a decision rather than an omission.
+//! its boxed tick list, its `ACCESS` block and its primary/secondary footer.
+//! Three things §5a draws are still not here, and each is a decision rather
+//! than an omission.
 //!
-//! **§5a's whole `ACCESS` block.** The mockup gives the composer an Expires
-//! row (`1 h · 24 h · 7 d · 30 d`), a view-count stepper, an "Open with"
-//! password with a Generate beside it, a Recipient address, an "only this
-//! address can open it" switch and a "tell me when it is opened" switch.
-//! Exactly one of the six is a thing this app can do today.
-//! [`send_plan_from`] builds a [`SendPlan`], and a `SendPlan` has
-//! `delete_in_days` (whose only legal values are `1`, `7` and `30` — there is
-//! no sub-day lifetime to offer under `1 h` or `24 h`), `password` and
-//! `max_access_count`. The other three — a recipient, an address lock and an
-//! open notification — are **not properties of a Bitwarden Send at all**, and
-//! there is no server here to make them ones. Building the two that could be
-//! built (a password, a view limit) without the four that cannot would give
-//! the user a §5a-shaped block that answers half its own questions, which is
-//! worse than the honest absence. It needs the owner's call on what the
-//! feature is, not a design pass's guess.
+//! **§5a's `ACCESS` block is now built — three of its six rows.** The block
+//! itself is [`super::send_ui::draw_access_block`], shared with the Sends
+//! screen's own composer so that the app's two Send composers answer one
+//! question one way; the three rows it draws are the lifetime, the view cap
+//! and the share password, and the three it does not are argued in full on
+//! that function. In short: a **recipient address** and the **"only this
+//! address can open it"** switch are one mechanism on the wire — a Send whose
+//! `authType` is `Email`, gated by a code the server mails — and the server
+//! this app is built against answers `501 Not Implemented` to every one of
+//! them, on create, on update and on access alike, so the switch would either
+//! fail the publish or, worse, lock nothing while claiming to. **"Tell me
+//! when it is opened"** is not a Send field at all; the only thing behind it
+//! would be this app polling `accessCount` on a timer, which is a background
+//! job and a notification surface wearing a switch's clothes. §5a's
+//! **`Generate`** beside the password is absent for a smaller reason, also
+//! given there: a generated share password the sender cannot read is one they
+//! cannot tell the recipient, and a reveal would be this app's third
+//! treatment of a typed secret.
 //!
 //! **The value previews down the right of the tick list.** §5a shows each
 //! row's actual content beside its label — the username, a masked password,
@@ -110,8 +114,13 @@ use crate::theme;
 use eframe::egui::{self, CornerRadius};
 use zeroize::Zeroizing;
 
-/// Height of every button on these two forms, matching the Sends pane.
-const BUTTON_HEIGHT: f32 = 26.0;
+// `BUTTON_HEIGHT` -- 26, "matching the Sends pane" -- is DELETED here rather
+// than left unused. It was the height of the four bare `egui::Button`s these
+// two forms used to draw, and every one of them is now a
+// `theme::primary_button_enabled` or a `theme::secondary_button`, which are
+// `theme::BUTTON_HEIGHT`'s 32. Its doc comment had also stopped being true:
+// the Sends pane's own footer moved to 32 when the composer did, so this
+// constant named a match with something that no longer measured that.
 
 // ---------------------------------------------------------------------------
 // Task 5 -- the plan that travels
@@ -124,12 +133,28 @@ const BUTTON_HEIGHT: f32 = 26.0;
 /// renders on sight. The name is the record's own, so the sender recognises
 /// the row in their Sends list; the body is [`write_json`]'s
 /// [`Zeroizing`] buffer, moved in rather than copied.
-pub fn send_plan_from(record: &Record) -> SendPlan {
+///
+/// # `access` is MOVED, not copied, and that is what makes the block real
+///
+/// It is the draft's own [`RecordDraft::access`], taken by value: the share
+/// password inside it is a [`Zeroizing`] buffer, and a version of this that
+/// took `&RecordDraft` and cloned would leave a second copy of that secret
+/// behind in the draft for the life of the modal, wiped only when the modal
+/// closed. Taken by value, there is one buffer and it travels.
+///
+/// This is also the only place the three Access answers meet the record, so
+/// it is the one place a test can ask "does what the user chose reach the
+/// plan that gets published" -- `the_access_block_reaches_the_plan_that_is_published`
+/// is that test. `..access` rather than `..SendPlan::default()` is the whole
+/// of the change and would be an easy thing to lose in a refactor; losing it
+/// would mean the Access block drew, validated and published nothing, in
+/// silence.
+pub fn send_plan_from(record: &Record, access: SendPlan) -> SendPlan {
     SendPlan {
         name: record.name.clone(),
         text: write_json(record),
         hidden: true,
-        ..SendPlan::default()
+        ..access
     }
 }
 
@@ -188,7 +213,7 @@ pub const INCLUDE_FIELD_COUNT: usize = 5;
 /// Singular at one, because "1 of 5 fields" is the one count a form like this
 /// is most likely to be showing and reading it as a plural is the sort of
 /// thing that makes a careful screen look careless. The same rule
-/// [`super::send_ui::lifetime_label`] follows for `1 day`.
+/// [`crate::send::lifetime_label`] follows for `1 hour` and `1 day`.
 pub fn include_counter(draft: &RecordDraft) -> String {
     let sel = &draft.selection;
     let ticked = [sel.username, sel.password, sel.uri, sel.notes, sel.totp]
@@ -260,6 +285,26 @@ pub struct RecordDraft {
     /// The passphrase the seed will be sealed under. Empty unless
     /// `selection.totp`; see [`RecordDraft::set_totp`].
     pub passphrase: Zeroizing<String>,
+    /// Design §5a's `ACCESS` block: how long the link lives, the share
+    /// password, and the view cap.
+    ///
+    /// # Why the draft carries a whole [`SendPlan`] for three fields
+    ///
+    /// The alternative was three loose fields here and an assembly step in
+    /// [`send_plan_from`], and an assembly step is precisely where the value
+    /// the form validated and the value that gets published come apart --
+    /// `send_ui::SendComposer`'s own doc records that reasoning, and it holds
+    /// a `SendPlan` for the same reason. The two Send composers in this app
+    /// now hold the same type for the same three answers, so a rule written
+    /// about one is true of the other.
+    ///
+    /// The name and body are not filled in until [`send_plan_from`]: they are
+    /// the RECORD, which is re-resolved by id at submit time precisely so
+    /// this form never holds a record's values between frames. What is here
+    /// between frames is three choices the user made about the link, none of
+    /// which is a secret about the vault -- except the share password, which
+    /// is a `Zeroizing` inside the plan and dies with the draft.
+    pub access: SendPlan,
 }
 
 impl Default for RecordDraft {
@@ -277,6 +322,11 @@ impl Default for RecordDraft {
                 totp: false,
             },
             passphrase: Zeroizing::new(String::new()),
+            // Seven days, no password, no view cap -- `SendPlan::default`'s
+            // own answers, not a second set written here. §5a's Access block
+            // opens on exactly this state, and the design's caption says so:
+            // "the password is off until you say so".
+            access: SendPlan::default(),
         }
     }
 }
@@ -326,7 +376,27 @@ pub fn export_problem(draft: &RecordDraft) -> Option<&'static str> {
     if !(sel.username || sel.password || sel.uri || sel.notes || sel.totp) {
         return Some(NOTHING_TICKED);
     }
-    None
+    // **The Access block's own refusals, in the words `crate::send` already
+    // has for them**, and delegated rather than restated for
+    // `send_ui::composer_problem`'s reason exactly: the sentence under this
+    // form's button and the refusal inside `plan_to_invocation` must be the
+    // same function, or this form can call a draft acceptable that the
+    // encoder then rejects -- after the modal has closed, on a background
+    // thread, with nothing on screen to explain it.
+    //
+    // It is `crate::send::validate_access` and not `validate_plan`, because
+    // the name and the body do not exist yet: the record is re-resolved by id
+    // when Create is pressed, which is the whole reason this form holds no
+    // record values between frames. `validate_access` is the three Access
+    // rules with the name and body rules left out, and `validate_plan` is
+    // those rules plus it -- so this form and the encoder still run the same
+    // code over the same three answers, and there is no arm of it that only
+    // one of them takes.
+    crate::send::validate_access(
+        draft.access.delete_in_hours,
+        draft.access.password.as_deref().map(String::as_str),
+        draft.access.max_access_count,
+    )
 }
 
 /// Whether the export button may be pressed at all.
@@ -369,6 +439,15 @@ pub const IMPORT_PASSPHRASE_HINT: &str = "Passphrase the sender set for the seed
 
 /// The label on the import form's submit button.
 pub const IMPORT_SUBMIT_LABEL: &str = "Import into my vault";
+
+/// The label on the import form's other button: the one that goes and gets
+/// the Send the link names.
+///
+/// **A named constant now rather than the bare `"Fetch"` this form used to
+/// pass inline**, because it is the only label on either of these two cards
+/// that was not one -- and the paint test that says which of this footer's
+/// two buttons is the filled primary has to name both of them to say it.
+pub const FETCH_LABEL: &str = "Fetch";
 
 /// Why the import button is grey: nothing to fetch yet.
 pub const NEEDS_LINK: &str = "Paste the Send link to see what it carries.";
@@ -658,6 +737,8 @@ pub fn draw_export_form(
     draft: &mut RecordDraft,
     item_name: &str,
     in_flight: bool,
+    now: &dyn crate::send::SendClock,
+    zone: &dyn crate::local_time::LocalOffset,
 ) -> RecordUiAction {
     let mut action = RecordUiAction::None;
     let enabled = !in_flight;
@@ -780,6 +861,33 @@ pub fn draw_export_form(
             note(ui, PASSPHRASE_NOTE, theme::TEXT_FAINT);
         }
 
+        // **§5a's `ACCESS` block**, drawn by the one function in this app that
+        // draws it -- `send_ui::draw_access_block`, which the Sends screen's
+        // own composer also calls. Everything about what it draws, what it
+        // deliberately does not draw, and why each absence is a decision
+        // rather than a to-do is argued there, in one place, rather than
+        // halved between this file and that one.
+        //
+        // It lives in `send_ui` and is called from here, which is the
+        // direction that makes sense of the two: `send_ui` is this window's
+        // Send module and already owns the composer, the pane and the plan;
+        // `record_ui` is a modal that borrows the Send machinery to publish
+        // one record. The block is a control for three fields of a
+        // `crate::send::SendPlan`, so it belongs beside the screen that is
+        // made of `SendPlan`s.
+        ui.add_space(12.0);
+        super::send_ui::draw_access_block(
+            ui,
+            super::send_ui::AccessControls {
+                delete_in_hours: &mut draft.access.delete_in_hours,
+                password: &mut draft.access.password,
+                max_access_count: &mut draft.access.max_access_count,
+            },
+            enabled,
+            now,
+            zone,
+        );
+
         ui.add_space(12.0);
         let problem = export_problem(draft);
         let can_submit = export_can_submit(problem, in_flight);
@@ -893,60 +1001,102 @@ pub fn draw_import_form(
                         .color(theme::INK),
                 );
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    // `selected` is driven by `draft.choice`, which starts
-                    // `None`, so neither button is lit until the user lights
-                    // one. There is no `unwrap_or` here and there must not be.
-                    for (label, choice) in [
-                        (CREATE_SECOND_LABEL, CollisionChoice::CreateSecond),
-                        (REPLACE_LABEL, CollisionChoice::Replace),
-                    ] {
-                        let chosen = draft.choice == Some(choice);
-                        if ui
-                            .add_enabled(
-                                enabled,
-                                egui::Button::new(
-                                    egui::RichText::new(label).size(12.0).color(theme::INK),
-                                )
-                                .selected(chosen)
-                                .min_size(egui::vec2(160.0, BUTTON_HEIGHT)),
-                            )
-                            .clicked()
-                        {
-                            draft.choice = Some(choice);
-                        }
+                // **One control with two positions, and not two buttons.**
+                //
+                // This was a `ui.horizontal` of two `egui::Button`s with
+                // `.selected()` on whichever was chosen -- separated by
+                // egui's item spacing, each with its own outline, each 160
+                // points wide whatever its label said. That is the exact
+                // shape `theme::segmented_control`'s own documentation
+                // records this app moving away from, and the Sends composer's
+                // lifetime row was moved off it a pass ago; this prompt was
+                // the last `.selected()` pair left in the two record forms.
+                //
+                // It matters more here than it did there. This is the one
+                // question in this whole feature whose wrong answer destroys
+                // data the user already had, and `.selected()` paints the
+                // chosen button in egui's own selection fill with
+                // [`theme::INK`] over it -- a grey that is easy to miss at a
+                // glance across two identical 160-point boxes. The segmented
+                // run fills the answer in force with [`theme::BLUE`] behind
+                // white, which is the weight this app gives a primary button
+                // and is the weight "you are about to replace an item" should
+                // have.
+                //
+                // **Neither cell is lit until the user lights one.**
+                // `draft.choice` starts `None`, both `selected` flags are
+                // therefore `false`, and there is no `unwrap_or` here and
+                // must not be: `import_can_proceed` refuses while the choice
+                // is `None`, and a default would answer a question nobody
+                // was asked.
+                let choices = [
+                    (CREATE_SECOND_LABEL, CollisionChoice::CreateSecond),
+                    (REPLACE_LABEL, CollisionChoice::Replace),
+                ];
+                let segments: Vec<theme::Segment<'_>> = choices
+                    .iter()
+                    .map(|(label, choice)| theme::Segment {
+                        label,
+                        selected: draft.choice == Some(*choice),
+                    })
+                    .collect();
+                // `segmented_control_disabled` and not `add_enabled`, for the
+                // reason that split exists: the inert run senses hover only,
+                // so while an import is running there is no path by which a
+                // cell can be pressed, and the answer already given stays
+                // legible in the wash rather than greying away.
+                if enabled {
+                    if let Some(index) = theme::segmented_control(ui, &segments) {
+                        draft.choice = Some(choices[index].1);
                     }
-                });
+                } else {
+                    theme::segmented_control_disabled(ui, &segments);
+                }
             }
         }
 
         ui.add_space(12.0);
         let problem = import_problem(ok, draft, collision);
         let can_proceed = import_can_proceed(ok, draft, collision, in_flight);
+        // **The import footer is the design system's two buttons**, and until
+        // this pass it was neither -- two bare `egui::Button`s differing only
+        // in the colour of their text and the width of their box, the exact
+        // defect the export form's footer was fixed for one pass earlier.
+        // The two modals are opened from the same window, sit in the same
+        // card frame and answer the same shape of question; leaving one on
+        // the design system and one off it made them look like they came from
+        // different applications, for no reason anybody could name.
+        //
+        // **Which button is the primary moved, and that is the point of
+        // doing this rather than swapping the widgets.** `Fetch` was drawn
+        // first and in [`theme::TEXT_MUTED`], and `IMPORT_SUBMIT_LABEL` --
+        // the press that actually creates an item -- was drawn second in
+        // plain ink. The create is the answer this form is FOR, so it takes
+        // the filled primary and `Fetch` takes the outlined secondary, which
+        // is exactly the arrangement `EXPORT_SUBMIT_LABEL` and
+        // `EXPORT_CANCEL_LABEL` have on the other card.
+        //
+        // The order stays `Fetch` then create, because that is the order the
+        // steps happen in: you cannot import a record you have not fetched,
+        // and a footer that put the second step first would read as a form
+        // you could submit straight away. `primary_button_enabled` carries
+        // the greying, so the create is visibly not pressable until
+        // `import_can_proceed` says it is.
+        //
+        // These are `theme::BUTTON_HEIGHT`'s 32 and not this file's old 26 --
+        // see `draw_export_form`'s footer, where that argument is made once.
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(
-                    enabled && !draft.link.trim().is_empty(),
-                    egui::Button::new(
-                        egui::RichText::new("Fetch").size(12.0).color(theme::TEXT_MUTED),
-                    )
-                    .min_size(egui::vec2(72.0, BUTTON_HEIGHT)),
-                )
+                .add_enabled_ui(enabled && !draft.link.trim().is_empty(), |ui| {
+                    theme::secondary_button(ui, FETCH_LABEL)
+                })
+                .inner
                 .clicked()
             {
                 action = RecordUiAction::FetchLink;
             }
             ui.add_space(8.0);
-            if ui
-                .add_enabled(
-                    can_proceed,
-                    egui::Button::new(
-                        egui::RichText::new(IMPORT_SUBMIT_LABEL).size(12.0).color(theme::INK),
-                    )
-                    .min_size(egui::vec2(150.0, BUTTON_HEIGHT)),
-                )
-                .clicked()
-            {
+            if theme::primary_button_enabled(ui, IMPORT_SUBMIT_LABEL, None, can_proceed).clicked() {
                 action = RecordUiAction::SubmitImport;
             }
             if let Some(problem) = problem {
@@ -1052,6 +1202,8 @@ pub fn draw_export_modal(
     ctx: &egui::Context,
     state: &mut RecordSend,
     in_flight: bool,
+    now: &dyn crate::send::SendClock,
+    zone: &dyn crate::local_time::LocalOffset,
 ) -> RecordUiAction {
     egui::Area::new(egui::Id::new("record-send-scrim"))
         .order(egui::Order::Foreground)
@@ -1073,7 +1225,7 @@ pub fn draw_export_modal(
             // `theme::modal_drag_handle`.
             theme::modal_drag_handle(ui, FORM_HEADER_HEIGHT);
             ui.set_max_width(MODAL_WIDTH);
-            draw_export_form(ui, &mut state.draft, &state.item_name, in_flight)
+            draw_export_form(ui, &mut state.draft, &state.item_name, in_flight, now, zone)
         })
         .inner
 }
@@ -1236,7 +1388,7 @@ mod tests {
     #[test]
     fn the_plan_carries_the_record_and_is_hidden() {
         let record = a_record();
-        let plan = send_plan_from(&record);
+        let plan = send_plan_from(&record, SendPlan::default());
 
         assert!(plan.hidden, "the record Send was not hidden, so a viewer renders the body on sight");
 
@@ -1261,17 +1413,124 @@ mod tests {
     /// assertion above is not an accident of a full fixture.
     #[test]
     fn even_a_bare_record_travels_hidden() {
-        let plan = send_plan_from(&Record {
-            name: "x".to_string(),
-            username: None,
-            password: None,
-            uri: None,
-            notes: None,
-            totp_sealed: None,
-            not_after: None,
-        });
+        let plan = send_plan_from(
+            &Record {
+                name: "x".to_string(),
+                username: None,
+                password: None,
+                uri: None,
+                notes: None,
+                totp_sealed: None,
+                not_after: None,
+            },
+            SendPlan::default(),
+        );
         assert!(plan.hidden);
         assert!(read_json(&plan.text).is_ok(), "{}", plan.text.as_str());
+    }
+
+    /// **What the user chose in §5a's `ACCESS` block reaches the plan that is
+    /// published.**
+    ///
+    /// This is the assertion the whole block turns on, and the one nothing
+    /// else in this file makes: `send_plan_from` fills in the name, the body
+    /// and `hidden`, and everything else it must carry through from the
+    /// draft. A version that had kept `..SendPlan::default()` would draw the
+    /// block, validate the block, and publish a seven-day Send with no
+    /// password and no cap -- in silence, with the user's own choices visible
+    /// on the card they pressed the button on.
+    ///
+    /// All three are set to something OTHER than the default, so a function
+    /// that ignored its second argument entirely would fail on every one.
+    #[test]
+    fn the_access_block_reaches_the_plan_that_is_published() {
+        let access = SendPlan {
+            delete_in_hours: 1,
+            password: Some(Zeroizing::new("share-pw-9271".to_string())),
+            max_access_count: Some(3),
+            ..SendPlan::default()
+        };
+        // Control: every one of the three really does differ from what a
+        // default plan carries, so the assertions below cannot pass by
+        // accident.
+        let default = SendPlan::default();
+        assert_ne!(access.delete_in_hours, default.delete_in_hours);
+        assert!(default.password.is_none() && default.max_access_count.is_none());
+
+        let plan = send_plan_from(&a_record(), access);
+        assert_eq!(plan.delete_in_hours, 1, "the lifetime the user chose did not travel");
+        assert_eq!(
+            plan.password.as_deref().map(String::as_str),
+            Some("share-pw-9271"),
+            "the share password did not travel, so the link opens for anyone who has it"
+        );
+        assert_eq!(plan.max_access_count, Some(3), "the view cap did not travel");
+
+        // And the three the function itself owns are still its own, so
+        // carrying the Access answers through did not hand a caller the
+        // ability to publish an unhidden record.
+        assert!(plan.hidden, "the record Send stopped being hidden");
+        assert_eq!(plan.name, "SAP Production");
+        assert!(read_json(&plan.text).is_ok(), "{}", plan.text.as_str());
+    }
+
+    /// **The export form's button answers to the Access block's refusals, in
+    /// `crate::send`'s own words.**
+    ///
+    /// The danger this guards is the quiet one: a form that validated only
+    /// its tick-boxes would call a draft submittable, close the modal, and
+    /// hand `plan_to_invocation` a plan it refuses -- on a background thread,
+    /// with nothing left on screen to say why nothing was published.
+    #[test]
+    fn the_export_form_refuses_what_the_encoder_would_refuse() {
+        let good = RecordDraft::default();
+        assert_eq!(export_problem(&good), None, "control: the opening draft is refused");
+
+        for (why, access) in [
+            (
+                "a lifetime that is not one of the picker's cells",
+                SendPlan { delete_in_hours: 3, ..SendPlan::default() },
+            ),
+            (
+                "a password that is present and empty",
+                SendPlan {
+                    password: Some(Zeroizing::new(String::new())),
+                    ..SendPlan::default()
+                },
+            ),
+            (
+                "a view cap of zero",
+                SendPlan { max_access_count: Some(0), ..SendPlan::default() },
+            ),
+        ] {
+            let draft = RecordDraft { access, ..RecordDraft::default() };
+            let problem = export_problem(&draft)
+                .unwrap_or_else(|| panic!("{why} was accepted by the form"));
+            assert!(
+                !export_can_submit(Some(problem), false),
+                "{why} left the publish button live"
+            );
+            // The same sentence the encoder would have answered with, which
+            // is the whole point of delegating rather than restating.
+            assert_eq!(
+                Some(problem),
+                crate::send::validate_access(
+                    draft.access.delete_in_hours,
+                    draft.access.password.as_deref().map(String::as_str),
+                    draft.access.max_access_count,
+                ),
+                "{why} is refused here in words `crate::send` does not use"
+            );
+        }
+
+        // The tick-box rules still come first: a draft that is wrong in both
+        // ways names the seed, which is the dangerous one.
+        let both = RecordDraft {
+            selection: RecordSelection { totp: true, ..RecordDraft::default().selection },
+            access: SendPlan { max_access_count: Some(0), ..SendPlan::default() },
+            ..RecordDraft::default()
+        };
+        assert_eq!(export_problem(&both), Some(NEEDS_PASSPHRASE));
     }
 
     /// The production half of this file, for the source pins below.
@@ -1303,7 +1562,7 @@ mod tests {
     fn this_file_builds_a_plan_and_never_starts_a_send() {
         let production = production();
         assert!(
-            production.contains("pub fn send_plan_from(record: &Record) -> SendPlan"),
+            production.contains("pub fn send_plan_from(record: &Record, access: SendPlan) -> SendPlan"),
             "control: the plan builder is gone, so the absences below are vacuous"
         );
         assert!(production.contains("hidden: true"), "control: the plan builder is not building");
@@ -1743,6 +2002,15 @@ mod paint_tests {
 
     const NOW: i64 = 1_786_320_000_000;
 
+    /// The timezone every paint test below stands in: UTC, injected.
+    ///
+    /// The export form now prints the instant its link dies, in the user's
+    /// own day -- so without a fixed offset here, a test that read a date off
+    /// the painted glyphs would pass or fail depending on where the machine
+    /// running `cargo test` happens to be. `send::expiry_wording`'s own tests
+    /// make the same arrangement for the same reason.
+    const UTC: crate::local_time::FixedOffset = crate::local_time::FixedOffset(0);
+
     /// Everything one frame painted that these tests can ask about: the
     /// glyph runs, where each of them landed, and every filled rectangle with
     /// the colour it was filled in.
@@ -1863,7 +2131,7 @@ mod paint_tests {
     fn the_form_paints_the_warning_only_with_the_seed_ticked() {
         let mut draft = RecordDraft::default();
         let before = paint(|ui| {
-            draw_export_form(ui, &mut draft, "SAP Production", false);
+            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
         });
         assert!(before.has(EXPORT_HEADING), "control: the form drew nothing recognisable");
         assert!(before.has(TOTP_LABEL), "the seed tick is not on the form at all");
@@ -1875,7 +2143,7 @@ mod paint_tests {
         let mut ticked = RecordDraft::default();
         ticked.set_totp(true);
         let after = paint(|ui| {
-            draw_export_form(ui, &mut ticked, "SAP Production", false);
+            draw_export_form(ui, &mut ticked, "SAP Production", false, &FixedClock(NOW), &UTC);
         });
         assert!(
             after.has(SEED_WARNING),
@@ -1912,7 +2180,7 @@ mod paint_tests {
             "the fixture wants a submittable draft, or the fill below is a disabled one"
         );
         let painted = paint(|ui| {
-            draw_export_form(ui, &mut draft, "SAP Production", false);
+            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
         });
 
         let (submit, submit_fill) = painted.button_under(EXPORT_SUBMIT_LABEL);
@@ -1958,7 +2226,7 @@ mod paint_tests {
     fn the_record_block_names_the_record_under_its_own_eyebrow() {
         let mut draft = RecordDraft::default();
         let painted = paint(|ui| {
-            draw_export_form(ui, &mut draft, "SAP Production", false);
+            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
         });
 
         assert!(
@@ -2006,7 +2274,7 @@ mod paint_tests {
 
         let mut draft = RecordDraft::default();
         let painted = paint(|ui| {
-            draw_export_form(ui, &mut draft, "SAP Production", false);
+            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
         });
         for label in labels {
             assert!(painted.has(label), "{label} is not a row on the form: {:?}", painted.text);
@@ -2108,5 +2376,297 @@ mod paint_tests {
         // Control on the same fixture: the form did draw, so the absences
         // above are not the absences of a blank frame.
         assert!(painted.has(IMPORT_HEADING), "{:?}", painted.text);
+    }
+
+    /// **§5a's `ACCESS` block is on this card: the eyebrow, three row labels,
+    /// four lifetime cells, and the date the link dies.**
+    ///
+    /// It is worth a paint test and not only the pure ones because every
+    /// other assertion about this block is about a value in a struct. A
+    /// `draw_access_block` that had been left out of `draw_export_form`
+    /// entirely would leave `export_problem`, `view_limit_from` and
+    /// `send_plan_from` all green and all pointless: the user would have no
+    /// way to set any of the three.
+    #[test]
+    fn the_access_block_is_on_the_record_composer() {
+        let mut draft = RecordDraft::default();
+        let painted = paint(|ui| {
+            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
+        });
+
+        assert!(
+            painted.has(super::super::send_ui::ACCESS_EYEBROW),
+            "§5a's ACCESS eyebrow is not on the card: {:?}",
+            painted.text
+        );
+        for label in [
+            super::super::send_ui::EXPIRES_LABEL,
+            super::super::send_ui::VIEWS_LABEL,
+            super::super::send_ui::OPEN_WITH_LABEL,
+        ] {
+            assert!(painted.has(label), "the {label:?} row is missing: {:?}", painted.text);
+        }
+
+        // All four cells of the widened lifetime run, including the two the
+        // old `u8` of days could not express.
+        for hours in crate::send::DELETE_IN_HOURS_CHOICES {
+            let cell = crate::send::lifetime_label(hours);
+            assert!(painted.has(&cell), "the {cell:?} cell is not drawn: {:?}", painted.text);
+        }
+
+        // The sentence under the run, naming the day this link dies -- at the
+        // UTC offset these tests stand in, and from `send.rs`'s own
+        // `expiry_wording` rather than from a second formatter here.
+        assert!(
+            painted.has(&crate::send::expiry_wording(
+                crate::send::DEFAULT_DELETE_IN_HOURS,
+                &FixedClock(NOW),
+                &UTC,
+            )),
+            "the composer does not say when the link stops working: {:?}",
+            painted.text
+        );
+        assert!(
+            painted.has("17 Aug 2026"),
+            "control: that sentence names some other day than the one seven days from `NOW`, \
+             so the assertion above is comparing a formatter with itself: {:?}",
+            painted.text
+        );
+
+        // Neither optional control is switched on, and the notes beside them
+        // say so rather than leaving two blank boxes.
+        assert!(painted.has(super::super::send_ui::NO_VIEW_LIMIT_NOTE), "{:?}", painted.text);
+        assert_eq!(draft.access.password, None, "a frame put a password on the Send");
+        assert_eq!(draft.access.max_access_count, None, "a frame capped the Send");
+
+        // And §5a's three unbuildable rows are not on the card under any
+        // label. A control that cannot do what it says is the one thing this
+        // block must not grow, and the three are named here so that adding
+        // one reds a test rather than shipping.
+        for absent in [
+            "Recipient",
+            "Only this address can open it",
+            "Tell me when it is opened",
+        ] {
+            assert!(
+                !painted.has(absent),
+                "{absent:?} is drawn on the composer, and there is no server behind it -- see \
+                 `send_ui::draw_access_block` on why all three are absences and not to-dos"
+            );
+        }
+    }
+
+    /// **§5a's Access block fits the modal it is drawn in.**
+    ///
+    /// The block's widest row is a four-cell segmented run sitting to the
+    /// right of a 96-point label column, inside a card that is
+    /// [`MODAL_WIDTH`] wide with a 12-point margin each side. That is a real
+    /// constraint and it is not obvious by inspection: the run sizes each
+    /// cell to its own label plus `theme::SEGMENT_PADDING`, so it grew when
+    /// the lifetime picker went from three cells to four, and it would grow
+    /// again if a label were reworded.
+    ///
+    /// **This is the measurement that has cost this project rework before.**
+    /// The design page is content-box, so §5a's `width: 690px` column and its
+    /// `height: 30px` boxes are all inside their borders; reading any of them
+    /// as a border-box number puts a control two points wider than it is,
+    /// which is invisible in a screenshot until the row it is in overflows.
+    /// The other paint tests here run in a 640-point pane, where nothing
+    /// overflows and nothing is learned.
+    #[test]
+    fn the_access_block_fits_inside_the_modal_it_is_drawn_in() {
+        let mut draft = RecordDraft::default();
+        let painted = paint(|ui| {
+            // The modal's own constraint, applied the way `draw_export_modal`
+            // applies it, so this measures the card the user actually sees.
+            ui.set_max_width(MODAL_WIDTH);
+            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
+        });
+
+        // The card's own left edge, taken from a control that is definitely
+        // in it, so the budget below is measured from the drawing and not
+        // from an assumption about where the pane starts.
+        let eyebrow = painted
+            .rect_of(super::super::send_ui::ACCESS_EYEBROW)
+            .expect("control: the ACCESS eyebrow did not paint");
+        let right_edge = eyebrow.left() + MODAL_WIDTH;
+
+        for hours in crate::send::DELETE_IN_HOURS_CHOICES {
+            let cell = crate::send::lifetime_label(hours);
+            let rect = painted
+                .rect_of(&cell)
+                .unwrap_or_else(|| panic!("the {cell:?} cell did not paint"));
+            assert!(
+                rect.right() <= right_edge,
+                "the {cell:?} cell runs {}pt past the right edge of a {MODAL_WIDTH}pt modal. \
+                 §5a's Access rows are a 96-point label column plus a control, and a \
+                 segmented run sizes every cell to its own label -- so a reworded lifetime, \
+                 or a fifth one, overflows the card before it overflows anything a screenshot \
+                 shows",
+                rect.right() - right_edge
+            );
+        }
+
+        // The notes beside the two optional controls are the other things on
+        // these rows that can push right, and they are sentences rather than
+        // labels.
+        for note in [
+            super::super::send_ui::NO_VIEW_LIMIT_NOTE,
+            super::super::send_ui::OPEN_WITH_LABEL,
+        ] {
+            let rect =
+                painted.rect_of(note).unwrap_or_else(|| panic!("{note:?} did not paint"));
+            assert!(
+                rect.right() <= right_edge,
+                "{note:?} runs {}pt past the modal's right edge",
+                rect.right() - right_edge
+            );
+        }
+    }
+
+    /// **The import footer is a primary beside a secondary, and the CREATE is
+    /// the primary.**
+    ///
+    /// The twin of `the_export_footer_wears_the_design_systems_two_buttons`,
+    /// and it exists because the two cards were left in different states: the
+    /// export footer was moved onto the design system a pass ago and this one
+    /// was not, so two modals opened from one window looked like they came
+    /// from two applications. The fill is also the whole of the fix -- both
+    /// buttons here used to be bare `egui::Button`s differing only in the
+    /// colour of their text, which no test could see.
+    #[test]
+    fn the_import_footer_wears_the_design_systems_two_buttons() {
+        // A fetched record with no collision and no seal, so the create is
+        // LIVE: a disabled primary is faded toward the window colour and this
+        // test would then be asserting the fade.
+        let record = Record {
+            name: "SAP Production".to_string(),
+            username: Some("dplatonov".to_string()),
+            password: None,
+            uri: None,
+            notes: None,
+            totp_sealed: None,
+            not_after: None,
+        };
+        let mut draft =
+            ImportDraft { link: "https://send.example/#/x".to_string(), ..Default::default() };
+        let fetched = Ok(record);
+        assert!(
+            import_can_proceed(fetched.as_ref().ok(), &draft, &Collision::Fresh, false),
+            "the fixture wants a proceedable draft, or the fill below is a disabled one"
+        );
+        let painted = paint(|ui| {
+            draw_import_form(
+                ui,
+                &mut draft,
+                Some(&fetched),
+                &Collision::Fresh,
+                false,
+                &FixedClock(NOW),
+            );
+        });
+
+        let (submit, submit_fill) = painted.button_under(IMPORT_SUBMIT_LABEL);
+        assert_eq!(
+            submit_fill,
+            theme::BLUE,
+            "the import's create is not the design system's filled primary. It is the answer \
+             this card is FOR, and it used to be the second of two identical boxes while \
+             `Fetch` -- a step on the way -- was drawn first"
+        );
+        assert_eq!(submit.height(), theme::BUTTON_HEIGHT);
+
+        let (fetch, fetch_fill) = painted.button_under(FETCH_LABEL);
+        assert_eq!(
+            fetch_fill,
+            theme::CARD,
+            "`Fetch` is not the design system's outlined secondary"
+        );
+        assert_eq!(fetch.height(), theme::BUTTON_HEIGHT, "the two answers are different heights");
+        assert_ne!(
+            submit_fill, fetch_fill,
+            "the import footer's two answers paint the same fill, which is the exact defect \
+             this pass fixed on the export footer"
+        );
+        // `Fetch` comes first, because that is the order the steps happen in.
+        assert!(
+            fetch.left() < submit.left(),
+            "the create is drawn before the fetch, so the card reads as something you could \
+             submit before fetching anything"
+        );
+    }
+
+    /// **The collision prompt is one segmented run, and the answer in force
+    /// is filled blue.**
+    ///
+    /// This is the one question in this feature whose wrong answer destroys
+    /// an item the user already had, and it was drawn as two `.selected()`
+    /// buttons -- egui's own grey selection fill over two identical
+    /// 160-point boxes. The three facts below are the ones that tell a
+    /// segmented run from a pair of buttons, and all three are invisible to a
+    /// test that only reads glyphs.
+    #[test]
+    fn the_collision_prompt_is_one_segmented_run_and_not_two_buttons() {
+        let record = Record {
+            name: "SAP Production".to_string(),
+            username: Some("dplatonov".to_string()),
+            password: None,
+            uri: None,
+            notes: None,
+            totp_sealed: None,
+            not_after: None,
+        };
+        let fetched = Ok(record);
+        let collision = Collision::SameName { existing_id: "item-1".to_string() };
+
+        // Nothing chosen: neither cell may be lit.
+        let mut untouched =
+            ImportDraft { link: "https://send.example/#/x".to_string(), ..Default::default() };
+        let before = paint(|ui| {
+            draw_import_form(ui, &mut untouched, Some(&fetched), &collision, false, &FixedClock(NOW));
+        });
+        for label in [CREATE_SECOND_LABEL, REPLACE_LABEL] {
+            let (cell, fill) = before.button_under(label);
+            assert_eq!(
+                cell.height(),
+                theme::SEGMENT_HEIGHT,
+                "{label:?} is not a segmented-control cell -- it is {}pt tall against the \
+                 run's {}",
+                cell.height(),
+                theme::SEGMENT_HEIGHT
+            );
+            assert_ne!(
+                fill,
+                theme::BLUE,
+                "{label:?} is lit with nothing chosen. `draft.choice` starts `None` and no \
+                 frame may turn that into a default: replacing is the one press in this \
+                 feature that destroys data the user already had"
+            );
+        }
+        let (first, _) = before.button_under(CREATE_SECOND_LABEL);
+        let (second, _) = before.button_under(REPLACE_LABEL);
+        let gap = second.left() - first.right();
+        assert!(
+            gap.abs() <= theme::SEGMENT_SEAM + 0.5,
+            "the two offers are {gap}pt apart, so they are two buttons in a row rather than \
+             one control with two positions"
+        );
+
+        // Replace chosen: that cell, and only that cell, is filled blue.
+        let mut replacing = ImportDraft {
+            link: "https://send.example/#/x".to_string(),
+            choice: Some(CollisionChoice::Replace),
+            ..Default::default()
+        };
+        let after = paint(|ui| {
+            draw_import_form(ui, &mut replacing, Some(&fetched), &collision, false, &FixedClock(NOW));
+        });
+        assert_eq!(
+            after.button_under(REPLACE_LABEL).1,
+            theme::BLUE,
+            "the chosen answer is not filled in the design's blue, so the press that replaces \
+             an item is as quiet on screen as the one that does not"
+        );
+        assert_ne!(after.button_under(CREATE_SECOND_LABEL).1, theme::BLUE);
     }
 }

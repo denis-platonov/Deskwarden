@@ -78,7 +78,7 @@ fn build(plan: &SendPlan, keys: &VaultKeys, now: &dyn SendClock) -> Result<Mappe
         },
         "file": Value::Null,
         "maxAccessCount": plan.max_access_count,
-        "deletionDate": crate::send::deletion_date(plan.delete_in_days, now),
+        "deletionDate": crate::send::deletion_date(plan.delete_in_hours, now),
         "expirationDate": Value::Null,
         "password": plan.password.as_ref().map(|p| key.password_hash(p).to_string()),
         "emails": Value::Null,
@@ -217,7 +217,7 @@ pub fn create(
             .get("deletionDate")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| crate::send::deletion_date(plan.delete_in_days, now)),
+            .unwrap_or_else(|| crate::send::deletion_date(plan.delete_in_hours, now)),
     })
 }
 
@@ -739,7 +739,7 @@ pub mod tests {
             name: "Wi-Fi password".to_string(),
             text: Zeroizing::new("correct-horse-battery-staple".to_string()),
             hidden: true,
-            delete_in_days: 7,
+            delete_in_hours: 24 * 7,
             password: Some(Zeroizing::new("share-pw-9271".to_string())),
             max_access_count: Some(3),
         }
@@ -801,7 +801,7 @@ pub mod tests {
         assert_eq!(body["disabled"], false);
         assert_eq!(
             body["deletionDate"].as_str().expect("a deletion date"),
-            crate::send::deletion_date(7, &NOW),
+            crate::send::deletion_date(24 * 7, &NOW),
             "the two backends must stamp the same instant in the same format"
         );
         assert!(

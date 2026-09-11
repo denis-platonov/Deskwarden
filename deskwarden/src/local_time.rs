@@ -55,9 +55,24 @@
 //! date is what turned `main` red at UTC midnight once; the instant and the
 //! offset are both injected here so that cannot recur through this path.
 
+/// Milliseconds in an hour.
+///
+/// **Added when a Send's lifetime stopped being a whole number of days.**
+/// `send::deletion_date` and `send::expiry_wording` both take hours now --
+/// design §5a offers a one-hour link -- and the alternative to this constant
+/// was `MILLIS_PER_DAY / 24` written at both call sites, which is the second
+/// copy of a unit conversion this module exists to prevent. It sits here
+/// rather than in `send.rs` for [`MILLIS_PER_DAY`]'s reason word for word:
+/// "how long is an hour" is not a Send concept.
+pub const MILLIS_PER_HOUR: i64 = 3_600_000;
+
 /// Milliseconds in a day, on the civil calendar this module uses (no leap
 /// seconds -- Unix time has none either).
-pub const MILLIS_PER_DAY: i64 = 86_400_000;
+///
+/// Written in terms of [`MILLIS_PER_HOUR`] rather than as a second literal,
+/// so the two cannot drift: `86_400_000` and `3_600_000` are each obviously
+/// right on their own and quietly wrong together if one is ever edited.
+pub const MILLIS_PER_DAY: i64 = MILLIS_PER_HOUR * 24;
 
 /// Month names as this app spells them, three letters, index 0 = January.
 ///

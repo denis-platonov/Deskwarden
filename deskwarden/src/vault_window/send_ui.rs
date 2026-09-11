@@ -1191,12 +1191,23 @@ pub const NAME_HINT: &str = "Name this Send";
 /// kind this app makes and a blank box invites a file drag that will do
 /// nothing.
 pub const TEXT_HINT: &str = "The text to share";
-/// The share-password switch.
-pub const PASSWORD_TOGGLE_LABEL: &str = "Require a password to open the link";
-/// The share-password field's placeholder.
-pub const PASSWORD_HINT: &str = "Password for the link";
-/// The line above the three lifetime buttons.
-pub const LIFETIME_PROMPT: &str = "The link stops working after";
+/// The share-password field's placeholder. **It says what an empty box
+/// means**, because empty is both the default and the off position, and a
+/// blank box under the words "Open with" otherwise reads as something the
+/// user has forgotten to fill in. See [`draw_access_block`].
+pub const PASSWORD_HINT: &str = "No password";
+
+// `PASSWORD_TOGGLE_LABEL` -- "Require a password to open the link" -- and
+// `LIFETIME_PROMPT` -- "The link stops working after" -- are DELETED here
+// rather than parked, and the deletion is the decision. Both were the
+// composer's own captions for two questions that are now asked once, in
+// [`ACCESS_EYEBROW`]'s block, in the row labels [`EXPIRES_LABEL`],
+// [`VIEWS_LABEL`] and [`OPEN_WITH_LABEL`]. Keeping them would have left two
+// spellings of one question in one file, which is the defect this pass
+// exists to remove; and a `pub const` raises no dead-code warning in a lib
+// crate, so an unused one sits indefinitely looking like copy somebody still
+// paints. The password switch went with its label -- see
+// [`draw_access_block`] on why an empty box is the off position now.
 /// The composer's own submit. **Not "Create Send"**: what the user gets back
 /// is a link, and the noun on the button is the thing that is about to exist
 /// in the world.
@@ -1232,9 +1243,11 @@ pub const CREATING_LABEL: &str = "Publishing\u{2026}";
 /// `Debug` is hand-written to print lengths rather than contents.
 ///
 /// **There is no separate "wants a password" flag.** `plan.password` is
-/// `Option<Zeroizing<String>>` and the switch drives that `Option` directly,
-/// so turning the password off wipes the buffer it was typed into rather than
-/// leaving a live secret behind a `false`.
+/// `Option<Zeroizing<String>>` and the Access block's field drives that
+/// `Option` directly, so emptying the box wipes the buffer it was typed into
+/// rather than leaving a live secret behind a `false`. It used to be driven
+/// by a tick-box through `wants_password` / `set_wants_password`; those are
+/// gone with the tick-box, and [`draw_access_block`] argues why.
 #[derive(Debug, Default)]
 pub struct SendComposer {
     /// Whether the form is on screen. **Window state, not pane state**: it
@@ -1244,24 +1257,6 @@ pub struct SendComposer {
     pub open: bool,
     /// The draft itself.
     pub plan: crate::send::SendPlan,
-}
-
-impl SendComposer {
-    /// Whether the share-password switch is on.
-    pub fn wants_password(&self) -> bool {
-        self.plan.password.is_some()
-    }
-
-    /// Turns the share-password switch on or off.
-    ///
-    /// Turning it **off drops the buffer**, which zeroizes it. Turning it on
-    /// starts from empty rather than from whatever was typed before, for the
-    /// same reason: there is no hidden copy to come back.
-    pub fn set_wants_password(&mut self, wanted: bool) {
-        if wanted != self.wants_password() {
-            self.plan.password = wanted.then(|| zeroize::Zeroizing::new(String::new()));
-        }
-    }
 }
 
 /// What is wrong with the draft, phrased for the user, or `None`.
@@ -1285,13 +1280,377 @@ pub fn composer_can_submit(problem: Option<&str>, in_flight: bool) -> bool {
     problem.is_none() && !in_flight
 }
 
-/// The label on one lifetime button.
-pub fn lifetime_label(days: u8) -> String {
-    if days == 1 {
-        "1 day".to_string()
-    } else {
-        format!("{days} days")
+// ---------------------------------------------------------------------------
+// Design section 5a's ACCESS block
+// ---------------------------------------------------------------------------
+
+/// Design §5a's third section eyebrow, over the Access rows. The design's own
+/// word, in the design's own case, for `record_ui::RECORD_EYEBROW`'s reason:
+/// [`theme::eyebrow`] deliberately does not uppercase for the caller, so the
+/// constant carries the case the glyphs are painted in and a paint test can
+/// look for it.
+pub const ACCESS_EYEBROW: &str = "ACCESS";
+
+/// §5a's first Access row label.
+pub const EXPIRES_LABEL: &str = "Expires";
+/// §5a's second Access row label. **The design's own word**, and the right
+/// one: the server counts *accesses*, and "Opens" would promise that a
+/// recipient who loads the page twice has spent two.
+pub const VIEWS_LABEL: &str = "Views";
+/// §5a's third Access row label.
+pub const OPEN_WITH_LABEL: &str = "Open with";
+
+/// The view-limit field's placeholder, and the whole of how the row says its
+/// off position. See [`views_note`].
+pub const VIEWS_HINT: &str = "Any";
+
+/// What the Access block says beside the view-limit box when there is no
+/// limit. **Not an empty space**: a blank box with nothing after it is a
+/// field the user is being asked to fill in, and this one is optional.
+pub const NO_VIEW_LIMIT_NOTE: &str = "the link works until it expires";
+
+/// What it says when there is one. §5a's own phrase, and it is the sentence
+/// that makes the number worth typing: a cap is not "how many people may
+/// read this", it is "after this many, the link is dead".
+pub const VIEW_LIMIT_NOTE: &str = "then the link dies";
+
+/// The most digits the view-limit box will take.
+///
+/// **A guard and not a style rule.** The box parses to a `u32`, and a `u32`
+/// runs out at ten digits -- so an eleven-digit entry would fail to parse,
+/// and a `parse().ok()` on a failure is `None`, which in this control means
+/// *no limit at all*. A user holding a key down would have silently turned a
+/// cap into an uncapped link. Six digits is far more views than any Send has,
+/// and it cannot overflow.
+pub const MAX_VIEW_LIMIT_DIGITS: usize = 6;
+
+/// The view limit a box holding `text` means, or `None` for no limit.
+///
+/// **A pure function, and the whole of the box's rule**, so the states this
+/// control can be in are assertable without running a frame -- which is this
+/// file's standing rule and is worth more here than usual, because the
+/// dangerous state ("the user meant a cap and got none") is invisible on
+/// screen.
+///
+/// Non-digits are dropped rather than refused. The box is a number and the
+/// only things a user types into it that are not digits are a stray letter
+/// and a pasted `"3 views"`; refusing the keystroke and dropping it look the
+/// same to a person typing, and dropping it means the paste does the obvious
+/// thing.
+///
+/// An empty box is `None`, which is the off position: see
+/// [`draw_access_block`] on why neither optional control has a switch in
+/// front of it. A `0` is `Some(0)`, deliberately -- it is a real thing to
+/// have typed and `crate::send::validate_plan` already has the sentence for
+/// it ("A limit of zero views would make the link useless."). Swallowing it
+/// to `None` here would turn a typo into an uncapped link with no refusal
+/// anywhere.
+pub fn view_limit_from(text: &str) -> Option<u32> {
+    let digits: String =
+        text.chars().filter(char::is_ascii_digit).take(MAX_VIEW_LIMIT_DIGITS).collect();
+    digits.parse::<u32>().ok()
+}
+
+/// The note beside the view-limit box, for the limit in force.
+pub fn views_note(limit: Option<u32>) -> &'static str {
+    match limit {
+        Some(_) => VIEW_LIMIT_NOTE,
+        None => NO_VIEW_LIMIT_NOTE,
     }
+}
+
+/// The three fields of a [`crate::send::SendPlan`] design §5a's Access block
+/// is a control for, borrowed rather than copied.
+///
+/// # Why a borrow bundle and not a struct either screen owns
+///
+/// The Sends screen's composer holds a whole `SendPlan` between frames and
+/// the record composer builds one at submit time out of a
+/// `record_ui::RecordDraft`. A shared block needs to drive both without
+/// either screen converting to the other's shape -- and a conversion is
+/// exactly where the validated value and the published value come apart,
+/// which `SendComposer`'s own doc records as the reason it holds a plan at
+/// all. Three `&mut`s cost nothing, convert nothing, and mean the block
+/// writes into the buffer that will be published.
+///
+/// Named fields rather than three positional arguments because two of the
+/// three are `Option`s of different types today and could stop being so
+/// tomorrow; `AccessControls { password, .. }` cannot be got wrong at a call
+/// site, which is [`theme::Segment`]'s stated reason for the same shape.
+pub struct AccessControls<'a> {
+    /// One of [`crate::send::DELETE_IN_HOURS_CHOICES`].
+    pub delete_in_hours: &'a mut u32,
+    /// The share password. `None` **is** the off position -- see
+    /// [`draw_access_block`].
+    pub password: &'a mut Option<zeroize::Zeroizing<String>>,
+    /// The view cap. `None` is no cap.
+    pub max_access_count: &'a mut Option<u32>,
+}
+
+/// The width of the label column §5a's Access rows line their controls up
+/// against: the design's own `width: 96px`.
+const ACCESS_LABEL_WIDTH: f32 = 96.0;
+
+/// The design's `gap: 14px` between an Access row's label and its control,
+/// and between the control and the note after it.
+const ACCESS_ROW_GAP: f32 = 14.0;
+
+/// The vertical gap between one Access row and the next: the design's
+/// `flex-direction: column; gap: 10px`.
+const ACCESS_ROW_SPACING: f32 = 10.0;
+
+/// The height of the two boxed controls in the Access block.
+///
+/// **§5a's `height: 30px` measured as a BORDER-BOX, which is 32.** The design
+/// page is content-box -- `box-sizing` is never set on it -- so a `div` with
+/// `height: 30px` inside `border: 1px solid #d7d3d3` occupies 32 points on
+/// screen, and 30 is what is left inside the border. Reading those numbers as
+/// border-box has cost this project rework more than once, which is why the
+/// arithmetic is written down here rather than the answer.
+///
+/// 32 is [`theme::BUTTON_HEIGHT`] exactly, which is not a coincidence worth
+/// hiding: it is the height every small action control in this app already
+/// is, and a row whose box matched the design to the point and matched
+/// nothing else in the app would be the odd one out in a card full of this
+/// design system's controls.
+const ACCESS_FIELD_HEIGHT: f32 = 32.0;
+
+/// The view-limit box's width: §5a's `width: 58px` plus its two 1-point
+/// borders -- [`ACCESS_FIELD_HEIGHT`]'s border-box arithmetic applied
+/// sideways.
+const VIEW_LIMIT_FIELD_WIDTH: f32 = 60.0;
+
+/// One Access row: a fixed-width label, then whatever the caller draws.
+///
+/// The label column is fixed rather than laid out naturally because that is
+/// the whole visual claim of §5a's block -- three questions whose answers
+/// start on one vertical line. Laid out naturally, "Expires", "Views" and
+/// "Open with" are three different widths and the three controls step
+/// rightwards down the card.
+fn access_row<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    enabled: bool,
+    body: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    ui.horizontal(|ui| {
+        // The design's gap, rather than egui's default item spacing, applied
+        // once for the whole row so the note after a control sits the same
+        // distance from it as the control sits from its label.
+        ui.spacing_mut().item_spacing.x = ACCESS_ROW_GAP;
+        ui.allocate_ui_with_layout(
+            egui::vec2(ACCESS_LABEL_WIDTH, ACCESS_FIELD_HEIGHT),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.label(
+                    egui::RichText::new(label)
+                        .size(13.0)
+                        .color(if enabled { theme::TEXT_SECONDARY } else { theme::TEXT_GHOST }),
+                );
+            },
+        );
+        body(ui)
+    })
+    .inner
+}
+
+/// **Design §5a's `ACCESS` block, and the one copy of it this app has.**
+///
+/// Both of this app's Send composers call it: `draw_composer` on the Sends
+/// screen and `record_ui::draw_export_form` in the record modal. That is the
+/// point of its existing. Two screens that publish a Send and answer "how
+/// long does this link live, who can open it, how many times" differently is
+/// the same defect this app just finished fixing in those two screens'
+/// footers, and it was already halfway present: the Sends composer had a
+/// lifetime row and a password tick-box, the record composer had neither, and
+/// neither had ever offered the view cap that `SendPlan::max_access_count`
+/// has carried and published since the feature was written.
+///
+/// # Three of §5a's six controls are built, and three are not
+///
+/// §5a's Access block draws six things. The three below are properties of a
+/// Bitwarden Send and reach the wire; the other three are argued, by name, at
+/// the bottom of this doc.
+///
+/// # Both optional controls are OFF by default, and neither has a switch
+///
+/// A password field that is empty means there is no password; a view box that
+/// is empty means there is no cap. The composer used to put a tick-box in
+/// front of the password ("Require a password to open the link") and that is
+/// now gone -- a switch in front of a single text box is a second way to say
+/// what the box already says, and it has a failure mode the box does not: a
+/// ticked switch over an empty field is a state the user reads as "password
+/// on", which `validate_plan` then has to refuse with a sentence about
+/// turning the password off. The box is its own switch, and emptying it drops
+/// the `Zeroizing` buffer, which wipes it -- the same guarantee
+/// `set_wants_password` gave when it took the tick-box's `false`.
+///
+/// # What the block does NOT draw, and why each one is absent
+///
+/// **A recipient e-mail address**, **an "only this address can open it"
+/// switch**, and **"tell me when it is opened"**. §5a draws all three, and
+/// none of them is a property of a Bitwarden Send.
+///
+/// *The recipient and the address lock are one thing on the wire, and it does
+/// not work here.* A Send's object does have an `emails` array and an
+/// `authType` of `Email`, so the field is nameable -- but the mechanism
+/// behind it is a one-time code the SERVER mails to that address before it
+/// will hand over the content, and the server this app is built against
+/// answers `501 Not Implemented` to every send whose `authType` is `Email`,
+/// on create, on update and on access alike. Drawing the box would therefore
+/// produce, for anyone who typed in it, a publish that fails -- or, worse,
+/// against a server that accepted the field and did nothing with it, a link
+/// the user believes is locked to one person and which anyone holding it can
+/// open. That second outcome is the reason this is a refusal and not a
+/// to-do: a lock that does not lock is worse than a visibly absent one.
+///
+/// *An open notification is not a Send concept at all.* There is no field on
+/// the object, no endpoint that subscribes to one, and nothing in the
+/// protocol that pushes to a client. It could only be built as polling --
+/// this app asking the server for `accessCount` on a timer and comparing --
+/// which is a different feature (a background job, a notification surface, a
+/// thing that must run while the app is closed to be worth anything) wearing
+/// a switch's clothes. A switch that silently means "if the app happens to be
+/// open, and you happen to look" is not the switch the design drew.
+///
+/// **§5a's `Generate` beside the password** is also absent, and for a smaller
+/// reason. This app masks a typed secret and offers no reveal on either of
+/// these two forms -- `record_ui`'s seed passphrase and the composer's own
+/// password are both plain masked fields. A generated share password that the
+/// sender cannot read is a password they cannot tell the recipient, so
+/// `Generate` is not one control but two, and the second one (a reveal) would
+/// be this file inventing a third treatment for secrets on a form that has
+/// two already. It is a coherent small feature and it is not this one.
+///
+/// `now` and `zone` are injected for `crate::send::expiry_wording`'s reason,
+/// which is this whole feature's rule: nothing here reads the machine's clock
+/// or its timezone, so every assertion about the sentence under the Expires
+/// row is exact wherever the suite runs.
+pub fn draw_access_block(
+    ui: &mut egui::Ui,
+    controls: AccessControls<'_>,
+    enabled: bool,
+    now: &dyn SendClock,
+    zone: &dyn LocalOffset,
+) {
+    theme::eyebrow(ui, ACCESS_EYEBROW);
+    ui.add_space(6.0);
+
+    // ---- Expires ---------------------------------------------------------
+    //
+    // **Extended, not replaced.** This run was already
+    // `theme::segmented_control` after the 2026-09 pass -- one control with
+    // three positions rather than three buttons, for that function's own
+    // stated reasons -- and all that changed is that the array behind it is
+    // four entries of hours rather than three of days. The choices still come
+    // from `send.rs` and are not spelled here: `validate_plan` refuses any
+    // other value, so a cell offering one would be a control that cannot
+    // work.
+    let labels: Vec<String> = crate::send::DELETE_IN_HOURS_CHOICES
+        .iter()
+        .map(|hours| crate::send::lifetime_label(*hours))
+        .collect();
+    let segments: Vec<theme::Segment<'_>> = labels
+        .iter()
+        .zip(crate::send::DELETE_IN_HOURS_CHOICES)
+        .map(|(label, hours)| theme::Segment {
+            label: label.as_str(),
+            selected: *controls.delete_in_hours == hours,
+        })
+        .collect();
+    access_row(ui, EXPIRES_LABEL, enabled, |ui| {
+        // `segmented_control_disabled` and not `add_enabled`, because that is
+        // the split this design system already makes for exactly this
+        // question (see `toggle_pill` / `toggle_pill_disabled`): the inert run
+        // senses hover only, so while a publish is in flight there is no path
+        // by which a cell can be pressed at all, and the answer in force stays
+        // legible in the wash rather than greying into the other three.
+        if enabled {
+            if let Some(index) = theme::segmented_control(ui, &segments) {
+                *controls.delete_in_hours = crate::send::DELETE_IN_HOURS_CHOICES[index];
+            }
+        } else {
+            theme::segmented_control_disabled(ui, &segments);
+        }
+    });
+    // **The DATE, not only the duration**, and for a sub-day lifetime the
+    // clock time with it. A publishing action where being wrong about the
+    // lifetime is the harm gets the thing the user can check against a
+    // calendar. `expiry_wording` is `send.rs`'s own, so this line and the
+    // `deletionDate` in the built JSON cannot disagree about what the choice
+    // means, and the day it prints is the user's LOCAL day -- the stored
+    // instant is UTC and stays UTC. §5a puts a bare `17 Aug, 14:20` at the
+    // end of the row; it reads as a sentence here because the row is already
+    // three columns wide inside a 360-point modal.
+    ui.add_space(4.0);
+    ui.label(
+        egui::RichText::new(crate::send::expiry_wording(*controls.delete_in_hours, now, zone))
+            .size(11.0)
+            .color(theme::TEXT_FAINT),
+    );
+    ui.add_space(ACCESS_ROW_SPACING);
+
+    // ---- Views -----------------------------------------------------------
+    //
+    // **A typed number and not §5a's `1 ▾` dropdown.** A dropdown is a fixed
+    // set of answers, and there is no fixed set here: the field is a `u32` on
+    // the wire and the useful values run from 1 to whatever the sender's
+    // situation is. It also cannot express the off position without a "no
+    // limit" row that reads as one of the numbers, where an empty box says it
+    // by being empty. Everything the box means is `view_limit_from`, which is
+    // a pure function and not a rule inside this closure.
+    let mut typed = controls.max_access_count.map(|n| n.to_string()).unwrap_or_default();
+    access_row(ui, VIEWS_LABEL, enabled, |ui| {
+        let changed = ui
+            .add_enabled(
+                enabled,
+                egui::TextEdit::singleline(&mut typed)
+                    .hint_text(VIEWS_HINT)
+                    .desired_width(VIEW_LIMIT_FIELD_WIDTH)
+                    .min_size(egui::vec2(VIEW_LIMIT_FIELD_WIDTH, ACCESS_FIELD_HEIGHT)),
+            )
+            .changed();
+        if changed {
+            *controls.max_access_count = view_limit_from(&typed);
+        }
+        ui.label(
+            egui::RichText::new(views_note(*controls.max_access_count))
+                .size(12.0)
+                .color(theme::TEXT_FAINT),
+        );
+    });
+    ui.add_space(ACCESS_ROW_SPACING);
+
+    // ---- Open with -------------------------------------------------------
+    //
+    // **The buffer is taken out of the plan and put back**, rather than a
+    // `get_or_insert_with(...)` that would leave an empty `Some` behind the
+    // moment the field is touched. Taken, typed into, and put back only if it
+    // still holds something: an emptied box drops the `Zeroizing` here, which
+    // wipes it, and leaves the plan's `password` at `None` -- which is
+    // exactly "there is no password on this Send" rather than "there is an
+    // empty one", the state `validate_plan` has to refuse.
+    //
+    // Masked with `.password(true)`, which is what BOTH of this app's forms
+    // already do for a typed secret -- the composer's own password field was
+    // one, and `record_ui`'s seed passphrase is another. `totp_add`'s
+    // Reveal/Hide is a different job: it unmasks a secret the app is SHOWING
+    // the user, not one they are typing.
+    let mut buffer = controls
+        .password
+        .take()
+        .unwrap_or_else(|| zeroize::Zeroizing::new(String::new()));
+    access_row(ui, OPEN_WITH_LABEL, enabled, |ui| {
+        ui.add_enabled(
+            enabled,
+            egui::TextEdit::singleline(&mut *buffer)
+                .hint_text(PASSWORD_HINT)
+                .password(true)
+                .desired_width(f32::INFINITY)
+                .min_size(egui::vec2(0.0, ACCESS_FIELD_HEIGHT)),
+        );
+    });
+    *controls.password = (!buffer.is_empty()).then_some(buffer);
 }
 
 /// The composer card. Returns the action **this form** reported, if any.
@@ -1338,108 +1697,52 @@ fn draw_composer(
                     .desired_width(f32::INFINITY),
             );
 
-            ui.add_space(10.0);
-            theme::field_label(ui, LIFETIME_PROMPT);
-            ui.add_space(4.0);
-            // **One control with three positions, and not three buttons.**
+            ui.add_space(12.0);
+            // **Design §5a's ACCESS block, drawn by the one function that
+            // draws it.**
             //
-            // Design §5a draws the Send's lifetime as the page's segmented
-            // control: cells butted together inside one rounded outline, the
-            // chosen cell filled solid blue behind white. What stood here was
-            // a `ui.horizontal` of three `egui::Button`s with `.selected()`
-            // on one of them -- separated by egui's item spacing, each with
-            // its own outline, each 72 points wide whatever its label said.
-            // That is precisely the shape `theme::segmented_control`'s own
-            // documentation records this app moving away from: separated
-            // cells "read as a row of independent buttons: three things you
-            // might press, rather than one control with three positions".
-            // The Send screen was the last surface still drawing the old one,
-            // so "the app has one segmented control" was true of the design
-            // system and false of the app.
+            // What stood here was this screen's own arrangement of two of
+            // §5a's six Access controls: a `field_label` reading "The link
+            // stops working after" over a segmented run, then a tick-box
+            // reading "Require a password to open the link" over a masked
+            // field. The record composer in `record_ui` had neither, and
+            // neither screen had ever offered the view cap that
+            // `SendPlan::max_access_count` has published since the feature
+            // was written.
             //
-            // It also fixes the selected cell's colour by accident of doing
-            // the right thing: `.selected()` gives egui's own selection fill
-            // with [`theme::INK`] text over it, and §5a's chosen cell is
-            // [`theme::BLUE`] behind white -- the same weight this app already
-            // gives a primary button, and for the segmented control's stated
-            // reason.
+            // **The composer gets the block too, and the argument is the one
+            // the footers were just fixed under.** The design page has no
+            // counterpart for this screen at all, so "§5a says so" is not
+            // available here and something else has to carry the decision. It
+            // is this: "how long does this link live", "who can open it" and
+            // "how many times" are questions about a Bitwarden Send, not
+            // about a screen, and this app has two screens that publish one.
+            // Two answers to one question is exactly what the matched pair of
+            // footer buttons was -- and the harm here is not cosmetic: a user
+            // who finds the view cap on the record composer and comes looking
+            // for it here would conclude the app cannot cap a text Send,
+            // which is false, and has been false since the field was plumbed.
             //
-            // **The choices still come from `send.rs` and are not spelled
-            // here.** `validate_plan` refuses any other value, so a cell
-            // offering one would be a control that cannot work.
-            let labels: Vec<String> = crate::send::DELETE_IN_DAYS_CHOICES
-                .iter()
-                .map(|days| lifetime_label(*days))
-                .collect();
-            let segments: Vec<theme::Segment<'_>> = labels
-                .iter()
-                .zip(crate::send::DELETE_IN_DAYS_CHOICES)
-                .map(|(label, days)| theme::Segment {
-                    label: label.as_str(),
-                    selected: composer.plan.delete_in_days == days,
-                })
-                .collect();
-            // `segmented_control_disabled` and not `add_enabled`, because
-            // that is the split this design system already makes for exactly
-            // this question (see `toggle_pill` / `toggle_pill_disabled`): the
-            // inert run senses hover only, so while a publish is in flight
-            // there is no path by which a cell can be pressed at all, and the
-            // answer in force stays legible in the wash rather than greying
-            // into the other two.
-            if enabled {
-                if let Some(index) = theme::segmented_control(ui, &segments) {
-                    composer.plan.delete_in_days = crate::send::DELETE_IN_DAYS_CHOICES[index];
-                }
-            } else {
-                theme::segmented_control_disabled(ui, &segments);
-            }
-            ui.add_space(4.0);
-            // **The DATE, not only the number of days.** A publishing action
-            // where being wrong about the lifetime is the harm gets the thing
-            // the user can check against a calendar. `expiry_wording` is
-            // `send.rs`'s own, so this line and the `deletionDate` in the JSON
-            // cannot disagree about what the choice means.
-            //
-            // The date it prints is the user's **local** day: the stored
-            // `deletionDate` is UTC and stays UTC, and a Send that dies at
-            // 00:30 UTC dies the previous evening in the Americas. See
-            // `send::expiry_wording`.
-            ui.label(
-                egui::RichText::new(crate::send::expiry_wording(
-                    composer.plan.delete_in_days,
-                    now,
-                    zone,
-                ))
-                .size(11.0)
-                .color(theme::TEXT_FAINT),
+            // The one thing lost is this screen's own wording, and it was
+            // worth losing. "The link stops working after" is a better
+            // sentence than "Expires" and a worse LABEL: it reads as a
+            // sentence only because it sat alone above its control, and there
+            // is no arrangement of three such sentences that lines three
+            // controls up on one left edge, which is §5a's whole visual claim
+            // for this block. The sentence is not gone -- `expiry_wording`
+            // still prints "The link stops working after 7 days -- on ..."
+            // under the row, where it now carries the date as well.
+            draw_access_block(
+                ui,
+                AccessControls {
+                    delete_in_hours: &mut composer.plan.delete_in_hours,
+                    password: &mut composer.plan.password,
+                    max_access_count: &mut composer.plan.max_access_count,
+                },
+                enabled,
+                now,
+                zone,
             );
-
-            ui.add_space(10.0);
-            let mut wants_password = composer.wants_password();
-            if ui
-                .add_enabled(
-                    enabled,
-                    egui::Checkbox::new(
-                        &mut wants_password,
-                        egui::RichText::new(PASSWORD_TOGGLE_LABEL)
-                            .size(12.0)
-                            .color(theme::TEXT_MUTED),
-                    ),
-                )
-                .changed()
-            {
-                composer.set_wants_password(wants_password);
-            }
-            if let Some(password) = composer.plan.password.as_mut() {
-                ui.add_space(4.0);
-                ui.add_enabled(
-                    enabled,
-                    egui::TextEdit::singleline(&mut **password)
-                        .hint_text(PASSWORD_HINT)
-                        .password(true)
-                        .desired_width(f32::INFINITY),
-                );
-            }
 
             ui.add_space(12.0);
             let problem = composer_problem(composer);
@@ -2655,23 +2958,28 @@ mod paint_tests {
     #[test]
     fn the_lifetime_picker_is_one_segmented_run_and_not_three_buttons() {
         let mut composer = open_composer();
-        let chosen = composer.plan.delete_in_days;
+        let chosen = composer.plan.delete_in_hours;
         let painted = paint_composer(&mut composer, false);
 
-        let cells: Vec<(u8, egui::Rect, egui::Color32)> = crate::send::DELETE_IN_DAYS_CHOICES
+        let cells: Vec<(u32, egui::Rect, egui::Color32)> = crate::send::DELETE_IN_HOURS_CHOICES
             .iter()
-            .map(|days| {
-                let label = lifetime_label(*days);
+            .map(|hours| {
+                let label = crate::send::lifetime_label(*hours);
                 let (rect, fill) = painted.control_under(&label);
-                (*days, rect, fill)
+                (*hours, rect, fill)
             })
             .collect();
 
-        for (days, rect, _) in &cells {
+        // Control: the run really did grow the design's sub-day cells. The
+        // three assertions below are shape assertions and would all pass over
+        // a three-cell run of days.
+        assert_eq!(cells.len(), 4, "the picker is not §5a's four-cell run");
+
+        for (hours, rect, _) in &cells {
             assert_eq!(
                 rect.height(),
                 theme::SEGMENT_HEIGHT,
-                "the {days}-day cell is not a segmented-control cell -- it is \
+                "the {hours}-hour cell is not a segmented-control cell -- it is \
                  {}pt tall against the run's {}",
                 rect.height(),
                 theme::SEGMENT_HEIGHT
@@ -2682,14 +2990,14 @@ mod paint_tests {
             let gap = pair[1].1.left() - pair[0].1.right();
             assert!(
                 gap.abs() <= theme::SEGMENT_SEAM + 0.5,
-                "the lifetime cells are {gap}pt apart, so they are three buttons in a row \
-                 rather than one joined run. §5a draws this as one control with three \
-                 positions, and separated cells read as three things you might press."
+                "the lifetime cells are {gap}pt apart, so they are four buttons in a row \
+                 rather than one joined run. §5a draws this as one control with four \
+                 positions, and separated cells read as four things you might press."
             );
         }
 
-        for (days, _, fill) in &cells {
-            if *days == chosen {
+        for (hours, _, fill) in &cells {
+            if *hours == chosen {
                 assert_eq!(
                     *fill,
                     theme::BLUE,
@@ -2699,7 +3007,7 @@ mod paint_tests {
                 assert_ne!(
                     *fill,
                     theme::BLUE,
-                    "the {days}-day cell is lit and it is not the one in force"
+                    "the {hours}-hour cell is lit and it is not the one in force"
                 );
             }
         }
@@ -2757,7 +3065,7 @@ mod paint_tests {
     #[test]
     fn a_publish_in_flight_leaves_the_lifetime_run_inert_and_readable() {
         let mut composer = open_composer();
-        let chosen = lifetime_label(composer.plan.delete_in_days);
+        let chosen = crate::send::lifetime_label(composer.plan.delete_in_hours);
         let painted = paint_composer(&mut composer, true);
 
         assert!(painted.has(CREATING_LABEL), "the in-flight word is not on the form");
@@ -2768,6 +3076,171 @@ mod paint_tests {
             "the lifetime in force is not drawn in the inert run's wash while a publish is \
              running -- either the run is still live, or it has greyed out the one answer \
              the user still has"
+        );
+    }
+
+    /// **The whole of what an empty view-limit box means, and what a filled
+    /// one does.**
+    ///
+    /// A pure function, so the states this control can be in are assertable
+    /// without running a frame -- which matters more here than usual, because
+    /// the dangerous state is invisible on screen: a box that looked capped
+    /// and parsed to `None` would publish an uncapped link with nothing
+    /// anywhere to say so.
+    #[test]
+    fn the_view_limit_box_reads_empty_as_no_limit_and_digits_as_a_cap() {
+        assert_eq!(view_limit_from(""), None, "an empty box is the off position");
+        assert_eq!(view_limit_from("   "), None, "whitespace is an empty box");
+        assert_eq!(view_limit_from("1"), Some(1));
+        assert_eq!(view_limit_from("42"), Some(42));
+
+        // A zero is kept and NOT swallowed to `None`. It is a real thing to
+        // have typed, and `validate_plan` has the sentence for it; turning it
+        // into "no limit" here would make a typo into an uncapped link with
+        // no refusal anywhere in the app.
+        assert_eq!(view_limit_from("0"), Some(0));
+        assert_eq!(
+            crate::send::validate_access(crate::send::DEFAULT_DELETE_IN_HOURS, None, Some(0)),
+            Some("A limit of zero views would make the link useless."),
+            "a zero cap is accepted by the encoder, so the box may not produce one silently"
+        );
+
+        // Non-digits are dropped, so a pasted "3 views" does the obvious
+        // thing rather than being refused with nothing on screen to say why.
+        assert_eq!(view_limit_from("3 views"), Some(3));
+        assert_eq!(view_limit_from("abc"), None);
+        assert_eq!(view_limit_from("-5"), Some(5), "a minus sign is not a digit");
+
+        // **The overflow guard, which is the reason the cap exists.** Eleven
+        // digits do not fit a `u32`; an ungated `parse().ok()` would answer
+        // `None`, and `None` in this control means NO LIMIT AT ALL. A user
+        // holding a key down would have quietly uncapped their own link.
+        let held_down = "9".repeat(20);
+        assert_eq!(
+            view_limit_from(&held_down),
+            Some(999_999),
+            "a long run of digits did not stop at {MAX_VIEW_LIMIT_DIGITS} -- if this is `None`, \
+             leaning on a key turns a cap into an uncapped Send"
+        );
+        assert!(
+            "9".repeat(MAX_VIEW_LIMIT_DIGITS).parse::<u32>().is_ok(),
+            "control: {MAX_VIEW_LIMIT_DIGITS} nines do not fit a u32, so the cap is too high"
+        );
+
+        // The note beside the box says which of the two states it is in.
+        assert_eq!(views_note(None), NO_VIEW_LIMIT_NOTE);
+        assert_eq!(views_note(Some(1)), VIEW_LIMIT_NOTE);
+        assert_ne!(NO_VIEW_LIMIT_NOTE, VIEW_LIMIT_NOTE);
+    }
+
+    /// **§5a's Access block is on the text composer, with all three of its
+    /// buildable rows.**
+    ///
+    /// The composer had a lifetime row and a password tick-box and no view
+    /// cap at all. This says the block arrived whole -- and the three
+    /// absences at the bottom say it did not bring with it the three controls
+    /// no server behind this app can honour.
+    #[test]
+    fn the_composer_wears_the_whole_access_block() {
+        let mut composer = open_composer();
+        let painted = paint_composer(&mut composer, false);
+
+        assert!(painted.has(ACCESS_EYEBROW), "the ACCESS eyebrow is missing: {:?}", painted.text);
+        for label in [EXPIRES_LABEL, VIEWS_LABEL, OPEN_WITH_LABEL] {
+            assert!(painted.has(label), "the {label:?} row is missing: {:?}", painted.text);
+        }
+        assert!(
+            painted.has(NO_VIEW_LIMIT_NOTE),
+            "the view box is empty and says nothing about what that means: {:?}",
+            painted.text
+        );
+        assert!(
+            painted.has(PASSWORD_HINT),
+            "the password box is empty and says nothing about what that means: {:?}",
+            painted.text
+        );
+
+        // **The tick-box is gone.** It was "Require a password to open the
+        // link" over a field that appeared only once ticked; the box is its
+        // own switch now, and a switch left in front of it would be a second
+        // way to say what the box says.
+        assert!(
+            !painted.has("Require a password"),
+            "the password switch is still drawn in front of a box that is its own switch"
+        );
+
+        // The three §5a rows that are absences and not to-dos. Named here so
+        // that adding one reds a test rather than shipping a control that
+        // cannot do what its label says.
+        for absent in ["Recipient", "Only this address can open it", "Tell me when it is opened"] {
+            assert!(
+                !painted.has(absent),
+                "{absent:?} is drawn on the composer, and there is no server behind it"
+            );
+        }
+    }
+
+    /// **What is typed into the Access block reaches the plan that is
+    /// published**, by the route a user actually takes.
+    ///
+    /// `draw_access_block` writes through three `&mut`s into the composer's
+    /// own `SendPlan`, which is the buffer `plan_to_invocation` will encode --
+    /// there is no conversion step in between and this says so. The password
+    /// half is the one that matters most: a control that drew, validated and
+    /// then published `None` would ship a Send anyone with the link can open,
+    /// with the user's own password visible in the box they typed it into.
+    #[test]
+    fn what_the_access_block_holds_is_what_the_composer_would_publish() {
+        let mut composer = open_composer();
+        composer.plan.delete_in_hours = 1;
+        composer.plan.password = Some(zeroize::Zeroizing::new("share-pw-9271".to_string()));
+        composer.plan.max_access_count = Some(3);
+
+        // A frame of the real form, which is where a block that dropped what
+        // it was handed would do the dropping.
+        let painted = paint_composer(&mut composer, false);
+        assert!(painted.has(ACCESS_EYEBROW), "control: the block did not draw");
+
+        assert_eq!(composer.plan.delete_in_hours, 1, "a frame reset the lifetime");
+        assert_eq!(
+            composer.plan.password.as_deref().map(String::as_str),
+            Some("share-pw-9271"),
+            "a frame dropped the share password, so the composer would publish an open link"
+        );
+        assert_eq!(composer.plan.max_access_count, Some(3), "a frame dropped the view cap");
+        assert_eq!(composer_problem(&composer), None, "the draft the user typed is refused");
+
+        // And the sub-day lifetime is the one now on screen, spelled by the
+        // one function that spells lifetimes.
+        assert!(
+            painted.has(&crate::send::lifetime_label(1)),
+            "the one-hour cell is not the one in force: {:?}",
+            painted.text
+        );
+        assert!(
+            painted.has("The link stops working after 1 hour"),
+            "the sentence under the run does not name the sub-day lifetime: {:?}",
+            painted.text
+        );
+    }
+
+    /// **A masked password box never paints what was typed into it.**
+    ///
+    /// The block writes a `Zeroizing` buffer through a `&mut` and hands it to
+    /// a `TextEdit`; `.password(true)` is one call away from being lost in an
+    /// edit, and losing it puts a share password on screen in a window the
+    /// user may well be screen-sharing. Nothing else in this file would
+    /// notice.
+    #[test]
+    fn the_share_password_is_never_painted_in_the_clear() {
+        let mut composer = open_composer();
+        composer.plan.password = Some(zeroize::Zeroizing::new("share-pw-9271".to_string()));
+        let painted = paint_composer(&mut composer, false);
+        assert!(painted.has(OPEN_WITH_LABEL), "control: the password row did not draw");
+        assert!(
+            !painted.has("share-pw-9271"),
+            "the share password was painted in the clear: {:?}",
+            painted.text
         );
     }
 
@@ -6504,16 +6977,40 @@ mod source_pins {
     /// in source order. See
     /// [`the_public_surface_of_the_send_module_is_exactly_these_items`].
     const SEND_PUBLIC_SURFACE: &[&str] = &[
-        "send.rs: pub const DELETE_IN_DAYS_CHOICES: [u8; 3] = [1, 7, 30];",
-        "send.rs: pub const DEFAULT_DELETE_IN_DAYS: u8 = 7;",
+        // **Re-pinned by the design §5a Access block, and a widening of
+        // nothing this wall guards.** The array went from three `u8`s of days
+        // to four `u32`s of hours and the default with it, so that §5a's
+        // `1 h` cell is expressible at all -- see `send::DELETE_IN_HOURS_CHOICES`
+        // for why the unit was the only thing in the way. Neither constant
+        // reaches a runner, an invocation or a child; they are read by
+        // `validate_plan`, by `deletion_date`'s arithmetic and by the picker
+        // that draws them.
+        "send.rs: pub const DELETE_IN_HOURS_CHOICES: [u32; 4] = [1, 24, 24 * 7, 24 * 30];",
+        "send.rs: pub const DEFAULT_DELETE_IN_HOURS: u32 = 24 * 7;",
         "send.rs: pub struct SendPlan {",
         "send.rs: pub name: String,",
         "send.rs: pub text: Zeroizing<String>,",
         "send.rs: pub hidden: bool,",
-        "send.rs: pub delete_in_days: u8,",
+        "send.rs: pub delete_in_hours: u32,",
         "send.rs: pub password: Option<Zeroizing<String>>,",
         "send.rs: pub max_access_count: Option<u32>,",
         "send.rs: pub fn validate_plan(plan: &SendPlan) -> Option<&'static str> {",
+        // **Added by the design §5a Access block, deliberately, and it is the
+        // second and last item that work adds to this wall.** It is
+        // `validate_plan`'s own last three rules, split out so that
+        // `record_ui`'s composer -- which has an Access block and no name or
+        // body yet, because the record is re-resolved by id at submit time --
+        // can run exactly the rules that apply to it. The two alternatives
+        // were both worse and are written out on the function: restate the
+        // three sentences in `record_ui`, or hand `validate_plan` an invented
+        // name and body, which meant cloning a share password out of a
+        // `Zeroizing` buffer on every frame that validated.
+        //
+        // It is not a door in the sense this list guards. It takes three
+        // scalars and a `&str`, returns a `&'static str`, reaches no runner,
+        // no invocation and no child, and `validate_plan` -- already on this
+        // list, one line up -- is now written in terms of it.
+        "send.rs: pub fn validate_access(",
         "send.rs: pub trait SendClock {",
         "send.rs: pub struct FixedClock(pub i64);",
         "send.rs: pub struct SystemClock;",
@@ -6524,12 +7021,24 @@ mod source_pins {
         // `crate::rest::send` stamps the SAME instant in the SAME format
         // as the CLI path, rather than growing a second copy of the
         // arithmetic that the two backends could then disagree over.
-        "send.rs: pub(crate) fn deletion_date(days: u8, now: &dyn SendClock) -> String {",
+        "send.rs: pub(crate) fn deletion_date(hours: u32, now: &dyn SendClock) -> String {",
+        // **Moved here from `send_ui`, deliberately, and it is the only item
+        // the §5a Access block adds to this wall.** It was the Sends screen's
+        // own `pub fn lifetime_label(days: u8)` while `expiry_wording`, four
+        // lines below, built the same phrase out of its own `format!` -- two
+        // spellings of one duration, agreeing by coincidence. It is now one
+        // function that both screens' cells and that sentence all read.
+        //
+        // It is a door in the sense this list counts and in no other: it
+        // takes a `u32` and returns a `String`, reaches no runner, no
+        // invocation and no child, and there is nothing behind it but a
+        // `format!`.
+        "send.rs: pub fn lifetime_label(hours: u32) -> String {",
         // `zone` was added beside `now` when the sentence stopped naming the
         // UTC day and started naming the user's own. Both are injected, and
         // that is the point of both: nothing in `send.rs` reads the machine's
         // clock or the machine's timezone for itself.
-        "send.rs: pub fn expiry_wording(days: u8, now: &dyn SendClock, zone: &dyn LocalOffset) -> String {",
+        "send.rs: pub fn expiry_wording(hours: u32, now: &dyn SendClock, zone: &dyn LocalOffset) -> String {",
         "send.rs: pub struct SendInvocation {",
         "send.rs: pub fn args(&self) -> &[String] {",
         "send.rs: pub fn stdin_json_b64(&self) -> &str {",

@@ -65,6 +65,8 @@ use deskwarden::breach::BreachCache;
 use deskwarden::hello::HelloState;
 use deskwarden::login_ui::{self, BwStatus, LoginForm};
 use deskwarden::kind_mark;
+use deskwarden::local_time;
+use deskwarden::send;
 use deskwarden::vault_bridge::{Folder, ItemKind, VaultItem};
 use deskwarden::vault_window::detail::{self, RevealState, TotpState};
 use deskwarden::vault_window::detail_edit::{self, EditDraft};
@@ -84,6 +86,20 @@ use std::path::PathBuf;
 /// prominent numbers are a code and a countdown, and a screenshot that changes
 /// every run is one no reviewer can diff against the last.
 const PREVIEW_UNIX: u64 = 1_699_999_980;
+
+/// [`PREVIEW_UNIX`] as the milliseconds a [`send::SendClock`] speaks in.
+///
+/// The record composer's §5a Access block prints the day its link dies, and
+/// this constant is that shot's half of the same rule: a screenshot carrying
+/// today's date is one no reviewer can diff against the last.
+const PREVIEW_MILLIS: i64 = PREVIEW_UNIX as i64 * 1_000;
+
+/// The timezone every preview shot stands in.
+///
+/// UTC, injected, for [`PREVIEW_UNIX`]'s reason applied one step further out:
+/// the day a Send expires on is the USER's day, so a shot taken with the
+/// machine's own zone would name a different date depending on who ran it.
+const PREVIEW_ZONE: local_time::FixedOffset = local_time::FixedOffset(0);
 
 /// Where the PNGs go: `$CARGO_TARGET_DIR` when the environment sets one,
 /// and the historical relative `target` when it does not.
@@ -2226,6 +2242,8 @@ impl Preview {
                         &mut fixtures.record,
                         "Ledgerline \u{b7} a.novak@ledgerline.com",
                         false,
+                        &send::FixedClock(PREVIEW_MILLIS),
+                        &PREVIEW_ZONE,
                     );
                 }
                 PaneKind::TotpAdd => {

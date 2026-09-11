@@ -15,6 +15,53 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### A Send can now carry a password, a view limit, and an hour-long life
+
+The window that shares a record -- and the one that shares a scrap of text --
+now has an **Access** block under the list of fields, with three controls that
+were part of the design from the start and had never been built.
+
+**A password on the link.** Type one and the link asks for it before it shows
+anything; leave the box empty and it does not. There is no switch to turn on
+first: an empty box is off. The password is never sent anywhere in the clear --
+your PC turns it into a proof that you knew it, and only the proof travels.
+
+**A view limit.** Type a number and the link stops working after that many
+opens. Leave it empty and it works until it expires. The count is enforced by
+the server rather than by this app, so the limit holds against anyone who has
+the link, not only against people opening it in Deskwarden.
+
+**Shorter lifetimes.** The link could last one, seven or thirty days. It can
+now last **one hour** as well, and the line under the picker tells you the time
+of day a short link dies rather than only the date. Nothing about the existing
+three choices moved: a link set to seven days still dies at the same moment it
+always did.
+
+Three more things the design drew are deliberately not here, and each is a
+decision rather than an oversight. A **recipient address** and an **only this
+address can open it** switch are one feature on the wire -- a Send that mails
+a one-time code before it opens -- and no server this app talks to implements
+it; a switch that said the link was locked to one person while anybody holding
+it could open it would be worse than no switch at all. **Tell me when it is
+opened** is not something a Send can do; the only way to build it would be this
+app checking on a timer while it happens to be running, which is not what the
+switch would appear to promise.
+
+### The two record windows look like each other again
+
+The window that imports a record from a link had been left behind when the one
+that sends a record was tidied up: its two buttons were the same plain grey as
+each other, so nothing on the card said which of them was the one it was for,
+and its **Create a second item / Replace the existing one** question was drawn
+as two identical boxes with the chosen one shaded very slightly.
+
+Both are now the same controls the rest of the app uses. **Import into my
+vault** is the filled blue button and **Fetch** the outlined one beside it, and
+the replace question is one control with two positions, with the answer you
+picked filled in solid. That last one matters more than it looks: replacing is
+the only press in this feature that destroys something you already had, and it
+is now impossible to miss which way it is set.
+
 ### "Scan a region" dims the desktop instead of covering it
 
 Choosing **Scan a region** when adding a one-time code opened a solid black

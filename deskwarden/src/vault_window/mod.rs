@@ -5501,8 +5501,32 @@ pub fn build_frame_with_search(
         // not of a screen, and two flags for one child is how the second one
         // gets started.
         if let Some(state) = &mut record_send {
-            match record_ui::draw_export_modal(ui.ctx(), state, send_create.in_flight) {
+            // The real clock and the real timezone, read here -- the modal's
+            // §5a Access block prints the instant the link dies, in the
+            // user's own day. Both are injected for `send::expiry_wording`'s
+            // stated reason: nothing below this line reads either for itself,
+            // so every assertion about that sentence is exact wherever the
+            // suite runs. The same two values the Sends pane is handed.
+            match record_ui::draw_export_modal(
+                ui.ctx(),
+                state,
+                send_create.in_flight,
+                &crate::send::SystemClock,
+                &crate::local_time::SystemZone,
+            ) {
                 record_ui::RecordUiAction::SubmitExport => {
+                    // **The Access block's three answers, TAKEN out of the
+                    // draft rather than copied out of it.** One of the three
+                    // is a share password in a `Zeroizing` buffer, and one
+                    // copy of a secret is the right number of copies; a
+                    // `clone()` here would leave a second live in the draft
+                    // until the modal was dropped. Taking is safe because the
+                    // modal closes unconditionally at the bottom of this arm,
+                    // replacing the whole `record_send` -- so there is no
+                    // frame in which the emptied draft is drawn, and if the
+                    // item turns out to be gone the taken plan is simply
+                    // dropped, which wipes it.
+                    let access = std::mem::take(&mut state.draft.access);
                     // Re-resolved by id: the vault may have been re-read
                     // between the open and this press, and the item that
                     // should be published is the one the window is holding
@@ -5533,7 +5557,7 @@ pub fn build_frame_with_search(
                                 // limit, and `SendPlan` carries that.
                                 None,
                             );
-                            record_ui::send_plan_from(&record)
+                            record_ui::send_plan_from(&record, access)
                         });
                     if let Some(plan) = plan {
                         send_create.in_flight = true;
@@ -35858,7 +35882,7 @@ mod send_create_wiring {
     thread_local! {
         /// Every create [`recording_create_spawn`] was asked to start, on this
         /// thread. Thread-local because `cargo test` runs tests in parallel.
-        static CREATE_SPAWNS: RefCell<Vec<(String, String, String, u8, String)>> =
+        static CREATE_SPAWNS: RefCell<Vec<(String, String, String, u32, String)>> =
             const { RefCell::new(Vec::new()) };
     }
 
@@ -35882,7 +35906,7 @@ mod send_create_wiring {
                 plan.name.clone(),
                 plan.text.to_string(),
                 plan.password.as_deref().cloned().unwrap_or_default(),
-                plan.delete_in_days,
+                plan.delete_in_hours,
                 session.to_string(),
             ));
         });
@@ -35893,7 +35917,7 @@ mod send_create_wiring {
     fn apply(
         action: send_ui::SendUiAction,
         create: &mut SendCreateState,
-    ) -> Vec<(String, String, String, u8, String)> {
+    ) -> Vec<(String, String, String, u32, String)> {
         CREATE_SPAWNS.with(|s| s.borrow_mut().clear());
         let ctx = egui::Context::default();
         let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
@@ -35961,7 +35985,7 @@ mod send_create_wiring {
                 DRAFT_NAME.to_string(),
                 SECRET.to_string(),
                 SHARE_PASSWORD.to_string(),
-                crate::send::DEFAULT_DELETE_IN_DAYS,
+                crate::send::DEFAULT_DELETE_IN_HOURS,
                 SESSION.to_string(),
             )],
             "pressing Create did not start exactly one publish carrying exactly the draft \

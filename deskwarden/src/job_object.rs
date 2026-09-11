@@ -6787,10 +6787,19 @@ mod tests {
         // jobless `bw` could be started through -- which is the claim this
         // allowlist exists to make out loud rather than leave assumed.
         "crate::local_time::LocalOffset",
-        "crate::local_time::MILLIS_PER_DAY",
+        // Added when a Send's lifetime stopped being a whole number of days:
+        // design section 5a offers a one-hour link, so `send.rs` multiplies
+        // by hours where it used to multiply by days. It is the same kind of
+        // item as `MILLIS_PER_DAY` beside it -- an `i64` literal -- and the
+        // paragraph above covers it word for word.
+        "crate::local_time::MILLIS_PER_HOUR",
         "crate::local_time::civil_parts",
         "crate::local_time::local_parts",
         "crate::local_time::format_day",
+        // The same formatter with a clock time on it, for the sub-day
+        // lifetimes: see `send::expiry_wording` on why an hour-long link is
+        // told the minute it dies and a seven-day one is not.
+        "crate::local_time::format_day_time",
         "crate::local_time::month_name",
         // A test double, named only by `send.rs`'s own test module.
         "crate::local_time::FixedOffset",
