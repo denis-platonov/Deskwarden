@@ -2681,7 +2681,37 @@ mod tests {
             // against the PREVIOUS pinned pair and reproduced
             // (27355, 0x9be2_c855_07e3_05d3) exactly, so it is measuring
             // what this test measures.
-            (27355, 0x28a8_aa4b_8b1a_805a_u64),
+            //
+            // **27359 bytes, new hash: the version goes BACK to a `-dev`
+            // suffix**, which is the hop the 0.15.20 and 0.15.21 releases
+            // both forgot. `version = "0.15.21"` became `"0.15.22-dev"`.
+            //
+            // The changelog's Unreleased section promises that a build from
+            // the working tree reports a version ending in `-dev`, and for
+            // two releases running it did not: the cut moved the version
+            // from `-dev` to plain and nothing moved it back, so every
+            // build after each tag claimed to BE that release while carrying
+            // commits it did not have. The owner noticed from the About
+            // line, which is exactly the reader that promise is for.
+            //
+            // Four bytes longer, so unlike the last two hops the LENGTH
+            // moves too -- the suffix is four characters where the previous
+            // two edits were digit-for-digit.
+            //
+            // No dependency was added, removed, re-pointed or re-featured,
+            // no `[patch]`/`[replace]`/`[workspace.dependencies]` table
+            // appeared, no path or fork appeared, and
+            // `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`.
+            //
+            // Recomputed the way every hop above records -- FNV-1a/64 over
+            // the file with CRLF normalised to LF, in a separate
+            // implementation outside this crate -- rather than copied out
+            // of the failure message. That implementation was first run
+            // against the PREVIOUS pinned pair and reproduced
+            // (27355, 0x28a8_aa4b_8b1a_805a) exactly, so it is measuring
+            // what this test measures.
+            (27359, 0x546e_fe01_2ee6_ade3_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
