@@ -101,6 +101,10 @@ pub mod prefs_ui;
 pub mod prompt_card;
 pub mod qr;
 pub mod record;
+/// `receive_history.json`: which Sends other people shared with this user and
+/// this app imported. A timestamp, a name and the vault item id it became --
+/// **never the access URL**, which carries the Send's own decryption key.
+pub mod receive_history;
 /// The 6b dimmed full-screen surface a QR code is dragged out of. **At the
 /// crate root and not under `vault_window`**, which carries a guard requiring
 /// every UI module there to have a production caller; this one has none until

@@ -15,6 +15,82 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### Sends has a list and a detail pane, like the vault
+
+The Sends screen was a single column of rows with every control crammed onto
+each one: a state pill, an expiry, Copy link, Delete, and a confirmation that
+widened the row to three buttons. Design 5b draws it as the vault window's own
+shape -- a rail, a list, and a detail pane beside it -- and it is that now.
+
+The **list** is one row per Send: an initials tile, the name, what the link
+needs and how many views are left, and the state pill at the row's right edge
+where the design puts it. Nothing on a row destroys anything. The row you pick
+opens in the **detail pane**, which shows the link itself (struck through, and
+marked *dead*, once the link has stopped working), whether opening it needs the
+share password, the views against their cap with the design's meter, and
+**both** dates -- when the link stops answering and when the record is deleted,
+which Bitwarden allows to be different days. Copy link, the switch that turns
+the link off and on, and Delete all live there.
+
+Above the card, one sentence answers the question the design says people
+actually have -- was it used: *"Opened 3 times. 7 views left before the link
+stops working."* There is deliberately no activity log. A Bitwarden Send
+records how many times it was opened and nothing else -- no times, no browser,
+no place -- so a panel promising a timeline would be an empty box that reads as
+a bug.
+
+### The sidebar has a SHARING section
+
+Under the folders, a labelled **SHARING** section holds **Sends** with three
+sub-rows beneath it: **Waiting**, **Used** and **Ended**. Every Send is on
+exactly one of them and the three add up to the number beside Sends.
+
+*Ended* covers both expired and revoked links, and the pill in the list still
+says which. That is deliberate: a rail row is a place to look, and at that
+altitude the useful question is only whether the link is still live -- which of
+the two ended it is a fact you want beside the link, not in a list of places to
+go. The list's own strip says which cut you are in and spells out what *Ended*
+covers, so the two words never read as a contradiction.
+
+### Shared with me
+
+A new row lists the Sends other people sent **you** -- the ones you read with
+**Import a record**. Nothing used to remember that happened: the record became
+an ordinary vault item and the event left no trace.
+
+It is a local list, in `receive_history.json` beside your settings, and it
+holds three things per import: when it arrived, what it was called, and which
+vault item it became. **It never holds the link.** A Send's address carries the
+key that decrypts it, so a file of those sitting in `%APPDATA%` would be a list
+of live secrets readable by anything running as you. The last twenty imports
+are kept.
+
+Each row says whether the item it created is still in your vault, because the
+list outlives the item and a row pointing at nothing should say so.
+
+### Scanning a code dims the screen you are on, not all of them
+
+Choosing **Scan the code on my screen** used to dim every monitor you own. The
+overlay was sized to the bounding box of the whole desktop, so a two-screen
+setup went dark on both to select a region on one -- and on an L-shaped
+arrangement the window covered pixels no monitor even owns.
+
+It now covers one display: the one holding the Deskwarden window you pressed
+the button in, resolved at the moment you press it and carried from there. Not
+the mouse cursor, which is the other obvious answer: the pointer can be parked
+on a second screen for hours when the button is reached by keyboard, and it can
+move between the press and the window appearing, while a window does not move
+on its own.
+
+The scan itself is unchanged and still reads **every** monitor. It is the part
+that opens no window and the part that usually finds your code without you
+dragging anything, so narrowing it would have made the feature worse at its
+main job. The chip at the bottom of the overlay that re-runs it says **All
+screens** now, where it used to say *Whole screen* -- it is named for the scan
+it runs rather than for the surface it sits on, and on a surface that covers
+one screen that is the word that tells you there is still a control here
+reaching the monitor the dim does not.
+
 ### Your Sends now say what became of them
 
 The Sends screen listed a name, a link and an expiry, and left the question

@@ -4,6 +4,13 @@
 //! counted -- including `bw serve`'s virtual "No Folder" bucket, which is
 //! reported as a folder but scoped by [`SidebarFilter::Unfiled`] rather than
 //! by an id), plus the auto-lock countdown pinned to the bottom.
+//!
+//! Below the folders sit the rail's own SCREENS -- Password health, and then
+//! design 5b's labelled SHARING section: the account's own Sends, that row's
+//! three sub-filters ([`SendScope`]), and `Shared with me`. See
+//! [`screen_rows`] for why those are two groups rather than one, and
+//! [`Screens`] for the three selection axes this rail now carries and why
+//! none of them is folded into either of the others.
 
 use crate::theme;
 use crate::vault_bridge::{Folder, ItemKind, VaultItem};
@@ -157,15 +164,30 @@ pub struct VaultLists<'a> {
     pub live: &'a [VaultItem],
     pub trash: Option<&'a [VaultItem]>,
     pub archive: Option<&'a [VaultItem]>,
-    /// How many Sends this account has, or `None` for "this app does not
-    /// know". A **count** and not a list, because Sends are not `VaultItem`s
-    /// and the rail only ever needs the number; the rows themselves live in
-    /// `vault_window::send_ui`.
+    /// How many Sends this account has, **and how they split across design
+    /// 5b's three sub-rows**, or `None` for "this app does not know".
+    ///
+    /// Counts and not a list, because Sends are not `VaultItem`s and the rail
+    /// only ever needs the numbers; the rows themselves live in
+    /// `vault_window::send_ui`. Four numbers in one value rather than four
+    /// fields here, so a parent badge and a sub-row badge cannot come from
+    /// two readings of the list against two clocks -- see [`SendCounts`].
     ///
     /// `None` covers two situations on purpose -- not fetched, and fetched
-    /// unsuccessfully -- because the badge must say the same thing about
-    /// both: it does not know. See [`badge_for`] and [`UNKNOWN_COUNT`].
-    pub sends: Option<usize>,
+    /// unsuccessfully -- because every badge in the section must say the same
+    /// thing about both: it does not know. See [`badge_for`] and
+    /// [`UNKNOWN_COUNT`].
+    pub sends: Option<SendCounts>,
+    /// How many Sends other people have shared with this user and this app
+    /// has imported -- design 5b's `Shared with me` row.
+    ///
+    /// A plain `usize` and **not** an `Option`, for `health_findings`'
+    /// reason one step along: this is a local file, not a query, and
+    /// [`crate::receive_history::ReceiveHistory::load`] folds every failure
+    /// -- absent, empty, unreadable -- into an empty history. There is no
+    /// "not fetched yet" state to represent, and a `0` here really does mean
+    /// "nothing has been shared with you", which the pane says in words.
+    pub received: usize,
     /// How many distinct items the password-health report has a finding
     /// against -- the Password health row's badge.
     ///
@@ -187,7 +209,14 @@ impl<'a> VaultLists<'a> {
     /// A window that holds only the live vault -- neither on-demand query has
     /// answered yet. What every caller starts from.
     pub fn live_only(live: &'a [VaultItem]) -> Self {
-        VaultLists { live, trash: None, archive: None, sends: None, health_findings: 0 }
+        VaultLists {
+            live,
+            trash: None,
+            archive: None,
+            sends: None,
+            received: 0,
+            health_findings: 0,
+        }
     }
 }
 
@@ -426,31 +455,264 @@ pub fn count_for(items: &[VaultItem], filter: &SidebarFilter) -> usize {
 /// it cannot drift apart.
 pub const SENDS_ROW_LABEL: &str = "Sends";
 
-/// The two rail rows that are **screens rather than cuts of an item list**,
-/// and the one place their mutual exclusion is enforced.
+/// Design 5b's `Shared with me` row: the Sends **other people** sent to this
+/// user and this app imported.
 ///
-/// Neither Sends nor Password health is a [`SidebarFilter`]: Sends are not
-/// `VaultItem`s at all, and password reuse is a property of a PAIR of items,
-/// which no per-item `scope_contains` predicate can answer. Both therefore
-/// sit beside `selected` rather than inside it.
+/// Its count is a local record rather than a query -- see
+/// [`crate::receive_history`], which is the file, and why it holds no access
+/// URL.
+pub const RECEIVED_ROW_LABEL: &str = "Shared with me";
+
+/// The design's own name for the section these rows sit in (5b: `SHARING`).
+pub const SHARING_SECTION_LABEL: &str = "SHARING";
+
+/// **Design 5b's SHARING sub-filters: a third selection axis, orthogonal to
+/// both [`SidebarFilter`] and [`Screen`].**
 ///
-/// **Two `bool`s behind one handle, and not two loose parameters**, because
-/// the invariant is not "each row sets its own flag" -- it is *at most one of
+/// # Why it is not either of the two axes that already exist
+///
+/// It is not a [`SidebarFilter`], for the reason [`Screens`] gives about the
+/// screens themselves: `item_list` matches on that type to choose its
+/// empty-state nouns and its per-row scoping, and a Send is not a
+/// `VaultItem`, so a variant there would force these rows through the item
+/// pane.
+///
+/// It is not a [`Screen`] either, and that distinction is the whole point of
+/// a separate type. A `Screen` answers *which pane is drawn*; every one of
+/// these draws the SAME pane. What they change is which of its rows are in
+/// it. Folding them in as `Screen::SendsWaiting`, `Screen::SendsUsed` and so
+/// on would have made `Screens::is(Screen::Sends)` false while the Sends
+/// screen was plainly on screen -- so every existing reader of that predicate
+/// (the fetch gate, the refetch policy, `vault_body_state`, the panel
+/// choice) would have needed a three-way `matches!` and the one that forgot
+/// would silently stop fetching. The axes stay separate and the pane reads
+/// both.
+///
+/// # `Ended` is not one of `SendState`'s four, and that is deliberate
+///
+/// [`crate::send::SendState`] has four members and this has three, because
+/// `Ended` merges `Expired` and `Revoked`. 5b's own counts confirm the
+/// partition rather than merely allowing it: 2 + 1 + 2 = 5, the parent row's
+/// number, so every Send is on exactly one sub-row and the three add up to
+/// the whole.
+///
+/// **The rail and the pill therefore say different words about the same
+/// Send, on purpose.** A pill names *what happened to this link* -- the
+/// owner pulled it back, or the clock ran out, and those are different facts
+/// with different remedies. A rail row names *a set of links to go and look
+/// at*, and at that altitude the useful question is only "is it still live?".
+/// Splitting `Ended` in the rail would put two rows in front of the user that
+/// differ by a fact the pill already carries, beside the link, at the moment
+/// it matters. Three rows are a glance; five are a diagnosis in the wrong
+/// place.
+///
+/// The mismatch is not left silent, which is the condition of making it. The
+/// list column's strip names the scope in force, and [`Self::gloss`] spells
+/// out under it what `Ended` covers -- naming both pill words in the one row
+/// that merges them. See `send_ui::draw_send_pane`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SendScope {
+    /// Every Send this account has published. The parent row.
+    #[default]
+    All,
+    /// [`crate::send::SendState::Waiting`].
+    Waiting,
+    /// [`crate::send::SendState::Used`].
+    Used,
+    /// [`crate::send::SendState::Expired`] **and**
+    /// [`crate::send::SendState::Revoked`]. See the type's docs.
+    Ended,
+}
+
+impl SendScope {
+    /// The three sub-rows, in the order 5b draws them. A constant rather than
+    /// three literals at the draw site, so the row loop, the count check and
+    /// the tests cannot come to disagree about which rows exist.
+    pub const SUB_ROWS: [SendScope; 3] = [Self::Waiting, Self::Used, Self::Ended];
+
+    /// The word the rail prints.
+    ///
+    /// Two of the three are `send_ui`'s own pill constants rather than fresh
+    /// literals, so a row and the pill beside it cannot drift into two
+    /// spellings of one state. `Ended` has no pill to borrow from -- it is
+    /// the merge -- so it is spelled here, once.
+    pub fn label(self) -> &'static str {
+        use crate::vault_window::send_ui;
+        match self {
+            SendScope::All => SENDS_ROW_LABEL,
+            SendScope::Waiting => send_ui::WAITING_LABEL,
+            SendScope::Used => send_ui::USED_LABEL,
+            SendScope::Ended => ENDED_ROW_LABEL,
+        }
+    }
+
+    /// Whether a Send in `state` belongs on this row.
+    ///
+    /// `All` admits everything, which is what makes the parent row's count
+    /// and the three sub-rows' counts come from one function rather than from
+    /// a total plus three predicates that have to agree with it.
+    pub fn admits(self, state: crate::send::SendState) -> bool {
+        use crate::send::SendState;
+        match self {
+            SendScope::All => true,
+            SendScope::Waiting => state == SendState::Waiting,
+            SendScope::Used => state == SendState::Used,
+            SendScope::Ended => matches!(state, SendState::Expired | SendState::Revoked),
+        }
+    }
+
+    /// The same word in the case design 5b draws a list column's strip in.
+    ///
+    /// A constant per scope rather than `label().to_uppercase()`, because a
+    /// case conversion at draw time produces a string no test and no reader
+    /// can grep for -- which is the whole reason `theme::eyebrow`'s own doc
+    /// tells callers to hand it a literal already in the design's case.
+    pub fn eyebrow(self) -> &'static str {
+        match self {
+            SendScope::All => crate::vault_window::send_ui::SENDS_HEADING,
+            SendScope::Waiting => "WAITING",
+            SendScope::Used => "USED",
+            SendScope::Ended => "ENDED",
+        }
+    }
+
+    /// The one line the Sends pane prints under its strip while this scope is
+    /// in force.
+    ///
+    /// `Ended`'s **names both pill words**, which is the bridge that lets the
+    /// rail merge two states without the pill beside a row reading as a
+    /// contradiction. See the type's docs; the other two are 5c's own glosses
+    /// for the states they select.
+    ///
+    /// `All` returns `None` rather than a fourth sentence: the pane already
+    /// prints [`crate::vault_window::send_ui::SCOPE_SUBTEXT`] there, which
+    /// says what this app can and cannot do with a Send, and two lines of
+    /// standing explanation on the unfiltered screen is one too many.
+    pub fn gloss(self) -> Option<&'static str> {
+        match self {
+            SendScope::All => None,
+            SendScope::Waiting => Some("The link is live, and nobody has opened it yet."),
+            SendScope::Used => Some("Opened, with every permitted view spent."),
+            SendScope::Ended => {
+                Some("Out of time or turned off -- expired and revoked links together.")
+            }
+        }
+    }
+}
+
+/// The word [`SendScope::Ended`] prints. Spelled once, and **not** one of
+/// `send_ui`'s four pill labels; see [`SendScope`] for why that is deliberate
+/// rather than an oversight.
+pub const ENDED_ROW_LABEL: &str = "Ended";
+
+/// How many Sends fall on the parent row and on each of its three sub-rows.
+///
+/// **One value carrying four numbers rather than four `Option<usize>`s**, so
+/// the rail cannot draw a parent count from one reading of the list and a
+/// sub-row count from another. The whole set is derived in one pass over one
+/// answer, against one clock -- which matters because three of the four
+/// states are clock-dependent and a badge computed a frame apart from its
+/// neighbour would be a rail whose rows do not add up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SendCounts {
+    pub all: usize,
+    pub waiting: usize,
+    pub used: usize,
+    pub ended: usize,
+}
+
+impl SendCounts {
+    /// Counts every state in `states` onto its row.
+    ///
+    /// Built by ASKING [`SendScope::admits`] rather than by a `match` written
+    /// a second time here: the predicate that decides which rows a Send is
+    /// counted on has to be the same one that decides which rows it is listed
+    /// on, or a badge says 2 over a list of three.
+    ///
+    /// **A named generic rather than `impl IntoIterator<Item = ...>` in
+    /// argument position**, and that is not style. `job_object`'s
+    /// `only_the_files_that_must_leave_the_job_can_open_a_bare_command` reads
+    /// every `impl` HEAD in this crate -- the text from the keyword to the
+    /// opening brace -- and refuses one that names `crate::send::` outside
+    /// `send.rs`, because an inherent impl written from a foreign module can
+    /// grow a method onto a type the two job-bearing files are allowed to
+    /// hold. An `impl Trait` argument puts that keyword and that path in one
+    /// head, so it reads as exactly the shape that rule exists to refuse. The
+    /// generic says the same thing without the collision, and leaving it as
+    /// `impl Trait` would have meant weakening a spawn guard to spell a
+    /// parameter more briefly.
+    pub fn over<I>(states: I) -> Self
+    where
+        I: IntoIterator<Item = crate::send::SendState>,
+    {
+        let mut counts = SendCounts::default();
+        for state in states {
+            counts.all += 1;
+            if SendScope::Waiting.admits(state) {
+                counts.waiting += 1;
+            }
+            if SendScope::Used.admits(state) {
+                counts.used += 1;
+            }
+            if SendScope::Ended.admits(state) {
+                counts.ended += 1;
+            }
+        }
+        counts
+    }
+
+    /// This scope's own number.
+    pub fn of(self, scope: SendScope) -> usize {
+        match scope {
+            SendScope::All => self.all,
+            SendScope::Waiting => self.waiting,
+            SendScope::Used => self.used,
+            SendScope::Ended => self.ended,
+        }
+    }
+}
+
+/// The rail rows that are **screens rather than cuts of an item list**, and
+/// the one place their mutual exclusion is enforced.
+///
+/// None of Sends, Password health or Shared with me is a [`SidebarFilter`]:
+/// Sends are not `VaultItem`s at all, password reuse is a property of a PAIR
+/// of items (which no per-item `scope_contains` predicate can answer), and a
+/// received Send is a line in a local history file rather than anything in
+/// the vault list. All three therefore sit beside `selected` rather than
+/// inside it.
+///
+/// **Flags behind one handle, and not loose parameters**, because the
+/// invariant is not "each row sets its own flag" -- it is *at most one of
 /// these is live, and selecting anything else clears them all*. With loose
 /// flags that invariant is re-implemented at every row, and the row that
 /// forgets one of them leaves the window painting a screen while the rail
 /// highlights Cards. Here it is [`Self::clear`] and [`Self::select`], and a
-/// row that calls neither does not compile into a working row at all.
+/// row that calls neither does not compile into a working row at all. The
+/// third screen was added by writing one variant and one line in `select`,
+/// which is the property that shape was chosen for.
+///
+/// **`scope` rides here rather than beside it**, and that is the same
+/// argument one level down. It is only meaningful while the Sends screen is
+/// up, so it is [`Self::clear`]'s job to put it back to
+/// [`SendScope::All`] -- otherwise a sub-row clicked, left and returned to by
+/// the parent row would come back still filtered, with the parent row
+/// highlighted and a list that does not match it. Keeping the axis in the
+/// same handle as the flag it depends on is what makes that one line rather
+/// than a rule every caller has to remember.
 ///
 /// They are not folded into `SidebarFilter` as variants for the reason
 /// [`screen_rows`] gives: that type is what `item_list` matches on to choose
 /// its empty-state nouns and its per-row scoping, so a variant there would
-/// force these screens through the item pane. The rail draws them in a group
-/// of their own, below the folders and behind their own divider, which is that
-/// same distinction made visible.
+/// force these screens through the item pane.
 pub struct Screens<'a> {
     pub sends: &'a mut bool,
     pub health: &'a mut bool,
+    /// Design 5b's `Shared with me`. See [`RECEIVED_ROW_LABEL`].
+    pub received: &'a mut bool,
+    /// Which SHARING sub-row is in force, meaningful only while `sends` is
+    /// true. See [`SendScope`].
+    pub scope: &'a mut SendScope,
 }
 
 /// Which screen row, if any, is live.
@@ -458,13 +720,16 @@ pub struct Screens<'a> {
 pub enum Screen {
     Sends,
     Health,
+    /// Design 5b's `Shared with me`: the local record of what was imported
+    /// from somebody else's link.
+    Received,
 }
 
 impl Screens<'_> {
-    /// Whether either screen is up -- i.e. whether `selected` is currently
+    /// Whether any screen is up -- i.e. whether `selected` is currently
     /// describing a row the user is NOT looking at.
     pub fn any(&self) -> bool {
-        *self.sends || *self.health
+        *self.sends || *self.health || *self.received
     }
 
     /// Whether this particular screen is the one that is up.
@@ -472,7 +737,32 @@ impl Screens<'_> {
         match screen {
             Screen::Sends => *self.sends,
             Screen::Health => *self.health,
+            Screen::Received => *self.received,
         }
+    }
+
+    /// The SHARING sub-row in force, or [`SendScope::All`] when the Sends
+    /// screen is not the one up.
+    ///
+    /// A reader rather than a bare field access, so nothing outside this type
+    /// can read a scope left over from a screen that is no longer showing --
+    /// the same hazard [`Self::clear`] resets the field for, closed a second
+    /// way at the point of use.
+    pub fn scope(&self) -> SendScope {
+        if *self.sends { *self.scope } else { SendScope::All }
+    }
+
+    /// Whether this SHARING row is the selected one: the parent row while no
+    /// sub-filter is in force, and the sub-row itself while one is.
+    ///
+    /// **Exactly one row in the rail carries the selection wash**, which is
+    /// why the parent is not also lit while a sub-row is. Two washes stacked
+    /// read as two selections, and every other row in this rail lights one.
+    /// What tells the user they are still inside SHARING is the section label
+    /// above the group and the list column's own strip, which names the scope
+    /// in force.
+    pub fn sharing_is(&self, scope: SendScope) -> bool {
+        *self.sends && *self.scope == scope
     }
 
     /// Back to the item list. Every item row calls this, which is what stops
@@ -480,16 +770,34 @@ impl Screens<'_> {
     pub fn clear(&mut self) {
         *self.sends = false;
         *self.health = false;
+        *self.received = false;
+        // See the type's docs: the scope belongs to the Sends screen, so
+        // leaving that screen by ANY door puts it back.
+        *self.scope = SendScope::All;
     }
 
-    /// This screen and no other. Written as clear-then-set so adding a third
-    /// screen cannot leave a second one live.
+    /// This screen and no other. Written as clear-then-set so adding a screen
+    /// cannot leave a second one live.
     pub fn select(&mut self, screen: Screen) {
         self.clear();
         match screen {
             Screen::Sends => *self.sends = true,
             Screen::Health => *self.health = true,
+            Screen::Received => *self.received = true,
         }
+    }
+
+    /// The Sends screen, filtered to `scope`.
+    ///
+    /// The parent row calls this with [`SendScope::All`] rather than
+    /// `select(Screen::Sends)`, so there is ONE way to arrive on this screen
+    /// and it always states which rows it wants. A parent row that used the
+    /// plain `select` would be relying on `clear`'s reset for its own
+    /// correctness, which is exactly the kind of load-bearing side effect
+    /// this rail keeps having to un-write.
+    pub fn select_sharing(&mut self, scope: SendScope) {
+        self.select(Screen::Sends);
+        *self.scope = scope;
     }
 }
 
@@ -649,7 +957,7 @@ fn item_row(
     let count = badge_for(&filter, lists);
     let width = ui.available_width();
     let selected_now = *selected == filter && !screens.any();
-    if sidebar_row(ui, label, count, selected_now, is_muted(&filter), width).clicked() {
+    if sidebar_row(ui, label, count, selected_now, is_muted(&filter), width, 0.0).clicked() {
         *selected = filter;
         screens.clear();
     }
@@ -917,6 +1225,7 @@ pub fn draw_sidebar(
                     *selected == filter && !screens.any(),
                     is_muted(&filter),
                     row_width,
+                    0.0,
                 );
                 if response.clicked() {
                     *selected = filter.clone();
@@ -1213,8 +1522,37 @@ fn countdown_label(ui: &mut egui::Ui, text: &str) -> egui::Rect {
     rect
 }
 
-/// The rail's own SCREENS -- Sends and Password health -- behind a divider of
-/// their own, below the folders.
+/// The rail's own SCREENS, below the folders: Password health behind a
+/// divider of its own, then design 5b's **SHARING** section behind a second
+/// one.
+///
+/// # Why there are now two groups here, and why SHARING is the lower one
+///
+/// 5b draws a labelled `SHARING` section holding `Shared`, its three
+/// sub-filters and `Shared with me`, at the foot of the rail. Password health
+/// is not in that design at all -- it is a screen this app added -- and it is
+/// plainly not sharing, so putting it under 5b's label would be a heading
+/// that lies about the row beneath it.
+///
+/// The two other arrangements were both worse. Leaving the section unlabelled
+/// and simply indenting three rows under Sends loses the one thing 5b's
+/// sidebar actually names. Putting the label above Sends and leaving Password
+/// health below it inside the same group has the same lying-heading problem
+/// with the rows in the other order.
+///
+/// So Password health keeps exactly the treatment it already had -- an
+/// unlabelled screen row, immediately behind the folders divider, which is
+/// what the paragraphs below argue for -- and SHARING becomes a labelled
+/// section of its own beneath it, where 5b puts it. The rail is then four
+/// groups separated by three identical hairlines, which is a more regular
+/// rail than the three-groups-two-hairlines it replaced, not a less regular
+/// one.
+///
+/// **This is what moved the rail's overflow measurements**, and they were
+/// re-measured rather than deleted; see
+/// `the_screen_rows_survive_a_vault_with_a_folder_for_every_letter`, which
+/// asserts both that a 26-folder vault still pushes the last row past the
+/// floor and that scrolling still brings every one of them back.
 ///
 /// **THE REPORT: "Let's add another separator after actual Vault items
 /// (folders) and have Sends and Password health separately."** These two rows
@@ -1249,17 +1587,6 @@ fn screen_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'
     inset_hairline(ui, 8.0);
     ui.add_space(14.0);
     ui.spacing_mut().item_spacing.y = ROW_GAP;
-    // Its badge is `lists.sends`, which is `None` for a fetch that FAILED as
-    // well as for one that has not happened, so it draws `UNKNOWN_COUNT`
-    // rather than a `0` that would read as "nothing of yours is published".
-    // See `send_ui::SendFetch::badge_count`.
-    {
-        let width = ui.available_width();
-        let on = screens.is(Screen::Sends);
-        if sidebar_row(ui, SENDS_ROW_LABEL, lists.sends, on, false, width).clicked() {
-            screens.select(Screen::Sends);
-        }
-    }
     // Password health's badge is the number of DISTINCT items with a finding
     // against them, which is a fact this app always has (it is computed from
     // the snapshot already in hand, with no query behind it), so unlike Sends
@@ -1269,12 +1596,77 @@ fn screen_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'
         let width = ui.available_width();
         let on = screens.is(Screen::Health);
         let label = crate::vault_window::password_health::HEALTH_ROW_LABEL;
-        if sidebar_row(ui, label, Some(lists.health_findings), on, false, width).clicked() {
+        if sidebar_row(ui, label, Some(lists.health_findings), on, false, width, 0.0).clicked() {
             screens.select(Screen::Health);
         }
     }
     ui.spacing_mut().item_spacing.y = 0.0;
+
+    // The second divider, the same hairline at the same 14px above and below,
+    // because it is meant to read as the same kind of boundary as the two
+    // above it.
+    ui.add_space(14.0);
+    inset_hairline(ui, 8.0);
+    ui.add_space(14.0);
+    section_label(ui, SHARING_SECTION_LABEL);
+    ui.add_space(SECTION_LABEL_INSET);
+    ui.spacing_mut().item_spacing.y = ROW_GAP;
+    // Every badge in this section is `lists.sends`, which is `None` for a
+    // fetch that FAILED as well as for one that has not happened, so all four
+    // draw `UNKNOWN_COUNT` together rather than a `0` that would read as
+    // "nothing of yours is published". Taking them from ONE value is what
+    // makes "all four say the same thing about a failure" structural rather
+    // than a rule four call sites have to keep. See
+    // `send_ui::SendFetch::counts` and [`SendCounts`].
+    {
+        let width = ui.available_width();
+        let on = screens.sharing_is(SendScope::All);
+        let count = lists.sends.map(|c| c.all);
+        if sidebar_row(ui, SENDS_ROW_LABEL, count, on, false, width, 0.0).clicked() {
+            screens.select_sharing(SendScope::All);
+        }
+    }
+    // 5b's three sub-rows, indented under the parent by
+    // `SUB_ROW_EXTRA_INDENT`. The set comes from `SendScope::SUB_ROWS` rather
+    // than three literals here, so the rows the rail draws and the rows the
+    // pane can be filtered to are one list.
+    for scope in SendScope::SUB_ROWS {
+        let width = ui.available_width();
+        let on = screens.sharing_is(scope);
+        let count = lists.sends.map(|c| c.of(scope));
+        if sidebar_row(ui, scope.label(), count, on, false, width, SUB_ROW_EXTRA_INDENT)
+            .clicked()
+        {
+            screens.select_sharing(scope);
+        }
+    }
+    // `Shared with me` is a SIBLING of the parent row, not a fourth sub-row,
+    // and 5b draws it flush for that reason: the three above it are cuts of
+    // one list, and this lists something else entirely -- what other people
+    // sent to this user. Its count is never `None` for
+    // `VaultLists::received`'s stated reason.
+    {
+        let width = ui.available_width();
+        let on = screens.is(Screen::Received);
+        if sidebar_row(ui, RECEIVED_ROW_LABEL, Some(lists.received), on, false, width, 0.0)
+            .clicked()
+        {
+            screens.select(Screen::Received);
+        }
+    }
+    ui.spacing_mut().item_spacing.y = 0.0;
 }
+
+/// How much further in a SHARING sub-row's label sits than its parent's.
+///
+/// Design 5b puts `padding: 8px 10px 8px 33px` on the three sub-rows against
+/// `padding: 8px 10px` on every other row, so the extra is 23px and the row's
+/// own [`ROW_HEIGHT`] is unchanged -- the indent is horizontal only, which is
+/// what keeps the rail's row pitch uniform through the section. Written as the
+/// difference rather than as the design's absolute 33, so it composes with
+/// [`ROW_INSET_X`] instead of silently disagreeing with it the first time that
+/// constant moves.
+const SUB_ROW_EXTRA_INDENT: f32 = 23.0;
 
 /// The countdown's type. One function rather than a `FontId` written at each
 /// of the two places that need it -- the label itself and
@@ -1336,6 +1728,14 @@ fn inset_hairline(ui: &mut egui::Ui, inset: f32) {
 /// own top, and the next row started roughly half a row too high. Painting
 /// touches no cursor at all, so the single `allocate_exact_size` below is
 /// the only thing that moves it -- by exactly `ROW_HEIGHT` + `ROW_GAP`.
+///
+/// `indent` is extra space in front of the LABEL only -- design 5b's SHARING
+/// sub-rows, which sit 23px further in than their parent. It moves no other
+/// part of the row: the band, the hover rect, the selection wash and the
+/// right-aligned count are all where they were, because the design indents
+/// the text and nothing else, and because a click target that shrank with the
+/// indent would make a sub-row harder to hit than the row above it. See
+/// [`SUB_ROW_EXTRA_INDENT`].
 fn sidebar_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -1343,6 +1743,7 @@ fn sidebar_row(
     selected: bool,
     muted: bool,
     width: f32,
+    indent: f32,
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
     if response.hovered() {
@@ -1390,7 +1791,7 @@ fn sidebar_row(
     // Clipped to the space left of the count, so a long folder name is cut
     // off rather than running underneath its own count.
     let label_area = egui::Rect::from_min_max(
-        egui::Pos2::new(rect.left() + ROW_INSET_X, rect.top()),
+        egui::Pos2::new(rect.left() + ROW_INSET_X + indent, rect.top()),
         egui::Pos2::new(rect.right() - ROW_INSET_X - count_width - 6.0, rect.bottom()),
     );
     ui.painter().with_clip_rect(label_area.intersect(ui.clip_rect())).text(
@@ -1684,7 +2085,12 @@ mod drag_and_drop_tests {
                                 VaultLists::live_only(items),
                                 folders,
                                 &mut filter,
-                                Screens { sends: &mut false, health: &mut false },
+                                Screens {
+                                    sends: &mut false,
+                                    health: &mut false,
+                                    received: &mut false,
+                                    scope: &mut SendScope::All,
+                                },
                                 "Locks in 11:42",
                                 false,
                             );
@@ -1910,7 +2316,12 @@ mod drag_and_drop_tests {
                                 lists,
                                 folders,
                                 filter,
-                                Screens { sends, health },
+                                Screens {
+                                    sends,
+                                    health,
+                                    received: &mut false,
+                                    scope: &mut SendScope::All,
+                                },
                                 countdown,
                                 false,
                             );
@@ -2077,7 +2488,12 @@ mod drag_and_drop_tests {
                                 VaultLists::live_only(&items),
                                 &folders,
                                 &mut filter,
-                                Screens { sends: &mut false, health: &mut false },
+                                Screens {
+                                    sends: &mut false,
+                                    health: &mut false,
+                                    received: &mut false,
+                                    scope: &mut SendScope::All,
+                                },
                                 "Locks in 11:42",
                                 false,
                             );
@@ -2371,7 +2787,7 @@ mod tests {
                 // `selected: false` keeps this on the default proportional
                 // font -- `theme::apply`'s Archivo families are not
                 // installed in this bare test context.
-                let response = sidebar_row(ui, "Row", Some(i), false, false, 180.0);
+                let response = sidebar_row(ui, "Row", Some(i), false, false, 180.0, 0.0);
                 rects.push(response.rect);
             }
         });
@@ -2750,7 +3166,12 @@ mod tests {
                 lists,
                 folders,
                 &mut selected,
-                Screens { sends: &mut sends_selected, health: &mut health_selected },
+                Screens {
+                    sends: &mut sends_selected,
+                    health: &mut health_selected,
+                    received: &mut false,
+                    scope: &mut SendScope::All,
+                },
                 lock_countdown,
                 false,
             );
@@ -3185,6 +3606,7 @@ mod tests {
             trash: Some(&trash),
             archive: Some(&archive),
             sends: None,
+            received: 0,
             health_findings: 0,
         };
 
@@ -3199,7 +3621,7 @@ mod tests {
     fn the_trash_row_lists_the_trashed_items_themselves() {
         let live = three_unfiled_and_two_filed();
         let trash = vec![trashed("t1"), trashed("t2")];
-        let lists = VaultLists { live: &live, trash: Some(&trash), archive: None, sends: None, health_findings: 0 };
+        let lists = VaultLists { live: &live, trash: Some(&trash), archive: None, sends: None, received: 0, health_findings: 0 };
 
         let listed: Vec<&str> = items_for(&SidebarFilter::Trash, lists)
             .expect("the trash list was fetched")
@@ -3227,7 +3649,7 @@ mod tests {
         assert_eq!(badge_text(None), UNKNOWN_COUNT);
 
         let empty: Vec<VaultItem> = Vec::new();
-        let fetched = VaultLists { live: &live, trash: Some(&empty), archive: None, sends: None, health_findings: 0 };
+        let fetched = VaultLists { live: &live, trash: Some(&empty), archive: None, sends: None, received: 0, health_findings: 0 };
         assert_eq!(badge_for(&SidebarFilter::Trash, fetched), Some(0));
         assert_eq!(badge_text(Some(0)), "0");
     }
@@ -3257,7 +3679,7 @@ mod tests {
         let folders = one_real_folder_and_the_virtual_bucket();
         let (painted, _, _) = painted_sidebar_lists(
             "Locks in 11:42",
-            VaultLists { live: &live, trash: Some(&trash), archive: Some(&archive), sends: None, health_findings: 0 },
+            VaultLists { live: &live, trash: Some(&trash), archive: Some(&archive), sends: None, received: 0, health_findings: 0 },
             &folders,
         );
 
@@ -3327,7 +3749,7 @@ mod tests {
         // has: the CLI said so.
         let (none_published, _, _) = painted_sidebar_lists(
             "Locks in 11:42",
-            VaultLists { sends: Some(0), ..VaultLists::live_only(&live) },
+            VaultLists { sends: Some(SendCounts::default()), ..VaultLists::live_only(&live) },
             &folders,
         );
         assert_eq!(badge_beside(&none_published, SENDS_ROW_LABEL), "0");
@@ -3336,7 +3758,14 @@ mod tests {
         // through: the live list here has five items.
         let (three, _, _) = painted_sidebar_lists(
             "Locks in 11:42",
-            VaultLists { sends: Some(3), ..VaultLists::live_only(&live) },
+            VaultLists {
+                sends: Some(SendCounts::over([
+                    crate::send::SendState::Waiting,
+                    crate::send::SendState::Used,
+                    crate::send::SendState::Revoked,
+                ])),
+                ..VaultLists::live_only(&live)
+            },
             &folders,
         );
         assert_eq!(badge_beside(&three, SENDS_ROW_LABEL), "3");
@@ -3392,12 +3821,27 @@ mod tests {
     /// for, from painted output: FOLDERS, then every folder row, then a
     /// divider, then the two screens, in that order down the panel.
     ///
-    /// The two dividers are asserted to be the SAME divider -- same helper,
-    /// same inset, same 14px of air above -- because a second boundary drawn
+    /// The dividers are asserted to be the SAME divider -- same helper, same
+    /// inset, same 14px of air above -- because a second boundary drawn
     /// differently reads as a different kind of boundary. That is the whole
     /// content of "another separator".
+    ///
+    /// # There are three of them now, and the section they added is 5b's
+    ///
+    /// This used to assert exactly two, over a rail of three groups. Design
+    /// 5b's sidebar has a labelled `SHARING` section holding the account's
+    /// own Sends, its three sub-filters and `Shared with me`, and Password
+    /// health is not in that design at all -- so it cannot live under 5b's
+    /// heading without the heading lying about it. The rail is therefore four
+    /// groups and three identical hairlines, which is MORE regular than what
+    /// it replaced rather than less; see [`screen_rows`], where the two
+    /// rejected arrangements are argued.
+    ///
+    /// The count is pinned rather than loosened to "at least two": a rail
+    /// that grew a fourth boundary nobody decided on is exactly what this
+    /// assertion is for.
     #[test]
-    fn the_rails_two_screens_sit_below_the_folders_behind_their_own_divider() {
+    fn the_rails_screens_sit_below_the_folders_behind_dividers_of_their_own() {
         let live = three_unfiled_and_two_filed();
         let folders = one_real_folder_and_the_virtual_bucket();
         let (painted, _, hairlines, _) = painted_sidebar_parts(
@@ -3416,12 +3860,13 @@ mod tests {
 
         assert_eq!(
             hairlines.len(),
-            2,
-            "the rail should draw exactly two dividers -- above FOLDERS and above the screens \
-             -- but drew {}: {hairlines:?}",
+            3,
+            "the rail should draw exactly three dividers -- above FOLDERS, above Password \
+             health and above SHARING -- but drew {}: {hairlines:?}",
             hairlines.len()
         );
-        let [above_folders, above_screens] = [hairlines[0], hairlines[1]];
+        let [above_folders, above_health, above_sharing] =
+            [hairlines[0], hairlines[1], hairlines[2]];
 
         // The order down the panel, end to end.
         let order = [
@@ -3430,15 +3875,21 @@ mod tests {
             ("FOLDERS", top_of("FOLDERS")),
             ("Engineering", top_of("Engineering")),
             ("No Folder", top_of("No Folder")),
-            ("the screens divider", above_screens.top()),
-            (SENDS_ROW_LABEL, top_of(SENDS_ROW_LABEL)),
+            ("the Password health divider", above_health.top()),
             (health, top_of(health)),
+            ("the SHARING divider", above_sharing.top()),
+            (SHARING_SECTION_LABEL, top_of(SHARING_SECTION_LABEL)),
+            (SENDS_ROW_LABEL, top_of(SENDS_ROW_LABEL)),
+            (SendScope::Waiting.label(), top_of(SendScope::Waiting.label())),
+            (SendScope::Used.label(), top_of(SendScope::Used.label())),
+            (ENDED_ROW_LABEL, top_of(ENDED_ROW_LABEL)),
+            (RECEIVED_ROW_LABEL, top_of(RECEIVED_ROW_LABEL)),
         ];
         for pair in order.windows(2) {
             assert!(
                 pair[0].1 < pair[1].1,
                 "{} is painted at y={} and {} at y={} -- the rail is not in the order \
-                 VAULT / folders / screens",
+                 VAULT / folders / Password health / SHARING",
                 pair[0].0,
                 pair[0].1,
                 pair[1].0,
@@ -3446,34 +3897,158 @@ mod tests {
             );
         }
 
-        // The same divider, twice: `inset_hairline(ui, 8.0)` both times, so
-        // the two span exactly the same x.
-        assert!(
-            (above_folders.left() - above_screens.left()).abs() < 0.01
-                && (above_folders.right() - above_screens.right()).abs() < 0.01,
-            "the two dividers are inset differently: {above_folders:?} and {above_screens:?}"
-        );
+        // The same divider, three times: `inset_hairline(ui, 8.0)` each time,
+        // so all three span exactly the same x.
+        for other in [above_health, above_sharing] {
+            assert!(
+                (above_folders.left() - other.left()).abs() < 0.01
+                    && (above_folders.right() - other.right()).abs() < 0.01,
+                "the dividers are inset differently: {above_folders:?} and {other:?}"
+            );
+        }
         // ...and the same 14px of air above each, measured from the bottom of
-        // the last row before it. Both rows are `sidebar_row`s, so their label
-        // boxes sit the same distance inside their bands and the two gaps are
-        // comparable.
-        let folders_gap = above_folders.top() - painted
-            .iter()
-            .find(|(text, _)| text == "Trash")
-            .expect("Trash")
-            .1
-            .bottom();
-        let screens_gap = above_screens.top() - painted
-            .iter()
-            .find(|(text, _)| text == "No Folder")
-            .expect("No Folder")
-            .1
-            .bottom();
-        assert!(
-            (folders_gap - screens_gap).abs() < 0.51,
-            "the FOLDERS divider has {folders_gap}pt above it and the screens divider \
-             {screens_gap}pt -- they are meant to be the same 14px boundary"
+        // the last row before it. All three follow a `sidebar_row`, so their
+        // label boxes sit the same distance inside their bands and the gaps
+        // are comparable.
+        let gap_after = |row: &str, line: egui::Rect| {
+            line.top()
+                - painted
+                    .iter()
+                    .find(|(text, _)| text == row)
+                    .unwrap_or_else(|| panic!("{row:?} was not painted"))
+                    .1
+                    .bottom()
+        };
+        let folders_gap = gap_after("Trash", above_folders);
+        for (row, line, which) in [
+            ("No Folder", above_health, "the Password health divider"),
+            (health, above_sharing, "the SHARING divider"),
+        ] {
+            let gap = gap_after(row, line);
+            assert!(
+                (folders_gap - gap).abs() < 0.51,
+                "the FOLDERS divider has {folders_gap}pt above it and {which} {gap}pt -- they \
+                 are meant to be the same 14px boundary"
+            );
+        }
+    }
+
+    /// **The three sub-rows are indented and their parent is not**, which is
+    /// the whole of what says they are cuts of the row above rather than
+    /// siblings of it -- and `Shared with me` is flush, because it lists
+    /// something else entirely.
+    ///
+    /// Measured off painted glyphs rather than off the constant, so a row
+    /// that took the indent and then lost it to a clip rect still fails.
+    #[test]
+    fn the_sharing_sub_rows_are_indented_under_their_parent_and_shared_with_me_is_not() {
+        let live = three_unfiled_and_two_filed();
+        let folders = one_real_folder_and_the_virtual_bucket();
+        let (painted, _, _, _) = painted_sidebar_parts(
+            "Locks in 11:42",
+            VaultLists::live_only(&live),
+            &folders,
         );
+        let left_of = |needle: &str| {
+            painted
+                .iter()
+                .find(|(text, _)| text == needle)
+                .map(|(_, rect)| rect.left())
+                .unwrap_or_else(|| panic!("the sidebar painted no {needle:?}: {painted:?}"))
+        };
+        let parent = left_of(SENDS_ROW_LABEL);
+        for scope in SendScope::SUB_ROWS {
+            let indented = left_of(scope.label());
+            assert!(
+                (indented - parent - SUB_ROW_EXTRA_INDENT).abs() < 0.51,
+                "{:?} starts at x={indented} and its parent at x={parent} -- the design indents \
+                 a sub-row by {SUB_ROW_EXTRA_INDENT}",
+                scope.label()
+            );
+        }
+        assert!(
+            (left_of(RECEIVED_ROW_LABEL) - parent).abs() < 0.51,
+            "`Shared with me` is indented like a sub-filter, and it is not one -- it lists what \
+             other people sent, not a cut of what this account published"
+        );
+    }
+
+    /// **Every Send is on exactly one sub-row, and the three add up to the
+    /// parent.**
+    ///
+    /// Design 5b's own counts say so -- 2 + 1 + 2 = 5 -- and that is the only
+    /// thing that makes merging `Expired` and `Revoked` into `Ended` a
+    /// partition rather than an overlap. Asserted over all four states rather
+    /// than over a fixture, so a fifth state added to `SendState` without a
+    /// row fails here instead of quietly going uncounted.
+    #[test]
+    fn the_three_sharing_sub_rows_partition_every_send_state() {
+        use crate::send::SendState;
+        for state in [SendState::Waiting, SendState::Used, SendState::Expired, SendState::Revoked]
+        {
+            let on: Vec<&str> = SendScope::SUB_ROWS
+                .iter()
+                .filter(|scope| scope.admits(state))
+                .map(|scope| scope.label())
+                .collect();
+            assert_eq!(
+                on.len(),
+                1,
+                "{state:?} is on {} sub-rows ({on:?}) -- the three are meant to be a partition, \
+                 so a Send is listed once and the counts add up",
+                on.len()
+            );
+            assert!(
+                SendScope::All.admits(state),
+                "{state:?} is not on the parent row, so the sub-rows count Sends the parent \
+                 does not"
+            );
+        }
+
+        let counts = SendCounts::over([
+            SendState::Waiting,
+            SendState::Waiting,
+            SendState::Used,
+            SendState::Expired,
+            SendState::Revoked,
+        ]);
+        // 5b's own numbers, from 5b's own list.
+        assert_eq!((counts.waiting, counts.used, counts.ended, counts.all), (2, 1, 2, 5));
+        assert_eq!(
+            counts.waiting + counts.used + counts.ended,
+            counts.all,
+            "the sub-rows do not add up to their parent: {counts:?}"
+        );
+    }
+
+    /// **The rail's `Ended` and the pill's `Expired`/`Revoked` are different
+    /// words on purpose, and the difference is not allowed to be silent.**
+    ///
+    /// Two halves. The words really do differ -- so this is a decision and
+    /// not a coincidence of spelling -- and the row that merges them has a
+    /// gloss that names BOTH pill words, which is the bridge that stops a
+    /// user who clicked `Ended` reading `Revoked` beside a row as a
+    /// contradiction. See [`SendScope`].
+    #[test]
+    fn the_ended_row_says_a_different_word_from_the_pills_and_explains_which_ones() {
+        use crate::vault_window::send_ui;
+        assert_ne!(ENDED_ROW_LABEL, send_ui::EXPIRED_LABEL);
+        assert_ne!(ENDED_ROW_LABEL, send_ui::REVOKED_LABEL);
+        // The two rows that do NOT merge anything borrow the pill's own word,
+        // so the only row spelled differently is the only row that differs.
+        assert_eq!(SendScope::Waiting.label(), send_ui::WAITING_LABEL);
+        assert_eq!(SendScope::Used.label(), send_ui::USED_LABEL);
+
+        let gloss = SendScope::Ended
+            .gloss()
+            .expect("the merging row has no gloss, so nothing on screen bridges the two words");
+        for word in [send_ui::EXPIRED_LABEL, send_ui::REVOKED_LABEL] {
+            assert!(
+                gloss.to_lowercase().contains(&word.to_lowercase()),
+                "the `Ended` gloss does not name {word:?}, so a pill saying it reads as a \
+                 contradiction of the row the user clicked: {gloss:?}"
+            );
+        }
     }
 
     /// **The move's own risk, and the reason this test exists at all.** The
@@ -3504,6 +4079,13 @@ mod tests {
 
         // Unscrolled: off the bottom. If this ever stops being true the test
         // below has stopped exercising anything -- the rail would simply fit.
+        //
+        // **RE-MEASURED, not deleted, when the SHARING section landed.** That
+        // section added a divider, a section label, three sub-rows and
+        // `Shared with me` -- a little over 200pt -- so this rail overflows
+        // sooner than it did and the LAST row is no longer Password health.
+        // Both ends are asserted: Sends is still past the floor, and the row
+        // that is now below it is further past it again.
         let (resting, bounds) = scrolled_rail(&live, &folders, 0.0);
         let sends_at_rest = row_top(&resting, SENDS_ROW_LABEL);
         assert!(
@@ -3513,11 +4095,26 @@ mod tests {
             folders.len(),
             bounds.bottom()
         );
+        let last_at_rest = row_top(&resting, RECEIVED_ROW_LABEL);
+        assert!(
+            last_at_rest > sends_at_rest,
+            "control: the rail's last row rests at y={last_at_rest}, above its Sends row at              y={sends_at_rest} -- the SHARING section this test was re-measured for is not              being drawn below it"
+        );
 
-        // Scrolled to the bottom: both rows are inside the rail, which is what
-        // "reachable" means for a row nobody can drag a window taller for.
+        // Scrolled to the bottom: EVERY row below the folders is inside the
+        // rail, which is what "reachable" means for a row nobody can drag a
+        // window taller for. The three sub-rows and `Shared with me` are in
+        // the list because they are now the lowest things in the rail, and so
+        // the ones a long folder list pushes out first.
         let (scrolled, bounds) = scrolled_rail(&live, &folders, -4000.0);
-        for label in [SENDS_ROW_LABEL, health] {
+        for label in [
+            health,
+            SENDS_ROW_LABEL,
+            SendScope::Waiting.label(),
+            SendScope::Used.label(),
+            ENDED_ROW_LABEL,
+            RECEIVED_ROW_LABEL,
+        ] {
             let rect = scrolled
                 .iter()
                 .find(|(text, _)| text == label)
@@ -3588,7 +4185,12 @@ mod tests {
                     VaultLists::live_only(live),
                     folders,
                     &mut selected,
-                    Screens { sends: &mut sends, health: &mut health },
+                    Screens {
+                            sends: &mut sends,
+                            health: &mut health,
+                            received: &mut false,
+                            scope: &mut SendScope::All,
+                        },
                     "Locks in 11:42",
                     false,
                 );
@@ -3699,7 +4301,12 @@ mod tests {
                     VaultLists::live_only(live),
                     folders,
                     &mut selected,
-                    Screens { sends: &mut sends_selected, health: &mut health_selected },
+                    Screens {
+                    sends: &mut sends_selected,
+                    health: &mut health_selected,
+                    received: &mut false,
+                    scope: &mut SendScope::All,
+                },
                     "Locks in 11:42",
                     false,
                 );
@@ -3782,7 +4389,12 @@ mod tests {
                 VaultLists::live_only(&live),
                 &folders,
                 &mut selected,
-                Screens { sends: &mut false, health: &mut false },
+                Screens {
+                                    sends: &mut false,
+                                    health: &mut false,
+                                    received: &mut false,
+                                    scope: &mut SendScope::All,
+                                },
                 "Locks in 11:42",
                 false,
             );
@@ -3996,7 +4608,12 @@ mod tests {
                             VaultLists::live_only(&items),
                             &folders,
                             &mut selected,
-                            Screens { sends: &mut sends, health: &mut health },
+                            Screens {
+                            sends: &mut sends,
+                            health: &mut health,
+                            received: &mut false,
+                            scope: &mut SendScope::All,
+                        },
                             "Locks in 11:42",
                             false,
                         );
@@ -4159,7 +4776,12 @@ mod tests {
                             VaultLists::live_only(&items),
                             &folders,
                             &mut selected,
-                            Screens { sends: &mut sends, health: &mut health },
+                            Screens {
+                            sends: &mut sends,
+                            health: &mut health,
+                            received: &mut false,
+                            scope: &mut SendScope::All,
+                        },
                             COUNTDOWN,
                             false,
                         );

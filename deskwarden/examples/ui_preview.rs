@@ -1026,6 +1026,8 @@ fn main() -> eframe::Result {
                 rail_selected: SidebarFilter::Logins,
                 rail_sends: false,
                 rail_health: false,
+                rail_received: false,
+                rail_scope: sidebar::SendScope::All,
                 // The weak finding, so the health shot carries the selected
                 // treatment too -- and it is the row with a detail line
                 // under its name, which is the taller of the row's two
@@ -1122,6 +1124,12 @@ struct Preview {
     rail_selected: SidebarFilter,
     rail_sends: bool,
     rail_health: bool,
+    /// Design 5b's `Shared with me` row, and which of its SHARING
+    /// sub-filters is in force. Held beside the two flags above for
+    /// `sidebar::Screens`' reason: the rail keeps three selection axes and
+    /// this shot has to be able to put any of them in any state.
+    rail_received: bool,
+    rail_scope: sidebar::SendScope,
     /// The Password health shot's own selection state.
     health_selected: Option<String>,
     /// Last applied window height, for the login window's size-to-content.
@@ -2099,8 +2107,13 @@ impl Preview {
     /// enough that the two screen rows below them are in the picture.
     fn draw_vault_rail(&mut self, root: &mut egui::Ui) {
         let fixtures = &self.fixtures;
-        let (selected, sends, health) =
-            (&mut self.rail_selected, &mut self.rail_sends, &mut self.rail_health);
+        let (selected, sends, health, received, scope) = (
+            &mut self.rail_selected,
+            &mut self.rail_sends,
+            &mut self.rail_health,
+            &mut self.rail_received,
+            &mut self.rail_scope,
+        );
         egui::CentralPanel::default()
             // Design 4.8's own frame, copied from the `Panel::left` in
             // `vault_window::mod`: `theme::CARD` with `padding: 14px 10px`.
@@ -2109,13 +2122,24 @@ impl Preview {
                 let _ = sidebar::draw_sidebar(
                     ui,
                     sidebar::VaultLists {
-                        sends: Some(3),
+                        // 5b's own five Sends, split across its own three
+                        // sub-rows -- 2 waiting, 1 used, 2 ended -- so the
+                        // shot shows the section adding up rather than a
+                        // number invented for the picture.
+                        sends: Some(sidebar::SendCounts::over([
+                            crate::send::SendState::Waiting,
+                            crate::send::SendState::Waiting,
+                            crate::send::SendState::Used,
+                            crate::send::SendState::Expired,
+                            crate::send::SendState::Revoked,
+                        ])),
+                        received: 52,
                         health_findings: 4,
                         ..sidebar::VaultLists::live_only(&fixtures.list)
                     },
                     &fixtures.rail_folders,
                     selected,
-                    sidebar::Screens { sends, health },
+                    sidebar::Screens { sends, health, received, scope },
                     "Locks in 11:42",
                     false,
                 );

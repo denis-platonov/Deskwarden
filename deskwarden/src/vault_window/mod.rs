@@ -1060,6 +1060,35 @@ pub fn build_frame_with_search(
     // and it cannot be a variant of that enum. Starts `false`, and
     // `draw_sidebar` is the sole writer.
     let mut health_selected = false;
+    // Design 5b's `Shared with me` screen: the local record of the Sends
+    // OTHER PEOPLE sent this user and this app imported. A third flag beside
+    // the two above, for `sidebar::Screens`' reason -- a received Send is a
+    // line in `receive_history.json` rather than anything in the vault list,
+    // so no `SidebarFilter` predicate can express it either.
+    let mut received_selected = false;
+    // Which of design 5b's three SHARING sub-filters is in force. A THIRD
+    // axis, orthogonal to both `filter` and the screen flags, and `Screens`
+    // is the one place it is written -- see `sidebar::SendScope`, which
+    // argues why it is neither a `SidebarFilter` variant nor a `Screen` one.
+    // `Screens::clear` puts it back to `All` on the way out of the screen, so
+    // there is no state in which this is filtering a pane nobody is looking
+    // at.
+    let mut send_scope = sidebar::SendScope::All;
+    // Which Send the detail pane beside the list is describing, by id. The
+    // Sends screen's own `selected_id`, and modelled on it exactly: the list
+    // column writes it, the pane resolves it against the rows it holds, and
+    // a selection that no longer names a row draws the "nothing picked" pane
+    // rather than a stale one. See `send_ui::draw_send_pane`.
+    let mut selected_send: Option<String> = None;
+    // What has been shared WITH this user, read once when the window opens
+    // and re-read after every successful import. A local file and not a
+    // query -- see `crate::receive_history`, and in particular why it holds
+    // no access URL.
+    let receive_history_path = crate::receive_history::default_path();
+    let mut receive_history = receive_history_path
+        .as_deref()
+        .map(crate::receive_history::ReceiveHistory::load)
+        .unwrap_or_default();
     // The `u64` is the `SendFetch` generation the fetch was started under, so
     // an answer to a question the user has since navigated away from can be
     // told apart from an answer to the current one. See
@@ -2662,6 +2691,17 @@ pub fn build_frame_with_search(
         // routing below, so the frame cannot start a fetch for a screen it
         // then does not draw.
         let on_sends = sends_selected;
+        // Design 5b's `Shared with me`, read the same way and kept SEPARATE
+        // from `on_sends` rather than folded into it.
+        //
+        // The two screens share a pane -- one list column, one detail, drawn
+        // by `send_ui::draw_send_pane` for both -- so the PANEL routing below
+        // asks for either. The FETCH does not: `Shared with me` reads a local
+        // file, and a `bw send list` spawned because the user opened it would
+        // be a child process started for a question that screen never asks.
+        // Folding the two into one flag is exactly how that happens, which is
+        // why the fetch gate below still reads `on_sends` alone.
+        let on_received = received_selected;
         // **The report, once per frame, and the only call to `report_for` in
         // this file.** The rail's badge and the pane both read THIS value, so
         // a badge saying 4 cannot sit beside a list of 3 -- the same rule
@@ -2712,12 +2752,19 @@ pub fn build_frame_with_search(
             vault_loading,
             items.is_empty(),
             vault_load_error.as_deref(),
-            on_sends,
+            // EITHER sharing screen takes the item list and the detail pane,
+            // because they are one pane; see `on_received` above for the one
+            // thing that is not shared between them.
+            on_sends || on_received,
         );
         // Read out before the match consumes it. NOT recomputed further down
         // from `filter` again: two derivations of "is the Sends screen up"
         // are two things that can disagree, and the one that decides which
         // panels are drawn must be the one the body state actually returned.
+        // **It now means "either SHARING screen is up", not "the Sends row
+        // is selected".** The two are one pane and take the same two columns,
+        // so every panel decision below asks this one question. What still
+        // asks the narrower one is the fetch -- see `on_received`.
         let show_sends = matches!(body, VaultBodyState::Sends);
         // **NOTHING IS DONE TO `search` HERE, AND THAT IS THE FIX.**
         //
@@ -2874,7 +2921,11 @@ pub fn build_frame_with_search(
         // The Sends list, on the same terms and for the same reasons: the
         // selected row is what asks for it, once, off the eframe thread. A
         // user who never opens Sends never spawns a `bw`.
-        if send_fetch.wants_fetch(show_sends) {
+        // **`on_sends`, NOT `show_sends`.** The wider flag is true on
+        // `Shared with me` too, and that screen's rows come off a local file:
+        // asking it here would spawn a `bw send list` for a question nobody
+        // on that screen has asked.
+        if send_fetch.wants_fetch(on_sends) {
             send_fetch.in_flight = true;
             (spawn_send_list)(
                 ui.ctx().clone(),
@@ -2907,12 +2958,20 @@ pub fn build_frame_with_search(
                     live: &items,
                     trash: trash_list.items.as_deref(),
                     archive: archive_list.items.as_deref(),
-                    // A count, not a list -- and `None` for a fetch that
-                    // FAILED as well as for one that has not happened, so the
-                    // badge draws an en dash rather than a `0` that would
-                    // read as "nothing of yours is published". See
-                    // `send_ui::SendFetch::badge_count`.
-                    sends: send_fetch.badge_count(),
+                    // Counts, not a list -- and `None` for a fetch that
+                    // FAILED as well as for one that has not happened, so
+                    // every badge in the SHARING section draws an en dash
+                    // rather than a `0` that would read as "nothing of yours
+                    // is published". All four come from ONE pass over one
+                    // answer against one clock; see `send_ui::SendFetch::counts`
+                    // and `sidebar::SendCounts`.
+                    sends: send_fetch.counts(&crate::send::SystemClock),
+                    // What has been shared WITH this user, off the local
+                    // history read when the window opened. Never `None`: a
+                    // file that is absent, empty or unreadable is an empty
+                    // history, which is the same fact as "nothing has been
+                    // shared with you". See `crate::receive_history`.
+                    received: receive_history.entries.len(),
                     // Distinct items with a finding, off the one report
                     // computed above. Never `None`: this is derived from
                     // `live`, which is already here, so there is no
@@ -2927,6 +2986,8 @@ pub fn build_frame_with_search(
                     sidebar::Screens {
                         sends: &mut sends_selected,
                         health: &mut health_selected,
+                        received: &mut received_selected,
+                        scope: &mut send_scope,
                     },
                     &lock_countdown,
                     may_unfile,
@@ -3020,10 +3081,26 @@ pub fn build_frame_with_search(
         // selected would win the band and then be painted by nobody -- the
         // silent failure this whole step is about, produced by the fix for
         // it.
-        let send_error: Option<String> = match (show_sends, send_fetch.result.as_ref()) {
+        // `on_sends` and not `show_sends`, for the fetch gate's reason one
+        // step along: the failure this carries is a failure of the Sends
+        // list, and `Shared with me` does not draw that list.
+        let send_error: Option<String> = match (on_sends, send_fetch.result.as_ref()) {
             (true, Some(Err(e))) => Some(e.user_message().to_string()),
             _ => None,
         };
+        // Design 5b's `Shared with me` rows, built from the local record and
+        // the live vault. Bound out here rather than inside the panel closure
+        // because it borrows `items`, which the closure also reads, and
+        // because building it twice would be two answers to "is that item
+        // still there". It is DATA and not the pane's model -- the gate the
+        // verdict's own pins guard is the `pane_state` expression below, and
+        // this is an argument beside it.
+        let received = send_ui::received_rows(
+            &receive_history,
+            &items,
+            &crate::send::SystemClock,
+            &crate::local_time::SystemZone,
+        );
         // The one message the inline band shows this frame, and which of the
         // four sources it came from -- see `inline_notice` for the order and
         // why Sends is first. Computed out here so the dismissal below can
@@ -3799,12 +3876,16 @@ pub fn build_frame_with_search(
             // darker colour being this frame's own `CANVAS` showing through
             // the margin, against the white header strip inside it.
             //
-            // The 20/18 belonged to the SENDS screen, which is the other
-            // thing this panel hosts and which draws its content directly on
-            // the panel with no strip of its own. The detail pane does have
-            // one, and a header strip that stops 20pt short of its panel is
-            // the band. So the margin moved to the Sends branch below, where
-            // it is one screen's padding rather than the shared container's.
+            // The 20/18 belonged to the SENDS screen, which used to draw its
+            // content directly on the panel with no strip of its own. **It
+            // does not any more**: design 5b's Sends screen is a list column
+            // and a detail pane, both of which carry white strips that must
+            // span their columns edge to edge, and a margin here would have
+            // reproduced on that screen the exact band the report was about.
+            // So the padding moved INSIDE `send_ui` -- `LIST_PAD` on the list
+            // column's text and rows, `DETAIL_PAD_X`/`DETAIL_PAD_Y` on the
+            // detail's strip and body -- where it is each column's own
+            // padding rather than the shared container's.
             .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(ui, |ui| {
                 // The Sends screen replaces the detail pane as well as the
@@ -3824,7 +3905,7 @@ pub fn build_frame_with_search(
                 // things -- see `send_ui::pane_state`, where that decision
                 // is tested.
                 if let Some(state) = &show_sends
-                    .then(|| send_ui::pane_state(send_fetch.result.as_ref(), &crate::send::SystemClock))
+                    .then(|| send_ui::pane_state(send_fetch.result.as_ref(), &crate::send::SystemClock, &crate::local_time::SystemZone))
                 {
                     // The pane draws and reports in one expression, and
                     // that expression IS the closure's value. A gate on
@@ -3832,23 +3913,37 @@ pub fn build_frame_with_search(
                     // blanks the whole screen, which the frame click tests
                     // fail on; a gate written here has to drop the verdict
                     // it just took, which the counter sees.
-                    // The panel's old `Margin::symmetric(20, 18)`, kept
-                    // here so the Sends screen is pixel-identical while the
-                    // detail pane beside it loses the band. See the frame
-                    // above.
-                    return egui::Frame::new()
-                        .inner_margin(Margin::symmetric(20, 18))
-                        .show(ui, |ui| send_ui::draw_send_pane(
+                    //
+                    // No frame and no margin: the pane is two columns with
+                    // their own strips and their own padding. See the panel's
+                    // own frame above.
+                    // **The fifth argument is which of the two SHARING
+                    // screens is up** -- and, for the account's own Sends,
+                    // which of design 5b's sub-filters. Written INLINE in the
+                    // argument list for the pane model's reason: a `let` for
+                    // it above the panel is a name, and a name upstream of
+                    // the pane is a second place to gate what the pane is
+                    // asked for. The whole call, that expression included, is
+                    // pinned by
+                    // `send_ui::source_pins::the_item_list_is_drawn_only_inside_the_not_sends_gate`,
+                    // which is why this note is above the call rather than
+                    // inside it: that pin reads the argument list as text.
+                    return send_ui::draw_send_pane(
                         ui,
                         state,
                         notice_message.as_deref(),
                         send_delete.view(),
+                        if on_received {
+                            send_ui::SendView::Received(&received)
+                        } else {
+                            send_ui::SendView::Mine(send_scope)
+                        },
+                        &mut selected_send,
                         &mut send_create.composer,
                         send_create.in_flight,
                         &crate::send::SystemClock,
                         &crate::local_time::SystemZone,
-                        ))
-                        .inner;
+                    );
                 }
                 // Resolved from the list the selection was made in, for the
                 // reason the row menu is: a row clicked under Trash or
@@ -5723,6 +5818,52 @@ pub fn build_frame_with_search(
                                                     &e,
                                                 );
                                             }
+                                        }
+                                    }
+                                    // **The one place a receive is
+                                    // recorded**, and it is HERE -- after the
+                                    // item exists, not when the link was
+                                    // fetched. A record written at fetch time
+                                    // would claim an import that the
+                                    // passphrase step, the collision answer or
+                                    // the create itself can still refuse, and
+                                    // `Shared with me` would count things this
+                                    // vault never received.
+                                    //
+                                    // What is written is three fields and
+                                    // never the link: a Send's access URL
+                                    // carries its own decryption key, so a
+                                    // history holding one would be a plaintext
+                                    // list of openable secrets beside
+                                    // `settings.json`. See
+                                    // `crate::receive_history`, which enforces
+                                    // that over its own struct declaration
+                                    // rather than promising it.
+                                    //
+                                    // A failed write is logged and nothing
+                                    // else: the import SUCCEEDED, and telling
+                                    // the user it failed would invite a retry
+                                    // that made a second copy -- the same
+                                    // reasoning the replace arm above uses.
+                                    // The in-memory history is updated either
+                                    // way, so the row counts what this session
+                                    // actually did.
+                                    let record = crate::receive_history::ReceivedRecord {
+                                        received_at_unix_millis:
+                                            crate::send::SendClock::now_unix_millis(
+                                                &crate::send::SystemClock,
+                                            ),
+                                        name: created.name.clone(),
+                                        item_id: created.id.clone(),
+                                    };
+                                    receive_history.record(record.clone());
+                                    if let Some(path) = receive_history_path.as_deref() {
+                                        if let Err(e) =
+                                            crate::receive_history::append(path, record)
+                                        {
+                                            log::warn!(
+                                                "a record was imported but could not be added                                                  to the receive history: {e:?}"
+                                            );
                                         }
                                     }
                                     selected_id = Some(created.id.clone());
@@ -21675,7 +21816,12 @@ mod the_idle_timer_follows_the_edited_setting {
                 VaultLists::live_only(&items),
                 &folders,
                 &mut selected,
-                sidebar::Screens { sends: &mut false, health: &mut false },
+                sidebar::Screens {
+                    sends: &mut false,
+                    health: &mut false,
+                    received: &mut false,
+                    scope: &mut sidebar::SendScope::All,
+                },
                 lock_countdown,
                 // This harness reads the rail's painted text; no drag is in
                 // flight, so the drop decision has nothing to decide.
@@ -30910,6 +31056,12 @@ mod send_delete_wiring {
         );
 
         // 2. Delete arms the confirmation and destroys nothing.
+        //
+        // **Pick the Send first.** Design 5b puts the controls in the detail
+        // pane, so a row has to be picked before there is a Delete at all --
+        // which is what a user does, and which makes "the Send this acted on"
+        // a real question rather than a coincidence of row order.
+        output = click(&ctx, &mut frame_fn, locate(&output, FRAME_SEND_NAME));
         let delete_at = locate(&output, send_ui::DELETE_LABEL);
         let armed = click(&ctx, &mut frame_fn, delete_at);
         assert!(
@@ -30974,8 +31126,12 @@ mod send_delete_wiring {
         });
 
         // The row is back (the report invalidated the list and the stub
-        // answered again), and its Delete button is not underneath the card --
-        // so a click there reaches the row rather than the overlay.
+        // answered again). **The selection survived the refetch**, which is
+        // why there is still a Delete to find: the window holds the picked id
+        // and the pane resolves it against the new list, so a Send that is
+        // still there is still described. Its button is not underneath the
+        // card either -- so a click there reaches the control rather than the
+        // overlay.
         let delete_rect = find(&showing, send_ui::DELETE_LABEL).unwrap_or_else(|| {
             panic!(
                 "control: no Delete button is on screen with the report card up, so there is \
@@ -31295,12 +31451,16 @@ mod send_delete_wiring {
             texts(&on_sends)
         );
 
-        // And the row works.
-        let delete_at = locate(&on_sends, send_ui::DELETE_LABEL);
+        // And the row works. Picked first, because design 5b puts the
+        // controls in the detail pane beside the list -- an empty vault must
+        // not stop a row being pickable either, and this is where that would
+        // show.
+        let picked = click(&ctx, &mut frame_fn, locate(&on_sends, FRAME_SEND_NAME));
+        let delete_at = locate(&picked, send_ui::DELETE_LABEL);
         let armed = click(&ctx, &mut frame_fn, delete_at);
         assert!(
             find(&armed, send_ui::CONFIRM_LABEL).is_some(),
-            "on an account whose vault is empty, pressing Delete on a Send row put up no \
+            "on an account whose vault is empty, pressing Delete on a picked Send put up no \
              {:?} confirmation. An empty vault is not a reason to refuse a revoke, and it \
              is the state every account is in on its first day. What was painted: {:?}",
             send_ui::CONFIRM_LABEL,
@@ -32030,45 +32190,24 @@ mod send_delete_wiring {
             })
     }
 
-    /// The `needle` button belonging to the row labelled `row`.
-    ///
-    /// With one Send on screen "the Copy link button" is unambiguous and
-    /// also undiscriminating -- it cannot tell a per-row lookup from
-    /// `rows[0]` or from a constant. With two, every button label appears
-    /// twice and a bare [`matrix_locate`] silently means "the first one",
-    /// so the row a press lands on has to be chosen rather than inherited.
-    fn matrix_locate_in_row(
-        state: ReachableState,
-        output: &egui::FullOutput,
-        row: &str,
-        needle: &str,
-    ) -> egui::Pos2 {
-        let row_y = matrix_locate(state, output, row).y;
-        let (_, rect) = matrix_labels(output)
-            .into_iter()
-            .filter(|(t, _)| t == needle)
-            .min_by(|(_, a), (_, b)| {
-                (a.center().y - row_y)
-                    .abs()
-                    .total_cmp(&(b.center().y - row_y).abs())
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "in state {state:?} the window painted no {needle:?} anywhere, so the \
-                     {row:?} row cannot be driven. What was painted: {:?}",
-                    matrix_texts(output)
-                )
-            });
-        assert!(
-            (rect.center().y - row_y).abs() < 40.0,
-            "in state {state:?} the nearest {needle:?} to the {row:?} row is {} points away, \
-             which is further than a row is tall -- that row has no {needle:?} of its own and \
-             this press would land on a different Send's button. What was painted: {:?}",
-            (rect.center().y - row_y).abs(),
-            matrix_texts(output)
-        );
-        rect.center()
-    }
+    // `matrix_locate_in_row` WAS HERE, and it is deleted rather than left
+    // unused. It found the `needle` button nearest in y to a named row and
+    // refused one further away than a row is tall, which is what made "the
+    // Copy link button" mean a particular row's while every control lived on
+    // its own row.
+    //
+    // **Design 5b puts the controls in the detail pane**, so there is no
+    // per-row button to disambiguate any more -- one Copy link, one Delete,
+    // one switch, all describing whichever Send is picked. The question it
+    // answered has not gone away, it has moved: the press now has to land on
+    // the controls of the row the test PICKED, and what says so is that the
+    // test picks a row and then asserts the detail header names that row.
+    // See step 3, which picks the SECOND Send for the copy and the FIRST for
+    // the revoke, so a control that acted on a remembered row rather than
+    // the shown one fails one of the two.
+    //
+    // Kept as a dead helper it would be a proximity rule nothing enforces,
+    // sitting beside a layout with no proximity left in it.
 
     fn matrix_frame(
         ctx: &egui::Context,
@@ -33115,39 +33254,45 @@ mod send_delete_wiring {
 
         // ---- the Sends screen, reached the only way there is ----
         //
-        // Step 1 below counts ONE string and reads it as two different
-        // things: the sidebar row that leads to the screen, and the pane's
-        // own heading. Nothing in the type system holds those two together,
-        // so they are held here -- reword either and this fails loudly
-        // instead of quietly degrading step 1 into "the sidebar row
-        // exists", which is true in every state including the ones where
+        // **This step used to hold the two labels EQUAL and count the one
+        // string twice.** Design 5b gives the list column an uppercase
+        // eyebrow over a rail row in sentence case, so they differ now -- and
+        // the witness got stronger rather than weaker for it. A count of a
+        // string two surfaces share is the weakest form of "the pane
+        // painted": it fails open the moment a third surface prints the same
+        // word, and it cannot say which occurrence is which. A string ONLY
+        // the pane paints is a direct witness.
+        //
+        // What is kept is the guard against the witness degenerating: if the
+        // two are ever put back in step, this assertion says so, because
+        // then finding `SENDS_HEADING` would prove only that the rail row
+        // exists -- which is true in every state, including the ones where
         // the window body is blank.
-        assert_eq!(
+        assert_ne!(
             send_ui::SENDS_HEADING,
             sidebar::SENDS_ROW_LABEL,
-            "the Sends pane's own heading and the sidebar row that leads to it are no longer \
-             the same string, so counting that string twice no longer proves the PANE \
-             painted. Count `send_ui::SENDS_HEADING` in its own right, or put the two back \
-             in step."
+            "the Sends pane's own heading and the sidebar row that leads to it are the same \
+             string again, so finding it below no longer proves the PANE painted -- it is \
+             satisfied by the rail row alone."
         );
         let sends_at = matrix_locate(state, &output, sidebar::SENDS_ROW_LABEL);
         output = matrix_click(&ctx, &mut frame_fn, sends_at);
 
-        // 1. **THE SCREEN IS THERE.** The pane paints its own "Sends"
-        //    heading, so the sidebar row that leads to it and the screen
-        //    itself are two different labels: one occurrence is a window
-        //    whose body painted NOTHING, which is what a gate on the outer
-        //    `show_sends` does -- the item list is skipped by `if
+        // 1. **THE SCREEN IS THERE.** The pane paints its list column's own
+        //    heading, which nothing else in this window paints: its absence
+        //    is a window whose body painted NOTHING, which is what a gate on
+        //    the outer `show_sends` does -- the item list is skipped by `if
         //    !show_sends` and the pane by the gate, and the user is left
         //    looking at an empty window for the rest of the session.
         assert!(
-            matrix_count(&output, sidebar::SENDS_ROW_LABEL) >= 2,
+            matrix_find(&output, send_ui::SENDS_HEADING).is_some(),
             "in state {state:?} the Sends row was pressed and the Sends PANE never painted \
-             its own heading -- only the sidebar row that leads to it is on screen. The \
-             SENDS SCREEN is blank: the item list is skipped because `show_sends` is true \
-             and the pane was not asked for, so the window keeps its sidebar and its \
+             its own heading ({:?}) -- only the sidebar row that leads to it is on screen. \
+             The SENDS SCREEN is blank: the item list is skipped because `show_sends` is \
+             true and the pane was not asked for, so the window keeps its sidebar and its \
              detail-pane placeholder and the user has no Sends feature at all. What was \
              painted: {:?}",
+            send_ui::SENDS_HEADING,
             matrix_texts(&output)
         );
 
@@ -33162,11 +33307,19 @@ mod send_delete_wiring {
         // `Some` for every frame below -- which is exactly how long a real
         // `bw send delete` holds it.
         if matches!(state, ReachableState::RevokeInFlight) {
-            let delete_at =
-                matrix_locate_in_row(state, &output, FRAME_SEND_NAME, send_ui::DELETE_LABEL);
+            // **Pick the row first.** Design 5b puts every control in the
+            // detail pane, so a Send has to be on screen there before there
+            // is a Delete to press -- which is also what a user does. The
+            // controls are then located across the whole frame rather than
+            // within 40pt of the row: they are deliberately NOT beside it.
+            let picked = matrix_click(
+                &ctx,
+                &mut frame_fn,
+                matrix_locate(state, &output, FRAME_SEND_NAME),
+            );
+            let delete_at = matrix_locate(state, &picked, send_ui::DELETE_LABEL);
             let armed = matrix_click(&ctx, &mut frame_fn, delete_at);
-            let confirm_at =
-                matrix_locate_in_row(state, &armed, FRAME_SEND_NAME, send_ui::CONFIRM_LABEL);
+            let confirm_at = matrix_locate(state, &armed, send_ui::CONFIRM_LABEL);
             output = matrix_click(&ctx, &mut frame_fn, confirm_at);
             assert_eq!(
                 FRAME_REVOKES.lock().expect("not poisoned").len(),
@@ -33287,16 +33440,56 @@ mod send_delete_wiring {
             }
         }
 
-        // 3. **THE ROW'S OWN CONTROLS.** Copy link is drawn, Delete arms the
+        // 2c. **THE DRAFT IS PUT AWAY THE WAY A USER PUTS IT AWAY.**
+        //
+        // The composer occupies the DETAIL column -- design 5b's shape, and
+        // the vault window's own: an edit form takes the detail pane and
+        // leaves the list column live. So in the one state that has a draft
+        // open, the per-Send controls of step 3 are behind it, and the way to
+        // them is Discard.
+        //
+        // **This is a control PRESSED, not a step skipped**, and it is worth
+        // more than what it replaces. The obvious shadow for this state is a
+        // gate on `send_create.composer.open`, and under one Discard is dead:
+        // the form never goes, and the assertion below says so. Nothing here
+        // was weakened to fit the new layout -- the matrix now drives a
+        // control it never drove before.
+        if matrix_find(&output, send_ui::COMPOSER_HEADING).is_some() {
+            let discard_at = matrix_locate(state, &output, send_ui::DISCARD_LABEL);
+            output = matrix_click(&ctx, &mut frame_fn, discard_at);
+            assert!(
+                matrix_find(&output, send_ui::COMPOSER_HEADING).is_none(),
+                "in state {state:?} Discard was pressed and the composer is still on screen, \
+                 so the form cannot be put away at all -- the user is stuck on a draft with \
+                 the rest of the screen behind it. What was painted: {:?}",
+                matrix_texts(&output)
+            );
+            assert!(
+                matrix_find(&output, send_ui::NEW_SEND_LABEL).is_some(),
+                "in state {state:?} the draft was discarded and the way to start another one \
+                 never came back. What was painted: {:?}",
+                matrix_texts(&output)
+            );
+        }
+
+        // 3. **THE SEND'S OWN CONTROLS.** Copy link is drawn, Delete arms the
         //    confirmation and destroys nothing, and Cancel really disarms it.
+        //    All three are in the DETAIL PANE now -- design 5b puts them
+        //    there -- so each step picks a row first, which is what a user
+        //    does and what makes "the row this acted on" a real question.
+        //
         // **THE SECOND ROW'S Copy link, AND THE SECOND ROW'S URL.** With
         // one row on screen this step could not tell a per-row lookup from
         // `rows[0].access_url` or from a hard-coded constant: all three
-        // answer with the same string. The row pressed here is not the
-        // first one, so only a lookup that really reads the row under the
-        // cursor produces the expected answer.
-        let copy_at =
-            matrix_locate_in_row(state, &output, FRAME_SECOND_SEND_NAME, "Copy link");
+        // answer with the same string. The row PICKED here is not the
+        // first one, so only a lookup that really reads the Send the pane is
+        // describing produces the expected answer.
+        let second_picked = matrix_click(
+            &ctx,
+            &mut frame_fn,
+            matrix_locate(state, &output, FRAME_SECOND_SEND_NAME),
+        );
+        let copy_at = matrix_locate(state, &second_picked, "Copy link");
         let (after_copy, copied) = matrix_click_watching_the_clipboard(&ctx, &mut frame_fn, copy_at);
         assert_eq!(
             copied.suppressed,
@@ -33329,15 +33522,21 @@ mod send_delete_wiring {
              `clipboard::copy_secret` like every other secret this app copies.",
             copied.unsuppressed
         );
-        let output = after_copy;
+        // Back to the FIRST Send for the destructive half, so the two halves
+        // of step 3 are about two different rows and a control that acted on
+        // a remembered row rather than the shown one fails one of them.
+        let output = matrix_click(
+            &ctx,
+            &mut frame_fn,
+            matrix_locate(state, &after_copy, FRAME_SEND_NAME),
+        );
         FRAME_REVOKES.lock().expect("not poisoned").clear();
-        let delete_at =
-            matrix_locate_in_row(state, &output, FRAME_SEND_NAME, send_ui::DELETE_LABEL);
+        let delete_at = matrix_locate(state, &output, send_ui::DELETE_LABEL);
         let armed = matrix_click(&ctx, &mut frame_fn, delete_at);
         assert!(
             matrix_find(&armed, send_ui::CONFIRM_LABEL).is_some(),
-            "in state {state:?} pressing Delete on a real Sends row put up no {:?} \
-             confirmation, so the row is inert. What was painted: {:?}",
+            "in state {state:?} pressing Delete on a real Send put up no {:?} \
+             confirmation, so the control is inert. What was painted: {:?}",
             send_ui::CONFIRM_LABEL,
             matrix_texts(&armed)
         );
@@ -33348,8 +33547,7 @@ mod send_delete_wiring {
              {started:?} -- so the confirmation is a decoration"
         );
 
-        let cancel_at =
-            matrix_locate_in_row(state, &armed, FRAME_SEND_NAME, send_ui::CANCEL_LABEL);
+        let cancel_at = matrix_locate(state, &armed, send_ui::CANCEL_LABEL);
         let disarmed = matrix_click(&ctx, &mut frame_fn, cancel_at);
         assert!(
             matrix_find(&disarmed, send_ui::CONFIRM_LABEL).is_none(),
@@ -33360,8 +33558,8 @@ mod send_delete_wiring {
         );
         assert!(
             matrix_find(&disarmed, send_ui::DELETE_LABEL).is_some(),
-            "in state {state:?} Cancel left the row with no Delete button at all. What was \
-             painted: {:?}",
+            "in state {state:?} Cancel left the detail pane with no Delete button at all. \
+             What was painted: {:?}",
             matrix_texts(&disarmed)
         );
         assert!(
@@ -33873,7 +34071,7 @@ mod send_delete_wiring {
 
         // The pane really shows no row for it. Not "result is None" restated
         // -- the glyph-level question the user sees.
-        let state = send_ui::pane_state(fetch.result.as_ref(), &crate::send::FixedClock(0));
+        let state = send_ui::pane_state(fetch.result.as_ref(), &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0));
         assert_eq!(
             state,
             send_ui::SendPaneState::Loading,
@@ -35043,9 +35241,17 @@ mod send_delete_wiring {
         // edit to a pin, which is how pins in this file have been weakened
         // before.
         let squashed = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        // `pane_state` takes a ZONE now as well as a clock, and the needle
+        // carries it. The detail pane prints absolute instants -- "17 Aug
+        // 2026, 14:20" -- and this file's standing rule is that nothing
+        // deciding what a date SAYS may read the machine for itself, so the
+        // offset is threaded from here exactly as `now` has been since the
+        // screen shipped. Pinning the whole expression keeps that: a second
+        // zone, or `SystemZone` reached for inside `send_ui`, fails here.
         let model = squashed(concat!(
             "if let Some(state) = &show_sends .then(|| send_ui::pane_", "state(\
-             send_fetch.result.as_ref(), &crate::send::SystemClock)) {"
+             send_fetch.result.as_ref(), &crate::send::SystemClock, \
+             &crate::local_time::SystemZone)) {"
         ));
         assert_eq!(
             squashed(&code).matches(&model).count(),
