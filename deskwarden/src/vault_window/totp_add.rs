@@ -960,6 +960,25 @@ pub fn validity_line(reading: &Reading) -> Option<String> {
 /// [`OtpRefusal::PartialSecret`] holds a character count, which
 /// [`validity_line`] prints for every *accepted* secret anyway: a length is
 /// not a seed, and here it is the whole diagnosis.
+///
+/// # Every sentence here has to fit the slot the design drew for it
+///
+/// `#6d` draws **one short line** under the field -- *"Valid base32 · 16
+/// characters · spaces ignored"* -- and these sentences are painted in that
+/// same slot by [`validity_row`]. At [`VALIDITY_PX`] across the body's own
+/// [`MANUAL_WIDTH`] less its padding, one line is a little over seventy
+/// characters; the length refusal below was written at two hundred and
+/// twenty, wrapped to three lines, and was reported as prose lying over the
+/// box above it. A refusal that is *correct* and four times the size of the
+/// space it is drawn in is still a defect, and the length of the string is
+/// the part of that this function owns.
+///
+/// So: **name the reason and point at the fix, and stop.** The mechanism --
+/// why base32 cannot be three characters, why an unknown parameter is refused
+/// rather than dropped -- is documentation and belongs in prose like this,
+/// not under a text field. `the_refusals_fit_the_line_the_design_drew_for_them`
+/// holds the whole family to it, so the next long sentence reds a test rather
+/// than a screenshot.
 pub fn refusal_sentence(refusal: &OtpRefusal) -> String {
     match refusal {
         OtpRefusal::NotOtpAuth => {
@@ -982,17 +1001,37 @@ pub fn refusal_sentence(refusal: &OtpRefusal) -> String {
         // here would send the reader hunting for a bad one that is not there.
         // What is wrong is the count, so the count is what this names -- and a
         // length in this class is always exactly one character away from one
-        // that works, in either direction, which is the thing worth telling
-        // someone who has just copied a seed off a card by eye.
+        // that works, in either direction, which is why the fix this points
+        // at is a single character in either direction and nothing else.
+        //
+        // **What this used to say, and why it does not any more.** It opened
+        // with "Those are all base32 characters, but a secret cannot be N of
+        // them" and then taught the arithmetic -- five bits a character, a run
+        // that stops part-way through a byte. Every clause of that was true
+        // and the whole of it was four times the line it had to live on: three
+        // wrapped rows of red in a slot the design draws one short row in. The
+        // reassurance that the alphabet is fine is carried now by what the
+        // sentence does NOT say (nothing about A-Z or 2-7, which
+        // `three_good_characters_are_not_a_valid_secret` pins), and the
+        // arithmetic is in `otpauth::decodes_to_whole_bytes`, which is where
+        // somebody who wants it will look.
+        //
+        // Pluralised, because this class contains 1: "1 characters cannot
+        // decode" is the kind of sentence that makes a user doubt the rest of
+        // the card.
         OtpRefusal::PartialSecret(characters) => format!(
-            "Those are all base32 characters, but a secret cannot be {characters} of them. \
-             Base32 packs five bits into each character, so a run of that length stops part-way \
-             through a byte \u{2014} a character is missing, or one has been copied twice."
+            "{characters} character{} cannot decode \u{2014} one is missing, or one has been \
+             copied twice.",
+            if *characters == 1 { "" } else { "s" }
         ),
+        // Shortened for the reason above it: this was three wrapped lines as
+        // well, and the clause that made it so -- "because a code saved from
+        // it would be wrong and nothing on screen would say why" -- is an
+        // argument for the refusal rather than anything the reader can act on.
+        // What they can act on is the key, so the key is what is left, and
+        // "refused, not ignored" is the one-clause version of the argument.
         OtpRefusal::UnknownParameter(key) => format!(
-            "That URI carries a parameter Deskwarden does not know: {key}. It is refused rather \
-             than ignored, because a code saved from it would be wrong and nothing on screen \
-             would say why."
+            "That URI carries {key}, which Deskwarden does not know \u{2014} refused, not ignored."
         ),
         OtpRefusal::BadParameter(name) => format!(
             "That URI's {name} is not a value Deskwarden can use, so the code it saved would \
@@ -1989,9 +2028,41 @@ const CAUTION_TEXT_INK: egui::Color32 = egui::Color32::from_rgb(0x7a, 0x4f, 0x05
 /// design's own `viewBox` coordinates: `<path d="M20 6 9 17l-5-5">`.
 const CHECK_MARK: &[Svg] = &[Svg::Line(&[(20.0, 6.0), (9.0, 17.0), (4.0, 12.0)])];
 
-/// 6d's header band. Answers nothing: this card's ways out are its footer and
-/// the Escape [`draw_add_modal`] already binds, and neither 6d nor 6c draws
-/// the ✕ that 6a's header carries.
+/// 6d's header band, and **the ✕ in its corner**. Answers whether that mark
+/// was pressed, and how tall the band came out.
+///
+/// # Why there is a mark here at all, when neither 6d nor 6c draws one
+///
+/// Because 6a does, and 6a is the screen before this one. This card and the
+/// picker are one surface a step apart -- same width, same frame, same way
+/// back -- and until this pass the corner gesture worked on the first step
+/// and silently stopped working on the second. That is worse than having no
+/// mark anywhere: a user who dismissed the picker from its corner once has
+/// been taught where this card's dismiss is, and the card that answers Escape
+/// but not the corner is the one that reads as hung. The app-wide rule --
+/// every dialog closes from its corner -- is the one that decides this, and
+/// the design panels are silent on it rather than against it.
+///
+/// It is [`theme::modal_dismiss_mark`] and not a typed U+2715 for
+/// `picker_header`'s recorded reason (that codepoint is in neither Archivo nor
+/// egui's fallback stack and lands as a tofu box), and its inset is
+/// [`theme::MODAL_CLOSE_INSET`] rather than anything derived here, because
+/// two files quietly answering "how far off the edge" differently is the
+/// exact drift that constant was created to end.
+///
+/// **What it does is what Escape does**, and that is not a coincidence to be
+/// maintained by hand: [`draw_add_form`] turns a press into
+/// [`TotpAddAction::Cancel`], which is the single value
+/// [`draw_add_modal`]'s Escape branch returns. One outcome, two gestures --
+/// so there is no state reachable through one and not the other.
+///
+/// # The mark does not allocate, so the band is unchanged
+///
+/// [`theme::modal_dismiss_mark`] is handed a rectangle and interacts at it;
+/// it claims no layout space. The band's height is still its padding around
+/// the taller of the title and [`MANUAL_HEADER_MARK`] -- which is
+/// [`theme::CLOSE_MARK_HIT`]'s sixteen exactly -- so the hit box fits inside
+/// what was already reserved and [`stage_header_height`] does not move.
 ///
 /// **Two states, one band.** While the user is typing it is 6d's own
 /// [`HEADING`] alone. Once a decoder has filled the field it is 6c's header
@@ -2007,9 +2078,10 @@ const CHECK_MARK: &[Svg] = &[Svg::Line(&[(20.0, 6.0), (9.0, 17.0), (4.0, 12.0)])
 /// the field below it was replaced would read as a different card rather than
 /// as the same one a step on.
 ///
-/// Reports the band's height, which is what the body under it has to be
-/// measured against -- see [`MODAL_BREATHING`].
-fn manual_header(ui: &mut egui::Ui, scanned: bool) -> f32 {
+/// Reports `(the band's height, whether the ✕ was pressed)`. The height is
+/// what the body under it has to be measured against -- see
+/// [`MODAL_BREATHING`].
+fn manual_header(ui: &mut egui::Ui, scanned: bool) -> (f32, bool) {
     let title = lay_out(
         ui,
         if scanned { CODE_READ_LABEL } else { HEADING },
@@ -2032,6 +2104,16 @@ fn manual_header(ui: &mut egui::Ui, scanned: bool) -> f32 {
         egui::vec2(ui.available_width(), MANUAL_HEADER_PAD_Y * 2.0 + content + RULE),
         egui::Sense::hover(),
     );
+
+    // The padding box, which is the band without its rule: centring the mark
+    // on the band itself would drop it half a point low, which is
+    // `picker_header`'s own note about the same arithmetic.
+    let line = egui::Rect::from_min_max(band.min, egui::pos2(band.right(), band.bottom() - RULE));
+    // **Registered before anything else in the band is painted**, so the
+    // rectangle the pointer is tested against is claimed before the galleys
+    // that share the band go down. Nothing here overlaps it -- see the kind
+    // label below, which is held off it -- so paint order costs nothing.
+    let close = theme::modal_dismiss_mark(ui, line, theme::CloseInk::OnCard);
 
     let painter = ui.painter();
     // `border-bottom: 1px solid #eae7e7`, run out past the card's own stroke
@@ -2063,16 +2145,25 @@ fn manual_header(ui: &mut egui::Ui, scanned: bool) -> f32 {
         theme::INK,
     );
     if let Some(kind) = kind {
+        // **Hung off the ✕ and not off the band's padding.** 6c sets this
+        // label at the far right of its header because nothing else is there;
+        // this card now has a dismiss in that corner, and a right edge
+        // computed from [`MANUAL_HEADER_PAD_X`] would put "otpauth://totp"
+        // straight through the mark's arms. Measured from `close.rect` rather
+        // than from [`theme::MODAL_CLOSE_INSET`] plus a hit width restated
+        // here, so the two cannot drift: whatever rectangle the shared mark
+        // took is the rectangle this clears, by [`MANUAL_HEADER_GAP`] -- the
+        // same gap the header already uses between its check and its title.
         painter.galley(
             egui::pos2(
-                band.right() - MANUAL_HEADER_PAD_X - kind.size().x,
+                close.rect.left() - MANUAL_HEADER_GAP - kind.size().x,
                 middle - kind.size().y / 2.0,
             ),
             kind,
             theme::TEXT_GHOST,
         );
     }
-    band.height()
+    (band.height(), close.clicked())
 }
 
 /// **Which item this is being written to**, at the top of the body.
@@ -2160,6 +2251,29 @@ fn secret_field(ui: &mut egui::Ui, typed: &mut String) -> egui::Response {
             .desired_width(inner.width())
             .layouter(&mut layouter),
     );
+    // **Put the layout cursor back where the band left it.**
+    //
+    // `Ui::put` is not a paint call. It opens a child `Ui` clamped to the
+    // rectangle it is given, and when that child closes egui advances the
+    // PARENT's cursor past the child's rect -- `advance_cursor_after_rect`,
+    // which *sets* the cursor rather than taking a maximum with it. The rect
+    // handed over here is `inner`, the box's padding box, whose bottom is
+    // `SECRET_BOX_STROKE + SECRET_BOX_PAD_Y` **above** the band this function
+    // allocated. So the cursor came out ten points higher than the box it just
+    // drew, and the next widget in the column -- [`validity_row`] -- opened
+    // ten points into the field: with the design's own one-line sentence the
+    // green check sat on the box's bottom border, and with a refusal long
+    // enough to wrap the first row of red was painted straight through it.
+    // That was reported as "wrong size and overlaps"; the size was the
+    // sentence's fault and the overlap was this line's absence.
+    //
+    // The fix is the one `send_ui` reached for when the Sends strip wound its
+    // own cursor backwards the same way: say explicitly where the cursor
+    // belongs. It belongs after `outer`, which is what `allocate_exact_size`
+    // above already claimed, so this restores rather than reserves and the
+    // column's `item_spacing` then applies to the band the user can see
+    // instead of to the text inside it.
+    ui.advance_cursor_after_rect(outer);
 
     let radius = CornerRadius::same(SECRET_BOX_RADIUS);
     let border = if response.has_focus() {
@@ -2642,7 +2756,19 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
         // left of the window after them is what the body may have -- see
         // [`MODAL_BREATHING`]. The caution band's sentence is laid out once
         // here and handed on to the band itself.
-        let header = manual_header(ui, state.scanned);
+        let (header, dismissed) = manual_header(ui, state.scanned);
+        // **The corner gesture, answered as the key is.** `draw_add_modal`
+        // turns Escape into exactly this value, so the ✕ and Escape cannot
+        // reach different states -- see `manual_header`. Assigned here rather
+        // than returned early because the rest of the card still has to be
+        // drawn this frame: a modal that vanished mid-layout would leave the
+        // footer's `Ui` half-built, and `draw_picker` answers its own ✕ the
+        // same way for the same reason. Anything below that acts on this
+        // frame -- Save, the way back -- assigns over it, which is
+        // `draw_add_modal`'s stated ordering rule applied inside the card.
+        if dismissed {
+            action = TotpAddAction::Cancel;
+        }
         let caution = state
             .already_has_code
             .then(|| caution_text(ui, ui.available_width()));
@@ -3768,6 +3894,22 @@ pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
 /// window is the way back, and the outcome that really ends it arrives from
 /// the overlay through [`apply_region_outcome`]. A Cancel here would be a
 /// second way to close a surface whose other window is still up.
+///
+/// # And that is why this stage gets no ✕, when every other one has one
+///
+/// 6a's header carries [`theme::modal_dismiss_mark`], `manual_header` now
+/// carries the same mark, and the camera stage draws 6a's header outright --
+/// so this is the one card in the flow with no corner gesture, and it is a
+/// decision rather than an oversight. A ✕ is a *dismiss*, and this card
+/// cannot dismiss anything: the surface the user is actually looking at is
+/// `region_overlay`'s full-screen window, which is in front of this one and
+/// owns both the keyboard and the scan. That is the same fact
+/// [`draw_add_modal`] encodes by not answering Escape here. A mark in this
+/// corner would either be invisible (covered by the overlay) or be a second
+/// cancel that tears the form down while the capture window is still up --
+/// and it would contradict the Escape rule one line of code away from it.
+/// The way out of this stage is the overlay's own Escape, which cancels the
+/// scan and captures nothing, and the way back this card draws.
 ///
 /// **This card is also what is on screen for the moment before the overlay
 /// exists**, while `region_overlay` takes and decodes its whole-screen scan,
@@ -6217,6 +6359,95 @@ mod tests {
         }
     }
 
+    /// One text shape the surface really painted: what it says, the rectangle
+    /// the galley occupies, and **how many rows it wrapped into**.
+    ///
+    /// [`Painted`] above keeps the strings and throws the geometry away, which
+    /// is right for "is this sentence on screen" and blind to both halves of
+    /// the defect design 6d's line under the field was reported with: how many
+    /// lines the sentence took, and whether it landed on top of the box above
+    /// it. Neither is answerable from a `Vec<String>`, and both are answerable
+    /// from a `TextShape`, which carries its position and its galley.
+    #[derive(Clone, Debug)]
+    struct PaintedText {
+        text: String,
+        rect: egui::Rect,
+        rows: usize,
+    }
+
+    fn collect_texts(shape: &egui::Shape, out: &mut Vec<PaintedText>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(PaintedText {
+                text: text.galley.text().to_owned(),
+                rect: egui::Rect::from_min_size(text.pos, text.galley.size()),
+                rows: text.galley.rows.len(),
+            }),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_texts(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every straight segment the surface painted.
+    ///
+    /// This is how `theme::modal_dismiss_mark` is found, and it is found
+    /// rather than computed on purpose: a test that re-derived the mark's
+    /// centre from [`theme::MODAL_CLOSE_INSET`] would agree with a card that
+    /// had stopped drawing one. The ✕ is the only thing on these cards drawn
+    /// as a pair of `line_segment`s -- [`paint_svg`]'s marks are
+    /// `Shape::line` paths, the bands are rects and the copy is galleys -- so
+    /// two crossing segments [`theme::CLOSE_MARK_SPAN`] across is an
+    /// unambiguous signature.
+    fn collect_segments(shape: &egui::Shape, out: &mut Vec<[egui::Pos2; 2]>) {
+        match shape {
+            egui::Shape::LineSegment { points, .. } => out.push(*points),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_segments(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Where the dismiss ✕ was painted: the point its two
+    /// [`theme::CLOSE_MARK_SPAN`] diagonals cross at.
+    ///
+    /// Found off the painted strokes, not computed from
+    /// [`theme::MODAL_CLOSE_INSET`], so a card that stopped drawing a mark
+    /// fails here instead of quietly agreeing with an arithmetic restatement
+    /// of where one would have gone. A free function rather than a method
+    /// because two harnesses ask it: the stage on its own, and the whole
+    /// modal with its drag handle laid over the header.
+    fn close_mark_in(segments: &[[egui::Pos2; 2]]) -> egui::Pos2 {
+        let arms: Vec<[egui::Pos2; 2]> = segments
+            .iter()
+            .copied()
+            .filter(|[a, b]| {
+                ((a.x - b.x).abs() - theme::CLOSE_MARK_SPAN).abs() < 0.5
+                    && ((a.y - b.y).abs() - theme::CLOSE_MARK_SPAN).abs() < 0.5
+            })
+            .collect();
+        assert_eq!(
+            arms.len(),
+            2,
+            "a dismiss ✕ is two crossing {}-point diagonals and {} were painted: {segments:?}",
+            theme::CLOSE_MARK_SPAN,
+            arms.len()
+        );
+        let centre =
+            |[a, b]: [egui::Pos2; 2]| egui::pos2((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+        let (first, second) = (centre(arms[0]), centre(arms[1]));
+        assert!(
+            (first - second).length() < 0.5,
+            "the two diagonals do not cross at one point: {first:?} and {second:?}"
+        );
+        first
+    }
+
     /// Whether two rectangles are the same one, within half a point.
     fn same_rect(a: egui::Rect, b: egui::Rect) -> bool {
         (a.min - b.min).length() < 0.5 && (a.max - b.max).length() < 0.5
@@ -7284,6 +7515,43 @@ mod tests {
         );
     }
 
+    /// **And the ✕ answers through the whole modal**, not only through the
+    /// stage drawn on its own.
+    ///
+    /// `the_by_hand_card_closes_from_its_corner` presses the mark on the card
+    /// alone. In the app the card is inside `theme::movable_modal` with
+    /// `theme::modal_drag_handle` laid over its entire header band, and a
+    /// drag-sensing strip over a ✕ swallows the click that dismisses the card
+    /// -- a defect this modal has already had once and fixed by registering
+    /// the handle before the stage. Nothing pinned that ordering; the picker's
+    /// own ✕ test drives `draw_picker` directly and would go on passing if the
+    /// strip started eating the press tomorrow. This is that pin, on both
+    /// stages that carry a mark.
+    #[test]
+    fn the_dismiss_mark_survives_the_modals_drag_handle() {
+        for stage in [Stage::Picker, Stage::Manual] {
+            let modal = Modal::new();
+            let mut state = TotpAdd::opening("i1", "Git Host", false);
+            state.stage = stage;
+            // **Two warm-up frames, and the second is the one read.** An
+            // `egui::Area` whose size it has never seen runs its first frame
+            // as a sizing pass and paints nothing but `Shape::Noop` -- so a
+            // mark looked for in that frame is missing for a reason that has
+            // nothing to do with whether the card draws one. The Escape tests
+            // beside this take one warm-up for the same reason; this needs
+            // shapes as well as an answer, so it takes the frame after.
+            let _ = modal.frame(&mut state, Vec::new());
+            let (idle, segments) = modal.frame_with_segments(&mut state, Vec::new());
+            assert_eq!(idle, TotpAddAction::None, "{stage:?}: the card dismissed itself");
+            let at = close_mark_in(&segments);
+            assert_eq!(
+                modal.frame(&mut state, click_at(at)),
+                TotpAddAction::Cancel,
+                "{stage:?}: the drag handle swallowed the press on the ✕"
+            );
+        }
+    }
+
     /// **A frame with no keystroke reports nothing**, which is the control
     /// the two above need: an assertion that Escape closes the modal passes
     /// just as well against a modal that closes on every frame.
@@ -7338,11 +7606,33 @@ mod tests {
         }
 
         fn frame(&self, state: &mut TotpAdd, events: Vec<egui::Event>) -> TotpAddAction {
+            self.frame_with_segments(state, events).0
+        }
+
+        /// The same frame, with the straight segments it painted.
+        ///
+        /// Needed by exactly one question and it is a question only this
+        /// harness can answer: whether the ✕ still answers **through the
+        /// modal**, where `theme::modal_drag_handle` lays a drag-sensing
+        /// strip over the whole header band. The stage harness draws the card
+        /// without that strip, so a mark it presses happily could still be
+        /// swallowed in the app -- which is the defect `draw_add_modal`
+        /// records having already fixed once, by registering the handle
+        /// first.
+        fn frame_with_segments(
+            &self,
+            state: &mut TotpAdd,
+            events: Vec<egui::Event>,
+        ) -> (TotpAddAction, Vec<[egui::Pos2; 2]>) {
             let mut action = TotpAddAction::None;
-            let _ = self.ctx.run_ui(Self::input(events), |ui| {
+            let output = self.ctx.run_ui(Self::input(events), |ui| {
                 action = draw_add_modal(ui.ctx(), state, 0);
             });
-            action
+            let mut segments = Vec::new();
+            for clipped in &output.shapes {
+                collect_segments(&clipped.shape, &mut segments);
+            }
+            (action, segments)
         }
     }
 
@@ -7370,6 +7660,8 @@ mod tests {
         action: TotpAddAction,
         painted: Painted,
         rects: Vec<PaintedRect>,
+        texts: Vec<PaintedText>,
+        segments: Vec<[egui::Pos2; 2]>,
     }
 
     impl ManualRun {
@@ -7405,6 +7697,45 @@ mod tests {
                 found.len()
             );
             found
+        }
+
+        /// The one painted text shape whose string contains `needle`, with
+        /// its geometry -- see [`PaintedText`].
+        fn text(&self, needle: &str) -> PaintedText {
+            let found: Vec<&PaintedText> =
+                self.texts.iter().filter(|t| t.text.contains(needle)).collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "{} text shape(s) carry {needle:?}; the card painted {:?}",
+                found.len(),
+                self.texts.iter().map(|t| t.text.as_str()).collect::<Vec<_>>()
+            );
+            found[0].clone()
+        }
+
+        /// **6d's one field**, found by its geometry rather than by a
+        /// remembered rectangle.
+        ///
+        /// [`SECRET_BOX_RADIUS`] alone would also match the footer's two
+        /// buttons, which the design rounds by the same 8, so the box is the
+        /// WIDEST rect at that radius -- 6d's field runs the whole body and
+        /// no button on this card is a third of it.
+        fn secret_box(&self) -> egui::Rect {
+            let mut boxes: Vec<PaintedRect> =
+                self.all(|r| r.radius == SECRET_BOX_RADIUS).into_iter().collect();
+            assert!(
+                !boxes.is_empty(),
+                "6d painted nothing at the field's own radius: {:?}",
+                self.rects
+            );
+            boxes.sort_by(|a, b| b.rect.width().total_cmp(&a.rect.width()));
+            boxes[0].rect
+        }
+
+        /// Where the dismiss ✕ was painted -- see [`close_mark_in`].
+        fn close_mark(&self) -> egui::Pos2 {
+            close_mark_in(&self.segments)
         }
 
         /// The one rectangle matching `pick`, or a panic naming what was
@@ -7447,9 +7778,13 @@ mod tests {
             });
             let mut painted = Painted(Vec::new());
             let mut rects = Vec::new();
+            let mut texts = Vec::new();
+            let mut segments = Vec::new();
             for clipped in &output.shapes {
                 collect(&clipped.shape, &mut painted);
                 collect_rects(&clipped.shape, &mut rects);
+                collect_texts(&clipped.shape, &mut texts);
+                collect_segments(&clipped.shape, &mut segments);
             }
             assert!(
                 !painted.0.is_empty(),
@@ -7461,7 +7796,7 @@ mod tests {
                 "6d painted no rectangles at all, so every assertion over that list would \
                  pass against nothing either"
             );
-            ManualRun { action, painted, rects }
+            ManualRun { action, painted, rects, texts, segments }
         }
 
         fn idle(&self, state: &mut TotpAdd) -> ManualRun {
@@ -7721,6 +8056,298 @@ mod tests {
         assert!(
             !refused.painted.has(CONFIRM_HEADING),
             "a refused field still painted a confirmation to save from"
+        );
+    }
+
+    /// What to look for when the fixture is an unknown parameter with a
+    /// deliberately long key.
+    ///
+    /// **Not the key itself**: the key is also in the URI the field is
+    /// holding, so a search for it finds the `TextEdit`'s own galley as well
+    /// as the refusal and neither test can tell which it measured. This
+    /// phrase is in the sentence and in nothing else on the card.
+    const OVERLONG_NEEDLE: &str = "which Deskwarden does not know";
+
+    /// Every input the one field can be driven into a refusal with, beside
+    /// the refusal it produces.
+    ///
+    /// A table rather than seven inline literals because three tests below
+    /// walk it and the thing they are checking is a property of the WHOLE
+    /// family: no refusal may outgrow the line design 6d draws for it, and a
+    /// variant added to [`OtpRefusal`] without an entry here is a sentence
+    /// nobody ever measured.
+    fn every_refusal_the_field_can_show() -> Vec<(String, OtpRefusal)> {
+        vec![
+            ("https://example.com/login".to_string(), OtpRefusal::NotOtpAuth),
+            (
+                "otpauth://hotp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&counter=1".to_string(),
+                OtpRefusal::NotTotp,
+            ),
+            (
+                "otpauth://totp/Git%20Host:anovak?issuer=Git%20Host".to_string(),
+                OtpRefusal::NoSecret,
+            ),
+            ("not!base32".to_string(), OtpRefusal::BadSecret),
+            ("sdf".to_string(), OtpRefusal::PartialSecret(3)),
+            (
+                "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&image=icon.png"
+                    .to_string(),
+                OtpRefusal::UnknownParameter("image".to_string()),
+            ),
+            (
+                "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&period=0".to_string(),
+                OtpRefusal::BadParameter("period"),
+            ),
+            // The one refusal that is about the URI's SIZE, so the fixture
+            // has to be that size: a bare seed this long becomes a URI past
+            // `otpauth::MAX_URI_LEN` on its way through `secret_as_uri`.
+            ("A".repeat(crate::otpauth::MAX_URI_LEN), OtpRefusal::TooLong),
+        ]
+    }
+
+    /// **The table above really drives what it claims to**, which every
+    /// assertion built on it depends on: a fixture that quietly stopped
+    /// producing its refusal would take three tests down to vacuity without
+    /// failing any of them.
+    #[test]
+    fn every_refusal_fixture_still_produces_its_refusal() {
+        for (typed, expected) in every_refusal_the_field_can_show() {
+            let Reading::Refused(actual) = read_field(&typed, 6, 30) else {
+                panic!("{expected:?}'s fixture is no longer refused at all");
+            };
+            assert_eq!(actual, expected, "the fixture for {expected:?} now produces {actual:?}");
+        }
+        // And it covers every variant, counted against the enumeration's own
+        // list -- `every_refusal_is_its_own_sentence` keeps that list honest.
+        assert_eq!(
+            every_refusal_the_field_can_show().len(),
+            8,
+            "a refusal was added to `OtpRefusal` without an input that reaches it, so the \
+             sentence it renders is one nobody has ever measured on screen"
+        );
+    }
+
+    /// **No refusal outgrows the line design 6d drew for it.**
+    ///
+    /// `#6d` puts ONE short line under the field. The length refusal was
+    /// written at two hundred and twenty characters and reached the screen as
+    /// three wrapped rows of red; the owner's words were *"yes but wrong size
+    /// and overlaps"*, and the size half is this. Measured by RENDERING each
+    /// refusal on the real card and reading the galley's row count, not by
+    /// counting characters against a guessed pixel budget: what decides
+    /// whether a sentence wraps is the face, the tracking and the body's real
+    /// width, and only the card knows all three.
+    ///
+    /// Two rows is the ceiling for the family and one is the rule for the
+    /// length refusal, which is the one the owner reported and the one whose
+    /// whole content is a number and a fix.
+    #[test]
+    fn the_refusals_fit_the_line_the_design_drew_for_them() {
+        let manual = Manual::new();
+        for (typed, refusal) in every_refusal_the_field_can_show() {
+            let sentence = refusal_sentence(&refusal);
+            let mut state = Manual::typing(&typed);
+            let run = manual.idle(&mut state);
+            let line = run.text(&sentence);
+            assert!(
+                line.rows <= 2,
+                "{refusal:?} wraps to {} rows under 6d's field, which draws one: {sentence:?}",
+                line.rows
+            );
+            if matches!(refusal, OtpRefusal::PartialSecret(_)) {
+                assert_eq!(
+                    line.rows, 1,
+                    "the length refusal takes {} rows: {sentence:?}",
+                    line.rows
+                );
+            }
+        }
+        // The control the ceiling needs. A sentence long enough to wrap DOES
+        // report more than two rows through the same path, so the assertions
+        // above are about the copy and not about `PaintedText::rows` always
+        // answering one.
+        let key = "a".repeat(120);
+        let mut overlong = Manual::typing(&format!(
+            "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&{key}=1"
+        ));
+        assert!(
+            manual.idle(&mut overlong).text(OVERLONG_NEEDLE).rows > 2,
+            "a deliberately overlong refusal reported two rows or fewer, so the ceiling above \
+             is measuring nothing"
+        );
+    }
+
+    /// **The length refusal is grammatical at every count in its class**,
+    /// including one.
+    ///
+    /// One character is five bits, which is not whole bytes, so
+    /// `PartialSecret(1)` is reachable by typing a single letter -- and "1
+    /// characters cannot decode" is the sentence that makes a user doubt the
+    /// rest of the card.
+    #[test]
+    fn the_length_refusal_is_grammatical_at_one() {
+        let one = refusal_sentence(&OtpRefusal::PartialSecret(1));
+        assert!(one.starts_with("1 character "), "{one}");
+        assert!(!one.contains("1 characters"), "{one}");
+        // And it is still plural everywhere else, so the arm above is a
+        // special case rather than a dropped `s`.
+        assert!(refusal_sentence(&OtpRefusal::PartialSecret(3)).starts_with("3 characters "));
+        assert!(refusal_sentence(&OtpRefusal::PartialSecret(11)).starts_with("11 characters "));
+        // Reachable, not hypothetical: one typed character really lands here.
+        assert!(matches!(read_field("A", 6, 30), Reading::Refused(OtpRefusal::PartialSecret(1))));
+    }
+
+    /// **The line under the field never lies on top of the field**, however
+    /// long the sentence in it is.
+    ///
+    /// This is the other half of *"yes but wrong size and overlaps"*, and it
+    /// is a layout defect rather than a copy one: [`secret_field`] draws its
+    /// `TextEdit` with `Ui::put`, which advances the parent's cursor past the
+    /// CHILD's rectangle -- the box's padding box, ten points above the band
+    /// the field actually occupies. Everything after it in the column opened
+    /// ten points high. With 6d's own one-line sentence that put the green
+    /// check on the box's bottom border; with a refusal long enough to wrap
+    /// it painted red prose straight through it.
+    ///
+    /// **Driven with a refusal deliberately longer than anything this module
+    /// ships**, because the copy has just been shortened and a test pinned to
+    /// today's longest sentence would stop testing the layout the moment the
+    /// next one arrives. The unknown-parameter refusal prints its key
+    /// verbatim, so a long key is a long sentence on demand.
+    #[test]
+    fn a_long_refusal_clears_the_field_it_is_under() {
+        let manual = Manual::new();
+        let key = "a".repeat(120);
+        let mut state = Manual::typing(&format!(
+            "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&{key}=1"
+        ));
+        let run = manual.idle(&mut state);
+        let line = run.text(OVERLONG_NEEDLE);
+        assert!(
+            line.rows >= 3,
+            "the fixture stopped wrapping ({} row(s)), so this test would pass against a \
+             layout that never moves a wrapped line",
+            line.rows
+        );
+
+        let field = run.secret_box();
+        // The design's own `gap: 7px` between the box and the line under it,
+        // read off `#6d`'s field column -- [`SECRET_BLOCK_GAP`]. Before the
+        // fix this gap was NEGATIVE three.
+        let gap = line.rect.top() - field.bottom();
+        assert!(
+            (gap - SECRET_BLOCK_GAP).abs() < 1.0,
+            "the refusal starts {gap} points under the field, not the design's \
+             {SECRET_BLOCK_GAP} -- a negative number here is the reported overlap"
+        );
+        // And it stays in the field's own column, which is the other thing
+        // the owner's screenshot showed: prose running past the box's edges.
+        assert!(
+            line.rect.right() <= field.right() + 0.5,
+            "the refusal runs {} points past the field's right edge",
+            line.rect.right() - field.right()
+        );
+        assert!(
+            line.rect.left() >= field.left() - 0.5,
+            "the refusal starts {} points left of the field",
+            field.left() - line.rect.left()
+        );
+    }
+
+    /// **6d's accepted line keeps the same gap**, which is the case the fix
+    /// above would be easy to get right for the refusal alone and wrong for.
+    ///
+    /// The overlap was a cursor that wound backwards, so it was never about
+    /// the sentence: the green check and *"Valid base32 · 16 characters ·
+    /// spaces ignored"* sat three points inside the box too, and on the state
+    /// design 6d actually draws.
+    #[test]
+    fn the_accepted_line_keeps_the_designs_gap_under_the_box() {
+        let manual = Manual::new();
+        let mut state = Manual::typing("JBSW Y3DP EHPK 3PXP");
+        let run = manual.idle(&mut state);
+        let line = run.text("Valid base32");
+        let field = run.secret_box();
+        let gap = line.rect.top() - field.bottom();
+        assert!(
+            (gap - SECRET_BLOCK_GAP).abs() < 1.0,
+            "6d's own line sits {gap} points under the field, not {SECRET_BLOCK_GAP}"
+        );
+    }
+
+    /// **The by-hand card closes from its corner, exactly as the picker
+    /// does.**
+    ///
+    /// The app's rule is that every dialog closes from its corner, and this
+    /// card was the hole in it: `picker_header` has carried
+    /// `theme::modal_dismiss_mark` since that pass and `manual_header` drew
+    /// nothing, so the gesture worked on 6a and stopped working one step
+    /// later in the same flow.
+    ///
+    /// Both halves, because a mark that paints and does not answer is the
+    /// defect this project has shipped twice -- once as a dead keycap, once
+    /// as a dead Cancel arm. The mark is FOUND (two crossing diagonals at
+    /// `theme::CLOSE_MARK_SPAN`, not a rectangle computed from the inset) and
+    /// then PRESSED at the point it was found at.
+    #[test]
+    fn the_by_hand_card_closes_from_its_corner() {
+        for scanned in [false, true] {
+            let manual = Manual::new();
+            let mut state = Manual::typing("JBSWY3DPEHPK3PXP");
+            state.scanned = scanned;
+            let laid_out = manual.idle(&mut state);
+            let at = laid_out.close_mark();
+            // Inside the card's header band and at its right-hand end, so a
+            // mark painted somewhere plausible but wrong does not pass.
+            let card = laid_out.only("card", |r| r.radius == CARD_RADIUS);
+            assert!(
+                at.x > card.rect.right() - 40.0 && at.x < card.rect.right(),
+                "the ✕ is at x={} on a card whose right edge is {}",
+                at.x,
+                card.rect.right()
+            );
+            assert!(
+                at.y < card.rect.top() + stage_header_height(Stage::Manual),
+                "the ✕ is below the header band"
+            );
+
+            // An idle frame reports nothing, so the press below is the thing
+            // that produced the answer.
+            assert_eq!(
+                laid_out.action,
+                TotpAddAction::None,
+                "scanned={scanned}: the card dismissed itself without being pressed"
+            );
+            assert_eq!(
+                manual.click(&mut state, at).action,
+                // The same value `draw_add_modal`'s Escape branch returns, so
+                // the key and the corner cannot reach different states.
+                TotpAddAction::Cancel,
+                "scanned={scanned}: pressing the ✕ did not dismiss the card"
+            );
+        }
+    }
+
+    /// **6c's kind label clears the mark rather than sharing its corner.**
+    ///
+    /// The scanned header sets `otpauth://totp` at the far right, which is
+    /// where the ✕ now is. A right edge computed from
+    /// [`MANUAL_HEADER_PAD_X`] would print that label straight through the
+    /// mark's arms -- legible in neither direction, and exactly the kind of
+    /// collision a headless suite cannot see and a screenshot can.
+    #[test]
+    fn the_scanned_headers_kind_label_clears_the_dismiss_mark() {
+        let manual = Manual::new();
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.accept_decoded(Zeroizing::new(UNUSUAL.to_string()));
+        let run = manual.idle(&mut state);
+        let at = run.close_mark();
+        let kind = run.text(CODE_READ_KIND);
+        assert!(
+            kind.rect.right() <= at.x - theme::CLOSE_MARK_HIT / 2.0,
+            "6c's {CODE_READ_KIND:?} ends at {} and the ✕'s box starts at {}",
+            kind.rect.right(),
+            at.x - theme::CLOSE_MARK_HIT / 2.0
         );
     }
 
