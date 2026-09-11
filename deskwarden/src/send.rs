@@ -109,52 +109,200 @@ use zeroize::Zeroizing;
 /// `include_str!` path or a `contains` that had been inverted.
 const ARGV_PIN_CONTROL: &str = "argv-pin-control-marker";
 
-/// The four lifetimes a Send may be given, **in hours**. Not a free `u32`:
-/// the picker offers exactly these, and [`validate_plan`] refuses anything
-/// else, so a caller cannot quietly publish a link that outlives what the
-/// user was shown.
+/// **How long a Send lasts, in the four shapes that answer is ever given in.**
 ///
-/// # Why hours, when this was three `u8`s of days
+/// Not a `u32` of hours any more, and the widening is the reason. A duration
+/// can say "1 hour" and "30 days"; it cannot say "3 months" without lying
+/// about how long a month is, it cannot say "the 14th of March" at all, and it
+/// cannot say "never" except by naming a number so large it is a sentinel
+/// wearing a duration's clothes. Each of those is a different kind of answer,
+/// so each is its own variant and the compiler makes every formatter,
+/// validator and encoder in this file account for all four.
 ///
-/// Design §5a's Access block offers `1 h · 24 h · 7 d · 30 d`, and a `u8` of
-/// days cannot say `1 h` at all -- the shortest lifetime it can express is a
-/// whole day, so the two sub-day cells the design draws were not "not built
-/// yet", they were unrepresentable. **Nothing above this constant was in the
-/// way.** The wire format is an ISO instant and not a day: [`deletion_date`]
-/// already stamps hours, minutes, milliseconds and a `Z`, `bw send create`
-/// reads it as an instant, and the user's own server parses it at full
-/// ISO-8601 precision with no whole-day rounding anywhere in its
-/// `parseDate`. The only thing that made a Send's shortest life one day was
-/// the unit of this array.
+/// `Copy`, so the composers' per-frame reads cost nothing and the type can sit
+/// in a `const` array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendLifetime {
+    /// A fixed number of hours from the moment the link is published.
+    ///
+    /// The unit is hours and not days because design §5a's Access block
+    /// offers a one-hour link, and a day cannot express one. Nothing
+    /// downstream rounds: [`deletion_date`] has always stamped a full ISO
+    /// instant, `bw send create` reads one, and the user's own server parses
+    /// it at full ISO-8601 precision.
+    ///
+    /// One hour is the shortest the picker offers rather than, say, five
+    /// minutes, because a Send is published by pressing a button and then
+    /// *told to someone*; a link that can die before the sentence naming it
+    /// has been read is a foot-gun rather than a control.
+    Hours(u32),
+    /// A whole number of calendar months from the day the link is published.
+    ///
+    /// **A month is not a number of days and this app does not pretend it
+    /// is.** `3 months` published as `90 days` is wrong by a day or two
+    /// depending on which months it crosses, and it is wrong where the cell
+    /// and the sentence under it are read together -- a control saying "3
+    /// months" beside a date three months and two days out is a form
+    /// disagreeing with itself. The arithmetic is
+    /// [`crate::local_time::add_months`], which clamps rather than wraps, so
+    /// 31 January plus one month is 28 February and never 3 March.
+    Months(u32),
+    /// A day the user pointed at on a calendar, **already resolved to the UTC
+    /// instant that day ends at** -- see
+    /// [`crate::local_time::end_of_local_day_utc_millis`] for why the end and
+    /// not the start.
+    ///
+    /// # Why an instant and not a `(year, month, day)`
+    ///
+    /// The two would be the same thing said twice, and the pair would need a
+    /// timezone to reconcile them -- meaning every function here that formats
+    /// a lifetime would take a zone in order to answer a question about a day
+    /// it was already told. Holding the resolved instant instead means
+    /// [`deletion_date`] is the same one line it is for every other variant,
+    /// and the day is recovered exactly when it is wanted for display, by the
+    /// same `local_parts` every other date in this app goes through.
+    ///
+    /// The conversion happens once, where the user picks, through
+    /// [`SendLifetime::on_local_day`]. There is no second spelling of it.
+    Until(i64),
+    /// No end date at all. The link works until the Send is deleted.
+    ///
+    /// **A first-class choice and drawn like one.** A credential shared inside
+    /// a household is wanted again next month and the month after; a link that
+    /// has to be re-made every thirty days is the wrong answer to that, not
+    /// the safe one. So there is no confirmation step, no warning colour and
+    /// no defensive wording anywhere on its path -- it is a cell like the
+    /// others, sitting with the others.
+    ///
+    /// On the wire it is [`NEVER_DELETION_DATE`], a real instant in the year
+    /// 9999, because `deletionDate` is a required non-null field for every
+    /// Bitwarden-compatible server and client. That is an implementation
+    /// detail of the transport and **the user is never shown it**:
+    /// [`lifetime_label`] says `Never` and [`expiry_wording`] says the link
+    /// has no end date.
+    Never,
+}
+
+/// **The nine rows the picker offers, in the order it offers them.**
 ///
-/// One hour is the shortest offered rather than, say, five minutes, because a
-/// Send is published by pressing a button and then *told to someone*; a link
-/// that can die before the sentence naming it has been read is a foot-gun
-/// rather than a control. Thirty days is unchanged and stays the longest: the
-/// server this app is built against refuses a deletion date more than 31 days
-/// out, so 30 is already the last round number under a real ceiling.
-pub const DELETE_IN_HOURS_CHOICES: [u32; 4] = [1, 24, 24 * 7, 24 * 30];
+/// `None` is the one row that has no constant value: a date the user points
+/// at, whose value *is* their answer. It is a slot in this list rather than a
+/// thing bolted on beside it, so there is exactly one statement anywhere of
+/// what the choices are and what order they come in -- the picker draws this,
+/// [`validate_access`] refuses anything not in it, and a row added here
+/// appears in both without either being edited.
+///
+/// # The order
+///
+/// Ascending, all the way through. `Never` is last because it is the longest,
+/// and the picked date sits just before it because it cannot reach past
+/// [`MAX_PICKED_MONTHS`].
+///
+/// **`Never` is a row like the others.** It is not tucked behind a "more"
+/// surface, not separated by a rule, and not last because it is dangerous. A
+/// credential shared with someone in the same house is wanted again next month
+/// and the month after; a link that expires is the wrong answer to that, and
+/// making the right one harder to reach would be this form disagreeing with
+/// its user about their own situation.
+pub const LIFETIME_CHOICES: [Option<SendLifetime>; 9] = [
+    Some(SendLifetime::Hours(1)),
+    Some(SendLifetime::Hours(24)),
+    Some(SendLifetime::Hours(24 * 7)),
+    Some(SendLifetime::Hours(24 * 30)),
+    Some(SendLifetime::Months(3)),
+    Some(SendLifetime::Months(6)),
+    Some(SendLifetime::Months(12)),
+    None,
+    Some(SendLifetime::Never),
+];
+
+/// The row label for the choice that has no fixed value, while no date has
+/// been picked. Once one has, the row and the closed box both say the date --
+/// see [`lifetime_label`].
+///
+/// The ellipsis is the app's promise that pressing it opens something rather
+/// than answering the question, which is the one thing this row does
+/// differently from the other eight.
+pub const PICK_A_DATE_LABEL: &str = "A date you pick\u{2026}";
 
 /// The default, and the one the picker starts on. **Seven days, unchanged**
-/// -- the widening added choices at the short end and moved nothing that was
-/// already there, so a user who never touches the row gets exactly the
-/// lifetime they got before.
-pub const DEFAULT_DELETE_IN_HOURS: u32 = 24 * 7;
+/// through every widening this control has had -- a user who never touches the
+/// row gets exactly the lifetime they have always got.
+pub const DEFAULT_LIFETIME: SendLifetime = SendLifetime::Hours(24 * 7);
 
-/// [`validate_plan`]'s answer for a lifetime that is not one of
-/// [`DELETE_IN_HOURS_CHOICES`].
+/// The `deletionDate` that means "this Send never expires".
 ///
-/// **A literal, and held against the array by a test rather than built from
-/// it.** [`validate_plan`] returns `&'static str` -- every one of its answers
-/// is a finished sentence shown beside the form, and a `String` there would
-/// make the one function this feature's two screens share allocate on every
-/// frame they validate. So the choices are spelled here, and
+/// # Why a sentinel instant and not an absent field
+///
+/// `deletionDate` is non-null in the D1 schema the user's own server runs, in
+/// its `storage-schema.ts`, in both of its response mappers, and in what every
+/// other Bitwarden client expects to render. A null would be a migration, four
+/// server call-site changes and a wire shape no existing client has seen, in
+/// exchange for nothing the user can perceive. The sentinel is also *true*:
+/// that server runs no cleanup job, so a Send dated in the year 9999 is a Send
+/// that genuinely never goes away.
+///
+/// This exact string, and not merely some large date: it is the largest
+/// four-digit-year ISO instant, it is what the server's own
+/// `LIMITS.send.neverDeletionDate` holds, and it sorts last lexicographically
+/// among ISO `Z` strings -- which is literally what that server's
+/// `deletion_date > ?` comparison does.
+///
+/// **It is never painted.** Every surface that names a lifetime goes through
+/// [`lifetime_label`] or [`expiry_wording`], and neither of them will show a
+/// user the year 9999.
+pub const NEVER_DELETION_DATE: &str = "9999-12-31T23:59:59.999Z";
+
+/// How far ahead the calendar lets a date be picked, as a count of whole
+/// months. Twelve, which is exactly as far as the longest preset reaches.
+///
+/// A date further out than the longest offered duration is not a date the user
+/// is reasoning about; it is `Never` said less clearly, and `Never` is right
+/// there in the same list. Bounding it also keeps the calendar navigable by
+/// month alone -- twelve taps from today to the far end, and no year control
+/// at all. See `theme::date_picker`.
+pub const MAX_PICKED_MONTHS: u32 = 12;
+
+/// The furthest a picked date may land, as milliseconds from now.
+///
+/// 366 days is [`MAX_PICKED_MONTHS`] at its longest -- a year that contains a
+/// leap day. The extra day is not slop: a picked date resolves to the **end**
+/// of a local day, which is up to a day-minus-a-millisecond past that day's
+/// start, and the local day itself sits up to fourteen hours either side of
+/// UTC. Measuring the window in whole days and adding one covers both exactly,
+/// and the calendar cannot offer a day outside it in the first place.
+const MAX_PICKED_MILLIS: i64 = 367 * crate::local_time::MILLIS_PER_DAY;
+
+/// [`validate_access`]'s answer for a lifetime that is none of the choices the
+/// picker offers.
+///
+/// **A literal, and held against [`LIFETIME_CHOICES`] by a test rather than
+/// built from it.** [`validate_plan`] returns `&'static str` -- every one of
+/// its answers is a finished sentence shown beside the form, and a `String`
+/// there would make the one function this feature's two screens share allocate
+/// on every frame they validate. So the choices are spelled here, and
 /// `the_lifetime_refusal_names_every_choice_the_picker_offers` reads the
-/// array, runs each entry through [`lifetime_label`] and insists this
-/// sentence contains all of them. A fifth cell added to the picker reds that
-/// test rather than shipping a refusal that names four.
+/// array, runs each entry through [`lifetime_label`] and insists this sentence
+/// contains all of them. A ninth preset added to the picker reds that test
+/// rather than shipping a refusal that names eight.
 const LIFETIME_CHOICES_SENTENCE: &str =
-    "Choose how long the link should last: 1 hour, 1 day, 7 days or 30 days.";
+    "Choose how long the link should last: 1 hour, 1 day, 7 days, 30 days, 3 months, 6 months, \
+     12 months, a date you pick, or Never.";
+
+/// [`validate_access`]'s answer for a picked date that is no longer ahead of
+/// the clock -- the composer left open across midnight with "today" chosen.
+///
+/// It matters because the server accepts a deletion date in the past without
+/// complaint: the publish would succeed and the link would be dead before it
+/// was copied.
+const LIFETIME_DATE_PASSED: &str = "That date has gone by. Pick a later one.";
+
+/// [`validate_access`]'s answer for a picked date beyond
+/// [`MAX_PICKED_MONTHS`]. It names the other choice rather than only refusing,
+/// because a user reaching past a year almost always wants the one that has no
+/// end at all.
+const LIFETIME_DATE_TOO_FAR: &str =
+    "Pick a date within the next 12 months, or choose Never for a link with no end date.";
 
 /// The longest name that will be accepted. `bw` has no documented limit; this
 /// exists so a name pasted out of a document cannot become a multi-kilobyte
@@ -190,9 +338,9 @@ pub struct SendPlan {
     pub name: String,
     pub text: Zeroizing<String>,
     pub hidden: bool,
-    /// One of [`DELETE_IN_HOURS_CHOICES`]. Defaults to
-    /// [`DEFAULT_DELETE_IN_HOURS`] via [`Default`].
-    pub delete_in_hours: u32,
+    /// One of [`LIFETIME_CHOICES`], or a date the user picked. Defaults to
+    /// [`DEFAULT_LIFETIME`] via [`Default`].
+    pub lifetime: SendLifetime,
     pub password: Option<Zeroizing<String>>,
     pub max_access_count: Option<u32>,
 }
@@ -203,7 +351,7 @@ impl Default for SendPlan {
             name: String::new(),
             text: Zeroizing::new(String::new()),
             hidden: false,
-            delete_in_hours: DEFAULT_DELETE_IN_HOURS,
+            lifetime: DEFAULT_LIFETIME,
             password: None,
             max_access_count: None,
         }
@@ -234,7 +382,7 @@ impl std::fmt::Debug for SendPlan {
             .field("name", &self.name)
             .field("text", &Redacted(self.text.len()))
             .field("hidden", &self.hidden)
-            .field("delete_in_hours", &self.delete_in_hours)
+            .field("lifetime", &self.lifetime)
             .field("password", &self.password.as_ref().map(|p| Redacted(p.len())))
             .field("max_access_count", &self.max_access_count)
             .finish()
@@ -245,7 +393,14 @@ impl std::fmt::Debug for SendPlan {
 ///
 /// A `&'static str` rather than an enum because every one of these is a
 /// sentence shown beside the form; there is nothing for a caller to branch on.
-pub fn validate_plan(plan: &SendPlan) -> Option<&'static str> {
+///
+/// # Why it takes a clock
+///
+/// One of the rules it delegates to is "the date you picked has not gone by",
+/// and the past is not a property of a `SendPlan`. The clock is injected for
+/// this module's blanket reason: nothing here reads the wall clock for itself,
+/// so every assertion about a refusal is exact wherever the suite runs.
+pub fn validate_plan(plan: &SendPlan, now: &dyn SendClock) -> Option<&'static str> {
     if plan.name.trim().is_empty() {
         return Some("Give the Send a name.");
     }
@@ -265,9 +420,10 @@ pub fn validate_plan(plan: &SendPlan) -> Option<&'static str> {
         return Some("That is too much text for one Send.");
     }
     validate_access(
-        plan.delete_in_hours,
+        plan.lifetime,
         plan.password.as_deref().map(String::as_str),
         plan.max_access_count,
+        now,
     )
 }
 
@@ -295,12 +451,34 @@ pub fn validate_plan(plan: &SendPlan) -> Option<&'static str> {
 /// The one rule NOT here is `hidden`, which has none: every value of it is
 /// legal and this app always publishes `true`.
 pub fn validate_access(
-    delete_in_hours: u32,
+    lifetime: SendLifetime,
     password: Option<&str>,
     max_access_count: Option<u32>,
+    now: &dyn SendClock,
 ) -> Option<&'static str> {
-    if !DELETE_IN_HOURS_CHOICES.contains(&delete_in_hours) {
-        return Some(LIFETIME_CHOICES_SENTENCE);
+    // **The picked date gets its own two refusals, and they are not the
+    // "choose a lifetime" sentence.** A user who picked 14 March has chosen
+    // from the list; what is wrong is the date, and a sentence listing nine
+    // choices back at them says nothing about which one to change.
+    //
+    // The past arm is the one that matters. The composer can sit open across
+    // local midnight with "today" selected, and the server accepts a deletion
+    // date that has already gone by without a word -- so without this, the
+    // publish succeeds and the link is dead before it is copied.
+    match lifetime {
+        SendLifetime::Until(at) => {
+            if at <= now.now_unix_millis() {
+                return Some(LIFETIME_DATE_PASSED);
+            }
+            if at > now.now_unix_millis().saturating_add(MAX_PICKED_MILLIS) {
+                return Some(LIFETIME_DATE_TOO_FAR);
+            }
+        }
+        other => {
+            if !LIFETIME_CHOICES.contains(&Some(other)) {
+                return Some(LIFETIME_CHOICES_SENTENCE);
+            }
+        }
     }
     // **An empty `Some` is not reachable from either composer any more** --
     // both draw the password as one box where empty *is* "no password", and
@@ -391,16 +569,107 @@ fn utc_parts(millis: i64) -> (i64, u32, u32, u32, u32, u32, u32) {
 /// about when a link dies -- the failure [`crate::local_time`] was extracted
 /// to end.
 ///
-/// **The parameter is hours and the format did not move**, which is the whole
-/// of why [`DELETE_IN_HOURS_CHOICES`] could be widened at all: this function
-/// has always emitted a full instant, so `now + 1 hour` is expressible in the
-/// bytes that already went over the wire. Nothing downstream rounds -- `bw`
-/// reads an ISO instant, and the server this app is built against parses one
-/// at full precision.
-pub(crate) fn deletion_date(hours: u32, now: &dyn SendClock) -> String {
-    let (y, mo, d, h, mi, s, ms) =
-        utc_parts(now.now_unix_millis() + i64::from(hours) * MILLIS_PER_HOUR);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")
+/// **The format did not move**, which is the whole of why the lifetime could
+/// be widened at all: this function has always emitted a full instant, so
+/// `now + 1 hour`, `now + 3 months` and a day the user pointed at are all
+/// expressible in the bytes that already went over the wire. Nothing
+/// downstream rounds -- `bw` reads an ISO instant, and the server this app is
+/// built against parses one at full precision.
+///
+/// [`SendLifetime::Never`] is the one answer that is not arithmetic on `now`:
+/// it is [`NEVER_DELETION_DATE`] verbatim, for the reason that constant gives.
+pub(crate) fn deletion_date(lifetime: SendLifetime, now: &dyn SendClock) -> String {
+    match deletion_instant(lifetime, now) {
+        Some(at) => {
+            let (y, mo, d, h, mi, s, ms) = utc_parts(at);
+            format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")
+        }
+        None => NEVER_DELETION_DATE.to_string(),
+    }
+}
+
+/// The UTC instant a lifetime resolves to, or `None` for
+/// [`SendLifetime::Never`], which resolves to no instant at all.
+///
+/// **The one place a lifetime becomes a moment.** [`deletion_date`] formats
+/// it for the wire and [`expiry_wording`] shifts it into the user's zone for
+/// the sentence under the picker; both take it from here, so the date the form
+/// promises and the date the server is told cannot come apart.
+///
+/// `Months` is calendar arithmetic on the **UTC** civil date, keeping the time
+/// of day: three months from 14:20 on 10 September is 14:20 on 10 December,
+/// and 31 January plus a month is the 28th or 29th of February rather than
+/// spilling into March. Doing it in UTC rather than in the user's zone can put
+/// the local clock time an hour out across a daylight-saving boundary, which
+/// is immaterial for a lifetime measured in months -- where it would not be
+/// immaterial, for a day the user pointed at, the zone is honoured exactly and
+/// [`SendLifetime::Until`] carries the already-resolved instant to prove it.
+fn deletion_instant(lifetime: SendLifetime, now: &dyn SendClock) -> Option<i64> {
+    let at = now.now_unix_millis();
+    match lifetime {
+        SendLifetime::Hours(hours) => Some(at + i64::from(hours) * MILLIS_PER_HOUR),
+        SendLifetime::Months(months) => {
+            let parts = crate::local_time::civil_parts(at);
+            let (y, mo, d) =
+                crate::local_time::add_months(parts.year, parts.month, parts.day, months);
+            let time_of_day = at.rem_euclid(crate::local_time::MILLIS_PER_DAY);
+            Some(
+                crate::local_time::days_from_civil(y, mo, d)
+                    .saturating_mul(crate::local_time::MILLIS_PER_DAY)
+                    .saturating_add(time_of_day),
+            )
+        }
+        SendLifetime::Until(instant) => Some(instant),
+        SendLifetime::Never => None,
+    }
+}
+
+impl SendLifetime {
+    /// The lifetime meaning "until the end of this local day".
+    ///
+    /// **The only way a [`SendLifetime::Until`] should ever be built**, and the
+    /// single place the calendar's `(year, month, day)` becomes an instant. See
+    /// [`crate::local_time::end_of_local_day_utc_millis`] for why the end of
+    /// the day and not the start -- in one line, because "until Friday" has to
+    /// include Friday, and because a day picked as *today* must not resolve to
+    /// a moment that has already gone.
+    pub fn on_local_day(year: i64, month: u32, day: u32, zone: &dyn LocalOffset) -> Self {
+        SendLifetime::Until(crate::local_time::end_of_local_day_utc_millis(
+            year, month, day, zone,
+        ))
+    }
+
+    /// The local day this lifetime lands on, for a calendar that has to open
+    /// showing the answer already in force. `None` when there is no day to
+    /// show -- [`SendLifetime::Never`].
+    pub fn local_day(self, now: &dyn SendClock, zone: &dyn LocalOffset) -> Option<(i64, u32, u32)> {
+        let at = deletion_instant(self, now)?;
+        let parts = crate::local_time::local_parts(at, zone);
+        Some((parts.year, parts.month, parts.day))
+    }
+}
+
+/// The first and last local day a date may be picked on: today, and
+/// [`MAX_PICKED_MONTHS`] months after today.
+///
+/// **Today and not tomorrow.** "This link dies tonight" is a real thing to
+/// want, and a picked day resolves to the *end* of that day (see
+/// [`crate::local_time::end_of_local_day_utc_millis`]), so today is a
+/// lifetime of however much of today is left rather than a lifetime of zero.
+///
+/// It is here and not on the calendar because the window is a fact about what
+/// this app will publish, which is this module's subject: [`validate_access`]
+/// enforces the same bound in milliseconds, and a calendar that offered a day
+/// the validator refuses would be a control whose every press produced a
+/// refusal.
+pub fn pickable_window(
+    now: &dyn SendClock,
+    zone: &dyn LocalOffset,
+) -> ((i64, u32, u32), (i64, u32, u32)) {
+    let today = crate::local_time::local_parts(now.now_unix_millis(), zone);
+    let first = (today.year, today.month, today.day);
+    let last = crate::local_time::add_months(today.year, today.month, today.day, MAX_PICKED_MONTHS);
+    (first, last)
 }
 
 /// One lifetime, named the way both of this app's Send composers name it:
@@ -422,8 +691,8 @@ pub(crate) fn deletion_date(hours: u32, now: &dyn SendClock) -> String {
 /// A multiple of 24 hours is a number of days -- `168 hours` is true and
 /// useless, and the user chose a cell that says a week. Anything shorter is
 /// named in hours. There is no third unit because there is no third kind of
-/// choice: [`DELETE_IN_HOURS_CHOICES`] is one sub-day cell and three
-/// whole-day ones.
+/// choice: the hour-based presets are one sub-day cell and three whole-day
+/// ones.
 ///
 /// §5a draws the second cell as `24 h`, and this names it **`1 day`**. That
 /// is not a slip. `24` hours is the lifetime this app has always offered as
@@ -449,16 +718,49 @@ pub(crate) fn deletion_date(hours: u32, now: &dyn SendClock) -> String {
 /// than one taking the design's glyphs and the other taking prose -- two
 /// screens naming one duration two ways is exactly what this function was
 /// moved here to stop.
-pub fn lifetime_label(hours: u32) -> String {
-    if hours % 24 == 0 && hours != 0 {
-        let days = hours / 24;
-        let unit = if days == 1 { "day" } else { "days" };
-        format!("{days} {unit}")
-    } else {
-        let unit = if hours == 1 { "hour" } else { "hours" };
-        format!("{hours} {unit}")
+/// # A picked date is named as the date, and `Never` is named `Never`
+///
+/// The other two variants have no duration to say. A date the user pointed at
+/// *is* the answer, so the label is the day itself, through
+/// [`crate::local_time::format_day`] -- the same formatter
+/// [`expiry_wording`] uses, so the control and the sentence under it cannot
+/// spell one day two ways. That is why this function takes a zone: the stored
+/// instant is UTC and the day the user picked is theirs.
+///
+/// `Never` is one word, with nothing appended to it. The wire carries
+/// [`NEVER_DELETION_DATE`] and **no user is ever shown the year 9999**; that
+/// constant exists because `deletionDate` is a required field, not because a
+/// date is what the choice means.
+pub fn lifetime_label(lifetime: SendLifetime, zone: &dyn LocalOffset) -> String {
+    match lifetime {
+        SendLifetime::Hours(hours) => {
+            if hours % 24 == 0 && hours != 0 {
+                let days = hours / 24;
+                let unit = if days == 1 { "day" } else { "days" };
+                format!("{days} {unit}")
+            } else {
+                let unit = if hours == 1 { "hour" } else { "hours" };
+                format!("{hours} {unit}")
+            }
+        }
+        SendLifetime::Months(months) => {
+            let unit = if months == 1 { "month" } else { "months" };
+            format!("{months} {unit}")
+        }
+        SendLifetime::Until(at) => {
+            crate::local_time::format_day(crate::local_time::local_parts(at, zone))
+        }
+        SendLifetime::Never => NEVER_LABEL.to_string(),
     }
 }
+
+/// What [`SendLifetime::Never`] is called, everywhere it is named.
+///
+/// One word, and no qualifier after it. See that variant on why it carries no
+/// warning: it is the right answer to sharing a household credential with
+/// someone who will want it again next month, and a label that hedged would be
+/// the form arguing with the user about a choice they are entitled to.
+pub const NEVER_LABEL: &str = "Never";
 
 /// What the form says under the lifetime picker: **the date the link dies**,
 /// not only the number of days.
@@ -508,16 +810,54 @@ pub fn lifetime_label(hours: u32) -> String {
 ///
 /// The duration half comes from [`lifetime_label`] rather than being
 /// re-spelled here -- see that function.
-pub fn expiry_wording(hours: u32, now: &dyn SendClock, zone: &dyn LocalOffset) -> String {
-    let expires_at = now.now_unix_millis() + i64::from(hours) * MILLIS_PER_HOUR;
-    let parts = crate::local_time::local_parts(expires_at, zone);
-    let when = if hours < 24 {
-        crate::local_time::format_day_time(parts)
-    } else {
-        crate::local_time::format_day(parts)
+/// # The two answers that are not durations
+///
+/// A **picked date** already is the date, so the sentence has no duration half
+/// to give: it says which day, and that the link lasts to the end of it --
+/// which is the one thing about a picked date the user cannot read off the
+/// calendar, and the thing that stops "today" meaning "already over".
+///
+/// **`Never`** gets a sentence that states the fact and stops. It does not
+/// warn, does not count anything, and does not tell the user where to go and
+/// undo it -- a link with no end date is a legitimate answer, chosen on
+/// purpose, and a caution printed under it would be the form second-guessing
+/// a choice it just offered. It does say what ends the link, because "no end
+/// date" on its own leaves open whether anything ever does.
+pub fn expiry_wording(lifetime: SendLifetime, now: &dyn SendClock, zone: &dyn LocalOffset) -> String {
+    let Some(expires_at) = deletion_instant(lifetime, now) else {
+        return NEVER_WORDING.to_string();
     };
-    format!("The link stops working after {} -- on {when}.", lifetime_label(hours))
+    let parts = crate::local_time::local_parts(expires_at, zone);
+    match lifetime {
+        SendLifetime::Until(_) => {
+            let day = crate::local_time::format_day(parts);
+            format!("The link works until the end of {day}.")
+        }
+        _ => {
+            let sub_day = matches!(lifetime, SendLifetime::Hours(hours) if hours < 24);
+            let when = if sub_day {
+                crate::local_time::format_day_time(parts)
+            } else {
+                crate::local_time::format_day(parts)
+            };
+            format!(
+                "The link stops working after {} -- on {when}.",
+                lifetime_label(lifetime, zone)
+            )
+        }
+    }
 }
+
+/// [`expiry_wording`]'s sentence for [`SendLifetime::Never`].
+///
+/// **Deletion is named as the thing that ends the link, and no place is named
+/// to do it.** This sentence is drawn on two forms, neither of which can point
+/// at where a Send is managed afterwards: nothing in this app shows a record's
+/// Sends on the record, so "you will see it on the item" would be false. It
+/// says what is true -- the link ends when the Send is deleted -- and leaves
+/// finding the Send to the Sends screen that lists them.
+pub const NEVER_WORDING: &str =
+    "The link has no end date. It keeps working until the Send is deleted.";
 
 // ---------------------------------------------------------------------------
 // The invocation
@@ -710,7 +1050,7 @@ pub fn plan_to_invocation(
     session: &str,
     now: &dyn SendClock,
 ) -> Result<SendInvocation, SendError> {
-    if let Some(problem) = validate_plan(plan) {
+    if let Some(problem) = validate_plan(plan, now) {
         return Err(SendError::Rejected(problem.to_string()));
     }
 
@@ -745,7 +1085,7 @@ pub fn plan_to_invocation(
         None => json_mut.push_str("null"),
     }
     json_mut.push_str(",\"deletionDate\":");
-    push_json_string(json_mut, &deletion_date(plan.delete_in_hours, now));
+    push_json_string(json_mut, &deletion_date(plan.lifetime, now));
     json_mut.push_str(",\"expirationDate\":null,\"password\":");
     match &plan.password {
         Some(p) => push_json_string(json_mut, p),
@@ -3412,27 +3752,57 @@ mod tests {
     /// before.**
     ///
     /// This was `delete_in_days_reaches_the_built_json` and compared 7 days
-    /// against 30. The two whole-day plans are kept verbatim -- the widening
-    /// must not move a lifetime that already existed, and these two exact
-    /// strings are what say so. The third plan is the one the old `u8` could
-    /// not express: a one-hour Send, whose `deletionDate` differs from
-    /// "now" in the HOUR field and in nothing else, which is the whole claim
-    /// that a sub-day lifetime reaches the wire rather than being rounded
-    /// somewhere on the way.
+    /// against 30. The two whole-day plans are kept verbatim -- no widening
+    /// may move a lifetime that already existed, and these two exact strings
+    /// are what say so. The one-hour plan is what the original `u8` of days
+    /// could not express: a `deletionDate` differing from "now" in the HOUR
+    /// field and in nothing else, which is the whole claim that a sub-day
+    /// lifetime reaches the wire rather than being rounded on the way.
+    ///
+    /// **The three arms the enum added are asserted here too, at the same
+    /// strength.** Each is a different KIND of answer and each could fail on
+    /// its own: a month could be published as thirty days, a picked day could
+    /// be published as the instant it starts rather than the instant it ends,
+    /// and `Never` could be published as some large duration instead of the
+    /// one sentinel every reader of this field agrees on.
     #[test]
-    fn delete_in_hours_reaches_the_built_json() {
-        let base = SendPlan { delete_in_hours: 24 * 7, ..plan() };
-        let variant = SendPlan { delete_in_hours: 24 * 30, ..plan() };
+    fn every_lifetime_reaches_the_built_json() {
+        let base = SendPlan { lifetime: SendLifetime::Hours(24 * 7), ..plan() };
+        let variant = SendPlan { lifetime: SendLifetime::Hours(24 * 30), ..plan() };
         let (a, b) = differ(&base, &variant);
         assert_eq!(a["deletionDate"], "2026-08-18T00:43:17.148Z");
         assert_eq!(b["deletionDate"], "2026-09-10T00:43:17.148Z");
 
-        let (_, hour) = differ(&base, &SendPlan { delete_in_hours: 1, ..plan() });
+        let (_, hour) = differ(&base, &SendPlan { lifetime: SendLifetime::Hours(1), ..plan() });
         assert_eq!(
             hour["deletionDate"], "2026-08-11T01:43:17.148Z",
             "a one-hour Send did not reach the JSON as an instant one hour from now -- the \
              minutes, seconds and milliseconds are `NOW`'s own, so a rounding to midnight or \
              to a whole day would show up here and nowhere else"
+        );
+
+        // Three calendar months from 11 Aug is 11 Nov, at NOW's own time of
+        // day. Ninety days would be 9 November, so a months-as-days
+        // implementation reds this line and nothing else.
+        let (_, months) = differ(&base, &SendPlan { lifetime: SendLifetime::Months(3), ..plan() });
+        assert_eq!(months["deletionDate"], "2026-11-11T00:43:17.148Z");
+
+        // A day picked in UTC resolves to that day's LAST millisecond. The
+        // start of the day would be `...T00:00:00.000Z`, which is the reading
+        // that publishes a link already dead when the day picked is today.
+        let picked = SendPlan {
+            lifetime: SendLifetime::on_local_day(2026, 9, 14, &crate::local_time::FixedOffset(0)),
+            ..plan()
+        };
+        let (_, on_day) = differ(&base, &picked);
+        assert_eq!(on_day["deletionDate"], "2026-09-14T23:59:59.999Z");
+
+        let (_, never) = differ(&base, &SendPlan { lifetime: SendLifetime::Never, ..plan() });
+        assert_eq!(
+            never["deletionDate"], NEVER_DELETION_DATE,
+            "`Never` must publish the one sentinel the server's own \
+             `LIMITS.send.neverDeletionDate` holds -- any other large date is a Send that \
+             expires in a very long time, which is a different thing"
         );
     }
 
@@ -3506,7 +3876,7 @@ mod tests {
             name: "Wi-Fi password".to_string(),
             text: Zeroizing::new("s3cr3t-body".to_string()),
             hidden: true,
-            delete_in_hours: 24 * 30,
+            lifetime: SendLifetime::Hours(24 * 30),
             password: Some(Zeroizing::new("share-pw".to_string())),
             max_access_count: Some(2),
         };
@@ -3959,7 +4329,7 @@ mod tests {
             name: "Wi-Fi password".to_string(),
             text: Zeroizing::new("hunter2".to_string()),
             hidden: true,
-            delete_in_hours: 24 * 30,
+            lifetime: SendLifetime::Hours(24 * 30),
             password: Some(Zeroizing::new("share-pw".to_string())),
             max_access_count: Some(4),
         };
@@ -4373,7 +4743,7 @@ mod tests {
 
     #[test]
     fn a_plan_is_refused_for_each_reason_it_can_be_refused_for() {
-        assert_eq!(validate_plan(&plan()), None, "control: the good plan is refused");
+        assert_eq!(validate_plan(&plan(), &NOW), None, "control: the good plan is refused");
         let cases = [
             SendPlan { name: "  ".to_string(), ..plan() },
             SendPlan { name: "n".repeat(MAX_NAME_LEN + 1), ..plan() },
@@ -4388,15 +4758,23 @@ mod tests {
             // for the same reason. `73` is the case the `u8` of days could
             // not even pose -- a plausible-looking number of hours that is
             // not a cell.
-            SendPlan { delete_in_hours: 3, ..plan() },
-            SendPlan { delete_in_hours: 73, ..plan() },
-            SendPlan { delete_in_hours: 0, ..plan() },
+            SendPlan { lifetime: SendLifetime::Hours(3), ..plan() },
+            SendPlan { lifetime: SendLifetime::Hours(73), ..plan() },
+            SendPlan { lifetime: SendLifetime::Hours(0), ..plan() },
+            // The two the enum added, and they are refused by the arm that
+            // exists for them rather than by the "choose a lifetime" one --
+            // see `the_picked_date_is_refused_for_its_own_two_reasons`.
+            SendPlan { lifetime: SendLifetime::Months(4), ..plan() },
+            SendPlan {
+                lifetime: SendLifetime::Until(NOW.0 - crate::local_time::MILLIS_PER_DAY),
+                ..plan()
+            },
             SendPlan { password: Some(Zeroizing::new(String::new())), ..plan() },
             SendPlan { max_access_count: Some(0), ..plan() },
         ];
         let mut ran = 0;
         for case in &cases {
-            let problem = validate_plan(case)
+            let problem = validate_plan(case, &NOW)
                 .unwrap_or_else(|| panic!("this plan was accepted: {:?}", case.name));
             assert!(problem.len() > 10, "the refusal says nothing useful: {problem:?}");
             assert!(
@@ -4406,9 +4784,56 @@ mod tests {
             ran += 1;
         }
         assert_eq!(ran, cases.len());
-        for hours in DELETE_IN_HOURS_CHOICES {
-            assert_eq!(validate_plan(&SendPlan { delete_in_hours: hours, ..plan() }), None);
+        for choice in LIFETIME_CHOICES.into_iter().flatten() {
+            assert_eq!(validate_plan(&SendPlan { lifetime: choice, ..plan() }, &NOW), None);
         }
+    }
+
+    /// **A picked date has two ways of being wrong and neither is "that is not
+    /// one of the choices".**
+    ///
+    /// The past arm is the one that matters and the one this feature could
+    /// most easily have shipped without: the composer can sit open across
+    /// local midnight with "today" chosen, and the server accepts a deletion
+    /// date that has already gone by without a word -- so the publish would
+    /// succeed and the link would be dead before it was copied.
+    #[test]
+    fn the_picked_date_is_refused_for_its_own_two_reasons() {
+        let utc = crate::local_time::FixedOffset(0);
+        // Control: a day inside the window is accepted, so the two refusals
+        // below are about the dates and not about the variant.
+        assert_eq!(
+            validate_access(SendLifetime::on_local_day(2026, 9, 14, &utc), None, None, &NOW),
+            None
+        );
+        // Today, resolved to the END of today, is still ahead of NOW -- which
+        // is the whole reason `on_local_day` takes the end of the day.
+        assert_eq!(
+            validate_access(SendLifetime::on_local_day(2026, 8, 11, &utc), None, None, &NOW),
+            None,
+            "a date picked as today must be publishable for the rest of today"
+        );
+        assert_eq!(
+            validate_access(SendLifetime::on_local_day(2026, 8, 10, &utc), None, None, &NOW),
+            Some(LIFETIME_DATE_PASSED)
+        );
+        assert_eq!(
+            validate_access(SendLifetime::on_local_day(2028, 1, 1, &utc), None, None, &NOW),
+            Some(LIFETIME_DATE_TOO_FAR)
+        );
+        // The far edge of the window, which is what `pickable_window` offers
+        // and therefore what the validator must accept.
+        let (_, last) = pickable_window(&NOW, &utc);
+        assert_eq!(
+            validate_access(
+                SendLifetime::on_local_day(last.0, last.1, last.2, &utc),
+                None,
+                None,
+                &NOW
+            ),
+            None,
+            "the last day the calendar offers is refused by the validator behind it"
+        );
     }
 
     /// **The refusal names every lifetime the picker offers**, which is what
@@ -4416,25 +4841,34 @@ mod tests {
     ///
     /// The old sentence said "1, 7 or 30 days" and was correct for exactly as
     /// long as the picker had three cells of days. This holds the sentence
-    /// against [`DELETE_IN_HOURS_CHOICES`] through [`lifetime_label`] -- the
-    /// same function that labels the cells -- so a choice added, removed or
-    /// renamed reds this rather than leaving a refusal that names a row the
-    /// user is not looking at.
+    /// against [`LIFETIME_CHOICES`] through [`lifetime_label`] -- the same
+    /// function that labels the rows -- so a choice added, removed or renamed
+    /// reds this rather than leaving a refusal that names a row the user is
+    /// not looking at.
+    ///
+    /// The picked-date row has no constant to label, so the sentence is held
+    /// against the words the picker actually puts on it instead.
     #[test]
     fn the_lifetime_refusal_names_every_choice_the_picker_offers() {
+        let utc = crate::local_time::FixedOffset(0);
         // Control: the needles are real. Without this an empty `choices`
         // would satisfy the loop below and say nothing.
-        assert_eq!(DELETE_IN_HOURS_CHOICES.len(), 4);
-        for hours in DELETE_IN_HOURS_CHOICES {
-            let label = lifetime_label(hours);
+        assert_eq!(LIFETIME_CHOICES.len(), 9);
+        assert_eq!(LIFETIME_CHOICES.iter().filter(|row| row.is_none()).count(), 1);
+        for choice in LIFETIME_CHOICES.into_iter().flatten() {
+            let label = lifetime_label(choice, &utc);
             assert!(
                 LIFETIME_CHOICES_SENTENCE.contains(&label),
                 "the picker offers {label:?} and the refusal does not name it: \
                  {LIFETIME_CHOICES_SENTENCE:?}"
             );
         }
+        assert!(
+            LIFETIME_CHOICES_SENTENCE.contains("a date you pick"),
+            "the picker offers a date and the refusal does not name it"
+        );
         assert_eq!(
-            validate_plan(&SendPlan { delete_in_hours: 3, ..plan() }),
+            validate_plan(&SendPlan { lifetime: SendLifetime::Hours(3), ..plan() }, &NOW),
             Some(LIFETIME_CHOICES_SENTENCE),
             "a lifetime off the row is refused with some other sentence"
         );
@@ -4449,18 +4883,45 @@ mod tests {
     /// `hours != 0` guard.
     #[test]
     fn every_lifetime_is_named_once_and_in_the_right_unit() {
-        let named: Vec<String> =
-            DELETE_IN_HOURS_CHOICES.iter().map(|h| lifetime_label(*h)).collect();
-        assert_eq!(named, vec!["1 hour", "1 day", "7 days", "30 days"]);
+        let utc = crate::local_time::FixedOffset(0);
+        let named: Vec<String> = LIFETIME_CHOICES
+            .into_iter()
+            .flatten()
+            .map(|choice| lifetime_label(choice, &utc))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                "1 hour", "1 day", "7 days", "30 days", "3 months", "6 months", "12 months",
+                "Never"
+            ]
+        );
         let mut unique = named.clone();
         unique.sort();
         unique.dedup();
-        assert_eq!(unique.len(), named.len(), "two cells of the picker carry one label");
+        assert_eq!(unique.len(), named.len(), "two rows of the picker carry one label");
         // Off the row, so that the plural rules are tested and not merely the
-        // four strings above.
-        assert_eq!(lifetime_label(2), "2 hours");
-        assert_eq!(lifetime_label(23), "23 hours");
-        assert_eq!(lifetime_label(48), "2 days");
+        // eight strings above.
+        assert_eq!(lifetime_label(SendLifetime::Hours(2), &utc), "2 hours");
+        assert_eq!(lifetime_label(SendLifetime::Hours(23), &utc), "23 hours");
+        assert_eq!(lifetime_label(SendLifetime::Hours(48), &utc), "2 days");
+        assert_eq!(lifetime_label(SendLifetime::Months(1), &utc), "1 month");
+        // **A picked date is named as its LOCAL day.** The instant stored is
+        // the end of 14 March in the zone it was picked in; five hours west of
+        // Greenwich it is still the 14th, and a label built off the UTC parts
+        // would say the 15th.
+        let new_york = crate::local_time::FixedOffset(-5 * 3_600_000);
+        let picked = SendLifetime::on_local_day(2027, 3, 14, &new_york);
+        assert_eq!(lifetime_label(picked, &new_york), "14 Mar 2027");
+        // **`Never` is one word and never a date.** The wire carries the year
+        // 9999 and no reader of this label may ever see it.
+        let never = lifetime_label(SendLifetime::Never, &utc);
+        assert_eq!(never, NEVER_LABEL);
+        assert!(!never.contains("9999"), "the sentinel leaked into a label: {never:?}");
+        assert!(
+            !expiry_wording(SendLifetime::Never, &NOW, &utc).contains("9999"),
+            "the sentinel leaked into the sentence under the picker"
+        );
     }
 
     /// **The length limit measures the name that gets PUBLISHED.**
@@ -4475,13 +4936,13 @@ mod tests {
     fn the_name_limit_is_measured_on_the_name_that_is_published() {
         let at_limit = "n".repeat(MAX_NAME_LEN);
         assert_eq!(
-            validate_plan(&SendPlan { name: at_limit.clone(), ..plan() }),
+            validate_plan(&SendPlan { name: at_limit.clone(), ..plan() }, &NOW),
             None,
             "control: a name of exactly {MAX_NAME_LEN} bytes is refused, so the limit is \
              off by one and the case below proves nothing"
         );
         assert_eq!(
-            validate_plan(&SendPlan { name: format!("  {at_limit}\t\r\n "), ..plan() }),
+            validate_plan(&SendPlan { name: format!("  {at_limit}\t\r\n "), ..plan() }, &NOW),
             None,
             "a name that is exactly at the limit once trimmed -- which is the name that \
              reaches the CLI -- was refused for its whitespace"
@@ -4489,7 +4950,7 @@ mod tests {
         // And the limit still bites on the trimmed length, so the fix did not
         // simply remove the check.
         assert_eq!(
-            validate_plan(&SendPlan { name: format!("  {at_limit}n  "), ..plan() }),
+            validate_plan(&SendPlan { name: format!("  {at_limit}n  "), ..plan() }, &NOW),
             Some("That name is too long."),
             "control: a name one byte over the limit once trimmed was accepted, so the \
              length check no longer refuses anything"
@@ -4525,47 +4986,47 @@ mod tests {
     fn the_deletion_date_is_the_injected_now_plus_the_chosen_hours() {
         // Control: the clock is read at all. A `deletion_date` that ignored
         // its argument would fail here rather than in a month's time.
-        assert_eq!(deletion_date(0, &FixedClock(0)), "1970-01-01T00:00:00.000Z");
-        assert_eq!(deletion_date(24, &NOW), "2026-08-12T00:43:17.148Z");
-        assert_eq!(deletion_date(24 * 7, &NOW), "2026-08-18T00:43:17.148Z");
-        assert_eq!(deletion_date(24 * 30, &NOW), "2026-09-10T00:43:17.148Z");
+        assert_eq!(deletion_date(SendLifetime::Hours(0), &FixedClock(0)), "1970-01-01T00:00:00.000Z");
+        assert_eq!(deletion_date(SendLifetime::Hours(24), &NOW), "2026-08-12T00:43:17.148Z");
+        assert_eq!(deletion_date(SendLifetime::Hours(24 * 7), &NOW), "2026-08-18T00:43:17.148Z");
+        assert_eq!(deletion_date(SendLifetime::Hours(24 * 30), &NOW), "2026-09-10T00:43:17.148Z");
         // The sub-day lifetimes. `NOW` is 00:43 UTC on the 11th, so one hour
         // is 01:43 the same day -- and twenty-three hours is 23:43, still the
         // same day, while twenty-four is the next. The minutes, seconds and
         // milliseconds are carried through untouched, which is what says no
         // step of this rounds to anything.
-        assert_eq!(deletion_date(1, &NOW), "2026-08-11T01:43:17.148Z");
-        assert_eq!(deletion_date(23, &NOW), "2026-08-11T23:43:17.148Z");
+        assert_eq!(deletion_date(SendLifetime::Hours(1), &NOW), "2026-08-11T01:43:17.148Z");
+        assert_eq!(deletion_date(SendLifetime::Hours(23), &NOW), "2026-08-11T23:43:17.148Z");
         // An hour that crosses midnight, which is the case a function taking
         // whole days never met: 23:30 on the 11th plus one hour is 00:30 on
         // the **12th**.
         const HALF_PAST_ELEVEN: FixedClock = FixedClock(1_786_491_000_000);
         assert_eq!(
-            deletion_date(0, &HALF_PAST_ELEVEN),
+            deletion_date(SendLifetime::Hours(0), &HALF_PAST_ELEVEN),
             "2026-08-11T23:30:00.000Z",
             "control: the fixture instant is not the one this test believes it is, so the \
              midnight crossing below would be asserting nothing"
         );
-        assert_eq!(deletion_date(1, &HALF_PAST_ELEVEN), "2026-08-12T00:30:00.000Z");
+        assert_eq!(deletion_date(SendLifetime::Hours(1), &HALF_PAST_ELEVEN), "2026-08-12T00:30:00.000Z");
         // A leap day, crossed both ways, because the civil-date arithmetic is
         // hand-rolled and February is where hand-rolled date code goes wrong.
         assert_eq!(
-            deletion_date(24, &FixedClock(1_709_078_400_000)),
+            deletion_date(SendLifetime::Hours(24), &FixedClock(1_709_078_400_000)),
             "2024-02-29T00:00:00.000Z"
         );
         assert_eq!(
-            deletion_date(24, &FixedClock(1_709_164_800_000)),
+            deletion_date(SendLifetime::Hours(24), &FixedClock(1_709_164_800_000)),
             "2024-03-01T00:00:00.000Z"
         );
         assert_eq!(
-            deletion_date(24, &FixedClock(4_107_456_000_000)),
+            deletion_date(SendLifetime::Hours(24), &FixedClock(4_107_456_000_000)),
             "2100-03-01T00:00:00.000Z"
         );
         // The longest lifetime the picker offers, in hours, does not overflow
         // the `i64` multiply -- 720 * 3_600_000 is nowhere near it, and this
         // is the assertion that says so rather than a comment claiming it.
         assert_eq!(
-            deletion_date(*DELETE_IN_HOURS_CHOICES.last().expect("four choices"), &NOW),
+            deletion_date(SendLifetime::Hours(24 * 30), &NOW),
             "2026-09-10T00:43:17.148Z"
         );
     }
@@ -4575,29 +5036,29 @@ mod tests {
         // UTC, so that the dates below read as they always have. The
         // timezone-dependent behaviour has its own tests directly beneath.
         let utc = crate::local_time::FixedOffset(0);
-        let seven = expiry_wording(24 * 7, &NOW, &utc);
+        let seven = expiry_wording(SendLifetime::Hours(24 * 7), &NOW, &utc);
         assert!(seven.contains("7 days"), "{seven:?}");
         assert!(
             seven.contains("18 Aug 2026"),
             "the wording gives a duration but not the date it lands on, which is the thing a \
              user can check: {seven:?}"
         );
-        let one = expiry_wording(24, &NOW, &utc);
+        let one = expiry_wording(SendLifetime::Hours(24), &NOW, &utc);
         assert!(one.contains("1 day") && !one.contains("1 days"), "{one:?}");
         assert!(one.contains("12 Aug 2026"), "{one:?}");
         assert!(
-            expiry_wording(24 * 30, &NOW, &utc).contains("10 Sep 2026"),
+            expiry_wording(SendLifetime::Hours(24 * 30), &NOW, &utc).contains("10 Sep 2026"),
             "{}",
-            expiry_wording(24 * 30, &NOW, &utc)
+            expiry_wording(SendLifetime::Hours(24 * 30), &NOW, &utc)
         );
         // The wording and the JSON must not disagree about the day; two
         // separate formatters over the same instant is exactly how they would.
         // At UTC+0 the two are the same instant AND the same reading, which is
         // the only offset at which this equality is the right assertion --
         // see `the_wording_is_local_while_the_stored_deletion_date_stays_utc`.
-        for hours in DELETE_IN_HOURS_CHOICES {
-            let wording = expiry_wording(hours, &NOW, &utc);
-            let iso = deletion_date(hours, &NOW);
+        for hours in [1u32, 24, 24 * 7, 24 * 30] {
+            let wording = expiry_wording(SendLifetime::Hours(hours), &NOW, &utc);
+            let iso = deletion_date(SendLifetime::Hours(hours), &NOW);
             let (y, m, d, ..) =
                 utc_parts(NOW.now_unix_millis() + i64::from(hours) * MILLIS_PER_HOUR);
             assert!(iso.starts_with(&format!("{y:04}-{m:02}-{d:02}")), "{iso:?}");
@@ -4628,7 +5089,7 @@ mod tests {
     fn a_sub_day_lifetime_names_the_time_and_a_longer_one_does_not() {
         let utc = crate::local_time::FixedOffset(0);
 
-        let hour = expiry_wording(1, &NOW, &utc);
+        let hour = expiry_wording(SendLifetime::Hours(1), &NOW, &utc);
         assert!(hour.contains("1 hour") && !hour.contains("1 hours"), "{hour:?}");
         assert!(
             hour.contains("11 Aug 2026, 01:43"),
@@ -4637,7 +5098,7 @@ mod tests {
         );
 
         for hours in [24u32, 24 * 7, 24 * 30] {
-            let wording = expiry_wording(hours, &NOW, &utc);
+            let wording = expiry_wording(SendLifetime::Hours(hours), &NOW, &utc);
             assert!(
                 !wording.contains("00:43"),
                 "a {hours}-hour link is being given a clock time it has not earned: {wording:?}"
@@ -4659,7 +5120,7 @@ mod tests {
     #[test]
     fn the_expiry_date_is_the_users_own_day_and_not_the_utc_one() {
         let new_york = crate::local_time::FixedOffset(-5 * 3_600_000);
-        let wording = expiry_wording(24, &NOW, &new_york);
+        let wording = expiry_wording(SendLifetime::Hours(24), &NOW, &new_york);
         assert!(
             wording.contains("11 Aug 2026"),
             "just-past-midnight UTC on the 12th is the evening of the 11th at UTC-5, and the \
@@ -4679,8 +5140,8 @@ mod tests {
     fn the_expiry_wording_never_names_a_timezone() {
         for offset in [-11, -5, 0, 1, 5, 13] {
             let zone = crate::local_time::FixedOffset(offset * 3_600_000);
-            for hours in DELETE_IN_HOURS_CHOICES {
-                let wording = expiry_wording(hours, &NOW, &zone);
+            for choice in LIFETIME_CHOICES.into_iter().flatten() {
+                let wording = expiry_wording(choice, &NOW, &zone);
                 assert!(
                     !wording.contains("UTC") && !wording.contains("GMT"),
                     "{wording:?} names a timezone at offset {offset}"
@@ -4697,14 +5158,14 @@ mod tests {
     /// the moment the link actually dies.
     #[test]
     fn the_wording_is_local_while_the_stored_deletion_date_stays_utc() {
-        let iso = deletion_date(24, &NOW);
+        let iso = deletion_date(SendLifetime::Hours(24), &NOW);
         assert!(iso.ends_with('Z'), "the stored instant is UTC and says so: {iso:?}");
         let mut readings = Vec::new();
         for offset in [-11, -5, 0, 5, 13] {
             let zone = crate::local_time::FixedOffset(offset * 3_600_000);
-            readings.push(expiry_wording(24, &NOW, &zone));
+            readings.push(expiry_wording(SendLifetime::Hours(24), &NOW, &zone));
             assert_eq!(
-                deletion_date(24, &NOW),
+                deletion_date(SendLifetime::Hours(24), &NOW),
                 iso,
                 "the stored deletion date moved with the display timezone, which would change \
                  when the link dies rather than how it is described"

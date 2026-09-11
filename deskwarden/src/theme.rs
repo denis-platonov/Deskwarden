@@ -1958,6 +1958,536 @@ fn segment_galley(ui: &Ui, label: &str, color: Color32) -> Arc<egui::Galley> {
 /// in-card controls.
 const SEGMENT_TEXT_SIZE: f32 = 12.0;
 
+// ---------------------------------------------------------------------------
+// The dropdown: the multiple-choice control for a set a run cannot hold
+// ---------------------------------------------------------------------------
+
+/// One row of a [`dropdown`]: what it says, and whether it is the answer
+/// currently in force.
+///
+/// The same shape as [`Segment`], and for the same stated reason -- two fields
+/// a caller could transpose and still compile.
+pub struct Choice<'a> {
+    /// The words on the row, and, when `selected`, the words in the closed
+    /// box. One string for both, so the control cannot say one thing shut and
+    /// another open.
+    pub label: &'a str,
+    /// Painted as the answer in force: [`BLUE_WASH`] behind [`BLUE_DEEP`].
+    pub selected: bool,
+}
+
+/// **The app's multiple-choice control for a set too large to lay out.**
+///
+/// Returns the index of the row that was chosen this frame, or `None`.
+///
+/// # When this and not [`segmented_control`]
+///
+/// A segmented run is the right control while two things hold: the
+/// alternatives fit on one line, and seeing them beside each other helps you
+/// choose. Both are properties of the *set*, not of the question, and both
+/// fail at the same place -- somewhere around five or six cells a run stops
+/// being a row of alternatives and becomes a wall of boxes, and past the width
+/// of its container it stops being anything at all.
+///
+/// This control is what the question becomes on the other side of that line.
+/// It costs one extra click, states the answer in force in the same space a
+/// run's widest cell would have taken, and does not grow when the set does.
+/// **It is not a replacement for the run**: a two- or three-way choice still
+/// belongs in a segmented control, where the alternatives are worth reading
+/// together and a click is a click.
+///
+/// # It is one box wide, and the caller says how wide
+///
+/// Unlike a run, whose width is the sum of its labels, a dropdown is a fixed
+/// box -- so it can sit in a column of controls that line up, which is exactly
+/// what §5a's Access block is. The caller passes the width because the
+/// container knows it and this function cannot: a control that sized itself to
+/// its longest row would jump about as the answer changed.
+///
+/// # The popup is egui's menu layer, painted in this app's vocabulary
+///
+/// The layer, the click-outside behaviour and the escape key are
+/// `egui::Popup::menu`'s, which is what the detail pane's kebab menu already
+/// uses -- inventing a second floating-layer implementation for one control is
+/// exactly the kind of parallel machinery this module exists to prevent. What
+/// is *painted* into it is this file's own: no egui button frames, the same
+/// hover wash a segmented cell gets, and the answer in force in the wash
+/// rather than in a tick.
+pub fn dropdown(ui: &mut Ui, width: f32, current: &str, choices: &[Choice<'_>]) -> Option<usize> {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, DROPDOWN_HEIGHT), Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(SEGMENT_RADIUS),
+        if hovered { CANVAS } else { CARD },
+        Stroke::new(1.0, BORDER_STRONG),
+        StrokeKind::Inside,
+    );
+    let galley = segment_galley(ui, current, INK);
+    ui.painter().galley(
+        Pos2::new(rect.left() + DROPDOWN_PAD_X, rect.center().y - galley.size().y / 2.0),
+        galley,
+        INK,
+    );
+    paint_chevron(ui, chevron_rect(rect), TEXT_MUTED);
+
+    let mut chosen = None;
+    egui::Popup::menu(&response).show(|ui| {
+        ui.set_min_width(width);
+        for (index, choice) in choices.iter().enumerate() {
+            if dropdown_row(ui, width, choice) {
+                chosen = Some(index);
+                ui.close();
+            }
+        }
+    });
+    chosen
+}
+
+/// [`dropdown`]'s inert twin, for a question whose answer is fixed by
+/// something outside the control.
+///
+/// A separate function rather than an `enabled` flag, which is the split this
+/// design system already makes twice ([`segmented_control_disabled`],
+/// [`toggle_pill_disabled`]) -- and the reason is the same one, sharpened.
+/// `add_enabled_ui(false)` round a live dropdown fades the whole box, answer
+/// included, to egui's disabled opacity; what the reader needs while a publish
+/// is running is not "you have no lifetime" but "you have this one and cannot
+/// change it". So the box keeps its full-strength text on [`CARD_TINT`], loses
+/// its chevron (there is nothing to open) and senses nothing at all.
+pub fn dropdown_disabled(ui: &mut Ui, width: f32, current: &str) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, DROPDOWN_HEIGHT), Sense::hover());
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(SEGMENT_RADIUS),
+        CARD_TINT,
+        Stroke::new(1.0, BORDER),
+        StrokeKind::Inside,
+    );
+    let galley = segment_galley(ui, current, TEXT_MUTED);
+    ui.painter().galley(
+        Pos2::new(rect.left() + DROPDOWN_PAD_X, rect.center().y - galley.size().y / 2.0),
+        galley,
+        TEXT_MUTED,
+    );
+}
+
+/// The closed box's height: [`BUTTON_HEIGHT`], because a dropdown stands in a
+/// column beside text fields and buttons and a box a few points off would make
+/// the column look mismeasured.
+pub const DROPDOWN_HEIGHT: f32 = BUTTON_HEIGHT;
+
+/// The gap between the box's edge and its text, both sides.
+pub const DROPDOWN_PAD_X: f32 = 10.0;
+
+/// One open row's height. Shorter than the closed box: a list of rows is read
+/// as a list, and rows the height of buttons read as a stack of buttons.
+pub const DROPDOWN_ROW_HEIGHT: f32 = 24.0;
+
+/// How much of a [`dropdown`]'s width is NOT available to its text: a pad each
+/// side, plus the chevron the closed box carries.
+///
+/// `pub` for the reason [`SEGMENT_SEAM`] is: "every row fits the box" is a
+/// claim a caller's own test has to make about the set it passes -- a fixed
+/// box clips rather than overflows, so nothing else would catch a row that
+/// grew -- and a caller that restated this arithmetic would be a second copy
+/// of it waiting to disagree with the control.
+pub const DROPDOWN_TEXT_BUDGET: f32 = DROPDOWN_PAD_X * 3.0 + CHEVRON_HALF * 2.0;
+
+/// How wide `label` is in a [`dropdown`], at the exact font the control lays
+/// it out in.
+///
+/// Exists so a caller's fit test measures what the control measures, rather
+/// than a guess at the font. See [`DROPDOWN_TEXT_BUDGET`].
+pub fn dropdown_text_width(ui: &Ui, label: &str) -> f32 {
+    segment_galley(ui, label, INK).size().x
+}
+
+/// Half the chevron's width, and the distance it stands in from the box's
+/// right edge.
+const CHEVRON_HALF: f32 = 4.0;
+
+/// Where the chevron sits inside a closed [`dropdown`] box.
+fn chevron_rect(box_rect: Rect) -> Rect {
+    let centre =
+        Pos2::new(box_rect.right() - DROPDOWN_PAD_X - CHEVRON_HALF, box_rect.center().y);
+    Rect::from_center_size(centre, Vec2::splat(CHEVRON_HALF * 2.0))
+}
+
+/// The "there is more under this" glyph: two strokes, pointing down.
+///
+/// Drawn rather than typed. A `▾` is a font's idea of a triangle and this app
+/// paints every other glyph it uses -- see the star, the eye and the kebab --
+/// so a character here would be the one mark whose weight and size came from
+/// somewhere else.
+fn paint_chevron(ui: &Ui, rect: Rect, color: Color32) {
+    let stroke = Stroke::new(ICON_STROKE, color);
+    let painter = ui.painter();
+    painter.line_segment(
+        [Pos2::new(rect.left(), rect.top()), Pos2::new(rect.center().x, rect.bottom())],
+        stroke,
+    );
+    painter.line_segment(
+        [Pos2::new(rect.center().x, rect.bottom()), Pos2::new(rect.right(), rect.top())],
+        stroke,
+    );
+}
+
+/// One open row, returning whether it was chosen.
+fn dropdown_row(ui: &mut Ui, width: f32, choice: &Choice<'_>) -> bool {
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, DROPDOWN_ROW_HEIGHT), Sense::click());
+    let hovered = response.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // The answer in force is the wash and not a tick in the margin: a tick
+    // needs a gutter every row pays for, and the wash is the weight this
+    // design system already gives "the one you have" in the nav.
+    let (fill, ink) = if choice.selected {
+        (BLUE_WASH, BLUE_DEEP)
+    } else if hovered {
+        (CANVAS, INK)
+    } else {
+        (Color32::TRANSPARENT, INK)
+    };
+    ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
+    let galley = segment_galley(ui, choice.label, ink);
+    ui.painter().galley(
+        Pos2::new(rect.left() + DROPDOWN_PAD_X, rect.center().y - galley.size().y / 2.0),
+        galley,
+        ink,
+    );
+    response.clicked()
+}
+
+// ---------------------------------------------------------------------------
+// The date picker: one month, and only the days that are answers
+// ---------------------------------------------------------------------------
+
+/// A `(year, month, day)` on the proleptic-Gregorian calendar
+/// [`crate::local_time`] works in. Months and days are 1-based.
+///
+/// A tuple struct would have been two `u32`s and an `i64` a caller could put
+/// in any order; this cannot be got wrong at a call site, which is the reason
+/// [`Segment`] is a struct too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Day {
+    pub year: i64,
+    pub month: u32,
+    pub day: u32,
+}
+
+/// **One month of a calendar, with the days that are not answers drawn inert.**
+///
+/// Returns the day that was clicked this frame, or `None`.
+///
+/// # Which month is on screen is this widget's own business
+///
+/// It lives in `egui`'s memory under `id_salt`, not on the caller's draft.
+/// Which month a calendar is scrolled to is the same kind of fact as how far a
+/// list is scrolled: it is not part of the answer, it is not published, it is
+/// not validated, and a screen that carried it would have it in its `Default`,
+/// its `Debug` and its equality for no reason. It opens on the month of
+/// whatever is already chosen, or on `first` when nothing is.
+///
+/// # Why a month grid and not three steppers
+///
+/// The grid **cannot express a date that does not exist**. A year box, a month
+/// box and a day box can say 31 February, so they need a rule about what
+/// happens when they do, and every such rule is a way for the form to answer a
+/// question the user did not ask. There are no impossible cells here: February
+/// draws 28 days because February has 28 days.
+///
+/// It also cannot express a date outside the window the caller allows. Days
+/// before `first` and after `last` are painted inert rather than hidden --
+/// hidden days make a month with a hole in it, which reads as a drawing bug;
+/// greyed ones say "this day exists and is not on offer", which is the true
+/// statement.
+///
+/// # Why month arrows and no year control
+///
+/// Because the window is bounded and small. This app offers a picked date at
+/// most twelve months out (`send::MAX_PICKED_MONTHS`), so the far end is
+/// twelve presses away and the common case -- a date in the next few weeks --
+/// is none or one. A year control would be a second navigation axis earning
+/// its keep only outside a range this picker refuses to show, and the arrows
+/// stop dead at the ends of the window rather than wandering into months where
+/// every cell is grey.
+///
+/// # It is a fixed size
+///
+/// Seven columns of [`CALENDAR_CELL`] and six week rows, always six, whether
+/// or not the month needs the last one. A grid that changed height as the
+/// month changed would shove everything under it up and down as the user
+/// pressed the arrows.
+pub fn date_picker(
+    ui: &mut Ui,
+    id_salt: &str,
+    selected: Option<Day>,
+    first: Day,
+    last: Day,
+) -> Option<Day> {
+    let memory_id = egui::Id::new(("date-picker", id_salt));
+    // Clamped on the way in as well as on the way out: the window moves as the
+    // clock does, so a month remembered yesterday can be behind `first` today,
+    // and a calendar that opened on a month with no offered day in it would
+    // look broken rather than bounded.
+    let remembered = ui
+        .ctx()
+        .memory(|m| m.data.get_temp::<Day>(memory_id))
+        .unwrap_or_else(|| month_of(selected.unwrap_or(first)));
+    let mut shown = remembered.clamp(month_of(first), month_of(last));
+    let picked = date_picker_at(ui, &mut shown, selected, first, last);
+    ui.ctx().memory_mut(|m| m.data.insert_temp(memory_id, shown));
+    picked
+}
+
+/// [`date_picker`]'s body, with the month on screen passed in rather than
+/// remembered.
+///
+/// Split out so the drawing is a pure function of its arguments -- a test can
+/// put the calendar on any month and read what it painted in one frame,
+/// without having to drive `egui`'s memory to get there.
+pub fn date_picker_at(
+    ui: &mut Ui,
+    shown: &mut Day,
+    selected: Option<Day>,
+    first: Day,
+    last: Day,
+) -> Option<Day> {
+    let (frame, _) = ui.allocate_exact_size(
+        Vec2::new(CALENDAR_WIDTH, CALENDAR_HEIGHT),
+        Sense::hover(),
+    );
+    ui.painter().rect(
+        frame,
+        CornerRadius::same(SEGMENT_RADIUS),
+        CARD_TINT,
+        Stroke::new(1.0, BORDER),
+        StrokeKind::Inside,
+    );
+
+    // ---- header: ‹  Mar 2027  › -----------------------------------------
+    let header = Rect::from_min_size(frame.min, Vec2::new(CALENDAR_WIDTH, CALENDAR_HEADER_H));
+    let back = Rect::from_min_size(
+        Pos2::new(header.left() + 4.0, header.top() + 4.0),
+        Vec2::splat(CALENDAR_HEADER_H - 8.0),
+    );
+    let forward = Rect::from_min_size(
+        Pos2::new(header.right() - 4.0 - (CALENDAR_HEADER_H - 8.0), header.top() + 4.0),
+        Vec2::splat(CALENDAR_HEADER_H - 8.0),
+    );
+    if calendar_arrow(ui, back, false, *shown > month_of(first)) {
+        *shown = step_month(*shown, -1);
+    }
+    if calendar_arrow(ui, forward, true, *shown < month_of(last)) {
+        *shown = step_month(*shown, 1);
+    }
+    let title = ui.painter().layout_no_wrap(
+        format!("{} {}", crate::local_time::month_name(shown.month), shown.year),
+        FontId::new(SEGMENT_TEXT_SIZE, FontFamily::Name(SEMIBOLD.into())),
+        INK,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            header.center().x - title.size().x / 2.0,
+            header.center().y - title.size().y / 2.0,
+        ),
+        title,
+        INK,
+    );
+
+    // ---- the weekday strip ----------------------------------------------
+    //
+    // Monday first, and one letter each. Monday-first is what a European
+    // desktop expects and is what this app's only other calendar-shaped
+    // thing -- nothing -- has to agree with; one letter because seven
+    // three-letter headings do not fit a grid whose cells are sized to two
+    // digits.
+    for (column, letter) in WEEKDAY_INITIALS.iter().enumerate() {
+        let cell = calendar_cell(frame, column, None);
+        let galley = ui.painter().layout_no_wrap(
+            (*letter).to_owned(),
+            FontId::new(CALENDAR_WEEKDAY_PX, FontFamily::Name(SEMIBOLD.into())),
+            TEXT_GHOST,
+        );
+        ui.painter().galley(
+            Pos2::new(cell.center().x - galley.size().x / 2.0, cell.center().y - galley.size().y / 2.0),
+            galley,
+            TEXT_GHOST,
+        );
+    }
+
+    // ---- the days --------------------------------------------------------
+    let first_of_month = crate::local_time::days_from_civil(shown.year, shown.month, 1);
+    let lead = monday_column(first_of_month);
+    let length = crate::local_time::days_in_month(shown.year, shown.month);
+    let mut picked = None;
+    for day in 1..=length {
+        let index = lead + (day as usize) - 1;
+        let cell = calendar_cell(frame, index % 7, Some(index / 7));
+        let here = Day { year: shown.year, month: shown.month, day };
+        if calendar_day(ui, cell, day, selected == Some(here), here >= first && here <= last) {
+            picked = Some(here);
+        }
+    }
+    picked
+}
+
+/// The seven column headings, Monday first.
+pub const WEEKDAY_INITIALS: [&str; 7] = ["M", "T", "W", "T", "F", "S", "S"];
+
+/// One day cell's size. Two digits at [`SEGMENT_TEXT_SIZE`] plus room to be a
+/// click target; seven of them are [`CALENDAR_WIDTH`].
+pub const CALENDAR_CELL: Vec2 = Vec2::new(28.0, 24.0);
+
+/// The month strip's height -- the two arrows and the month's name.
+const CALENDAR_HEADER_H: f32 = 28.0;
+
+/// The weekday initials' height.
+const CALENDAR_WEEKDAY_H: f32 = 16.0;
+
+/// The weekday initials' size. Smaller than a day: they are a key to the grid,
+/// not part of it.
+const CALENDAR_WEEKDAY_PX: f32 = 10.0;
+
+/// Six week rows, always. See [`date_picker`] on why the grid does not shrink
+/// for a short month.
+const CALENDAR_ROWS: usize = 6;
+
+/// The picker's outer width: seven columns and a point of padding each side.
+pub const CALENDAR_WIDTH: f32 = CALENDAR_CELL.x * 7.0 + CALENDAR_PAD * 2.0;
+
+/// The picker's outer height.
+pub const CALENDAR_HEIGHT: f32 = CALENDAR_HEADER_H
+    + CALENDAR_WEEKDAY_H
+    + CALENDAR_CELL.y * CALENDAR_ROWS as f32
+    + CALENDAR_PAD;
+
+/// The inset between the grid and the card round it.
+const CALENDAR_PAD: f32 = 6.0;
+
+/// Where a grid cell sits. `row` is `None` for the weekday strip, which is the
+/// row above the first week.
+fn calendar_cell(frame: Rect, column: usize, row: Option<usize>) -> Rect {
+    let top = match row {
+        None => frame.top() + CALENDAR_HEADER_H,
+        Some(row) => {
+            frame.top() + CALENDAR_HEADER_H + CALENDAR_WEEKDAY_H + row as f32 * CALENDAR_CELL.y
+        }
+    };
+    let height = match row {
+        None => CALENDAR_WEEKDAY_H,
+        Some(_) => CALENDAR_CELL.y,
+    };
+    Rect::from_min_size(
+        Pos2::new(frame.left() + CALENDAR_PAD + column as f32 * CALENDAR_CELL.x, top),
+        Vec2::new(CALENDAR_CELL.x, height),
+    )
+}
+
+/// Which column a Unix epoch day falls in, Monday = 0.
+///
+/// Epoch day 0 is Thursday 1 January 1970, so Monday is three days before it;
+/// `+ 3` and a Euclidean remainder puts Monday at zero for dates either side
+/// of the epoch.
+fn monday_column(epoch_day: i64) -> usize {
+    (epoch_day + 3).rem_euclid(7) as usize
+}
+
+/// The month a day belongs to, with the day flattened to the 1st, so two
+/// [`Day`]s can be compared by month alone.
+fn month_of(day: Day) -> Day {
+    Day { day: 1, ..day }
+}
+
+/// `shown` moved one month in `direction`, staying on the 1st.
+fn step_month(shown: Day, direction: i64) -> Day {
+    let zero_based = shown.month as i64 - 1 + direction;
+    Day {
+        year: shown.year + zero_based.div_euclid(12),
+        month: (zero_based.rem_euclid(12) + 1) as u32,
+        day: 1,
+    }
+}
+
+/// One month arrow, returning whether it was pressed. A disabled arrow is
+/// drawn and senses nothing -- [`segmented_control_disabled`]'s rule: an end
+/// of the range should look like an end, not like a control that has gone
+/// missing.
+fn calendar_arrow(ui: &mut Ui, rect: Rect, forward: bool, enabled: bool) -> bool {
+    let response = ui.interact(
+        rect,
+        ui.id().with(("calendar-arrow", forward)),
+        if enabled { Sense::click() } else { Sense::hover() },
+    );
+    let hovered = enabled && response.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        ui.painter().rect_filled(rect, CornerRadius::same(4), CANVAS);
+    }
+    let color = if enabled { INK } else { TEXT_GHOST };
+    let stroke = Stroke::new(ICON_STROKE, color);
+    let tip_x = if forward { rect.center().x + 2.5 } else { rect.center().x - 2.5 };
+    let back_x = if forward { rect.center().x - 2.0 } else { rect.center().x + 2.0 };
+    let painter = ui.painter();
+    painter.line_segment(
+        [Pos2::new(back_x, rect.center().y - 4.0), Pos2::new(tip_x, rect.center().y)],
+        stroke,
+    );
+    painter.line_segment(
+        [Pos2::new(tip_x, rect.center().y), Pos2::new(back_x, rect.center().y + 4.0)],
+        stroke,
+    );
+    enabled && response.clicked()
+}
+
+/// One day cell, returning whether it was chosen. Out-of-window days sense
+/// nothing at all, so there is no click for a caller to have to ignore.
+fn calendar_day(ui: &mut Ui, rect: Rect, day: u32, selected: bool, offered: bool) -> bool {
+    let response = ui.interact(
+        rect,
+        ui.id().with(("calendar-day", rect.left() as i32, rect.top() as i32)),
+        if offered { Sense::click() } else { Sense::hover() },
+    );
+    let hovered = offered && response.hovered();
+    if hovered {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let (fill, ink) = if selected {
+        (BLUE, Color32::WHITE)
+    } else if hovered {
+        (CANVAS, INK)
+    } else if offered {
+        (Color32::TRANSPARENT, INK)
+    } else {
+        (Color32::TRANSPARENT, TEXT_GHOST)
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(
+            Rect::from_center_size(rect.center(), Vec2::splat(CALENDAR_CELL.y - 2.0)),
+            CornerRadius::same(4),
+            fill,
+        );
+    }
+    let galley = ui.painter().layout_no_wrap(
+        day.to_string(),
+        FontId::new(SEGMENT_TEXT_SIZE, FontFamily::Name(REGULAR.into())),
+        ink,
+    );
+    ui.painter().galley(
+        Pos2::new(rect.center().x - galley.size().x / 2.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        ink,
+    );
+    offered && response.clicked()
+}
+
 /// Height of the detail pane's header-strip controls (design 2b: `height:
 /// 34px` on both "Fill in app" and "Edit").
 ///

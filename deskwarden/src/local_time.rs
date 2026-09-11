@@ -150,6 +150,109 @@ pub fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// A proleptic-Gregorian `(year, month, day)` back to days since the Unix
+/// epoch. The exact inverse of [`civil_from_days`], and Hinnant's own
+/// `days_from_civil`.
+///
+/// **Added when a Send's lifetime could be a day the user points at.** Until
+/// then every instant this app produced was `now + a duration`, so the
+/// conversion only ever ran one way; a calendar is the other way round -- the
+/// user names `14 Mar 2027` and the app has to work out which instant that is.
+/// It lives beside its inverse so the pair can be tested against each other
+/// (`every_civil_day_survives_the_round_trip`), which is the only way to catch
+/// an off-by-one in either of them.
+///
+/// `month` is 1-12 and `day` is 1-31, both unchecked: the formula is total for
+/// every input and simply answers the day the arithmetic lands on, so a
+/// `(2026, 2, 30)` comes back as 2 March. Callers that must not invent a date
+/// clamp first -- see [`clamp_day_of_month`].
+pub fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let m = month as i64;
+    let d = day as i64;
+    let y = if m <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// How many days month `month` of `year` has, 28-31.
+///
+/// Derived from [`days_from_civil`] rather than from a table plus a leap-year
+/// rule, because the table-plus-rule version is two things that can disagree
+/// and this is one thing that cannot: the length of a month is the distance to
+/// the first of the next one.
+pub fn days_in_month(year: i64, month: u32) -> u32 {
+    let (next_year, next_month) = if month >= 12 { (year + 1, 1) } else { (year, month + 1) };
+    (days_from_civil(next_year, next_month, 1) - days_from_civil(year, month, 1)) as u32
+}
+
+/// `day`, pulled back to the last day of `year`/`month` if that month is
+/// shorter.
+///
+/// The rule every calendar uses for "the same day, N months later": 31 January
+/// plus one month is 28 February, not 3 March. It is a clamp and not a
+/// wrap because a Send's lifetime must never be longer than the user asked
+/// for, and wrapping into the next month is exactly that.
+pub fn clamp_day_of_month(year: i64, month: u32, day: u32) -> u32 {
+    day.min(days_in_month(year, month))
+}
+
+/// `months` whole calendar months after `(year, month, day)`, with the day
+/// clamped by [`clamp_day_of_month`].
+///
+/// **A month is not a number of days and this app must not pretend it is.**
+/// `3 months` offered as `90 days` is wrong by a day or two depending on which
+/// months it crosses, and it is wrong in the direction the label cannot
+/// justify -- a cell that says "3 months" beside a date three months and two
+/// days out is a control disagreeing with the sentence under it.
+pub fn add_months(year: i64, month: u32, day: u32, months: u32) -> (i64, u32, u32) {
+    let zero_based = (month as i64 - 1) + months as i64;
+    let out_year = year + zero_based.div_euclid(12);
+    let out_month = (zero_based.rem_euclid(12) + 1) as u32;
+    (out_year, out_month, clamp_day_of_month(out_year, out_month, day))
+}
+
+/// The UTC instant at which the local day `(year, month, day)` ends: its last
+/// millisecond, `23:59:59.999` on the user's own wall clock.
+///
+/// # Why end of day, and why this is the function a calendar needs
+///
+/// A user who picks a day on a calendar has named a *day*, and the field
+/// underneath is an *instant*. Any instant inside that day would satisfy the
+/// type and only one of them satisfies the user: a link chosen to last until
+/// Friday that stops working at 00:00 on Friday was dead for the whole of the
+/// day it was supposed to cover, and -- worse -- a day picked as *today*
+/// resolves to an instant in the past, which the server accepts and which
+/// publishes a link that is dead on arrival. The last millisecond of the day
+/// is the only reading that makes "until Friday" mean Friday and makes "today"
+/// mean the rest of today.
+///
+/// # The offset is resolved twice, and it has to be
+///
+/// [`LocalOffset`] answers "what is the offset **at this UTC instant**", and
+/// the input here is a wall-clock reading rather than an instant -- the very
+/// thing the offset is needed to convert. So the wall reading is used as a
+/// first approximation of the instant, the offset that applies there is
+/// subtracted, and the offset is asked again at the result. One refinement is
+/// enough for every real zone: offsets move by an hour and daylight-saving
+/// transitions happen in the small hours, so the second answer is the right
+/// one for a reading at one minute to midnight.
+pub fn end_of_local_day_utc_millis(
+    year: i64,
+    month: u32,
+    day: u32,
+    zone: &dyn LocalOffset,
+) -> i64 {
+    let wall = days_from_civil(year, month, day)
+        .saturating_mul(MILLIS_PER_DAY)
+        .saturating_add(MILLIS_PER_DAY - 1);
+    let guess = wall.saturating_sub(zone.offset_millis_at(wall));
+    wall.saturating_sub(zone.offset_millis_at(guess))
+}
+
 /// The civil date and time of `millis` past the Unix epoch, **in whatever
 /// zone `millis` is already expressed in**.
 ///

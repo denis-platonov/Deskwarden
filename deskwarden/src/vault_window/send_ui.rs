@@ -1266,8 +1266,14 @@ pub struct SendComposer {
 /// `plan_to_invocation` are the same function, so there is no draft this form
 /// calls acceptable that the encoder then rejects, and none it greys out that
 /// would in fact have published.
-pub fn composer_problem(composer: &SendComposer) -> Option<&'static str> {
-    crate::send::validate_plan(&composer.plan)
+/// It takes a clock for `crate::send::validate_plan`'s reason: one of the
+/// rules is that a picked date has not gone by, and the past is not a
+/// property of a draft.
+pub fn composer_problem(
+    composer: &SendComposer,
+    now: &dyn crate::send::SendClock,
+) -> Option<&'static str> {
+    crate::send::validate_plan(&composer.plan, now)
 }
 
 /// Whether the Create button may be pressed at all.
@@ -1378,8 +1384,8 @@ pub fn views_note(limit: Option<u32>) -> &'static str {
 /// tomorrow; `AccessControls { password, .. }` cannot be got wrong at a call
 /// site, which is [`theme::Segment`]'s stated reason for the same shape.
 pub struct AccessControls<'a> {
-    /// One of [`crate::send::DELETE_IN_HOURS_CHOICES`].
-    pub delete_in_hours: &'a mut u32,
+    /// One of `crate::send::LIFETIME_CHOICES`, or a date the user picked.
+    pub lifetime: &'a mut crate::send::SendLifetime,
     /// The share password. `None` **is** the off position -- see
     /// [`draw_access_block`].
     pub password: &'a mut Option<zeroize::Zeroizing<String>>,
@@ -1419,6 +1425,102 @@ const ACCESS_FIELD_HEIGHT: f32 = 32.0;
 /// borders -- [`ACCESS_FIELD_HEIGHT`]'s border-box arithmetic applied
 /// sideways.
 const VIEW_LIMIT_FIELD_WIDTH: f32 = 60.0;
+
+/// The expiry dropdown's width.
+///
+/// A fixed box, which is the whole point of moving this row off a segmented
+/// run: it no longer changes size when a label is reworded or a choice is
+/// added. 150 is comfortably over the widest thing it ever has to hold -- the
+/// `A date you pick…` row, which is the longest of the nine at 12px semibold
+/// -- and comfortably under the **226 points** §5a's Access block actually has
+/// for a control inside `record_ui`'s 360-point export modal (12-point margins
+/// each side, then a 96-point label column and a 14-point gap). That budget is
+/// the constraint this row failed against, and
+/// `the_access_block_fits_inside_the_modal_it_is_drawn_in` is what holds it.
+pub const EXPIRY_FIELD_WIDTH: f32 = 150.0;
+
+/// The salt `theme::date_picker` remembers its month under.
+///
+/// A constant rather than a literal at the call site because both composers
+/// draw the same block through [`draw_access_block`], and two screens that
+/// each invented a salt would each remember a different month for what the
+/// user experiences as one control.
+const EXPIRY_CALENDAR_ID: &str = "send-expiry-calendar";
+
+/// One row of the expiry dropdown, named.
+///
+/// The eight fixed rows are `crate::send::lifetime_label`'s job. The ninth has
+/// no fixed value, so it says what pressing it does -- until a date has
+/// actually been picked, at which point the row says that date, because a row
+/// that still read "a date you pick" beside a calendar showing 14 March would
+/// be the control refusing to admit it has an answer.
+fn lifetime_row_label(
+    choice: Option<crate::send::SendLifetime>,
+    current: crate::send::SendLifetime,
+    zone: &dyn crate::local_time::LocalOffset,
+) -> String {
+    match choice {
+        Some(lifetime) => crate::send::lifetime_label(lifetime, zone),
+        None if matches!(current, crate::send::SendLifetime::Until(_)) => {
+            crate::send::lifetime_label(current, zone)
+        }
+        None => crate::send::PICK_A_DATE_LABEL.to_string(),
+    }
+}
+
+/// What choosing row `index` means, given what was already chosen.
+///
+/// # The picked-date row keeps the deadline it inherited
+///
+/// Eight of the nine rows are their own answer. The ninth is "I want to name a
+/// day", and it has to become *some* day the moment it is pressed, because the
+/// calendar under it opens on one and the sentence above it names one.
+///
+/// It takes the day the current answer already lands on. Switching from
+/// `30 days` to a picked date therefore changes nothing about when the link
+/// dies until the user clicks a cell -- it only changes how the deadline is
+/// expressed. The alternative, seeding it with today or with some invented
+/// default, would silently move the deadline as a side effect of opening a
+/// calendar to look at it.
+///
+/// `Never` has no day to inherit, so that one case falls back to the day
+/// `crate::send::DEFAULT_LIFETIME` lands on. Either way the seed is clamped
+/// into the window the calendar offers, so the picker never opens on a day it
+/// would refuse.
+fn lifetime_for_row(
+    index: usize,
+    current: crate::send::SendLifetime,
+    now: &dyn crate::send::SendClock,
+    zone: &dyn crate::local_time::LocalOffset,
+) -> Option<crate::send::SendLifetime> {
+    match crate::send::LIFETIME_CHOICES.get(index)? {
+        Some(lifetime) => Some(*lifetime),
+        None => {
+            if matches!(current, crate::send::SendLifetime::Until(_)) {
+                return Some(current);
+            }
+            let (first, last) = crate::send::pickable_window(now, zone);
+            let seed = current
+                .local_day(now, zone)
+                .or_else(|| crate::send::DEFAULT_LIFETIME.local_day(now, zone))
+                .unwrap_or(first)
+                .clamp(first, last);
+            Some(crate::send::SendLifetime::on_local_day(seed.0, seed.1, seed.2, zone))
+        }
+    }
+}
+
+/// `crate::send::pickable_window` in the shape the calendar takes it.
+fn pickable_window(
+    now: &dyn crate::send::SendClock,
+    zone: &dyn crate::local_time::LocalOffset,
+) -> (theme::Day, theme::Day) {
+    let (first, last) = crate::send::pickable_window(now, zone);
+    (
+        theme::Day { year: first.0, month: first.1, day: first.2 },
+        theme::Day { year: last.0, month: last.1, day: last.2 },
+    )
+}
 
 /// One Access row: a fixed-width label, then whatever the caller draws.
 ///
@@ -1538,39 +1640,91 @@ pub fn draw_access_block(
 
     // ---- Expires ---------------------------------------------------------
     //
-    // **Extended, not replaced.** This run was already
-    // `theme::segmented_control` after the 2026-09 pass -- one control with
-    // three positions rather than three buttons, for that function's own
-    // stated reasons -- and all that changed is that the array behind it is
-    // four entries of hours rather than three of days. The choices still come
-    // from `send.rs` and are not spelled here: `validate_plan` refuses any
-    // other value, so a cell offering one would be a control that cannot
-    // work.
-    let labels: Vec<String> = crate::send::DELETE_IN_HOURS_CHOICES
+    // **The segmented run is gone from this row, and the reason is that nine
+    // choices are not a segmented control's question.**
+    //
+    // This row held `theme::segmented_control` for as long as the answer was a
+    // short duration: four cells, `1 hour · 1 day · 7 days · 30 days`, one
+    // control with four positions. Then the choices became nine -- months, a
+    // date the user picks, and no end date at all.
+    //
+    // Nine will not fit, and the measurement is not close. The binding
+    // container is `record_ui`'s export modal, not the composer: 360 points
+    // wide with a 12-point margin each side, minus §5a's 96-point label column
+    // and its 14-point gap, leaves **226 points** for the control. The four
+    // cells that are there today come to a little over 200 of it. Adding
+    // `3 months`, `6 months`, `12 months`, the date row and `Never` roughly
+    // triples that -- a run sizes every cell to its own label, so there is no
+    // setting of any constant that recovers it.
+    //
+    // Three shapes were considered and two were rejected:
+    //
+    //   * **Wrapping the run onto two or three lines.** Cheapest, and it keeps
+    //     the pixels while throwing away the property that justified them. A
+    //     segmented control earns its joined cells by being *one run with one
+    //     lit position*; stacked into three pills that is three controls with
+    //     one lit between them, which is a thing the reader has to work out
+    //     rather than see. It is also 90 points of vertical space in a modal
+    //     that is already scrolling.
+    //
+    //   * **A short run of the common choices plus a way into the rest.** Two
+    //     controls for one question, and the answer in force moves between
+    //     them depending on what it is -- so "what does this say right now"
+    //     has two places to look. It would also have put `Never` behind a
+    //     secondary surface, and `Never` is a common answer, not an advanced
+    //     one: a password shared with someone in the same house is wanted
+    //     again next month.
+    //
+    //   * **One dropdown holding all nine.** Chosen. It is a fixed box that
+    //     does not grow with the set, it states the answer in force in the
+    //     space the run's widest cell took, every choice including `Never` is
+    //     one press from every other, and it lines up with the view-limit
+    //     field below it instead of running past it. It costs one extra click
+    //     on a form that already costs a name, a body and a button.
+    //
+    // The dropdown is `theme::dropdown` and not a widget built here, for this
+    // codebase's standing rule: a control drawn privately on one screen is a
+    // second design system. See that function on when a dropdown is right and
+    // when a segmented run still is -- this row is the first caller, and the
+    // §5a Views row's own `1 ▾` is the obvious second.
+    //
+    // The rows come from `send.rs` and are not spelled here: `validate_access`
+    // refuses any other answer, so a row offering one would be a control that
+    // cannot work.
+    let labels: Vec<String> = crate::send::LIFETIME_CHOICES
         .iter()
-        .map(|hours| crate::send::lifetime_label(*hours))
+        .map(|choice| lifetime_row_label(*choice, *controls.lifetime, zone))
         .collect();
-    let segments: Vec<theme::Segment<'_>> = labels
+    let choices: Vec<theme::Choice<'_>> = labels
         .iter()
-        .zip(crate::send::DELETE_IN_HOURS_CHOICES)
-        .map(|(label, hours)| theme::Segment {
+        .zip(crate::send::LIFETIME_CHOICES)
+        .map(|(label, choice)| theme::Choice {
             label: label.as_str(),
-            selected: *controls.delete_in_hours == hours,
+            // The picked-date row is the answer in force whenever the answer
+            // IS a picked date, whatever date that is -- it is one row, not a
+            // row per day.
+            selected: match choice {
+                Some(lifetime) => *controls.lifetime == lifetime,
+                None => matches!(*controls.lifetime, crate::send::SendLifetime::Until(_)),
+            },
         })
         .collect();
+    let current = crate::send::lifetime_label(*controls.lifetime, zone);
     access_row(ui, EXPIRES_LABEL, enabled, |ui| {
-        // `segmented_control_disabled` and not `add_enabled`, because that is
-        // the split this design system already makes for exactly this
-        // question (see `toggle_pill` / `toggle_pill_disabled`): the inert run
-        // senses hover only, so while a publish is in flight there is no path
-        // by which a cell can be pressed at all, and the answer in force stays
-        // legible in the wash rather than greying into the other three.
+        // `dropdown_disabled` and not `add_enabled_ui`, for the reason that
+        // split exists in this design system (see `toggle_pill` /
+        // `toggle_pill_disabled`, and the segmented run before it): the inert
+        // box senses nothing, so while a publish is in flight there is no path
+        // by which it can be opened at all -- and the answer in force stays at
+        // full strength rather than fading with the box round it.
         if enabled {
-            if let Some(index) = theme::segmented_control(ui, &segments) {
-                *controls.delete_in_hours = crate::send::DELETE_IN_HOURS_CHOICES[index];
+            if let Some(index) = theme::dropdown(ui, EXPIRY_FIELD_WIDTH, &current, &choices) {
+                if let Some(next) = lifetime_for_row(index, *controls.lifetime, now, zone) {
+                    *controls.lifetime = next;
+                }
             }
         } else {
-            theme::segmented_control_disabled(ui, &segments);
+            theme::dropdown_disabled(ui, EXPIRY_FIELD_WIDTH, &current);
         }
     });
     // **The DATE, not only the duration**, and for a sub-day lifetime the
@@ -1579,15 +1733,44 @@ pub fn draw_access_block(
     // calendar. `expiry_wording` is `send.rs`'s own, so this line and the
     // `deletionDate` in the built JSON cannot disagree about what the choice
     // means, and the day it prints is the user's LOCAL day -- the stored
-    // instant is UTC and stays UTC. §5a puts a bare `17 Aug, 14:20` at the
-    // end of the row; it reads as a sentence here because the row is already
-    // three columns wide inside a 360-point modal.
+    // instant is UTC and stays UTC. For `Never` it is the one sentence that
+    // says what "no end date" actually means; it does not caution, because
+    // `Never` is a choice this form offers rather than one it tolerates.
     ui.add_space(4.0);
     ui.label(
-        egui::RichText::new(crate::send::expiry_wording(*controls.delete_in_hours, now, zone))
+        egui::RichText::new(crate::send::expiry_wording(*controls.lifetime, now, zone))
             .size(11.0)
             .color(theme::TEXT_FAINT),
     );
+    // ---- the calendar, only while the answer is a date -------------------
+    //
+    // **A disclosure under the row, not a second popup layer.** The dropdown
+    // is already a floating layer; opening a calendar inside it would mean a
+    // menu whose contents change shape when one of its rows is pressed, and
+    // `PopupCloseBehavior` has no reading of that which is not surprising. A
+    // block that appears under the row is the pattern `detail_edit` already
+    // chose for the same question, it paints in one frame so a test can read
+    // it, and it leaves the answer and the means of changing it on screen
+    // together.
+    if matches!(*controls.lifetime, crate::send::SendLifetime::Until(_)) {
+        ui.add_space(6.0);
+        let (first, last) = pickable_window(now, zone);
+        let selected = controls
+            .lifetime
+            .local_day(now, zone)
+            .map(|(year, month, day)| theme::Day { year, month, day });
+        // The calendar is drawn while a publish is in flight too, and it is
+        // simply not asked for its answer: the chosen day stays legible, which
+        // is what the row above it does, and a grid that vanished for the
+        // duration of a publish would take the reader's own answer off the
+        // card at the moment they are watching it be used.
+        if let Some(day) = theme::date_picker(ui, EXPIRY_CALENDAR_ID, selected, first, last) {
+            if enabled {
+                *controls.lifetime =
+                    crate::send::SendLifetime::on_local_day(day.year, day.month, day.day, zone);
+            }
+        }
+    }
     ui.add_space(ACCESS_ROW_SPACING);
 
     // ---- Views -----------------------------------------------------------
@@ -1735,7 +1918,7 @@ fn draw_composer(
             draw_access_block(
                 ui,
                 AccessControls {
-                    delete_in_hours: &mut composer.plan.delete_in_hours,
+                    lifetime: &mut composer.plan.lifetime,
                     password: &mut composer.plan.password,
                     max_access_count: &mut composer.plan.max_access_count,
                 },
@@ -1745,7 +1928,7 @@ fn draw_composer(
             );
 
             ui.add_space(12.0);
-            let problem = composer_problem(composer);
+            let problem = composer_problem(composer, now);
             let can_submit = composer_can_submit(problem, in_flight);
             // **The footer's two answers are the design system's two
             // buttons**, and until this pass they were neither.
@@ -2497,11 +2680,11 @@ mod tests {
     fn the_submit_rule_is_fed_the_forms_own_verdict() {
         let mut composer = SendComposer::default();
         assert!(
-            composer_problem(&composer).is_some(),
+            composer_problem(&composer, &FixedClock(NOW)).is_some(),
             "control: a freshly opened composer is empty, so the form must refuse it"
         );
         assert!(
-            !composer_can_submit(composer_problem(&composer), false),
+            !composer_can_submit(composer_problem(&composer, &FixedClock(NOW)), false),
             "an empty draft could be submitted, which would publish an empty Send under a \
              public link"
         );
@@ -2509,17 +2692,17 @@ mod tests {
         composer.plan.name.push_str("a name");
         composer.plan.text.push_str("a body");
         assert_eq!(
-            composer_problem(&composer),
+            composer_problem(&composer, &FixedClock(NOW)),
             None,
             "control: a filled draft is still refused, so the `None` row above is not a \
              verdict this form ever reaches"
         );
         assert!(
-            composer_can_submit(composer_problem(&composer), false),
+            composer_can_submit(composer_problem(&composer, &FixedClock(NOW)), false),
             "a draft the form accepts could not be submitted"
         );
         assert!(
-            !composer_can_submit(composer_problem(&composer), true),
+            !composer_can_submit(composer_problem(&composer, &FixedClock(NOW)), true),
             "a draft the form accepts could be submitted DURING a publish"
         );
     }
@@ -2753,6 +2936,11 @@ mod paint_tests {
 
     const NOW: i64 = 1_786_320_000_000;
 
+    /// The offset every assertion in this module stands at. Injected for
+    /// `send::expiry_wording`'s stated reason: no test in this crate reads
+    /// the machine's timezone.
+    const UTC: crate::local_time::FixedOffset = crate::local_time::FixedOffset(0);
+
     /// The vault window's centre pane at the **minimum window size**: 900x600
     /// is `settings::MIN_VAULT_WINDOW_SIZE`, less the sidebar's 212 and a
     /// generous allowance for the titlebar and chrome above. If the window
@@ -2941,76 +3129,189 @@ mod paint_tests {
         }
     }
 
-    /// **The lifetime picker is ONE control with three positions, and design
-    /// §5a's chosen cell is filled blue.**
+    /// **The lifetime picker is ONE control, it states the answer in force,
+    /// and it is a fixed box rather than a run that grows with the set.**
     ///
-    /// What this replaced was three `egui::Button`s with `.selected()` on
-    /// one: separated by egui's item spacing, each with its own outline, each
-    /// sized to 72 points rather than to its own label. The three facts below
-    /// are the three that tell the two shapes apart, and all three are
-    /// invisible to a test that only reads glyphs.
+    /// This test's ancestor asserted the shape of a four-cell segmented run:
+    /// every cell [`theme::SEGMENT_HEIGHT`] tall, consecutive cells joined
+    /// within [`theme::SEGMENT_SEAM`], the one in force filled blue. The
+    /// control moved to `theme::dropdown` when the set reached nine (see
+    /// [`draw_access_block`] for the measurement that forced it), so the run's
+    /// geometry is gone -- but the property those three assertions were
+    /// protecting is not, and this asserts it at the new shape:
     ///
-    ///  * every cell is [`theme::SEGMENT_HEIGHT`] tall;
-    ///  * consecutive cells are **joined**, meeting within
-    ///    [`theme::SEGMENT_SEAM`] of each other rather than separated by a
-    ///    gap;
-    ///  * the cell in force carries [`theme::BLUE`] and the others do not.
+    ///  * there is **one** control for the question, [`theme::DROPDOWN_HEIGHT`]
+    ///    tall -- not a row of buttons and not two controls between which the
+    ///    answer moves;
+    ///  * it **says the answer in force** when shut, so the form does not
+    ///    require a press to be readable;
+    ///  * it is exactly [`EXPIRY_FIELD_WIDTH`] wide whatever the answer is, so
+    ///    a longer label cannot push it past the card. The old run's width was
+    ///    the sum of its labels, and that is precisely what stopped working.
     #[test]
-    fn the_lifetime_picker_is_one_segmented_run_and_not_three_buttons() {
+    fn the_lifetime_picker_is_one_fixed_box_that_states_the_answer() {
         let mut composer = open_composer();
-        let chosen = composer.plan.delete_in_hours;
+        let chosen = crate::send::lifetime_label(composer.plan.lifetime, &UTC);
         let painted = paint_composer(&mut composer, false);
 
-        let cells: Vec<(u32, egui::Rect, egui::Color32)> = crate::send::DELETE_IN_HOURS_CHOICES
-            .iter()
-            .map(|hours| {
-                let label = crate::send::lifetime_label(*hours);
-                let (rect, fill) = painted.control_under(&label);
-                (*hours, rect, fill)
-            })
-            .collect();
+        let (shut, _) = painted.control_under(&chosen);
+        assert_eq!(
+            shut.height(),
+            theme::DROPDOWN_HEIGHT,
+            "the lifetime control is {}pt tall against the design system's dropdown box of {}",
+            shut.height(),
+            theme::DROPDOWN_HEIGHT
+        );
+        assert!(
+            (shut.width() - EXPIRY_FIELD_WIDTH).abs() < 0.5,
+            "the lifetime control is {}pt wide rather than its fixed {EXPIRY_FIELD_WIDTH} -- a \
+             control whose width follows its label is the shape that overflowed the card",
+            shut.width()
+        );
 
-        // Control: the run really did grow the design's sub-day cells. The
-        // three assertions below are shape assertions and would all pass over
-        // a three-cell run of days.
-        assert_eq!(cells.len(), 4, "the picker is not §5a's four-cell run");
-
-        for (hours, rect, _) in &cells {
-            assert_eq!(
-                rect.height(),
-                theme::SEGMENT_HEIGHT,
-                "the {hours}-hour cell is not a segmented-control cell -- it is \
-                 {}pt tall against the run's {}",
-                rect.height(),
-                theme::SEGMENT_HEIGHT
-            );
-        }
-
-        for pair in cells.windows(2) {
-            let gap = pair[1].1.left() - pair[0].1.right();
-            assert!(
-                gap.abs() <= theme::SEGMENT_SEAM + 0.5,
-                "the lifetime cells are {gap}pt apart, so they are four buttons in a row \
-                 rather than one joined run. §5a draws this as one control with four \
-                 positions, and separated cells read as four things you might press."
-            );
-        }
-
-        for (hours, _, fill) in &cells {
-            if *hours == chosen {
-                assert_eq!(
-                    *fill,
-                    theme::BLUE,
-                    "the chosen lifetime is not filled in the design's blue"
-                );
-            } else {
-                assert_ne!(
-                    *fill,
-                    theme::BLUE,
-                    "the {hours}-hour cell is lit and it is not the one in force"
-                );
+        // The eight other answers are behind a press and must NOT be on the
+        // card: a dropdown that painted its whole list shut would be a
+        // segmented run with extra steps, and would overflow for the same
+        // reason.
+        for other in crate::send::LIFETIME_CHOICES.into_iter().flatten() {
+            let label = crate::send::lifetime_label(other, &UTC);
+            if label == chosen {
+                continue;
             }
+            assert!(
+                !painted.has(&label),
+                "the {label:?} row is on the card with the control shut: {:?}",
+                painted.text
+            );
         }
+
+        // And the one that is NOT a duration is reachable in the same list,
+        // rather than behind some other surface -- the point of the dropdown
+        // was that `Never` costs exactly what `7 days` costs.
+        assert!(
+            crate::send::LIFETIME_CHOICES.contains(&Some(crate::send::SendLifetime::Never)),
+            "`Never` is not one of the picker's own rows"
+        );
+    }
+
+    /// **Pressing row N gives the answer row N is labelled with**, for all
+    /// nine, and the picked-date row inherits rather than invents.
+    ///
+    /// A pure function over an index, which is what the dropdown hands back --
+    /// so the one place this feature could silently publish a different
+    /// lifetime from the one pressed is tested without running a frame. An
+    /// off-by-one here would be invisible on screen until a link died on the
+    /// wrong day.
+    #[test]
+    fn pressing_a_row_gives_the_answer_that_row_is_labelled_with() {
+        let now = FixedClock(NOW);
+        for (index, row) in crate::send::LIFETIME_CHOICES.into_iter().enumerate() {
+            let got = lifetime_for_row(index, crate::send::DEFAULT_LIFETIME, &now, &UTC)
+                .unwrap_or_else(|| panic!("row {index} gave no answer"));
+            match row {
+                Some(expected) => assert_eq!(
+                    got, expected,
+                    "row {index} is labelled {:?} and produces {got:?}",
+                    lifetime_row_label(row, crate::send::DEFAULT_LIFETIME, &UTC)
+                ),
+                // The picked-date row keeps the deadline it inherited: the
+                // default is seven days out, so pressing it must land on that
+                // same day and not on today, on the first of a month, or on
+                // anything else invented.
+                None => {
+                    let day = got.local_day(&now, &UTC).expect("a picked date has a day");
+                    assert_eq!(
+                        Some(day),
+                        crate::send::DEFAULT_LIFETIME.local_day(&now, &UTC),
+                        "the picked-date row moved the deadline as a side effect of opening \
+                         a calendar to look at it"
+                    );
+                    assert!(matches!(got, crate::send::SendLifetime::Until(_)));
+                }
+            }
+            // Whatever it produced, the encoder must accept it -- a row the
+            // picker offers and the validator refuses is a control whose every
+            // press is a refusal.
+            assert_eq!(
+                crate::send::validate_access(got, None, None, &now),
+                None,
+                "row {index} produces an answer the encoder refuses"
+            );
+        }
+
+        // `Never` has no day to inherit, and the fallback is the default's
+        // rather than a panic or a zero.
+        let from_never =
+            lifetime_for_row(7, crate::send::SendLifetime::Never, &now, &UTC).expect("an answer");
+        assert_eq!(
+            from_never.local_day(&now, &UTC),
+            crate::send::DEFAULT_LIFETIME.local_day(&now, &UTC)
+        );
+
+        // An index off the end is `None` and not a panic: the dropdown and the
+        // list are built from the same array, but a draw closure is not the
+        // place to find out that they were not.
+        assert_eq!(
+            lifetime_for_row(99, crate::send::DEFAULT_LIFETIME, &now, &UTC),
+            None
+        );
+    }
+
+    /// **The picked-date row says what pressing it does, until it has an
+    /// answer -- and then it says the answer.**
+    #[test]
+    fn the_picked_date_row_names_itself_and_then_names_the_date() {
+        assert_eq!(
+            lifetime_row_label(None, crate::send::DEFAULT_LIFETIME, &UTC),
+            crate::send::PICK_A_DATE_LABEL
+        );
+        let picked = crate::send::SendLifetime::on_local_day(2027, 3, 14, &UTC);
+        assert_eq!(lifetime_row_label(None, picked, &UTC), "14 Mar 2027");
+        // And a fixed row is never affected by what is in force.
+        assert_eq!(
+            lifetime_row_label(Some(crate::send::SendLifetime::Never), picked, &UTC),
+            crate::send::NEVER_LABEL
+        );
+    }
+
+    /// **Every row of the picker fits inside the box that holds it.**
+    ///
+    /// The dropdown does not grow to its widest row -- that is the whole
+    /// reason it replaced the run -- so a reworded or added choice that is
+    /// wider than [`EXPIRY_FIELD_WIDTH`] would be silently clipped rather than
+    /// visibly overflowing, which is the failure mode a fixed box trades for
+    /// the one it fixes. This is the assertion that catches it.
+    #[test]
+    fn every_row_of_the_lifetime_picker_fits_the_box() {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let mut widest = 0.0f32;
+        let mut name = String::new();
+        let _ = ctx.run_ui(input(), |ui| {
+            for row in crate::send::LIFETIME_CHOICES {
+                let label = lifetime_row_label(row, crate::send::DEFAULT_LIFETIME, &UTC);
+                let width = theme::dropdown_text_width(ui, &label);
+                if width > widest {
+                    widest = width;
+                    name = label;
+                }
+            }
+        });
+        assert!(widest > 0.0, "control: no row was measured at all");
+        let room = EXPIRY_FIELD_WIDTH - theme::DROPDOWN_TEXT_BUDGET;
+        assert!(
+            widest <= room,
+            "the {name:?} row is {widest}pt wide and the box leaves {room}pt for text, \
+             so it is clipped"
+        );
     }
 
     /// **The composer's two answers are a primary and a secondary**, measured
@@ -3025,7 +3326,7 @@ mod paint_tests {
     fn the_composers_two_answers_are_a_primary_and_a_secondary() {
         let mut composer = open_composer();
         assert!(
-            composer_problem(&composer).is_none(),
+            composer_problem(&composer, &FixedClock(NOW)).is_none(),
             "the fixture wants a submittable draft, or the fill below is a disabled one"
         );
         let painted = paint_composer(&mut composer, false);
@@ -3051,31 +3352,43 @@ mod paint_tests {
         );
     }
 
-    /// **While a publish is in flight the lifetime run is inert, and the
+    /// **While a publish is in flight the lifetime control is inert, and the
     /// answer in force is still legible.**
     ///
-    /// `theme::segmented_control_disabled` is what this form now draws in
-    /// that state, and it exists precisely so the run does not grey into an
-    /// undifferentiated strip: the cell in force keeps
-    /// [`theme::BLUE_WASH`], which is "you have this answer and cannot change
-    /// it" rather than "you have no answer". Pinned because the alternative
-    /// -- an `add_enabled(false)` over the live control -- looks nearly the
-    /// same in a screenshot and is a run whose cells egui will still let
-    /// through on a re-layout.
+    /// `theme::dropdown_disabled` is what this form draws in that state, and
+    /// it exists for the reason its segmented-run predecessor did: the reader
+    /// needs "you have this answer and cannot change it", not "you have no
+    /// answer". Pinned because the alternative -- an `add_enabled_ui(false)`
+    /// round the live control -- looks nearly the same in a screenshot while
+    /// fading the answer with the box, and leaves a control egui will still
+    /// let through on a re-layout.
     #[test]
-    fn a_publish_in_flight_leaves_the_lifetime_run_inert_and_readable() {
+    fn a_publish_in_flight_leaves_the_lifetime_control_inert_and_readable() {
         let mut composer = open_composer();
-        let chosen = crate::send::lifetime_label(composer.plan.delete_in_hours);
+        let chosen = crate::send::lifetime_label(composer.plan.lifetime, &UTC);
+        let live = paint_composer(&mut composer, false);
+        let (_, live_fill) = live.control_under(&chosen);
         let painted = paint_composer(&mut composer, true);
 
         assert!(painted.has(CREATING_LABEL), "the in-flight word is not on the form");
+        assert!(
+            painted.has(&chosen),
+            "the lifetime in force is not on the card while a publish is running, so the \
+             user cannot read back what they are publishing: {:?}",
+            painted.text
+        );
         let (_, fill) = painted.control_under(&chosen);
         assert_eq!(
             fill,
-            theme::BLUE_WASH,
-            "the lifetime in force is not drawn in the inert run's wash while a publish is \
-             running -- either the run is still live, or it has greyed out the one answer \
-             the user still has"
+            theme::CARD_TINT,
+            "the lifetime control is not the design system's inert box while a publish is \
+             running -- either it is still live, or it has been faded out with everything \
+             the user still needs to read on it"
+        );
+        assert_ne!(
+            fill, live_fill,
+            "control: the inert box and the live one paint the same, so this test would \
+             pass over a control that was never disabled at all"
         );
     }
 
@@ -3100,7 +3413,12 @@ mod paint_tests {
         // no refusal anywhere in the app.
         assert_eq!(view_limit_from("0"), Some(0));
         assert_eq!(
-            crate::send::validate_access(crate::send::DEFAULT_DELETE_IN_HOURS, None, Some(0)),
+            crate::send::validate_access(
+                crate::send::DEFAULT_LIFETIME,
+                None,
+                Some(0),
+                &FixedClock(NOW),
+            ),
             Some("A limit of zero views would make the link useless."),
             "a zero cap is accepted by the encoder, so the box may not produce one silently"
         );
@@ -3192,7 +3510,7 @@ mod paint_tests {
     #[test]
     fn what_the_access_block_holds_is_what_the_composer_would_publish() {
         let mut composer = open_composer();
-        composer.plan.delete_in_hours = 1;
+        composer.plan.lifetime = crate::send::SendLifetime::Hours(1);
         composer.plan.password = Some(zeroize::Zeroizing::new("share-pw-9271".to_string()));
         composer.plan.max_access_count = Some(3);
 
@@ -3201,20 +3519,28 @@ mod paint_tests {
         let painted = paint_composer(&mut composer, false);
         assert!(painted.has(ACCESS_EYEBROW), "control: the block did not draw");
 
-        assert_eq!(composer.plan.delete_in_hours, 1, "a frame reset the lifetime");
+        assert_eq!(
+            composer.plan.lifetime,
+            crate::send::SendLifetime::Hours(1),
+            "a frame reset the lifetime"
+        );
         assert_eq!(
             composer.plan.password.as_deref().map(String::as_str),
             Some("share-pw-9271"),
             "a frame dropped the share password, so the composer would publish an open link"
         );
         assert_eq!(composer.plan.max_access_count, Some(3), "a frame dropped the view cap");
-        assert_eq!(composer_problem(&composer), None, "the draft the user typed is refused");
+        assert_eq!(
+            composer_problem(&composer, &FixedClock(NOW)),
+            None,
+            "the draft the user typed is refused"
+        );
 
         // And the sub-day lifetime is the one now on screen, spelled by the
         // one function that spells lifetimes.
         assert!(
-            painted.has(&crate::send::lifetime_label(1)),
-            "the one-hour cell is not the one in force: {:?}",
+            painted.has(&crate::send::lifetime_label(crate::send::SendLifetime::Hours(1), &UTC)),
+            "the one-hour answer is not the one in the shut box: {:?}",
             painted.text
         );
         assert!(
@@ -6977,24 +7303,33 @@ mod source_pins {
     /// in source order. See
     /// [`the_public_surface_of_the_send_module_is_exactly_these_items`].
     const SEND_PUBLIC_SURFACE: &[&str] = &[
-        // **Re-pinned by the design §5a Access block, and a widening of
-        // nothing this wall guards.** The array went from three `u8`s of days
-        // to four `u32`s of hours and the default with it, so that §5a's
-        // `1 h` cell is expressible at all -- see `send::DELETE_IN_HOURS_CHOICES`
-        // for why the unit was the only thing in the way. Neither constant
-        // reaches a runner, an invocation or a child; they are read by
-        // `validate_plan`, by `deletion_date`'s arithmetic and by the picker
-        // that draws them.
-        "send.rs: pub const DELETE_IN_HOURS_CHOICES: [u32; 4] = [1, 24, 24 * 7, 24 * 30];",
-        "send.rs: pub const DEFAULT_DELETE_IN_HOURS: u32 = 24 * 7;",
+        // **Re-pinned by the nine-choice lifetime pass, and a widening of
+        // nothing this wall guards.** The lifetime stopped being a `u32` of
+        // hours -- a duration cannot say "3 months" without lying about how
+        // long a month is, cannot say "the 14th of March" at all, and cannot
+        // say "never" except as a sentinel wearing a duration's clothes -- so
+        // it is an enum of the four shapes that answer is given in, with the
+        // choices, the default, the wire sentinel, the picker's bound and the
+        // two special labels beside it.
+        //
+        // Not one of these reaches a runner, an invocation or a child. They
+        // are read by `validate_access`, by `deletion_date`'s arithmetic and
+        // by the control that draws them; the enum's two `impl` methods below
+        // are civil-date arithmetic and nothing else.
+        "send.rs: pub enum SendLifetime {",
+        "send.rs: pub const LIFETIME_CHOICES: [Option<SendLifetime>; 9] = [",
+        "send.rs: pub const PICK_A_DATE_LABEL: &str = \" \";",
+        "send.rs: pub const DEFAULT_LIFETIME: SendLifetime = SendLifetime::Hours(24 * 7);",
+        "send.rs: pub const NEVER_DELETION_DATE: &str = \" \";",
+        "send.rs: pub const MAX_PICKED_MONTHS: u32 = 12;",
         "send.rs: pub struct SendPlan {",
         "send.rs: pub name: String,",
         "send.rs: pub text: Zeroizing<String>,",
         "send.rs: pub hidden: bool,",
-        "send.rs: pub delete_in_hours: u32,",
+        "send.rs: pub lifetime: SendLifetime,",
         "send.rs: pub password: Option<Zeroizing<String>>,",
         "send.rs: pub max_access_count: Option<u32>,",
-        "send.rs: pub fn validate_plan(plan: &SendPlan) -> Option<&'static str> {",
+        "send.rs: pub fn validate_plan(plan: &SendPlan, now: &dyn SendClock) -> Option<&'static str> {",
         // **Added by the design §5a Access block, deliberately, and it is the
         // second and last item that work adds to this wall.** It is
         // `validate_plan`'s own last three rules, split out so that
@@ -7021,7 +7356,17 @@ mod source_pins {
         // `crate::rest::send` stamps the SAME instant in the SAME format
         // as the CLI path, rather than growing a second copy of the
         // arithmetic that the two backends could then disagree over.
-        "send.rs: pub(crate) fn deletion_date(hours: u32, now: &dyn SendClock) -> String {",
+        "send.rs: pub(crate) fn deletion_date(lifetime: SendLifetime, now: &dyn SendClock) -> String {",
+        // The enum's own two methods, and the window the calendar offers.
+        // `on_local_day` is the single place a picked `(year, month, day)`
+        // becomes an instant; `local_day` is the inverse, for a calendar that
+        // has to open on the answer already in force; `pickable_window` is the
+        // bound `validate_access` enforces, stated once so the control and the
+        // validator cannot disagree. All three are integer arithmetic over a
+        // clock and an offset that are both injected.
+        "send.rs: pub fn on_local_day(year: i64, month: u32, day: u32, zone: &dyn LocalOffset) -> Self {",
+        "send.rs: pub fn local_day(self, now: &dyn SendClock, zone: &dyn LocalOffset) -> Option<(i64, u32, u32)> {",
+        "send.rs: pub fn pickable_window(",
         // **Moved here from `send_ui`, deliberately, and it is the only item
         // the §5a Access block adds to this wall.** It was the Sends screen's
         // own `pub fn lifetime_label(days: u8)` while `expiry_wording`, four
@@ -7030,15 +7375,21 @@ mod source_pins {
         // function that both screens' cells and that sentence all read.
         //
         // It is a door in the sense this list counts and in no other: it
-        // takes a `u32` and returns a `String`, reaches no runner, no
+        // takes an enum and an offset and returns a `String`, reaches no runner, no
         // invocation and no child, and there is nothing behind it but a
         // `format!`.
-        "send.rs: pub fn lifetime_label(hours: u32) -> String {",
+        "send.rs: pub fn lifetime_label(lifetime: SendLifetime, zone: &dyn LocalOffset) -> String {",
+        // The one word `Never` is named by, beside the function that names
+        // it. A `&str` constant, read by the label and by nothing else.
+        "send.rs: pub const NEVER_LABEL: &str = \" \";",
         // `zone` was added beside `now` when the sentence stopped naming the
         // UTC day and started naming the user's own. Both are injected, and
         // that is the point of both: nothing in `send.rs` reads the machine's
         // clock or the machine's timezone for itself.
-        "send.rs: pub fn expiry_wording(hours: u32, now: &dyn SendClock, zone: &dyn LocalOffset) -> String {",
+        "send.rs: pub fn expiry_wording(lifetime: SendLifetime, now: &dyn SendClock, zone: &dyn LocalOffset) -> String {",
+        // And the one sentence that has no date in it, for the same reason:
+        // a `&str` beside the function that returns it.
+        "send.rs: pub const NEVER_WORDING: &str =",
         "send.rs: pub struct SendInvocation {",
         "send.rs: pub fn args(&self) -> &[String] {",
         "send.rs: pub fn stdin_json_b64(&self) -> &str {",

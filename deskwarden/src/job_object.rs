@@ -6793,6 +6793,19 @@ mod tests {
         // item as `MILLIS_PER_DAY` beside it -- an `i64` literal -- and the
         // paragraph above covers it word for word.
         "crate::local_time::MILLIS_PER_HOUR",
+        // And the day, for the calendar arithmetic a picked date needs:
+        // `send.rs` converts a whole number of days to milliseconds when it
+        // resolves a `Months` lifetime and when it bounds a picked one. The
+        // same kind of item again -- an `i64` literal.
+        "crate::local_time::MILLIS_PER_DAY",
+        // The calendar arithmetic a picked date needs. `add_months` and
+        // `days_from_civil` are integer arithmetic over a `(year, month, day)`;
+        // `end_of_local_day_utc_millis` is that plus two calls to the injected
+        // `LocalOffset` already on this list. None of the three takes a handle,
+        // a path or a `Command`, and none can start anything.
+        "crate::local_time::add_months",
+        "crate::local_time::days_from_civil",
+        "crate::local_time::end_of_local_day_utc_millis",
         "crate::local_time::civil_parts",
         "crate::local_time::local_parts",
         "crate::local_time::format_day",
@@ -7693,7 +7706,13 @@ mod tests {
             last_production_item: "UTC everywhere that is not Windows",
             min_code_len: 1000,
             callees: LOCAL_TIME_CALLEES,
-            call_sites: 44,
+            // 44 -> 64 when the module grew the inverse of its own civil
+            // conversion and the calendar arithmetic a date picker needs:
+            // `days_from_civil`, `days_in_month`, `clamp_day_of_month`,
+            // `add_months` and `end_of_local_day_utc_millis`. Every one of the
+            // twenty new sites is integer arithmetic or a call to the injected
+            // `LocalOffset`, both already on the list above.
+            call_sites: 64,
             macros: LOCAL_TIME_MACROS,
             imports: LOCAL_TIME_IMPORTS,
             local_paths: LOCAL_TIME_LOCAL_PATHS,
@@ -7716,7 +7735,10 @@ mod tests {
         "checked_mul",
         "civil_from_days",
         "civil_parts",
+        "clamp_day_of_month",
         "copied",
+        "days_from_civil",
+        "days_in_month",
         "default",
         "derive",
         "div_euclid",
@@ -7728,11 +7750,23 @@ mod tests {
         "is_err",
         "let",
         "local_millis",
+        "min",
         "month_name",
         "not",
         "offset_millis_at",
+        // The calendar arithmetic a date PICKER needs, added when a Send's
+        // lifetime could be a day the user points at rather than only a
+        // duration. `days_from_civil` is the exact inverse of
+        // `civil_from_days` above it; the rest are integer arithmetic over
+        // its result. Same paragraph as the block at the top of this list:
+        // no handle, no path, no `Command`.
+        "pubfnadd_months",
         "pubfncivil_from_days",
         "pubfncivil_parts",
+        "pubfnclamp_day_of_month",
+        "pubfndays_from_civil",
+        "pubfndays_in_month",
+        "pubfnend_of_local_day_utc_millis",
         "pubfnformat_day",
         "pubfnformat_day_time",
         "pubfnlocal_millis",
@@ -7741,6 +7775,8 @@ mod tests {
         "pubstructFixedOffset",
         "rem_euclid",
         "saturating_add",
+        "saturating_mul",
+        "saturating_sub",
         "unwrap_or",
     ];
     /// The two formatters build their sentence with `format!` and nothing

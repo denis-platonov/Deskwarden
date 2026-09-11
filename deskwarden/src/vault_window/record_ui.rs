@@ -368,7 +368,14 @@ impl RecordDraft {
 /// a blank passphrase is the exact state
 /// `record_from` answers with [`TotpToSend::None`], and a user whose button
 /// stayed live would publish a record with the seed silently missing.
-pub fn export_problem(draft: &RecordDraft) -> Option<&'static str> {
+///
+/// It takes a clock for `crate::send::validate_plan`'s reason: one of the
+/// Access rules is that a picked date has not gone by, and the past is not a
+/// property of a draft.
+pub fn export_problem(
+    draft: &RecordDraft,
+    now: &dyn crate::send::SendClock,
+) -> Option<&'static str> {
     let sel = &draft.selection;
     if sel.totp && draft.passphrase.trim().is_empty() {
         return Some(NEEDS_PASSPHRASE);
@@ -393,9 +400,10 @@ pub fn export_problem(draft: &RecordDraft) -> Option<&'static str> {
     // code over the same three answers, and there is no arm of it that only
     // one of them takes.
     crate::send::validate_access(
-        draft.access.delete_in_hours,
+        draft.access.lifetime,
         draft.access.password.as_deref().map(String::as_str),
         draft.access.max_access_count,
+        now,
     )
 }
 
@@ -879,7 +887,7 @@ pub fn draw_export_form(
         super::send_ui::draw_access_block(
             ui,
             super::send_ui::AccessControls {
-                delete_in_hours: &mut draft.access.delete_in_hours,
+                lifetime: &mut draft.access.lifetime,
                 password: &mut draft.access.password,
                 max_access_count: &mut draft.access.max_access_count,
             },
@@ -889,7 +897,7 @@ pub fn draw_export_form(
         );
 
         ui.add_space(12.0);
-        let problem = export_problem(draft);
+        let problem = export_problem(draft, now);
         let can_submit = export_can_submit(problem, in_flight);
         // **§5a's footer: a filled primary beside an outlined secondary.**
         //
@@ -1445,7 +1453,7 @@ mod tests {
     #[test]
     fn the_access_block_reaches_the_plan_that_is_published() {
         let access = SendPlan {
-            delete_in_hours: 1,
+            lifetime: crate::send::SendLifetime::Hours(1),
             password: Some(Zeroizing::new("share-pw-9271".to_string())),
             max_access_count: Some(3),
             ..SendPlan::default()
@@ -1454,11 +1462,15 @@ mod tests {
         // default plan carries, so the assertions below cannot pass by
         // accident.
         let default = SendPlan::default();
-        assert_ne!(access.delete_in_hours, default.delete_in_hours);
+        assert_ne!(access.lifetime, default.lifetime);
         assert!(default.password.is_none() && default.max_access_count.is_none());
 
         let plan = send_plan_from(&a_record(), access);
-        assert_eq!(plan.delete_in_hours, 1, "the lifetime the user chose did not travel");
+        assert_eq!(
+            plan.lifetime,
+            crate::send::SendLifetime::Hours(1),
+            "the lifetime the user chose did not travel"
+        );
         assert_eq!(
             plan.password.as_deref().map(String::as_str),
             Some("share-pw-9271"),
@@ -1484,12 +1496,15 @@ mod tests {
     #[test]
     fn the_export_form_refuses_what_the_encoder_would_refuse() {
         let good = RecordDraft::default();
-        assert_eq!(export_problem(&good), None, "control: the opening draft is refused");
+        assert_eq!(export_problem(&good, &FixedClock(NOW)), None, "control: the opening draft is refused");
 
         for (why, access) in [
             (
                 "a lifetime that is not one of the picker's cells",
-                SendPlan { delete_in_hours: 3, ..SendPlan::default() },
+                SendPlan {
+                    lifetime: crate::send::SendLifetime::Hours(3),
+                    ..SendPlan::default()
+                },
             ),
             (
                 "a password that is present and empty",
@@ -1504,7 +1519,7 @@ mod tests {
             ),
         ] {
             let draft = RecordDraft { access, ..RecordDraft::default() };
-            let problem = export_problem(&draft)
+            let problem = export_problem(&draft, &FixedClock(NOW))
                 .unwrap_or_else(|| panic!("{why} was accepted by the form"));
             assert!(
                 !export_can_submit(Some(problem), false),
@@ -1515,9 +1530,10 @@ mod tests {
             assert_eq!(
                 Some(problem),
                 crate::send::validate_access(
-                    draft.access.delete_in_hours,
+                    draft.access.lifetime,
                     draft.access.password.as_deref().map(String::as_str),
                     draft.access.max_access_count,
+                    &FixedClock(NOW),
                 ),
                 "{why} is refused here in words `crate::send` does not use"
             );
@@ -1530,7 +1546,7 @@ mod tests {
             access: SendPlan { max_access_count: Some(0), ..SendPlan::default() },
             ..RecordDraft::default()
         };
-        assert_eq!(export_problem(&both), Some(NEEDS_PASSPHRASE));
+        assert_eq!(export_problem(&both, &FixedClock(NOW)), Some(NEEDS_PASSPHRASE));
     }
 
     /// The production half of this file, for the source pins below.
@@ -1593,8 +1609,8 @@ mod tests {
         assert!(draft.passphrase.is_empty());
         // And the opening draft is one the button is live for, so the
         // defaults are usable rather than merely safe.
-        assert_eq!(export_problem(&draft), None);
-        assert!(export_can_submit(export_problem(&draft), false));
+        assert_eq!(export_problem(&draft, &FixedClock(NOW)), None);
+        assert!(export_can_submit(export_problem(&draft, &FixedClock(NOW)), false));
     }
 
     /// **The disabled button, as a pure function of the draft.**
@@ -1605,25 +1621,25 @@ mod tests {
     #[test]
     fn ticking_the_seed_disables_the_button_until_a_passphrase_is_typed() {
         let mut draft = RecordDraft::default();
-        assert!(export_can_submit(export_problem(&draft), false), "control: live before the tick");
+        assert!(export_can_submit(export_problem(&draft, &FixedClock(NOW)), false), "control: live before the tick");
 
         draft.set_totp(true);
-        assert_eq!(export_problem(&draft), Some(NEEDS_PASSPHRASE));
+        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(NEEDS_PASSPHRASE));
         assert!(
-            !export_can_submit(export_problem(&draft), false),
+            !export_can_submit(export_problem(&draft, &FixedClock(NOW)), false),
             "a seed can be published with nothing to seal it under"
         );
 
         // Whitespace is not a passphrase.
         draft.passphrase = Zeroizing::new("   ".to_string());
-        assert_eq!(export_problem(&draft), Some(NEEDS_PASSPHRASE));
+        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(NEEDS_PASSPHRASE));
 
         draft.passphrase = Zeroizing::new("correct horse battery staple".to_string());
-        assert_eq!(export_problem(&draft), None);
-        assert!(export_can_submit(export_problem(&draft), false));
+        assert_eq!(export_problem(&draft, &FixedClock(NOW)), None);
+        assert!(export_can_submit(export_problem(&draft, &FixedClock(NOW)), false));
 
         // And in flight, nothing submits whatever the draft says.
-        assert!(!export_can_submit(export_problem(&draft), true));
+        assert!(!export_can_submit(export_problem(&draft, &FixedClock(NOW)), true));
     }
 
     /// An empty draft is refused for its own reason, so the seed rule above is
@@ -1634,9 +1650,9 @@ mod tests {
             selection: RecordSelection::default(),
             ..RecordDraft::default()
         };
-        assert_eq!(export_problem(&draft), Some(NOTHING_TICKED));
+        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(NOTHING_TICKED));
         let ticked = RecordDraft { selection: RecordSelection { uri: true, ..Default::default() }, ..RecordDraft::default() };
-        assert_eq!(export_problem(&ticked), None, "control: one tick is enough");
+        assert_eq!(export_problem(&ticked, &FixedClock(NOW)), None, "control: one tick is enough");
     }
 
     /// Unticking the seed drops the passphrase, which zeroizes it. Re-ticking
@@ -1652,7 +1668,7 @@ mod tests {
         assert!(draft.passphrase.is_empty(), "the passphrase survived an untick");
         draft.set_totp(true);
         assert!(draft.passphrase.is_empty(), "a re-tick brought the old passphrase back");
-        assert_eq!(export_problem(&draft), Some(NEEDS_PASSPHRASE));
+        assert_eq!(export_problem(&draft, &FixedClock(NOW)), Some(NEEDS_PASSPHRASE));
     }
 
     /// The seed and its passphrase leave this form as one value, so no caller
@@ -2176,7 +2192,7 @@ mod paint_tests {
         // be asserting the fade rather than the fill.
         let mut draft = RecordDraft::default();
         assert!(
-            export_problem(&draft).is_none(),
+            export_problem(&draft, &FixedClock(NOW)).is_none(),
             "the fixture wants a submittable draft, or the fill below is a disabled one"
         );
         let painted = paint(|ui| {
@@ -2407,19 +2423,25 @@ mod paint_tests {
             assert!(painted.has(label), "the {label:?} row is missing: {:?}", painted.text);
         }
 
-        // All four cells of the widened lifetime run, including the two the
-        // old `u8` of days could not express.
-        for hours in crate::send::DELETE_IN_HOURS_CHOICES {
-            let cell = crate::send::lifetime_label(hours);
-            assert!(painted.has(&cell), "the {cell:?} cell is not drawn: {:?}", painted.text);
-        }
+        // The lifetime control, shut, saying the answer in force. It is a
+        // dropdown rather than a run of cells -- see
+        // `send_ui::draw_access_block` for the measurement that forced the
+        // change -- so what the card carries is one label and not nine.
+        assert!(
+            painted.has(&crate::send::lifetime_label(
+                crate::send::DEFAULT_LIFETIME,
+                &UTC
+            )),
+            "the lifetime control does not say the answer in force: {:?}",
+            painted.text
+        );
 
-        // The sentence under the run, naming the day this link dies -- at the
-        // UTC offset these tests stand in, and from `send.rs`'s own
+        // The sentence under the control, naming the day this link dies -- at
+        // the UTC offset these tests stand in, and from `send.rs`'s own
         // `expiry_wording` rather than from a second formatter here.
         assert!(
             painted.has(&crate::send::expiry_wording(
-                crate::send::DEFAULT_DELETE_IN_HOURS,
+                crate::send::DEFAULT_LIFETIME,
                 &FixedClock(NOW),
                 &UTC,
             )),
@@ -2458,13 +2480,19 @@ mod paint_tests {
 
     /// **§5a's Access block fits the modal it is drawn in.**
     ///
-    /// The block's widest row is a four-cell segmented run sitting to the
-    /// right of a 96-point label column, inside a card that is
-    /// [`MODAL_WIDTH`] wide with a 12-point margin each side. That is a real
-    /// constraint and it is not obvious by inspection: the run sizes each
-    /// cell to its own label plus `theme::SEGMENT_PADDING`, so it grew when
-    /// the lifetime picker went from three cells to four, and it would grow
-    /// again if a label were reworded.
+    /// The block's widest row is the lifetime control sitting to the right of
+    /// a 96-point label column, inside a card that is [`MODAL_WIDTH`] wide
+    /// with a 12-point margin each side. That leaves **226 points**, and it is
+    /// a real constraint that is not obvious by inspection.
+    ///
+    /// **This test is why the lifetime row is a dropdown.** It used to loop
+    /// over a segmented run's cells, because a run sizes each cell to its own
+    /// label plus `theme::SEGMENT_PADDING` -- so the run grew when the picker
+    /// went from three cells to four, and when the set reached nine there was
+    /// no setting of any constant that fitted it in 226 points.
+    /// `send_ui::EXPIRY_FIELD_WIDTH` is a fixed box that cannot grow at all,
+    /// and this measures the box rather than a label inside it, so the claim
+    /// survives a reworded answer.
     ///
     /// **This is the measurement that has cost this project rework before.**
     /// The design page is content-box, so §5a's `width: 690px` column and its
@@ -2491,21 +2519,26 @@ mod paint_tests {
             .expect("control: the ACCESS eyebrow did not paint");
         let right_edge = eyebrow.left() + MODAL_WIDTH;
 
-        for hours in crate::send::DELETE_IN_HOURS_CHOICES {
-            let cell = crate::send::lifetime_label(hours);
-            let rect = painted
-                .rect_of(&cell)
-                .unwrap_or_else(|| panic!("the {cell:?} cell did not paint"));
-            assert!(
-                rect.right() <= right_edge,
-                "the {cell:?} cell runs {}pt past the right edge of a {MODAL_WIDTH}pt modal. \
-                 §5a's Access rows are a 96-point label column plus a control, and a \
-                 segmented run sizes every cell to its own label -- so a reworded lifetime, \
-                 or a fifth one, overflows the card before it overflows anything a screenshot \
-                 shows",
-                rect.right() - right_edge
-            );
-        }
+        // The lifetime control, measured as a BOX and not as a label. The
+        // label is found first because that is the only thing the paint
+        // harness can see, and the box is then reconstructed round it: the
+        // text starts one `DROPDOWN_PAD_X` inside the left edge, and the box
+        // runs `EXPIRY_FIELD_WIDTH` from there. Measuring the label alone
+        // would pass for a box twice as wide as the card.
+        let answer = crate::send::lifetime_label(crate::send::DEFAULT_LIFETIME, &UTC);
+        let label = painted
+            .rect_of(&answer)
+            .unwrap_or_else(|| panic!("the {answer:?} answer did not paint"));
+        let box_right =
+            label.left() - theme::DROPDOWN_PAD_X + super::super::send_ui::EXPIRY_FIELD_WIDTH;
+        assert!(
+            box_right <= right_edge,
+            "the lifetime control runs {}pt past the right edge of a {MODAL_WIDTH}pt modal. \
+             §5a's Access rows are a 96-point label column plus a control, which leaves 226 \
+             points -- and a control wider than that overflows the card before it overflows \
+             anything a screenshot shows",
+            box_right - right_edge
+        );
 
         // The notes beside the two optional controls are the other things on
         // these rows that can push right, and they are sentences rather than

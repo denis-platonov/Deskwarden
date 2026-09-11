@@ -10189,7 +10189,10 @@ fn apply_send_action(
             // rendering. Both call `crate::send::validate_plan`, which is
             // also what `plan_to_invocation` refuses on, so the three cannot
             // disagree about what a publishable draft is.
-            if !create.in_flight && send_ui::composer_problem(&create.composer).is_none() {
+            if !create.in_flight
+                && send_ui::composer_problem(&create.composer, &crate::send::SystemClock)
+                    .is_none()
+            {
                 create.in_flight = true;
                 create.report = None;
                 spawn_create(
@@ -35882,7 +35885,7 @@ mod send_create_wiring {
     thread_local! {
         /// Every create [`recording_create_spawn`] was asked to start, on this
         /// thread. Thread-local because `cargo test` runs tests in parallel.
-        static CREATE_SPAWNS: RefCell<Vec<(String, String, String, u32, String)>> =
+        static CREATE_SPAWNS: RefCell<Vec<(String, String, String, crate::send::SendLifetime, String)>> =
             const { RefCell::new(Vec::new()) };
     }
 
@@ -35906,7 +35909,7 @@ mod send_create_wiring {
                 plan.name.clone(),
                 plan.text.to_string(),
                 plan.password.as_deref().cloned().unwrap_or_default(),
-                plan.delete_in_hours,
+                plan.lifetime,
                 session.to_string(),
             ));
         });
@@ -35917,7 +35920,7 @@ mod send_create_wiring {
     fn apply(
         action: send_ui::SendUiAction,
         create: &mut SendCreateState,
-    ) -> Vec<(String, String, String, u32, String)> {
+    ) -> Vec<(String, String, String, crate::send::SendLifetime, String)> {
         CREATE_SPAWNS.with(|s| s.borrow_mut().clear());
         let ctx = egui::Context::default();
         let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
@@ -35985,7 +35988,7 @@ mod send_create_wiring {
                 DRAFT_NAME.to_string(),
                 SECRET.to_string(),
                 SHARE_PASSWORD.to_string(),
-                crate::send::DEFAULT_DELETE_IN_HOURS,
+                crate::send::DEFAULT_LIFETIME,
                 SESSION.to_string(),
             )],
             "pressing Create did not start exactly one publish carrying exactly the draft \
@@ -36048,7 +36051,7 @@ mod send_create_wiring {
             ..SendCreateState::default()
         };
         assert!(
-            send_ui::composer_problem(&create.composer).is_some(),
+            send_ui::composer_problem(&create.composer, &crate::send::SystemClock).is_some(),
             "control: the empty draft is considered publishable, so this test is about \
              nothing"
         );

@@ -15,6 +15,106 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### Deskwarden gets out of the way while it scans your screen
+
+Choosing **Scan the code on my screen** used to leave the Deskwarden window
+sitting exactly where it was -- on top of the screen it was about to read. The
+scan itself coped, because the window is taken out of the picture before the
+capture, but you did not: if the scan could not find a code and asked you to
+drag a box around it, it was asking you to point at something Deskwarden was
+covering. And when the scan *did* find a code and drew a ring around it, the
+ring could be behind the window too.
+
+Deskwarden now minimises itself for the length of the scan and comes back to
+the front the moment it is over -- however it ends: a code found, no code
+found, several found, Escape, the close button, or the window going away under
+it. It minimises rather than hides, so even in the worst case it is one taskbar
+click away, and its taskbar button, its place in Alt-Tab and everything else
+about a minimised window are exactly what they are when you minimise it
+yourself.
+
+Two smaller things follow from it. The keyboard stays with the scan overlay
+while Deskwarden is down, so **Esc** still cancels. And the ring around a code
+that was found waits for the window to finish getting out of the way before its
+half-second starts, so you get the whole of it rather than whatever is left.
+
+### The screen-scan overlay is lighter, so you can see your own screen through it
+
+The dimming that falls over the desktop while you pick a region was too heavy:
+*"don't do hard overlay - needs to be transparent enough"*. It let 32% of your
+screen through, which is what the design specifies -- but the design draws its
+example over a bright white desktop, and over a real one the same wash reads as
+nearly black. It now lets 55% through, so the window you are pointing at is a
+window you can still read.
+
+### A Send can last three months, a year, until a date you pick, or forever
+
+The expiry choice on both Send forms offered four answers -- one hour, one day,
+seven days, thirty days -- and stopped there, because the server behind them
+refused any deletion date more than thirty-one days out. That ceiling was never
+a rule about sharing; it was a cloud quota copied into a self-hosted server that
+has no quota, and it made "keep this for the quarter" impossible to say.
+
+There are now nine answers: **1 hour, 1 day, 7 days, 30 days, 3 months, 6
+months, 12 months, a date you pick, and Never.** Months are real calendar months
+-- three months from the 31st of January is the 28th of February, not ninety
+days later.
+
+**Never means never.** A link with no end date keeps working until you delete
+the Send. It is a choice like any other on the list, in the same control, one
+press away: a password shared with someone in your own house is wanted again
+next month, and re-making the link every thirty days is not the safer answer,
+just the more tedious one. The line under the picker says plainly that the link
+has no end date and what ends it.
+
+**A date you pick opens a calendar.** It shows one month at a time, with the
+days outside the next twelve months drawn but not offered, so there is no way to
+name a date that does not exist or a date that will be refused. A picked day
+lasts until the **end** of that day, in your own timezone -- so picking today
+gives you the rest of today rather than a link that was already dead when you
+copied it.
+
+**The control itself changed shape.** Nine answers will not fit in a row of
+cells inside the export window, so the expiry row is now a dropdown: one box
+that states the answer in force, the same width whatever that answer is. It is
+part of the design system rather than a one-off on this screen, so the next
+screen that needs a list of answers has one to use.
+
+### "Browse" matches the button beside it
+
+In the **Matched app** section of the item editor, the two buttons under the
+program-file box -- "Choose a running app..." and "Browse..." -- were not the
+same control. Browse was drawn with a plain button rather than the app's own,
+so it came out in a lighter weight and a few points shorter than its
+neighbour, its bottom edge stopping above the line. Three of the four things
+you could see about it already matched by accident, which is why it read as
+emphasis rather than as a mistake. It is the app's button now, at the app's
+height, and the pair sits on one line.
+
+### The keystroke builder and the send confirmation wear the design system
+
+Three things on the two screens that stand between a keystroke sequence and a
+real password had been drawn by hand instead of with the controls the rest of
+the app uses.
+
+**Steps / Template is one switch now.** The pair of buttons at the top of the
+keystroke builder had become two separate boxes with the current one shaded
+faintly. It is the same control the backend picker and the record windows use:
+one pill with two positions, and the view you are looking at filled in solid.
+
+**Hold Space to send is the button it should always have been.** On the card
+that appears before a sequence types a real password, the hold bar was drawn in
+the palest blue in the palette -- lighter than the two grey answers beneath it,
+so the one control on that card that actually sends was the quietest thing on
+it. It is now the solid blue this app gives to the action a window is for, in
+white, taller than the two answers under it, and it fills in a darker blue as
+you hold.
+
+**The password step is in red.** That same card listed the step that types your
+password in exactly the same grey as the Tab above it. It now sits in its own
+tinted box in the one red this app uses for nothing else, so the step you need
+to notice is the step you notice.
+
 ### A Send can now carry a password, a view limit, and an hour-long life
 
 The window that shares a record -- and the one that shares a scrap of text --
