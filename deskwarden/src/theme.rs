@@ -4588,6 +4588,327 @@ pub struct ModalPress {
     pub confirmed: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Where a modal SITS, and how the user moves it
+//
+// Every card in this app used to be pinned, and not by a decision anybody
+// argued: each one was written as an `Area` carrying
+// `.anchor(Align2::CENTER_CENTER, Vec2::ZERO)`, and an anchored `Area` is
+// pinned BY DEFINITION -- egui recomputes its position from the anchor on
+// every frame, so a `.movable(true)` on the same builder is read and then
+// thrown away. Eleven sites inherited the line from the one written before
+// them, which is how a property nobody chose comes to hold everywhere.
+//
+// The answer lives HERE rather than at those eleven sites, for the reason the
+// card itself does: "how does a modal behave" is one answer, and a modal
+// written next month is movable by construction if the only way to get an
+// `Area` for it is to ask this file for one.
+// ---------------------------------------------------------------------------
+
+/// The top strip of a hand-built card -- one that is an `egui::Frame` with a
+/// `Margin::same(20)` and a bold 15px title on its first line, rather than
+/// [`modal_card`]'s coloured band.
+///
+/// Six cards in this crate are built that way (`folder_modal`,
+/// `detail_edit`'s discard confirm, `vault_window`'s two export cards and its
+/// revoke report, and its launch confirm), and this is the height of what a
+/// user reads as their header: 20 points of margin plus the ~19 the 15px line
+/// occupies. It is deliberately a POINT SHORT of where the next widget starts
+/// -- every one of those cards follows its title with `add_space(10.0)` -- so
+/// the grab strip cannot reach a control.
+pub const MODAL_PLAIN_HEADER_HEIGHT: f32 = 40.0;
+
+/// How far one modal has been dragged away from its centred position, and the
+/// pass it was last drawn on.
+///
+/// **An offset from the centre, not a position, and the card stays
+/// ANCHORED.** `.anchor(CENTER_CENTER, offset)` keeps everything the anchor
+/// was already doing for free: with the offset at zero the builder is
+/// character for character the one that was there before, so a card opens
+/// exactly where it opened yesterday and every paint test that measured it
+/// still measures the same rectangle; and a window the user RESIZES
+/// re-centres the card under it, instead of leaving it stranded beside an
+/// edge that has moved. A stored absolute position would have had to be
+/// migrated by hand on every resize, and would have got the first frame wrong
+/// -- the frame on which nothing has measured the card yet.
+///
+/// **`last_pass` is how the offset is thrown away when the modal closes.** A
+/// closed modal draws nothing, so there is no "on close" callback to hang
+/// this on; what there IS is the pass number the card was last seen on. A gap
+/// in that -- not drawn on the pass before this one -- is a card that went
+/// away and came back, and that is the moment the position resets. See
+/// [`modal_offset`] for why resetting is the right default.
+#[derive(Clone, Copy, Default)]
+struct ModalOffset {
+    /// The drag, accumulated. Always already clamped: see [`modal_offset`].
+    by: Vec2,
+    /// [`egui::Context::cumulative_pass_nr`] when this card was last drawn.
+    last_pass: u64,
+}
+
+/// **The clamp, and it is the whole rule: a modal may not be dragged so that
+/// any part of it leaves the window.**
+///
+/// The requirement is that the card stay reachable -- that the user can
+/// always get at the header to drag it back, and at whatever control dismisses
+/// it. The tempting version of that rule is "keep the header and the ✕ in",
+/// and it does not survive contact with these cards, because they do not
+/// agree on where the dismiss control IS: `prefs_ui` draws a ✕ at the right
+/// end of its header, [`modal_card`] draws two answers in a FOOTER band at
+/// the very bottom, `folder_modal` puts a Cancel button in the body, and
+/// `totp_add` moves its dismiss between stages. A helper that clamped "the
+/// dismiss control" would have to be told where each card keeps one, and
+/// would be wrong the first time a card moved it.
+///
+/// Containing the whole card needs none of that: whatever the dismiss control
+/// is and wherever it lives, it is inside the card, so a card inside the
+/// window has it inside the window too. It is also the rule a user can
+/// predict without being told -- the card stops at the edge, the way a window
+/// stops at the edge of a screen.
+///
+/// The arithmetic falls out symmetric, which is worth naming because it is
+/// what makes the rule one line: a card centred in a window has exactly half
+/// the leftover width free on its left and half on its right, so the travel
+/// is `±(window - card) / 2` per axis.
+///
+/// **A card LARGER than the window gets no travel at all**, rather than
+/// negative travel: `slack` floors at zero, so the clamp collapses to
+/// `offset = 0`, which is the centred position the card opened at. That is
+/// the least-bad place for a card that cannot fit -- it is the position that
+/// wastes the least of it off either edge -- and it is the one the user
+/// already knows, so a window shrunk until the card no longer fits snaps the
+/// card back to the middle rather than parking it against a corner.
+///
+/// **egui agrees with this rule, and that is not a reason to drop it.** An
+/// `Area` is `constrain`ed to the window by default, so the card egui DRAWS
+/// is already kept inside whatever this returns -- measured, not assumed:
+/// disable this clamp and `the_card_cannot_be_dragged_out_of_the_window`
+/// still passes. What egui does not do is stop the offset THIS file
+/// remembers from running away, and an un-clamped offset five thousand points
+/// past the edge is five thousand points the user must drag back before the
+/// card so much as twitches.
+/// `a_card_shoved_past_the_edge_comes_back_on_the_very_next_drag` is the one
+/// that dies without this, and it is the reason the clamp exists.
+///
+/// It also keeps [`movable_modal_at`] honest, where egui's constraint would
+/// be an active hazard rather than a spare net: that caller PAINTS from the
+/// rectangle it was handed, so a position egui had to pull back into the
+/// window would be a card whose chrome and whose widgets disagreed.
+pub fn clamp_modal_offset(window: Rect, card: Vec2, by: Vec2) -> Vec2 {
+    let slack = ((window.size() - card) / 2.0).max(Vec2::ZERO);
+    Vec2::new(by.x.clamp(-slack.x, slack.x), by.y.clamp(-slack.y, slack.y))
+}
+
+/// Reads this modal's drag offset, resets it if the modal has just been
+/// reopened, re-clamps it to the window as it is NOW, and writes it back.
+///
+/// `size` is the card's, when the caller knows it; `None` on the frame a
+/// self-measuring card has not been measured on yet, where there is nothing
+/// to clamp against and nothing has been dragged either.
+///
+/// # The position resets when the modal closes
+///
+/// A card dragged into a corner and then reopened there is a card the user
+/// has to go and look for, and the cost is not symmetric: the frame the modal
+/// opens on is the ONE moment this app can guarantee the card is findable, so
+/// spending it is cheap and not spending it is how a user ends up hunting for
+/// a dialog they are sure they opened. Remembering the position would buy the
+/// user who drags the same card aside twice in a row one drag; it would cost
+/// every other user the assumption that a modal appears in the middle of the
+/// window.
+///
+/// # Why the clamp is applied to the STORED offset and not just to the drawn
+/// position
+///
+/// The vault window is resizable, down to [`crate::settings::MIN_VAULT_WINDOW_SIZE`],
+/// so a card dragged to the edge of a large window is a card whose offset no
+/// longer fits after the window is dragged smaller. Re-clamping every pass is
+/// what keeps it reachable: the card walks back in as the window closes on
+/// it, rather than sliding out of the window and taking its dismiss control
+/// with it.
+///
+/// Clamping the STORED value -- rather than keeping the raw offset and
+/// clamping only for display -- is the deliberate half. The alternative
+/// remembers the drag that no longer fits and springs the card back out when
+/// the window is widened again, minutes later, with no pointer anywhere near
+/// it. A card that moves on its own is worse than a card that forgot how far
+/// it was once pushed, and this way the operation is idempotent: what is
+/// stored is always a position the card is actually in.
+fn modal_offset(ctx: &egui::Context, id: egui::Id, size: Option<Vec2>) -> Vec2 {
+    let pass = ctx.cumulative_pass_nr();
+    let mut state = ctx.data(|d| d.get_temp::<ModalOffset>(id)).unwrap_or_default();
+    // Strictly `<`: drawn on the pass before this one is a modal that stayed
+    // open, and egui runs more than one pass for a single frame whenever
+    // something asks for a re-layout, so "the same pass" has to count as open
+    // too.
+    if state.last_pass + 1 < pass {
+        state.by = Vec2::ZERO;
+    }
+    if let Some(size) = size {
+        state.by = clamp_modal_offset(ctx.content_rect(), size, state.by);
+    }
+    state.last_pass = pass;
+    ctx.data_mut(|d| d.insert_temp(id, state));
+    state.by
+}
+
+/// **The way every self-measuring modal in this app gets its `Area`.**
+///
+/// Hand it the same `egui::Area::new(egui::Id::new("..."))` the call site used
+/// to write, and get back one that is on [`egui::Order::Foreground`], centred,
+/// and offset by however far the user has dragged it. With nothing dragged
+/// that is exactly `.order(Foreground).anchor(CENTER_CENTER, Vec2::ZERO)` --
+/// the line it replaces -- so the first frame of every card, and every test
+/// that measured one, is unchanged.
+///
+/// **The `Area` is the CALLER's**, for [`modal_scrim`]'s reason: the ids are
+/// literals at the call sites because `item_list::MODAL_SCRIM_AREAS` and its
+/// source walk read them there, and a helper taking a bare string would move
+/// the declaration out of that walk's sight.
+///
+/// The caller must also call [`modal_drag_handle`] as the FIRST thing inside
+/// the area, or the card is centred and still unmovable. That is two calls
+/// rather than one because the second one needs a `Ui` that only exists
+/// inside `show`, and because only the card knows how tall its own header is.
+pub fn movable_modal(ctx: &egui::Context, area: egui::Area) -> egui::Area {
+    let id = area.layer().id;
+    // The size egui measured last pass. `None` before the card has ever been
+    // drawn, which is the frame an anchored `Area` paints nothing on anyway
+    // -- see `prefs_ui`'s `an_anchored_area_paints_nothing_on_its_first_frame`.
+    let size = egui::AreaState::load(ctx, id).and_then(|state| state.size);
+    let by = modal_offset(ctx, id, size);
+    area.order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, by)
+}
+
+/// [`movable_modal`] for a card that COMPUTES its own rectangle instead of
+/// letting egui measure it: the area, **and the rectangle the card is now
+/// at**.
+///
+/// `prefs_ui` is the one of those. Its card is a fixed size worked out from
+/// the window, placed with `fixed_pos` rather than an anchor so that it paints
+/// on the very first frame instead of spending one being measured; feeding it
+/// through the anchor would undo that. It then paints itself in ABSOLUTE
+/// coordinates taken from that rectangle -- header, ✕, body panel and all --
+/// so moving the `Area` alone would move where the card's widgets are laid
+/// out and leave its painted chrome behind. Hence both halves come back from
+/// one call: whatever the caller derives its geometry from must be the
+/// returned rect and not the one it passed in.
+///
+/// Clamped against the size the caller already knows, which is why this one
+/// needs no warm-up frame before the clamp is real.
+pub fn movable_modal_at(
+    ctx: &egui::Context,
+    area: egui::Area,
+    card: Rect,
+) -> (egui::Area, Rect) {
+    let id = area.layer().id;
+    let moved = card.translate(modal_offset(ctx, id, Some(card.size())));
+    (area.order(egui::Order::Foreground).fixed_pos(moved.min), moved)
+}
+
+/// **The grabbable strip: a card is dragged by its header and by nothing
+/// else.**
+///
+/// Call it as the first statement inside a [`movable_modal`] area, passing
+/// the height of that card's own header -- [`MODAL_HEADER_HEIGHT`] for
+/// [`modal_card`]'s coloured band, [`MODAL_PLAIN_HEADER_HEIGHT`] for a
+/// hand-built card's title line, or the card's own constant where it has one.
+///
+/// # Why not the whole card
+///
+/// These cards are full of text fields, tick-boxes, segmented runs and
+/// buttons, and a drag that started anywhere on the card would fight every
+/// one of them: a drag is how a text field selects, how a segmented control
+/// is swiped, how a scrolling body is flung. The header is the one band of
+/// every card that holds nothing a pointer does anything with, which is what
+/// makes it the handle -- the same reason a title bar is a title bar.
+///
+/// # Why it is registered FIRST, and why it senses only drags
+///
+/// egui hit-tests clicks and drags SEPARATELY, but not independently: where
+/// the topmost widget under the pointer senses drags and not clicks, it
+/// swallows the click rather than letting it through to whatever is below
+/// (`egui::hit_test`, the `(Some(click), Some(drag))` arm -- "it would be
+/// confusing if clicking a drag-widget would actually click something else
+/// below it"). A strip registered after the header's contents would therefore
+/// eat the ✕ that `prefs_ui` and `totp_add` draw there. Registered before
+/// them it is the one UNDERNEATH, egui reports the ✕ for the click and this
+/// strip for the drag, and both work.
+///
+/// Registering first has a price and it is one frame: the strip has to be
+/// placed before the card has been laid out, so it is placed over the rect
+/// the card occupied on the previous pass. On the pass a card changes size --
+/// `totp_add` moving between stages, an error line appearing -- the strip is
+/// momentarily up to half the size change out of position. The alternative
+/// costs a dismiss button.
+///
+/// # `Sense::drag()`, and `ui.interact` rather than `ui.allocate_rect`
+///
+/// `allocate_rect` would grow the `Ui`'s min rect, which IS the size egui
+/// centres the area by, so the strip would push the card off centre by its
+/// own height.
+///
+/// # The cursor
+///
+/// `Grab` on hover and `Grabbing` while held. `PointingHand` is this app's
+/// mark for "this does something when you click it" ([`close_glyph`] sets it,
+/// so do the buttons), and the header does nothing when clicked -- pointing a
+/// finger at it would promise an action that is not there. The grab pair is
+/// the platform's own word for "this moves", and it also reports back: the
+/// cursor changing under the pointer is the only thing on screen that says
+/// the header is a handle at all.
+pub fn modal_drag_handle(ui: &mut Ui, header_height: f32) {
+    let id = ui.layer_id().id;
+    let Some(state) = egui::AreaState::load(ui.ctx(), id) else {
+        return;
+    };
+    if state.size.is_none() {
+        // Never drawn: there is no rect to put a handle on yet.
+        return;
+    }
+    let card = state.rect();
+    modal_drag_handle_at(
+        ui,
+        Rect::from_min_max(
+            card.min,
+            Pos2::new(card.max.x, (card.min.y + header_height).min(card.max.y)),
+        ),
+    );
+}
+
+/// [`modal_drag_handle`] for a card that knows its own header rectangle this
+/// frame, rather than having to read last frame's off the `Area`.
+///
+/// [`movable_modal_at`]'s partner, and its advantage is the same one: a card
+/// that computes its geometry can be grabbed on the first frame it is drawn
+/// and stays exact through a resize, where a self-measuring card's handle is
+/// one pass behind its own layout.
+pub fn modal_drag_handle_at(ui: &mut Ui, header: Rect) {
+    // The area's own id, taken from the layer rather than passed in, so it
+    // cannot drift out of step with the id `movable_modal` stored under.
+    let id = ui.layer_id().id;
+    let response = ui.interact(header, id.with("modal-drag"), Sense::drag());
+    if response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        let by = response.drag_delta();
+        if by != Vec2::ZERO {
+            ui.ctx().data_mut(|d| {
+                let mut offset = d.get_temp::<ModalOffset>(id).unwrap_or_default();
+                offset.by += by;
+                d.insert_temp(id, offset);
+            });
+            // The clamp and the redraw both happen in `movable_modal` on the
+            // next pass, which is the pass this asks for. Without it a drag
+            // that ends between repaints leaves the card a few points behind
+            // the pointer until something else wakes the window.
+            ui.ctx().request_repaint();
+        }
+    } else if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+    }
+}
+
 /// The dimmed, click-eating scrim a modal sits on.
 ///
 /// **The `Area` is the CALLER's, and that is not an accident of style.**
@@ -4623,8 +4944,13 @@ pub fn modal_scrim(ctx: &egui::Context, area: egui::Area) {
         });
 }
 
-/// Draws one modal card, centred, and reports which of its two answers was
-/// pressed.
+/// Draws one modal card, centred until the user moves it, and reports which
+/// of its two answers was pressed.
+///
+/// **Movable, and its callers do nothing to get that.** The area comes from
+/// [`movable_modal`] and the handle from [`modal_drag_handle`], both called
+/// here, so `delete_modal` and `icon_modal` are draggable by the header band
+/// this function draws for them without either file mentioning a drag.
 ///
 /// `body` fills the white middle band; it is given a `Ui` already inset by
 /// the card's margins and already the right width for a wrapping label.
@@ -4647,9 +4973,11 @@ pub fn modal_card(
     confirm: impl FnOnce(&mut Ui) -> Response,
 ) -> ModalPress {
     let mut press = ModalPress::default();
-    area.order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+    movable_modal(ctx, area)
         .show(ctx, |ui| {
+            // First, before anything the header draws -- see
+            // [`modal_drag_handle`] on why the order is the whole trick.
+            modal_drag_handle(ui, MODAL_HEADER_HEIGHT);
             let framed = egui::Frame::new()
                 .fill(CARD)
                 .corner_radius(CornerRadius::same(MODAL_RADIUS))
@@ -9191,6 +9519,478 @@ mod modal_card_tests {
             1,
             "a subject with no username painted more than its name: {:?}",
             alone.texts
+        );
+    }
+}
+
+#[cfg(test)]
+mod modal_drag_tests {
+    //! Real frames of a movable modal, driven by a real pointer: where the
+    //! card opens, what moves it, what does not, how far it may go, and what
+    //! is left of that the next time it opens.
+    //!
+    //! Driven through [`movable_modal`] and [`modal_drag_handle`] rather than
+    //! through [`modal_card`], because what is under test is the WINDOW
+    //! BEHAVIOUR every modal in this app now shares, and a card of its own
+    //! keeps these assertions from turning into assertions about the delete
+    //! confirmation's padding. `modal_card` itself is checked once at the
+    //! bottom, so the wiring between the two is not taken on trust.
+    use super::*;
+
+    /// The window these frames run in.
+    const WINDOW: Vec2 = Vec2::new(900.0, 700.0);
+    /// The test card. `delete_modal`'s width, and a height that leaves plenty
+    /// of slack in both directions so a clamp that fired early would show.
+    const CARD: Vec2 = Vec2::new(340.0, 240.0);
+    /// The card's grabbable strip, and the height of the click target drawn
+    /// inside it -- the ✕ `prefs_ui` and `totp_add` keep there.
+    const HEADER: f32 = MODAL_HEADER_HEIGHT;
+    const CARD_ID: &str = "theme-modal-drag-test-card";
+
+    /// One window, drawing one modal, across as many frames as a test needs.
+    struct Window {
+        ctx: egui::Context,
+        /// Resizable, because a card that fitted in a large window and no
+        /// longer fits in a small one is half of what the clamp is for.
+        size: std::cell::Cell<Vec2>,
+        /// Whether the modal is drawn at all. A closed modal is a modal that
+        /// draws nothing, which is the only signal the offset has to reset on.
+        open: std::cell::Cell<bool>,
+        /// Frames the header's own click target reported a click on.
+        marked: std::cell::Cell<u32>,
+    }
+
+    impl Window {
+        /// A window with the modal open and settled: the sizing pass egui
+        /// spends measuring an anchored area, then two live frames, so
+        /// everything below is asserting about a card that is really on
+        /// screen.
+        fn opened() -> Self {
+            let window = Window {
+                ctx: egui::Context::default(),
+                size: std::cell::Cell::new(WINDOW),
+                open: std::cell::Cell::new(true),
+                marked: std::cell::Cell::new(0),
+            };
+            for _ in 0..3 {
+                window.frame(&[]);
+            }
+            assert_eq!(
+                window.card().size(),
+                CARD,
+                "the card never reached its real size, so every position below is measured \
+                 against the wrong rectangle"
+            );
+            window
+        }
+
+        fn frame(&self, events: &[egui::Event]) {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, self.size.get())),
+                events: events.to_vec(),
+                ..Default::default()
+            };
+            let _ = self.ctx.run_ui(input, |ui| {
+                if !self.open.get() {
+                    return;
+                }
+                let ctx = ui.ctx();
+                movable_modal(ctx, egui::Area::new(egui::Id::new(CARD_ID))).show(ctx, |ui| {
+                    // First, exactly as every converted call site calls it.
+                    modal_drag_handle(ui, HEADER);
+                    let (card, _) = ui.allocate_exact_size(CARD, Sense::hover());
+                    // A click target in the header, at the right-hand end and
+                    // the size of the real thing, where `prefs_ui` and
+                    // `totp_add` keep their ✕ -- registered AFTER the handle,
+                    // which is the whole of why it still works. Its geometry
+                    // is `prefs_ui::tests::close_rect`'s.
+                    if ui
+                        .interact(self.mark(card), egui::Id::new("header-mark"), Sense::click())
+                        .clicked()
+                    {
+                        self.marked.set(self.marked.get() + 1);
+                    }
+                    // And something in the BODY that wants drags of its own,
+                    // the way a text field or a scrolling band does.
+                    let body = Rect::from_min_max(
+                        Pos2::new(card.min.x, card.min.y + HEADER),
+                        card.max,
+                    );
+                    ui.interact(body, egui::Id::new("body-field"), Sense::click_and_drag());
+                });
+            });
+        }
+
+        /// Where the card is right now.
+        fn card(&self) -> Rect {
+            egui::AreaState::load(&self.ctx, egui::Id::new(CARD_ID))
+                .expect("the modal has never been drawn")
+                .rect()
+        }
+
+        /// Where a card that has not been moved sits: the middle of the
+        /// window, which is what the anchor these cards used to carry meant.
+        fn centre(&self) -> Rect {
+            Rect::from_center_size(
+                Rect::from_min_size(Pos2::ZERO, self.size.get()).center(),
+                CARD,
+            )
+        }
+
+        /// Press at `from`, move to `to`, release. Five frames because that is
+        /// what a real drag is: egui hit-tests a press against the widget
+        /// rects of the PREVIOUS frame, the move is a frame of its own, and
+        /// the offset it accumulates is read by the anchor on the frame after
+        /// that.
+        fn drag(&self, from: Pos2, to: Pos2) {
+            self.frame(&[egui::Event::PointerMoved(from)]);
+            self.frame(&[egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            self.frame(&[egui::Event::PointerMoved(to)]);
+            self.frame(&[egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            self.frame(&[]);
+        }
+
+        /// The middle of the card's grabbable strip, well clear of the ✕ that
+        /// shares the band with it.
+        fn header_grip(&self) -> Pos2 {
+            let card = self.card();
+            Pos2::new(card.center().x, card.min.y + HEADER / 2.0)
+        }
+
+        /// Where the header's own click target sits on a card: the right-hand
+        /// end of the band, `prefs_ui::tests::close_rect`'s geometry.
+        fn mark(&self, card: Rect) -> Rect {
+            Rect::from_center_size(
+                Pos2::new(card.max.x - 22.0, card.min.y + HEADER / 2.0),
+                Vec2::splat(16.0),
+            )
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Where it opens
+    // -----------------------------------------------------------------------
+
+    /// **The requirement that everything else is measured against.** These
+    /// cards were anchored `CENTER_CENTER`; making them movable must not have
+    /// moved them. If this fails, every paint test in `delete_modal`,
+    /// `icon_modal`, `prefs_ui` and this file is asserting about a card that
+    /// has quietly drifted.
+    #[test]
+    fn a_modal_opens_exactly_where_the_anchor_used_to_put_it() {
+        let window = Window::opened();
+        assert_eq!(window.card(), window.centre());
+    }
+
+    // -----------------------------------------------------------------------
+    // What moves it, and what does not
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dragging_the_header_moves_the_card_by_what_the_pointer_moved() {
+        let window = Window::opened();
+        let from = window.header_grip();
+        window.drag(from, from + Vec2::new(120.0, -80.0));
+        assert_eq!(
+            window.card(),
+            window.centre().translate(Vec2::new(120.0, -80.0)),
+            "the card did not follow the pointer"
+        );
+    }
+
+    /// **The body is not a handle.** The cards are full of text fields, tick
+    /// lists and scrolling bands, every one of which reads a drag as its own;
+    /// a card that moved when any of them was dragged would fight all of them.
+    #[test]
+    fn dragging_the_body_moves_nothing() {
+        let window = Window::opened();
+        let at = window.card().center();
+        window.drag(at, at + Vec2::new(120.0, 60.0));
+        assert_eq!(
+            window.card(),
+            window.centre(),
+            "a drag inside the body moved the card, so every control in it now fights the drag"
+        );
+    }
+
+    /// **The handle does not eat the header's own controls.** egui hit-tests
+    /// clicks and drags separately but not independently: a drag-sensing strip
+    /// laid OVER a click-sensing one swallows the click. `prefs_ui` and
+    /// `totp_add` both keep their ✕ in the header, so the handle has to be
+    /// registered underneath them -- and this is what says it still is.
+    /// `prefs_ui::tests::the_header_cross_closes_the_modal` is the same
+    /// assertion against the real card.
+    #[test]
+    fn a_click_in_the_header_still_reaches_the_control_the_handle_lies_under() {
+        let window = Window::opened();
+        let at = window.mark(window.card()).center();
+        window.frame(&[egui::Event::PointerMoved(at)]);
+        window.frame(&[egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        window.frame(&[egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(
+            window.marked.get(),
+            1,
+            "the drag handle swallowed the click aimed at the header's own control -- the ✕ on \
+             the real cards is now unreachable"
+        );
+        assert_eq!(window.card(), window.centre(), "a click alone moved the card");
+    }
+
+    // -----------------------------------------------------------------------
+    // How far it may go
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_card_cannot_be_dragged_out_of_the_window() {
+        let window = Window::opened();
+        let from = window.header_grip();
+        window.drag(from, from + Vec2::new(5_000.0, 5_000.0));
+        let card = window.card();
+        let screen = Rect::from_min_size(Pos2::ZERO, WINDOW);
+        assert!(
+            screen.contains_rect(card),
+            "the card left the window: {card:?} is not inside {screen:?}"
+        );
+        // And it went as far as it is allowed to go, rather than refusing the
+        // drag: the far corner, exactly.
+        assert_eq!(card.max, screen.max);
+    }
+
+    /// **The reason the clamp is applied to the STORED offset and not only to
+    /// the drawn position.** egui's own `constrain` already keeps an `Area`
+    /// inside the window, so a card shoved at the edge LOOKS right either way.
+    /// What it does not do is stop the offset this file remembers from running
+    /// away: a drag five thousand points past the edge, un-clamped, is five
+    /// thousand points the user has to drag back before the card twitches.
+    /// This fails outright without `clamp_modal_offset` writing its answer
+    /// back.
+    #[test]
+    fn a_card_shoved_past_the_edge_comes_back_on_the_very_next_drag() {
+        let window = Window::opened();
+        let from = window.header_grip();
+        window.drag(from, from + Vec2::new(5_000.0, 0.0));
+        let parked = window.card();
+
+        let grip = window.header_grip();
+        window.drag(grip, grip - Vec2::new(40.0, 0.0));
+        assert_eq!(
+            window.card(),
+            parked.translate(Vec2::new(-40.0, 0.0)),
+            "the card did not answer the drag back, so the offset kept counting past the edge"
+        );
+    }
+
+    /// **The window is resizable and the card has to survive that.** The vault
+    /// window goes down to `settings::MIN_VAULT_WINDOW_SIZE`, so a card parked
+    /// against the edge of a large window is a card whose offset no longer
+    /// fits once the window is dragged smaller. Re-clamping every pass is what
+    /// walks it back in rather than letting it slide out with its dismiss
+    /// control.
+    #[test]
+    fn shrinking_the_window_walks_a_parked_card_back_inside_it() {
+        let window = Window::opened();
+        let from = window.header_grip();
+        window.drag(from, from + Vec2::new(5_000.0, 5_000.0));
+
+        let small = Vec2::new(700.0, 480.0);
+        window.size.set(small);
+        window.frame(&[]);
+        window.frame(&[]);
+        let card = window.card();
+        let screen = Rect::from_min_size(Pos2::ZERO, small);
+        assert!(
+            screen.contains_rect(card),
+            "the card stayed outside the window it was shrunk into: {card:?} vs {screen:?}"
+        );
+        assert_eq!(card.max, screen.max, "it did not stay in the corner it was parked in");
+    }
+
+    // -----------------------------------------------------------------------
+    // What is left of it next time
+    // -----------------------------------------------------------------------
+
+    /// **Opening is the one moment this app can promise the card is
+    /// findable.** A card dragged into a corner and reopened there is a card
+    /// the user has to hunt for; see [`modal_offset`] for the full argument.
+    #[test]
+    fn closing_the_modal_puts_it_back_in_the_middle() {
+        let window = Window::opened();
+        let from = window.header_grip();
+        window.drag(from, from + Vec2::new(150.0, 90.0));
+        assert_ne!(window.card(), window.centre(), "the card never moved, so this proves nothing");
+
+        window.open.set(false);
+        window.frame(&[]);
+        window.open.set(true);
+        window.frame(&[]);
+        assert_eq!(
+            window.card(),
+            window.centre(),
+            "the modal reopened where it was dragged to rather than in the middle"
+        );
+    }
+
+    /// The other half of the one above: a modal that is merely STILL OPEN does
+    /// not forget. Without this, a reset keyed on something coarser than "was
+    /// it drawn on the pass before" would pass the test above by snapping the
+    /// card back every frame, which is not a fix, it is a card that cannot be
+    /// moved at all.
+    #[test]
+    fn a_modal_that_stays_open_stays_where_it_was_put() {
+        let window = Window::opened();
+        let from = window.header_grip();
+        window.drag(from, from + Vec2::new(150.0, 90.0));
+        let moved = window.card();
+        for _ in 0..10 {
+            window.frame(&[]);
+        }
+        assert_eq!(window.card(), moved, "the card crept back to the middle on its own");
+    }
+
+    // -----------------------------------------------------------------------
+    // The clamp on its own
+    // -----------------------------------------------------------------------
+
+    /// The rule stated as arithmetic: half the leftover room, each way.
+    #[test]
+    fn the_travel_is_half_the_slack_in_each_direction() {
+        let window = Rect::from_min_size(Pos2::ZERO, Vec2::new(900.0, 700.0));
+        let card = Vec2::new(340.0, 240.0);
+        assert_eq!(
+            clamp_modal_offset(window, card, Vec2::new(1000.0, 1000.0)),
+            Vec2::new(280.0, 230.0)
+        );
+        assert_eq!(
+            clamp_modal_offset(window, card, Vec2::new(-1000.0, -1000.0)),
+            Vec2::new(-280.0, -230.0)
+        );
+        // Inside the range, untouched.
+        assert_eq!(
+            clamp_modal_offset(window, card, Vec2::new(12.0, -34.0)),
+            Vec2::new(12.0, -34.0)
+        );
+    }
+
+    /// A card too big for the window gets no travel rather than negative
+    /// travel: it stays centred, which is both where it opened and the
+    /// position that wastes the least of it off either edge.
+    #[test]
+    fn a_card_larger_than_its_window_is_centred_and_cannot_be_moved() {
+        let window = Rect::from_min_size(Pos2::ZERO, Vec2::new(300.0, 200.0));
+        let card = Vec2::new(340.0, 240.0);
+        assert_eq!(clamp_modal_offset(window, card, Vec2::new(80.0, -80.0)), Vec2::ZERO);
+    }
+
+    /// The clamp is idempotent, which is what makes it safe to run on the
+    /// stored value every pass: clamping an already-clamped offset changes
+    /// nothing, so a card never drifts by being looked at.
+    #[test]
+    fn clamping_twice_is_clamping_once() {
+        let window = Rect::from_min_size(Pos2::new(-40.0, 17.0), Vec2::new(900.0, 700.0));
+        let card = Vec2::new(340.0, 240.0);
+        let once = clamp_modal_offset(window, card, Vec2::new(4000.0, -4000.0));
+        assert_eq!(clamp_modal_offset(window, card, once), once);
+    }
+
+    // -----------------------------------------------------------------------
+    // And the real card, once
+    // -----------------------------------------------------------------------
+
+    /// [`modal_card`] is the card `delete_modal` and `icon_modal` draw, and
+    /// neither of those files says a word about dragging -- they get it
+    /// because this function asks for a [`movable_modal`] and lays a
+    /// [`modal_drag_handle`] over its own header band. This is the test that
+    /// says so, so the day someone rewrites the area line in `modal_card`,
+    /// two modals do not silently go back to being pinned.
+    #[test]
+    fn the_shared_card_is_dragged_by_the_header_band_it_draws_itself() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("theme-modal-card-drag-test");
+        let mut clock = 0.0;
+        let blank = || egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW)),
+            ..Default::default()
+        };
+        // The two throwaway frames every harness in this crate runs before
+        // `apply`: a font set registered during a frame is only usable from
+        // the start of the next, and this card's title is set in Archivo.
+        let _ = ctx.run_ui(blank(), |_ui| {});
+        apply(&ctx);
+        let _ = ctx.run_ui(blank(), |_ui| {});
+
+        let mut frame = |events: &[egui::Event]| {
+            clock += 0.1;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, WINDOW)),
+                time: Some(clock),
+                events: events.to_vec(),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                modal_card(
+                    ui.ctx(),
+                    egui::Area::new(id),
+                    ModalCard {
+                        accent: ERROR,
+                        glyph: ModalGlyph::Warning,
+                        title: "Delete item",
+                        width: 340.0,
+                        dismiss: "Cancel",
+                    },
+                    |ui| {
+                        ui.label(RichText::new("It moves to the Trash.").size(12.0));
+                    },
+                    |ui| destructive_button(ui, "Delete"),
+                );
+            });
+        };
+        // One sizing pass, which paints nothing, then two live ones.
+        for _ in 0..3 {
+            frame(&[]);
+        }
+        let before = egui::AreaState::load(&ctx, id).expect("the card was never drawn").rect();
+        let grip = Pos2::new(before.center().x, before.min.y + MODAL_HEADER_HEIGHT / 2.0);
+        let to = grip + Vec2::new(90.0, 70.0);
+        frame(&[egui::Event::PointerMoved(grip)]);
+        frame(&[egui::Event::PointerButton {
+            pos: grip,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        frame(&[egui::Event::PointerMoved(to)]);
+        frame(&[egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        frame(&[]);
+        let after = egui::AreaState::load(&ctx, id).expect("the card vanished").rect();
+        assert_eq!(
+            after,
+            before.translate(Vec2::new(90.0, 70.0)),
+            "`modal_card`'s own header band did not drag the card"
         );
     }
 }

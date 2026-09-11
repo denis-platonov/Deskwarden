@@ -6322,10 +6322,12 @@ fn draw_discard_confirm(ctx: &egui::Context) -> Option<DiscardAnswer> {
             );
         });
 
-    egui::Area::new(egui::Id::new("detail-edit-discard-modal"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    // Movable by its title line, centred again the next time it opens --
+    // `theme::movable_modal`, which is where the `.anchor(CENTER_CENTER, ZERO)`
+    // that used to pin every card in this app went.
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("detail-edit-discard-modal")))
         .show(ctx, |ui| {
+            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
             egui::Frame::new()
                 .fill(theme::CARD)
                 .corner_radius(CornerRadius::same(10))

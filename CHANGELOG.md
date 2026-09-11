@@ -15,6 +15,103 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### "Scan a region" dims the desktop instead of covering it
+
+Choosing **Scan a region** when adding a one-time code opened a solid black
+screen. The dim that was supposed to let your desktop show through was there
+all along; the window was simply never told to let anything through.
+
+Two things had to happen on the frame that window first appears -- one that
+makes it see-through, and one that keeps the overlay's own dim out of the
+picture it takes. Both were being done a couple of frames too early, before
+the window existed, so both quietly did nothing and were never tried again.
+They now wait for the window.
+
+The second of those is why a box dragged around a code could come back with
+"No code in that region" for a code that was plainly on screen: the picture
+was taken through the dim.
+
+Deskwarden's log now records whether each of those two went through, so a
+future report of this does not have to be guessed at.
+
+### Dialogs can be moved out of the way
+
+Every card that opens over the vault window -- the delete confirmation, the
+folder editor, the icon picker, Preferences, the Send and import forms, the
+"Add a one-time code" card, the export and revoke reports, and the launch
+confirmation -- was pinned to the middle of the window, which is awkward when
+the thing you need to read is behind it.
+
+**Drag one by its header** and it moves. The pointer turns into a hand over
+the strip that can be grabbed, so you can see where that is. Everything else
+about these cards is unchanged: the rest of the window stays dimmed and still
+ignores clicks, Escape still closes the ones that took it, and every button
+and field inside the card works exactly as before.
+
+A card cannot be pushed off the edge of the window, so it can always be
+dragged back and its close button is always reachable -- and if you make the
+window smaller, a card parked near the edge comes back in with it. A card
+always opens in the middle again: where you dragged it last time is not
+remembered, so a dialog is never somewhere you have to go looking for it.
+
+The one notice that does **not** move is the short confirmation that appears
+along the bottom of the window after a Send is created. That is a passing
+message rather than a card you work in, and it leaves on its own.
+
+### The keys the "Add a one-time code" picker draws now work
+
+The picker for adding a one-time code shows a key on the right of every
+route: a return symbol on the first, and a number on the rest. Only the
+return key did anything, and it could overrule a row you had just clicked on
+the same moment.
+
+Pressing **Enter** or **1** now takes the first route, **2** the second,
+**3** the third and **4** the fourth, and a row you press with the mouse
+always wins over a key pressed at the same time. The keys act only on this
+picker -- never while you are typing a secret into the form, and never while
+the screen scan overlay is up -- and only on their own, so Ctrl+Shift+2, the
+chord that opens this card, still does just that.
+
+### The webcam route can read a code again
+
+Adding a one-time code by **webcam** did not work. The camera switched on,
+its light came on, and after eight seconds the card said *"That camera sent
+no picture"* -- from a camera that had by then sent seventy of them.
+
+Windows reports a camera's picture size as a single number with the width
+packed into one half of it and the height into the other. Deskwarden was
+unpacking the height without discarding the width's half, so a 1280x720
+camera was recorded as being 1280 wide and about five and a half trillion
+tall. Every picture that arrived was then measured against that and thrown
+away as the wrong size, and a route that drops every picture is
+indistinguishable, from the outside, from one that never gets any. Fixed,
+and pinned by a test carrying the real number the camera produced.
+
+Verified against the camera that reported it: 742 pictures over 75 seconds,
+steady, with no drop-outs.
+
+### A camera that fails now says which way it failed
+
+Every call Deskwarden makes to open a camera used to throw away the reason
+it failed, so a camera that refused the picture format, a camera another app
+was holding and a camera with a cap on the lens all produced the same
+sentence and left nothing behind to tell them apart -- which is why the
+fault above went unexplained for a release. All of them are now written to
+`deskwarden.log`: the camera's name, what was asked of it, and what Windows
+answered. No picture from a camera is ever logged.
+
+A camera **another program is already using** now says so, instead of
+claiming it sent no picture. Three more things the route got wrong are also
+fixed: a camera that changes its picture format mid-stream is followed
+rather than read at the old measurements; a read that reports an error is
+noticed instead of being retried forever; and a camera that ends its stream
+without ever having sent a picture says it sent no picture, rather than
+saying it stopped, which is advice about a different problem.
+
+Pictures that arrive but cannot be read are now counted and complained about
+in the log, so the next fault of this shape names itself in one line instead
+of looking like silence.
+
 ## 0.15.21 - 2026-09-10
 
 ### The Send screens use the app's own buttons again

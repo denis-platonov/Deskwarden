@@ -68,10 +68,14 @@ pub fn draw_folder_edit_modal(ctx: &egui::Context, state: &mut FolderEditState) 
                 .rect_filled(screen, CornerRadius::ZERO, egui::Color32::from_black_alpha(90));
         });
 
-    egui::Area::new(egui::Id::new("folder-edit-modal"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    // Centred on the frame it opens and wherever the user has dragged it
+    // after that -- `theme::movable_modal` replaces the `.anchor(CENTER_CENTER,
+    // ZERO)` that used to pin this card, and the handle below is its title
+    // line. The offset resets when the modal closes, so the next open is
+    // centred again.
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("folder-edit-modal")))
         .show(ctx, |ui| {
+            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
             egui::Frame::new()
                 .fill(theme::CARD)
                 .corner_radius(CornerRadius::same(10))

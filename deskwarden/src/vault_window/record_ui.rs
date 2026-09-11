@@ -569,6 +569,19 @@ fn heading(ui: &mut egui::Ui, text: &str) {
     ui.add_space(8.0);
 }
 
+/// The top strip of either form, measured rather than guessed: [`card`]'s
+/// 12-point margin plus the ~18 [`heading`]'s 14px line occupies. It is what
+/// `draw_export_modal` and `draw_import_modal` hand
+/// [`theme::modal_drag_handle`] as the band the card is dragged by.
+///
+/// A point short of where the first control begins -- `heading` follows itself
+/// with `add_space(8.0)` -- so the grab strip cannot reach one. It is its own
+/// number and not `theme::MODAL_PLAIN_HEADER_HEIGHT` because these two cards
+/// are the tighter [`card`] frame and not the 20-point one the rest of the
+/// hand-built modals use; sharing a constant between two different paddings is
+/// how a handle ends up over a text field.
+const FORM_HEADER_HEIGHT: f32 = 30.0;
+
 fn note(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
     ui.label(egui::RichText::new(text).size(11.0).color(colour));
 }
@@ -1053,10 +1066,12 @@ pub fn draw_export_modal(
             );
         });
 
-    egui::Area::new(egui::Id::new("record-send-modal"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-send-modal")))
         .show(ctx, |ui| {
+            // Before the form, not after: a drag strip laid over the form's
+            // controls would swallow their clicks. See
+            // `theme::modal_drag_handle`.
+            theme::modal_drag_handle(ui, FORM_HEADER_HEIGHT);
             ui.set_max_width(MODAL_WIDTH);
             draw_export_form(ui, &mut state.draft, &state.item_name, in_flight)
         })
@@ -1156,10 +1171,9 @@ pub fn draw_import_modal(
             );
         });
 
-    egui::Area::new(egui::Id::new("record-import-modal"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-import-modal")))
         .show(ctx, |ui| {
+            theme::modal_drag_handle(ui, FORM_HEADER_HEIGHT);
             ui.set_max_width(MODAL_WIDTH);
             let action = draw_import_form(
                 ui,

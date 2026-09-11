@@ -9338,10 +9338,11 @@ fn draw_export_report(ctx: &egui::Context, report: &ExportReport) -> bool {
     };
     let text = text.as_str();
     let mut dismissed = false;
-    egui::Area::new(egui::Id::new("vault-export-report"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("vault-export-report")))
         .show(ctx, |ui| {
+            // Dragged by its title line; centred again the next time an
+            // export reports. See `theme::movable_modal`.
+            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
             egui::Frame::new()
                 .fill(theme::CARD)
                 .corner_radius(egui::CornerRadius::same(10))
@@ -9389,10 +9390,13 @@ const EXPORTING: &str = "Exporting the vault...";
 /// The in-flight half of [`draw_export_report`]: the same card, with no
 /// dismiss button on it.
 fn draw_export_in_flight(ctx: &egui::Context) {
-    egui::Area::new(egui::Id::new("vault-export-progress"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    // **Movable even though it has no dismiss control at all.** This is the
+    // one card in the app the user cannot close -- it goes when the export
+    // finishes -- which is exactly why being able to push it aside is worth
+    // having: until now the only way to see what it covered was to wait.
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("vault-export-progress")))
         .show(ctx, |ui| {
+            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
             egui::Frame::new()
                 .fill(theme::CARD)
                 .corner_radius(egui::CornerRadius::same(10))
@@ -9902,10 +9906,10 @@ fn draw_send_delete_report(ctx: &egui::Context, report: &SendDeleteReport) -> bo
         DeleteTone::Bad => theme::ERROR,
     };
     let mut dismissed = false;
-    egui::Area::new(egui::Id::new("vault-send-delete-report"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("vault-send-delete-report")))
         .show(ctx, |ui| {
+            // Dragged by its title line; centred again on the next report.
+            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
             egui::Frame::new()
                 .fill(theme::CARD)
                 .corner_radius(egui::CornerRadius::same(10))
@@ -10519,6 +10523,13 @@ fn draw_send_create_report(ctx: &egui::Context, report: &SendCreateReport) -> bo
         CreateTone::Bad => theme::ERROR,
     };
     let mut dismissed = false;
+    // **Pinned, and deliberately left out of the modals that are not.**
+    // `theme::movable_modal` made every card in this app draggable by its
+    // header; this is not one of them. It is a TOAST -- it anchors
+    // `CENTER_BOTTOM` rather than centre, it has no scrim, it has no header
+    // to grab, it covers nothing worth uncovering, and it leaves on its own.
+    // A notice that slid out from under the strip the eye watches for notices
+    // would be worse in every case than one that does not move.
     egui::Area::new(egui::Id::new("vault-send-create-report"))
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -18.0))
@@ -13079,10 +13090,12 @@ fn draw_launch_confirm_modal(ctx: &egui::Context, pending: &PendingLaunch) -> La
                 .rect_filled(screen, CornerRadius::ZERO, egui::Color32::from_black_alpha(90));
         });
 
-    egui::Area::new(egui::Id::new("launch-confirm-modal"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    // Movable by its title line. It matters more here than on most cards:
+    // this one shows a command line in full, and a command line long enough
+    // to need reading is a card tall enough to cover the item it came from.
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("launch-confirm-modal")))
         .show(ctx, |ui| {
+            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
             egui::Frame::new()
                 .fill(theme::CARD)
                 .corner_radius(CornerRadius::same(10))
@@ -37154,23 +37167,71 @@ mod send_create_wiring {
         );
     }
 
-    /// The key itself is unspent, and `T` -- the mnemonic -- deliberately is
-    /// not the one taken.
+    /// The key itself is unspent **at this modifier set**, and `T` -- the
+    /// mnemonic -- deliberately is not the one taken.
+    ///
+    /// # Why this is not "no other file may say `Num2`"
+    ///
+    /// It was, and the over-approximation cost something real: design 6a's
+    /// picker draws a `2` keycap on its second row, and that keycap shipped
+    /// drawn and dead because binding it would have tripped this test. The
+    /// collision being reported is not one any keystroke can reach -- this
+    /// chord is read with `matches_exact(CTRL|SHIFT)` and the picker reads
+    /// its digits with `modifiers.is_none()`, so the two answer disjoint
+    /// events. The owner's instruction was "just 1-4 when window focused,
+    /// so local chord only for this modal", which is exactly that split.
+    ///
+    /// So the rule is the one that was always meant: **one binding per key
+    /// AND modifier set**. Another file may name this key, but only while
+    /// saying in its own source that it reads the key bare -- and no file
+    /// but this one may name the modifiers this chord carries. Two bindings
+    /// that really could both fire are still caught; a binding that cannot
+    /// is no longer forbidden for the shape of its spelling.
+    ///
+    /// A textual pin can only approximate the runtime fact, and this one
+    /// approximates it in the safe direction: the escape hatch is a file
+    /// declaring `modifiers.is_none()`, which is a thing a reader can go and
+    /// check is true, not a flag a file sets to opt itself out.
     #[test]
     fn the_add_code_chord_is_a_key_no_other_binding_takes() {
         let key = concat!("Key", "::Num2");
-        let elsewhere: Vec<String> = every_source_file()
+        let bare = concat!("modifiers.is_", "none()");
+        let unguarded: Vec<String> = every_source_file()
             .into_iter()
             .filter(|(path, text)| {
-                path != "vault_window/mod.rs" && code_without_comments(text).contains(key)
+                if path == "vault_window/mod.rs" {
+                    return false;
+                }
+                let code = code_without_comments(text);
+                code.contains(key) && !code.contains(bare)
             })
             .map(|(path, _)| path)
             .collect();
         assert!(
-            elsewhere.is_empty(),
-            "`egui::Key::Num2` is bound somewhere else in production too: {elsewhere:?}. Two \
-             bindings on one key resolve to whichever is read first and the other silently \
-             never fires"
+            unguarded.is_empty(),
+            "`egui::Key::Num2` is named in production outside this file, by a file that \
+             does not read its keys bare: {unguarded:?}. This chord is CTRL+SHIFT+2, so a \
+             binding that does not exclude modifiers can be reached by the same keystroke, \
+             and two bindings on one event resolve to whichever is read first while the \
+             other silently never fires"
+        );
+
+        // **The modifiers are this file's alone**, which is the other half
+        // of "one binding per key AND modifier set": the bare-key exemption
+        // above would be worth nothing if another file could spell this
+        // chord's modifiers and then read the key both ways.
+        let mods = concat!("ADD_TOTP_", "MODIFIERS");
+        let claimants: Vec<String> = every_source_file()
+            .into_iter()
+            .filter(|(path, text)| {
+                path != "vault_window/mod.rs" && code_without_comments(text).contains(mods)
+            })
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            claimants.is_empty(),
+            "this chord's modifiers are named in production outside this file: \
+             {claimants:?}. They are what makes the bare-key exemption above safe"
         );
         assert_eq!(
             code_without_comments(include_str!("mod.rs")).matches(key).count(),

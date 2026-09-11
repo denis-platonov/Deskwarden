@@ -6149,20 +6149,38 @@ pub fn draw_prefs_modal(ctx: &egui::Context, state: &mut PrefsState) -> PrefsAct
     // before it can centre it, so its first frame paints nothing at all -- and
     // this card's geometry is computed here rather than measured, so there is
     // nothing to wait for. See `an_anchored_area_paints_nothing_on_its_first_frame`.
-    egui::Area::new(egui::Id::new("prefs-modal"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(card.min)
+    //
+    // **And `card` is REBOUND to what `movable_modal_at` hands back**, which
+    // is the centred rect plus however far the user has dragged the header.
+    // Everything below paints in absolute coordinates derived from `card`, so
+    // a version of this that moved only the `Area` would have moved where the
+    // widgets are laid out and left the painted chrome behind. Nothing has
+    // moved until the header is dragged: the offset is zero on the frame the
+    // gear opens this, which is why every frame test in this file still
+    // measures the card where `modal_card_rect` puts it.
+    let (area, card) = theme::movable_modal_at(
+        ctx,
+        egui::Area::new(egui::Id::new("prefs-modal")),
+        card,
+    );
+    area
         .show(ctx, |ui| {
+            // The header is the handle. Registered BEFORE the click-catcher
+            // and before the ✕, because a drag-sensing strip laid over a
+            // click-sensing one swallows the click -- `theme::modal_drag_handle`
+            // records the measurement.
+            let header = Rect::from_min_max(
+                card.min,
+                Pos2::new(card.max.x, (card.min.y + MODAL_HEADER_HEIGHT).min(card.max.y)),
+            );
+            theme::modal_drag_handle_at(ui, header);
+
             // Swallows anything aimed at the card that no control inside it
             // claims. Allocated FIRST so the widgets drawn below -- later in
             // the same layer, and therefore on top -- still win their clicks.
             ui.allocate_rect(card, Sense::click());
             ui.set_clip_rect(card);
 
-            let header = Rect::from_min_max(
-                card.min,
-                Pos2::new(card.max.x, (card.min.y + MODAL_HEADER_HEIGHT).min(card.max.y)),
-            );
             {
                 let painter = ui.painter();
                 painter.rect_filled(card, CornerRadius::same(MODAL_RADIUS), theme::WINDOW_BG);
@@ -14487,6 +14505,83 @@ mod modal_tests {
             action,
             PrefsAction::Close,
             "the dismiss mark did not close the modal, which leaves Esc as the only way out"
+        );
+    }
+
+    /// **The settings card moves with its header, chrome and all.**
+    ///
+    /// This one is not `theme::modal_drag_tests`' assertion over again. Every
+    /// other modal in this app is a self-measuring `Area` that egui positions;
+    /// this card computes its own rectangle and paints itself in absolute
+    /// coordinates taken from it, which is why `theme::movable_modal_at` hands
+    /// the moved rect BACK and this function rebinds `card` to it. Move only
+    /// the `Area` and the widgets go one way while the painted header, border
+    /// and ✕ stay behind -- so this reads BOTH halves: the title is painted at
+    /// the new place, and the dismiss mark at the new place is the one that
+    /// works.
+    #[test]
+    fn dragging_the_header_moves_the_card_its_chrome_and_its_dismiss_mark() {
+        let ctx = styled_context();
+        let mut state = a_state();
+        let centred = modal_card_rect(Rect::from_min_size(Pos2::ZERO, PANE));
+        // TWO warm-ups, `the_header_cross_closes_the_modal`'s: one for egui to
+        // create the area, one for it to lay the dismiss mark out where a
+        // click can find it.
+        let _ = frame(&ctx, &mut state, &[], true);
+        let _ = frame(&ctx, &mut state, &[], true);
+        let at_rest = frame(&ctx, &mut state, &[], true).0.rect_of(MODAL_TITLE);
+
+        // Grabbed at the LEFT end of the header, well clear of the ✕ that
+        // shares the band with it.
+        //
+        // **A short drag, because this card has very little room.** It is
+        // [`modal_card_rect`]'s, which is nearly the height of the window, so
+        // `theme::clamp_modal_offset`'s travel -- half the leftover room --
+        // is only a couple of dozen points vertically. Ninety across and
+        // twenty down is inside that, so what this measures is the drag and
+        // not the clamp; `theme::modal_drag_tests` measures the clamp.
+        let grip = Pos2::new(centred.min.x + 40.0, centred.min.y + MODAL_HEADER_HEIGHT / 2.0);
+        let by = Vec2::new(-90.0, 20.0);
+        let _ = frame(&ctx, &mut state, &[egui::Event::PointerMoved(grip)], true);
+        let _ = frame(
+            &ctx,
+            &mut state,
+            &[egui::Event::PointerButton {
+                pos: grip,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+            true,
+        );
+        let _ = frame(&ctx, &mut state, &[egui::Event::PointerMoved(grip + by)], true);
+        let _ = frame(
+            &ctx,
+            &mut state,
+            &[egui::Event::PointerButton {
+                pos: grip + by,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            true,
+        );
+        let (moved, action, _) = frame(&ctx, &mut state, &[], true);
+        assert_eq!(action, PrefsAction::None, "the drag closed the modal");
+        assert_eq!(
+            moved.rect_of(MODAL_TITLE),
+            at_rest.translate(by),
+            "the card's painted header did not follow the drag"
+        );
+
+        // And the ✕ went with it: the mark at the card's NEW corner closes,
+        // which it could not do if the hit rect had stayed behind.
+        let card = centred.translate(by);
+        let (_, action, _) = frame(&ctx, &mut state, &click(close_rect(card).center()), true);
+        assert_eq!(
+            action,
+            PrefsAction::Close,
+            "the dismiss mark did not move with the card, so a dragged card cannot be closed"
         );
     }
 

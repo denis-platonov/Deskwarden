@@ -2876,6 +2876,103 @@ const ROW_SUB_LINE: f32 = 1.45;
 /// highlight that cannot move is a recommendation.
 const DEFAULT_ROW: usize = 0;
 
+/// **The keys design 6a's keycaps promise, and the rows they take.**
+///
+/// The owner, against the shipped 0.15.21 build: *"Enter and 1,2,3,4 not
+/// workong - supposed to be hjotkeys"*. They were right about the promise --
+/// 6a draws an affordance on the right of every route row, a filled `↵` chip
+/// on the first and a bare ordinal on the other three -- and right that the
+/// app answered almost none of it. Only Enter was bound, and it was bound in
+/// a place that let it overrule a click landing on the same frame.
+///
+/// # Why `1` is here when 6a draws no `1`
+///
+/// A one-line departure from the design, argued rather than slipped in. The
+/// design hangs `↵` off the first row and ordinals off rows two to four, so
+/// on the page the first row's affordance is a *different kind of thing* from
+/// the others -- it says "this is the default", not "this is number one".
+/// That reads correctly on a page. In a hand it does not: the rows are
+/// numbered one to four down the card, three of the numbers work, and the
+/// owner reached for the fourth. A picker whose second, third and fourth rows
+/// answer their digit and whose first does not is a worse surface than the
+/// design's, because it teaches a rule and then breaks it on the one row it
+/// drew in blue.
+///
+/// So `1` is accepted and **the drawn keycap stays the design's `↵`**. The
+/// design decides what the row says; this decides what the keyboard answers,
+/// and the two only have to agree in the direction that matters -- every
+/// glyph drawn is a key that works. A key that works without being drawn
+/// costs nothing and breaks no promise.
+///
+/// # Every row answers its own digit
+///
+/// `2` was the one keycap on this card that shipped drawn and dead, and it
+/// was dead for a reason that turned out not to be about this file at all.
+/// `vault_window::ADD_TOTP_KEY` is `Key::Num2` -- CTRL+SHIFT+2 is the chord
+/// that OPENS this modal -- and `mod.rs`'s
+/// `the_add_code_chord_is_a_key_no_other_binding_takes` used to hold that
+/// key to being named in no production file but its own.
+///
+/// No keystroke could ever have reached both: that chord is read with
+/// `matches_exact(CTRL|SHIFT)` and every key in this table is read with no
+/// modifier at all. The guard was a *textual* pin that over-approximated --
+/// it forbade the spelling rather than the binding -- and the cost of the
+/// over-approximation was a keycap the design draws and the app ignored.
+///
+/// That guard now reads `one binding per key AND modifier set`, which is
+/// what it always meant, so this row is bound like the other three. The
+/// owner settled it in those terms: "just 1-4 when window focused, so local
+/// chord only for this modal".
+///
+/// Writing the key some other way to slip past the pin was the alternative
+/// and it was never one: a guard a file can dodge protects nothing, and the
+/// next person to bind a digit would have found a precedent for dodging it.
+const ROUTE_KEYS: [(egui::Key, usize); 5] = [
+    (egui::Key::Enter, 0),
+    (egui::Key::Num1, 0),
+    (egui::Key::Num2, 1),
+    (egui::Key::Num3, 2),
+    (egui::Key::Num4, 3),
+];
+
+/// **Which route a keystroke picks, if any.**
+///
+/// Pure over the key and the modifier state so the whole table is a thing a
+/// test can enumerate, including the rows it must *not* answer.
+///
+/// # Bare keys only
+///
+/// A held modifier means the keystroke belongs to somebody else. This window
+/// binds CTRL+K, CTRL+L, CTRL+N, CTRL+SHIFT+2 and CTRL+SHIFT+R, and the
+/// detail pane binds more; a picker that answered `1` on CTRL+1 would be
+/// taking a route on a chord aimed past it. `is_none()` and not
+/// "no CTRL", because SHIFT+3 is `#` and ALT+4 is a system gesture, and
+/// neither is a user asking for the third or fourth row.
+///
+/// # A dead row's key is dead
+///
+/// A disabled row is [`DEFERRED_REASON`]'s case: it is drawn, it says why it
+/// does nothing, and it cannot be clicked. Its digit must be exactly as inert
+/// as its rectangle, or the keyboard becomes a way into a route the surface
+/// has said is not available -- which is worse than a dead keycap, because it
+/// is a live key with no affordance at all.
+/// `rows` is a parameter and not [`ROUTES`] read directly, for the reason
+/// `a_deferred_row_still_says_that_it_is_deferred` paints a synthetic table:
+/// nothing in `ROUTES` is disabled today, so the dead-row branch would be
+/// code no test had ever run, in the one place where "it does nothing" is the
+/// whole requirement.
+fn route_for_key(rows: &[RouteRow], key: egui::Key, modifiers: egui::Modifiers) -> Option<Route> {
+    if !modifiers.is_none() {
+        return None;
+    }
+    ROUTE_KEYS
+        .iter()
+        .find(|(bound, _)| *bound == key)
+        .and_then(|(_, row)| rows.get(*row))
+        .filter(|row| row.enabled)
+        .map(|row| row.route)
+}
+
 /// The gap between a dead row's title and the reason beside it.
 ///
 /// The design has no such element -- 6a draws all four routes live, and so
@@ -3153,13 +3250,18 @@ pub fn action_for(route: Route) -> TotpAddAction {
 /// title at `font-weight: 600`, a subtitle in `#7d7979`, and its ordinal set
 /// in 10px monospace in `#9b9797`.
 ///
-/// **The ordinals are not key bindings and are not drawn as keycaps.** 6a
-/// sets them as bare monospace text where it sets the ↵ in a filled chip, and
-/// the difference is real: `Key::Num2` is the key that OPENS this modal
-/// (`vault_window::ADD_TOTP_KEY`, held to being bound exactly once anywhere
-/// in this crate by `the_add_code_chord_is_a_key_no_other_binding_takes`), so
-/// a picker that also answered a bare 2 would be advertising the digit that
-/// got the user here as the digit that leaves by another door.
+/// **The ordinals are drawn as bare monospace text and the ↵ is drawn in a
+/// filled chip, and that difference is 6a's and stays.** What has changed is
+/// what they mean: they were decoration, and the owner read them as a promise
+/// -- *"Enter and 1,2,3,4 not workong - supposed to be hjotkeys"* -- which is
+/// the only reading a number down the right-hand edge of a list supports. So
+/// the ordinals are key bindings now; see [`ROUTE_KEYS`] for the table, for
+/// why `1` answers a row the design gives no digit, and for why the second
+/// row's `2` is the one that is still only paint.
+///
+/// The chip is still not given to the other three. It marks the DEFAULT
+/// route, not "this one has a shortcut", and drawing four chips would say
+/// four rows are the recommended one.
 fn route_row(ui: &mut egui::Ui, row: &RouteRow, index: usize) -> (egui::Response, egui::Rect) {
     let width = ui.available_width();
     let selected = index == DEFAULT_ROW;
@@ -3561,15 +3663,48 @@ pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
                         chosen = Some(row.route);
                     }
                 }
-                // **What the ↵ on the default row means.** The design draws a
-                // keycap and not an ordinal on that one row, and a keycap for
-                // a key nothing answers is the kind of promise this file
-                // refuses elsewhere (see [`ROUTES`] on what the image row
-                // names). Enter is
-                // unbound everywhere else in this window's production, so it
-                // is answered here, by the row the design says it belongs to.
-                if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    chosen = Some(ROUTES[DEFAULT_ROW].route);
+                // **The keycaps 6a draws, answered.** See [`ROUTE_KEYS`] for
+                // which keys those are, why `1` is among them and why `2`
+                // still is not.
+                //
+                // # Only if nothing was pressed on this frame
+                //
+                // `draw_add_modal`'s Escape handler makes this argument for
+                // the key that closes the card, and it is the same argument:
+                // a control acting on this frame wins, and the key is the
+                // fallback. It is not academic here. The block this replaced
+                // read the rows' clicks into `chosen` and then assigned over
+                // it unconditionally, so a frame carrying both a click on the
+                // webcam row and an Enter took the FIRST row -- a keystroke
+                // silently overruling the thing the user actually pressed.
+                //
+                // # And only on this stage, by construction
+                //
+                // `draw_stage` calls this function in its `Stage::Picker` arm
+                // and nowhere else, so these keys cannot reach 6d, where a
+                // bare `3` is a character the user is typing into a secret
+                // field, and cannot reach 6b, where the region overlay owns
+                // the keyboard. That is a stronger guarantee than the runtime
+                // `state.stage != Stage::Scanning` the Escape handler needs,
+                // and it is why this lives here rather than beside it.
+                //
+                // **6c's `↵` is still deliberately not built**; see
+                // `theme::destructive_button` and the note above the primary
+                // there. Binding Enter on that card could overwrite a seed
+                // the user cannot recover from a focused field, and nothing
+                // on this card is anywhere near that.
+                if chosen.is_none() {
+                    chosen = ui.input(|i| {
+                        i.events.iter().find_map(|event| match event {
+                            egui::Event::Key {
+                                key,
+                                pressed: true,
+                                modifiers,
+                                ..
+                            } => route_for_key(&ROUTES, *key, *modifiers),
+                            _ => None,
+                        })
+                    });
                 }
                 if let Some(route) = chosen {
                     if route == Route::ByHand {
@@ -4290,10 +4425,15 @@ pub fn draw_add_modal(
             );
         });
 
-    let action = egui::Area::new(egui::Id::new("totp-add-modal"))
-        .order(egui::Order::Foreground)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    let action = theme::movable_modal(ctx, egui::Area::new(egui::Id::new("totp-add-modal")))
         .show(ctx, |ui| {
+            // **The handle goes on before the stage does, and it is the
+            // stage's own header.** Registered first because a drag-sensing
+            // strip laid over the header's ✕ swallows the click that dismisses
+            // this card -- `theme::modal_drag_handle` records the measurement
+            // -- and the height is [`stage_header_height`] because this is the
+            // one card in the app whose header changes with what it is showing.
+            theme::modal_drag_handle(ui, stage_header_height(state.stage));
             ui.set_max_width(stage_width(state.stage));
             draw_stage(ui, state, now_unix)
         })
@@ -4356,6 +4496,45 @@ fn stage_width(stage: Stage) -> f32 {
         Stage::Webcam => WEBCAM_WIDTH,
     }
 }
+
+/// How tall the card's grabbable header is at each stage: what
+/// [`theme::modal_drag_handle`] is handed so the strip the user drags by lies
+/// over the band they can see and nowhere else.
+///
+/// [`stage_width`]'s sibling, and it exists for the same reason -- this is the
+/// one card in the app that is four cards, and the header it wears is not the
+/// same one at each of them.
+///
+/// **Every arm is a FLOOR and not a measurement.** The manual stage's band is
+/// as tall as its padding around the taller of its title and its mark
+/// ([`manual_header`]), and the title at 14px is the taller of those on every
+/// face this app ships -- so the mark is the number to build the floor from.
+/// Erring short costs a few points at the bottom of a band that are not
+/// grabbable; erring long puts a drag-sensing strip over the first control of
+/// the body, and a drag-sensing strip over a control eats that control's
+/// clicks.
+///
+/// [`Stage::Scanning`] is the odd one: it is not a [`stage_card`] at all but
+/// the plain [`card`], a 12-point margin round a 14px heading, and its handle
+/// is that heading's line. It is also the stage the 6b overlay owns the
+/// keyboard during -- but the overlay is a window of its own and the pointer
+/// is inside it, so nothing here can be dragged while it is up, and this
+/// needs no special case for it.
+fn stage_header_height(stage: Stage) -> f32 {
+    match stage {
+        // Both draw `picker_header`, whose band is `HEADER_HEIGHT`.
+        Stage::Picker | Stage::Webcam => HEADER_HEIGHT,
+        Stage::Manual => MANUAL_HEADER_PAD_Y * 2.0 + MANUAL_HEADER_MARK + RULE,
+        Stage::Scanning => SCANNING_HEADER_HEIGHT,
+    }
+}
+
+/// [`card`]'s 12-point top margin plus the ~18 that [`draw_scanning`]'s 14px
+/// bold heading occupies: the grabbable strip of the scanning stage.
+///
+/// A point short of the line under it -- that heading is followed by
+/// `add_space(6.0)` -- for [`stage_header_height`]'s reason.
+const SCANNING_HEADER_HEIGHT: f32 = 30.0;
 
 /// **The one place that decides which half of this surface is on screen**, so
 /// no caller has to know there are four.
@@ -6235,6 +6414,225 @@ mod tests {
                  about which row is the default one"
             );
         }
+    }
+
+    /// One bare keystroke, for the keycap tests below.
+    fn tap(key: egui::Key) -> Vec<egui::Event> {
+        taps(key, egui::Modifiers::default())
+    }
+
+    /// One keystroke with whatever modifiers are held.
+    fn taps(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }]
+    }
+
+    /// **Every keycap 6a draws is a key that really answers, and each answers
+    /// its OWN row.**
+    ///
+    /// The defect, reported by the owner against 0.15.21: *"Enter and 1,2,3,4
+    /// not workong - supposed to be hjotkeys"*. Enter was bound; nothing else
+    /// was. Written as a table rather than four assertions so that a binding
+    /// that answered the right key with the wrong row -- the failure mode of
+    /// a hand-written `match` over four near-identical arms -- reds with the
+    /// pair printed.
+    #[test]
+    fn each_keycap_takes_the_row_it_is_drawn_on() {
+        for (key, route) in [
+            (egui::Key::Enter, Route::ScanRegion),
+            (egui::Key::Num1, Route::ScanRegion),
+            (egui::Key::Num3, Route::ByHand),
+            (egui::Key::Num4, Route::Webcam),
+        ] {
+            let mut state = TotpAdd::opening("id-1", "Git Host", false);
+            let picker = Picker::new();
+            assert_eq!(
+                picker.idle(&mut state).action,
+                TotpAddAction::None,
+                "{key:?}: the picker asks for something with nothing pressed, so the assertion \
+                 below would pass against a picker that reported every frame"
+            );
+            let pressed = picker.frame(&mut state, tap(key));
+            assert_eq!(
+                pressed.action,
+                action_for(route),
+                "{key:?} did not take the {route:?} row 6a hangs it off"
+            );
+            // `ByHand` reports nothing and moves the stage instead, so the
+            // assertion above is vacuous for it on its own.
+            if route == Route::ByHand {
+                assert_eq!(
+                    state.stage,
+                    Stage::Manual,
+                    "{key:?} reported nothing AND did not open 6d, so it did nothing at all"
+                );
+            }
+        }
+    }
+
+    /// **A held modifier means the keystroke belongs to somebody else.**
+    ///
+    /// This window binds CTRL+K, CTRL+L, CTRL+N and CTRL+SHIFT+2; the last of
+    /// those is the chord that opened this very card. A picker that answered
+    /// a bare digit's row on any chord containing it would take a route on a
+    /// keystroke aimed past it.
+    #[test]
+    fn a_route_key_under_a_modifier_is_not_this_surfaces_business() {
+        for modifiers in [
+            egui::Modifiers::CTRL,
+            egui::Modifiers::ALT,
+            egui::Modifiers::SHIFT,
+            egui::Modifiers::CTRL.plus(egui::Modifiers::SHIFT),
+        ] {
+            for key in [egui::Key::Num1, egui::Key::Num3, egui::Key::Num4] {
+                let mut state = TotpAdd::opening("id-1", "Git Host", false);
+                let picker = Picker::new();
+                let pressed = picker.frame(&mut state, taps(key, modifiers));
+                assert_eq!(
+                    pressed.action,
+                    TotpAddAction::None,
+                    "{key:?} under {modifiers:?} took a route"
+                );
+                assert_eq!(
+                    state.stage,
+                    Stage::Picker,
+                    "{key:?} under {modifiers:?} moved the stage"
+                );
+            }
+        }
+    }
+
+    /// **A row that is drawn and dead has a key that is dead too.**
+    ///
+    /// [`DEFERRED_REASON`]'s row cannot be clicked and says why. A digit that
+    /// walked into the route anyway would be worse than a dead keycap: it is
+    /// a live key with no affordance at all, on a route the card has just
+    /// said is unavailable.
+    ///
+    /// Driven through a synthetic table because nothing in [`ROUTES`] is
+    /// deferred today -- see [`route_for_key`]'s own note.
+    #[test]
+    fn a_deferred_rows_key_does_nothing() {
+        let mut deferred = ROUTES;
+        for row in deferred.iter_mut() {
+            row.enabled = false;
+        }
+        for (key, _) in ROUTE_KEYS {
+            assert_eq!(
+                route_for_key(&deferred, key, egui::Modifiers::default()),
+                None,
+                "{key:?} walked into a route whose row is drawn dead"
+            );
+            // And the control: the same key on the live table does answer, so
+            // the assertion above is about `enabled` and not about the key
+            // being unbound.
+            assert!(
+                route_for_key(&ROUTES, key, egui::Modifiers::default()).is_some(),
+                "{key:?} answers nothing even on the live table"
+            );
+        }
+    }
+
+    /// **The route keys do not exist on any stage but the picker.**
+    ///
+    /// 6d is a form with a secret field in it: a bare `3` there is a
+    /// character the user is typing, and taking them off the card mid-seed
+    /// would lose it. 6b owns the keyboard outright while the overlay is up.
+    /// Both are guaranteed by construction -- `draw_stage` calls
+    /// `draw_picker` in one arm only -- and this is what holds that
+    /// construction in place.
+    #[test]
+    fn the_route_keys_are_dead_on_every_other_stage() {
+        for stage in [Stage::Manual, Stage::Scanning] {
+            for key in [egui::Key::Enter, egui::Key::Num1, egui::Key::Num3, egui::Key::Num4] {
+                let mut state = TotpAdd::opening("id-1", "Git Host", false);
+                state.stage = stage;
+                let ctx = egui::Context::default();
+                let _ = ctx.run_ui(Picker::input(Vec::new()), |_ui| {});
+                crate::theme::apply(&ctx);
+                let mut action = TotpAddAction::None;
+                let _ = ctx.run_ui(Picker::input(tap(key)), |ui| {
+                    action = draw_stage(ui, &mut state, BOUNDARY);
+                });
+                assert_eq!(
+                    state.stage, stage,
+                    "{key:?} moved the form off {stage:?}, where it is not a shortcut"
+                );
+                assert!(
+                    !matches!(
+                        action,
+                        TotpAddAction::ScanRegion
+                            | TotpAddAction::OpenImage
+                            | TotpAddAction::OpenWebcam
+                    ),
+                    "{key:?} took a route from {stage:?}: {action:?}"
+                );
+            }
+        }
+    }
+
+    /// **Every keycap the card draws is a key that works.**
+    ///
+    /// This replaces `the_second_rows_digit_is_the_one_key_still_owed`,
+    /// which existed only so that one missing binding could not go quiet. It
+    /// is gone because the debt is paid, and what stands in its place is the
+    /// rule that debt was a violation of: a drawn keycap that answers
+    /// nothing is the defect, so the pin is over every row rather than over
+    /// the one row that happened to be wrong.
+    ///
+    /// Enter and `1` both reach the first row -- the design draws the
+    /// keycap as the return mark and the owner asked for the digits -- so
+    /// the assertion is that every row is REACHABLE, not that every row has
+    /// exactly one key.
+    #[test]
+    fn every_row_the_picker_draws_answers_its_own_digit() {
+        for (row, _) in ROUTES.iter().enumerate() {
+            assert!(
+                ROUTE_KEYS.iter().any(|(_, bound)| *bound == row),
+                "row {row} is drawn with a keycap and no key in `ROUTE_KEYS` reaches it"
+            );
+        }
+        // The digits line up with the rows they are painted on, rather than
+        // every row merely being reachable by something.
+        for (key, row) in [
+            (egui::Key::Num1, 0),
+            (egui::Key::Num2, 1),
+            (egui::Key::Num3, 2),
+            (egui::Key::Num4, 3),
+        ] {
+            assert_eq!(
+                ROUTE_KEYS.iter().find(|(k, _)| *k == key).map(|(_, r)| *r),
+                Some(row),
+                "{key:?} does not pick the row it is drawn on"
+            );
+        }
+        assert_eq!(ROUTES[1].route, Route::ImageFile);
+    }
+
+    /// **A click on this frame beats a key on this frame.**
+    ///
+    /// The block this replaced read every row's click into `chosen` and then
+    /// assigned over it unconditionally when Enter was down, so a frame
+    /// carrying both took the FIRST row -- a keystroke silently overruling
+    /// the thing the user actually pressed. `draw_add_modal`'s Escape handler
+    /// makes the same argument for the key that closes the card.
+    #[test]
+    fn a_pressed_row_beats_a_key_on_the_same_frame() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        let picker = Picker::new();
+        let at = picker.idle(&mut state).row(Route::Webcam).center();
+        let mut events = click_at(at);
+        events.extend(tap(egui::Key::Enter));
+        assert_eq!(
+            picker.frame(&mut state, events).action,
+            action_for(Route::Webcam),
+            "Enter overruled the row the user actually pressed"
+        );
     }
 
     /// **The ↵ the default row advertises is a key that really answers.**
