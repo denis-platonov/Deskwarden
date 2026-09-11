@@ -651,38 +651,41 @@ pub enum RecordUiAction {
 /// 336-wide column, so arithmetic off the column would have put the mark a
 /// hundred points adrift of the corner. The frame has just measured itself and
 /// can simply say.
+/// It is `theme::form_card` and no longer a `Frame` spelled out here, and
+/// that swap is the whole of what this function now is.
+///
+/// **Why it moved.** §5a's composer is a bordered, rounded, SHADOWED card in
+/// three bands -- a header closed by a hairline, a padded body, a tinted
+/// footer -- and what stood here was white-on-white with an 8px radius and no
+/// edge at all. The Sends screen's text composer had written out the same
+/// four lines independently, so the two composers agreed only by coincidence,
+/// and the coincidence was that neither was §5a. One function draws the card
+/// now; `theme::form_card` argues every part of it.
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> (egui::Rect, R) {
-    let framed = egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, add);
-    (framed.response.rect, framed.inner)
+    theme::form_card(ui, add)
 }
 
-/// Either form's first line, answering with **the rectangle the heading
+/// Either form's first band, answering with **the rectangle the heading
 /// occupies** -- the line the dismiss ✕ is hung on once [`card`] has measured
 /// itself.
+///
+/// The 8-point space this used to follow itself with is gone: the header is a
+/// band now, and what separates it from the first control is its own padding
+/// and the hairline under it rather than a gap.
 fn heading(ui: &mut egui::Ui, text: &str) -> egui::Rect {
-    let line = ui
-        .label(egui::RichText::new(text).size(14.0).color(theme::INK).strong())
-        .rect;
-    ui.add_space(8.0);
-    line
+    theme::form_card_header(ui, text)
 }
 
-/// The top strip of either form, measured rather than guessed: [`card`]'s
-/// 12-point margin plus the ~18 [`heading`]'s 14px line occupies. It is what
-/// `draw_export_modal` and `draw_import_modal` hand
-/// [`theme::modal_drag_handle`] as the band the card is dragged by.
+/// The top strip of either form: what `draw_export_modal` and
+/// `draw_import_modal` hand [`theme::modal_drag_handle`] as the band the card
+/// is dragged by.
 ///
-/// A point short of where the first control begins -- `heading` follows itself
-/// with `add_space(8.0)` -- so the grab strip cannot reach one. It is its own
-/// number and not `theme::MODAL_PLAIN_HEADER_HEIGHT` because these two cards
-/// are the tighter [`card`] frame and not the 20-point one the rest of the
-/// hand-built modals use; sharing a constant between two different paddings is
-/// how a handle ends up over a text field.
-const FORM_HEADER_HEIGHT: f32 = 30.0;
+/// It is now exactly [`theme::FORM_CARD_HEADER_HEIGHT`] -- the header band,
+/// to the hairline that closes it -- rather than a number of this file's own.
+/// The band is a real strip with nothing in it but the title, which is
+/// precisely what a drag handle wants, and a handle measured off anything
+/// else is how one ends up over a text field.
+const FORM_HEADER_HEIGHT: f32 = theme::FORM_CARD_HEADER_HEIGHT;
 
 fn note(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
     ui.label(egui::RichText::new(text).size(11.0).color(colour));
@@ -767,151 +770,151 @@ pub fn draw_export_form(
     let enabled = !in_flight;
     let (card_rect, title) = card(ui, |ui| {
         let title = heading(ui, EXPORT_HEADING);
+        theme::form_card_body(ui, |ui| {
+            // **§5a's `RECORD` block: the record is NAMED, not mentioned.**
+            //
+            // The design opens the composer with a chip -- a monogram tile, the
+            // record's name set in the blue the rest of this app gives a chosen
+            // thing, and a subtitle -- under an eyebrow that says what the block
+            // is. What stood here was the item's name in [`note`]'s 11px grey,
+            // which is the size and colour this file uses for fine print: the one
+            // line that says WHICH record is about to be published was drawn
+            // quieter than the sentence explaining why the button is grey.
+            //
+            // The tile is `theme::avatar`, which is the same tile the item list
+            // and the delete modal draw, so the chip reads as the row it was
+            // opened from. `emphasized` is on for §5a's reason: this record is
+            // the chosen one, and blue-on-wash is what this app's tiles already
+            // say that with.
+            theme::eyebrow(ui, RECORD_EYEBROW);
+            ui.add_space(theme::EYEBROW_GAP);
+            record_chip(ui, item_name);
+            ui.add_space(theme::BLOCK_GAP);
 
-        // **§5a's `RECORD` block: the record is NAMED, not mentioned.**
-        //
-        // The design opens the composer with a chip -- a monogram tile, the
-        // record's name set in the blue the rest of this app gives a chosen
-        // thing, and a subtitle -- under an eyebrow that says what the block
-        // is. What stood here was the item's name in [`note`]'s 11px grey,
-        // which is the size and colour this file uses for fine print: the one
-        // line that says WHICH record is about to be published was drawn
-        // quieter than the sentence explaining why the button is grey.
-        //
-        // The tile is `theme::avatar`, which is the same tile the item list
-        // and the delete modal draw, so the chip reads as the row it was
-        // opened from. `emphasized` is on for §5a's reason: this record is
-        // the chosen one, and blue-on-wash is what this app's tiles already
-        // say that with.
-        theme::eyebrow(ui, RECORD_EYEBROW);
-        ui.add_space(6.0);
-        record_chip(ui, item_name);
-        ui.add_space(12.0);
+            // **§5a's `INCLUDE` block**, with the design's own running count
+            // beside its eyebrow. See [`include_counter`] for why the number is
+            // worth having and why it is a pure function.
+            ui.horizontal(|ui| {
+                theme::eyebrow(ui, INCLUDE_EYEBROW);
+                ui.add_space(10.0);
+                ui.label(
+                    egui::RichText::new(include_counter(draft))
+                        .size(12.0)
+                        .color(theme::TEXT_GHOST),
+                );
+            });
+            ui.add_space(theme::EYEBROW_GAP);
 
-        // **§5a's `INCLUDE` block**, with the design's own running count
-        // beside its eyebrow. See [`include_counter`] for why the number is
-        // worth having and why it is a pure function.
-        ui.horizontal(|ui| {
-            theme::eyebrow(ui, INCLUDE_EYEBROW);
-            ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new(include_counter(draft))
-                    .size(12.0)
-                    .color(theme::TEXT_GHOST),
+            // **The ticks are a LIST, and §5a draws the list as one boxed
+            // object**: a 1px hairline outline round the run, a 10px radius, and
+            // the lighter `#f3f2f2` rule between one row and the next. Both
+            // weights are already this design system's -- `theme::HAIRLINE` is
+            // the card border and `theme::row_rule` is the between-rows rule the
+            // detail pane draws -- so the box is assembled out of the two
+            // dividers the app has rather than a third.
+            //
+            // It is not decoration. Five loose check-boxes stacked in a column
+            // are five independent questions; the same five inside one outline
+            // are the answer to "what travels", which is the whole subject of
+            // this card and the thing §5a's caption calls out ("each field is an
+            // explicit opt-in"). The counter above only reads as a counter of
+            // something once the something has an edge.
+            egui::Frame::new()
+                .stroke(egui::Stroke::new(1.0, theme::HAIRLINE))
+                .corner_radius(CornerRadius::same(TICK_LIST_RADIUS))
+                .inner_margin(egui::Margin::symmetric(TICK_LIST_PAD_X, TICK_LIST_PAD_Y))
+                .show(ui, |ui| {
+                    let mut first = true;
+                    let rule_between = |ui: &mut egui::Ui, first: &mut bool| {
+                        if *first {
+                            *first = false;
+                        } else {
+                            ui.add_space(TICK_ROW_GAP);
+                            theme::row_rule(ui);
+                            ui.add_space(TICK_ROW_GAP);
+                        }
+                    };
+
+                    for (label, ticked) in [
+                        (USERNAME_LABEL, &mut draft.selection.username),
+                        (PASSWORD_LABEL, &mut draft.selection.password),
+                        (URI_LABEL, &mut draft.selection.uri),
+                        (NOTES_LABEL, &mut draft.selection.notes),
+                    ] {
+                        rule_between(ui, &mut first);
+                        ui.add_enabled(
+                            enabled,
+                            egui::Checkbox::new(
+                                ticked,
+                                egui::RichText::new(label).size(12.0).color(theme::TEXT_SECONDARY),
+                            ),
+                        );
+                    }
+
+                    // The seed's tick goes through `set_totp` rather than a
+                    // `&mut bool`, so unticking it drops the passphrase.
+                    rule_between(ui, &mut first);
+                    let mut totp = draft.selection.totp;
+                    if ui
+                        .add_enabled(
+                            enabled,
+                            egui::Checkbox::new(
+                                &mut totp,
+                                egui::RichText::new(TOTP_LABEL).size(12.0).color(theme::TEXT_SECONDARY),
+                            ),
+                        )
+                        .changed()
+                    {
+                        draft.set_totp(totp);
+                    }
+                });
+
+            if warning_is_shown(draft) {
+                ui.add_space(8.0);
+                // Painted in the error colour and at the same size as the labels
+                // above it, not as fine print: it is the sentence that decides
+                // whether the tick above was a mistake.
+                ui.label(egui::RichText::new(SEED_WARNING).size(12.0).color(theme::ERROR));
+                ui.add_space(8.0);
+                // `theme::hinted_field` and not a bare `egui::TextEdit`: this box
+                // sat directly under the composer's other boxes wearing egui's
+                // frame instead of the design's, which is the same defect the
+                // Sends composer's name and body fields had. See that function.
+                ui.add_enabled_ui(enabled, |ui| {
+                    theme::hinted_field(ui, &mut draft.passphrase, PASSPHRASE_HINT, true)
+                });
+                ui.add_space(4.0);
+                note(ui, PASSPHRASE_NOTE, theme::TEXT_FAINT);
+            }
+
+            // **§5a's `ACCESS` block**, drawn by the one function in this app that
+            // draws it -- `send_ui::draw_access_block`, which the Sends screen's
+            // own composer also calls. Everything about what it draws, what it
+            // deliberately does not draw, and why each absence is a decision
+            // rather than a to-do is argued there, in one place, rather than
+            // halved between this file and that one.
+            //
+            // It lives in `send_ui` and is called from here, which is the
+            // direction that makes sense of the two: `send_ui` is this window's
+            // Send module and already owns the composer, the pane and the plan;
+            // `record_ui` is a modal that borrows the Send machinery to publish
+            // one record. The block is a control for three fields of a
+            // `crate::send::SendPlan`, so it belongs beside the screen that is
+            // made of `SendPlan`s.
+            ui.add_space(12.0);
+            super::send_ui::draw_access_block(
+                ui,
+                super::send_ui::AccessControls {
+                    lifetime: &mut draft.access.lifetime,
+                    password: &mut draft.access.password,
+                    max_access_count: &mut draft.access.max_access_count,
+                },
+                enabled,
+                now,
+                zone,
             );
         });
-        ui.add_space(6.0);
 
-        // **The ticks are a LIST, and §5a draws the list as one boxed
-        // object**: a 1px hairline outline round the run, a 10px radius, and
-        // the lighter `#f3f2f2` rule between one row and the next. Both
-        // weights are already this design system's -- `theme::HAIRLINE` is
-        // the card border and `theme::row_rule` is the between-rows rule the
-        // detail pane draws -- so the box is assembled out of the two
-        // dividers the app has rather than a third.
-        //
-        // It is not decoration. Five loose check-boxes stacked in a column
-        // are five independent questions; the same five inside one outline
-        // are the answer to "what travels", which is the whole subject of
-        // this card and the thing §5a's caption calls out ("each field is an
-        // explicit opt-in"). The counter above only reads as a counter of
-        // something once the something has an edge.
-        egui::Frame::new()
-            .stroke(egui::Stroke::new(1.0, theme::HAIRLINE))
-            .corner_radius(CornerRadius::same(TICK_LIST_RADIUS))
-            .inner_margin(egui::Margin::symmetric(TICK_LIST_PAD_X, TICK_LIST_PAD_Y))
-            .show(ui, |ui| {
-                let mut first = true;
-                let rule_between = |ui: &mut egui::Ui, first: &mut bool| {
-                    if *first {
-                        *first = false;
-                    } else {
-                        ui.add_space(TICK_ROW_GAP);
-                        theme::row_rule(ui);
-                        ui.add_space(TICK_ROW_GAP);
-                    }
-                };
-
-                for (label, ticked) in [
-                    (USERNAME_LABEL, &mut draft.selection.username),
-                    (PASSWORD_LABEL, &mut draft.selection.password),
-                    (URI_LABEL, &mut draft.selection.uri),
-                    (NOTES_LABEL, &mut draft.selection.notes),
-                ] {
-                    rule_between(ui, &mut first);
-                    ui.add_enabled(
-                        enabled,
-                        egui::Checkbox::new(
-                            ticked,
-                            egui::RichText::new(label).size(12.0).color(theme::TEXT_SECONDARY),
-                        ),
-                    );
-                }
-
-                // The seed's tick goes through `set_totp` rather than a
-                // `&mut bool`, so unticking it drops the passphrase.
-                rule_between(ui, &mut first);
-                let mut totp = draft.selection.totp;
-                if ui
-                    .add_enabled(
-                        enabled,
-                        egui::Checkbox::new(
-                            &mut totp,
-                            egui::RichText::new(TOTP_LABEL).size(12.0).color(theme::TEXT_SECONDARY),
-                        ),
-                    )
-                    .changed()
-                {
-                    draft.set_totp(totp);
-                }
-            });
-
-        if warning_is_shown(draft) {
-            ui.add_space(8.0);
-            // Painted in the error colour and at the same size as the labels
-            // above it, not as fine print: it is the sentence that decides
-            // whether the tick above was a mistake.
-            ui.label(egui::RichText::new(SEED_WARNING).size(12.0).color(theme::ERROR));
-            ui.add_space(8.0);
-            ui.add_enabled(
-                enabled,
-                egui::TextEdit::singleline(&mut *draft.passphrase)
-                    .hint_text(PASSPHRASE_HINT)
-                    .password(true)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add_space(4.0);
-            note(ui, PASSPHRASE_NOTE, theme::TEXT_FAINT);
-        }
-
-        // **§5a's `ACCESS` block**, drawn by the one function in this app that
-        // draws it -- `send_ui::draw_access_block`, which the Sends screen's
-        // own composer also calls. Everything about what it draws, what it
-        // deliberately does not draw, and why each absence is a decision
-        // rather than a to-do is argued there, in one place, rather than
-        // halved between this file and that one.
-        //
-        // It lives in `send_ui` and is called from here, which is the
-        // direction that makes sense of the two: `send_ui` is this window's
-        // Send module and already owns the composer, the pane and the plan;
-        // `record_ui` is a modal that borrows the Send machinery to publish
-        // one record. The block is a control for three fields of a
-        // `crate::send::SendPlan`, so it belongs beside the screen that is
-        // made of `SendPlan`s.
-        ui.add_space(12.0);
-        super::send_ui::draw_access_block(
-            ui,
-            super::send_ui::AccessControls {
-                lifetime: &mut draft.access.lifetime,
-                password: &mut draft.access.password,
-                max_access_count: &mut draft.access.max_access_count,
-            },
-            enabled,
-            now,
-            zone,
-        );
-
-        ui.add_space(12.0);
         let problem = export_problem(draft, now);
         let can_submit = export_can_submit(problem, in_flight);
         // **§5a's footer: a filled primary beside an outlined secondary.**
@@ -929,24 +932,46 @@ pub fn draw_export_form(
         // These are `theme::BUTTON_HEIGHT`'s 32 and not §5a's 34 -- see
         // `send_ui::draw_composer`'s footer for the argument, which is the
         // same one and is made once there.
-        ui.horizontal(|ui| {
-            if theme::primary_button_enabled(ui, EXPORT_SUBMIT_LABEL, None, can_submit).clicked() {
-                action = RecordUiAction::SubmitExport;
-            }
-            ui.add_space(8.0);
-            if ui
-                .add_enabled_ui(enabled, |ui| theme::secondary_button(ui, EXPORT_CANCEL_LABEL))
-                .inner
-                .clicked()
-            {
-                action = RecordUiAction::Cancel;
-            }
-            // The reason the button is grey, beside the button. A disabled
-            // control with no explanation is a control the user reads as
-            // broken.
-            if let Some(problem) = problem {
-                ui.add_space(8.0);
-                note(ui, problem, theme::TEXT_FAINT);
+        //
+        // **And they are in §5a's footer BAND now**, which they were not:
+        // the two answers used to be simply the last things in the body, with
+        // the refusal sentence trailing after them as loose prose. Both cards
+        // are fixed together and by the same functions, because two composers
+        // that publish the same object and end differently is the defect one
+        // level up from the one the owner reported.
+        theme::form_card_footer(ui, |ui| {
+            // The footer's one right-hand slot, and the three things that
+            // want it, exactly as `send_ui::draw_composer` arranges them --
+            // the argument is made there, once, and this card obeys it rather
+            // than restating it.
+            let note_text = problem.unwrap_or(super::send_ui::APPEARS_IN_SENDS);
+            let mut beside = false;
+            ui.horizontal(|ui| {
+                if theme::primary_button_enabled(ui, EXPORT_SUBMIT_LABEL, None, can_submit)
+                    .clicked()
+                {
+                    action = RecordUiAction::SubmitExport;
+                }
+                ui.add_space(theme::FORM_FOOTER_GAP);
+                if ui
+                    .add_enabled_ui(enabled, |ui| theme::secondary_button(ui, EXPORT_CANCEL_LABEL))
+                    .inner
+                    .clicked()
+                {
+                    action = RecordUiAction::Cancel;
+                }
+                if theme::form_footer_note_width(ui, note_text) + theme::FORM_FOOTER_GAP
+                    <= ui.available_width()
+                {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        theme::form_footer_note(ui, note_text);
+                    });
+                    beside = true;
+                }
+            });
+            if !beside {
+                ui.add_space(theme::FORM_FOOTER_GAP);
+                theme::form_footer_note(ui, note_text);
             }
         });
         title
@@ -986,115 +1011,112 @@ pub fn draw_import_form(
     let enabled = !in_flight;
     let (card_rect, title) = card(ui, |ui| {
         let title = heading(ui, IMPORT_HEADING);
-        ui.add_enabled(
-            enabled,
-            egui::TextEdit::singleline(&mut draft.link)
-                .hint_text(LINK_HINT)
-                .desired_width(f32::INFINITY),
-        );
-        ui.add_space(4.0);
-        note(ui, LINK_NOTE, theme::TEXT_FAINT);
+        let ok = theme::form_card_body(ui, |ui| {
+            ui.add_enabled_ui(enabled, |ui| {
+                theme::hinted_field(ui, &mut draft.link, LINK_HINT, false)
+            });
+            ui.add_space(4.0);
+            note(ui, LINK_NOTE, theme::TEXT_FAINT);
 
-        let ok = match record {
-            Some(Err(refusal)) => {
+            let ok = match record {
+                Some(Err(refusal)) => {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(refusal_sentence(refusal)).size(12.0).color(theme::ERROR),
+                    );
+                    None
+                }
+                Some(Ok(record)) => Some(record),
+                None => None,
+            };
+
+            if let Some(record) = ok {
                 ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(refusal_sentence(refusal)).size(12.0).color(theme::ERROR),
-                );
-                None
-            }
-            Some(Ok(record)) => Some(record),
-            None => None,
-        };
+                note(ui, WILL_IMPORT_HEADING, theme::TEXT_MUTED);
+                ui.add_space(2.0);
+                // Names only. Never a value; see `fields_present`.
+                for name in fields_present(record) {
+                    note(ui, name, theme::TEXT_SECONDARY);
+                }
 
-        if let Some(record) = ok {
-            ui.add_space(10.0);
-            note(ui, WILL_IMPORT_HEADING, theme::TEXT_MUTED);
-            ui.add_space(2.0);
-            // Names only. Never a value; see `fields_present`.
-            for name in fields_present(record) {
-                note(ui, name, theme::TEXT_SECONDARY);
-            }
+                if let Some(stale) = stale_note(record, now) {
+                    ui.add_space(8.0);
+                    note(ui, &stale, theme::TEXT_MUTED);
+                }
 
-            if let Some(stale) = stale_note(record, now) {
-                ui.add_space(8.0);
-                note(ui, &stale, theme::TEXT_MUTED);
-            }
+                if needs_passphrase(record) {
+                    ui.add_space(8.0);
+                    ui.add_enabled_ui(enabled, |ui| {
+                        theme::hinted_field(ui, &mut draft.passphrase, IMPORT_PASSPHRASE_HINT, true)
+                    });
+                }
 
-            if needs_passphrase(record) {
-                ui.add_space(8.0);
-                ui.add_enabled(
-                    enabled,
-                    egui::TextEdit::singleline(&mut *draft.passphrase)
-                        .hint_text(IMPORT_PASSPHRASE_HINT)
-                        .password(true)
-                        .desired_width(f32::INFINITY),
-                );
-            }
-
-            if let Collision::SameName { .. } = collision {
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(collision_prompt(&record.name))
-                        .size(12.0)
-                        .color(theme::INK),
-                );
-                ui.add_space(4.0);
-                // **One control with two positions, and not two buttons.**
-                //
-                // This was a `ui.horizontal` of two `egui::Button`s with
-                // `.selected()` on whichever was chosen -- separated by
-                // egui's item spacing, each with its own outline, each 160
-                // points wide whatever its label said. That is the exact
-                // shape `theme::segmented_control`'s own documentation
-                // records this app moving away from, and the Sends composer's
-                // lifetime row was moved off it a pass ago; this prompt was
-                // the last `.selected()` pair left in the two record forms.
-                //
-                // It matters more here than it did there. This is the one
-                // question in this whole feature whose wrong answer destroys
-                // data the user already had, and `.selected()` paints the
-                // chosen button in egui's own selection fill with
-                // [`theme::INK`] over it -- a grey that is easy to miss at a
-                // glance across two identical 160-point boxes. The segmented
-                // run fills the answer in force with [`theme::BLUE`] behind
-                // white, which is the weight this app gives a primary button
-                // and is the weight "you are about to replace an item" should
-                // have.
-                //
-                // **Neither cell is lit until the user lights one.**
-                // `draft.choice` starts `None`, both `selected` flags are
-                // therefore `false`, and there is no `unwrap_or` here and
-                // must not be: `import_can_proceed` refuses while the choice
-                // is `None`, and a default would answer a question nobody
-                // was asked.
-                let choices = [
-                    (CREATE_SECOND_LABEL, CollisionChoice::CreateSecond),
-                    (REPLACE_LABEL, CollisionChoice::Replace),
-                ];
-                let segments: Vec<theme::Segment<'_>> = choices
-                    .iter()
-                    .map(|(label, choice)| theme::Segment {
-                        label,
-                        selected: draft.choice == Some(*choice),
-                    })
-                    .collect();
-                // `segmented_control_disabled` and not `add_enabled`, for the
-                // reason that split exists: the inert run senses hover only,
-                // so while an import is running there is no path by which a
-                // cell can be pressed, and the answer already given stays
-                // legible in the wash rather than greying away.
-                if enabled {
-                    if let Some(index) = theme::segmented_control(ui, &segments) {
-                        draft.choice = Some(choices[index].1);
+                if let Collision::SameName { .. } = collision {
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(collision_prompt(&record.name))
+                            .size(12.0)
+                            .color(theme::INK),
+                    );
+                    ui.add_space(4.0);
+                    // **One control with two positions, and not two buttons.**
+                    //
+                    // This was a `ui.horizontal` of two `egui::Button`s with
+                    // `.selected()` on whichever was chosen -- separated by
+                    // egui's item spacing, each with its own outline, each 160
+                    // points wide whatever its label said. That is the exact
+                    // shape `theme::segmented_control`'s own documentation
+                    // records this app moving away from, and the Sends composer's
+                    // lifetime row was moved off it a pass ago; this prompt was
+                    // the last `.selected()` pair left in the two record forms.
+                    //
+                    // It matters more here than it did there. This is the one
+                    // question in this whole feature whose wrong answer destroys
+                    // data the user already had, and `.selected()` paints the
+                    // chosen button in egui's own selection fill with
+                    // [`theme::INK`] over it -- a grey that is easy to miss at a
+                    // glance across two identical 160-point boxes. The segmented
+                    // run fills the answer in force with [`theme::BLUE`] behind
+                    // white, which is the weight this app gives a primary button
+                    // and is the weight "you are about to replace an item" should
+                    // have.
+                    //
+                    // **Neither cell is lit until the user lights one.**
+                    // `draft.choice` starts `None`, both `selected` flags are
+                    // therefore `false`, and there is no `unwrap_or` here and
+                    // must not be: `import_can_proceed` refuses while the choice
+                    // is `None`, and a default would answer a question nobody
+                    // was asked.
+                    let choices = [
+                        (CREATE_SECOND_LABEL, CollisionChoice::CreateSecond),
+                        (REPLACE_LABEL, CollisionChoice::Replace),
+                    ];
+                    let segments: Vec<theme::Segment<'_>> = choices
+                        .iter()
+                        .map(|(label, choice)| theme::Segment {
+                            label,
+                            selected: draft.choice == Some(*choice),
+                        })
+                        .collect();
+                    // `segmented_control_disabled` and not `add_enabled`, for the
+                    // reason that split exists: the inert run senses hover only,
+                    // so while an import is running there is no path by which a
+                    // cell can be pressed, and the answer already given stays
+                    // legible in the wash rather than greying away.
+                    if enabled {
+                        if let Some(index) = theme::segmented_control(ui, &segments) {
+                            draft.choice = Some(choices[index].1);
+                        }
+                    } else {
+                        theme::segmented_control_disabled(ui, &segments);
                     }
-                } else {
-                    theme::segmented_control_disabled(ui, &segments);
                 }
             }
-        }
+            // Handed back out of the body band because the footer's own refusal
+            // sentence is a fact about what the link fetched.
+            ok
+        });
 
-        ui.add_space(12.0);
         let problem = import_problem(ok, draft, collision);
         let can_proceed = import_can_proceed(ok, draft, collision, in_flight);
         // **The import footer is the design system's two buttons**, and until
@@ -1124,23 +1146,53 @@ pub fn draw_import_form(
         //
         // These are `theme::BUTTON_HEIGHT`'s 32 and not this file's old 26 --
         // see `draw_export_form`'s footer, where that argument is made once.
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled_ui(enabled && !draft.link.trim().is_empty(), |ui| {
-                    theme::secondary_button(ui, FETCH_LABEL)
-                })
-                .inner
-                .clicked()
-            {
-                action = RecordUiAction::FetchLink;
-            }
-            ui.add_space(8.0);
-            if theme::primary_button_enabled(ui, IMPORT_SUBMIT_LABEL, None, can_proceed).clicked() {
-                action = RecordUiAction::SubmitImport;
-            }
+        //
+        // **And in §5a's footer BAND**, for the export card's reason: these
+        // two cards are opened from the same window and sit in the same
+        // frame, so one of them growing a banded footer and the other keeping
+        // a row of buttons at the end of its body would be the same
+        // divergence this pass exists to close, one card over.
+        theme::form_card_footer(ui, |ui| {
+            let mut beside = false;
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled_ui(enabled && !draft.link.trim().is_empty(), |ui| {
+                        theme::secondary_button(ui, FETCH_LABEL)
+                    })
+                    .inner
+                    .clicked()
+                {
+                    action = RecordUiAction::FetchLink;
+                }
+                ui.add_space(theme::FORM_FOOTER_GAP);
+                if theme::primary_button_enabled(ui, IMPORT_SUBMIT_LABEL, None, can_proceed)
+                    .clicked()
+                {
+                    action = RecordUiAction::SubmitImport;
+                }
+                // **No standing note on this card**, and the absence is the
+                // decision: `APPEARS_IN_SENDS` answers "where does the thing
+                // I am publishing end up", and this form publishes nothing --
+                // it pulls a record INTO the vault. The slot carries the
+                // refusal when there is one and is empty when there is not,
+                // rather than being filled with a sentence invented to
+                // occupy it.
+                if let Some(problem) = problem {
+                    if theme::form_footer_note_width(ui, problem) + theme::FORM_FOOTER_GAP
+                        <= ui.available_width()
+                    {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            theme::form_footer_note(ui, problem);
+                        });
+                        beside = true;
+                    }
+                }
+            });
             if let Some(problem) = problem {
-                ui.add_space(8.0);
-                note(ui, problem, theme::TEXT_FAINT);
+                if !beside {
+                    ui.add_space(theme::FORM_FOOTER_GAP);
+                    theme::form_footer_note(ui, problem);
+                }
             }
         });
         title
@@ -2184,6 +2236,79 @@ mod paint_tests {
              against nothing"
         );
         painted
+    }
+
+    /// **The record composer is the same banded card the Sends composer is**,
+    /// and this test exists because the two coming apart is the defect one
+    /// level up from the one that was reported.
+    ///
+    /// The owner screenshotted `send_ui`'s text composer and said it was not
+    /// as per design: no card, bare inputs, a footer of loose buttons and
+    /// floating prose. Every one of those was equally true here -- the two
+    /// forms had each written out `Frame::new().fill(CARD).corner_radius(8)`
+    /// in their own file, so they agreed only by coincidence, and the
+    /// coincidence was that neither was §5a. Fixing one of them and not the
+    /// other would have produced two composers that publish the same object
+    /// and look like two applications.
+    ///
+    /// Asserted on this card's own paint rather than by comparing two
+    /// screens' pixels: the shared thing is `theme::form_card` and its three
+    /// bands, so what each card has to show is that it went through them.
+    #[test]
+    fn the_export_card_is_the_banded_card_and_not_a_form_laid_flat() {
+        let mut draft = RecordDraft::default();
+        let painted = paint(|ui| {
+            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
+        });
+
+        let heading = painted.rect_of(EXPORT_HEADING).expect("the heading was not painted");
+        let submit = painted.rect_of(EXPORT_SUBMIT_LABEL).expect("the submit was not painted");
+
+        // The footer band: §5a's `#fbfaf9`, which is `theme::CARD_TINT`, and
+        // nothing else on this card is painted in it.
+        let band = painted
+            .fills
+            .iter()
+            .filter(|(_, colour)| *colour == theme::CARD_TINT)
+            .map(|(rect, _)| *rect)
+            .max_by(|a, b| a.bottom().total_cmp(&b.bottom()))
+            .expect("no tinted footer band was painted -- the answers are still the last \
+                     things in the body");
+        assert!(
+            band.contains_rect(submit),
+            "the submit at {submit:?} is outside the footer band at {band:?}"
+        );
+        assert!(
+            !band.contains_rect(heading),
+            "the heading is inside the footer band, so the 'band' found is the whole card"
+        );
+
+        // §5a's standing note, in the footer's right-hand slot, spelled once
+        // for both composers.
+        assert!(
+            painted.has(crate::vault_window::send_ui::APPEARS_IN_SENDS),
+            "the record composer's footer does not say where the Send ends up, and the Sends \
+             composer's does -- one fact, two cards, two answers: {:?}",
+            painted.text
+        );
+
+        // The header band's closing rule. `theme::hairline` is the one weight
+        // §5a draws under a card's title, and a card with no rule under its
+        // heading is a heading with a gap under it.
+        //
+        // Bounded by the heading above and the body's first line below rather
+        // than by an arithmetic guess at the band's height: the heading's rect
+        // is its GLYPH ink, which stops short of the line box, so "one padding
+        // below the heading" is not where the rule is.
+        let first_block =
+            painted.rect_of(RECORD_EYEBROW).expect("the RECORD eyebrow was not painted");
+        let rule = painted.fills.iter().any(|(rect, colour)| {
+            *colour == theme::HAIRLINE
+                && (rect.height() - 1.0).abs() < 0.5
+                && rect.top() > heading.bottom()
+                && rect.bottom() < first_block.top()
+        });
+        assert!(rule, "no hairline closes the header band off from the body");
     }
 
     /// **The warning is on screen when the seed is ticked, and not before.**

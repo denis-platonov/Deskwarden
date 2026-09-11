@@ -3340,6 +3340,37 @@ pub const NEW_SEND_LABEL: &str = "New Send";
 /// `send_delete_wiring::ReachableState::ComposerOpen` is checked by.
 pub const COMPOSER_HEADING: &str = "New text Send";
 
+/// The eyebrow over the name field -- this composer's counterpart of §5a's
+/// `Record`. See `draw_composer` for why the two inputs are eyebrowed at all.
+pub const NAME_EYEBROW: &str = "NAME";
+/// The eyebrow over the body field -- this composer's counterpart of §5a's
+/// `Include`. **The design's own vocabulary for "what travels"**, said as the
+/// noun rather than as the verb, because a text Send's body is one thing and
+/// there is nothing to include or leave out.
+pub const TEXT_EYEBROW: &str = "TEXT";
+
+/// How many lines of the body the box shows before it scrolls. The four it
+/// has always shown -- enough for a host, a user and a note, which is what
+/// this field is used for, and short enough that the Access block below it is
+/// on screen at the window floor.
+pub const BODY_ROWS: usize = 4;
+
+/// The standing note at the footer's right-hand end: **§5a's `Appears in
+/// Shared`, in this app's own vocabulary.**
+///
+/// §5a says `Shared` because the rail row its design puts a new Send into is
+/// called that. This app's is called `Sends` -- `sidebar::SENDS_ROW_LABEL` --
+/// under a `SHARING` section, so `Appears in Shared` would name a row the
+/// user cannot find. The note's job is to answer "where does this go when I
+/// press the blue button", and an answer that does not match the rail is
+/// worse than none.
+///
+/// It is `pub` and shared with `record_ui` deliberately: both composers
+/// publish a Send into the same list, so a second spelling of the same fact
+/// on the other card is exactly the defect the shared Access block and the
+/// shared footer buttons were each introduced to remove.
+pub const APPEARS_IN_SENDS: &str = "Appears in Sends";
+
 /// The name field's placeholder.
 pub const NAME_HINT: &str = "Name this Send";
 /// The body field's placeholder. **Says "text"**, because that is the only
@@ -3677,6 +3708,57 @@ fn pickable_window(
     )
 }
 
+/// The three Access row labels, in the order the block draws them, so
+/// [`access_label_width`] measures exactly the set that is on screen.
+const ACCESS_LABELS: [&str; 3] = [EXPIRES_LABEL, VIEWS_LABEL, OPEN_WITH_LABEL];
+
+/// §5a's Access label type size.
+const ACCESS_LABEL_PX: f32 = 13.0;
+
+/// **How wide the label column is, for the width this block was actually
+/// given.**
+///
+/// §5a's answer is 96 and that is the first answer this returns. It is not
+/// the only one it can return, and the reason is the detail column: 250
+/// points of card at `settings::MIN_VAULT_WINDOW_SIZE` is 226 inside
+/// `theme::FORM_CARD_PAD_X`, and `96 + 14 + 150` is 260. Something has to
+/// give, and it is worth being exact about what:
+///
+///   * **Not the control.** [`EXPIRY_FIELD_WIDTH`] is 150 because the widest
+///     row it has to state is `A date you pick…`; a narrower box elides the
+///     answer in force, which is the one thing that control exists to show.
+///   * **Not the block's shape.** Stacking each label above its control at
+///     narrow widths would make the same form two different forms depending
+///     on how the window is dragged.
+///   * **The column's WIDTH, not its existence.** §5a's claim here is that
+///     three questions have their answers on one vertical line -- which is a
+///     claim about the three agreeing with each other, not about the number
+///     96. Measuring the widest of the three labels and giving all three that
+///     keeps the claim exactly and costs the block nothing it can see.
+///
+/// It is a function of the room rather than a constant for the same reason
+/// `action_pad_for` is: the pane is resizable, so the answer has to be too.
+fn access_label_width(ui: &egui::Ui) -> f32 {
+    let room = ui.available_width();
+    if ACCESS_LABEL_WIDTH + ACCESS_ROW_GAP + EXPIRY_FIELD_WIDTH <= room {
+        return ACCESS_LABEL_WIDTH;
+    }
+    ACCESS_LABELS
+        .iter()
+        .map(|label| {
+            ui.painter()
+                .layout_no_wrap(
+                    (*label).to_string(),
+                    egui::FontId::new(ACCESS_LABEL_PX, egui::FontFamily::Proportional),
+                    theme::TEXT_SECONDARY,
+                )
+                .size()
+                .x
+        })
+        .fold(0.0_f32, f32::max)
+        .ceil()
+}
+
 /// One Access row: a fixed-width label, then whatever the caller draws.
 ///
 /// The label column is fixed rather than laid out naturally because that is
@@ -3684,9 +3766,19 @@ fn pickable_window(
 /// start on one vertical line. Laid out naturally, "Expires", "Views" and
 /// "Open with" are three different widths and the three controls step
 /// rightwards down the card.
+///
+/// **And that is what it did**, for as long as the column was drawn with
+/// `allocate_ui_with_layout`. That function allocates what its CHILD ended up
+/// occupying, not the size it was asked for, so the "fixed" 96-point column
+/// was in fact each label's own width -- the three controls stepped rightwards
+/// exactly as this doc says they must not, on both composers, in every
+/// screenshot ever taken of either. The slot is now allocated first and the
+/// label placed into it, which is `theme::modal_answer`'s idiom and is the
+/// only one in this codebase that actually reserves a rectangle.
 fn access_row<R>(
     ui: &mut egui::Ui,
     label: &str,
+    label_width: f32,
     enabled: bool,
     body: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
@@ -3695,16 +3787,19 @@ fn access_row<R>(
         // once for the whole row so the note after a control sits the same
         // distance from it as the control sits from its label.
         ui.spacing_mut().item_spacing.x = ACCESS_ROW_GAP;
-        ui.allocate_ui_with_layout(
-            egui::vec2(ACCESS_LABEL_WIDTH, ACCESS_FIELD_HEIGHT),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.label(
-                    egui::RichText::new(label)
-                        .size(13.0)
-                        .color(if enabled { theme::TEXT_SECONDARY } else { theme::TEXT_GHOST }),
-                );
-            },
+        let (slot, _) = ui.allocate_exact_size(
+            egui::vec2(label_width, ACCESS_FIELD_HEIGHT),
+            egui::Sense::hover(),
+        );
+        let mut cell = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(slot)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        cell.label(
+            egui::RichText::new(label)
+                .size(ACCESS_LABEL_PX)
+                .color(if enabled { theme::TEXT_SECONDARY } else { theme::TEXT_GHOST }),
         );
         body(ui)
     })
@@ -3791,7 +3886,12 @@ pub fn draw_access_block(
     zone: &dyn LocalOffset,
 ) {
     theme::eyebrow(ui, ACCESS_EYEBROW);
-    ui.add_space(6.0);
+    ui.add_space(theme::EYEBROW_GAP);
+
+    // Measured ONCE, at the top, and handed to all three rows: the property
+    // §5a's label column is for is that the three agree, and three rows each
+    // measuring for themselves is three chances to disagree by a point.
+    let label_width = access_label_width(ui);
 
     // ---- Expires ---------------------------------------------------------
     //
@@ -3865,7 +3965,7 @@ pub fn draw_access_block(
         })
         .collect();
     let current = crate::send::lifetime_label(*controls.lifetime, zone);
-    access_row(ui, EXPIRES_LABEL, enabled, |ui| {
+    access_row(ui, EXPIRES_LABEL, label_width, enabled, |ui| {
         // `dropdown_disabled` and not `add_enabled_ui`, for the reason that
         // split exists in this design system (see `toggle_pill` /
         // `toggle_pill_disabled`, and the segmented run before it): the inert
@@ -3938,15 +4038,17 @@ pub fn draw_access_block(
     // by being empty. Everything the box means is `view_limit_from`, which is
     // a pure function and not a rule inside this closure.
     let mut typed = controls.max_access_count.map(|n| n.to_string()).unwrap_or_default();
-    access_row(ui, VIEWS_LABEL, enabled, |ui| {
+    access_row(ui, VIEWS_LABEL, label_width, enabled, |ui| {
+        // `theme::inline_field` and not a bare `egui::TextEdit`, which is what
+        // stood here: the bare one wears egui's frame, egui's radius and
+        // egui's one-line height, so this row's box and the `Open with` box
+        // below it and the two boxes on the composer above were four
+        // different-looking controls on one card. See that function.
         let changed = ui
-            .add_enabled(
-                enabled,
-                egui::TextEdit::singleline(&mut typed)
-                    .hint_text(VIEWS_HINT)
-                    .desired_width(VIEW_LIMIT_FIELD_WIDTH)
-                    .min_size(egui::vec2(VIEW_LIMIT_FIELD_WIDTH, ACCESS_FIELD_HEIGHT)),
-            )
+            .add_enabled_ui(enabled, |ui| {
+                theme::inline_field(ui, &mut typed, VIEWS_HINT, VIEW_LIMIT_FIELD_WIDTH, false)
+            })
+            .inner
             .changed();
         if changed {
             *controls.max_access_count = view_limit_from(&typed);
@@ -3978,15 +4080,11 @@ pub fn draw_access_block(
         .password
         .take()
         .unwrap_or_else(|| zeroize::Zeroizing::new(String::new()));
-    access_row(ui, OPEN_WITH_LABEL, enabled, |ui| {
-        ui.add_enabled(
-            enabled,
-            egui::TextEdit::singleline(&mut *buffer)
-                .hint_text(PASSWORD_HINT)
-                .password(true)
-                .desired_width(f32::INFINITY)
-                .min_size(egui::vec2(0.0, ACCESS_FIELD_HEIGHT)),
-        );
+    access_row(ui, OPEN_WITH_LABEL, label_width, enabled, |ui| {
+        let room = ui.available_width();
+        ui.add_enabled_ui(enabled, |ui| {
+            theme::inline_field(ui, &mut buffer, PASSWORD_HINT, room, true);
+        });
     });
     *controls.password = (!buffer.is_empty()).then_some(buffer);
 }
@@ -4007,35 +4105,62 @@ fn draw_composer(
 ) -> Option<SendUiAction> {
     let mut action = None;
     let enabled = !in_flight;
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(COMPOSER_HEADING)
-                    .size(14.0)
-                    .color(theme::INK)
-                    .strong(),
-            );
-            ui.add_space(8.0);
+    // **§5a's card, in §5a's three bands**, drawn by the one set of functions
+    // in this app that draws them -- `record_ui`'s record composer calls the
+    // same three. See `theme::form_card` for what they are and why they are
+    // there rather than here.
+    theme::form_card(ui, |ui| {
+        theme::form_card_header(ui, COMPOSER_HEADING);
+        theme::form_card_body(ui, |ui| {
+            // **Both inputs get an eyebrow, and the decision is worth
+            // stating because the easy answer was to leave them bare.**
+            //
+            // §5a's card is three eyebrowed blocks -- `Record`, `Include`,
+            // `Access` -- and the eyebrows are not decoration: they are what
+            // makes the card read as a sequence of decisions ("which record",
+            // "what travels", "who can open it") rather than as a stack of
+            // widgets. This composer had exactly one of the three, over the
+            // Access block, because that block was lifted from §5a wholesale.
+            // One eyebrow is the worst of the three available answers: it
+            // says the card has sections and then labels only the last one,
+            // so the top half reads as preamble to the part that is properly
+            // designed.
+            //
+            // The two inputs ARE this screen's counterparts of §5a's first
+            // two blocks. A text Send has no record to pick and no field list
+            // to narrow; what it has is a name (which identifies the Send the
+            // way §5a's chip identifies its record) and a body (which is what
+            // travels, the way §5a's tick list is). Same two questions, two
+            // boxes instead of a chip and a list.
+            //
+            // The eyebrow and the placeholder overlap while the box is empty
+            // -- `NAME` over `Name this Send` -- and that is accepted rather
+            // than fixed by deleting one. The placeholder is the only thing
+            // in the box for the few seconds before the user types, and the
+            // eyebrow is the only thing left once they have; neither covers
+            // the other's half of the field's life.
+            theme::eyebrow(ui, NAME_EYEBROW);
+            ui.add_space(theme::EYEBROW_GAP);
+            ui.add_enabled_ui(enabled, |ui| {
+                theme::hinted_field(ui, &mut composer.plan.name, NAME_HINT, false);
+            });
+            ui.add_space(theme::BLOCK_GAP);
 
-            ui.add_enabled(
-                enabled,
-                egui::TextEdit::singleline(&mut composer.plan.name)
-                    .hint_text(NAME_HINT)
-                    .desired_width(f32::INFINITY),
-            );
-            ui.add_space(6.0);
-            ui.add_enabled(
-                enabled,
-                egui::TextEdit::multiline(&mut *composer.plan.text)
-                    .hint_text(TEXT_HINT)
-                    .desired_rows(4)
-                    .desired_width(f32::INFINITY),
-            );
+            theme::eyebrow(ui, TEXT_EYEBROW);
+            ui.add_space(theme::EYEBROW_GAP);
+            // `theme::text_area` and not `egui::TextEdit::multiline`, which
+            // is what stood here. The body is the one field on this card that
+            // the design system had no box for, so it was drawn as a bare
+            // multiline -- egui's frame, egui's radius, no focus halo -- and
+            // sat directly under a name field that was drawn the same bare
+            // way. Two boxes, two chromes, neither of them this app's. The
+            // fix is a primitive in `theme.rs`, not a private one here: that
+            // rule has already paid for itself twice on this screen.
+            ui.add_enabled_ui(enabled, |ui| {
+                theme::text_area(ui, &mut composer.plan.text, TEXT_HINT, BODY_ROWS);
+            });
 
-            ui.add_space(12.0);
+            ui.add_space(theme::BLOCK_GAP);
             // **Design §5a's ACCESS block, drawn by the one function that
             // draws it.**
             //
@@ -4081,49 +4206,75 @@ fn draw_composer(
                 now,
                 zone,
             );
+        });
 
-            ui.add_space(12.0);
-            let problem = composer_problem(composer, now);
-            let can_submit = composer_can_submit(problem, in_flight);
-            // **The footer's two answers are the design system's two
-            // buttons**, and until this pass they were neither.
+        let problem = composer_problem(composer, now);
+        let can_submit = composer_can_submit(problem, in_flight);
+        // **The footer's two answers are the design system's two
+        // buttons**, in the design's own footer BAND.
+        //
+        // §5a's composer ends in a filled blue `Create & copy link`
+        // beside an outlined white `Cancel`, on a tinted strip closed off
+        // from the body by a hairline -- a primary and a secondary, which
+        // is the whole of what a form footer says about which of its two
+        // answers is the one it is for. The buttons were fixed an earlier
+        // pass ago; the strip is new, and `theme::form_card_footer` argues
+        // why a row of buttons that is simply the last thing in the body
+        // is not a footer.
+        //
+        // **32 points and a 7px radius, not §5a's 34 and 8.** The design
+        // draws this card's buttons two points taller than every other
+        // action button in the app (3h's Continue, the detail pane's
+        // Save, "Fill in app"), all of which are `theme::BUTTON_HEIGHT`.
+        // `theme.rs` already refused to move those five to match one
+        // outlier and gave the outlier its own function instead
+        // (`primary_button_matching_field`, for 2b's `+ New`, which is
+        // 34/8 because it matches the *search box* it sits beside). There
+        // is no box beside this one to match: the Send composer's footer
+        // is an action footer like every other, so it takes the action
+        // footer's metrics rather than becoming the app's second
+        // almost-32.
+        theme::form_card_footer(ui, |ui| {
+            // **§5a's footer has ONE slot at its right-hand end, and three
+            // things in this app want it.** The design puts a standing note
+            // there (`Appears in Shared`); this form also has a sentence
+            // saying why the primary is off, and a word saying a publish is
+            // running. Until this pass the first did not exist, and the
+            // other two were loose `ui.label`s sitting after the buttons in
+            // the body -- prose at the end of a control row, which is what
+            // the owner saw as `Give the Send a name.` floating beside
+            // `Discard`.
             //
-            // Design §5a's composer ends in a filled blue `Create & copy
-            // link` beside an outlined white `Cancel` -- a primary and a
-            // secondary, which is the whole of what a form footer says about
-            // which of its two answers is the one it is for. What stood here
-            // was two bare `egui::Button`s that differed only in the colour
-            // of their *text*: same default fill, same default outline, same
-            // size, so the publish and the throw-away read as a matched pair
-            // and the user's eye had nothing to land on. `theme.rs` records
-            // this exact defect on the item form's Save --
-            // "the two footer buttons looked like they came from different
-            // families -- they did" -- and `primary_button_enabled` is the
-            // half of the design system that exists so a footer that needs
-            // `add_enabled` does not have to leave it.
-            //
-            // **32 points and a 7px radius, not §5a's 34 and 8.** The design
-            // draws this card's buttons two points taller than every other
-            // action button in the app (3h's Continue, the detail pane's
-            // Save, "Fill in app"), all of which are `theme::BUTTON_HEIGHT`.
-            // `theme.rs` already refused to move those five to match one
-            // outlier and gave the outlier its own function instead
-            // (`primary_button_matching_field`, for 2b's `+ New`, which is
-            // 34/8 because it matches the *search box* it sits beside). There
-            // is no box beside this one to match: the Send composer's footer
-            // is an action footer like every other, so it takes the action
-            // footer's metrics rather than becoming the app's second
-            // almost-32.
+            // They share the slot rather than stacking, and the order is
+            // the order of how much the reader needs each one. A publish in
+            // flight is the only thing worth saying while it runs. A
+            // refusal is a stronger claim on the slot than the standing
+            // note is: while the form cannot be submitted, "why not" is
+            // what the reader is looking for, and `APPEARS_IN_SENDS` is a
+            // fact about a Send that does not exist yet. Once the form is
+            // submittable there is no refusal to print, and the note is
+            // what is left to say. The three are never wanted together, so
+            // one slot is not a compromise.
+            let note = if in_flight {
+                CREATING_LABEL
+            } else {
+                problem.unwrap_or(APPEARS_IN_SENDS)
+            };
+            // **Beside the answers when it fits, on its own line when it
+            // does not**, measured rather than assumed; see
+            // `theme::form_footer_note_width` for why §5a's right-hand
+            // placement cannot simply be taken at the window floor.
+            let mut beside = false;
             ui.horizontal(|ui| {
-                if theme::primary_button_enabled(ui, CREATE_LABEL, None, can_submit).clicked() {
+                if theme::primary_button_enabled(ui, CREATE_LABEL, None, can_submit).clicked()
+                {
                     action = Some(SendUiAction::SubmitSend);
                 }
-                ui.add_space(BUTTON_GAP);
+                ui.add_space(theme::FORM_FOOTER_GAP);
                 // `add_enabled_ui` rather than `add_enabled`, because
                 // `secondary_button` is a `ui.add` with no enabled twin and
-                // the whole control -- fill, outline and label -- has to fade
-                // together. Same shape `primary_button_with_metrics` uses
-                // internally, for the same reason.
+                // the whole control -- fill, outline and label -- has to
+                // fade together.
                 if ui
                     .add_enabled_ui(enabled, |ui| theme::secondary_button(ui, DISCARD_LABEL))
                     .inner
@@ -4131,21 +4282,21 @@ fn draw_composer(
                 {
                     action = Some(SendUiAction::CancelComposer);
                 }
-                ui.add_space(BUTTON_GAP);
-                if in_flight {
-                    ui.label(
-                        egui::RichText::new(CREATING_LABEL)
-                            .size(12.0)
-                            .color(theme::TEXT_MUTED),
-                    );
-                } else if let Some(problem) = problem {
-                    // **The reason the button is grey, beside the button.** A
-                    // disabled control with no explanation is a control the
-                    // user reads as broken.
-                    ui.label(egui::RichText::new(problem).size(11.0).color(theme::TEXT_FAINT));
+                if theme::form_footer_note_width(ui, note) + theme::FORM_FOOTER_GAP
+                    <= ui.available_width()
+                {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        theme::form_footer_note(ui, note);
+                    });
+                    beside = true;
                 }
             });
+            if !beside {
+                ui.add_space(theme::FORM_FOOTER_GAP);
+                theme::form_footer_note(ui, note);
+            }
         });
+    });
     action
 }
 
@@ -5264,6 +5415,14 @@ mod paint_tests {
         /// control's chosen cell and a primary button are both "a rectangle
         /// somewhere behind a label" until the fill is read.
         fills: Vec<(egui::Rect, egui::Color32)>,
+        /// Each rectangle's **outline**, with the colour it was stroked in.
+        ///
+        /// `fills` cannot answer for the composer's card: `theme::form_card`
+        /// paints its edge as a separate transparent-filled `rect_stroke`
+        /// after the contents (see that function for why), so the card's
+        /// border arrives as a shape with no fill at all and would be
+        /// invisible to every assertion in this module.
+        strokes: Vec<(egui::Rect, egui::Color32)>,
     }
 
     impl Painted {
@@ -5362,6 +5521,7 @@ mod paint_tests {
             egui::Shape::Rect(rect) => {
                 out.rects.push(rect.rect);
                 out.fills.push((rect.rect, rect.fill));
+                out.strokes.push((rect.rect, rect.stroke.color));
             }
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
@@ -5461,7 +5621,43 @@ mod paint_tests {
         // assertion below is about the form's own internal geometry, which
         // this file already pins against the pane floor in
         // `every_row_of_the_lifetime_picker_fits_the_box`.
-        let size = egui::vec2(720.0 + crate::vault_window::LIST_WIDTH, 900.0);
+        paint_composer_at(composer, in_flight, ROOMY_COMPOSER_PANE)
+    }
+
+    /// The comfortable pane [`paint_composer`] draws in.
+    const ROOMY_COMPOSER_PANE: egui::Vec2 =
+        egui::vec2(720.0 + crate::vault_window::LIST_WIDTH, 900.0);
+
+    /// **The two panes every assertion about the composer's CARD is made
+    /// against**, named together so a test cannot quietly be written at one
+    /// of them.
+    ///
+    /// The first is [`ROOMY_COMPOSER_PANE`]; the second is the pane floor's
+    /// own width, where the detail column is 298 points and the card is 250.
+    /// That second number is the one this form has only ever been in danger
+    /// at -- §5a's Access block does not fit inside it at the design's own
+    /// measurements, which is why `access_label_width` exists -- and it is
+    /// this file's standing rule that every new paint test on this screen is
+    /// run at it.
+    ///
+    /// The narrow pane is made TALL rather than 600 high, and that is not a
+    /// cheat: egui culls shapes entirely outside the screen rect, so a form
+    /// longer than the window would come back as missing widgets rather than
+    /// as a scroll bar, and every assertion below would be measuring the top
+    /// of the card. The axis under test is the width.
+    fn composer_panes() -> [(&'static str, egui::Vec2); 2] {
+        [
+            ("the roomy pane", ROOMY_COMPOSER_PANE),
+            ("the window floor", egui::vec2(min_pane_size().x, 1600.0)),
+        ]
+    }
+
+    /// [`paint_composer`], in a pane of the caller's choosing.
+    fn paint_composer_at(
+        composer: &mut SendComposer,
+        in_flight: bool,
+        size: egui::Vec2,
+    ) -> Painted {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -5498,6 +5694,315 @@ mod paint_tests {
             painted.text
         );
         painted
+    }
+
+    /// A draft with **no name**, so the composer refuses to submit: the state
+    /// the owner screenshotted, and the one every assertion about the off
+    /// look and the refusal sentence is made in.
+    fn unfinished_composer() -> SendComposer {
+        let composer = SendComposer { open: true, ..SendComposer::default() };
+        assert!(
+            composer_problem(&composer, &FixedClock(NOW)).is_some(),
+            "the fixture wants a draft the form refuses, and this one is submittable"
+        );
+        composer
+    }
+
+    /// **The design-system BOX a label sits in**, and not whatever rectangle
+    /// happens to be smallest around it.
+    ///
+    /// [`Painted::control_under`] takes the smallest filled rect containing
+    /// the text, which is right for a button and wrong for a field: every box
+    /// in `theme.rs` puts a frameless `egui::TextEdit` inside itself, and a
+    /// frameless `TextEdit` still paints its own transparent frame at the
+    /// text's inset rect. That rect is smaller than the box and ten points to
+    /// the right of it, so a test written against `control_under` measures a
+    /// 15-point-tall field starting inside its own padding -- which is how
+    /// this pair of assertions failed the first time they were run against a
+    /// form that was in fact correct.
+    fn box_under(painted: &Painted, label: &str) -> egui::Rect {
+        let text = painted
+            .rect_of(label)
+            .unwrap_or_else(|| panic!("{label:?} was not painted at all: {:?}", painted.text));
+        let area = |r: &egui::Rect| r.width() * r.height();
+        painted
+            .fills
+            .iter()
+            .filter(|(rect, colour)| *colour == theme::CARD && rect.contains_rect(text))
+            .map(|(rect, _)| *rect)
+            .min_by(|a, b| area(a).total_cmp(&area(b)))
+            .unwrap_or_else(|| {
+                panic!("{label:?} is not inside any box this design system painted")
+            })
+    }
+
+    /// The bottom-most rectangle painted in `fill`, which for the composer's
+    /// footer band is the band: nothing else on the card is that colour, and
+    /// the modal frame's own tinted footer is not on this screen.
+    fn band_of(painted: &Painted, fill: egui::Color32) -> egui::Rect {
+        painted
+            .fills
+            .iter()
+            .filter(|(_, colour)| *colour == fill)
+            .map(|(rect, _)| *rect)
+            .max_by(|a, b| a.bottom().total_cmp(&b.bottom()))
+            .unwrap_or_else(|| panic!("nothing at all was painted in {fill:?}"))
+    }
+
+    /// **The composer is a CARD: an edge, a rounded corner and a footer band
+    /// -- not a form laid flat on the pane.**
+    ///
+    /// The defect this pins is the one the owner opened with. The form was
+    /// `Frame::new().fill(theme::CARD)` on `theme::CANVAS`, which is white on
+    /// a two-value-off grey with no border and no shadow, and its two answers
+    /// were simply the last widgets in the body. Design §5a draws a bordered,
+    /// rounded, shadowed card whose footer is a tinted strip closed off by a
+    /// hairline, and none of those four things was present.
+    ///
+    /// Asserted on the STROKE and not only on a fill, because that is what
+    /// the card's edge is: `theme::form_card` paints it last as a
+    /// transparent-filled outline, so a test that read fills alone would pass
+    /// against a card with no border at all -- which is exactly the state
+    /// being fixed.
+    #[test]
+    fn the_composer_is_a_card_with_an_edge_and_a_tinted_footer() {
+        for (where_, pane) in composer_panes() {
+            let painted = paint_composer_at(&mut open_composer(), false, pane);
+
+            let heading = painted
+                .rect_of(COMPOSER_HEADING)
+                .unwrap_or_else(|| panic!("{where_}: the heading was not painted"));
+            let edge = painted
+                .strokes
+                .iter()
+                .filter(|(rect, colour)| {
+                    *colour == theme::BORDER_STRONG && rect.contains_rect(heading)
+                })
+                .map(|(rect, _)| *rect)
+                .max_by(|a, b| {
+                    let area = |r: &egui::Rect| r.width() * r.height();
+                    area(a).total_cmp(&area(b))
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{where_}: nothing outlined in the design's card border encloses the \
+                         composer's heading -- the form is drawn flat on the pane, which is \
+                         the report this pass was opened over"
+                    )
+                });
+
+            let band = band_of(&painted, theme::CARD_TINT);
+            assert!(
+                edge.contains_rect(band),
+                "{where_}: the tinted footer band at {band:?} is not inside the card at \
+                 {edge:?}"
+            );
+            assert!(
+                (band.bottom() - edge.bottom()).abs() <= 1.5,
+                "{where_}: the footer band stops {}pt above the card's own bottom edge -- a \
+                 band that does not reach the corner is a stripe",
+                edge.bottom() - band.bottom()
+            );
+            assert!(
+                (band.width() - edge.width()).abs() <= 2.5,
+                "{where_}: the footer band is {}pt wide inside a {}pt card, so it reads as a \
+                 box in the footer rather than as the footer",
+                band.width(),
+                edge.width()
+            );
+
+            let create = painted
+                .rect_of(CREATE_LABEL)
+                .unwrap_or_else(|| panic!("{where_}: the submit was not painted"));
+            assert!(
+                band.contains_rect(create),
+                "{where_}: the submit is at {create:?}, outside the footer band at {band:?} \
+                 -- the answers are still the last things in the body"
+            );
+        }
+    }
+
+    /// **§5a's Access block is three questions whose answers start on one
+    /// vertical line, and for the whole life of this block they did not.**
+    ///
+    /// `access_row` reserved its label column with
+    /// `Ui::allocate_ui_with_layout`, which allocates what the child ended up
+    /// occupying rather than the size it was asked for -- so the "fixed" 96
+    /// points was in fact each label's own width, and `Expires`, `Views` and
+    /// `Open with` being three different widths stepped their three controls
+    /// rightwards down the card. It was in every screenshot ever taken of
+    /// either composer and no test could see it, because every assertion on
+    /// this block was about one row at a time.
+    ///
+    /// The floor pane is the half of this that matters most: 96 + 14 + 150 is
+    /// 260 against 226 of card, so the design's own column does not fit and
+    /// `access_label_width` narrows it. What must survive that is not the 96
+    /// -- it is the three agreeing.
+    #[test]
+    fn the_access_rows_start_their_controls_on_one_line() {
+        for (where_, pane) in composer_panes() {
+            let mut composer = open_composer();
+            let painted = paint_composer_at(&mut composer, false, pane);
+            let chosen = crate::send::lifetime_label(composer.plan.lifetime, &UTC);
+
+            let expires = box_under(&painted, &chosen);
+            let views = box_under(&painted, VIEWS_HINT);
+            let open_with = box_under(&painted, PASSWORD_HINT);
+
+            for (name, rect) in [("Views", views), ("Open with", open_with)] {
+                assert!(
+                    (rect.left() - expires.left()).abs() <= 1.0,
+                    "{where_}: the {name} control starts at {} against the Expires control's \
+                     {} -- §5a's Access block is a label column, and controls that step \
+                     rightwards are what having one prevents",
+                    rect.left(),
+                    expires.left()
+                );
+            }
+        }
+    }
+
+    /// **The footer's right-hand slot carries the refusal while there is one
+    /// and the standing note once there is not.**
+    ///
+    /// §5a ends its footer with a standing note (`Appears in Shared`); this
+    /// form had none, and instead left the sentence explaining the grey
+    /// button as loose prose after the buttons -- `Give the Send a name.`
+    /// floating beside `Discard`, which is what the owner saw. Both now go in
+    /// the one place §5a defines for a note about the card, and the order
+    /// between them is argued at the call site.
+    #[test]
+    fn the_footers_note_says_the_refusal_first_and_then_where_the_send_goes() {
+        for (where_, pane) in composer_panes() {
+            let mut unfinished = unfinished_composer();
+            let refusing = paint_composer_at(&mut unfinished, false, pane);
+            let problem = composer_problem(&unfinished, &FixedClock(NOW))
+                .expect("the fixture is a refusing draft");
+            assert!(
+                refusing.has(problem),
+                "{where_}: the form refuses to submit and does not say why: {:?}",
+                refusing.text
+            );
+            assert!(
+                !refusing.has(APPEARS_IN_SENDS),
+                "{where_}: the standing note is printed beside a refusal, so the footer says \
+                 two things at once in a slot that holds one"
+            );
+
+            let ready = paint_composer_at(&mut open_composer(), false, pane);
+            assert!(
+                ready.has(APPEARS_IN_SENDS),
+                "{where_}: a submittable draft's footer says nothing about where the Send \
+                 ends up -- §5a's standing note is the whole of what that slot is for: {:?}",
+                ready.text
+            );
+
+            let band = band_of(&ready, theme::CARD_TINT);
+            let note = ready
+                .rect_of(APPEARS_IN_SENDS)
+                .unwrap_or_else(|| panic!("{where_}: the note was not painted"));
+            assert!(
+                band.contains_rect(note),
+                "{where_}: the standing note at {note:?} is outside the footer band at \
+                 {band:?} -- it is prose after the card again"
+            );
+        }
+    }
+
+    /// **A `Create link` that cannot be pressed is not a pale blue one.**
+    ///
+    /// The owner's second report on this screenshot. `primary_button_enabled`
+    /// used to run its button inside a disabled `Ui`, which fades
+    /// `theme::BLUE` toward the window colour -- a washed-out version of the
+    /// live fill, which reads as the button rendered oddly rather than as an
+    /// action that is not available. The design system already had a
+    /// vocabulary for "switched off" one row up the same card
+    /// (`theme::disabled_text_field`), and this asserts the button now speaks
+    /// it: `theme::OFF_FILL`, not a blend of `BLUE`.
+    ///
+    /// The live case is asserted beside it, because "the disabled button is
+    /// grey" passes just as well on a form that has no live state at all.
+    #[test]
+    fn a_create_link_that_cannot_be_pressed_is_not_a_pale_blue_one() {
+        for (where_, pane) in composer_panes() {
+            let live = paint_composer_at(&mut open_composer(), false, pane);
+            let (_, on) = live.control_under(CREATE_LABEL);
+            assert_eq!(
+                on,
+                theme::BLUE,
+                "{where_}: a submittable composer's primary is not the design's blue"
+            );
+
+            let refusing = paint_composer_at(&mut unfinished_composer(), false, pane);
+            let (_, off) = refusing.control_under(CREATE_LABEL);
+            assert_eq!(
+                off,
+                theme::OFF_FILL,
+                "{where_}: the unpressable submit is painted {off:?} rather than the design \
+                 system's switched-off fill -- a wash of the live colour says \"this button, \
+                 dimmed\" where the user needs \"not a control right now\""
+            );
+            assert_ne!(
+                on, off,
+                "{where_}: the submit paints the same fill whether it can be pressed or not"
+            );
+        }
+    }
+
+    /// **Both of the composer's own inputs are the design system's boxes**,
+    /// under §5a's eyebrows.
+    ///
+    /// What they were: two bare `egui::TextEdit`s, one single-line and one
+    /// multi-line, wearing egui's frame and egui's radius on a card whose
+    /// every other control came from `theme.rs`. The owner's words were that
+    /// the fields are drawn as thin outlines. The name box is now
+    /// `theme::FIELD_HEIGHT` exactly -- the measurement every input box in
+    /// this app shares, live or greyed -- and the body is
+    /// `theme::text_area`'s taller one in the same treatment.
+    ///
+    /// The eyebrows are asserted here rather than in a test of their own
+    /// because they and the boxes are one decision: the blocks are §5a's
+    /// first two, and `draw_composer` argues why this form's two inputs are
+    /// eyebrowed at all.
+    #[test]
+    fn both_of_the_composers_inputs_are_the_design_systems_boxes() {
+        for (where_, pane) in composer_panes() {
+            let painted = paint_composer_at(&mut open_composer(), false, pane);
+
+            for eyebrow in [NAME_EYEBROW, TEXT_EYEBROW, ACCESS_EYEBROW] {
+                assert!(
+                    painted.has(eyebrow),
+                    "{where_}: the {eyebrow:?} eyebrow is not on the card, so the block above \
+                     the Access rows is the only one the card admits to having: {:?}",
+                    painted.text
+                );
+            }
+
+            let name = box_under(&painted, "SAP Production");
+            assert!(
+                (name.height() - theme::FIELD_HEIGHT).abs() <= 0.5,
+                "{where_}: the name field's box is {}pt tall against the design system's \
+                 {}pt -- it is not one of this app's fields",
+                name.height(),
+                theme::FIELD_HEIGHT
+            );
+
+            let body = box_under(&painted, "hunter2");
+            assert!(
+                body.height() > name.height(),
+                "{where_}: the body box is {}pt against the name's {}pt, so the paragraph \
+                 field is not taller than the one-line one",
+                body.height(),
+                name.height()
+            );
+            assert!(
+                (body.width() - name.width()).abs() <= 1.0,
+                "{where_}: the two boxes are {}pt and {}pt wide -- they are stacked on one \
+                 card and have to share an edge",
+                name.width(),
+                body.width()
+            );
+        }
     }
 
     /// An open composer with a valid draft, so the submit below is LIVE: a

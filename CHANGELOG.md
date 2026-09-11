@@ -78,6 +78,64 @@ a band that has already been allocated winds the layout cursor *backwards*, so
 the detail pane's body opened flush against the header's hairline with its own
 top margin applied from the wrong place.
 
+### Both Send composers are the same card, and the card is design 5a's
+
+Opening **New Send** on the Sends screen drew a heading, two thin outlined
+boxes, an `ACCESS` block, and two buttons with a grey sentence trailing after
+them -- all of it flat white on a screen that is also nearly white. Design 5a
+draws that form as a card: a border, a 12-point radius, a real drop shadow, a
+title band closed off by a hairline, and a tinted footer strip carrying the
+answers with a standing note at its right-hand end. None of those six things
+was on screen.
+
+The same was true of the **Send this record** card, which is the form design 5a
+was actually drawn for. The two composers had each written out their own
+four-line card frame in their own file, so they agreed with each other only by
+coincidence -- and the coincidence was that neither of them was 5a. They are
+now built by one set of functions in the design system, and a test on each card
+holds it there.
+
+What the pictures showed, and what changed:
+
+* **The form sat flat on the pane.** It is a card now, with 5a's border, radius
+  and shadow, and its three bands: the title over a hairline, the questions,
+  and a tinted footer.
+* **The inputs were drawn by egui and not by this app.** The name box, the body
+  box, the view-cap box, the share-password box and the record card's
+  passphrase box were all bare text editors wearing a default frame -- five
+  boxes in one family of forms, none of which matched the boxes on the item
+  form next door. They are the design system's field now, including a new
+  multi-line box for a Send's text, which the design system did not have.
+* **`Create link` was a pale blue when it could not be pressed.** A washed-out
+  version of the live colour reads as the button rendered oddly, not as an
+  action that is unavailable -- so people press it. A switched-off button now
+  looks the way a switched-off field on the same card already looked: grey
+  fill, grey outline, grey words. Every primary button in the app that can be
+  greyed moved with it.
+* **The hint saying why the button was grey was loose prose beside it.**
+  *"Give the Send a name."* sat after `Discard` like a caption nobody had found
+  a home for. 5a has a defined place for a note about the card -- the right-hand
+  end of the footer -- and that slot now carries the refusal while there is one
+  and *"Appears in Sends"* once there is not.
+* **5a's `ACCESS` block was three questions whose answers did not line up.**
+  The block reserves a fixed label column precisely so that `Expires`, `Views`
+  and `Open with` start their controls on one vertical line; the reservation
+  never worked, and the three controls stepped rightwards down the card. In
+  every screenshot ever taken of either composer. They line up now, at both
+  window sizes -- at the smallest window the design's own 96-point column does
+  not fit, so the column narrows to the widest of the three labels rather than
+  the three coming apart.
+* **The card had one section heading and three sections.** 5a's composer is
+  three blocks under three eyebrows; this one labelled only the last, which
+  made the top half read as preamble to the part that had been designed. The
+  name and the text are this form's equivalents of 5a's first two blocks -- what
+  the Send is called, and what travels -- and they are labelled as such.
+
+`cargo run --example ui_preview -- --sends` renders a seventh state: the
+composer at the smallest window the app allows, which is the only width its
+card has ever been in danger at. The record composer's own shot is taller, so
+the footer this pass added is in the picture rather than below it.
+
 ### A three-character secret is no longer accepted as a one-time code
 
 Typing `asd` into **Secret key or otpauth:// URI** was answered with a green
@@ -87,15 +145,59 @@ byte and seven bits of a byte that was never typed. There is no seed in there
 to decode, and a code saved from it would never have matched anything.
 
 Deskwarden now checks that the length of a secret is one that can decode at
-all, and when it cannot, the line under the field says so in its own words:
-the characters are fine, the count is not, and a length like that is always
-exactly one character away from one that works -- a character dropped, or a
-character copied twice, which is what happens when a seed is read off a card
-by eye.
+all, and when it cannot, the line under the field says so in one line: how
+many characters there are, and that a length like that is always exactly one
+character away from one that works -- a character dropped, or a character
+copied twice, which is what happens when a seed is read off a card by eye.
 
 Nothing has become stricter about secrets that are merely *short*. A
 four-character seed is still accepted, because how much seed is enough is the
 site's decision and not Deskwarden's.
+
+### The add-a-code card can be looked at, and the line under its field behaves
+
+The refusal above was correct and it arrived on screen as three wrapped lines
+of red prose lying across the box it was about. It shipped that way because
+**the add-a-code card was the one surface in this app nobody could render**:
+`examples/ui_preview.rs` can draw and self-screenshot the vault, the item
+list, the rail, the health screen, the Sends screen and several modals, and it
+could not draw this one at all. The only way to see the card was to open a
+vault, open an item, press Add code and type into the field.
+
+`cargo run --example ui_preview -- --totp` now writes seven states of it into
+`target/ui_preview_totp/`: design 6a's route picker, 6d with a seed accepted,
+6d refused, 6d carrying the longest refusal the parser can produce, 6c's
+scanned confirmation, the fused confirmation, and the whole card at the
+smallest window the app allows. `--all` walks them too. The worst-case shot
+picks its own fixture -- whichever refusal renders longest -- so a sentence
+reworded longer than today's moves the picture with it.
+
+What the pictures showed, and what changed:
+
+* **The refusals were written for a paragraph and drawn in a caption.** Design
+  6d draws one short line under the field. The length refusal was two hundred
+  and twenty characters and taught the reader base32's bit packing on the way
+  past; the unknown-parameter refusal was longer still. Both now name the
+  reason, point at the fix and stop -- *"3 characters cannot decode -- one is
+  missing, or one has been copied twice."* -- and a test renders every refusal
+  on the real card and fails any that takes more than two lines.
+* **The line under the field was painted ten points too high**, so it lay over
+  the box above it. This is the same design-system defect the Sends screen
+  turned up in the same week, reached by a different road: the field's text
+  editor is placed into an already-allocated band, and placing a control that
+  way winds the layout cursor *backwards*. With a one-line sentence it put the
+  green check on the box's bottom border; with a refusal long enough to wrap it
+  put red prose through it. The card says where the cursor belongs now, and a
+  test drives the field with a refusal deliberately longer than anything the
+  app ships so the next long sentence cannot bring it back.
+* **The card had no ✕.** Every dialog in this app closes from its corner, and
+  the pass that made that true reached the route picker and stopped: press the
+  corner on *Add a one-time code* and it closes, walk one step on to *Enter the
+  secret* and there was nothing there. The mark is in that corner now and does
+  exactly what Escape already did. The card that is up while a screen scan runs
+  still has none, deliberately: the capture window in front of it owns both the
+  keyboard and the screen, which is the same reason that card does not answer
+  Escape either.
 
 ### Typing a code by hand no longer reads your own typing back to you
 

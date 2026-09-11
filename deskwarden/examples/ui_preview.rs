@@ -20,6 +20,7 @@
 //! cargo run --example ui_preview -- --backend-choice --screenshot # the self-hosted backend choice
 //! cargo run --example ui_preview -- --vault --screenshot        # the Vault page, both clients
 //! cargo run --example ui_preview -- --sends --screenshot        # design 5b's Sends screen, six states
+//! cargo run --example ui_preview -- --totp --screenshot         # designs 6a/6c/6d, the add-a-code card, seven states
 //! cargo run --example ui_preview -- --all                 # EVERY surface below
 //! ```
 //!
@@ -28,6 +29,20 @@
 //! the whole screen at the app's minimum window size. It is a directory for
 //! the reason `--vault` and `--kinds` are -- the states are only worth
 //! looking at beside each other, and beside design 5b.
+//!
+//! `--totp` writes seven PNGs into `target/ui_preview_totp/`, and it exists
+//! because **the add-a-code modal could not be rendered here at all**. Every
+//! other surface in this file could be looked at without the app running;
+//! design 6d could only be reached by opening a vault, opening an item,
+//! pressing Add code and typing into the field -- so a refusal that wrapped
+//! to three lines and painted itself over the box above it shipped, and the
+//! only review anybody could give it was a screenshot taken by hand. The
+//! seven are 6a's picker, 6d typed and accepted, 6d refused (the reported
+//! `sdf`), 6d carrying the LONGEST refusal the parser can produce, 6c's
+//! scanned confirmation, the fused confirmation with non-default parameters,
+//! and the whole card at the app's minimum window size. A directory for
+//! `--sends`' reason: the line under the field is only reviewable beside the
+//! states either side of it.
 //!
 //! `--all` is what CI runs. It walks [`Surface`] in one process -- one
 //! `run_native`, resized between surfaces -- and writes a PNG per surface into
@@ -84,6 +99,7 @@ use deskwarden::vault_window::sidebar::{self, SidebarFilter};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
 use deskwarden::vault_window::rehearsal;
 use deskwarden::vault_window::send_ui::{self, SendComposer};
+use deskwarden::otpauth::OtpRefusal;
 use deskwarden::vault_window::totp_add::{self, TotpAdd};
 use deskwarden::{app_identity::AppIdentityCache, prefs_ui, scratch_window, theme};
 use eframe::egui::{self, Margin};
@@ -242,6 +258,57 @@ enum Surface {
     /// nothing of it is on that shot: a confirmation card is what happens
     /// AFTER a route has been chosen.
     TotpAddPicker,
+    /// **Design 6d as a user first meets it**: a bare base32 seed typed into
+    /// the field, the green check and *"Valid base32 · 16 characters · spaces
+    /// ignored"* under it, the two parameter runs live, and the live code
+    /// below.
+    ///
+    /// [`Surface::TotpAddConfirm`] is not this picture. It pastes a whole
+    /// URI, which takes the parameter controls out of the user's hands and
+    /// puts the card into its 8/60/SHA-256 state -- the case worth catching,
+    /// and not the case worth *looking* at. The by-hand route is the one 6d
+    /// draws and the one every number on that panel was measured from, so it
+    /// is the one that has to be laid beside it.
+    TotpAddTyped,
+    /// **The reported defect**: `sdf` in 6d's field.
+    ///
+    /// Three base32 characters are fifteen bits, which is not whole bytes, so
+    /// the parser refuses -- correctly -- and the card has to say so in the
+    /// one short line the design draws there. It said so in a three-line
+    /// paragraph painted over the box above it. This is the picture that
+    /// makes both halves of that reviewable, and the reason the seed is
+    /// spelled `sdf` rather than something tidier is that `sdf` is what the
+    /// owner typed.
+    TotpAddRefused,
+    /// **The LONGEST refusal the parser can produce**, which is this line's
+    /// worst case and therefore the only width test that means anything.
+    ///
+    /// A short sentence fits whatever the layout does with it, so a picture
+    /// of a short refusal reviews nothing: the defect above was invisible
+    /// until a sentence arrived that had to wrap. The fixture asserts its own
+    /// sentence is the longest [`totp_add::refusal_sentence`] renders (see
+    /// `Fixtures::new`), so a refusal reworded longer than this one moves the
+    /// picture with it instead of leaving it behind.
+    TotpAddRefusedLongest,
+    /// **Design 6c**: a payload a decoder read, confirmed rather than typed.
+    ///
+    /// The header's green check and *"Code read"*, the masked secret, the
+    /// four parameter chips and the field table -- none of which is on the
+    /// typed card, because a scanned URI must never be poured into a box
+    /// that paints what it holds. The two are one card a step apart and the
+    /// only way to see that they still read as one card is to look at them
+    /// side by side.
+    TotpAddScanned,
+    /// **The whole card at `settings::MIN_VAULT_WINDOW_SIZE`**, 900x600.
+    ///
+    /// The card is 470 wide at every window size -- that is
+    /// `stage_width(Stage::Manual)` and it does not move -- so what the floor
+    /// decides is the card's HEIGHT: `draw_add_form` measures its header,
+    /// its caution band and its footer against `content_rect().height()` and
+    /// gives the body whatever is left, which at 600 is the case where the
+    /// confirmation scrolls instead of growing. Drawn with the confirmation
+    /// up, because an empty field would fit any window and answer nothing.
+    TotpAddNarrow,
     /// The preferences window's Clipboard page, everything switched on --
     /// four live pills, the interval field, the always-on note and the reset
     /// button. The page 3e does not contain, so there is no drawing to
@@ -436,6 +503,18 @@ enum Surface {
     /// "something is missing", it is "the same pane reads differently", and
     /// only the pair shows that.
     SendsNarrow,
+    /// **The composer at `settings::MIN_VAULT_WINDOW_SIZE`**, which is the
+    /// only width its card has ever been in danger at.
+    ///
+    /// [`Surface::SendsComposer`] draws the form in a 590pt detail column,
+    /// where everything fits and nothing is learned. The form's real
+    /// constraint is the 298pt column -- 250 of card, and 214 inside the
+    /// card's own margins once §5a's padding is on it -- against a §5a
+    /// Access block whose label column alone is 96. A form that reads as
+    /// §5a's family at the comfortable width and elides half of itself at
+    /// the floor has not been fixed, it has been fixed in the picture
+    /// somebody looked at; this is the other picture.
+    SendsComposerNarrow,
     /// **The vault window's item list**, at the exact width the window gives
     /// it, with a card of every network this app can name in it.
     ///
@@ -681,6 +760,11 @@ const ALL: &[Surface] = &[
     Surface::RecordComposer,
     Surface::TotpAddConfirm,
     Surface::TotpAddPicker,
+    Surface::TotpAddTyped,
+    Surface::TotpAddRefused,
+    Surface::TotpAddRefusedLongest,
+    Surface::TotpAddScanned,
+    Surface::TotpAddNarrow,
     Surface::PrefsClipboard,
     Surface::PrefsClipboardOff,
     Surface::PrefsAbout,
@@ -718,6 +802,7 @@ const ALL: &[Surface] = &[
     Surface::SendsEmpty,
     Surface::SendsReceived,
     Surface::SendsNarrow,
+    Surface::SendsComposerNarrow,
     Surface::Rehearsal,
     Surface::VaultSetupSpinner,
     Surface::FirstWindowLoading,
@@ -751,6 +836,11 @@ impl Surface {
             Surface::RecordComposer => "record_composer",
             Surface::TotpAddConfirm => "totp_add_confirm",
             Surface::TotpAddPicker => "totp_add_picker",
+            Surface::TotpAddTyped => "totp_add_typed",
+            Surface::TotpAddRefused => "totp_add_refused",
+            Surface::TotpAddRefusedLongest => "totp_add_refused_longest",
+            Surface::TotpAddScanned => "totp_add_scanned",
+            Surface::TotpAddNarrow => "totp_add_narrow",
             Surface::PrefsClipboard => "prefs_clipboard",
             Surface::PrefsClipboardOff => "prefs_clipboard_off",
             // **Renamed from `prefs_about_*`, not merely re-pointed.** The
@@ -794,6 +884,7 @@ impl Surface {
             Surface::SendsEmpty => "sends_empty",
             Surface::SendsReceived => "sends_received",
             Surface::SendsNarrow => "sends_narrow",
+            Surface::SendsComposerNarrow => "sends_composer_narrow",
             Surface::Rehearsal => "rehearsal",
             Surface::VaultSetupSpinner => "vault_setup_spinner",
             Surface::FirstWindowLoading => "first_window_loading",
@@ -841,9 +932,19 @@ impl Surface {
             | Surface::CardDetail
             | Surface::CardDetailRevealed
             | Surface::DiscardConfirm
-            | Surface::RecordComposer
             | Surface::TotpAddConfirm
-            | Surface::TotpAddPicker => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
+            | Surface::TotpAddPicker
+            | Surface::TotpAddTyped
+            | Surface::TotpAddRefused
+            | Surface::TotpAddRefusedLongest
+            | Surface::TotpAddScanned => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
+            // **The shipped window's floor, not a pane's width.** The
+            // add-a-code card is a modal over the whole vault window rather
+            // than a pane inside it, and the number it reads is
+            // `content_rect().height()` -- so the surface that reviews it at
+            // the floor has to BE the floor, `settings::MIN_VAULT_WINDOW_SIZE`
+            // to the point. Spelled out for [`PANE_WIDTH`]'s reason.
+            Surface::TotpAddNarrow => egui::vec2(900.0, 600.0),
             // Taller than the shipped pane on purpose. A login carrying three
             // websites is a longer form than 740pt holds, and the shipped
             // pane's answer -- scroll it -- is right for the app and useless
@@ -856,6 +957,13 @@ impl Surface {
             // replaces did not. A taller preview would hide the very thing
             // being shown. The Add menu adds a wrapped chip row, so the open
             // state gets a little more room rather than a scroll bar.
+            // Taller than the shipped pane, for [`Surface::EditWebsites`]'s
+            // reason and with a sharper edge to it: this card grew a FOOTER
+            // BAND, and a footer is the one part of a form whose whole job is
+            // to be the last thing -- a screenshot that stops above it is a
+            // picture of the card with the reviewed part cropped off. At 740
+            // it did exactly that, through the pass that added the band.
+            Surface::RecordComposer => egui::vec2(PANE_WIDTH, 900.0),
             Surface::EditSparse => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
             Surface::EditSparseAdding => egui::vec2(PANE_WIDTH, 900.0),
             // The shipped window is 1000x780 with a 40px chrome bar on top;
@@ -926,7 +1034,9 @@ impl Surface {
             | Surface::SendsComposer
             | Surface::SendsEmpty
             | Surface::SendsReceived => egui::vec2(SENDS_WIDTH, PANE_HEIGHT),
-            Surface::SendsNarrow => egui::vec2(SENDS_NARROW_WIDTH, SENDS_NARROW_HEIGHT),
+            Surface::SendsNarrow | Surface::SendsComposerNarrow => {
+                egui::vec2(SENDS_NARROW_WIDTH, SENDS_NARROW_HEIGHT)
+            }
             // The viewport's own inner size, read off the module that builds
             // it -- so a window resized in the app is a preview resized with
             // it, rather than a picture of a layout nobody ships.
@@ -995,6 +1105,13 @@ fn main() -> eframe::Result {
     // flag for the six, exactly as `--vault` is one flag for a pair and
     // `--kinds` is one for a trio -- what is under review is the set.
     let sends = arg("--sends");
+    // Designs 6a, 6c and 6d -- the add-a-code card, which had NO preview at
+    // all until this flag and could only be looked at by running the app and
+    // typing into it. One flag for the seven states for `--sends`' reason,
+    // and more sharply than for any other set here: the line under the field
+    // is a refusal in one shot and an acceptance in the next, and whether it
+    // sits where the design puts it is a question about the pair.
+    let totp = arg("--totp");
 
     // `--all` walks the whole list; otherwise the single surface the flags
     // name, exactly as this example has always behaved.
@@ -1026,6 +1143,21 @@ fn main() -> eframe::Result {
             Surface::SendsEmpty,
             Surface::SendsReceived,
             Surface::SendsNarrow,
+            Surface::SendsComposerNarrow,
+        ]
+    } else if totp {
+        // 6a first, because it is the door; then 6d in the three states of
+        // its one line -- accepted, refused, and refused at its worst -- then
+        // 6c, then the fused confirmation, then the whole card at the floor.
+        // The order is the order a reviewer walks them in.
+        vec![
+            Surface::TotpAddPicker,
+            Surface::TotpAddTyped,
+            Surface::TotpAddRefused,
+            Surface::TotpAddRefusedLongest,
+            Surface::TotpAddScanned,
+            Surface::TotpAddConfirm,
+            Surface::TotpAddNarrow,
         ]
     } else {
         vec![Surface::LoginUnlock]
@@ -1086,6 +1218,9 @@ fn main() -> eframe::Result {
         // renders six states of one screen and the whole value of it is that
         // they can be laid out together.
         target_dir().join("ui_preview_sends")
+    } else if totp {
+        // A DIRECTORY, for the same reason: seven states of one card.
+        target_dir().join("ui_preview_totp")
     } else {
         target_dir().join("ui_preview_login.png")
     };
@@ -1100,7 +1235,7 @@ fn main() -> eframe::Result {
             Ok(Box::new(Preview {
                 queue,
                 at: 0,
-                directory: all || vault || kinds || sends,
+                directory: all || vault || kinds || sends || totp,
                 out,
                 form: LoginForm::default(),
                 // The app name a real 3c card would have been pre-filled with,
@@ -1377,6 +1512,15 @@ impl eframe::App for Preview {
             Surface::RecordComposer => self.draw_pane(root, PaneKind::Composer),
             Surface::TotpAddConfirm => self.draw_pane(root, PaneKind::TotpAdd),
             Surface::TotpAddPicker => self.draw_pane(root, PaneKind::TotpPicker),
+            Surface::TotpAddTyped => self.draw_pane(root, PaneKind::TotpForm(TotpShot::Typed)),
+            Surface::TotpAddRefused => {
+                self.draw_pane(root, PaneKind::TotpForm(TotpShot::Refused))
+            }
+            Surface::TotpAddRefusedLongest => {
+                self.draw_pane(root, PaneKind::TotpForm(TotpShot::RefusedLongest))
+            }
+            Surface::TotpAddScanned => self.draw_pane(root, PaneKind::TotpForm(TotpShot::Scanned)),
+            Surface::TotpAddNarrow => self.draw_pane(root, PaneKind::TotpForm(TotpShot::Narrow)),
             Surface::PrefsClipboard => self.draw_prefs(root, true),
             Surface::PrefsClipboardOff => self.draw_prefs(root, false),
             Surface::PrefsAbout => self.draw_prefs_about(root),
@@ -1418,7 +1562,8 @@ impl eframe::App for Preview {
             | Surface::SendsComposer
             | Surface::SendsEmpty
             | Surface::SendsReceived
-            | Surface::SendsNarrow => self.draw_sends(root, self.current()),
+            | Surface::SendsNarrow
+            | Surface::SendsComposerNarrow => self.draw_sends(root, self.current()),
             Surface::Rehearsal => self.draw_rehearsal(root),
             Surface::VaultSetupSpinner => self.draw_vault_setup_spinner(root),
             Surface::FirstWindowLoading
@@ -1483,6 +1628,30 @@ enum PaneKind {
     TotpAdd,
     /// Design 6a's picker, the front door onto the four routes.
     TotpPicker,
+    /// The same form in one of [`TotpShot`]'s states -- the five this
+    /// example added when it turned out design 6d could not be rendered
+    /// here at all.
+    TotpForm(TotpShot),
+}
+
+/// Which state of the add-a-code card `PaneKind::TotpForm` is drawing.
+///
+/// An enum rather than five `PaneKind` variants, for [`DetailShot`]'s reason:
+/// these are one surface in five states, and the thing under review is the
+/// difference between them.
+#[derive(Clone, Copy)]
+enum TotpShot {
+    /// A bare base32 seed, accepted -- `totp_add_typed`.
+    Typed,
+    /// The reported `sdf` -- `totp_add_refused`.
+    Refused,
+    /// The longest sentence [`totp_add::refusal_sentence`] can render --
+    /// `totp_add_refused_longest`.
+    RefusedLongest,
+    /// A decoded payload, confirmed rather than typed -- `totp_add_scanned`.
+    Scanned,
+    /// The accepted card again, in a 900x600 window -- `totp_add_narrow`.
+    Narrow,
 }
 
 /// Which fixture the read pane is drawn from, and in what reveal state.
@@ -2328,7 +2497,8 @@ impl Preview {
         // left standing put the composer on top of the surface drawn next --
         // which is exactly what the first run of this preview showed, and is
         // the same trap `draw_pane` records for `RevealState`.
-        let wants_composer = matches!(surface, Surface::SendsComposer);
+        let wants_composer =
+            matches!(surface, Surface::SendsComposer | Surface::SendsComposerNarrow);
         if wants_composer && self.sends_composer.plan.name.is_empty() {
             self.sends_composer.plan.name.push_str("Staging database");
             self.sends_composer
@@ -2370,7 +2540,14 @@ impl Preview {
         // on why one shared selection would let one picture decide another's.
         let selected: &mut Option<String> = match surface {
             Surface::SendsSelected | Surface::SendsComposer => &mut self.sends_selected,
-            Surface::SendsNarrow => &mut self.sends_narrow_selected,
+            // The narrow composer takes the narrow shot's own selection, for
+            // this field's stated reason: the composer covers the detail
+            // column, so what is picked decides only which LIST row is
+            // outlined behind it -- and borrowing the wide shot's field would
+            // let this picture move that one's.
+            Surface::SendsNarrow | Surface::SendsComposerNarrow => {
+                &mut self.sends_narrow_selected
+            }
             Surface::SendsReceived => &mut self.sends_received_selected,
             // `SendsList` and `SendsEmpty` are the pictures of a column with
             // nothing picked, so they are handed a selection that is None and
@@ -2534,6 +2711,22 @@ impl Preview {
                 PaneKind::TotpPicker => {
                     let _ = totp_add::draw_picker(ui, &mut fixtures.totp_picker);
                 }
+                // **One fixture per shot, never one fixture re-typed.** The
+                // `--all` walk shares a single `Fixtures`, so a state
+                // rewritten in place here would decide whichever surface
+                // happened to be drawn next -- the trap the read pane's
+                // `RevealState` comment records, and the one the Sends
+                // composer fell into.
+                PaneKind::TotpForm(shot) => {
+                    let state = match shot {
+                        TotpShot::Typed => &mut fixtures.totp_typed,
+                        TotpShot::Refused => &mut fixtures.totp_refused,
+                        TotpShot::RefusedLongest => &mut fixtures.totp_refused_longest,
+                        TotpShot::Scanned => &mut fixtures.totp_scanned,
+                        TotpShot::Narrow => &mut fixtures.totp_narrow,
+                    };
+                    let _ = totp_add::draw_add_form(ui, state, PREVIEW_UNIX);
+                }
             });
     }
 }
@@ -2566,6 +2759,18 @@ struct Fixtures {
     record: RecordDraft,
     totp_add: TotpAdd,
     totp_picker: TotpAdd,
+    /// 6d with a bare seed typed in -- see [`Surface::TotpAddTyped`].
+    totp_typed: TotpAdd,
+    /// 6d with the owner's `sdf` in it -- see [`Surface::TotpAddRefused`].
+    totp_refused: TotpAdd,
+    /// 6d with the longest refusal the parser renders -- see
+    /// [`Surface::TotpAddRefusedLongest`].
+    totp_refused_longest: TotpAdd,
+    /// 6c, a payload a decoder read -- see [`Surface::TotpAddScanned`].
+    totp_scanned: TotpAdd,
+    /// The accepted card again, drawn in a 900x600 window -- see
+    /// [`Surface::TotpAddNarrow`].
+    totp_narrow: TotpAdd,
     rehearsal: scratch_window::RehearsalView,
     rehearsal_arrived: String,
     /// The Password health screen's items -- see [`HEALTH_JSON`].
@@ -2655,6 +2860,107 @@ impl Fixtures {
         let mut totp_picker = TotpAdd::opening("preview", "Git Host \u{b7} anovak", true);
         totp_picker.refusal = Some(totp_add::PickerRefusal::NoCode(totp_add::CodeSource::Region));
 
+        // **Design 6d as the design itself draws it**: the panel's own seed,
+        // spaces and all, so the picture beside `#6d` differs from it in
+        // nothing but the rendering. Against an item with NO code, because
+        // the replace warning is `totp_add` above's half of this set and a
+        // caution band on every shot would push the line under the field --
+        // the thing these pictures exist for -- further down each one.
+        let mut totp_typed = TotpAdd::opening("preview", "Git Host \u{b7} anovak", false);
+        totp_typed.typed = zeroize::Zeroizing::new("JBSW Y3DP EHPK 3PXP".to_string());
+
+        // **The reported defect, spelled the way it was reported.**
+        let mut totp_refused = TotpAdd::opening("preview", "Git Host \u{b7} anovak", false);
+        totp_refused.typed = zeroize::Zeroizing::new("sdf".to_string());
+
+        // **The worst case the line under the field can be handed**, chosen
+        // here rather than written down.
+        //
+        // Every refusal the one field can be driven into is listed with the
+        // input that drives it there; the shot takes whichever renders the
+        // longest sentence. A refusal reworded longer than today's worst case
+        // therefore MOVES this picture instead of leaving it behind, which is
+        // the whole failure this surface exists to prevent: the three-line
+        // overlap shipped because no rendered state had a sentence long
+        // enough to wrap.
+        let drivable: Vec<(&str, OtpRefusal)> = vec![
+            ("https://example.com/login", OtpRefusal::NotOtpAuth),
+            (
+                "otpauth://hotp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&counter=1",
+                OtpRefusal::NotTotp,
+            ),
+            ("otpauth://totp/Git%20Host:anovak?issuer=Git%20Host", OtpRefusal::NoSecret),
+            ("not!base32", OtpRefusal::BadSecret),
+            ("sdf", OtpRefusal::PartialSecret(3)),
+            (
+                "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&image=icon.png",
+                OtpRefusal::UnknownParameter("image".to_string()),
+            ),
+            (
+                "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&period=0",
+                OtpRefusal::BadParameter("period"),
+            ),
+        ];
+        // Each input really produces the refusal it is filed under, so the
+        // choice below is over sentences this field can actually show rather
+        // than over a table somebody once wrote.
+        for (typed, expected) in &drivable {
+            let totp_add::Reading::Refused(actual) = totp_add::read_field(typed, 6, 30) else {
+                panic!("the preview's {expected:?} fixture is not refused at all: {typed}");
+            };
+            assert_eq!(&actual, expected, "{typed} no longer produces {expected:?}");
+        }
+        let (longest_input, longest_refusal) = drivable
+            .iter()
+            .max_by_key(|(_, refusal)| totp_add::refusal_sentence(refusal).chars().count())
+            .expect("the refusal table is not empty");
+        // And nothing OUTSIDE that table renders longer. `TooLong` is the
+        // one refusal no typed fixture here reaches -- it needs a URI past
+        // `otpauth::MAX_URI_LEN` -- so without this the table could silently
+        // stop covering the worst case.
+        let longest_rendered = totp_add::refusal_sentence(longest_refusal).chars().count();
+        for refusal in [
+            OtpRefusal::NotOtpAuth,
+            OtpRefusal::NotTotp,
+            OtpRefusal::NoSecret,
+            OtpRefusal::BadSecret,
+            OtpRefusal::PartialSecret(3),
+            OtpRefusal::UnknownParameter("image".to_string()),
+            OtpRefusal::BadParameter("period"),
+            OtpRefusal::TooLong,
+        ] {
+            let sentence = totp_add::refusal_sentence(&refusal);
+            assert!(
+                sentence.chars().count() <= longest_rendered,
+                "{refusal:?} renders {} characters, longer than anything the preview can \
+                 drive the field into ({longest_rendered}) -- the worst-case shot is no \
+                 longer the worst case",
+                sentence.chars().count()
+            );
+        }
+        let mut totp_refused_longest =
+            TotpAdd::opening("preview", "Git Host \u{b7} anovak", false);
+        totp_refused_longest.typed = zeroize::Zeroizing::new((*longest_input).to_string());
+
+        // **Design 6c**: a payload a decoder handed over, through the very
+        // call the region scan makes -- `accept_decoded` -- rather than by
+        // setting `scanned` beside `typed` here. Two fields that have to
+        // agree are two fields that come to disagree, and what this shot is
+        // for is the card that flag selects.
+        let mut totp_scanned = TotpAdd::opening("preview", "Git Host \u{b7} anovak", false);
+        totp_scanned.accept_decoded(zeroize::Zeroizing::new(
+            "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&issuer=Git%20Host\
+             &digits=8&period=60&algorithm=SHA256"
+                .to_string(),
+        ));
+
+        // **The tallest the card ever gets, in the shortest window it is ever
+        // drawn in**: an accepted seed (so the confirmation, the live code and
+        // the countdown are all on it) against an item that already has one
+        // (so the caution band is too), at 900x600.
+        let mut totp_narrow = TotpAdd::opening("preview", "Git Host \u{b7} anovak", true);
+        totp_narrow.typed = zeroize::Zeroizing::new("JBSW Y3DP EHPK 3PXP".to_string());
+
         Self {
             folders: vec![
                 Folder { id: "f-work".into(), name: "Work".into(), other: Default::default() },
@@ -2691,6 +2997,11 @@ impl Fixtures {
             record,
             totp_add,
             totp_picker,
+            totp_typed,
+            totp_refused,
+            totp_refused_longest,
+            totp_scanned,
+            totp_narrow,
             draft,
             websites_login,
             websites_draft,

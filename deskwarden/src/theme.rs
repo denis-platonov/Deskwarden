@@ -1791,12 +1791,10 @@ pub fn primary_button(ui: &mut Ui, label: &str, kbd: Option<&str>) -> Response {
 /// looked like they came from different families -- they did, and this is the
 /// missing half that lets Save come from this one.
 ///
-/// `enabled == false` runs the button inside a disabled `Ui`, so egui fades
-/// the whole control -- the explicit [`BLUE`] fill included -- toward the
-/// window colour. That fade is the only signal that the action is off, which
-/// is why `detail_edit`'s
-/// `the_disabled_save_button_does_not_look_enabled` asserts on the painted
-/// fill and not on anything structural.
+/// `enabled == false` paints [`OFF_FILL`] / [`OFF_EDGE`] / [`OFF_INK`] and
+/// senses nothing; see [`OFF_FILL`] for why that replaced a faded [`BLUE`].
+/// `detail_edit`'s `the_disabled_save_button_does_not_look_enabled` asserts
+/// on the painted fill, and is what holds the two apart.
 pub fn primary_button_enabled(
     ui: &mut Ui,
     label: &str,
@@ -1844,6 +1842,39 @@ pub fn destructive_button(ui: &mut Ui, label: &str) -> Response {
     )
 }
 
+/// **What any control in this design system looks like when it is switched
+/// off**, and the reason it is three constants rather than one.
+///
+/// `disabled_field_box` states the rule this obeys: greyed means fill, border
+/// and ink move TOGETHER -- [`CANVAS`] where [`CARD`] was, [`BORDER`] where
+/// [`BORDER_STRONG`] was, [`TEXT_GHOST`] where the body colour was -- because
+/// any one of them alone reads as a styling accident rather than as a control
+/// that cannot be pressed. The fields obeyed it and the buttons did not.
+///
+/// **What a disabled primary used to be, and why it was wrong.** It was
+/// [`BLUE`] run through egui's own `fade_out_to_color`, which is a linear
+/// blend of the enabled fill toward the window colour: a pale blue button.
+/// The owner's report on the Send composer named it exactly -- "`Create link`
+/// is a pale blue when disabled" -- and the complaint is not that the fade is
+/// subtle. It is that a washed-out version of the live colour says *"this is
+/// the button, dimmed"*, which reads as a rendering state rather than as a
+/// refusal; a user who cannot see why it is pale tries to press it. The three
+/// greys below say *"this is not a control right now"* in the vocabulary this
+/// app already uses for exactly that, one row up in the same form.
+///
+/// The disabled button also **senses nothing** rather than running inside a
+/// disabled `Ui`, and that is what makes the colours possible: a disabled
+/// `Ui` fades everything its painter touches, so an explicitly grey button
+/// drawn inside one would come out a paler grey still and the whole point
+/// would be lost. `Sense::hover()` is the same refusal by a different means
+/// -- no click reaches it, and `Response::clicked()` is `false` -- and it is
+/// what `disabled_text_field` already does for the same reason.
+pub const OFF_FILL: Color32 = CANVAS;
+/// See [`OFF_FILL`].
+pub const OFF_EDGE: Color32 = BORDER;
+/// See [`OFF_FILL`].
+pub const OFF_INK: Color32 = TEXT_GHOST;
+
 fn primary_button_with_metrics(
     ui: &mut Ui,
     label: &str,
@@ -1860,31 +1891,33 @@ fn primary_button_with_metrics(
         Some(k) => format!("{label}  {k}"),
         None => label.to_string(),
     };
-    // `add_enabled_ui` and not `add_enabled`, so the arrow below is drawn by
-    // the SAME faded painter as the button it sits inside. `add_enabled`
-    // returns to the parent `Ui` before this function paints the glyph, which
-    // would leave a full-opacity ↵ on a greyed-out button.
-    ui.add_enabled_ui(enabled, |ui| {
-        let response = ui.add(
-            egui::Button::new(semibold(text, 13.0).color(Color32::WHITE))
-                .fill(BLUE)
-                .stroke(Stroke::NONE)
-                .corner_radius(CornerRadius::same(radius))
-                // The design's action buttons are 32px tall (3h Continue, 2b/3f
-                // toolbar); text + padding alone comes up short.
-                .min_size(Vec2::new(0.0, height)),
+    // The switched-off look is painted at FULL strength and sensed as a
+    // hover, rather than run through a disabled `Ui`; see [`OFF_FILL`] for
+    // why the fade had to go and why removing the sense is what replaces it.
+    let (ink, fill, edge, sense) = if enabled {
+        (Color32::WHITE, BLUE, Stroke::NONE, Sense::click())
+    } else {
+        (OFF_INK, OFF_FILL, Stroke::new(1.0, OFF_EDGE), Sense::hover())
+    };
+    let response = ui.add(
+        egui::Button::new(semibold(text, 13.0).color(ink))
+            .fill(fill)
+            .stroke(edge)
+            .sense(sense)
+            .corner_radius(CornerRadius::same(radius))
+            // The design's action buttons are 32px tall (3h Continue, 2b/3f
+            // toolbar); text + padding alone comes up short.
+            .min_size(Vec2::new(0.0, height)),
+    );
+    if paint_return {
+        paint_return_arrow(
+            ui.painter(),
+            Pos2::new(response.rect.right() - 17.0, response.rect.center().y),
+            RETURN_GLYPH_SIZE,
+            if enabled { Color32::from_white_alpha(204) } else { OFF_INK },
         );
-        if paint_return {
-            paint_return_arrow(
-                ui.painter(),
-                Pos2::new(response.rect.right() - 17.0, response.rect.center().y),
-                RETURN_GLYPH_SIZE,
-                Color32::from_white_alpha(204),
-            );
-        }
-        response
-    })
-    .inner
+    }
+    response
 }
 
 /// Extent of the drawn ↵ glyph. The design sets it in 10px monospace beside
@@ -5244,7 +5277,146 @@ pub const FIELD_HEIGHT: f32 = 38.0;
 /// egui's default widget styling gives a focused field a plain border color
 /// change, not this soft ring, so it's painted explicitly here.
 pub fn text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
-    field_box(ui, value, password, 10.0).0
+    field_box(ui, value, FieldShape { password, ..FieldShape::wide(ui) }).0
+}
+
+/// [`text_field`] **with a placeholder in it**.
+///
+/// It exists because the two Send composers needed one and there was none, so
+/// both had reached for a bare `egui::TextEdit::singleline(..).hint_text(..)`
+/// instead -- which is a different control: egui's own frame, egui's own
+/// radius, egui's own one-line height, and none of the focus halo. Put beside
+/// this design system's boxes on the same card, the difference is what the
+/// owner reported as "the inputs are bare outlines"; put beside the vault's
+/// item form, it is two spellings of "a field" in one app.
+///
+/// A separate function rather than a `hint` parameter on [`text_field`]
+/// because [`text_field`]'s own callers have nothing to put in one -- every
+/// field on the item form carries a [`field_label`] above it, which is where
+/// that form says what a box is for.
+/// `password` masks what is typed, the way [`text_field`]'s own flag does --
+/// `record_ui`'s seed passphrase is a hinted field AND a secret, and a second
+/// function for that one difference would be the third spelling of this box.
+pub fn hinted_field(ui: &mut Ui, value: &mut String, hint: &str, password: bool) -> Response {
+    field_box(ui, value, FieldShape { hint, password, ..FieldShape::wide(ui) }).0
+}
+
+/// A field **in a row beside its label**, at [`BUTTON_HEIGHT`] rather than
+/// [`FIELD_HEIGHT`], and as wide as the caller asks.
+///
+/// §5a's Access rows are the reason for both departures. Their boxes are the
+/// design's own `height: 30px` inside a 1px border -- 32 read as a border-box,
+/// which is [`BUTTON_HEIGHT`] exactly -- and one of them (the view cap) is a
+/// two-digit number in a 60-point box rather than a full-width line. A row of
+/// 38-point boxes would be a row of form fields laid sideways; these are the
+/// small controls a settings row carries.
+///
+/// `width` is taken and not measured from the `Ui`, because these sit inside
+/// a horizontal layout where `available_width` is the rest of the row.
+pub fn inline_field(
+    ui: &mut Ui,
+    value: &mut String,
+    hint: &str,
+    width: f32,
+    password: bool,
+) -> Response {
+    field_box(
+        ui,
+        value,
+        FieldShape { hint, password, width, height: BUTTON_HEIGHT, right_pad: 10.0 },
+    )
+    .0
+}
+
+/// How tall one row of a [`text_area`] is, laid out rather than guessed.
+fn text_area_row(ui: &Ui) -> f32 {
+    let font = FontId::new(14.0, FontFamily::Proportional);
+    ui.ctx().fonts_mut(|f| f.row_height(&font))
+}
+
+/// The padding a [`text_area`] keeps above and below its text.
+///
+/// [`FIELD_HEIGHT`]'s own: a 38-point box round a ~19-point row leaves 9.5
+/// either side, and a multi-line box whose first line sat at a different
+/// inset from the single-line box above it would read as a different control
+/// rather than as a taller one.
+const TEXT_AREA_PAD_Y: f32 = 9.0;
+
+/// **A multi-line box in [`text_field`]'s treatment**: the same fill, the same
+/// border, the same radius and the same focus halo, `rows` text rows tall.
+///
+/// The one field on either Send composer that [`text_field`] could not
+/// already have been: the text a Send carries is a paragraph, and until this
+/// existed the composer drew it as a bare `egui::TextEdit::multiline`. That
+/// left the two boxes stacked on one card -- a name and the body under it --
+/// wearing two different chromes, which is the single most visible thing in
+/// the screenshot this pass was opened over.
+///
+/// It is here rather than in `send_ui` for this module's standing rule: a
+/// control drawn privately on one screen is a second design system, and this
+/// one is a *variant of a control this file already owns*, which is the
+/// strongest case of all for it living beside its sibling.
+pub fn text_area(ui: &mut Ui, value: &mut String, hint: &str, rows: usize) -> Response {
+    let bg = ui.painter().add(egui::Shape::Noop);
+    let row_height = text_area_row(ui);
+    let height = row_height * rows as f32 + TEXT_AREA_PAD_Y * 2.0;
+    let (outer, _) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), height),
+        Sense::hover(),
+    );
+    let inner = Rect::from_min_max(
+        Pos2::new(outer.min.x + 10.0, outer.min.y + TEXT_AREA_PAD_Y),
+        Pos2::new(outer.max.x - 10.0, outer.max.y - TEXT_AREA_PAD_Y),
+    );
+    let response = ui.put(
+        inner,
+        egui::TextEdit::multiline(value)
+            .hint_text(hint)
+            .frame(egui::Frame::new())
+            .font(FontId::new(14.0, FontFamily::Proportional))
+            .margin(Margin::ZERO)
+            .desired_width(inner.width())
+            .desired_rows(rows),
+    );
+    let border = field_border(ui, outer, response.has_focus());
+    ui.painter().set(
+        bg,
+        egui::epaint::RectShape::new(
+            outer,
+            CornerRadius::same(FIELD_RADIUS),
+            CARD,
+            border,
+            StrokeKind::Middle,
+        ),
+    );
+    response
+}
+
+/// The design's input-box radius, shared by [`text_field`], [`text_area`] and
+/// [`inline_field`] so a box cannot change shape by changing height.
+const FIELD_RADIUS: u8 = 8;
+
+/// The border a field box wears, **and the focus halo painted round it**.
+///
+/// Split out of [`field_box`] when [`text_area`] became the second control
+/// that needed it: the ring is `box-shadow: 0 0 0 3px #dbe4f7` in the design
+/// and is drawn OUTSIDE the box, so it has to go on the painter directly
+/// while the border goes into the reserved shape behind the text. Two callers
+/// spelling that pair out twice is how one of them ends up with a ring and
+/// the other with a blue line.
+fn field_border(ui: &Ui, outer: Rect, focused: bool) -> Stroke {
+    if !focused {
+        return Stroke::new(1.0, BORDER_STRONG);
+    }
+    // expand(2.0) with a 3px stroke covers 0.5..3.5px outside the rect:
+    // flush against the 1px border's outer edge, like the mock's box-shadow.
+    ui.painter().rect_stroke(
+        outer.expand(2.0),
+        CornerRadius::same(FIELD_RADIUS),
+        Stroke::new(3.0, FOCUS_RING),
+        StrokeKind::Middle,
+    );
+    Stroke::new(1.0, BLUE)
 }
 
 /// A password field with the design's in-field "Show"/"Hide" reveal toggle
@@ -5252,7 +5424,8 @@ pub fn text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
 /// `revealed` is the caller's persistent toggle state.
 pub fn password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> Response {
     // The wide right inset keeps typed text from running under the toggle.
-    let (response, box_rect) = field_box(ui, value, !*revealed, 52.0);
+    let (response, box_rect) =
+        field_box(ui, value, FieldShape { password: !*revealed, right_pad: 52.0, ..FieldShape::wide(ui) });
 
     // 3h's in-field reveal: a click-sensing label, not a Button, so no
     // padding or fill fights the field it sits inside.
@@ -5389,21 +5562,56 @@ fn disabled_field_box(ui: &mut Ui, text: &str, right_pad: f32) -> Rect {
     outer
 }
 
-/// Allocates the design's full 38px input box, places a frameless `TextEdit`
-/// inside it (10px left inset, `right_pad` right inset), and paints the box:
-/// 1px border at rest, blue border with a flush 3px `FOCUS_RING` halo when
-/// focused — a treatment egui's own `TextEdit` frame can't produce.
+/// What [`field_box`] is being asked for, named rather than positional.
+///
+/// Five arguments, of which three are numbers of the same type, is how a box
+/// ends up 32 wide and 60 tall at one call site; [`Segment`] and
+/// `send_ui::AccessControls` are here for the same reason. [`Self::wide`] is
+/// the full-width 38-point box the item form has always drawn, so the
+/// original callers read as they did.
+struct FieldShape<'a> {
+    /// The placeholder, or `""` for a box whose label sits above it.
+    hint: &'a str,
+    /// Whether the typed value is masked.
+    password: bool,
+    /// The box's outer width.
+    width: f32,
+    /// The box's outer height.
+    height: f32,
+    /// How much room to leave at the right for an in-field affordance.
+    right_pad: f32,
+}
+
+impl<'a> FieldShape<'a> {
+    /// The design's full-width form field: [`FIELD_HEIGHT`], no placeholder,
+    /// the plain 10-point right inset.
+    fn wide(ui: &Ui) -> Self {
+        Self {
+            hint: "",
+            password: false,
+            width: ui.available_width(),
+            height: FIELD_HEIGHT,
+            right_pad: 10.0,
+        }
+    }
+}
+
+/// Allocates one of the design's input boxes, places a frameless `TextEdit`
+/// inside it (10px left inset, `shape.right_pad` right inset), and paints the
+/// box: 1px border at rest, blue border with a flush 3px `FOCUS_RING` halo
+/// when focused — a treatment egui's own `TextEdit` frame can't produce.
 ///
 /// The *box* is what gets allocated, not the text row: a frameless TextEdit
 /// only allocates its text height, and painting a 38px box around a 16px
 /// allocation made the box overlap the label above and shift left of its
 /// right inset (asymmetric padding). Returns the response and the box rect
 /// (for in-field affordances like the reveal toggle).
-fn field_box(ui: &mut Ui, value: &mut String, password: bool, right_pad: f32) -> (Response, Rect) {
+fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Response, Rect) {
     // Placeholder so the box paints *under* the text egui draws in ui.put.
     let bg = ui.painter().add(egui::Shape::Noop);
+    let right_pad = shape.right_pad;
     let (outer, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), FIELD_HEIGHT),
+        Vec2::new(shape.width, shape.height),
         Sense::hover(),
     );
     // The TextEdit gets a rect of exactly its row height, centered in the
@@ -5427,32 +5635,24 @@ fn field_box(ui: &mut Ui, value: &mut String, password: bool, right_pad: f32) ->
     let response = ui.put(
         inner,
         egui::TextEdit::singleline(value)
-            .password(password)
+            .hint_text(shape.hint)
+            .password(shape.password)
             .frame(egui::Frame::new())
             .font(font)
             .margin(Margin::ZERO)
             .desired_width(inner.width()),
     );
 
-    let rounding = CornerRadius::same(8);
-    let border = if response.has_focus() {
-        // expand(2.0) with a 3px stroke covers 0.5..3.5px outside the rect:
-        // flush against the 1px border's outer edge, like the mock's
-        // box-shadow -- expand(3.0) would leave a visible white ring between
-        // border and halo.
-        ui.painter().rect_stroke(
-            outer.expand(2.0),
-            rounding,
-            Stroke::new(3.0, FOCUS_RING),
-            StrokeKind::Middle,
-        );
-        Stroke::new(1.0, BLUE)
-    } else {
-        Stroke::new(1.0, BORDER_STRONG)
-    };
+    let border = field_border(ui, outer, response.has_focus());
     ui.painter().set(
         bg,
-        egui::epaint::RectShape::new(outer, rounding, CARD, border, StrokeKind::Middle),
+        egui::epaint::RectShape::new(
+            outer,
+            CornerRadius::same(FIELD_RADIUS),
+            CARD,
+            border,
+            StrokeKind::Middle,
+        ),
     );
     (response, outer)
 }
@@ -5521,6 +5721,239 @@ pub fn row_rule(ui: &mut Ui) {
 fn rule(ui: &mut Ui, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::ZERO, color);
+}
+
+// ---------------------------------------------------------------------------
+// The form card -- design §5a
+// ---------------------------------------------------------------------------
+//
+// **§5a is a card in three bands, and until this existed neither of the two
+// composers that draw it had any of the three.** The design's composer is
+// `background #ffffff; border: 1px solid #d7d3d3; border-radius: 12px;
+// box-shadow: 0 14px 34px rgba(45,43,43,0.18); overflow: hidden`, and inside
+// that a header strip closed by a `#eae7e7` rule, a padded body, and a
+// `#fbfaf9` footer opened by the same rule and carrying the two answers with
+// a standing note pushed to the right.
+//
+// What the app drew instead, on BOTH composers, was `Frame::new().fill(CARD)
+// .corner_radius(8).inner_margin(12)` -- white on white, no edge, no shadow,
+// no bands -- with the buttons and a floating sentence simply the last things
+// in the body. On the Sends screen that card sits on `theme::CANVAS` inside
+// the detail column, so the only thing separating "the form" from "the pane"
+// was a two-value difference in grey. The owner's word for it was that the
+// composer "sits flat".
+//
+// It is one set of functions and not a card each, because the two composers
+// differing from each other is the same defect one level up: the Sends
+// screen's text composer and `record_ui`'s record composer are the same card
+// with different middles, and a user who has seen one must not be able to
+// tell they were drawn by different hands. That is the standing rule this
+// module exists for and it has already been paid for twice on this screen --
+// once for the footer buttons, once for the Access block.
+
+/// §5a's `border-radius: 12px`.
+///
+/// Four points more than the 8 the two composers used, and the difference is
+/// deliberate rather than incidental: 8 is this app's CONTROL radius (every
+/// button, every field box), and a card drawn at its buttons' radius reads as
+/// a big button. `MODAL_RADIUS`'s 10 is the same argument one step down.
+pub const FORM_CARD_RADIUS: u8 = 12;
+
+/// §5a's `box-shadow: 0 14px 34px rgba(45, 43, 43, 0.18)`.
+///
+/// `0.18` of 255 is 46, which is `MODAL_SHADOW`'s alpha exactly -- the same
+/// ink, thrown further. It is what makes the card a thing laid ON the pane
+/// rather than a region of it, and it is the one part of §5a's chrome that no
+/// amount of border weight substitutes for.
+pub const FORM_CARD_SHADOW: Shadow = Shadow {
+    offset: [0, 14],
+    blur: 34,
+    spread: 0,
+    color: Color32::from_rgba_unmultiplied_const(45, 43, 43, 46),
+};
+
+/// The card's horizontal padding: **12, and NOT §5a's 18.**
+///
+/// This is the one measurement on the card that is deliberately not the
+/// design's, and the departure is argued here because it is where it is made.
+///
+/// §5a is drawn as a free-standing 690-point card, where 18 points a side is
+/// 5% of the width. This card lives in the Sends screen's DETAIL COLUMN,
+/// which is 298 points at `settings::MIN_VAULT_WINDOW_SIZE` -- 250 of card
+/// once the column's own 24-point margins are off it. At that width 18 a side
+/// is 14% of the card, and it comes out of the one block that cannot spare
+/// it: §5a's Access rows are a 96-point label column plus a 14-point gap plus
+/// a control, and every point of padding is a point that block has to give
+/// back. 12 is what both composers already used, it is what `record_ui`'s
+/// 360-point export modal was measured against, and it is the number
+/// `send_ui::EXPIRY_FIELD_WIDTH`'s own doc does the arithmetic with.
+pub const FORM_CARD_PAD_X: i8 = 12;
+
+/// The card's vertical band padding. §5a runs 15 / 16 / 13 down its three
+/// bands; this is one number for all three, because three near-identical
+/// paddings is three chances to disagree and the difference between them is
+/// not visible at any width this card is drawn at.
+pub const FORM_CARD_PAD_Y: i8 = 12;
+
+/// How tall [`form_card_header`] is, for a caller that has to reserve the
+/// strip before drawing it -- `record_ui`'s modal drag handle is the one.
+///
+/// [`FORM_CARD_PAD_Y`] either side of the 14px heading's ~18-point line, plus
+/// the rule that closes the band. Stated rather than measured because the
+/// handle is laid down BEFORE the header is drawn; a handle that had to wait
+/// for the band's rect would be a handle laid over the band's contents.
+pub const FORM_CARD_HEADER_HEIGHT: f32 = FORM_CARD_PAD_Y as f32 * 2.0 + 18.0 + 1.0;
+
+/// The gap between the footer's two answers. §5a's `gap: 9px`, rounded to the
+/// 8 this app's other footers use.
+pub const FORM_FOOTER_GAP: f32 = 8.0;
+
+/// The gap between an [`eyebrow`] and the block it names. §5a's `gap: 8px`,
+/// drawn at the 6 both composers were already using -- the eyebrow's own line
+/// box carries a couple of points of air that the design's `div` does not.
+pub const EYEBROW_GAP: f32 = 6.0;
+
+/// The gap between one eyebrowed block and the next. §5a's `gap: 16px` on the
+/// card body, at the 12 both composers were already using.
+///
+/// Named here rather than left as a literal at six call sites because it is
+/// the rhythm that makes two forms look like one form: the composers each
+/// spelled it out in their own file, and the moment one of them wanted a
+/// little more room somewhere the two would have stopped matching with
+/// nothing failing to compile.
+pub const BLOCK_GAP: f32 = 12.0;
+
+/// §5a's card: white, edged, rounded and **shadowed**, with no padding of its
+/// own -- the three band helpers below pad themselves, because a band has to
+/// reach the card's edge to be a band.
+///
+/// Answers with the card's rectangle, which is what `record_ui` hangs its
+/// dismiss ✕ on.
+///
+/// **The border is painted AFTER the contents**, which is not how
+/// `egui::Frame` does it and is the reason this is a function. A `Frame` sets
+/// its fill and stroke into a shape index reserved before the body, so
+/// anything the body paints edge-to-edge -- which the footer band, by
+/// definition, does -- lands on top of the stroke and eats it on three sides.
+/// Painting the ring last costs one extra shape and removes the whole class
+/// of fixes where a band is inset by a point to let a border show through.
+pub fn form_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> (Rect, R) {
+    let framed = egui::Frame::new()
+        .fill(CARD)
+        .corner_radius(CornerRadius::same(FORM_CARD_RADIUS))
+        .shadow(FORM_CARD_SHADOW)
+        .show(ui, add);
+    let rect = framed.response.rect;
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(FORM_CARD_RADIUS),
+        Stroke::new(1.0, BORDER_STRONG),
+        StrokeKind::Inside,
+    );
+    (rect, framed.inner)
+}
+
+/// The card's first band: the form's name, and the [`HAIRLINE`] that closes
+/// the band off from the body.
+///
+/// Answers with the rectangle the heading's own glyphs occupy -- the line
+/// `modal_corner_mark_gated` hangs a dismiss ✕ level with.
+///
+/// 14 points and `strong`, which is this app's card-heading size everywhere
+/// else and is one point under §5a's `15px/800`. The design page sets this
+/// card's title a point larger than its other cards' and there is no reason
+/// in the app for the Send composer's heading to be the one heading that is
+/// bigger than the rest.
+pub fn form_card_header(ui: &mut Ui, title: &str) -> Rect {
+    let line = egui::Frame::new()
+        .inner_margin(Margin::symmetric(FORM_CARD_PAD_X, FORM_CARD_PAD_Y))
+        .show(ui, |ui| {
+            ui.label(RichText::new(title).size(14.0).color(INK).strong()).rect
+        })
+        .inner;
+    hairline(ui);
+    line
+}
+
+/// The card's middle band: everything the form is actually asking, at the
+/// card's padding.
+pub fn form_card_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(FORM_CARD_PAD_X, FORM_CARD_PAD_Y))
+        .show(ui, add)
+        .inner
+}
+
+/// The card's last band: a [`HAIRLINE`], then [`CARD_TINT`] out to the card's
+/// three edges with the bottom corners rounded to match it.
+///
+/// The tint and the rule above it are the send preflight's own footer and the
+/// modal frame's, reproduced rather than reinvented -- §5a's `#fbfaf9` IS
+/// [`CARD_TINT`], and `modal_footer_band` already draws this pair.
+///
+/// **Why the band exists at all**, since the buttons would sit in the same
+/// place without it: a footer is the card saying "the questions are over,
+/// here are the answers", and a row of buttons that is simply the last thing
+/// in the body says only "here are two more controls". On the Sends composer
+/// the body ends in the Access block's own last row, which is a label, a box
+/// and a note -- and the un-banded footer put a blue button, a white button
+/// and a grey sentence on the line directly below it, in the same rhythm. The
+/// band is what tells the eye the form has ended.
+pub fn form_card_footer<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    hairline(ui);
+    // Reserved before the contents so the tint paints behind them, and filled
+    // in once their rect is known: `Frame`'s own idiom, used directly because
+    // a `Frame`'s fill is confined to the rect layout gives it and this one
+    // has to reach the card's rounded bottom corners.
+    let band = ui.painter().add(egui::Shape::Noop);
+    let laid_out = egui::Frame::new()
+        .inner_margin(Margin::symmetric(FORM_CARD_PAD_X, FORM_CARD_PAD_Y))
+        .show(ui, add);
+    let rect = laid_out.response.rect;
+    ui.painter().set(
+        band,
+        egui::epaint::RectShape::filled(
+            rect,
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: FORM_CARD_RADIUS,
+                se: FORM_CARD_RADIUS,
+            },
+            CARD_TINT,
+        ),
+    );
+    laid_out.inner
+}
+
+/// The footer's standing note: §5a's `Appears in Shared`, in §5a's own
+/// treatment -- 12px in [`TEXT_GHOST`], pushed to the right of the answers.
+///
+/// It is a function rather than a `ui.label` at two call sites for the reason
+/// [`eyebrow`] is one: two forms spelling out the same size and the same grey
+/// is how they end up a point apart.
+pub fn form_footer_note(ui: &mut Ui, text: &str) {
+    ui.label(RichText::new(text).size(12.0).color(TEXT_GHOST));
+}
+
+/// How wide [`form_footer_note`] would paint `text`, so a footer can decide
+/// whether the note fits beside the answers or belongs on its own line.
+///
+/// §5a puts the note on the buttons' line because §5a's card is 690 points
+/// wide. This one is 250 at the window floor, where two answers alone take
+/// most of the row -- and a note elided to `Appears in Sen…` is worse than no
+/// note, because it says nothing AND looks broken. Measuring is what lets one
+/// footer be §5a's at the width §5a was drawn for and still be readable at
+/// the width this app can actually be dragged to.
+pub fn form_footer_note_width(ui: &Ui, text: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            text.to_string(),
+            FontId::new(12.0, FontFamily::Proportional),
+            TEXT_GHOST,
+        )
+        .size()
+        .x
 }
 
 // ---------------------------------------------------------------------------
