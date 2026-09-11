@@ -18,6 +18,70 @@
 //! and it is checked here against **Bitwarden's own published vectors**, not
 //! against this crate's own round trip. A round-trip test cannot see a wrong
 //! HMAC label: it produces a Send this app can read and no other client can.
+//!
+//! # The second authority: the JavaScript a recipient actually runs
+//!
+//! Published vectors settle `derive_shareable_key`. They do **not** settle the
+//! two literals this file passes it, the PBKDF2 salt, or the shape of the
+//! link -- and every one of those is a way to ship a Send that looks encrypted
+//! and opens for nobody. So they were read off the web vault this deployment
+//! serves, which is the code the recipient's browser executes when the link is
+//! opened, and which therefore cannot be wrong about what a Send is here.
+//!
+//! `GET /` returns a page whose module graph is `assets/index-*.js` and
+//! `assets/shared-*.js`. In the first, beside the Sends screen:
+//!
+//! ```text
+//! var Er = `bitwarden-send`, Dr = `send`, Or = 16, kr = 1e5;
+//! async function jr(e) {                         // the Send's two keys
+//!   if (e.length >= 64) return { enc: e.slice(0,32), mac: e.slice(32,64) };
+//!   let t = await xe(e, Er, Dr, 64);
+//!   return { enc: t.slice(0,32), mac: t.slice(32,64) };
+//! }
+//! async function Mr(e, t) { return Ae(await j(e, t, kr, 32)); } // password
+//! function wr(e) { return Ae(e).replace(/\+/g,`-`)             // the fragment
+//!                              .replace(/\//g,`_`).replace(/=+$/g,``); }
+//! function rc(e, t, n) { return `${e}/#/send/${t}/${n}`; }      // the link
+//! ```
+//!
+//! and in the second, where `xe` and `j` are defined:
+//!
+//! ```text
+//! async function xi(e, t, n, r) {          // xe: HKDF, salt = t, info = n
+//!   let o = { name: `HKDF`, salt: K(i), info: K(a), hash: `SHA-256` };
+//!   ... deriveBits(o, c, r * 8) ...
+//! }
+//! async function yi(e, t, n, r) {          // j: PBKDF2-SHA256, salt = t
+//!   ... deriveBits({ name: `PBKDF2`, hash: `SHA-256`, salt: K(a),
+//!                    iterations: n }, s, r * 8) ...
+//! }
+//! ```
+//!
+//! **WebCrypto's HKDF is extract-then-expand**, so `xe(key, "bitwarden-send",
+//! "send", 64)` is `HKDF-Extract(salt = "bitwarden-send", ikm = key)` --
+//! which is `HMAC-SHA256(key = "bitwarden-send", msg = key)`, the PRK line
+//! above -- followed by `HKDF-Expand(prk, "send", 64)`. The two derivations
+//! are the same function reached from two directions, and that equality is
+//! not argued from the reading alone: the served module was run against
+//! Bitwarden's own two published vectors and reproduced both, which is the
+//! control for the whole paragraph. See
+//! [`tests::the_derivation_matches_the_web_vault_this_server_serves`] for the
+//! vectors that came back, and
+//! [`tests::a_send_encrypted_by_the_web_vault_opens_with_the_derived_key`] for
+//! the one thing a derivation comparison still cannot prove: that a whole
+//! ciphertext crosses.
+//!
+//! What the same reading settles about the rest of this file: the key is
+//! `Or` = 16 bytes; `enc` is the first 32 derived bytes and `mac` the next 32;
+//! the share password is `kr` = 100 000 PBKDF2-SHA256 iterations **salted with
+//! the raw send key** and encoded with `Ae`, which is `btoa` -- standard
+//! base64, padding kept; and the fragment is `wr`, the same bytes in base64url
+//! with the padding stripped, placed in the link by `rc` as
+//! `{base}/#/send/{accessId}/{fragment}`.
+//!
+//! **File Sends are out of scope** here as they are in
+//! [`crate::rest::send`]: the same key opens one, but this module never
+//! produces the file half of the body.
 
 use crate::rest::crypto::{decrypt, encrypt, CryptoError, EncString, SymmetricKey};
 use hmac::{Hmac, Mac};
@@ -208,6 +272,114 @@ mod tests {
         let other =
             derive_shareable_key(b"0123456789abcdef", "attachment", "send").expect("derives");
         assert_ne!(base64_of(&send), base64_of(&other), "the name is in the HMAC key");
+    }
+
+    /// **The three numbers the recipient's own browser produces**, taken from
+    /// the JavaScript this deployment serves and not from any document.
+    ///
+    /// # How these were obtained
+    ///
+    /// The module docs quote the source; these are what it *answered*. The
+    /// served `assets/shared-*.js` is an ES module, so it was imported into a
+    /// Node process -- no browser, no vault, no account -- and its own
+    /// exported HKDF, PBKDF2 and base64 called directly on fixed inputs. The
+    /// first thing asked of it was Bitwarden's own two published vectors,
+    /// which it reproduced byte for byte; that is the control that makes the
+    /// three lines below statements about *this* file's parameters rather
+    /// than about a function nobody has identified.
+    ///
+    /// # Why these and not a round trip
+    ///
+    /// [`the_derivation_matches_bitwardens_published_vectors`] proves the
+    /// derivation. It cannot prove the two literals `"send"` and `"send"`, it
+    /// cannot prove the PBKDF2 salt is the send key rather than the e-mail,
+    /// and it cannot prove the fragment is base64url -- and each of those
+    /// produces a Send that encrypts perfectly and opens for nobody. Three
+    /// constants, checked against the only implementation whose opinion
+    /// decides whether a link works.
+    #[test]
+    fn the_derivation_matches_the_web_vault_this_server_serves() {
+        // `jr(new Uint8Array(16).fill(4))`, its 64 bytes through `Ae`.
+        assert_eq!(
+            base64_of(&SendKey::from_bytes([4u8; 16]).cipher_key().expect("derives")),
+            "/8uwx0f+bA9Ar28VCWWqiOlGy0oDlzVcdP83dA8BLYNSvqOAKdr/3T32IIXakPUZQjpX0cMtJLJceRfHvVTx0w==",
+            "this app's Send key is not the one the web vault derives for the same link"
+        );
+
+        // `Mr("correct-horse", new Uint8Array(16).fill(2))`.
+        assert_eq!(
+            *SendKey::from_bytes([2u8; 16]).password_hash("correct-horse"),
+            "adfEDIiQVlRimUvuq8IWHHs2g9Xu2jXTpajsJVMccFA=",
+            "the share password this app stores is not the one the web vault checks against"
+        );
+
+        // `wr()` of the sixteen bytes chosen above to force `+` and `/`.
+        assert_eq!(
+            SendKey::from_bytes([
+                0xfbu8, 0xff, 0xbf, 0xfb, 0xff, 0xbf, 0xfb, 0xff, 0xbf, 0xfb, 0xff, 0xbf, 0xfb,
+                0xff, 0xbf, 0xfb,
+            ])
+            .fragment(),
+            "-_-_-_-_-_-_-_-_-_-_-w",
+            "the fragment this app writes is not the one the web vault reads back"
+        );
+    }
+
+    /// **A Send encrypted by that JavaScript, opened here.**
+    ///
+    /// The derivation vectors above compare *keys*. This compares a whole
+    /// ciphertext, which is the only thing that also settles the pieces a key
+    /// comparison leaves out: the `2.iv|ct|mac` layout, CBC with a 16-byte IV,
+    /// PKCS#7 padding, and -- the one most likely to be got wrong and least
+    /// likely to be noticed -- that the MAC is taken over `iv ++ ct` in that
+    /// order and is verified rather than ignored.
+    ///
+    /// The string was produced by calling the served module's own `Gt`
+    /// (`2.${b64(iv)}|${b64(ct)}|${b64(hmac(mac, iv ++ ct))}`) on the keys
+    /// `jr` derives for a send key of sixteen `0x04` bytes, over the plaintext
+    /// `the body`. It is a constant here because a test that re-fetched the
+    /// bundle would be a test that fails when the network does.
+    ///
+    /// # The other direction, and where the proof of it lives
+    ///
+    /// This test runs the interoperability the way a test can: a constant in,
+    /// an assertion out. The direction that actually decides whether a link
+    /// works is the opposite one -- the recipient's browser *decrypts* what
+    /// this app wrote -- and a test cannot hold that, because holding it means
+    /// running the served JavaScript.
+    ///
+    /// It was run. Three ciphertexts from this module's own [`encrypt`] over
+    /// the same key and plaintext, three different random IVs, were handed to
+    /// the served module's own decrypt; all three came back as `the body`, and
+    /// the same strings under a Send key of sixteen `0x05` bytes were refused
+    /// with `MAC mismatch` -- which is the control saying the MAC was checked
+    /// rather than skipped. That is not reproducible from `cargo test` and is
+    /// therefore not asserted here; it is recorded so that a reader knows the
+    /// claim was checked and not merely argued, and so that the next person to
+    /// change this file knows what to re-run. **Nothing was published to any
+    /// real account to establish it**: every value on both sides is a fixed
+    /// array in a test.
+    #[test]
+    fn a_send_encrypted_by_the_web_vault_opens_with_the_derived_key() {
+        const FROM_THE_WEB_VAULT: &str = "2.goOibGHrL9tl73H+Rar1Zg==|\
+             0yK4fibeysWgKmU5M1hXiA==|2dHwum32rZrCy+rL69JggndYzpBbLg1eUWwdRpT1Qcw=";
+
+        let sealed: EncString = FROM_THE_WEB_VAULT.parse().expect("the web vault's own shape");
+        let key = SendKey::from_bytes([4u8; 16]);
+        let opened = decrypt(&key.cipher_key().expect("derives"), &sealed)
+            .expect("the web vault's ciphertext does not open with this app's Send key");
+        assert_eq!(&*opened, b"the body", "it opened, and said something else");
+
+        // **The control, and it is two controls in one.** A different send
+        // key must not open the same string -- so the success above is a fact
+        // about the derivation and not about a `decrypt` that accepts
+        // anything -- and the failure must come from the MAC, which is what
+        // says the MAC is checked at all.
+        let wrong = SendKey::from_bytes([5u8; 16]);
+        assert!(
+            decrypt(&wrong.cipher_key().expect("derives"), &sealed).is_err(),
+            "a Send opened with the wrong key, so nothing above was verified"
+        );
     }
 
     /// A `SymmetricKey` has no accessor for its bytes -- deliberately. The

@@ -1778,6 +1778,70 @@ impl RestClient {
         })
     }
 
+    /// `GET /api/sends/{id}` -- one Send, still encrypted.
+    ///
+    /// **This exists to be the first half of [`Self::update_send`]**, and that
+    /// is the whole of why it is not served out of [`Self::fetch_sends`]: a
+    /// `PUT` replaces a record, so the body has to carry the fields the caller
+    /// is not changing, and the only honest source for those is the server's
+    /// own current copy of *this* row -- not a list fetched at some earlier
+    /// moment and possibly holding a name, a deletion date or an access limit
+    /// the owner has since changed from another client. One extra round trip
+    /// to avoid writing back a stale record over a fresh one.
+    ///
+    /// **On `write_agent`, not `sync_agent`.** [`Self::fetch_sends`] is on the
+    /// sync agent because a whole account's Sends is a response size this
+    /// client does not bound; one Send is not, and this read is the opening
+    /// move of a write. Giving it the write deadline keeps the two halves of
+    /// one operation under one budget rather than letting a read stall for
+    /// [`SYNC_DEADLINE`] before a write that would have given up sooner.
+    pub fn fetch_send(
+        &self,
+        session: &mut Session,
+        id: &str,
+    ) -> Result<serde_json::Value, RestError> {
+        let url = self.send_url(id)?;
+        self.refreshing(session, |session| {
+            self.value_from(self.bearer(self.write_agent.get(&url), session).call())
+        })
+    }
+
+    /// `PUT /api/sends/{id}` -- the edit, and in this crate that means
+    /// **turning a live link off**.
+    ///
+    /// # This replaces the whole Send
+    ///
+    /// [`Self::update_cipher`]'s warning, on a record where getting it wrong
+    /// is louder: whatever the body omits, a Bitwarden server drops. A body
+    /// that carried only `{"disabled": true}` would be read by *this*
+    /// deployment -- its handler gates every field on presence -- and refused
+    /// by a stock Bitwarden server, whose `SendRequestModel` requires the
+    /// type, the key and the deletion date. So the body is a whole record,
+    /// and it is a [`crate::rest::send::MappedSendUpdate`] rather than a
+    /// `serde_json::Value` for [`Self::create_send`]'s reason exactly: that
+    /// type's only constructor builds the record by copying the server's own
+    /// row, so the ciphertext a Send is made of cannot be re-assembled, and
+    /// cleartext cannot be assembled at all, in this module.
+    ///
+    /// Returns the server's own copy. The caller needs it: `disabled` is a
+    /// **claim about a public link**, and a status code cannot carry whether
+    /// the claim took. See [`crate::rest::send::set_disabled`], which checks
+    /// it, on the reasoning [`Self::archive_route`] already applies to
+    /// `archivedDate`.
+    pub fn update_send(
+        &self,
+        session: &mut Session,
+        id: &str,
+        update: &crate::rest::send::MappedSendUpdate,
+    ) -> Result<serde_json::Value, RestError> {
+        let url = self.send_url(id)?;
+        self.refreshing(session, |session| {
+            self.value_from(
+                self.bearer(self.write_agent.put(&url), session).send_json(update.body()),
+            )
+        })
+    }
+
     // ---- receiving a Send from a link --------------------------------------
     //
     // **Three requests that are never given the vault's session**, on
@@ -3496,9 +3560,23 @@ mod tests {
         // and carry no body at all, so every remaining body out of this
         // module is a mapped type again -- see the assertions below, which
         // between them account for all five.
+        //
+        // **Ten, and the tenth is the Send update.** This number is meant to
+        // be moved deliberately and this is the argument for moving it. The
+        // rule the census exists to hold is not "there are nine bodies"; it
+        // is *every body this module puts on the wire comes from a mapped
+        // type whose constructor did the encrypting*, and the tenth obeys it:
+        // `MappedSendUpdate` is built only by `rest::send` out of a row the
+        // server itself just sent back, so the ciphertext in it was never
+        // re-made here and no cleartext can reach it. The weaker alternative
+        // -- letting `update_send` take a `serde_json::Value` so the count
+        // stayed at nine -- is exactly the hand-built body every assertion
+        // below exists to forbid, and it would have been the one carrying a
+        // Send's name and text. The named assertion further down is what
+        // stops an eleventh hiding behind this one.
         assert_eq!(
             production.matches("send_json(").count(),
-            9,
+            10,
             "a new JSON body sender appeared in rest::api"
         );
         // Two of them are the cipher writers, and both send a mapped cipher.
@@ -3558,6 +3636,17 @@ mod tests {
             1,
             "the token Send-access route stopped sending an empty body"
         );
+        // **The tenth is the Send update**, and it is a mapped type on the
+        // same terms as the create: `MappedSendUpdate` has no constructor but
+        // `rest::send`'s, which copies the server's own row and changes one
+        // boolean. A `serde_json::Value` here would let a caller assemble a
+        // whole Send -- its name and its text -- in this module, in the
+        // clear, which is the single thing this census is for.
+        assert_eq!(
+            production.matches("send_json(update.body())").count(),
+            1,
+            "the Send update endpoint stopped sending a MappedSendUpdate"
+        );
 
         // And there is **no** hand-built body left anywhere: the four mapped
         // sends above are the write agent's only `post`/`put` with content.
@@ -3570,10 +3659,16 @@ mod tests {
             0,
             "a hand-built body appeared in rest::api"
         );
+        // **Six, and the sixth is the Send update's `put`.** Moved with the
+        // total above and for the same argued reason; what this one adds is
+        // the half the total cannot say -- that the new body went out on the
+        // *write* agent with the vault's session, which is where a Send the
+        // account owns belongs, and not on `anon_agent`, which is reached by
+        // a link a stranger pasted.
         assert_eq!(
             production.matches("self.write_agent.post(&url), session).send_json").count()
                 + production.matches("self.write_agent.put(&url), session).send_json").count(),
-            5,
+            6,
             "the write agent gained another body-carrying call -- and a receive that moved \
              this number is a receive that was handed the vault's session"
         );
@@ -4430,6 +4525,147 @@ mod tests {
             matches!(client.delete_send(&mut session, "../ciphers/x"), Err(RestError::UnsafeId)),
             "an id that is not path-safe must be refused before it is a URL"
         );
+    }
+
+    /// One server row, as `GET /api/sends/{id}` answers it.
+    fn a_send_row() -> serde_json::Value {
+        serde_json::json!({
+            "id": "send-1",
+            "accessId": "acc-1",
+            "type": 0,
+            "name": "2.bg==|bg==|bg==",
+            "notes": serde_json::Value::Null,
+            "text": { "text": "2.dA==|dA==|dA==", "hidden": true },
+            "file": serde_json::Value::Null,
+            "key": "2.az==|az==|az==",
+            "maxAccessCount": 3,
+            "accessCount": 1,
+            "password": "STORED-PBKDF2-HASH=",
+            "hideEmail": false,
+            "disabled": false,
+            "deletionDate": "2026-09-06T00:43:17.148Z",
+            "expirationDate": serde_json::Value::Null,
+        })
+    }
+
+    /// **A disable is a read and then a write**, both path-scoped, both on
+    /// the vault's bearer -- and the body is the row that came back with one
+    /// boolean moved. The whole operation is driven here rather than in
+    /// `rest::send`'s own tests because a `Session` in this crate can only be
+    /// obtained by granting one against a server, and [`granted`] is where
+    /// that happens.
+    #[test]
+    fn turning_a_send_off_reads_the_row_and_writes_it_back_disabled() {
+        let mut server = crate::test_http::server();
+        let (client, mut session) = granted(&mut server);
+
+        let read = server
+            .mock("GET", "/api/sends/send-1")
+            .match_header("Authorization", "Bearer AT-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_send_row().to_string())
+            .expect(1)
+            .create();
+
+        let mut expected = a_send_row();
+        let object = expected.as_object_mut().expect("an object");
+        object.remove("id");
+        object.remove("accessId");
+        object.remove("accessCount");
+        object.insert("disabled".to_string(), serde_json::json!(true));
+        object.insert("password".to_string(), serde_json::Value::Null);
+
+        let mut echoed = a_send_row();
+        echoed["disabled"] = serde_json::json!(true);
+        let written = server
+            .mock("PUT", "/api/sends/send-1")
+            .match_header("Authorization", "Bearer AT-1")
+            .match_body(crate::test_http::Matcher::Json(expected))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(echoed.to_string())
+            .expect(1)
+            .create();
+
+        crate::rest::send::set_disabled(&client, &mut session, "send-1", true)
+            .expect("the link is turned off");
+        read.assert();
+        written.assert();
+    }
+
+    /// **An accepted request that did not do what it said is a failure.**
+    ///
+    /// `archive_route` makes this judgement about `archivedDate` and the
+    /// reasoning is the same here with more at stake: a `200` reported as
+    /// success over a link that is still live is the one outcome the Sends
+    /// path is arranged to prevent. The two ways it can happen -- the server
+    /// echoes the old value, or echoes nothing at all -- are both driven.
+    #[test]
+    fn a_send_the_server_did_not_actually_disable_is_not_reported_as_off() {
+        for answer in [a_send_row().to_string(), "{}".to_string()] {
+            let mut server = crate::test_http::server();
+            let (client, mut session) = granted(&mut server);
+            let _read = server
+                .mock("GET", "/api/sends/send-1")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(a_send_row().to_string())
+                .expect(1)
+                .create();
+            let _written = server
+                .mock("PUT", "/api/sends/send-1")
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_body(answer.clone())
+                .expect(1)
+                .create();
+
+            let refusal = crate::rest::send::set_disabled(&client, &mut session, "send-1", true)
+                .expect_err("a link that is still live is not a success");
+            assert!(
+                refusal.user_message().contains("still be live"),
+                "the sentence does not warn that the link may be live: {}",
+                refusal.user_message()
+            );
+        }
+    }
+
+    /// Both new routes check the id before it is a URL, through the same
+    /// [`is_url_path_safe`] gate the revoke already uses -- so neither the
+    /// read nor the write can be aimed at another record's route.
+    #[test]
+    fn a_send_id_that_is_not_path_safe_never_becomes_a_url() {
+        let mut server = crate::test_http::server();
+        let (client, mut session) = granted(&mut server);
+        let nothing = server
+            .mock("GET", crate::test_http::Matcher::Any)
+            .with_status(200)
+            .expect(0)
+            .create();
+
+        assert!(matches!(
+            client.fetch_send(&mut session, "../ciphers/x"),
+            Err(RestError::UnsafeId)
+        ));
+        let update = crate::rest::send::disabled_from_row(&a_send_row(), true).expect("maps");
+        assert!(matches!(
+            client.update_send(&mut session, "../ciphers/x", &update),
+            Err(RestError::UnsafeId)
+        ));
+        nothing.assert();
+
+        // The control: the same client, with a safe id, does reach the
+        // server -- so the two refusals above are about the id.
+        let read = server
+            .mock("GET", "/api/sends/send-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(a_send_row().to_string())
+            .expect(1)
+            .create();
+        assert!(client.fetch_send(&mut session, "send-1").is_ok());
+        read.assert();
     }
 
     /// The token discipline, on a folder write: one 401, one refresh, one

@@ -246,6 +246,155 @@ pub fn delete(client: &RestClient, session: &mut Session, id: &str) -> Result<()
     client.delete_send(session, id).map_err(|e| map_error(e, Ambiguity::Safe))
 }
 
+// ---- turning a live link off ------------------------------------------------
+
+/// A server-ready body for `PUT /api/sends/{id}`.
+///
+/// [`MappedSend`]'s sibling, and it carries the same guarantee from the other
+/// direction: that one encrypts, this one **never does**. Its only
+/// constructor is [`disabled_from_row`], which copies a row the server just
+/// sent back, so every ciphertext in it is ciphertext the server already has.
+/// The type exists so that `rest::api` cannot be handed a body somebody
+/// assembled -- see that module's own census of what it is allowed to send.
+pub struct MappedSendUpdate {
+    body: Value,
+}
+
+impl MappedSendUpdate {
+    pub(crate) fn body(&self) -> &Value {
+        &self.body
+    }
+}
+
+/// One server row, as the body that writes it back with `disabled` changed.
+///
+/// # Why a whole record for one boolean
+///
+/// Because a `PUT` on a Send is a replacement, not a patch, and the two
+/// servers this client talks to disagree about how forgiving to be. This
+/// deployment's own handler gates every field on presence, so `{"disabled":
+/// true}` would work against it; a stock Bitwarden server validates a
+/// `SendRequestModel`, which requires the type, the key and the deletion
+/// date, and would refuse the same body with a `400` that reads like a bug in
+/// this app. Copying the row satisfies both, and it is also what the web
+/// vault does -- its own update builds the full record and sends it.
+///
+/// # The three fields that are NOT copied, and why each one matters
+///
+/// * **`password`.** The row's `password` is the *stored PBKDF2 hash*, and an
+///   update treats an incoming string as a **new password to hash**. Echoing
+///   it would hash the hash: the Send would keep working for nobody, the
+///   owner would have no way to discover what happened, and the recipient
+///   holding the agreed password would simply be told it was wrong. An
+///   explicit `null` is the "leave it alone" value on both servers.
+/// * **`emails` and `authType`.** Absent rather than `null`, and the
+///   difference is not cosmetic: a present `null` is read as "this Send no
+///   longer has e-mail gating" and *strips* it. Turning a link off must not
+///   quietly widen who could have opened it if it were turned back on.
+/// * **`accessCount`.** The server's counter, not the client's opinion.
+///
+/// Everything else is copied verbatim, `file` included -- so this disables a
+/// **file** Send as readily as a text one. That is deliberate and is the one
+/// place in this module where file Sends are in scope: this app cannot create
+/// one, but `SendSummary::is_file` says the Sends screen lists ones made
+/// elsewhere, and the operation those most need is the one that turns them
+/// off.
+///
+/// One row this refuses to special-case: [`summary_from`] tolerates a Send
+/// whose `name` is absent or empty, because a revoke and a link need neither.
+/// A write does -- both servers require a name -- so such a row comes back
+/// from the server as a `400` carrying its own sentence rather than being
+/// patched up here. That is the right way round: inventing a name for a Send
+/// the owner did not name is a change to their record made in passing, while
+/// a refusal is visible and costs only the operation that was asked for.
+///
+/// # Errors
+///
+/// [`SendError::Rejected`] naming the missing field if the row carries no
+/// `key` or no `deletionDate`. Both are required by the record this builds,
+/// and a body assembled around a missing one would be a request to *delete*
+/// the Send's key or to re-date it -- which is [`summary_from`]'s rule
+/// applied to a write: a row that cannot be written back correctly is a
+/// failure, not a best effort.
+pub fn disabled_from_row(row: &Value, disabled: bool) -> Result<MappedSendUpdate, SendError> {
+    // Read before the body is built, so a missing one is a refusal rather
+    // than a `null` in a field the server will act on.
+    let key = field(row, "key")?;
+    let deletion_date = field(row, "deletionDate")?;
+    let copied = |name: &str| row.get(name).cloned().unwrap_or(Value::Null);
+
+    Ok(MappedSendUpdate {
+        body: json!({
+            // Bitwarden refuses a type change outright, so this is copied
+            // rather than assumed to be 0: sending `0` for a file Send would
+            // turn a disable into "Sends can't change type".
+            "type": row.get("type").and_then(Value::as_i64).unwrap_or(0),
+            "name": copied("name"),
+            "notes": copied("notes"),
+            "key": key,
+            "text": copied("text"),
+            "file": copied("file"),
+            "maxAccessCount": copied("maxAccessCount"),
+            "deletionDate": deletion_date,
+            "expirationDate": copied("expirationDate"),
+            "password": Value::Null,
+            "hideEmail": copied("hideEmail"),
+            "disabled": disabled,
+        }),
+    })
+}
+
+/// Turns one Send's public link off, or back on.
+///
+/// **No vault key and no `/api/sync`**, exactly like [`delete`] and for the
+/// same reason: nothing here is encrypted or decrypted, only copied. That is
+/// what makes this the operation most likely to still work when the others
+/// cannot -- and turning a link off is the operation that most needs to.
+///
+/// # Why the answer is checked
+///
+/// Because what is being asserted is a fact about a **public link**, and a
+/// status code cannot carry it. This is `RestClient::archive_route`'s
+/// reasoning about `archivedDate`, applied where the stakes are higher: a
+/// `200` on a request the server accepted and did not act on would be
+/// reported to the owner as "the link is off" while the link stayed live,
+/// which is this crate's "could not check must never render as success" rule
+/// pointed at the one thing Sends are careful about. So the server's echoed
+/// `disabled` must come back and must say what was asked; anything else is a
+/// refusal.
+///
+/// # Errors
+///
+/// [`SendError`] as [`map_error`] gives it, with [`Ambiguity::Safe`] on both
+/// requests: this publishes nothing, so a transport failure is
+/// [`SendError::Offline`] and never [`SendError::TimedOut`] -- whose sentence
+/// is about a link that may now exist. A failure here leaves the Send exactly
+/// as the owner last saw it.
+pub fn set_disabled(
+    client: &RestClient,
+    session: &mut Session,
+    id: &str,
+    disabled: bool,
+) -> Result<(), SendError> {
+    let row = client.fetch_send(session, id).map_err(|e| map_error(e, Ambiguity::Safe))?;
+    let update = disabled_from_row(&row, disabled)?;
+    let answer =
+        client.update_send(session, id, &update).map_err(|e| map_error(e, Ambiguity::Safe))?;
+
+    match answer.get("disabled").and_then(Value::as_bool) {
+        Some(state) if state == disabled => Ok(()),
+        // Deliberately one sentence for both "it said the opposite" and "it
+        // said nothing": to the owner they mean the same thing -- this app
+        // cannot tell them the link is off -- and a message that guessed
+        // which had happened would be guessing.
+        _ => Err(SendError::Rejected(
+            "Bitwarden accepted the change but did not confirm it. Check your Sends list: \
+             this link may still be live."
+                .to_string(),
+        )),
+    }
+}
+
 /// `pub` for the same reason [`crate::rest::crypto::tests`] is: `rest::api`
 /// needs a `MappedSend` fixture, and a `MappedSend` has no constructor but
 /// [`encrypt_plan`] -- which is the whole point of the type. Sharing the
@@ -332,6 +481,20 @@ pub fn list_on_active_account() -> Result<Vec<SendSummary>, SendError> {
 pub fn delete_on_active_account(id: &str) -> Result<(), SendError> {
     let (client, mut authenticated) = active_account()?;
     delete(&client, &mut authenticated.session, id)
+}
+
+/// Turns one Send's link off, or back on. **No sync and no key**, on
+/// [`delete_on_active_account`]'s terms exactly -- see [`set_disabled`].
+///
+/// The fourth of these, and the first that is not yet wired to a screen.
+/// `vault_window`'s `BackendTasks` is where the other three are reached from
+/// and is where this one goes; it is left unwired here rather than half-wired
+/// because that trait has a `bw serve` arm as well, and `bw send` has no
+/// verb for this at all -- what the CLI backend should answer is a question
+/// about what the Sends screen says, not about this module.
+pub fn set_disabled_on_active_account(id: &str, disabled: bool) -> Result<(), SendError> {
+    let (client, mut authenticated) = active_account()?;
+    set_disabled(&client, &mut authenticated.session, id, disabled)
 }
 
 // ---- receiving a Send from a link -------------------------------------------
@@ -733,6 +896,156 @@ pub mod tests {
         assert!(summary_from(&text_row(&theirs), &mine, "https://x").is_err());
         // The control: the same row under its own vault's key maps.
         assert!(summary_from(&text_row(&theirs), &theirs, "https://x").is_ok());
+    }
+
+    // ---- turning a live link off -------------------------------------------
+
+    /// A row with every field a real one carries, including the two this
+    /// mapper must refuse to write back.
+    fn full_row(keys: &VaultKeys) -> Value {
+        let mut row = text_row(keys);
+        let object = row.as_object_mut().expect("an object");
+        object.insert("notes".to_string(), json!("2.bm90ZXM=|bm90ZXM=|bm90ZXM="));
+        object.insert("text".to_string(), json!({ "text": "2.dA==|dA==|dA==", "hidden": true }));
+        object.insert("file".to_string(), Value::Null);
+        object.insert("maxAccessCount".to_string(), json!(3));
+        object.insert("accessCount".to_string(), json!(2));
+        object.insert("expirationDate".to_string(), json!("2026-09-05T00:00:00.000Z"));
+        object.insert("password".to_string(), json!("STORED-PBKDF2-HASH="));
+        object.insert("hideEmail".to_string(), json!(true));
+        object.insert("disabled".to_string(), json!(false));
+        row
+    }
+
+    /// **One boolean moves and nothing else does.** The body is compared
+    /// field by field against the row it came from, because "it replaces the
+    /// whole Send" means every field not compared here is one this app could
+    /// silently drop.
+    #[test]
+    fn the_disable_body_writes_the_row_back_with_only_disabled_changed() {
+        let keys = keys();
+        let row = full_row(&keys);
+        let body = disabled_from_row(&row, true).expect("the row maps").body().clone();
+
+        assert_eq!(body["disabled"], json!(true), "the one field that was meant to change");
+        for field in
+            ["type", "name", "notes", "key", "text", "file", "maxAccessCount", "expirationDate", "hideEmail"]
+        {
+            assert_eq!(body[field], row[field], "`{field}` did not survive the round trip");
+        }
+        assert_eq!(
+            body["deletionDate"], row["deletionDate"],
+            "the deletion date was re-stamped rather than copied, which would move it"
+        );
+
+        // The control for the loop: the row really does carry a distinct,
+        // non-null value in each of those, so nine comparisons of `null` to
+        // `null` cannot be what just passed.
+        for field in ["name", "notes", "key", "text", "maxAccessCount", "expirationDate"] {
+            assert!(!row[field].is_null(), "control: the fixture's `{field}` is null");
+        }
+    }
+
+    /// **The stored password hash is never written back.**
+    ///
+    /// The row's `password` is a PBKDF2 hash; an update reads an incoming
+    /// string as a *new password to hash*. Echoing it would hash the hash and
+    /// lock out the one person who was given the password, with nothing on
+    /// screen to say so. The assertion is over the serialised body, not the
+    /// `password` field alone, so the hash cannot arrive under some other
+    /// name either.
+    #[test]
+    fn the_disable_body_never_writes_the_stored_password_hash_back() {
+        let keys = keys();
+        let row = full_row(&keys);
+        let body = disabled_from_row(&row, true).expect("the row maps").body().clone();
+
+        assert_eq!(body["password"], Value::Null, "`password` must be an explicit null");
+        let sent = serde_json::to_string(&body).expect("serializable");
+        assert!(!sent.contains("STORED-PBKDF2-HASH"), "the stored hash reached the body: {sent}");
+        // The control: the hash really is in the row, so its absence above is
+        // a fact about the mapper and not about the fixture.
+        assert!(
+            serde_json::to_string(&row).expect("serializable").contains("STORED-PBKDF2-HASH"),
+            "control: the fixture carries no hash, so the absence above proves nothing"
+        );
+    }
+
+    /// **`emails` and `authType` are absent, not null.** A present `null` is
+    /// read as "no e-mail gating any more" and strips it; turning a link off
+    /// must not quietly change who could open it.
+    #[test]
+    fn the_disable_body_leaves_email_gating_alone_by_saying_nothing_about_it() {
+        let keys = keys();
+        let mut row = full_row(&keys);
+        row["emails"] = json!("someone@example.com");
+        row["authType"] = json!(2);
+        let body = disabled_from_row(&row, true).expect("the row maps").body().clone();
+
+        let object = body.as_object().expect("an object");
+        assert!(!object.contains_key("emails"), "`emails` is present and would be acted on");
+        assert!(!object.contains_key("authType"), "`authType` is present and would be acted on");
+        // And the server's own counter is not this client's to state.
+        assert!(!object.contains_key("accessCount"), "`accessCount` is the server's");
+        // The control: fields that ARE meant to be there are, so a mapper
+        // that had returned an empty object could not pass the three above.
+        assert!(object.contains_key("key") && object.contains_key("disabled"));
+    }
+
+    /// **A file Send can be turned off**, which is the one operation on one
+    /// that this app most needs: it cannot create a file Send, `is_file` says
+    /// the screen lists ones made elsewhere, and a link is a link.
+    #[test]
+    fn a_file_send_is_turned_off_as_readily_as_a_text_one() {
+        let keys = keys();
+        let mut row = full_row(&keys);
+        row["type"] = json!(1);
+        row["text"] = Value::Null;
+        row["file"] = json!({ "id": "file-1", "fileName": "2.Zg==|Zg==|Zg==", "size": "12" });
+
+        let body = disabled_from_row(&row, true).expect("the row maps").body().clone();
+        assert_eq!(body["type"], json!(1), "the type was not copied, so this is a type change");
+        assert_eq!(body["file"], row["file"], "the file half of the record was dropped");
+        assert_eq!(body["disabled"], json!(true));
+    }
+
+    /// A row that cannot be written back **correctly** is a failure, not a
+    /// best effort: `summary_from`'s rule on the write side. A body missing
+    /// the key would ask the server to forget it; one missing the deletion
+    /// date would ask it to pick a new one.
+    #[test]
+    fn a_row_that_cannot_be_written_back_is_refused_rather_than_guessed() {
+        let keys = keys();
+        for missing in ["key", "deletionDate"] {
+            let mut row = full_row(&keys);
+            row.as_object_mut().expect("an object").remove(missing);
+            // Matched rather than `expect_err`ed: that would want a `Debug`
+            // on the body, and a Send body is not a thing this crate teaches
+            // to print itself.
+            let refusal = match disabled_from_row(&row, true) {
+                Ok(_) => panic!("a row with no `{missing}` was turned into a body anyway"),
+                Err(refusal) => refusal,
+            };
+            assert!(
+                refusal.user_message().contains(missing),
+                "the refusal does not name `{missing}`: {}",
+                refusal.user_message()
+            );
+        }
+        // The control: the whole row maps, so the two failures above are
+        // about the missing field and not about the fixture.
+        assert!(disabled_from_row(&full_row(&keys), true).is_ok());
+    }
+
+    /// Turning a link back **on** is the same mapper, and the boolean is not
+    /// hard-coded anywhere in it.
+    #[test]
+    fn the_same_mapper_turns_a_link_back_on() {
+        let keys = keys();
+        let mut row = full_row(&keys);
+        row["disabled"] = json!(true);
+        let body = disabled_from_row(&row, false).expect("the row maps").body().clone();
+        assert_eq!(body["disabled"], json!(false), "the argument does not reach the body");
     }
 
     /// **A transport failure on a create is ambiguous.** The request may have
