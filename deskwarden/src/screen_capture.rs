@@ -387,6 +387,148 @@ pub fn clamp_to_monitors(
     Ok(clamped)
 }
 
+/// **Which single display a surface that is not allowed to cover the whole
+/// desktop should cover** -- the rule, with the Win32 taken out.
+///
+/// The answer is the monitor that holds `anchor`; when no monitor holds it,
+/// the monitor nearest to it; and when `anchor` is `None`, the first monitor
+/// in the list. `None` comes back only when there is no monitor with any area
+/// at all, which is the one case where there is no honest rectangle to
+/// substitute -- the same refusal [`clamp_to_monitors`] makes for a rectangle
+/// that overlaps nothing.
+///
+/// # Why "nearest" and not "refuse"
+///
+/// An anchor lands between monitors more often than it sounds like it should.
+/// The window a caller anchors on can be half off the edge of its screen, so
+/// its centre sits in the dead band of an L-shaped desktop; a monitor can be
+/// unplugged between the reading and this call; and a cursor parked at the far
+/// right of the rightmost screen is one pixel outside `rcMonitor`. In every
+/// one of those the user is plainly working on a screen, and refusing would
+/// turn "cover the display I am on" into "no overlay at all". Nearest is the
+/// same choice Windows itself makes with `MONITOR_DEFAULTTONEAREST`, and it is
+/// what `app::clamp_to_monitor` already passes for the autofill card.
+///
+/// Distance is measured to the **rectangle**, not to its centre: the
+/// point-to-rect distance is zero everywhere inside a monitor and grows with
+/// the gap outside it, so a point just past the right edge of a wide screen
+/// picks that screen rather than the physically smaller one whose centre
+/// happens to be closer. Squared, because only the ordering is used and a
+/// square root cannot change it.
+///
+/// Ties go to the earlier monitor in the list, which is `EnumDisplayMonitors`'
+/// order in production -- arbitrary, but *stable*, and stability is the whole
+/// requirement: two calls a frame apart must not answer differently, or the
+/// overlay moves under the user.
+///
+/// **Zero-area monitors are skipped.** A degenerate entry in the enumeration
+/// is not a screen, and handing one back would open a zero-sized always-on-top
+/// window the user cannot dismiss -- which is the refusal
+/// [`crate::region_overlay::RegionOverlay::open`] has always made and now
+/// makes through this.
+///
+/// Pure -- the monitors and the anchor are both arguments. [`active_display`]
+/// is what reads the real ones.
+pub fn display_holding(anchor: Option<(i32, i32)>, monitors: &[ScreenRect]) -> Option<ScreenRect> {
+    let real = || monitors.iter().filter(|m| m.width() > 0 && m.height() > 0);
+    let Some((x, y)) = anchor else {
+        return real().next().copied();
+    };
+    // `min_by_key` keeps the FIRST of equal keys, which is the tie-break this
+    // doc promises; a `max_by_key` would keep the last, and the two disagree
+    // on every desktop with two identical monitors.
+    real()
+        .min_by_key(|m| {
+            // Point-to-rectangle: zero inside, the gap outside. `right` and
+            // `bottom` are exclusive in a `ScreenRect`, so the last pixel
+            // column of a monitor is `right - 1` and clamping to `right`
+            // would put a point one past the edge at distance zero from the
+            // monitor beyond it as well.
+            let dx = (m.left - x).max(x - (m.right - 1)).max(0) as i64;
+            let dy = (m.top - y).max(y - (m.bottom - 1)).max(0) as i64;
+            dx * dx + dy * dy
+        })
+        .copied()
+}
+
+/// The mouse cursor in virtual-screen physical pixels -- the same space
+/// [`monitor_bounds`] reports and every GDI call in this module speaks.
+///
+/// `None` when Windows will not say, which it does during a fast user switch
+/// and on a locked session. Logged rather than discarded: this is the reading
+/// that decides which monitor an overlay covers, and a silent `None` here
+/// would show up to the user as an overlay on the wrong screen with nothing
+/// anywhere to say why.
+pub fn cursor_position() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+    let mut at = POINT::default();
+    match unsafe { GetCursorPos(&mut at) } {
+        Ok(()) => Some((at.x, at.y)),
+        Err(e) => {
+            log::warn!("screen capture: GetCursorPos refused ({e}); no cursor to place a surface by");
+            None
+        }
+    }
+}
+
+/// **The display the user is working on**, resolved now and meant to be
+/// carried rather than asked for again.
+///
+/// `anchor` is the caller's own idea of where the user is -- for the region
+/// overlay, the centre of the Deskwarden window the press came from. When it
+/// is `None` this falls back to the mouse cursor, and when that is unavailable
+/// too, to the first monitor. [`display_holding`] is the rule and is tested on
+/// its own; this adds the one impure reading and the log line.
+///
+/// # "Active" means the window the user pressed the button in, not the cursor
+///
+/// Both were on the table and they agree almost always -- the user clicks
+/// *Scan the code on my screen* with the mouse, so the pointer is over the
+/// Deskwarden window and both answers are the same monitor. They come apart in
+/// exactly two places, and the window wins both:
+///
+/// * **The press was a keyboard press.** Space or Enter on a focused button is
+///   a first-class way to use this app, and it leaves the cursor wherever it
+///   was last put down -- which can be parked on a second screen for hours.
+///   The window is where the user is looking; a stale pointer is not.
+/// * **The pointer moves between the press and the frame.** The cursor is a
+///   reading that changes under you: the route spends `PRESCAN_SETTLE` and a
+///   whole-desktop capture between the press and the window being created, and
+///   a user who nudges the mouse in that time would get an overlay on a
+///   different screen than the one they were on when they pressed. A window's
+///   position does not move on its own.
+///
+/// It is also the monitor the user could see least of a moment ago: Deskwarden
+/// was sitting on top of it, is about to be minimised out of the way, and the
+/// dim arriving on that same screen is what makes the minimise read as "the
+/// app stepped aside" rather than as "the app vanished and something else
+/// appeared somewhere".
+///
+/// # Resolve it before the minimise, and carry it
+///
+/// The anchor has to be read while the Deskwarden window is still where the
+/// user put it. `region_overlay` sends that window down with
+/// `SW_SHOWMINNOACTIVE` a few frames later, and a minimised window's
+/// `GetWindowRect` is off-screen nonsense (`-32000, -32000` on Windows), which
+/// would resolve to whichever monitor is nearest to that. So this is called
+/// once, at the moment the route starts, and the rectangle it answers is
+/// stored -- never recomputed from a frame that runs after the minimise.
+pub fn active_display(anchor: Option<(i32, i32)>, monitors: &[ScreenRect]) -> Option<ScreenRect> {
+    let at = anchor.or_else(cursor_position);
+    let chosen = display_holding(at, monitors);
+    // **Logged, and the next multi-monitor report is why.** "The overlay came
+    // up on the wrong screen" is unanswerable without knowing which screens
+    // the app could see, which one it picked and what it picked it by; with
+    // this line it is three numbers off the user's log.
+    log::info!(
+        "screen capture: active display {chosen:?} chosen by {at:?} (anchor {anchor:?}) out of \
+         {} monitor(s): {monitors:?}",
+        monitors.len()
+    );
+    chosen
+}
+
 /// Whether a captured buffer carries the signature of a window whose app
 /// called `SetWindowDisplayAffinity` -- **every pixel exactly pure black**.
 ///
@@ -1007,6 +1149,146 @@ mod tests {
             clamp_to_monitors(enormous, &[enormous]),
             Err(CaptureRefusal::TooLarge)
         );
+    }
+
+    // -- 2b. picking the active display ------------------------------------
+
+    /// A two-monitor desktop of the shape that produced the report this was
+    /// written for: a second screen left of and above the primary, so the
+    /// bounding box of the pair is neither of them and its origin is negative.
+    fn two_screens() -> [ScreenRect; 2] {
+        [
+            ScreenRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            ScreenRect {
+                left: -1280,
+                top: -200,
+                right: 0,
+                bottom: 520,
+            },
+        ]
+    }
+
+    /// **An anchor inside a monitor picks that monitor**, and picks the one it
+    /// is in rather than the primary or the first.
+    #[test]
+    fn the_active_display_is_the_one_holding_the_anchor() {
+        let screens = two_screens();
+        assert_eq!(display_holding(Some((300, 400)), &screens), Some(screens[0]));
+        // The interesting half: a point on the monitor that is NOT first in
+        // the list and whose coordinates are negative.
+        assert_eq!(
+            display_holding(Some((-600, -100)), &screens),
+            Some(screens[1])
+        );
+        // And it is one monitor and not the pair: the bounding box of these
+        // two is 3200x1280, which is what the overlay used to cover.
+        assert_eq!(
+            display_holding(Some((300, 400)), &screens).map(|m| (m.width(), m.height())),
+            Some((1920, 1080))
+        );
+    }
+
+    /// **The last pixel column of a monitor is inside it.** `right` and
+    /// `bottom` are exclusive, so a cursor parked at the far right of the
+    /// primary reads as `1919` and must not be handed to the screen beyond it.
+    #[test]
+    fn the_far_edge_of_a_monitor_still_belongs_to_it() {
+        let screens = two_screens();
+        assert_eq!(
+            display_holding(Some((1919, 1079)), &screens),
+            Some(screens[0])
+        );
+        // The other side of the seam, a single pixel away: x = 0 is the
+        // primary's first column, and x = -1 is the last column of the screen
+        // left of it.
+        assert_eq!(display_holding(Some((0, 300)), &screens), Some(screens[0]));
+        assert_eq!(display_holding(Some((-1, 300)), &screens), Some(screens[1]));
+    }
+
+    /// **A point no monitor holds picks the nearest one rather than nothing.**
+    /// The dead band of an L-shaped desktop is where a half-off-screen
+    /// window's centre lands, and "no overlay at all" is not an answer.
+    #[test]
+    fn an_anchor_in_the_gap_picks_the_nearest_screen() {
+        let screens = two_screens();
+        // Below the left screen and left of the primary: nothing holds it.
+        // It is 281 px below `screens[1]`'s last row and 640 px left of
+        // `screens[0]`'s first column, so the near one is the left screen.
+        assert_eq!(
+            display_holding(Some((-640, 800)), &screens),
+            Some(screens[1])
+        );
+        // Mirror it: just under the primary and well right of the left
+        // screen, and the answer flips. Same gap, different nearest, so the
+        // assertion above is about the distance and not about list order.
+        assert_eq!(
+            display_holding(Some((1000, 1200)), &screens),
+            Some(screens[0])
+        );
+    }
+
+    /// No anchor -- a locked session, where `GetCursorPos` refuses -- still
+    /// gives a screen, and no monitors at all still gives none.
+    #[test]
+    fn no_anchor_is_the_first_screen_and_no_screens_is_no_answer() {
+        let screens = two_screens();
+        assert_eq!(display_holding(None, &screens), Some(screens[0]));
+        assert_eq!(display_holding(None, &[]), None);
+        // A degenerate monitor is skipped rather than handed out as a
+        // zero-sized always-on-top window nobody can dismiss.
+        let degenerate = ScreenRect {
+            left: 10,
+            top: 10,
+            right: 10,
+            bottom: 10,
+        };
+        assert_eq!(display_holding(None, &[degenerate]), None);
+        assert_eq!(
+            display_holding(Some((11, 11)), &[degenerate, screens[0]]),
+            Some(screens[0])
+        );
+    }
+
+    /// **An exact tie goes to the earlier monitor, every time.** The property
+    /// the overlay's placement rests on is not which one wins but that the
+    /// same question always gets the same answer: a surface that re-resolved
+    /// its monitor and disagreed would move under the user.
+    #[test]
+    fn an_exact_tie_always_goes_the_same_way() {
+        // A 1001-pixel gap between two screens, so there is an integer point
+        // exactly equidistant from both: the left screen's last column is
+        // 1919 and the right screen's first is 2921, and 2420 is 501 from
+        // each.
+        let twins = [
+            ScreenRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            ScreenRect {
+                left: 2921,
+                top: 0,
+                right: 4841,
+                bottom: 1080,
+            },
+        ];
+        for _ in 0..8 {
+            assert_eq!(display_holding(Some((2420, 500)), &twins), Some(twins[0]));
+        }
+        // Reversed, the same tie goes to the other one -- which is what makes
+        // the assertion above about list order rather than about the left
+        // screen being closer after all.
+        let swapped = [twins[1], twins[0]];
+        assert_eq!(display_holding(Some((2420, 500)), &swapped), Some(twins[1]));
+        // One pixel off the tie and the distance decides, in both directions.
+        assert_eq!(display_holding(Some((2419, 500)), &twins), Some(twins[0]));
+        assert_eq!(display_holding(Some((2421, 500)), &twins), Some(twins[1]));
     }
 
     // -- 3. the blocked-window diagnosis -----------------------------------

@@ -80,8 +80,8 @@
 //!
 //! Testable, and tested below as plain functions with no window anywhere:
 //!
-//! * [`Drag::rect`] and [`whole_screen`] -- the geometry that is this
-//!   module's rather than `screen_capture`'s;
+//! * [`Drag::rect`] -- the geometry that is this module's rather than
+//!   `screen_capture`'s;
 //! * [`to_screen`] -- the one conversion this window owns, points to
 //!   virtual-screen pixels;
 //! * [`lockon_badge`] -- the found/not-found label decision;
@@ -108,11 +108,18 @@
 //!   window is shown** -- see [`Appearing`], which carries a measurement of
 //!   both: the compositor does honour it, and the window used to be on screen
 //!   for 1315 ms before it was asked to.
-//! * that the viewport covers **every** monitor. The rectangle handed to the
-//!   builder is computed from [`crate::screen_capture::monitor_bounds`], and
-//!   that computation is tested -- but whether the window manager honours a
-//!   position and size spanning a mixed-DPI virtual desktop is a fact about a
-//!   real desktop.
+//! * that the viewport covers **the display the user is on**. The rectangle
+//!   handed to the builder is [`crate::screen_capture::active_display`]'s
+//!   answer, and that choice is tested there as a pure function -- but a
+//!   `ViewportBuilder`'s position and size are a request, and everything
+//!   between here and `CreateWindowExW` may renegotiate it. That is a fact
+//!   about a real desktop and a real window manager, so it is *measured*
+//!   rather than asserted: [`log_window_rect`] writes the rectangle the window
+//!   really got beside the one it asked for, on the frame before it is shown
+//!   and on the frame it is shown, and says so loudly when they differ. On a
+//!   single 5120x1440 display the two agree exactly and the window is created
+//!   hidden at its final rectangle and shown once -- 0 samples at any other
+//!   size, sampled every 17 ms.
 //! * that the dimming composites correctly over other windows. That needs a
 //!   transparent, always-on-top window over a real compositor.
 //! * that the overlay itself is excluded from the blit, and that the vault
@@ -206,7 +213,36 @@ pub const SCAN_FOUND: &str = "Code read";
 /// 6b's two shortcut affordances, at the right-hand end of the bottom bar.
 /// Each is a bordered chip carrying its label and, in the design's monospace,
 /// the key that does the same thing.
-pub const WHOLE_SCREEN_HINT: &str = "Whole screen";
+///
+/// # It says *All screens*, and it used to say *Whole screen*
+///
+/// **This is the one word the surface gains for the overlay narrowing to a
+/// single display,** and it is the whole of what was needed there.
+///
+/// The overlay now covers the active display and nothing else -- see
+/// [`RegionOverlay::open`] -- so a code sitting on the user's other monitor
+/// can no longer be dragged over. That is the owner's explicit instruction and
+/// is implemented as asked, but it leaves a user who *does* have a code on the
+/// other screen looking at a dim they cannot extend, and a surface that offers
+/// no way out of that is a surface that has stopped being the fallback it
+/// exists to be.
+///
+/// The way out was already on the bar: [`scan_screen_with`] walks **every**
+/// monitor and always has, and this chip and the `A` key are what run it on
+/// demand. What was wrong was only the label. *"Whole screen"* on a surface
+/// that now covers one screen reads as "the whole of this screen" -- it
+/// describes the dim, and the dim is no longer the thing it does. *"All
+/// screens"* describes the scan, which is what it really runs, and in doing so
+/// tells the user on the surface itself that there is a control here that
+/// reaches the monitor the dim does not.
+///
+/// No monitor picker, and none was considered for long: a chooser is a second
+/// decision to put in front of someone who is trying to add a two-factor code,
+/// and the scan that walks every screen answers the same question without one.
+/// A code the scan cannot see on another monitor -- one it misses twice -- is
+/// a residual gap, and the honest fix for it is to move the code onto the
+/// screen the user is working on, which is what they would do anyway.
+pub const WHOLE_SCREEN_HINT: &str = "All screens";
 /// See [`WHOLE_SCREEN_HINT`]. The key printed inside that chip, and the key
 /// the callback really matches on -- [`egui::Key::A`].
 pub const WHOLE_SCREEN_KEY: &str = "A";
@@ -481,43 +517,14 @@ impl Drag {
     }
 }
 
-/// The rectangle 6b's *"Whole screen · A"* shortcut selects: the bounding box
-/// of every monitor, in virtual-screen physical pixels. `None` when the
-/// monitor enumeration came back empty, which is the one case where there is
-/// no honest answer to substitute.
-///
-/// **A bounding box, not a union.** On an L-shaped desktop the box covers
-/// pixels no monitor owns, and that is deliberate: this value is fed to
-/// [`crate::screen_capture::clamp_to_monitors`] exactly like a drag is, and
-/// that function cuts it down to the monitor it overlaps most. So "whole
-/// screen" means *the whole of the dominant monitor* rather than a stitched
-/// panorama -- which is also the only thing that could hold a QR code, since a
-/// code does not span a bezel.
-pub fn whole_screen(monitors: &[ScreenRect]) -> Option<ScreenRect> {
-    let mut bounds: Option<ScreenRect> = None;
-    for monitor in monitors {
-        if monitor.width() == 0 || monitor.height() == 0 {
-            continue;
-        }
-        bounds = Some(match bounds {
-            None => *monitor,
-            Some(so_far) => ScreenRect {
-                left: so_far.left.min(monitor.left),
-                top: so_far.top.min(monitor.top),
-                right: so_far.right.max(monitor.right),
-                bottom: so_far.bottom.max(monitor.bottom),
-            },
-        });
-    }
-    bounds
-}
-
 /// Converts a pointer position **in egui points, relative to this viewport**
 /// into virtual-screen physical pixels -- the space
 /// [`crate::screen_capture`] and every GDI call speak.
 ///
-/// `origin` is the viewport's top-left in those same pixels, which is where
-/// [`whole_screen`] put it. `points_per_pixel` is `Context::pixels_per_point`.
+/// `origin` is the viewport's top-left in those same pixels -- the top-left
+/// of the one display [`crate::screen_capture::active_display`] chose, which is
+/// where [`RegionOverlay::open`] put the window. `points_per_pixel` is
+/// `Context::pixels_per_point`.
 ///
 /// The rounding is [`f32::round`] and not a truncation: a truncating cast
 /// biases every coordinate toward the origin, which on a tight crop eats the
@@ -960,7 +967,19 @@ impl std::fmt::Debug for ScreenScan {
 ///
 /// # One monitor at a time, not one bounding box
 ///
-/// [`whole_screen`] exists and is deliberately not used here.
+/// **This did NOT narrow when the overlay did, and that is deliberate.**
+/// [`RegionOverlay::open`] now puts the window on one display, because a
+/// full-desktop window is a surface the user has to be able to dismiss and a
+/// geometry Windows renegotiates. None of that applies here: this decodes and
+/// opens no window at all, and it is the path that usually succeeds -- it is
+/// how the route answers without the user dragging anything. Narrowing it to
+/// match the overlay would make the feature worse at its main job in order to
+/// fix a complaint about a window. So the scan is every monitor and the
+/// overlay is one, the *All screens* chip runs this rather than the overlay's
+/// rectangle, and [`WHOLE_SCREEN_HINT`] is named for that.
+///
+/// A bounding box of the whole desktop would not work here either, which is
+/// the older half of this argument and the reason there is a loop at all.
 /// [`crate::screen_capture::capture_rect`] clamps whatever it is given down
 /// to *the monitor it overlaps most*, so a bounding box across a two-monitor
 /// desktop reads the larger monitor and silently ignores the other -- which
@@ -1107,7 +1126,24 @@ pub struct RegionView {
 /// demands, not a claim about concurrency.
 #[derive(Debug)]
 struct Inner {
-    origin: (i32, i32),
+    /// **The one display this overlay covers, resolved once and carried.**
+    ///
+    /// This used to be an `origin: (i32, i32)` alone, with the *size* read
+    /// back out of `screen_capture::monitor_bounds()` on every frame of
+    /// [`RegionOverlay::show`]. One rectangle rather than a corner here and an
+    /// extent there is not tidiness: the two readings could disagree -- a
+    /// monitor unplugged, a resolution changed or a screen rearranged between
+    /// the press and the frame moved the size without moving the origin -- and
+    /// a window whose position and extent come from different desktops is a
+    /// window in the wrong place by construction.
+    ///
+    /// Resolved in [`RegionOverlay::open`] by
+    /// [`crate::screen_capture::active_display`], at the moment the route
+    /// starts. It must not be recomputed later: by the time the window is up,
+    /// Deskwarden's own window has been minimised and the anchor that chose
+    /// this rectangle no longer exists. See that function for the argument
+    /// about what "active" means.
+    display: ScreenRect,
     points_per_pixel: f32,
     drag: Option<Drag>,
     found: bool,
@@ -1372,19 +1408,89 @@ fn locked(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
 }
 
 impl RegionOverlay {
-    /// Opens over the given monitors. `points_per_pixel` is the parent
-    /// context's, and `monitors` is [`crate::screen_capture::monitor_bounds`]
-    /// in production -- an argument so that the placement arithmetic can be
-    /// exercised without a desktop.
+    /// **Opens over ONE of the given monitors -- the active display -- and no
+    /// longer over the bounding box of all of them.**
+    ///
+    /// `points_per_pixel` is the parent context's, and `monitors` is
+    /// [`crate::screen_capture::monitor_bounds`] in production -- an argument
+    /// so that the placement arithmetic can be exercised without a desktop.
     ///
     /// `None` when there are no monitors to cover: there is no rectangle to
     /// put a window on, and a zero-sized always-on-top window would be a
     /// surface the user cannot dismiss.
+    ///
+    /// # Why one display, asked for by the owner
+    ///
+    /// *"just cover the whole active display with the transparent screen"*.
+    /// This used to be the bounding box of every monitor -- a `whole_screen`
+    /// helper that is gone, because placing this window was the only thing
+    /// that ever wanted it -- which on a multi-monitor desktop is a window
+    /// that is larger than any
+    /// screen, can start at a negative origin, and on an L-shaped arrangement
+    /// covers pixels no monitor owns. A user with two screens got both of them
+    /// dimmed to select a region on one.
+    ///
+    /// It is also the geometry every renegotiation Windows can perform on a
+    /// window has to act on. A window spanning two monitors at different
+    /// scaling gets `WM_DPICHANGED` the moment it is shown, and `winit`
+    /// answers that by *moving and resizing it* to the rectangle Windows
+    /// suggests (`platform_impl/windows/event_loop.rs`, the `WM_DPICHANGED`
+    /// arm: it computes a `new_outer_rect` from the suggested rect and calls
+    /// `SetWindowPos`). That is a window that appears at one size and jumps to
+    /// another, with the newly exposed part of its redirection surface
+    /// unpainted until a frame covers it -- which is the shape of the "small
+    /// popup, then transparent, then black" the owner reported. A window that
+    /// sits inside a single monitor crosses no DPI boundary and gets no such
+    /// message.
+    ///
+    /// # The anchor is read HERE, and here is the only place it can be
+    ///
+    /// [`crate::screen_capture::active_display`] carries the argument for what
+    /// "active" means and why it must be resolved before anything moves. The
+    /// deadline is this function: a few frames later
+    /// [`RegionOverlay::stand_aside`] minimises the Deskwarden window this
+    /// anchor is the centre of, and a minimised window's `GetWindowRect` is
+    /// `-32000, -32000`. So the rectangle is resolved once, now, and stored in
+    /// [`Inner::display`] -- `show` reads it back and never asks again.
+    ///
+    /// # What did NOT narrow, deliberately
+    ///
+    /// [`scan_screen_with`] still walks **every** monitor, on both of its
+    /// paths: the prescan this route runs before any window exists, and the
+    /// *All screens* chip. It is decode-only, it opens no window, and it is
+    /// the path that usually succeeds -- narrowing it would make the feature
+    /// worse at its main job to fix a complaint about a window. So the scan is
+    /// the whole desktop and the *overlay* is one screen, and the chip is
+    /// named for the scan it runs rather than for the surface it runs from.
+    /// See [`WHOLE_SCREEN_HINT`].
     pub fn open(monitors: &[ScreenRect], points_per_pixel: f32) -> Option<RegionOverlay> {
-        let bounds = whole_screen(monitors)?;
+        // The anchor: the centre of Deskwarden's own window, which is the
+        // window the press came from and is still exactly where the user put
+        // it. `None` -- no such window, which is what a test process and a
+        // probe with a differently-titled root both are -- falls through to
+        // the cursor inside `active_display`.
+        let display = screen_capture::active_display(own_window_centre(), monitors)?;
+        Self::open_on(display, points_per_pixel)
+    }
+
+    /// [`RegionOverlay::open`] with the display already chosen: everything
+    /// that function does except read the desktop.
+    ///
+    /// This is the seam the tests drive, and it is the shape the placement
+    /// arithmetic was always tested through: the arithmetic that places a
+    /// drag, a mark and a reveal inside a viewport is exercised on a display
+    /// that is negative, offset and scaled, and none of that needs a
+    /// compositor. It is also what keeps those tests deterministic now that
+    /// the production entry point reads a live cursor -- `open` on a
+    /// fabricated monitor list would otherwise answer differently depending on
+    /// where the mouse happened to be when the suite ran.
+    pub fn open_on(display: ScreenRect, points_per_pixel: f32) -> Option<RegionOverlay> {
+        if display.width() == 0 || display.height() == 0 {
+            return None;
+        }
         Some(RegionOverlay {
             inner: Arc::new(Mutex::new(Inner {
-                origin: (bounds.left, bounds.top),
+                display,
                 points_per_pixel,
                 drag: None,
                 found: false,
@@ -1430,8 +1536,8 @@ impl RegionOverlay {
         let to_points = |rect: ScreenRect| {
             let at = |x: i32, y: i32| {
                 egui::pos2(
-                    (x - held.origin.0) as f32 / scale,
-                    (y - held.origin.1) as f32 / scale,
+                    (x - held.display.left) as f32 / scale,
+                    (y - held.display.top) as f32 / scale,
                 )
             };
             egui::Rect::from_min_max(at(rect.left, rect.top), at(rect.right, rect.bottom))
@@ -1773,15 +1879,35 @@ impl RegionOverlay {
         // unoptimised build. Two or three per overlay, none after that.
         let waiting = matches!(locked(&self.inner).appearing, Appearing::Waiting);
         let exists = waiting && crate::foreground::own_window_titled(REGION_TITLE).is_some();
+        let display = locked(&self.inner).display;
         if locked(&self.inner).appearing.compose(exists) {
             let_the_desktop_through(REGION_TITLE);
             exclude_from_capture(REGION_TITLE);
+            // **Before the show**, which is the whole value of measuring here:
+            // this is the last moment the geometry can be inspected without
+            // the user having already seen whatever it is. See
+            // [`log_window_rect`].
+            log_window_rect(REGION_TITLE, "hidden, about to be shown", display);
             ctx.send_viewport_cmd_to(region_viewport(), egui::ViewportCommand::Visible(true));
             ctx.request_repaint_of(region_viewport());
             ctx.request_repaint();
             return;
         }
         if locked(&self.inner).appearing.on_screen() {
+            // And again on the first frame it is up, because the show itself
+            // is one of the moments Windows may renegotiate the rectangle --
+            // `ShowWindow` is what moves a window onto a monitor as far as
+            // `WM_DPICHANGED` is concerned. Two lines, one before and one
+            // after, is what tells "it was never the right size" apart from
+            // "it was, and then it moved".
+            log_window_rect(REGION_TITLE, "shown", display);
+            // **The DWM call, a second time, now that the window is really on
+            // screen.** See [`let_the_desktop_through`]'s "Twice, and why"
+            // -- this is the half that is made on a visible window, and it is
+            // here rather than in the callback so that it lands before the
+            // raise and the minimise rather than behind their two
+            // `EnumWindows`.
+            let_the_desktop_through(REGION_TITLE);
             // A selection surface that opens behind the window being selected
             // from is useless, so this one raises; see its row in
             // `foreground::OPENS_A_VIEWPORT_AND_RAISES_IT`.
@@ -1888,7 +2014,11 @@ impl RegionOverlay {
             let Some(at) = pointer else {
                 return;
             };
-            let cursor = to_screen(held.origin, held.points_per_pixel, at);
+            let cursor = to_screen(
+                (held.display.left, held.display.top),
+                held.points_per_pixel,
+                at,
+            );
             match (held.drag, down) {
                 // A drag begins.
                 (None, true) => {
@@ -2007,17 +2137,24 @@ impl RegionOverlay {
             PrescanStep::Done => {}
         }
 
-        let (origin, scale) = {
+        // **One rectangle, read back from where `open` stored it, and no
+        // second reading of the desktop.**
+        //
+        // This block used to take the origin from `Inner` and the size from a
+        // fresh `screen_capture::monitor_bounds()` on every frame, which is
+        // two readings of a desktop that is allowed to change between them:
+        // unplug a monitor, change a resolution or drag a screen in Display
+        // Settings and the position came from the old arrangement while the
+        // extent came from the new one. Worse, the size was recomputed after
+        // Deskwarden's own window had been minimised, which is precisely the
+        // moment the anchor that chose it stopped existing. `Inner::display`
+        // is resolved once in `open` and carried; see it, and
+        // `screen_capture::active_display`, for why.
+        let (display, scale) = {
             let held = locked(&self.inner);
-            (held.origin, held.points_per_pixel)
+            (held.display, held.points_per_pixel)
         };
-        let bounds = screen_capture::monitor_bounds();
-        let size = whole_screen(&bounds).unwrap_or(ScreenRect {
-            left: origin.0,
-            top: origin.1,
-            right: origin.0,
-            bottom: origin.1,
-        });
+        let origin = (display.left, display.top);
         let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
 
         // Every frame: a lock-on that only ran on egui input would stop the
@@ -2037,8 +2174,8 @@ impl RegionOverlay {
                 .with_title(REGION_TITLE)
                 .with_position(egui::pos2(origin.0 as f32 / scale, origin.1 as f32 / scale))
                 .with_inner_size([
-                    size.width() as f32 / scale,
-                    size.height() as f32 / scale,
+                    display.width() as f32 / scale,
+                    display.height() as f32 / scale,
                 ])
                 .with_decorations(false)
                 .with_always_on_top()
@@ -2906,6 +3043,57 @@ fn exclude_from_capture(title: &str) {
 /// `login_ui::round_window_corners` for the same pattern and the longer
 /// argument about why the lookup must be process-scoped.
 ///
+/// # Twice, and why -- once hidden and once on screen
+///
+/// [`RegionOverlay::appear`] calls this on **both** of its steps: on the frame
+/// the window first exists and is still hidden, and again on the first frame
+/// it is up. That is deliberate belt-and-braces against one specific doubt,
+/// and the doubt is worth writing down because the obvious "simplification" is
+/// to delete one of them.
+///
+/// The doubt: does a blur-behind registration made on a **hidden** window
+/// survive being shown? Showing a window can rebuild its redirection surface,
+/// and a registration that was dropped there would leave the overlay
+/// compositing no alpha at all -- which does not look like a subtle bug, it
+/// looks like a **black screen**, because `window_host`'s clear is fully
+/// transparent and `DIM_ALPHA` over nothing is `rgb(14, 13, 13)`. The history
+/// fits that shape: before the window was created hidden the call was made on
+/// a visible window and the surface was see-through (at the cost of 1315 ms of
+/// white); after, a black screen was reported.
+///
+/// **It is not what was measured on this machine.** The probe in
+/// `scratchpad/dimprobe` drives the real [`RegionOverlay::show`] and the real
+/// [`Appearing`] machine through exactly the hidden-then-shown path, samples a
+/// patch of a checkerboard backdrop every ~17 ms and fits two models to it.
+/// With the single hidden call and nothing else, from the first visible sample
+/// onwards: mean absolute error **0.37** against `backdrop * (1 - a) + dim *
+/// a` and **59.71** against `dim * a`, correlation with the backdrop
+/// **1.0000**, and no black or white sample anywhere in the run. A
+/// registration that had been dropped by the show could not produce that: 0.37
+/// out of 255 is the blend, per pixel, at exactly `DIM_ALPHA`. So on this
+/// desktop and this driver the hidden call does survive.
+///
+/// The second call stays anyway, and the argument for keeping it is not
+/// superstition:
+///
+/// * It costs one `EnumWindows` and one DWM call, once per overlay, on a frame
+///   that is already doing two of each for the raise and the minimise.
+/// * It cannot reintroduce the white box. The white box was the window being
+///   *on screen* before anything had composited it; this runs a frame after
+///   the window was composited, asks for the same thing that was already
+///   asked for, and changes nothing about when the window appears.
+/// * "The registration survived the show on the machine I could measure" is a
+///   weaker claim than "the registration is in place while the window is
+///   visible", and the second one is what the surface actually needs. A driver
+///   or a compositor generation where the first is false costs the user a
+///   black rectangle covering their screen, and this is the cheapest possible
+///   insurance against it.
+///
+/// What it is **not** allowed to become is a call made *instead* of the hidden
+/// one, or one made from the viewport callback. Both put the DWM call behind
+/// the window appearing, which is the 1315 ms regression [`Appearing`] carries
+/// the measurement for.
+///
 /// # Not tested, and cannot be
 ///
 /// There is no window in a test process, so this is a no-op there and no
@@ -3049,6 +3237,128 @@ fn set_capture_exclusion(title: &str, exclude: bool) {
 /// down is a user staring at Deskwarden sitting on top of the code they are
 /// being asked to point at, and without this line there is nothing in
 /// `deskwarden.log` that tells that apart from a window that went down fine.
+/// **Where the user is, read at the instant the route starts**: the centre of
+/// Deskwarden's own window in virtual-screen physical pixels.
+///
+/// This is the anchor [`crate::screen_capture::active_display`] picks a
+/// monitor by, and the centre rather than the top-left because a window
+/// straddling two screens belongs to the one that has most of it -- which is
+/// also what `MonitorFromWindow(MONITOR_DEFAULTTONEAREST)` answers and what
+/// `app::clamp_to_monitor` already relies on for the autofill card.
+///
+/// `None` in three cases, all of which fall through to the cursor in
+/// `active_display`: there is no window with that title (a test process, or a
+/// probe whose root is titled something else), `GetWindowRect` refused, or the
+/// window is already minimised. **That last one is the point of the check.** A
+/// minimised window's rectangle on Windows is `-32000, -32000` -- a sentinel,
+/// not a position -- and handing it to a nearest-monitor rule would reliably
+/// pick the top-left screen of the desktop rather than the one the user is on.
+/// This function is only ever called from `RegionOverlay::open`, before
+/// anything in this module has minimised anything, so an iconic window here
+/// means the *user* had the app minimised when the press arrived, and the
+/// cursor is then the better answer.
+///
+/// Logged either way, like every other Win32 call in this module: "the overlay
+/// came up on the wrong screen" is a report that cannot be answered without
+/// knowing what this returned.
+fn own_window_centre() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsIconic};
+
+    let title = crate::vault_window::WINDOW_TITLE;
+    let Some(hwnd) = crate::foreground::own_window_titled(title) else {
+        log::info!(
+            "region overlay: no window titled {title:?} to anchor the overlay's display on; \
+             falling back to the mouse cursor"
+        );
+        return None;
+    };
+    let handle = HWND(hwnd as *mut _);
+    if unsafe { IsIconic(handle) }.as_bool() {
+        log::info!(
+            "region overlay: {title:?} is already minimised, so its rectangle is Windows' \
+             -32000 sentinel and not a position; falling back to the mouse cursor"
+        );
+        return None;
+    }
+    let mut rect = RECT::default();
+    if let Err(e) = unsafe { GetWindowRect(handle, &mut rect) } {
+        log::warn!(
+            "region overlay: GetWindowRect refused on {title:?} ({hwnd:#x}): {e}; falling back \
+             to the mouse cursor to choose the overlay's display"
+        );
+        return None;
+    }
+    let centre = (
+        rect.left + (rect.right - rect.left) / 2,
+        rect.top + (rect.bottom - rect.top) / 2,
+    );
+    log::info!("region overlay: {title:?} is at {rect:?}, anchoring the overlay on {centre:?}");
+    Some(centre)
+}
+
+/// **What rectangle the OS actually gave the overlay's window**, against the
+/// one that was asked for.
+///
+/// # Why this is logged and not merely trusted
+///
+/// A `ViewportBuilder`'s position and size are a *request*. Everything between
+/// this module and `CreateWindowExW` is allowed to renegotiate it: `winit`
+/// creates every window at `CW_USEDEFAULT` and applies the size and the
+/// position afterwards, converting logical points to pixels with the scale
+/// factor of whichever monitor the window happened to land on; Windows then
+/// sends `WM_DPICHANGED` if the result straddles two monitors at different
+/// scaling, and `winit`'s handler answers that by moving and resizing the
+/// window to the rectangle Windows suggests. Every one of those is invisible
+/// from here, and the symptom of all of them is the same: a window that is not
+/// the size it asked to be, with the part of its redirection surface nobody
+/// has painted showing through as a flat rectangle.
+///
+/// So the two rectangles are compared and the answer is written down. On the
+/// hidden frame -- [`Appearing::Hidden`] -- this is the last chance to see the
+/// geometry before the user does; on the frame it is shown it is the record of
+/// what they saw. A mismatch is a `warn` with both rectangles in it, which is
+/// the line the next multi-monitor report will be answered from.
+fn log_window_rect(title: &str, step: &str, asked_for: ScreenRect) {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+
+    let Some(hwnd) = crate::foreground::own_window_titled(title) else {
+        log::warn!("region overlay: no window titled {title:?} to measure at {step}");
+        return;
+    };
+    let mut rect = RECT::default();
+    if let Err(e) = unsafe { GetWindowRect(HWND(hwnd as *mut _), &mut rect) } {
+        log::warn!("region overlay: GetWindowRect refused on {title:?} at {step}: {e}");
+        return;
+    }
+    let got = ScreenRect {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.bottom,
+    };
+    if got == asked_for {
+        log::info!(
+            "region overlay: {step} -- the window is at {got:?} ({}x{}), which is the display \
+             that was asked for",
+            got.width(),
+            got.height()
+        );
+    } else {
+        log::warn!(
+            "region overlay: {step} -- the window is at {got:?} ({}x{}) and NOT at the {}x{} \
+             display it asked for, {asked_for:?}. Something between this module and \
+             CreateWindowExW renegotiated the geometry; the part of the surface no frame has \
+             painted will show as a flat rectangle",
+            got.width(),
+            got.height(),
+            asked_for.width(),
+            asked_for.height()
+        );
+    }
+}
+
 fn send_window_down(title: &str) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindow, SW_SHOWMINNOACTIVE};
@@ -3278,29 +3588,151 @@ mod tests {
         }
     }
 
-    /// **"Whole screen" spans every monitor, including ones left of and above
-    /// the primary** -- where the coordinates are negative and a `max`-only
-    /// bounding box silently drops them.
+    /// **The overlay covers ONE display, and the window is sized from the one
+    /// it was given rather than from a second reading of the desktop.**
+    ///
+    /// The owner's report, and the thing this whole change is: *"just cover
+    /// the whole active display with the transparent screen"*. Three things
+    /// have to hold together and only the first two are assertable as values;
+    /// the third is source, because it is inside a `ViewportBuilder` no
+    /// harness in this crate can call.
     #[test]
-    fn whole_screen_covers_monitors_placed_before_the_origin() {
-        let monitors = [rect(0, 0, 1920, 1080), rect(-1280, -200, 0, 520)];
-        assert_eq!(whole_screen(&monitors), Some(rect(-1280, -200, 1920, 1080)));
-        // Positive control on the negative half: with only the primary, the
-        // answer really is just the primary, so the assertion above is about
-        // the second monitor and not about a hardcoded box.
-        assert_eq!(whole_screen(&monitors[..1]), Some(rect(0, 0, 1920, 1080)));
+    fn the_overlay_covers_one_display_and_sizes_itself_from_it() {
+        // The rectangle the overlay carries IS the display it was opened on,
+        // corner and extent both -- not the bounding box of anything.
+        let display = rect(-1280, -200, 0, 520);
+        let overlay = RegionOverlay::open_on(display, 1.0).expect("opens");
+        assert_eq!(locked(&overlay.inner).display, display);
+        // A pointer at the far corner of the viewport is the far corner of
+        // THAT display, which is the observable consequence of the extent
+        // being one screen's: 1280x720 points at 1.0.
+        assert_eq!(
+            to_screen(
+                (display.left, display.top),
+                1.0,
+                (display.width() as f32, display.height() as f32)
+            ),
+            (0, 520)
+        );
+
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+
+        // **The display is chosen once, in `open`.** `show` runs every frame
+        // and runs after the minimise; a `screen_capture::active_display` call
+        // anywhere in it would be a rectangle chosen from an anchor that no
+        // longer exists. See `screen_capture::active_display`.
+        assert_eq!(
+            code.matches("screen_capture::active_display(").count(),
+            1,
+            "the active display is resolved somewhere other than `open`, or not at all -- it \
+             has to be read before `stand_aside` minimises the window the anchor is the centre \
+             of, and carried from there"
+        );
+        let opener = code
+            .split("pub fn open(monitors: &[ScreenRect], points_per_pixel: f32)")
+            .nth(1)
+            .expect("`RegionOverlay::open` was restructured");
+        assert!(
+            opener
+                .split("fn open_on")
+                .next()
+                .unwrap()
+                .contains("screen_capture::active_display(own_window_centre(), monitors)"),
+            "`open` no longer anchors the display on Deskwarden's own window"
+        );
+
+        // **And `show` sizes the window from what was carried, not from a
+        // fresh enumeration.** This is the half that used to read
+        // `monitor_bounds()` every frame for the extent while taking the
+        // corner from `Inner`; the two could disagree, and did so exactly when
+        // the desktop changed under a live overlay.
+        let builder = code
+            .split("ViewportBuilder::default()")
+            .nth(1)
+            .expect("the viewport builder is gone")
+            .split(".with_visible(false)")
+            .next()
+            .unwrap();
+        assert!(
+            builder.contains("display.width() as f32 / scale")
+                && builder.contains("display.height() as f32 / scale"),
+            "the overlay's window is sized from something other than the display it carries"
+        );
+        assert!(
+            !builder.contains("monitor_bounds"),
+            "the viewport builder reads the desktop again instead of using the display `open` \
+             chose"
+        );
     }
 
-    /// No monitors -- and an empty degenerate one -- give no rectangle rather
-    /// than a zero-sized always-on-top window the user cannot dismiss.
+    /// **The scan still walks EVERY monitor, on both of its paths.**
+    ///
+    /// The overlay narrowed to one display and this deliberately did not. See
+    /// [`scan_screen_with`]: it opens no window, it is decode-only, and it is
+    /// the path that usually answers the route without the user dragging
+    /// anything -- narrowing it to match the surface would make the feature
+    /// worse at its main job. Both call sites are pinned because there are
+    /// exactly two and one of them is inside the viewport callback.
+    #[test]
+    fn the_scan_still_reads_every_monitor_even_though_the_overlay_does_not() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(
+            code.matches("scan_screen_with(").count(),
+            3,
+            "the number of `scan_screen_with` call sites changed: one definition, the prescan \
+             and the All screens chip"
+        );
+        // Neither of the two calls narrows what it is given, and there are
+        // exactly two desktop enumerations left -- one per scan. Comment lines
+        // are dropped first, because this module's docs name the function
+        // constantly and a raw count would be about the prose.
+        let statements: String = code
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            statements.matches("screen_capture::monitor_bounds()").count(),
+            2,
+            "a `monitor_bounds()` reading was added or removed; the only two left should be the \
+             prescan's and the All screens chip's, both feeding `scan_screen_with`"
+        );
+        assert!(
+            code.contains("self.apply_scan(scan_screen_with(&RegionSeams::production(), &monitors));"),
+            "the prescan no longer scans the monitor list it enumerated"
+        );
+        assert!(
+            code.contains("&screen_capture::monitor_bounds(),"),
+            "the All screens chip no longer scans every monitor"
+        );
+        // And the chip that runs it is named for that, rather than for the
+        // surface it sits on. See `WHOLE_SCREEN_HINT`.
+        assert_eq!(WHOLE_SCREEN_HINT, "All screens");
+    }
+
+    /// No monitors -- and a degenerate one -- give no overlay rather than a
+    /// zero-sized always-on-top window the user cannot dismiss.
+    ///
+    /// This used to assert the same thing of a `whole_screen` that is gone:
+    /// the overlay's rectangle is now one display, chosen by
+    /// `screen_capture::display_holding`, and the refusal it is asserting has
+    /// moved there with it. `the_active_display_is_the_one_holding_the_anchor`
+    /// and its neighbours in `screen_capture` are where the choice is tested;
+    /// this is about what `open` does with "there is no display".
     #[test]
     fn no_monitors_is_no_overlay() {
-        assert_eq!(whole_screen(&[]), None);
-        assert_eq!(whole_screen(&[rect(10, 10, 10, 10)]), None);
         assert!(RegionOverlay::open(&[], 1.0).is_none());
+        assert!(RegionOverlay::open(&[rect(10, 10, 10, 10)], 1.0).is_none());
+        // The same refusal at the seam the tests drive, where nothing reads a
+        // desktop at all.
+        assert!(RegionOverlay::open_on(rect(10, 10, 10, 10), 1.0).is_none());
         // Positive control: with a monitor, one really does open, so the
-        // `is_none` above is about the empty list.
+        // `is_none`s above are about the missing rectangle.
         assert!(RegionOverlay::open(&[rect(0, 0, 800, 600)], 1.0).is_some());
+        assert!(RegionOverlay::open_on(rect(0, 0, 800, 600), 1.0).is_some());
     }
 
     /// **Points to virtual-screen pixels, on a monitor whose origin is
@@ -3783,7 +4215,11 @@ mod tests {
     /// lie `ADD_TOTP_SHORTCUT` is pinned against elsewhere in this crate.
     #[test]
     fn the_shortcut_chips_name_the_keys_that_work() {
-        assert_eq!(WHOLE_SCREEN_HINT, "Whole screen");
+        // **"All screens" and not "Whole screen".** The chip is named for the
+        // scan it runs, which walks every monitor, and no longer for the
+        // surface it sits on, which now covers one. See `WHOLE_SCREEN_HINT`
+        // for the argument, and `RegionOverlay::open` for what narrowed.
+        assert_eq!(WHOLE_SCREEN_HINT, "All screens");
         assert_eq!(WHOLE_SCREEN_KEY, "A");
         assert_eq!(CANCEL_HINT, "Cancel");
         assert_eq!(CANCEL_KEY, "ESC");
@@ -4047,7 +4483,7 @@ mod tests {
     /// **Every monitor is read, not just the biggest one.**
     ///
     /// This is the reason `scan_screen_with` walks monitors instead of
-    /// handing `whole_screen`'s bounding box to one capture:
+    /// handing the bounding box of the desktop to one capture:
     /// `capture_rect` clamps to the monitor it overlaps most, so a bounding
     /// box would read the large monitor and never look at the small one --
     /// and the small one is where the code is here, exactly as it is when the
@@ -4638,7 +5074,7 @@ mod tests {
             .split("match self.prescan_step(Instant::now()) {")
             .nth(1)
             .expect("`show` no longer drives the prescan through a match")
-            .split("let (origin, scale) = {")
+            .split("let (display, scale) = {")
             .next()
             .expect("the prescan match no longer ends where it did");
         assert!(
@@ -4844,9 +5280,15 @@ mod tests {
 
     // -- the reveal --------------------------------------------------------
 
-    /// A found scan, ready to be revealed, on an overlay covering `monitors`.
-    fn found_on(monitors: &[ScreenRect], scale: f32, at: ScreenRect) -> RegionOverlay {
-        let overlay = RegionOverlay::open(monitors, scale).expect("opens");
+    /// A found scan, ready to be revealed, on an overlay covering `display`.
+    ///
+    /// Takes the one display rather than a monitor list since the overlay
+    /// stopped covering every monitor: `open_on` is the seam that skips the
+    /// live cursor reading, which is what keeps these assertions about the
+    /// arithmetic rather than about where the mouse happened to be. See
+    /// [`RegionOverlay::open_on`].
+    fn found_on(display: ScreenRect, scale: f32, at: ScreenRect) -> RegionOverlay {
+        let overlay = RegionOverlay::open_on(display, scale).expect("opens");
         overlay.apply_scan(ScreenScan::Found(
             Zeroizing::new("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP".into()),
             at,
@@ -4863,7 +5305,7 @@ mod tests {
     /// code.
     #[test]
     fn the_reveal_runs_once_on_a_clock_and_then_never_again() {
-        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        let overlay = found_on(rect(0, 0, 1920, 1080), 1.0, FOUND_AT);
         let t0 = Instant::now();
         // The first painted frame starts the clock and shows the mark.
         assert_eq!(overlay.reveal_step(t0), Some(FOUND_AT));
@@ -4903,7 +5345,7 @@ mod tests {
     /// which is the shape of the hang this module has already shipped once.
     #[test]
     fn a_second_scan_cannot_restart_or_reopen_the_reveal() {
-        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        let overlay = found_on(rect(0, 0, 1920, 1080), 1.0, FOUND_AT);
         let t0 = Instant::now();
         assert_eq!(overlay.reveal_step(t0), Some(FOUND_AT));
 
@@ -4943,7 +5385,7 @@ mod tests {
     /// with no pointer, no key and no press anywhere in the sequence.
     #[test]
     fn the_reveal_does_not_wait_for_the_user() {
-        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        let overlay = found_on(rect(0, 0, 1920, 1080), 1.0, FOUND_AT);
         let t0 = Instant::now();
         // Two hundred frames inside the dwell, with no input of any kind. The
         // first of them starts the clock; the rest are the repaints an idle
@@ -5004,17 +5446,21 @@ mod tests {
     /// The last leg of the coordinate chain: `qr` reports a box in the
     /// captured buffer's pixels, `scan_screen_with` places it on the virtual
     /// screen, and this converts it into points inside a viewport whose origin
-    /// is the desktop's top-left. Every step of that is a subtraction or a
-    /// division that is the identity on a single 100% monitor, so this is
-    /// driven on a desktop that is neither.
+    /// is the covered display's top-left. Every step of that is a subtraction
+    /// or a division that is the identity on a single 100% monitor at the
+    /// origin, so this is driven on a display that is neither.
     #[test]
     fn the_mark_is_drawn_over_the_code_and_not_beside_it() {
-        // Origin at (-1280, -200) -- a monitor left of and above the primary
-        // -- at 200% scaling, so both the offset and the scale factor have to
-        // be taken out for the answer to be right.
-        let monitors = [rect(-1280, -200, 0, 520), rect(0, 0, 1920, 1080)];
+        // The overlay covers ONE display, and this one is placed left of and
+        // above the primary at 200% scaling -- so both the offset and the
+        // scale factor have to be taken out for the answer to be right. It
+        // used to be the bounding box of a two-monitor desktop, which had the
+        // same top-left by construction; the arithmetic under test is
+        // unchanged and the rectangle it is driven on is now the one the
+        // window really gets. See `RegionOverlay::open`.
+        let display = rect(-1280, -200, 0, 520);
         let at = rect(-1080, 0, -880, 200);
-        let overlay = found_on(&monitors, 2.0, at);
+        let overlay = found_on(display, 2.0, at);
         // In screen pixels the code runs from (-1080, 0) to (-880, 200); the
         // viewport's origin is (-1280, -200), so that is 200..400 by 200..400
         // pixels in, and at 2.0 that is 100..200 by 100..200 points.
@@ -5025,7 +5471,7 @@ mod tests {
         // The same code on a plain 100% single-monitor desktop is reported at
         // its own pixels, which is the control that says the arithmetic above
         // is the offset and the scale and not a coincidence.
-        let plain = found_on(&[rect(0, 0, 1920, 1080)], 1.0, rect(300, 200, 460, 380));
+        let plain = found_on(rect(0, 0, 1920, 1080), 1.0, rect(300, 200, 460, 380));
         assert_eq!(
             plain.view().reveal,
             Some(rect_pts(300.0, 200.0, 460.0, 380.0))
@@ -5105,7 +5551,7 @@ mod tests {
     /// so no window and no sleeping is involved.
     #[test]
     fn the_reveal_waits_for_the_vault_window_to_get_out_of_the_way() {
-        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        let overlay = found_on(rect(0, 0, 1920, 1080), 1.0, FOUND_AT);
         let t0 = Instant::now();
         // What the first-frame hook does, without the Win32 call it also
         // makes: the window went down at `t0`.
@@ -5148,7 +5594,7 @@ mod tests {
     /// of every reveal for no reason at all.
     #[test]
     fn a_reveal_with_nothing_to_wait_for_starts_at_once() {
-        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        let overlay = found_on(rect(0, 0, 1920, 1080), 1.0, FOUND_AT);
         let t0 = Instant::now();
         assert!(locked(&overlay.inner).aside_at.is_none());
         assert_eq!(overlay.reveal_step(t0), Some(FOUND_AT));
@@ -5257,6 +5703,26 @@ mod tests {
                 < shown,
             "the window is shown before it is taken out of screen captures, so a capture \
              taken in between reads this overlay's own dim"
+        );
+        // **And a second time, after the show.** See `let_the_desktop_through`'s
+        // "Twice, and why": the hidden call was measured to survive the show
+        // on this machine, and the second one is the insurance against a
+        // driver where it does not -- where the cost to the user is a black
+        // rectangle over their screen rather than a subtle artefact. It is
+        // insurance only: it must be an ADDITION to the hidden call and never
+        // a replacement for it, which is what `dwm < shown` above holds.
+        assert_eq!(
+            first.matches("let_the_desktop_through(REGION_TITLE);").count(),
+            2,
+            "the DWM call is no longer made exactly twice in `appear` -- once on the hidden \
+             window and once on the first frame it is up. Dropping the second one takes the \
+             black-screen insurance away; dropping the first one puts the 1315 ms white box \
+             back"
+        );
+        assert!(
+            first.rfind("let_the_desktop_through(REGION_TITLE);").unwrap() > shown,
+            "the second DWM call is not after the show, so both of them are made on a hidden \
+             window and the surface has no call made while it is visible at all"
         );
         // **And the step means "the window exists", not "this has not run
         // before".** That was the defect that shipped through 0.15.21 and it is
@@ -5423,7 +5889,7 @@ mod tests {
     /// window.
     #[test]
     fn the_reveal_waits_for_the_window_to_have_finished_appearing() {
-        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        let overlay = found_on(rect(0, 0, 1920, 1080), 1.0, FOUND_AT);
         locked(&overlay.inner).appearing = Appearing::Hidden;
         let t0 = Instant::now();
         // Frames pass, the mark is painted, and the clock does not start: the
