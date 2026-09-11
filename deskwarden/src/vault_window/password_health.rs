@@ -1136,9 +1136,13 @@ fn draw_summary(ui: &mut egui::Ui, report: &HealthReport) {
 }
 
 /// A "REUSED"/"WEAK" band, in the sidebar's own section-label idiom.
+///
+/// [`theme::eyebrow`] and no longer five arguments spelled out here: the five
+/// were exactly that function's, and a private copy of a design-system
+/// element is how two surfaces come to draw the same band at two weights.
 fn section_heading(ui: &mut egui::Ui, text: &str) {
     ui.add_space(6.0);
-    ui.label(theme::letterspaced(text, 11.0, theme::BOLD, 1.2, theme::TEXT_GHOST));
+    theme::eyebrow(ui, text);
 }
 
 /// "One password, 3 items", over the rows it covers.

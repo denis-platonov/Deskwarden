@@ -3844,6 +3844,57 @@ pub fn field_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(TEXT_MUTED));
 }
 
+/// **The design's section eyebrow**: the small all-caps, letterspaced,
+/// ghost-grey line that names the block under it.
+///
+/// It is the same run of CSS everywhere the design uses it — `font-size:
+/// 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+/// color: #9b9797` — and it is used in nearly every panel on the page: the
+/// sidebar's `VAULT` and `SHARING` headers (§5b), the Send composer's
+/// `RECORD` / `INCLUDE` / `ACCESS` blocks (§5a), the history card's
+/// `ACTIVITY` and the `STATES` legend (§5c), and the password-health and
+/// preferences cards besides.
+///
+/// **It is a design-system element and not a call-site flourish**, which is
+/// the whole reason it is here. Five surfaces in this crate already spell the
+/// same five arguments out by hand — `sidebar::section_label`,
+/// `password_health`, `prefs_ui` twice, `detail`, `totp_add` — and the two
+/// that happen to disagree do so by a tenth of a pixel of tracking, which is
+/// exactly the kind of drift that nobody can see in one screenshot and
+/// everybody can see in two. A sixth hand-spelled copy inside the Send
+/// composer would have been the one that made "the eyebrow" a matter of
+/// opinion.
+///
+/// **Uppercasing is NOT done here.** `text-transform: uppercase` is a
+/// presentation rule in CSS and an irreversible string edit in Rust: a caller
+/// that handed this an already-capitalised constant would get the constant it
+/// can grep for, and a caller that handed it a sentence would get a shout it
+/// never asked for. Every caller in this crate passes a literal that is
+/// already in the case the design draws it in, and that literal is the thing
+/// a paint test can search the painted glyphs for.
+///
+/// The tracking is 1.2 and not the 1.1 [`CARD_HEADER_TRACKING`] uses. Both
+/// are `0.1em` at 11px in the design; the wordmark's is tuned a tenth tighter
+/// against the mark it sits beside, and this one is the value the sidebar's
+/// headers were measured to.
+pub fn eyebrow(ui: &mut Ui, text: &str) {
+    ui.label(letterspaced(text, EYEBROW_PX, BOLD, EYEBROW_TRACKING, TEXT_GHOST));
+}
+
+/// [`eyebrow`]'s type size. `font-size: 11px` in the design, everywhere it
+/// appears.
+pub const EYEBROW_PX: f32 = 11.0;
+
+/// [`eyebrow`]'s letter tracking: the design's `letter-spacing: 0.1em` at
+/// [`EYEBROW_PX`], which is 1.1 points, drawn at the 1.2 the sidebar's
+/// section headers were measured to and which this app has therefore been
+/// shipping since design 4.8.
+///
+/// Both numbers are `pub` for the reason [`SEGMENT_SEAM`] is: a surface's own
+/// paint test that wants to say "this line is the eyebrow" should measure
+/// against the design system's value rather than restate it.
+pub const EYEBROW_TRACKING: f32 = 1.2;
+
 /// [`field_label`], greyed, for a field that cannot be typed into right now
 /// -- see [`disabled_text_field`]. A label left at [`TEXT_MUTED`] over a
 /// greyed box reads as a live field whose box happens to be pale.

@@ -39,6 +39,46 @@
 //! user can get back to a link they published. The create's own banner shows
 //! the new link too, but the list is what makes it durable -- which is why a
 //! successful create invalidates the list rather than only reporting.
+//!
+//! ## Design §5b and §5c, and what this screen is not
+//!
+//! §5a — "Compose a Send" — is **not this file**. It is
+//! [`super::record_ui::draw_export_form`], whose card header is §5a's own
+//! `Send a record` and whose tick list is §5a's field-level opt-in; the
+//! composer below makes a plain text Send and has no counterpart anywhere on
+//! the design page. The lifetime run and the footer here nevertheless take
+//! their treatment from §5a, because this app has one segmented control and
+//! one pair of footer buttons and the Send screens were the last surface
+//! still drawing its own.
+//!
+//! **§5b, "Shared folder", is a full-window frame and not a screen to build.**
+//! It wears the page's dark badge, which across the whole design marks the
+//! frames drawn at window width (2b "Vault window", 3f, 4e, 7b) rather than
+//! the panel-sized mockups, and its caption says so outright: SAME LIST +
+//! DETAIL AS THE VAULT. It is the existing vault window with the Sends screen
+//! in the centre column — a wider framing of surfaces that exist — plus three
+//! things that do not: a `SHARING` sidebar section with `Waiting` / `Used` /
+//! `Ended` sub-filters under it, a `Shared with me` row, and a per-Send detail
+//! pane. The titlebar `Send a record CTRL+⇧+S` pill it draws was built, then
+//! **removed at the owner's direction** and replaced by an envelope in the
+//! detail pane's header strip; see [`super::record_ui::SEND_RECORD_LABEL`],
+//! where that departure is argued in place. So §5b is not evidence of an
+//! unbuilt screen so much as of an unbuilt *state model* — see §5c.
+//!
+//! **§5c, "History & states", is a feature and not a treatment.** It wants
+//! four named states (`Waiting`, `Used`, `Expired`, `Revoked`) and a per-Send
+//! timeline reading "Password revealed · 15:01 · Edge on Windows · Berlin, DE
+//! · 84.13.…". [`SendSummary`] carries an id, a name, an access URL, a
+//! deletion date and `is_file`, and [`SendRow`] paints those. The states are
+//! *derivable* from fields Bitwarden's Send API does have and this crate's
+//! parser does not read (`accessCount`, `maxAccessCount`, `disabled`,
+//! `expirationDate`); the timeline is not, at any price — there is no
+//! per-access audit in a Bitwarden Send, no recipient, no user agent and no
+//! geolocation, and nothing here could invent them. Painting the four state
+//! pills over an inferred state, while the card above them promises an
+//! opened-at time this app cannot know, would make the richer half of §5c a
+//! blank that reads as a bug. Both halves need the owner's call on what the
+//! feature is before either is drawn.
 
 use crate::local_time::LocalOffset;
 use crate::send::{SendClock, SendError, SendSummary};
@@ -1299,34 +1339,60 @@ fn draw_composer(
             );
 
             ui.add_space(10.0);
-            ui.label(
-                egui::RichText::new(LIFETIME_PROMPT)
-                    .size(12.0)
-                    .color(theme::TEXT_FAINT),
-            );
+            theme::field_label(ui, LIFETIME_PROMPT);
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                // **The choices come from `send.rs` and are not spelled
-                // here.** `validate_plan` refuses any other value, so a
-                // button offering one would be a control that cannot work.
-                for days in crate::send::DELETE_IN_DAYS_CHOICES {
-                    let chosen = composer.plan.delete_in_days == days;
-                    let colour = if chosen { theme::INK } else { theme::TEXT_MUTED };
-                    if ui
-                        .add_enabled(
-                            enabled,
-                            egui::Button::new(
-                                egui::RichText::new(lifetime_label(days)).size(12.0).color(colour),
-                            )
-                            .selected(chosen)
-                            .min_size(egui::vec2(72.0, COPY_BUTTON_HEIGHT)),
-                        )
-                        .clicked()
-                    {
-                        composer.plan.delete_in_days = days;
-                    }
+            // **One control with three positions, and not three buttons.**
+            //
+            // Design §5a draws the Send's lifetime as the page's segmented
+            // control: cells butted together inside one rounded outline, the
+            // chosen cell filled solid blue behind white. What stood here was
+            // a `ui.horizontal` of three `egui::Button`s with `.selected()`
+            // on one of them -- separated by egui's item spacing, each with
+            // its own outline, each 72 points wide whatever its label said.
+            // That is precisely the shape `theme::segmented_control`'s own
+            // documentation records this app moving away from: separated
+            // cells "read as a row of independent buttons: three things you
+            // might press, rather than one control with three positions".
+            // The Send screen was the last surface still drawing the old one,
+            // so "the app has one segmented control" was true of the design
+            // system and false of the app.
+            //
+            // It also fixes the selected cell's colour by accident of doing
+            // the right thing: `.selected()` gives egui's own selection fill
+            // with [`theme::INK`] text over it, and §5a's chosen cell is
+            // [`theme::BLUE`] behind white -- the same weight this app already
+            // gives a primary button, and for the segmented control's stated
+            // reason.
+            //
+            // **The choices still come from `send.rs` and are not spelled
+            // here.** `validate_plan` refuses any other value, so a cell
+            // offering one would be a control that cannot work.
+            let labels: Vec<String> = crate::send::DELETE_IN_DAYS_CHOICES
+                .iter()
+                .map(|days| lifetime_label(*days))
+                .collect();
+            let segments: Vec<theme::Segment<'_>> = labels
+                .iter()
+                .zip(crate::send::DELETE_IN_DAYS_CHOICES)
+                .map(|(label, days)| theme::Segment {
+                    label: label.as_str(),
+                    selected: composer.plan.delete_in_days == days,
+                })
+                .collect();
+            // `segmented_control_disabled` and not `add_enabled`, because
+            // that is the split this design system already makes for exactly
+            // this question (see `toggle_pill` / `toggle_pill_disabled`): the
+            // inert run senses hover only, so while a publish is in flight
+            // there is no path by which a cell can be pressed at all, and the
+            // answer in force stays legible in the wash rather than greying
+            // into the other two.
+            if enabled {
+                if let Some(index) = theme::segmented_control(ui, &segments) {
+                    composer.plan.delete_in_days = crate::send::DELETE_IN_DAYS_CHOICES[index];
                 }
-            });
+            } else {
+                theme::segmented_control_disabled(ui, &segments);
+            }
             ui.add_space(4.0);
             // **The DATE, not only the number of days.** A publishing action
             // where being wrong about the lifetime is the harm gets the thing
@@ -1378,30 +1444,48 @@ fn draw_composer(
             ui.add_space(12.0);
             let problem = composer_problem(composer);
             let can_submit = composer_can_submit(problem, in_flight);
+            // **The footer's two answers are the design system's two
+            // buttons**, and until this pass they were neither.
+            //
+            // Design §5a's composer ends in a filled blue `Create & copy
+            // link` beside an outlined white `Cancel` -- a primary and a
+            // secondary, which is the whole of what a form footer says about
+            // which of its two answers is the one it is for. What stood here
+            // was two bare `egui::Button`s that differed only in the colour
+            // of their *text*: same default fill, same default outline, same
+            // size, so the publish and the throw-away read as a matched pair
+            // and the user's eye had nothing to land on. `theme.rs` records
+            // this exact defect on the item form's Save --
+            // "the two footer buttons looked like they came from different
+            // families -- they did" -- and `primary_button_enabled` is the
+            // half of the design system that exists so a footer that needs
+            // `add_enabled` does not have to leave it.
+            //
+            // **32 points and a 7px radius, not §5a's 34 and 8.** The design
+            // draws this card's buttons two points taller than every other
+            // action button in the app (3h's Continue, the detail pane's
+            // Save, "Fill in app"), all of which are `theme::BUTTON_HEIGHT`.
+            // `theme.rs` already refused to move those five to match one
+            // outlier and gave the outlier its own function instead
+            // (`primary_button_matching_field`, for 2b's `+ New`, which is
+            // 34/8 because it matches the *search box* it sits beside). There
+            // is no box beside this one to match: the Send composer's footer
+            // is an action footer like every other, so it takes the action
+            // footer's metrics rather than becoming the app's second
+            // almost-32.
             ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        can_submit,
-                        egui::Button::new(
-                            egui::RichText::new(CREATE_LABEL).size(12.0).color(theme::INK),
-                        )
-                        .min_size(egui::vec2(104.0, COPY_BUTTON_HEIGHT)),
-                    )
-                    .clicked()
-                {
+                if theme::primary_button_enabled(ui, CREATE_LABEL, None, can_submit).clicked() {
                     action = Some(SendUiAction::SubmitSend);
                 }
                 ui.add_space(BUTTON_GAP);
+                // `add_enabled_ui` rather than `add_enabled`, because
+                // `secondary_button` is a `ui.add` with no enabled twin and
+                // the whole control -- fill, outline and label -- has to fade
+                // together. Same shape `primary_button_with_metrics` uses
+                // internally, for the same reason.
                 if ui
-                    .add_enabled(
-                        enabled,
-                        egui::Button::new(
-                            egui::RichText::new(DISCARD_LABEL)
-                                .size(12.0)
-                                .color(theme::TEXT_MUTED),
-                        )
-                        .min_size(egui::vec2(DELETE_BUTTON_WIDTH, COPY_BUTTON_HEIGHT)),
-                    )
+                    .add_enabled_ui(enabled, |ui| theme::secondary_button(ui, DISCARD_LABEL))
+                    .inner
                     .clicked()
                 {
                     action = Some(SendUiAction::CancelComposer);
@@ -2378,11 +2462,20 @@ mod paint_tests {
         )
     }
 
+    #[derive(Default)]
     struct Painted {
         text: Vec<String>,
         rects: Vec<egui::Rect>,
         /// The rect of each painted text run, by its text.
         text_rects: Vec<(String, egui::Rect)>,
+        /// Each filled rectangle **with the colour it was filled in**.
+        ///
+        /// `rects` above drops the fill, which is fine for the geometry
+        /// assertions it was added for and useless for the only question a
+        /// test can ask about a button: what colour is it. A segmented
+        /// control's chosen cell and a primary button are both "a rectangle
+        /// somewhere behind a label" until the fill is read.
+        fills: Vec<(egui::Rect, egui::Color32)>,
     }
 
     impl Painted {
@@ -2398,6 +2491,31 @@ mod paint_tests {
                 .find(|(t, _)| t.contains(needle))
                 .map(|(_, r)| *r)
         }
+
+        /// The **smallest** filled rectangle containing `inner`, and its fill
+        /// -- the control a label sits on rather than the card the control
+        /// sits on. Smallest and not first, because the card, the pane and
+        /// any wrapping frame all contain the label too.
+        fn fill_behind(&self, inner: egui::Rect) -> Option<(egui::Rect, egui::Color32)> {
+            self.fills
+                .iter()
+                .filter(|(r, _)| r.contains_rect(inner))
+                .min_by(|a, b| {
+                    let area = |r: &egui::Rect| r.width() * r.height();
+                    area(&a.0).partial_cmp(&area(&b.0)).expect("finite rects")
+                })
+                .copied()
+        }
+
+        /// [`Self::fill_behind`], found from a control's own words.
+        fn control_under(&self, label: &str) -> (egui::Rect, egui::Color32) {
+            let text = self
+                .rect_of(label)
+                .unwrap_or_else(|| panic!("{label:?} was not painted at all: {:?}", self.text));
+            self.fill_behind(text).unwrap_or_else(|| {
+                panic!("{label:?} was painted with no filled rectangle behind it at all")
+            })
+        }
     }
 
     fn collect(shape: &egui::Shape, out: &mut Painted) {
@@ -2407,7 +2525,10 @@ mod paint_tests {
                 out.text_rects
                     .push((text.galley.text().to_owned(), text.visual_bounding_rect()));
             }
-            egui::Shape::Rect(rect) => out.rects.push(rect.rect),
+            egui::Shape::Rect(rect) => {
+                out.rects.push(rect.rect);
+                out.fills.push((rect.rect, rect.fill));
+            }
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     collect(shape, out);
@@ -2445,7 +2566,7 @@ mod paint_tests {
             action = draw_send_pane(ui, state, notice, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
 
-        let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
+        let mut painted = Painted::default();
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut painted);
         }
@@ -2455,6 +2576,199 @@ mod paint_tests {
              against nothing"
         );
         (painted, action)
+    }
+
+    /// [`paint_with`], with the composer OPEN and in whatever draft the
+    /// caller wants.
+    ///
+    /// A fixture of its own because every other one in this module builds a
+    /// `SendComposer::default()`, which is closed -- so nothing the form
+    /// draws has ever been reachable from here, and the composer's own
+    /// controls have until now been asserted only through `vault_window`'s
+    /// whole-window matrix.
+    fn paint_composer(composer: &mut SendComposer, in_flight: bool) -> Painted {
+        let size = egui::vec2(720.0, 900.0);
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+
+        let state = SendPaneState::Empty;
+        let output = ctx.run_ui(input(), |ui| {
+            let _ = draw_send_pane(
+                ui,
+                &state,
+                None,
+                SendDeleteView::default(),
+                composer,
+                in_flight,
+                &crate::send::FixedClock(NOW),
+                &crate::local_time::FixedOffset(0),
+            )
+            .into_action();
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
+        }
+        assert!(
+            painted.has(COMPOSER_HEADING),
+            "the fixture did not open the composer at all, so every assertion below would be \
+             about the empty pane: {:?}",
+            painted.text
+        );
+        painted
+    }
+
+    /// An open composer with a valid draft, so the submit below is LIVE: a
+    /// disabled primary is faded toward the window colour, and a fill read
+    /// off one would be the fade rather than the design's blue.
+    fn open_composer() -> SendComposer {
+        SendComposer {
+            open: true,
+            plan: crate::send::SendPlan {
+                name: "SAP Production".to_string(),
+                text: zeroize::Zeroizing::new("hunter2".to_string()),
+                ..crate::send::SendPlan::default()
+            },
+        }
+    }
+
+    /// **The lifetime picker is ONE control with three positions, and design
+    /// §5a's chosen cell is filled blue.**
+    ///
+    /// What this replaced was three `egui::Button`s with `.selected()` on
+    /// one: separated by egui's item spacing, each with its own outline, each
+    /// sized to 72 points rather than to its own label. The three facts below
+    /// are the three that tell the two shapes apart, and all three are
+    /// invisible to a test that only reads glyphs.
+    ///
+    ///  * every cell is [`theme::SEGMENT_HEIGHT`] tall;
+    ///  * consecutive cells are **joined**, meeting within
+    ///    [`theme::SEGMENT_SEAM`] of each other rather than separated by a
+    ///    gap;
+    ///  * the cell in force carries [`theme::BLUE`] and the others do not.
+    #[test]
+    fn the_lifetime_picker_is_one_segmented_run_and_not_three_buttons() {
+        let mut composer = open_composer();
+        let chosen = composer.plan.delete_in_days;
+        let painted = paint_composer(&mut composer, false);
+
+        let cells: Vec<(u8, egui::Rect, egui::Color32)> = crate::send::DELETE_IN_DAYS_CHOICES
+            .iter()
+            .map(|days| {
+                let label = lifetime_label(*days);
+                let (rect, fill) = painted.control_under(&label);
+                (*days, rect, fill)
+            })
+            .collect();
+
+        for (days, rect, _) in &cells {
+            assert_eq!(
+                rect.height(),
+                theme::SEGMENT_HEIGHT,
+                "the {days}-day cell is not a segmented-control cell -- it is \
+                 {}pt tall against the run's {}",
+                rect.height(),
+                theme::SEGMENT_HEIGHT
+            );
+        }
+
+        for pair in cells.windows(2) {
+            let gap = pair[1].1.left() - pair[0].1.right();
+            assert!(
+                gap.abs() <= theme::SEGMENT_SEAM + 0.5,
+                "the lifetime cells are {gap}pt apart, so they are three buttons in a row \
+                 rather than one joined run. §5a draws this as one control with three \
+                 positions, and separated cells read as three things you might press."
+            );
+        }
+
+        for (days, _, fill) in &cells {
+            if *days == chosen {
+                assert_eq!(
+                    *fill,
+                    theme::BLUE,
+                    "the chosen lifetime is not filled in the design's blue"
+                );
+            } else {
+                assert_ne!(
+                    *fill,
+                    theme::BLUE,
+                    "the {days}-day cell is lit and it is not the one in force"
+                );
+            }
+        }
+    }
+
+    /// **The composer's two answers are a primary and a secondary**, measured
+    /// on the fills.
+    ///
+    /// They used to be two bare `egui::Button`s differing only in the colour
+    /// of their text -- so on screen the publish and the throw-away were a
+    /// matched pair, and no test in this crate could say so. See
+    /// `record_ui`'s twin of this test: the same defect stood on both of this
+    /// app's Send composers.
+    #[test]
+    fn the_composers_two_answers_are_a_primary_and_a_secondary() {
+        let mut composer = open_composer();
+        assert!(
+            composer_problem(&composer).is_none(),
+            "the fixture wants a submittable draft, or the fill below is a disabled one"
+        );
+        let painted = paint_composer(&mut composer, false);
+
+        let (create, create_fill) = painted.control_under(CREATE_LABEL);
+        assert_eq!(
+            create_fill,
+            theme::BLUE,
+            "the composer's submit is not the design system's filled primary"
+        );
+        assert_eq!(create.height(), theme::BUTTON_HEIGHT);
+
+        let (discard, discard_fill) = painted.control_under(DISCARD_LABEL);
+        assert_eq!(
+            discard_fill,
+            theme::CARD,
+            "the composer's way out is not the design system's outlined secondary"
+        );
+        assert_eq!(discard.height(), theme::BUTTON_HEIGHT);
+        assert_ne!(
+            create_fill, discard_fill,
+            "the two answers paint the same fill, which is the exact defect this pass fixed"
+        );
+    }
+
+    /// **While a publish is in flight the lifetime run is inert, and the
+    /// answer in force is still legible.**
+    ///
+    /// `theme::segmented_control_disabled` is what this form now draws in
+    /// that state, and it exists precisely so the run does not grey into an
+    /// undifferentiated strip: the cell in force keeps
+    /// [`theme::BLUE_WASH`], which is "you have this answer and cannot change
+    /// it" rather than "you have no answer". Pinned because the alternative
+    /// -- an `add_enabled(false)` over the live control -- looks nearly the
+    /// same in a screenshot and is a run whose cells egui will still let
+    /// through on a re-layout.
+    #[test]
+    fn a_publish_in_flight_leaves_the_lifetime_run_inert_and_readable() {
+        let mut composer = open_composer();
+        let chosen = lifetime_label(composer.plan.delete_in_days);
+        let painted = paint_composer(&mut composer, true);
+
+        assert!(painted.has(CREATING_LABEL), "the in-flight word is not on the form");
+        let (_, fill) = painted.control_under(&chosen);
+        assert_eq!(
+            fill,
+            theme::BLUE_WASH,
+            "the lifetime in force is not drawn in the inert run's wash while a publish is \
+             running -- either the run is still live, or it has greyed out the one answer \
+             the user still has"
+        );
     }
 
     fn rows(n: usize) -> SendPaneState {
@@ -2693,7 +3007,7 @@ mod paint_tests {
         let output = ctx.run_ui(base(), |ui| {
             let _ = draw_send_pane(ui, state, None, delete, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
-        let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
+        let mut painted = Painted::default();
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut painted);
         }
@@ -2867,7 +3181,7 @@ mod paint_tests {
         let output = ctx.run_ui(base(), |ui| {
             let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
         });
-        let mut painted = Painted { text: Vec::new(), rects: Vec::new(), text_rects: Vec::new() };
+        let mut painted = Painted::default();
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut painted);
         }

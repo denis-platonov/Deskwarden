@@ -56,6 +56,51 @@
 //! `None` is the starting state and no code here turns it into a default:
 //! replacing is the one step in this whole feature that can destroy data the
 //! user already had, so it is never the answer to a question nobody was asked.
+//!
+//! # Design §5a, and the four blocks of it that are deliberately not built
+//!
+//! [`draw_export_form`] **is** design §5a — "Compose a Send", captioned
+//! FIELD-LEVEL, NOT WHOLE-RECORD — and after the 2026-09 design pass it
+//! carries §5a's `RECORD` chip, its `INCLUDE` block with the running count,
+//! its boxed tick list and its primary/secondary footer. Four things §5a
+//! draws are still not here, and each is a decision rather than an omission.
+//!
+//! **§5a's whole `ACCESS` block.** The mockup gives the composer an Expires
+//! row (`1 h · 24 h · 7 d · 30 d`), a view-count stepper, an "Open with"
+//! password with a Generate beside it, a Recipient address, an "only this
+//! address can open it" switch and a "tell me when it is opened" switch.
+//! Exactly one of the six is a thing this app can do today.
+//! [`send_plan_from`] builds a [`SendPlan`], and a `SendPlan` has
+//! `delete_in_days` (whose only legal values are `1`, `7` and `30` — there is
+//! no sub-day lifetime to offer under `1 h` or `24 h`), `password` and
+//! `max_access_count`. The other three — a recipient, an address lock and an
+//! open notification — are **not properties of a Bitwarden Send at all**, and
+//! there is no server here to make them ones. Building the two that could be
+//! built (a password, a view limit) without the four that cannot would give
+//! the user a §5a-shaped block that answers half its own questions, which is
+//! worse than the honest absence. It needs the owner's call on what the
+//! feature is, not a design pass's guess.
+//!
+//! **The value previews down the right of the tick list.** §5a shows each
+//! row's actual content beside its label — the username, a masked password,
+//! "3 apps". This form is handed `item_name` and a [`RecordDraft`] and
+//! nothing else, on purpose: it is drawn from `vault_window`'s frame closure
+//! against an item that is re-resolved by id at submit time, and a form that
+//! held a record's values between frames is a form holding a password it did
+//! not need to hold.
+//!
+//! **The password row's red treatment** (`background: #fdf3f2`, a red tick,
+//! and the badge "visible to anyone with the link"). New copy, and safety
+//! copy at that; this file already has one pinned safety sentence in
+//! [`SEED_WARNING`] and a second belongs to whoever owns the wording.
+//!
+//! **§5a's field set.** The mockup's five rows are Username, Password,
+//! One-time code, Notes and **Autofill targets**; this form's five are
+//! Username, Password, **Website**, Notes and TOTP seed. `Autofill targets`
+//! is not something [`crate::record::payload::Record`] can carry, and the
+//! seed sits last rather than third because [`SEED_WARNING`] and its
+//! passphrase field hang off it and belong at the end of the list rather than
+//! through the middle of it.
 
 use crate::record::import::Collision;
 use crate::record::payload::{Record, RecordRefusal};
@@ -106,6 +151,54 @@ pub const NOTES_LABEL: &str = "Notes";
 /// See [`USERNAME_LABEL`]. **Not ticked by default.** A seed is not a default.
 pub const TOTP_LABEL: &str = "TOTP seed";
 
+/// Design §5a's first section eyebrow, over the record the composer was
+/// opened against.
+///
+/// The design's own word, in the design's own case: `text-transform:
+/// uppercase` is applied to the literal `Record` in the mockup, and
+/// [`theme::eyebrow`] deliberately does not uppercase for the caller -- see
+/// that function -- so the constant carries the case the glyphs are painted
+/// in and a paint test can look for it.
+pub const RECORD_EYEBROW: &str = "RECORD";
+
+/// Design §5a's second section eyebrow, over the tick list. See
+/// [`RECORD_EYEBROW`].
+pub const INCLUDE_EYEBROW: &str = "INCLUDE";
+
+/// How many fields the tick list offers, and therefore the denominator in
+/// [`include_counter`].
+///
+/// **Derived from nothing and checked against the drawing**, deliberately:
+/// [`RecordSelection`] is a struct of five `bool`s and not a collection, so
+/// there is no `len()` to ask, and a hand-written 5 that drifted from the
+/// rows actually drawn would put a counter on screen that disagrees with the
+/// list under it. `the_include_counter_counts_every_row_the_form_draws` is
+/// what holds the two together.
+pub const INCLUDE_FIELD_COUNT: usize = 5;
+
+/// Design §5a's `2 of 5 fields`, beside the [`INCLUDE_EYEBROW`].
+///
+/// **A pure function of the draft**, like every other answer these two forms
+/// paint, so the sentence can be asserted without running a frame. It is also
+/// the only thing on this form that says how much of the record is about to
+/// travel *as a number*: five tick-boxes are five separate facts, and a
+/// sender scanning the card before pressing a publish button wants the
+/// total, which is exactly the argument §5a makes for putting it there.
+///
+/// Singular at one, because "1 of 5 fields" is the one count a form like this
+/// is most likely to be showing and reading it as a plural is the sort of
+/// thing that makes a careful screen look careless. The same rule
+/// [`super::send_ui::lifetime_label`] follows for `1 day`.
+pub fn include_counter(draft: &RecordDraft) -> String {
+    let sel = &draft.selection;
+    let ticked = [sel.username, sel.password, sel.uri, sel.notes, sel.totp]
+        .into_iter()
+        .filter(|on| *on)
+        .count();
+    let noun = if ticked == 1 { "field" } else { "fields" };
+    format!("{ticked} of {INCLUDE_FIELD_COUNT} {noun}")
+}
+
 /// **The safety control of this whole feature, verbatim.**
 ///
 /// Shown whenever [`TOTP_LABEL`] is ticked, and pinned by content in
@@ -127,7 +220,25 @@ pub const PASSPHRASE_NOTE: &str =
      nothing.";
 
 /// The label on the export form's submit button.
+///
+/// **Not §5a's `Create & copy link`, and that is a refusal rather than an
+/// oversight.** Pressing this starts a `bw send create` whose link comes back
+/// in `vault_window`'s create banner; nothing on that path touches the
+/// clipboard. A button promising a copy that does not happen is worse than
+/// one that promises less, and the alternative -- making the copy happen --
+/// is a behaviour change (a public URL silently replacing whatever the user
+/// had on the clipboard) that belongs to whoever owns the clipboard rules in
+/// this app, not to a design pass. See this file's report note.
 pub const EXPORT_SUBMIT_LABEL: &str = "Create link";
+
+/// The export form's way out.
+///
+/// A named constant rather than the bare `"Cancel"` it used to be, for the
+/// reason every other label on these two forms is one: it is now the thing
+/// `the_export_footer_wears_the_design_systems_two_buttons` finds the
+/// secondary button by, and a literal that only exists inside a closure is a
+/// literal a paint test has to restate.
+pub const EXPORT_CANCEL_LABEL: &str = "Cancel";
 
 /// Why the export button is grey: the seed tick with nothing to seal under.
 pub const NEEDS_PASSPHRASE: &str =
@@ -462,6 +573,68 @@ fn note(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
     ui.label(egui::RichText::new(text).size(11.0).color(colour));
 }
 
+/// The tick list's own box, from design §5a: `border: 1px solid #eae7e7;
+/// border-radius: 10px`, its rows at `padding: 10px 12px`.
+///
+/// The 10 is split either side of the row rule as [`TICK_ROW_GAP`] rather
+/// than spent as padding on each row, because egui lays these rows out as
+/// widgets in a column and there is no per-row box to pad.
+const TICK_LIST_RADIUS: u8 = 10;
+const TICK_LIST_PAD_X: i8 = 12;
+const TICK_LIST_PAD_Y: i8 = 8;
+const TICK_ROW_GAP: f32 = 5.0;
+
+/// The monogram tile beside the record's name in §5a's `RECORD` chip.
+///
+/// 32, the design's own, and the same tile `item_list` draws a row with --
+/// the point of the chip is that it is recognisably the row the composer was
+/// opened from.
+const RECORD_CHIP_TILE: f32 = 32.0;
+
+/// Design §5a's picked-record chip: a monogram tile and the record's name, in
+/// a blue-wash box edged in [`theme::BLUE_EDGE`].
+///
+/// # Three things §5a draws here that are deliberately not built
+///
+/// **The `Change` link.** §5a's chip ends in a `Change` affordance, which
+/// implies a record picker inside the composer. There is none, and there
+/// should not be: this composer is opened *against the item the user has
+/// selected in the list*, which is why [`draw_export_modal`] is a modal
+/// rather than a pane -- the list stays on screen behind it. "Change" is
+/// therefore already spelled "press Escape and click the other row", and a
+/// second, in-card way to choose a record would be a second selection model
+/// in a window that has one.
+///
+/// **The `Login · Engineering` subtitle.** The kind and the folder are real
+/// facts about the item and this function is handed neither -- it takes the
+/// name, because the name is what [`RecordSend`] copies at open time
+/// precisely so the heading cannot go blank if the item disappears
+/// underneath. Passing two more strings through for a subtitle is a change to
+/// what the composer is *given*, not to how it draws, and it belongs with the
+/// rest of §5a's Access block rather than on its own.
+///
+/// **The `SP` initials as the design's literal glyphs.** The design's tile
+/// says `SP` because its record is called "SAP Production"; ours says
+/// whatever [`theme::initials`] makes of the record actually being sent,
+/// which is the same function the item list and the delete modal use.
+fn record_chip(ui: &mut egui::Ui, item_name: &str) {
+    egui::Frame::new()
+        .fill(theme::BLUE_WASH)
+        .stroke(egui::Stroke::new(1.0, theme::BLUE_EDGE))
+        .corner_radius(CornerRadius::same(TICK_LIST_RADIUS))
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                theme::avatar(ui, &theme::initials(item_name), RECORD_CHIP_TILE, true);
+                ui.add_space(11.0);
+                // 13px and semibold in [`theme::BLUE_DEEP`], which is §5a's
+                // `#14307a` exactly, and is what this app already paints the
+                // chosen row's name in.
+                ui.label(theme::semibold(item_name, 13.0).color(theme::BLUE_DEEP));
+            });
+        });
+}
+
 /// The export form.
 ///
 /// Every decision it paints comes from [`export_problem`] and
@@ -477,39 +650,104 @@ pub fn draw_export_form(
     let enabled = !in_flight;
     card(ui, |ui| {
         heading(ui, EXPORT_HEADING);
-        note(ui, item_name, theme::TEXT_MUTED);
-        ui.add_space(8.0);
 
-        for (label, ticked) in [
-            (USERNAME_LABEL, &mut draft.selection.username),
-            (PASSWORD_LABEL, &mut draft.selection.password),
-            (URI_LABEL, &mut draft.selection.uri),
-            (NOTES_LABEL, &mut draft.selection.notes),
-        ] {
-            ui.add_enabled(
-                enabled,
-                egui::Checkbox::new(
-                    ticked,
-                    egui::RichText::new(label).size(12.0).color(theme::TEXT_SECONDARY),
-                ),
+        // **§5a's `RECORD` block: the record is NAMED, not mentioned.**
+        //
+        // The design opens the composer with a chip -- a monogram tile, the
+        // record's name set in the blue the rest of this app gives a chosen
+        // thing, and a subtitle -- under an eyebrow that says what the block
+        // is. What stood here was the item's name in [`note`]'s 11px grey,
+        // which is the size and colour this file uses for fine print: the one
+        // line that says WHICH record is about to be published was drawn
+        // quieter than the sentence explaining why the button is grey.
+        //
+        // The tile is `theme::avatar`, which is the same tile the item list
+        // and the delete modal draw, so the chip reads as the row it was
+        // opened from. `emphasized` is on for §5a's reason: this record is
+        // the chosen one, and blue-on-wash is what this app's tiles already
+        // say that with.
+        theme::eyebrow(ui, RECORD_EYEBROW);
+        ui.add_space(6.0);
+        record_chip(ui, item_name);
+        ui.add_space(12.0);
+
+        // **§5a's `INCLUDE` block**, with the design's own running count
+        // beside its eyebrow. See [`include_counter`] for why the number is
+        // worth having and why it is a pure function.
+        ui.horizontal(|ui| {
+            theme::eyebrow(ui, INCLUDE_EYEBROW);
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(include_counter(draft))
+                    .size(12.0)
+                    .color(theme::TEXT_GHOST),
             );
-        }
+        });
+        ui.add_space(6.0);
 
-        // The seed's tick goes through `set_totp` rather than a `&mut bool`,
-        // so unticking it drops the passphrase.
-        let mut totp = draft.selection.totp;
-        if ui
-            .add_enabled(
-                enabled,
-                egui::Checkbox::new(
-                    &mut totp,
-                    egui::RichText::new(TOTP_LABEL).size(12.0).color(theme::TEXT_SECONDARY),
-                ),
-            )
-            .changed()
-        {
-            draft.set_totp(totp);
-        }
+        // **The ticks are a LIST, and §5a draws the list as one boxed
+        // object**: a 1px hairline outline round the run, a 10px radius, and
+        // the lighter `#f3f2f2` rule between one row and the next. Both
+        // weights are already this design system's -- `theme::HAIRLINE` is
+        // the card border and `theme::row_rule` is the between-rows rule the
+        // detail pane draws -- so the box is assembled out of the two
+        // dividers the app has rather than a third.
+        //
+        // It is not decoration. Five loose check-boxes stacked in a column
+        // are five independent questions; the same five inside one outline
+        // are the answer to "what travels", which is the whole subject of
+        // this card and the thing §5a's caption calls out ("each field is an
+        // explicit opt-in"). The counter above only reads as a counter of
+        // something once the something has an edge.
+        egui::Frame::new()
+            .stroke(egui::Stroke::new(1.0, theme::HAIRLINE))
+            .corner_radius(CornerRadius::same(TICK_LIST_RADIUS))
+            .inner_margin(egui::Margin::symmetric(TICK_LIST_PAD_X, TICK_LIST_PAD_Y))
+            .show(ui, |ui| {
+                let mut first = true;
+                let rule_between = |ui: &mut egui::Ui, first: &mut bool| {
+                    if *first {
+                        *first = false;
+                    } else {
+                        ui.add_space(TICK_ROW_GAP);
+                        theme::row_rule(ui);
+                        ui.add_space(TICK_ROW_GAP);
+                    }
+                };
+
+                for (label, ticked) in [
+                    (USERNAME_LABEL, &mut draft.selection.username),
+                    (PASSWORD_LABEL, &mut draft.selection.password),
+                    (URI_LABEL, &mut draft.selection.uri),
+                    (NOTES_LABEL, &mut draft.selection.notes),
+                ] {
+                    rule_between(ui, &mut first);
+                    ui.add_enabled(
+                        enabled,
+                        egui::Checkbox::new(
+                            ticked,
+                            egui::RichText::new(label).size(12.0).color(theme::TEXT_SECONDARY),
+                        ),
+                    );
+                }
+
+                // The seed's tick goes through `set_totp` rather than a
+                // `&mut bool`, so unticking it drops the passphrase.
+                rule_between(ui, &mut first);
+                let mut totp = draft.selection.totp;
+                if ui
+                    .add_enabled(
+                        enabled,
+                        egui::Checkbox::new(
+                            &mut totp,
+                            egui::RichText::new(TOTP_LABEL).size(12.0).color(theme::TEXT_SECONDARY),
+                        ),
+                    )
+                    .changed()
+                {
+                    draft.set_totp(totp);
+                }
+            });
 
         if warning_is_shown(draft) {
             ui.add_space(8.0);
@@ -532,28 +770,29 @@ pub fn draw_export_form(
         ui.add_space(12.0);
         let problem = export_problem(draft);
         let can_submit = export_can_submit(problem, in_flight);
+        // **§5a's footer: a filled primary beside an outlined secondary.**
+        //
+        // The two answers on this card were two bare `egui::Button`s with the
+        // same default fill, the same default outline and the same 26px
+        // height, differing only in the colour of their text -- so the
+        // publish and the throw-away read as a matched pair, and §5a's
+        // one clear point about this footer (a blue button and a white one)
+        // was the one thing missing from it. `theme.rs` names this defect on
+        // the item form's Save, and `primary_button_enabled` is the half of
+        // the design system that exists so a footer needing `add_enabled` has
+        // no reason to leave it.
+        //
+        // These are `theme::BUTTON_HEIGHT`'s 32 and not §5a's 34 -- see
+        // `send_ui::draw_composer`'s footer for the argument, which is the
+        // same one and is made once there.
         ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    can_submit,
-                    egui::Button::new(
-                        egui::RichText::new(EXPORT_SUBMIT_LABEL).size(12.0).color(theme::INK),
-                    )
-                    .min_size(egui::vec2(104.0, BUTTON_HEIGHT)),
-                )
-                .clicked()
-            {
+            if theme::primary_button_enabled(ui, EXPORT_SUBMIT_LABEL, None, can_submit).clicked() {
                 action = RecordUiAction::SubmitExport;
             }
             ui.add_space(8.0);
             if ui
-                .add_enabled(
-                    enabled,
-                    egui::Button::new(
-                        egui::RichText::new("Cancel").size(12.0).color(theme::TEXT_MUTED),
-                    )
-                    .min_size(egui::vec2(72.0, BUTTON_HEIGHT)),
-                )
+                .add_enabled_ui(enabled, |ui| theme::secondary_button(ui, EXPORT_CANCEL_LABEL))
+                .inner
                 .clicked()
             {
                 action = RecordUiAction::Cancel;
@@ -1490,17 +1729,78 @@ mod paint_tests {
 
     const NOW: i64 = 1_786_320_000_000;
 
-    struct Painted(Vec<String>);
+    /// Everything one frame painted that these tests can ask about: the
+    /// glyph runs, where each of them landed, and every filled rectangle with
+    /// the colour it was filled in.
+    ///
+    /// **The fills are what make a claim about a BUTTON possible.** A footer
+    /// test that can only see text can say "the words `Create link` are on
+    /// screen", which stays true of a bare `egui::Button`, of a label, and of
+    /// a control drawn at zero size. Which of the two answers is the primary
+    /// one is a fact about the rectangle behind the words and nothing else --
+    /// the same measurement `detail_edit`'s
+    /// `the_disabled_save_button_does_not_look_enabled` makes, for the same
+    /// reason.
+    struct Painted {
+        text: Vec<String>,
+        /// Each painted run, with its visual bounds.
+        text_rects: Vec<(String, egui::Rect)>,
+        /// Each filled rectangle, with its fill.
+        fills: Vec<(egui::Rect, egui::Color32)>,
+    }
 
     impl Painted {
         fn has(&self, needle: &str) -> bool {
-            self.0.iter().any(|t| t.contains(needle))
+            self.text.iter().any(|t| t.contains(needle))
+        }
+
+        /// Where a painted run landed. The first match wins, which is what
+        /// every caller here wants: the labels these forms draw are distinct.
+        fn rect_of(&self, needle: &str) -> Option<egui::Rect> {
+            self.text_rects
+                .iter()
+                .find(|(t, _)| t.contains(needle))
+                .map(|(_, r)| *r)
+        }
+
+        /// The **smallest** filled rectangle that contains `inner`, and its
+        /// fill -- in other words, the control a label is sitting on rather
+        /// than the card the control is sitting on.
+        ///
+        /// Smallest and not first, because the card, the modal's body and the
+        /// pane all contain the label too and any of them could be painted
+        /// first; the innermost box is the only one that is unambiguously
+        /// *this* control's.
+        fn fill_behind(&self, inner: egui::Rect) -> Option<(egui::Rect, egui::Color32)> {
+            self.fills
+                .iter()
+                .filter(|(r, _)| r.contains_rect(inner))
+                .min_by(|a, b| {
+                    let area = |r: &egui::Rect| r.width() * r.height();
+                    area(&a.0).partial_cmp(&area(&b.0)).expect("finite rects")
+                })
+                .copied()
+        }
+
+        /// [`Self::fill_behind`], found from a label's own words.
+        fn button_under(&self, label: &str) -> (egui::Rect, egui::Color32) {
+            let text = self
+                .rect_of(label)
+                .unwrap_or_else(|| panic!("{label:?} was not painted at all: {:?}", self.text));
+            self.fill_behind(text).unwrap_or_else(|| {
+                panic!("{label:?} was painted with no filled rectangle behind it at all")
+            })
         }
     }
 
     fn collect(shape: &egui::Shape, out: &mut Painted) {
         match shape {
-            egui::Shape::Text(text) => out.0.push(text.galley.text().to_owned()),
+            egui::Shape::Text(text) => {
+                out.text.push(text.galley.text().to_owned());
+                out.text_rects
+                    .push((text.galley.text().to_owned(), text.visual_bounding_rect()));
+            }
+            egui::Shape::Rect(rect) => out.fills.push((rect.rect, rect.fill)),
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     collect(shape, out);
@@ -1527,12 +1827,13 @@ mod paint_tests {
         let output = ctx.run_ui(input(), |ui| {
             (draw.take().expect("run_ui runs the closure once"))(ui);
         });
-        let mut painted = Painted(Vec::new());
+        let mut painted =
+            Painted { text: Vec::new(), text_rects: Vec::new(), fills: Vec::new() };
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut painted);
         }
         assert!(
-            !painted.0.is_empty(),
+            !painted.text.is_empty(),
             "the form painted no text at all, so every assertion over this list would pass \
              against nothing"
         );
@@ -1565,9 +1866,157 @@ mod paint_tests {
         assert!(
             after.has(SEED_WARNING),
             "the seed was ticked and the warning was NOT painted: {:?}",
-            after.0
+            after.text
         );
         assert!(after.has(NEEDS_PASSPHRASE), "the greyed button's reason was not painted");
+    }
+
+    /// **Design §5a's footer is a primary beside a secondary, measured on the
+    /// fills and not on the words.**
+    ///
+    /// Until this pass the two answers were bare `egui::Button`s that
+    /// differed only in the colour of their *text*, which no test could see
+    /// and which on screen made the publish and the throw-away one matched
+    /// pair. The assertion is therefore on the rectangle behind each label:
+    /// [`theme::BLUE`] under the submit, [`theme::CARD`] under the way out.
+    /// A regression that reverted either button to egui's default chrome
+    /// reds here, where reverting it used to change nothing any test could
+    /// name.
+    ///
+    /// The heights are pinned alongside, because a control drawn at zero size
+    /// still paints its galley -- `send_ui`'s paint tests learned that once
+    /// -- and "there is a blue rectangle somewhere behind these words" is not
+    /// yet a button.
+    #[test]
+    fn the_export_footer_wears_the_design_systems_two_buttons() {
+        // A draft with something ticked, so the submit is LIVE: a disabled
+        // primary is faded toward the window colour and this test would then
+        // be asserting the fade rather than the fill.
+        let mut draft = RecordDraft::default();
+        assert!(
+            export_problem(&draft).is_none(),
+            "the fixture wants a submittable draft, or the fill below is a disabled one"
+        );
+        let painted = paint(|ui| {
+            draw_export_form(ui, &mut draft, "SAP Production", false);
+        });
+
+        let (submit, submit_fill) = painted.button_under(EXPORT_SUBMIT_LABEL);
+        assert_eq!(
+            submit_fill,
+            theme::BLUE,
+            "the composer's submit is not the design system's filled primary -- §5a's footer \
+             is a blue button beside a white one, and a footer whose two answers carry the \
+             same chrome says neither is the one the card is for"
+        );
+        assert_eq!(
+            submit.height(),
+            theme::BUTTON_HEIGHT,
+            "the submit is not this app's action-button height"
+        );
+
+        let (cancel, cancel_fill) = painted.button_under(EXPORT_CANCEL_LABEL);
+        assert_eq!(
+            cancel_fill,
+            theme::CARD,
+            "the composer's way out is not the design system's outlined secondary"
+        );
+        assert_eq!(
+            cancel.height(),
+            theme::BUTTON_HEIGHT,
+            "the two footer answers are different heights"
+        );
+        assert_ne!(
+            submit_fill, cancel_fill,
+            "the two answers paint the same fill, which is the exact defect this pass fixed"
+        );
+    }
+
+    /// **§5a's `RECORD` block: the eyebrow, the monogram tile and the record's
+    /// own name.**
+    ///
+    /// The name is the one line on this card that says *which* record is
+    /// about to become a public link, and it used to be painted in the same
+    /// 11px grey this file uses for fine print. Pinned by the tile's size as
+    /// well as by the glyphs, because "the initials are on screen" is true of
+    /// two letters dropped anywhere.
+    #[test]
+    fn the_record_block_names_the_record_under_its_own_eyebrow() {
+        let mut draft = RecordDraft::default();
+        let painted = paint(|ui| {
+            draw_export_form(ui, &mut draft, "SAP Production", false);
+        });
+
+        assert!(
+            painted.has(RECORD_EYEBROW),
+            "§5a's RECORD eyebrow is not on the card: {:?}",
+            painted.text
+        );
+        assert!(
+            painted.has("SAP Production"),
+            "the composer does not name the record it was opened against: {:?}",
+            painted.text
+        );
+
+        let initials = theme::initials("SAP Production");
+        let tile = painted
+            .rect_of(&initials)
+            .unwrap_or_else(|| panic!("the monogram {initials:?} was not painted"));
+        // The glyphs' own ink is smaller than the tile; what is asserted is
+        // that they sit inside a box of the design's 32, which is the tile
+        // `avatar` allocated.
+        assert!(
+            tile.width() <= RECORD_CHIP_TILE && tile.height() <= RECORD_CHIP_TILE,
+            "the record chip's monogram does not fit the design's {RECORD_CHIP_TILE}pt tile: \
+             {tile:?}"
+        );
+    }
+
+    /// **The counter agrees with the list under it, for every one of the six
+    /// tick counts the form can be in.**
+    ///
+    /// [`include_counter`] is a pure function over a struct of five `bool`s
+    /// and [`INCLUDE_FIELD_COUNT`] is a hand-written 5 beside it; nothing in
+    /// the type system holds the two together, and a sixth tick row added
+    /// without touching the constant would put a counter on screen that
+    /// disagrees with the rows it is counting. This walks the real form and
+    /// counts the labels it really drew.
+    #[test]
+    fn the_include_counter_counts_every_row_the_form_draws() {
+        let labels = [USERNAME_LABEL, PASSWORD_LABEL, URI_LABEL, NOTES_LABEL, TOTP_LABEL];
+        assert_eq!(
+            labels.len(),
+            INCLUDE_FIELD_COUNT,
+            "the denominator and the list of rows have come apart"
+        );
+
+        let mut draft = RecordDraft::default();
+        let painted = paint(|ui| {
+            draw_export_form(ui, &mut draft, "SAP Production", false);
+        });
+        for label in labels {
+            assert!(painted.has(label), "{label} is not a row on the form: {:?}", painted.text);
+        }
+
+        // The default draft is username + password, which is the state §5a
+        // itself draws -- "2 of 5 fields".
+        assert_eq!(include_counter(&RecordDraft::default()), "2 of 5 fields");
+        assert!(
+            painted.has("2 of 5 fields"),
+            "the counter §5a puts beside INCLUDE is not painted: {:?}",
+            painted.text
+        );
+
+        // Every count, including the two ends and the singular.
+        let with = |username, password, uri, notes, totp| RecordDraft {
+            selection: RecordSelection { username, password, uri, notes, totp },
+            ..RecordDraft::default()
+        };
+        assert_eq!(include_counter(&with(false, false, false, false, false)), "0 of 5 fields");
+        assert_eq!(include_counter(&with(true, false, false, false, false)), "1 of 5 field");
+        assert_eq!(include_counter(&with(true, true, true, false, false)), "3 of 5 fields");
+        assert_eq!(include_counter(&with(true, true, true, true, false)), "4 of 5 fields");
+        assert_eq!(include_counter(&with(true, true, true, true, true)), "5 of 5 fields");
     }
 
     /// The import form paints the field **names** of a record it was given,
@@ -1605,19 +2054,19 @@ mod paint_tests {
             );
         });
 
-        assert!(painted.has(WILL_IMPORT_HEADING), "{:?}", painted.0);
+        assert!(painted.has(WILL_IMPORT_HEADING), "{:?}", painted.text);
         for name in [USERNAME_LABEL, PASSWORD_LABEL, URI_LABEL, SEALED_SEED_LABEL] {
-            assert!(painted.has(name), "{name} was not listed: {:?}", painted.0);
+            assert!(painted.has(name), "{name} was not listed: {:?}", painted.text);
         }
         for value in ["dplatonov", "hunter2", "sap.example"] {
-            assert!(!painted.has(value), "a VALUE was painted ({value}): {:?}", painted.0);
+            assert!(!painted.has(value), "a VALUE was painted ({value}): {:?}", painted.text);
         }
         // The staleness line, the two collision offers, and the reason the
         // button is grey -- all on screen, with nothing chosen.
-        assert!(painted.has("It will still import."), "{:?}", painted.0);
+        assert!(painted.has("It will still import."), "{:?}", painted.text);
         assert!(painted.has(CREATE_SECOND_LABEL));
         assert!(painted.has(REPLACE_LABEL));
-        assert!(painted.has(NEEDS_COLLISION_CHOICE), "{:?}", painted.0);
+        assert!(painted.has(NEEDS_COLLISION_CHOICE), "{:?}", painted.text);
         assert_eq!(draft.choice, None, "a frame chose an answer on the user's behalf");
     }
 
@@ -1631,11 +2080,11 @@ mod paint_tests {
         let painted = paint(|ui| {
             draw_import_form(ui, &mut draft, Some(&refused), &Collision::Fresh, false, &FixedClock(NOW));
         });
-        assert!(painted.has("surprise"), "the refused field was not named: {:?}", painted.0);
+        assert!(painted.has("surprise"), "the refused field was not named: {:?}", painted.text);
         assert!(
             !painted.has(WILL_IMPORT_HEADING),
             "a refused payload was previewed as if it had been read: {:?}",
-            painted.0
+            painted.text
         );
         // And no field-name line either: the preview is the whole thing that
         // must not appear, not just its heading.
@@ -1644,6 +2093,6 @@ mod paint_tests {
         }
         // Control on the same fixture: the form did draw, so the absences
         // above are not the absences of a blank frame.
-        assert!(painted.has(IMPORT_HEADING), "{:?}", painted.0);
+        assert!(painted.has(IMPORT_HEADING), "{:?}", painted.text);
     }
 }

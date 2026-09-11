@@ -15,6 +15,26 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### The Send screens use the app's own buttons again
+
+The two screens that publish a Send -- **Send a record**, and the **New
+Send** composer on the Sends screen -- each ended in two buttons that looked
+identical: same fill, same outline, same size, differing only in the colour
+of their words. The button that publishes a public link and the button that
+throws the draft away read as a matched pair. Both footers now carry the
+same pair every other form in Deskwarden does: a filled blue button for the
+thing the form is for, an outlined one for the way out.
+
+**How long the link lasts** was three separate buttons side by side. It is
+now the one joined control the rest of the app uses for a multiple choice,
+with the chosen span filled in. While a Send is being published the control
+stays readable rather than greying out the answer you picked.
+
+**Send a record** also says more about what it is about to send: the record
+is named properly, with its own tile, under a heading that says it is the
+record; and the tick list is one boxed list with a running count beside it
+-- "2 of 5 fields" -- instead of five loose tick-boxes.
+
 ## 0.15.20 - 2026-09-10
 
 ### Windows appear finished, and the screen scan shows your desktop again
