@@ -104,7 +104,10 @@
 //! * that the window is see-through at all. [`let_the_desktop_through`] makes
 //!   the DWM call `winit` skips, and whether the compositor honours it is a
 //!   fact about a real desktop with a real driver. What is asserted is that
-//!   the call is made, on the frame the window first exists.
+//!   the call is made, on the frame the window first exists and **before that
+//!   window is shown** -- see [`Appearing`], which carries a measurement of
+//!   both: the compositor does honour it, and the window used to be on screen
+//!   for 1315 ms before it was asked to.
 //! * that the viewport covers **every** monitor. The rectangle handed to the
 //!   builder is computed from [`crate::screen_capture::monitor_bounds`], and
 //!   that computation is tested -- but whether the window manager honours a
@@ -641,9 +644,13 @@ pub const PRESCAN_SETTLE: Duration = Duration::from_millis(80);
 /// reach, and a route that never reaches it is the hang this module was
 /// already fixed for once.
 ///
-/// So the window goes down on the overlay's **first painted frame** instead --
-/// the one that raises it, excludes it and makes it see-through -- which is
-/// the first moment a live child viewport exists. The same probe, minimising
+/// So the window goes down on the frame that **raises** the overlay instead --
+/// the second of [`Appearing`]'s two steps, one root frame after the one that
+/// composites the window and asks for it to be shown -- which is the first
+/// moment a live child viewport exists *and is visible*. It used to be the
+/// overlay's own first painted frame, and moved with the white-box fix; the
+/// guarantee got stronger rather than weaker, because "registered" became
+/// "on screen". The same probe, minimising
 /// there, measures the root going on at about 8 frames a second and this
 /// overlay at twice that, indefinitely. That is `eframe`'s deliberate
 /// `INVISIBLE_WINDOW_REPAINT_INTERVAL` throttle of a window Windows sends no
@@ -1108,11 +1115,10 @@ struct Inner {
     /// `None` while the overlay is still up. Set once, by the frame that ends
     /// it.
     outcome: Option<Outcome>,
-    /// Whether the first-frame hook has run yet. Once, on the first frame the
-    /// OS window really exists -- which is **not** the callback's first frame,
-    /// and is checked rather than assumed. See the hook itself in
-    /// [`RegionOverlay::show`].
-    raised: bool,
+    /// How far the overlay's own OS window has got towards being on screen.
+    /// See [`Appearing`], which replaced a `raised: bool` and carries the
+    /// measurement that made it three states rather than one flag.
+    appearing: Appearing,
     open: bool,
     /// How far the whole-screen scan has got. See [`Prescan`].
     prescan: Prescan,
@@ -1213,6 +1219,135 @@ enum Reveal {
     Done,
 }
 
+/// **How far the overlay's own OS window has got towards being on screen** --
+/// which is a different question from whether `egui` has a viewport for it,
+/// and the difference is a second and a third of a solid full-screen
+/// rectangle.
+///
+/// # What it replaced, and what that cost
+///
+/// A `bool` called `raised`, set on the first frame the window was found, with
+/// four Win32 calls hanging off it. They ran late, and *late* is the whole
+/// defect: `eframe` creates a window out of a frame's viewport output and
+/// **shows it immediately**, so between the window appearing and the first
+/// frame that paints it, what is on screen is a full-screen always-on-top
+/// rectangle of whatever Windows leaves in an unpainted window's redirection
+/// surface.
+///
+/// Measured on this machine, driving the real [`RegionOverlay::open`] and
+/// [`RegionOverlay::show`] over a fixed backdrop in another process and
+/// sampling a patch of screen every 17 ms:
+///
+/// ```text
+/// t=5939 ms  backdrop     mean=(132.6, 78.3, 121.9)  sd=74.3
+/// t=5956 ms  WHITE        mean=(255.0, 255.0, 255.0) sd=0.00   <- the window appears
+/// ...        WHITE        80 consecutive samples, no other state between
+/// t=7289 ms  (the window's first painted frame takes it out of captures)
+/// t=8632 ms  see-through  model error 0.37 see-through, 60.72 opaque-flat
+/// ```
+///
+/// **1315 ms of solid white** -- eighty consecutive samples, first to last,
+/// with the next non-white sample 17.8 ms later. That is the owner's *"blinks black, then white
+/// box shows up"* -- their machine starts that rectangle black and ends it
+/// white, this one only ever showed white -- and in the drag-fallback case it
+/// is their *"if no QR the screen is pitch black, no way I can guess where the
+/// QR code is"*: a solid screen for well over a second with nothing on it to
+/// point at. Their own log has the same shape two seconds wide, because every
+/// window lookup on the way to the DWM call is an `EnumWindows`.
+///
+/// **It was never the transparency.** The steady state measures see-through in
+/// every configuration tried: with the capture mask and the minimise both on
+/// (mean absolute error **0.37** against a see-through model, **60.72** against
+/// an opaque-flat one, correlation 1.0000) and with both off (**0.37** and
+/// **59.89**). The DWM call has been landing and working the whole time. What
+/// shipped was the window being on screen for a second and a third before it
+/// did.
+///
+/// # The fix is this crate's own, borrowed from [`crate::window_host::Reveal`]
+///
+/// Build the viewport `with_visible(false)`, make the DWM call and set the
+/// capture mask on the window while it is still hidden, and only then ask for
+/// it to be shown. Re-measured the same way on the same code: **one** sample of
+/// white instead of eighty -- at most one unpainted frame, which is the floor
+/// for this architecture and exactly what `window_host::Reveal` already accepts
+/// for every other window in this crate.
+///
+/// # Why both steps run on the ROOT's frame
+///
+/// The first has no choice. **A hidden deferred viewport's callback does not
+/// run at all**: `eframe`'s `glow_integration::run_ui_and_paint` computes
+/// `run_ui` as `is_visible || is_viewport_or_descendant_visible(..)`, and
+/// `epi_integration::update` calls a child viewport's `viewport_ui_cb` only
+/// `if is_visible`; a hidden viewport with no children of its own fails both. A
+/// state machine that lived in the callback and waited to be shown would wait
+/// for ever, behind a full-screen window with no way to cancel it. So the show
+/// is sent with `send_viewport_cmd_to`, from outside -- `eframe` buffers
+/// commands addressed at another viewport in `deferred_commands` and applies
+/// them as soon as that viewport has a window.
+///
+/// The second is a choice, and it was measured. The raise and the minimise are
+/// an `EnumWindows` each; put them on the overlay's own first visible frame and
+/// that whole cost sits between the window appearing and its first painted
+/// pixel. Measured both ways, same probe, same code: **54** white samples with
+/// them in the callback against **one** with them on the root's next frame.
+///
+/// # Every transition is forwards, as with [`Prescan`] and [`Reveal`]
+///
+/// `Waiting` is where an overlay whose window does not exist yet stays, and the
+/// lookup that leaves it is the only `EnumWindows` this costs -- two or three
+/// per overlay, none afterwards. `Hidden` lasts one root frame, and that frame
+/// is guaranteed rather than hoped for: the step that enters `Hidden` asks the
+/// root for it. `Up` is absorbing, and each method below is the only way out of
+/// one state, so neither can run twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Appearing {
+    /// `eframe` has not created the OS window yet. **Checked rather than
+    /// assumed**: the hook this replaced claimed its one chance on a frame
+    /// where the lookup answered `None`, and spent it -- which is the defect
+    /// that shipped through 0.15.21 and cost the DWM call, the capture mask
+    /// and the raise all three, silently.
+    Waiting,
+    /// The window exists and is **hidden**. DWM has been asked to composite
+    /// its per-pixel alpha, it is out of screen captures, and `Visible(true)`
+    /// is queued for the end of this frame.
+    Hidden,
+    /// It is on screen. Raised, and Deskwarden's own window has gone down
+    /// behind it.
+    Up,
+}
+
+impl Appearing {
+    /// **Leaves `Waiting`, and nothing else.** Answers `true` on the one frame
+    /// the caller should composite the window and ask for it to be shown.
+    ///
+    /// `window_exists` is what the caller's lookup found, and is only consulted
+    /// here -- once the window has been seen it is never looked for again.
+    fn compose(&mut self, window_exists: bool) -> bool {
+        if matches!(self, Self::Waiting) && window_exists {
+            *self = Self::Hidden;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// **Leaves `Hidden`, and nothing else.** Answers `true` on the one frame
+    /// the caller should raise the window and send Deskwarden's own window
+    /// down.
+    ///
+    /// A caller that never composed stays in `Waiting` and gets `false` for
+    /// ever, which is what a test overlay and an overlay whose window never
+    /// appeared both are.
+    fn on_screen(&mut self) -> bool {
+        if matches!(self, Self::Hidden) {
+            *self = Self::Up;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// What [`RegionOverlay::prescan_step`] wants the caller to do this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrescanStep {
@@ -1255,7 +1390,7 @@ impl RegionOverlay {
                 found: false,
                 throttle: DecodeThrottle::new(DECODE_INTERVAL),
                 outcome: None,
-                raised: false,
+                appearing: Appearing::Waiting,
                 open: true,
                 prescan: Prescan::Due,
                 masked: false,
@@ -1440,10 +1575,11 @@ impl RegionOverlay {
                 // **...and not even that frame, while Deskwarden's own window
                 // is still on its way down.**
                 //
-                // The minimise is issued on the overlay's first painted frame,
-                // which is this frame -- so on a route that found a code, the
-                // window this reveal exists to get out of the way is still on
-                // screen right now. Starting the clock here would spend the
+                // The minimise is issued on the root frame that raises this
+                // window, which is at best this frame and may be the one after
+                // it -- so on a route that found a code, the window this
+                // reveal exists to get out of the way can still be on screen
+                // right now. Starting the clock here would spend the
                 // front of `REVEAL_DWELL` ringing a code behind it, by an
                 // amount that varies with the user's machine, which is exactly
                 // the defect `Reveal::Due` was introduced to avoid for a
@@ -1455,6 +1591,21 @@ impl RegionOverlay {
                 // forwards, and the reveal branch of the callback asks for the
                 // next frame itself. `None` -- an overlay that never stood
                 // aside -- has nothing to wait for and does not.
+                //
+                // **And not while the window has only just been shown,
+                // either.** `Appearing::Hidden` means `Visible(true)` has gone
+                // out and the minimise has not happened yet -- it is on the
+                // root's next frame, one `request_repaint` away and guaranteed
+                // by it. Without this the dwell could start a whole root frame
+                // before the window it exists to get out of the way had even
+                // been asked to go, which is the same defect `MINIMISE_SETTLE`
+                // carries the measurement for, reached from the other side. A
+                // test overlay is `Waiting` and never `Hidden`, so this waits
+                // for nothing there; and the state only moves forwards, so it
+                // cannot wait for ever.
+                if matches!(held.appearing, Appearing::Hidden) {
+                    return Some(at);
+                }
                 if let Some(down_at) = held.aside_at {
                     if now < down_at + MINIMISE_SETTLE {
                         return Some(at);
@@ -1561,6 +1712,84 @@ impl RegionOverlay {
             send_window_down(crate::vault_window::WINDOW_TITLE);
         } else {
             bring_window_back(crate::vault_window::WINDOW_TITLE);
+        }
+    }
+
+    /// **Takes the overlay's window from "created" to "composited, on screen,
+    /// raised, with Deskwarden out of the way behind it"** -- two steps, one
+    /// root frame apart, and never a third.
+    ///
+    /// Both steps run here, on the ROOT's frame. See [`Appearing`] for why
+    /// neither can be in the viewport callback, and for the measurement of what
+    /// the arrangement this replaced cost.
+    ///
+    /// # Step one, on a window nobody can see yet
+    ///
+    /// 1. [`let_the_desktop_through`] **first**. It is the call `winit` skips
+    ///    and the only thing that makes this surface a dimmed desktop rather
+    ///    than a rectangle. DWM attributes set on a hidden window are honoured
+    ///    when it appears -- the same property `foreground::own_window_titled`
+    ///    records for `login_ui`'s rounded corners.
+    /// 2. [`exclude_from_capture`], also while hidden, so there is no frame in
+    ///    which this window is on screen and *in* a capture. A region dragged
+    ///    on this surface is captured through where this surface is, and a
+    ///    capture that included its own dim reads as "no code there" for a code
+    ///    that is plainly on screen.
+    /// 3. `Visible(true)`, addressed at the overlay's viewport. `eframe` reads
+    ///    `is_visible` at the TOP of a frame and applies queued viewport
+    ///    commands at the BOTTOM, so the frame that asks to be shown is the
+    ///    frame that does not paint; the two repaint requests beside it are
+    ///    what buy the frame that does, one for the overlay and one for the
+    ///    root. Without them nothing else would ask -- an always-on-top window
+    ///    over every monitor gets no events of its own.
+    ///
+    /// The `return` is load-bearing: the show is applied at the END of this
+    /// frame, so step two must not be on it.
+    ///
+    /// # Step two, on the root's next frame
+    ///
+    /// * `foreground::pick` skips invisible windows, so this is the first frame
+    ///   a raise can find anything at all. `window_host::Reveal` splits show
+    ///   from raise for this same reason.
+    /// * The minimise must not land while this process's only live viewport is
+    ///   the one being minimised -- a minimised `eframe` root alone takes no
+    ///   further frames at all, measured twice at 5.5 s of nothing. By this
+    ///   frame the overlay is not merely registered but visible, which is a
+    ///   stronger guarantee than the one the shipped arrangement had.
+    /// * The minimise stays after the raise: `SW_SHOWMINNOACTIVE` activates
+    ///   nothing, so a foreground this window has already taken is one it keeps
+    ///   -- which is what leaves Escape working with the app down. See
+    ///   [`send_window_down`].
+    ///
+    /// One thing moved with it. The reveal's dwell must not start before
+    /// Deskwarden is down, and the minimise is now a frame later than the
+    /// overlay's first paint, so [`RegionOverlay::reveal_step`] holds while
+    /// [`Appearing::Hidden`] as well as while `MINIMISE_SETTLE` runs.
+    fn appear(&self, ctx: &egui::Context) {
+        // The lookup, and only while there is something to find.
+        // `own_window_titled` does NOT skip invisible windows -- see its doc,
+        // which is what makes a window created hidden findable at all -- and it
+        // is an `EnumWindows`, measured in the hundreds of milliseconds in an
+        // unoptimised build. Two or three per overlay, none after that.
+        let waiting = matches!(locked(&self.inner).appearing, Appearing::Waiting);
+        let exists = waiting && crate::foreground::own_window_titled(REGION_TITLE).is_some();
+        if locked(&self.inner).appearing.compose(exists) {
+            let_the_desktop_through(REGION_TITLE);
+            exclude_from_capture(REGION_TITLE);
+            ctx.send_viewport_cmd_to(region_viewport(), egui::ViewportCommand::Visible(true));
+            ctx.request_repaint_of(region_viewport());
+            ctx.request_repaint();
+            return;
+        }
+        if locked(&self.inner).appearing.on_screen() {
+            // A selection surface that opens behind the window being selected
+            // from is useless, so this one raises; see its row in
+            // `foreground::OPENS_A_VIEWPORT_AND_RAISES_IT`.
+            crate::foreground::raise_window(REGION_TITLE);
+            // **And Deskwarden's own window goes down.** Every exit from `show`
+            // puts it back, and `Inner`'s `Drop` covers the exits that do not
+            // come through `show` at all.
+            self.stand_aside(true);
         }
     }
 
@@ -1834,7 +2063,21 @@ impl RegionOverlay {
                 // flag on the ROOT viewport, which feeds the GL config
                 // template and was removed from `vault_window` for that
                 // reason.
-                .with_transparent(true),
+                .with_transparent(true)
+                // **Created hidden, and shown by [`RegionOverlay::appear`]
+                // once it is composited.**
+                //
+                // The same flag `app_window` and `vault_window` open their own
+                // windows with, for the same reason and against a measurement
+                // of the same defect: Windows shows a newly created window
+                // before its GL surface, its font atlas or its first frame
+                // exist, and what the user gets in the meantime is a solid
+                // rectangle of whatever was in the redirection surface. On a
+                // small window that is the startup white box; on this one it is
+                // every pixel of every monitor, and it was measured at 1315 ms.
+                // See [`Appearing`], which carries the numbers and the reason
+                // the show cannot be driven from the callback below.
+                .with_visible(false),
             move |root, _class| {
                 // **The overlay is over the moment an outcome is recorded, and
                 // from then on this callback must do nothing at all.**
@@ -1866,88 +2109,30 @@ impl RegionOverlay {
                     return;
                 }
 
-                // **"The first frame on which this window EXISTS", which is not
-                // the first frame this callback runs, and the difference is the
-                // whole of why the overlay was a solid black screen.**
+                // **Nothing about the window itself happens on this
+                // callback's frames any more, and the move is the fix.**
                 //
-                // This used to be `!held.raised`, set on the very first
-                // invocation. Measured -- `examples/overlay_transparency_probe
-                // --shape real`, which drives this module's own `open` and
-                // `show` and lists every top-level window of the process on each
-                // of the callback's first frames:
+                // What used to be here was a hook on the first frame this
+                // callback ran with an HWND to work on, and it did four things:
+                // the raise, the capture mask, the DWM call that makes this
+                // surface see-through, and the minimise. All four now run from
+                // [`RegionOverlay::appear`], on the ROOT's frame, in two steps
+                // one frame apart. Two reasons, and they point the same way:
                 //
-                // ```text
-                // real overlay frame 1: hwnd by REGION_TITLE = None   (8 windows, none ours)
-                // real overlay frame 2: hwnd by REGION_TITLE = None   (8 windows, none ours)
-                // real overlay frame 3: hwnd by REGION_TITLE = Some(..)  ("Deskwarden - scan a region")
-                // ```
+                // * This viewport is created hidden, and **a hidden deferred
+                //   viewport's callback is not called at all** -- `eframe`
+                //   gates it on `is_visible`. A hook here would be a hook
+                //   waiting for a show that only it could send.
+                // * Everything on this callback's critical path is in front of
+                //   a paint. The raise and the minimise are an `EnumWindows`
+                //   each, measured in the hundreds of milliseconds in an
+                //   unoptimised build; doing them here, on the frame the window
+                //   first became visible, put that whole cost between the
+                //   window appearing and its first painted pixel. Measured: 54
+                //   white samples that way against ONE with them on the root's
+                //   next frame.
                 //
-                // `eframe` runs a deferred viewport's callback for two frames
-                // before it creates the OS window: the viewport is registered
-                // out of the parent's frame output, and the window and its GL
-                // surface are built on a later pass. So all three calls below
-                // ran against an HWND that did not exist, every one of them
-                // resolved the window by title and returned `None`, and every
-                // one of them did nothing -- silently, because all three
-                // discard their result. `raised` was set anyway, so none of
-                // them was ever tried again.
-                //
-                // That is one bug with three faces, and only one of them was
-                // being chased: the missing `DwmEnableBlurBehindWindow` is the
-                // black screen, the missing `SetWindowDisplayAffinity` means a
-                // dragged rectangle is captured THROUGH this overlay's own dim
-                // (see `exclude_from_capture`), and the missing raise is why
-                // the window relies on `with_always_on_top` alone to be in
-                // front.
-                //
-                // The fix is to claim the frame only when there is something to
-                // claim it for. The lookup is one `EnumWindows` per frame until
-                // the window appears -- two or three of them, once per overlay
-                // -- and none at all afterwards, because `raised` short-circuits
-                // it.
-                let first_frame = {
-                    let mut held = locked(&mine.inner);
-                    if held.raised {
-                        false
-                    } else if crate::foreground::own_window_titled(REGION_TITLE).is_some() {
-                        held.raised = true;
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if first_frame {
-                    // The OS window exists by here -- the same hook every
-                    // window in this crate raises from. A selection surface
-                    // that opens behind the window being selected from is
-                    // useless, so this one raises; see its row in
-                    // `foreground::OPENS_A_VIEWPORT_AND_RAISES_IT`.
-                    crate::foreground::raise_window(REGION_TITLE);
-                    exclude_from_capture(REGION_TITLE);
-                    // **And Deskwarden's own window goes down, here and
-                    // nowhere earlier.**
-                    //
-                    // This is the frame the whole placement argument lands on.
-                    // It is after the raise deliberately: `SW_SHOWMINNOACTIVE`
-                    // activates nothing, so a foreground this window has
-                    // already taken is a foreground it keeps -- which is what
-                    // makes Escape still work with the app minimised. And it
-                    // cannot be any earlier, because until this frame there is
-                    // no window of ours but the one about to be minimised, and
-                    // an eframe root that is minimised and alone stops taking
-                    // frames entirely. See `MINIMISE_SETTLE`, which carries
-                    // the measurement.
-                    //
-                    // Every exit from `show` puts it back, and `Inner`'s
-                    // `Drop` covers the exits that do not come through `show`.
-                    mine.stand_aside(true);
-                    // And the one call that makes this window see-through at
-                    // all. It has to be here rather than in the builder
-                    // above, because it is a call on an HWND that does not
-                    // exist until the builder has been honoured. See
-                    // `let_the_desktop_through`.
-                    let_the_desktop_through(REGION_TITLE);
-                }
+                // See [`Appearing`] for the whole of it.
 
                 // **The reveal owns its frames entirely.**
                 //
@@ -2066,6 +2251,16 @@ impl RegionOverlay {
                 mine.remember_chips(chips);
             },
         );
+        // **After the viewport is registered, and on the ROOT's frame.**
+        //
+        // Both halves are load-bearing. The viewport has to be registered first
+        // so the `Visible(true)` this may send has an entry in this frame's
+        // viewport output to land in; and it has to be here rather than in the
+        // callback above because the callback does not run while the window is
+        // hidden, which is exactly the stretch this drives. See [`Appearing`].
+        if self.is_open() {
+            self.appear(ctx);
+        }
         let still_open = self.is_open();
         if !still_open {
             // Whatever ended it -- a code found, none found, several found, a
@@ -2700,10 +2895,14 @@ fn exclude_from_capture(title: &str) {
 /// # Why here and not in the viewport builder
 ///
 /// Because it is a call on an `HWND`, and there is no `HWND` until `eframe`
-/// has honoured the builder. This runs on the overlay's first painted frame,
-/// beside [`exclude_from_capture`], and resolves the window the way every
-/// other Win32 call in this crate does: by title, scoped to this process,
-/// through [`crate::foreground::own_window_titled`]. See
+/// has honoured the builder. This runs from [`RegionOverlay::appear`], on the
+/// frame the window first exists and **while it is still hidden** -- beside
+/// [`exclude_from_capture`] and before the show, which is what stops the user
+/// seeing a solid rectangle in the meantime -- and resolves the window the way
+/// every other Win32 call in this crate does: by title, scoped to this
+/// process, through [`crate::foreground::own_window_titled`]. That lookup does
+/// not skip invisible windows, which is what makes a hidden window findable at
+/// all. See
 /// `login_ui::round_window_corners` for the same pattern and the longer
 /// argument about why the lookup must be process-scoped.
 ///
@@ -2842,8 +3041,8 @@ fn set_capture_exclusion(title: &str, exclude: bool) {
 /// its return value cannot answer "did this work" and is not treated as
 /// though it could. `IsIconic` can, and does -- on the handle already
 /// resolved, with no second `EnumWindows`, because that lookup was measured at
-/// hundreds of milliseconds in an unoptimised build and this is on the
-/// overlay's first painted frame.
+/// hundreds of milliseconds in an unoptimised build and this is on the frame
+/// the overlay takes the screen -- a frame whose cost the user is watching.
 ///
 /// Logged either way rather than discarded, which is this module's rule since
 /// three silently-failing Win32 calls cost a day: a window that did not go
@@ -4410,9 +4609,9 @@ mod tests {
         assert_ne!(crate::vault_window::WINDOW_TITLE, REGION_TITLE);
     }
 
-    /// **The window goes down on the overlay's first painted frame, and not on
-    /// the frame that masks it -- which is the one thing here that was
-    /// measured rather than reasoned.**
+    /// **The window goes down once the overlay is on screen, and not on the
+    /// frame that masks it -- which is the one thing here that was measured
+    /// rather than reasoned.**
     ///
     /// Between `PrescanStep::Mask` and `PrescanStep::Scan` this overlay has
     /// registered no viewport, so the root is an eframe app whose only window
@@ -4421,8 +4620,16 @@ mod tests {
     /// set on that frame is never reached and the route hangs. `MINIMISE_SETTLE`'s
     /// doc carries the measurement; this keeps the code on the right side of
     /// it.
+    ///
+    /// It used to say "the overlay's first painted frame" and meant the
+    /// viewport callback's first frame. The window is created hidden now, that
+    /// callback does not run until it is shown, and both the raise and the
+    /// minimise happen from [`RegionOverlay::appear`] on the root's frame --
+    /// one frame after the show, when the overlay is not merely registered but
+    /// visible. Same property, stronger guarantee, different place; see
+    /// [`Appearing`].
     #[test]
-    fn the_window_goes_down_on_the_overlays_own_first_frame() {
+    fn the_window_goes_down_once_the_overlay_is_on_screen() {
         let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
         let code = source.split("#[cfg(test)]").next().unwrap();
 
@@ -4444,17 +4651,17 @@ mod tests {
             "the prescan no longer masks the vault window before it captures"
         );
 
-        // It goes down in the first-frame hook, AFTER the overlay has taken
-        // the foreground. `SW_SHOWMINNOACTIVE` activates nothing, so a
-        // foreground this window already holds is one it keeps -- which is
-        // what leaves Escape working with the app minimised.
+        // It goes down in `appear`, AFTER the overlay has taken the
+        // foreground. `SW_SHOWMINNOACTIVE` activates nothing, so a foreground
+        // this window already holds is one it keeps -- which is what leaves
+        // Escape working with the app minimised.
         let hook = code
-            .split("if first_frame {")
+            .split("fn appear(&self, ctx: &egui::Context) {")
             .nth(1)
-            .expect("the first-frame hook is gone")
-            .split("// **The reveal owns its frames entirely.**")
+            .expect("`appear` is gone")
+            .split("\n    }")
             .next()
-            .expect("the first-frame hook no longer ends where it did");
+            .expect("`appear` no longer ends where it did");
         let raise = hook.find("raise_window(REGION_TITLE);").expect("the raise is gone");
         let down = hook.find("stand_aside(true);").expect("the window is never sent down");
         assert!(
@@ -4466,6 +4673,25 @@ mod tests {
             hook.find("exclude_from_capture(REGION_TITLE);").expect("the mask is gone") < down,
             "the overlay stopped excluding itself from captures before standing the vault \
              window down"
+        );
+        // **And both of those are in the step AFTER the one that shows the
+        // window.** `foreground::pick` skips invisible windows, so a raise on
+        // the frame that merely asked for the show finds nothing; and a
+        // minimise on that frame would be a minimise with no visible viewport
+        // of this process left, which is the hang `MINIMISE_SETTLE` records.
+        let shown = hook
+            .find("ViewportCommand::Visible(true)")
+            .expect("the overlay is never shown, so it is a window nobody can see");
+        assert!(
+            shown < raise && shown < down,
+            "the overlay is raised or minimised into on the same step that asks for it to be \
+             shown -- `Visible(true)` is applied at the END of that frame, so at this point \
+             there is still nothing visible to raise"
+        );
+        assert!(
+            hook.find("appearing.on_screen()").expect("the second step's gate is gone") < raise,
+            "the raise and the minimise are no longer behind `Appearing::on_screen`, so they \
+             can run on the frame that only asked for the show -- or twice"
         );
     }
 
@@ -4479,6 +4705,12 @@ mod tests {
     /// with none of the bookkeeping (`hidden`, `close_or_hide`,
     /// `spawn_show_waiter`) that goes with it -- the same distinction that
     /// file's own `ChromeAction::Minimize` arm is built around.
+    ///
+    /// It used to forbid `ViewportCommand::Visible` outright, and that stopped
+    /// being the right question when the overlay's own window started being
+    /// created hidden -- see [`Appearing`]. The needle is now about *which*
+    /// viewport the command is addressed at, which is the distinction that was
+    /// always meant.
     #[test]
     fn the_vault_window_is_minimised_rather_than_hidden() {
         let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
@@ -4505,10 +4737,34 @@ mod tests {
             "this module hides the vault window; a hidden window that fails to come back is \
              unreachable, which is the one outcome the minimise exists to avoid"
         );
-        assert!(
-            !code.contains("ViewportCommand::Visible"),
-            "this module drives the vault window's visibility, which is the state \
+        // **`Visible` is allowed now, and in exactly one shape.**
+        //
+        // This module shows its OWN viewport: the overlay is created hidden and
+        // shown once it is composited, which is the white-box fix `Appearing`
+        // carries the measurement for. What is still forbidden is a `Visible`
+        // that lands on the VAULT window -- and that distinction is not a
+        // matter of intent, it is the addressed form. `show` runs on the vault
+        // window's own context, so a bare `send_viewport_cmd` there drives the
+        // visibility of the window `vault_window`'s `keep_ui_loaded` machinery
+        // believes only it produces, with none of its bookkeeping. So the pin
+        // is an identity: every `Visible` in this module is an addressed one,
+        // aimed at this module's own viewport.
+        assert_eq!(
+            code.matches("ViewportCommand::Visible").count(),
+            code.matches("send_viewport_cmd_to(region_viewport(), egui::ViewportCommand::Visible")
+                .count(),
+            "this module sends a `Visible` command that is not addressed at its own viewport, \
+             so it is driving the vault window's visibility -- which is the state \
              `vault_window`'s keep_ui_loaded machinery owns"
+        );
+        // Positive control on that identity, which would otherwise be true of a
+        // module that sent no `Visible` at all -- including one whose overlay is
+        // created hidden and then never shown, which is a full-screen window
+        // nobody can see and nobody can cancel.
+        assert_eq!(
+            code.matches("ViewportCommand::Visible").count(),
+            1,
+            "the overlay is shown from a different number of places than one"
         );
         // `SW_MINIMIZE` also activates the next top-level window in Z order,
         // which is somebody else's -- measured to cost this overlay the
@@ -4973,45 +5229,57 @@ mod tests {
             code.contains("DeleteObject(region)"),
             "the blur region is never deleted"
         );
-        // It happens on the first painted frame, beside the capture
-        // exclusion, because that is the first moment there is a window to
-        // call it on.
+        // It happens on the frame the window first exists, beside the
+        // capture exclusion, because that is the first moment there is a
+        // window to call it on -- and BEFORE the window is shown, which is the
+        // rest of this module's white-box fix. See `Appearing`.
         let first = code
-            .split("if first_frame {")
+            .split("fn appear(&self, ctx: &egui::Context) {")
             .nth(1)
-            .expect("the callback no longer has a first-frame hook");
-        let first = first.split("\n                }").next().unwrap();
+            .expect("`appear` is gone");
+        let first = first.split("\n    }").next().unwrap();
+        let dwm = first
+            .find("let_the_desktop_through(REGION_TITLE);")
+            .expect("the DWM call is not made on the frame the window first exists");
+        let shown = first
+            .find("ViewportCommand::Visible(true)")
+            .expect("the overlay is never shown");
         assert!(
-            first.contains("let_the_desktop_through(REGION_TITLE);"),
-            "the DWM call is not made on the frame the window first exists"
+            dwm < shown,
+            "the window is shown before DWM has been asked to composite its alpha, so the \
+             user gets a solid full-screen rectangle until the call lands -- measured at 1315 \
+             ms of pure white, which is the defect this ordering exists to remove"
         );
-        // **And `first_frame` means "the window exists", not "the callback has
-        // not run before".** This is the defect that shipped through 0.15.21
-        // and it is invisible in a diff: the call was made, on a window that
-        // did not exist yet, and returned `None` and did nothing. `eframe` runs
-        // a deferred viewport's callback for two frames before it creates the
-        // OS window -- measured, on the real `open`/`show`, by the probe this
-        // module's history records -- so a hook that fires on the first
-        // callback fires into nothing and never fires again.
+        assert!(
+            first
+                .find("exclude_from_capture(REGION_TITLE);")
+                .expect("the capture mask is gone")
+                < shown,
+            "the window is shown before it is taken out of screen captures, so a capture \
+             taken in between reads this overlay's own dim"
+        );
+        // **And the step means "the window exists", not "this has not run
+        // before".** That was the defect that shipped through 0.15.21 and it is
+        // invisible in a diff: the calls were made, on a window that did not
+        // exist yet, and every one of them resolved `None` and did nothing --
+        // silently, because all three discarded their result. The flag was set
+        // anyway, so none was ever tried again. `Appearing::compose` takes the
+        // answer as an argument and only leaves `Waiting` when it is true.
+        assert!(
+            first.contains("own_window_titled(REGION_TITLE).is_some()"),
+            "`appear` no longer waits for the window to exist, so the DWM call and the capture \
+             exclusion run against an HWND that is not there yet -- which is a solid overlay \
+             and a capture taken through its own dim, both silently"
+        );
         let gate = code
-            .split("let first_frame = {")
+            .split("fn compose(&mut self, window_exists: bool) -> bool {")
             .nth(1)
-            .expect("the first-frame gate is gone");
-        let gate = gate.split("};").next().unwrap();
+            .expect("`Appearing::compose` is gone");
+        let gate = gate.split("\n    }").next().unwrap();
         assert!(
-            gate.contains("own_window_titled(REGION_TITLE).is_some()"),
-            "the first-frame hook no longer waits for the window to exist, so the DWM call, the \
-             capture exclusion and the raise all run against an HWND that is not there yet -- \
-             which is a black overlay, a capture taken through its own dim, and no raise, all \
-             three silently"
-        );
-        // The flag is set INSIDE that check rather than unconditionally, or the
-        // hook is spent on the frame it could not do anything.
-        let before_flag = gate.split("held.raised = true;").next().unwrap();
-        assert!(
-            before_flag.contains("own_window_titled(REGION_TITLE).is_some()"),
-            "`raised` is set before the window has been found, so the one chance to make these \
-             calls is spent on a frame that cannot make them"
+            gate.contains("&& window_exists"),
+            "`Appearing::compose` leaves `Waiting` without being told the window exists, so \
+             the one chance to make these calls is spent on a frame that cannot make them"
         );
         // The vault window's root viewport does NOT ask for transparency: on
         // Windows that flag only reaches the GL config template, where it
@@ -5024,6 +5292,162 @@ mod tests {
             !vault.contains(".with_transparent(true)"),
             "the vault window asks for transparency again; see `let_the_desktop_through`"
         );
+    }
+
+    /// **The viewport is created hidden, and that is the white box.**
+    ///
+    /// The measurement is in [`Appearing`]'s doc and cannot be repeated from
+    /// here -- there is no compositor in a test process. What can be held is
+    /// the flag, and the flag is the whole fix: without it `eframe` creates the
+    /// OS window and Windows shows it immediately, and every pixel of every
+    /// monitor is a solid rectangle until the first frame paints. Measured at
+    /// **1315 ms**, eighty consecutive 17 ms samples of `(255, 255, 255)` with
+    /// `sd = 0.00` and nothing else in between; zero and one across two runs
+    /// after the change.
+    ///
+    /// It is also the reason the DWM call and the capture mask left the
+    /// viewport callback: a hidden deferred viewport's callback is not run at
+    /// all, so a hook there would wait for a show only it could send.
+    #[test]
+    fn the_overlay_window_is_created_hidden_and_shown_once_it_is_composited() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        let builder = code
+            .split("ViewportBuilder::default()")
+            .nth(1)
+            .expect("the overlay no longer builds a viewport")
+            .split("move |root, _class| {")
+            .next()
+            .expect("the builder no longer ends at the callback");
+        assert!(
+            builder.contains(".with_visible(false)"),
+            "the overlay's viewport is no longer created hidden, so the window is on screen \
+             before it is composited and before it has painted -- which is the second and a \
+             third of solid white this module was fixed for"
+        );
+        // Positive control on the needle: the builder really is the haystack,
+        // so the presence above is about this window and not about an empty
+        // string.
+        assert!(builder.contains(".with_title(REGION_TITLE)"));
+        // And exactly one show, so a second one cannot appear somewhere that
+        // runs before the DWM call.
+        assert_eq!(
+            code.matches("ViewportCommand::Visible(true)").count(),
+            1,
+            "the overlay is shown from more than one place, so the ordering the white-box fix \
+             rests on is no longer decided in one spot"
+        );
+        // The callback is not where any of it happens any more. A hook there
+        // would never run: `eframe` gates a deferred viewport's callback on
+        // `is_visible`.
+        let callback = code
+            .split("move |root, _class| {")
+            .nth(1)
+            .expect("the viewport callback is gone")
+            // Bounded at the line that follows the closure, or the needles
+            // below would find these functions' own definitions further down
+            // the file and this would be a test of nothing.
+            .split("// **After the viewport is registered")
+            .next()
+            .expect("the callback no longer ends where it did");
+        for needle in [
+            "let_the_desktop_through(",
+            "exclude_from_capture(",
+            "raise_window(",
+            "stand_aside(true)",
+        ] {
+            assert!(
+                !callback.contains(needle),
+                "`{needle}` is back inside the viewport callback. While the window is hidden \
+                 that callback does not run at all, and once it does run everything in front \
+                 of the paint is more solid rectangle on screen"
+            );
+        }
+    }
+
+    /// **Each step of the appearance happens once, in order, and only when it
+    /// is allowed to.**
+    ///
+    /// The pure half of [`Appearing`], which is all a test process can reach:
+    /// the effects are four Win32 calls and a viewport command and not one of
+    /// them can be observed from `cargo test`. What can be observed is that
+    /// `compose` waits for a window, that `on_screen` waits for `compose`, and
+    /// that neither ever fires twice -- the last of which is what keeps the
+    /// vault window from being re-minimised every frame for the life of the
+    /// overlay.
+    #[test]
+    fn the_window_appears_in_two_steps_and_neither_repeats() {
+        // Nothing happens while there is no window, however many frames pass.
+        let mut appearing = Appearing::Waiting;
+        for _ in 0..50 {
+            assert!(!appearing.compose(false));
+            assert!(
+                !appearing.on_screen(),
+                "the overlay raised and minimised into a window that does not exist yet"
+            );
+            assert_eq!(appearing, Appearing::Waiting);
+        }
+        // The frame the window appears composites it and asks for the show.
+        assert!(appearing.compose(true));
+        assert_eq!(appearing, Appearing::Hidden);
+        // And not twice, which would be a second DWM call, a second mask and a
+        // second `Visible(true)` every frame.
+        for _ in 0..50 {
+            assert!(!appearing.compose(true));
+            assert_eq!(appearing, Appearing::Hidden);
+        }
+        // The next frame is the one that raises and stands the vault window
+        // aside.
+        assert!(appearing.on_screen());
+        assert_eq!(appearing, Appearing::Up);
+        // Absorbing, both ways. A `true` here is a window that re-raises itself
+        // every frame and a vault window minimised again each time the user
+        // clicks its taskbar button.
+        for _ in 0..50 {
+            assert!(!appearing.on_screen());
+            assert!(!appearing.compose(true));
+            assert_eq!(appearing, Appearing::Up);
+        }
+    }
+
+    /// **The reveal's dwell does not start until the window it is getting out
+    /// of the way has been asked to go.**
+    ///
+    /// `MINIMISE_SETTLE` covers the stretch after the minimise is issued. This
+    /// covers the stretch before it: the overlay's window is shown at the end
+    /// of one root frame and the minimise happens on the next, so there is one
+    /// frame in which the overlay is painting, the reveal is `Due`, and
+    /// Deskwarden is still sitting on top of the code being ringed. A dwell
+    /// started there is a dwell the user spends looking at a ring behind a
+    /// window.
+    #[test]
+    fn the_reveal_waits_for_the_window_to_have_finished_appearing() {
+        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        locked(&overlay.inner).appearing = Appearing::Hidden;
+        let t0 = Instant::now();
+        // Frames pass, the mark is painted, and the clock does not start: the
+        // reveal is still `Due`, so a dwell later is still a whole dwell.
+        for _ in 0..20 {
+            assert_eq!(overlay.reveal_step(t0), Some(FOUND_AT));
+            assert!(matches!(locked(&overlay.inner).reveal, Reveal::Due { .. }));
+        }
+        assert_eq!(
+            overlay.reveal_step(t0 + REVEAL_DWELL * 4),
+            Some(FOUND_AT),
+            "the reveal ended while the window was still only just shown, so the user got \
+             nothing at all"
+        );
+        // Once the window is up -- and with nothing to wait for, because a
+        // test overlay never stands aside -- the clock starts on the next
+        // frame and runs its full length from there.
+        locked(&overlay.inner).appearing = Appearing::Up;
+        let t1 = t0 + REVEAL_DWELL * 4;
+        assert_eq!(overlay.reveal_step(t1), Some(FOUND_AT));
+        assert!(matches!(locked(&overlay.inner).reveal, Reveal::Showing { .. }));
+        assert_eq!(overlay.reveal_step(t1 + REVEAL_DWELL - Duration::from_millis(1)), Some(FOUND_AT));
+        assert_eq!(overlay.reveal_step(t1 + REVEAL_DWELL), None);
+        assert!(!overlay.is_open());
     }
 
     /// **The scan is decode-only: nothing paints it.**
