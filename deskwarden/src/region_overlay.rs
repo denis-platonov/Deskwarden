@@ -278,31 +278,67 @@ pub fn scan_miss_line(miss: ScanMiss) -> String {
 // design's 26px badge on a 100% monitor and grows with the user's scaling the
 // way every other surface in this app does.
 
-/// How dark the desktop goes outside the selection.
+/// How dark the desktop goes outside the selection: the app's ink at 45%, so
+/// the user's own screen comes through at 55%.
 ///
-/// **Ink at 68%, not black at 55%.** 6b composites the desktop at
-/// `opacity: 0.32` over `#201e1d`, which over a real desktop is the same
-/// arithmetic as painting that ink at `1 - 0.32` -- `0.68 * 255`, rounded.
-/// Black was what this drew before and it read as a colder, flatter dim than
-/// the design's, because the design's wash is the app's ink and carries its
-/// warmth. The selection itself is left entirely unpainted, which is what
-/// "stays lit" means on a transparent viewport.
+/// The colour is the design's and is not in question -- `#201e1d`, the app's
+/// ink, rather than black, because a black wash reads as a colder, flatter dim
+/// than this one and carries none of the product's warmth. The selection
+/// itself is left entirely unpainted, which is what "stays lit" means on a
+/// transparent viewport. What changed is the **weight**.
 ///
-/// **Re-examined once the window was actually see-through, and left alone.**
-/// It is worth saying why, because the temptation to re-tune it here is
-/// strong and would be a mistake. Until
+/// # This is a deliberate departure from design 6b, asked for by the owner
+///
+/// *"don't do hard overlay - needs to be transparent enough"*. It is worth
+/// being exact about what is being departed from, because the obvious reading
+/// -- that the old value was a misreading of the design and this is the fix --
+/// is wrong, and somebody will "fix" it back if the record does not say so.
+///
+/// **The design really does specify the heavy value.** `Deskwarden.dc.html`
+/// under `id="6b"` draws its mock as a container at `background: #201e1d` with
+/// the fake desktop inside it at `opacity: 0.32`. Over a real desktop that is
+/// the same arithmetic as painting the ink at `1 - 0.32` -- `0.68 * 255`,
+/// rounded, which is 173. That was checked against the file rather than
+/// remembered, because an earlier pass read the two the other way round and
+/// the question of which of them was wrong was worth settling. Neither: 173
+/// was faithful.
+///
+/// **It was faithful and still wrong in the hand, and the mockup itself says
+/// why.** The desktop the design fakes behind the dim is `#ffffff` chrome over
+/// an `#f7f6f5` page -- a bright white screen. A real desktop is mostly darker
+/// than that, so the same 68% of ink that reads as a soft scrim over white
+/// reads as near-black over the screen a user actually has. The design
+/// measured its wash against the one background that flatters it.
+///
+/// **And nobody could have noticed until now.** Until
 /// [`let_the_desktop_through`] this viewport was opaque and cleared to
-/// near-black, so 173 was being composited over black rather than over the
-/// desktop -- and the result was black whatever the number was. Every
-/// judgement anyone could have formed about this value was formed against
-/// that, so *none of them was about this value*. What the arithmetic above
-/// says is unchanged and is now true for the first time: at 68% the desktop
-/// comes through at the design's own 32%. Lightening it because 68% "looks
-/// heavy" in isolation would be substituting a guess for the design's
-/// measurement, and the only honest reason to move it would be a real desktop
-/// where the selection cannot be told from the dim -- which is the opposite
-/// complaint.
-pub const DIM_ALPHA: u8 = 173;
+/// near-black, so whatever this number was, it was being composited over black
+/// and the result was black. The window is genuinely see-through for the first
+/// time, which is what made the value judgeable at all -- and the first person
+/// to judge it said it was too heavy.
+///
+/// # Why 115
+///
+/// `115 / 255` is 0.451, so the desktop comes through at **55%** rather than
+/// the design's 32%. Bounded on both sides, and neither bound is taste:
+///
+/// * Below, by what the dim is *for*. It has one job -- to make the unpainted
+///   selection read as lit, so the user can see what they have framed. That
+///   needs a contrast step at the selection's edge that survives whatever is
+///   behind it, and a wash much under 40% stops being a step at all on a busy
+///   desktop. It also has to stay dark enough to carry
+///   [`BAR_HINT_INK`]'s grey and [`BAR_TITLE_PX`]'s white, which are type for
+///   a dark ground.
+/// * Above, by the complaint. At 68% the desktop is a rumour; at 55% it is a
+///   screen someone can read a window title off, which is what "transparent
+///   enough" means for a surface whose whole purpose is to point at something
+///   already on it.
+///
+/// It stays **one** constant. Every wash on this surface that is not the
+/// design's own plate -- [`SIZE_BG_ALPHA`] and [`BAR_BG_ALPHA`] are plates and
+/// keep their own numbers -- comes from here, so there is one place to move it
+/// again.
+pub const DIM_ALPHA: u8 = 115;
 
 /// The solid ring around the selection: `box-shadow: 0 0 0 2px #1b3fa0`.
 pub const SELECTION_RING: f32 = 2.0;
@@ -384,6 +420,24 @@ pub const BAR_REASON_PX: f32 = 12.0;
 /// distinguishable from both without introducing a second accent to a screen
 /// that has one. `BLUE_SOFT` is that same blue, lightened for a dark ground,
 /// which is what this bar is.
+///
+/// **Re-examined when [`DIM_ALPHA`] was lightened, and deliberately left
+/// alone.** The worry was the right one to have and its premise turns out to
+/// be false: this ink is not on the dim. [`paint_bar`] fills the bar with its
+/// own plate at [`BAR_BG_ALPHA`] -- the design's `rgba(32, 30, 29, 0.92)`,
+/// which is not the wash and did not move -- and only then sets type on it.
+/// "A dark ground" is still exactly what this sits on. The same goes for
+/// [`BAR_HINT_INK`] and the white title beside them, for the size readout on
+/// [`SIZE_BG_ALPHA`], for the chips, and for the lock-on badge and the
+/// reveal's, which are solid fills.
+///
+/// The one thing on this surface that really is alpha over the wash is the
+/// selection's **halo** ([`HALO_ALPHA`], the design's 28% blue outside the
+/// solid ring), and it is not a control: it is a glow around a fully opaque
+/// two-point ring, and a dark blue glow is if anything easier to see against a
+/// lighter field than against a near-black one. So nothing here was changed on
+/// a hunch, and `the_bar_carries_its_own_ground_and_not_the_dim` is what stops
+/// the premise quietly becoming false later.
 pub const BAR_REASON_INK: egui::Color32 = theme::BLUE_SOFT;
 
 /// A shortcut chip's height (`height: 28px`).
@@ -563,6 +617,81 @@ pub const DECODE_INTERVAL: Duration = Duration::from_millis(150);
 /// **Not a proof.** Nothing in this crate can assert the compositor acted;
 /// see the module header's list of what a real desktop is needed for.
 pub const PRESCAN_SETTLE: Duration = Duration::from_millis(80);
+
+/// **How long Deskwarden's own window takes to leave the screen after it has
+/// been sent down, and therefore how long the reveal waits before starting its
+/// clock.**
+///
+/// # What this is a settle for, which is not what it was expected to be
+///
+/// The obvious place to put the minimise was the `Mask` frame, beside
+/// [`exclude_from_capture`] -- window out of the capture and off the screen in
+/// one breath, [`PRESCAN_SETTLE`] lengthened to cover both, capture after.
+/// **That design is fatal and was measured to be**, which is the whole reason
+/// this is a second constant rather than a bigger first one.
+///
+/// Between `Mask` and `Scan` this overlay has registered **no viewport at
+/// all**: [`RegionOverlay::show`] returns early on those frames, so the root
+/// is an eframe application with exactly one window and that window is
+/// iconic. Measured with a probe that minimises such a root and counts its
+/// frames for the next five seconds: it takes **none**. Not a throttled
+/// trickle -- the last frame is the one that issued the minimise, and nothing
+/// follows it, however hard that frame asks for a repaint. A settle deadline
+/// set on a frame that is the last frame is a deadline nothing will ever
+/// reach, and a route that never reaches it is the hang this module was
+/// already fixed for once.
+///
+/// So the window goes down on the overlay's **first painted frame** instead --
+/// the one that raises it, excludes it and makes it see-through -- which is
+/// the first moment a live child viewport exists. The same probe, minimising
+/// there, measures the root going on at about 8 frames a second and this
+/// overlay at twice that, indefinitely. That is `eframe`'s deliberate
+/// `INVISIBLE_WINDOW_REPAINT_INTERVAL` throttle of a window Windows sends no
+/// `WM_PAINT` to, and it is a real cost paid by the drag fallback; it is not a
+/// freeze.
+///
+/// Which leaves one thing that genuinely has to wait, and it is not the scan's
+/// capture -- that one is protected by the mask, set two frames earlier, which
+/// is exactly the belt this is braces to. It is the **reveal**. The reveal
+/// exists to show the user the code on their own screen, and it is issued on
+/// the same frame as the minimise: without a wait, the first part of
+/// [`REVEAL_DWELL`] would be spent ringing a code behind the window that is
+/// still on its way down. That is the argument [`Reveal::Due`] already makes
+/// about a window that does not exist yet, applied to a window that has not
+/// gone yet.
+///
+/// # Why 120 ms
+///
+/// Measured, on a real desktop, by minimising a window filled with a colour
+/// nothing else is and capturing its own rectangle exactly once, at one delay,
+/// per process run -- one shot rather than a sampling loop, because a
+/// `capture_rect` loop is a `BitBlt` off the screen DC every few milliseconds
+/// and three earlier versions of this measurement measured the probe instead
+/// of the minimise.
+///
+/// Across eight runs at requested delays from 0 to 320 ms, the window was
+/// fully present in the frame before the call (`filled = 1.000` every time)
+/// and **completely absent at every delay tried**, including the shortest the
+/// instrument can reach -- about 60 ms after `ShowWindow` returns, which is a
+/// floor set by a thread wake plus the ~30 ms a capture of that size costs,
+/// not by the compositor. `ShowWindow` itself returned in 4-6 ms.
+///
+/// So the honest reading is "gone within 60 ms, and probably much sooner",
+/// and 60 ms is an upper bound on a number this instrument cannot resolve
+/// rather than the number. 120 ms is twice that: margin for a machine slower
+/// than the one it was measured on, and comfortably more than
+/// [`PRESCAN_SETTLE`]'s 80 ms, which buys two composes at 30 Hz on the same
+/// reasoning.
+///
+/// It is also small enough not to matter. It is spent once, in front of a
+/// 450 ms reveal, at the end of a route whose scan is a full binarisation of
+/// every monitor -- so it moves the code onto the user's screen a fifth of a
+/// second later in exchange for the code being the thing they can actually
+/// see when it arrives.
+///
+/// **Not a proof**, on the same terms as [`PRESCAN_SETTLE`]: nothing in this
+/// crate can assert the compositor acted. See the module header's list.
+pub const MINIMISE_SETTLE: Duration = Duration::from_millis(120);
 
 /// **How long the overlay shows the user the code it just found, before it
 /// closes and 6c appears.**
@@ -992,6 +1121,19 @@ struct Inner {
     /// OS call, and this is what makes masking and unmasking idempotent and
     /// what [`Inner::drop`] reads to guarantee the mask comes off.
     masked: bool,
+    /// Whether Deskwarden's own window has been sent down for the length of
+    /// this overlay. A flag for [`Inner::masked`]'s reasons exactly --
+    /// `ShowWindow` is an OS call, this makes standing aside and coming back
+    /// idempotent, and it is what [`Inner::drop`] reads to guarantee the
+    /// window comes back. **Of the two flags this is the one with the
+    /// catastrophic failure mode**: a mask left on is a window missing from
+    /// screenshots, and a window left down is the user's app gone.
+    aside: bool,
+    /// When it went down, so the reveal can wait out [`MINIMISE_SETTLE`]
+    /// before starting its clock. `None` on an overlay that never stood aside
+    /// -- a test's, or one dropped before it ever had a window -- and `None`
+    /// means "nothing to wait for", which is true of exactly those.
+    aside_at: Option<Instant>,
     /// Why 6b opened. `None` until the scan has answered.
     reason: Option<ScanMiss>,
     /// How far the reveal has got. See [`Reveal`].
@@ -1117,6 +1259,8 @@ impl RegionOverlay {
                 open: true,
                 prescan: Prescan::Due,
                 masked: false,
+                aside: false,
+                aside_at: None,
                 reason: None,
                 reveal: Reveal::Nothing,
                 chips: [egui::Rect::NOTHING; 2],
@@ -1293,6 +1437,29 @@ impl RegionOverlay {
             // gets the whole dwell rather than whatever is left of it after
             // the OS has made a window.
             Reveal::Due { at } => {
+                // **...and not even that frame, while Deskwarden's own window
+                // is still on its way down.**
+                //
+                // The minimise is issued on the overlay's first painted frame,
+                // which is this frame -- so on a route that found a code, the
+                // window this reveal exists to get out of the way is still on
+                // screen right now. Starting the clock here would spend the
+                // front of `REVEAL_DWELL` ringing a code behind it, by an
+                // amount that varies with the user's machine, which is exactly
+                // the defect `Reveal::Due` was introduced to avoid for a
+                // window that did not exist yet. `MINIMISE_SETTLE` carries the
+                // measurement and the argument.
+                //
+                // This cannot become a wait with no end: `aside_at` is set
+                // once, the comparison is against a clock that only moves
+                // forwards, and the reveal branch of the callback asks for the
+                // next frame itself. `None` -- an overlay that never stood
+                // aside -- has nothing to wait for and does not.
+                if let Some(down_at) = held.aside_at {
+                    if now < down_at + MINIMISE_SETTLE {
+                        return Some(at);
+                    }
+                }
                 held.reveal = Reveal::Showing {
                     at,
                     until: now + REVEAL_DWELL,
@@ -1329,6 +1496,72 @@ impl RegionOverlay {
             held.masked = on;
         }
         set_capture_exclusion(crate::vault_window::WINDOW_TITLE, on);
+    }
+
+    /// **Sends Deskwarden's own window down out of the user's way, or brings
+    /// it back on top.**
+    ///
+    /// # Why this exists at all
+    ///
+    /// [`mask_own_window`](Self::mask_own_window) solves the machine's view
+    /// and not the user's. `WDA_EXCLUDEFROMCAPTURE` takes the vault window out
+    /// of the blit, so the scan reads what is behind it -- but the window is
+    /// still physically on screen, on top of the code, and both of the things
+    /// this overlay then does are things the user has to *look* at: the drag
+    /// fallback asks them to point at a code the window is covering, and the
+    /// reveal rings a code the window is covering. The owner said it in one
+    /// sentence: *"when Scan code clicked - that should minimize the DW window
+    /// so it doesn't obstruct the screen - obviously it doesn't have the QR
+    /// code but some other window has it, once back - it should be on top
+    /// again"*.
+    ///
+    /// # Minimise and not hide, and the difference is not aesthetic
+    ///
+    /// `SW_HIDE` is instant, leaves no taskbar button and looks better. It is
+    /// also the one choice whose failure mode is unrecoverable: a hidden
+    /// window that does not come back is a window the user cannot reach by any
+    /// means at all, whereas a minimised one that does not come back is one
+    /// taskbar click away. Everything below is built so that it always comes
+    /// back, and choosing the option that does not *need* that to be true is
+    /// how a safety argument is meant to be made.
+    ///
+    /// The second reason is this app's own state. `vault_window`'s
+    /// `keep_ui_loaded` machinery has a hidden state of its own -- a `hidden`
+    /// cell, `close_or_hide`, `spawn_show_waiter`, a named event the daemon
+    /// signals -- and `ChromeAction::Hide`'s neighbour argues at length that
+    /// *"Minimize is not a hide, and must not become one"*: a minimised window
+    /// is still in use, keeps its taskbar button, keeps `vault_is_in_use`
+    /// answering `true` and keeps its vault-service attachment, where a hidden
+    /// one has none of that. Hiding from here would put the window into a
+    /// state that machinery believes only it can produce, without any of the
+    /// bookkeeping it does; minimising puts it in exactly the state the app's
+    /// own minimise button produces, which that machinery already ignores by
+    /// design.
+    ///
+    /// # The mask stays on as well
+    ///
+    /// A minimised window is not composited, so the exclusion is redundant
+    /// while it is down -- and it is kept, because it is what covers the
+    /// window in the frames between the press and the minimise taking effect,
+    /// and because the scan's capture happens two frames *before* this is ever
+    /// called. See [`MINIMISE_SETTLE`] for why it cannot be called earlier.
+    ///
+    /// Idempotent through [`Inner::aside`], for
+    /// [`mask_own_window`](Self::mask_own_window)'s reasons.
+    fn stand_aside(&self, away: bool) {
+        {
+            let mut held = locked(&self.inner);
+            if held.aside == away {
+                return;
+            }
+            held.aside = away;
+            held.aside_at = if away { Some(Instant::now()) } else { None };
+        }
+        if away {
+            send_window_down(crate::vault_window::WINDOW_TITLE);
+        } else {
+            bring_window_back(crate::vault_window::WINDOW_TITLE);
+        }
     }
 
     /// Records where [`draw`] painted the bar's chips, so the next frame's
@@ -1476,6 +1709,13 @@ impl RegionOverlay {
     /// overlay; answers `false` when there is nothing left to show.
     pub fn show(&self, ctx: &egui::Context) -> bool {
         if !self.is_open() {
+            // **Both, and in this order.** Standing aside was the last thing
+            // done on the way in, so coming back is the first thing done on
+            // the way out; and the window is put back before it is put back
+            // into captures, so it is never briefly on screen and invisible to
+            // the user's own screenshots at the same time. Both are no-ops on
+            // an overlay that never did either.
+            self.stand_aside(false);
             self.mask_own_window(false);
             return false;
         }
@@ -1684,6 +1924,23 @@ impl RegionOverlay {
                     // `foreground::OPENS_A_VIEWPORT_AND_RAISES_IT`.
                     crate::foreground::raise_window(REGION_TITLE);
                     exclude_from_capture(REGION_TITLE);
+                    // **And Deskwarden's own window goes down, here and
+                    // nowhere earlier.**
+                    //
+                    // This is the frame the whole placement argument lands on.
+                    // It is after the raise deliberately: `SW_SHOWMINNOACTIVE`
+                    // activates nothing, so a foreground this window has
+                    // already taken is a foreground it keeps -- which is what
+                    // makes Escape still work with the app minimised. And it
+                    // cannot be any earlier, because until this frame there is
+                    // no window of ours but the one about to be minimised, and
+                    // an eframe root that is minimised and alone stops taking
+                    // frames entirely. See `MINIMISE_SETTLE`, which carries
+                    // the measurement.
+                    //
+                    // Every exit from `show` puts it back, and `Inner`'s
+                    // `Drop` covers the exits that do not come through `show`.
+                    mine.stand_aside(true);
                     // And the one call that makes this window see-through at
                     // all. It has to be here rather than in the builder
                     // above, because it is a call on an HWND that does not
@@ -1811,19 +2068,23 @@ impl RegionOverlay {
         );
         let still_open = self.is_open();
         if !still_open {
-            // Whatever ended it, the vault window goes back into screen
-            // captures here. `Inner`'s `Drop` is the backstop for the paths
-            // that do not come through this line -- the form closing under a
-            // live overlay, or a panic unwinding past it.
+            // Whatever ended it -- a code found, none found, several found, a
+            // refusal, Escape, the close button -- the vault window comes back
+            // up and back into screen captures here. `Inner`'s `Drop` is the
+            // backstop for the paths that do not come through this line: the
+            // form closing under a live overlay, the vault locking, or a panic
+            // unwinding past it. Order as in the early return above.
+            self.stand_aside(false);
             self.mask_own_window(false);
         }
         still_open
     }
 }
 
-/// **The mask comes off however the overlay ends.**
+/// **The window comes back, and the mask comes off, however the overlay
+/// ends.**
 ///
-/// `show` takes it off on the frame it answers `false`, which covers every
+/// `show` does both on the frame it answers `false`, which covers every
 /// ordinary ending. This covers the rest: the caller drops the overlay
 /// because the form closed under it, the vault locks, or a panic unwinds
 /// through the frame. `WDA_EXCLUDEFROMCAPTURE` outlives whoever set it, and a
@@ -1832,10 +2093,25 @@ impl RegionOverlay {
 /// took once -- exactly the kind of thing a `Drop` exists to make impossible
 /// to forget.
 ///
+/// **The minimise is the same shape of obligation with a much worse failure
+/// mode, so it is on the same hook.** A mask left on is a window the user
+/// cannot screenshot. A window left down is the user's application gone: no
+/// window, nothing on screen, and only a taskbar button between them and
+/// concluding the app has crashed. That asymmetry is also why it is a
+/// minimise and not a hide -- there *is* a taskbar button -- but the point of
+/// this `Drop` is that the taskbar button should never be the thing that saves
+/// it.
+///
+/// Order is the reverse of the way in, as in `show`: back up first, back into
+/// captures second.
+///
 /// It is on `Inner` rather than on [`RegionOverlay`] because the overlay is an
 /// `Arc` handle that is cloned per frame; this runs when the last one goes.
 impl Drop for Inner {
     fn drop(&mut self) {
+        if self.aside {
+            bring_window_back(crate::vault_window::WINDOW_TITLE);
+        }
         if self.masked {
             set_capture_exclusion(crate::vault_window::WINDOW_TITLE, false);
         }
@@ -2540,6 +2816,118 @@ fn set_capture_exclusion(title: &str, exclude: bool) {
     }
 }
 
+/// [`RegionOverlay::stand_aside`]'s way down: `ShowWindow` with
+/// `SW_SHOWMINNOACTIVE`.
+///
+/// # `SW_SHOWMINNOACTIVE` and not `SW_MINIMIZE`, which was measured
+///
+/// The two differ in one clause of the documentation and it turns out to
+/// decide whether this feature works. `SW_MINIMIZE` minimises the window
+/// **and activates the next top-level window in the Z order**, which is
+/// somebody else's -- so the moment Deskwarden goes down, the foreground
+/// leaves this process. Measured with a probe that opens the real overlay,
+/// minimises the root and then asks Windows which window has the foreground:
+/// with `SW_MINIMIZE` the answer was a browser, and the overlay -- which is
+/// always-on-top, so still perfectly visible -- was no longer the window the
+/// keyboard was going to. **Escape is how this surface is cancelled.** An
+/// overlay covering every monitor that cannot be dismissed from the keyboard
+/// is close to the worst thing this module could ship.
+///
+/// `SW_SHOWMINNOACTIVE` minimises and activates nothing. The same probe, same
+/// sequence, answered "the overlay" at every check afterwards.
+///
+/// # What is logged, and why it is not the return value
+///
+/// `ShowWindow` returns the window's **previous visibility**, not success, so
+/// its return value cannot answer "did this work" and is not treated as
+/// though it could. `IsIconic` can, and does -- on the handle already
+/// resolved, with no second `EnumWindows`, because that lookup was measured at
+/// hundreds of milliseconds in an unoptimised build and this is on the
+/// overlay's first painted frame.
+///
+/// Logged either way rather than discarded, which is this module's rule since
+/// three silently-failing Win32 calls cost a day: a window that did not go
+/// down is a user staring at Deskwarden sitting on top of the code they are
+/// being asked to point at, and without this line there is nothing in
+/// `deskwarden.log` that tells that apart from a window that went down fine.
+fn send_window_down(title: &str) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindow, SW_SHOWMINNOACTIVE};
+
+    let Some(hwnd) = crate::foreground::own_window_titled(title) else {
+        log::warn!(
+            "region overlay: no window titled {title:?} to send down; it will stay on top of \
+             whatever the user is being asked to point at"
+        );
+        return;
+    };
+    let handle = HWND(hwnd as *mut _);
+    // The return is the PREVIOUS visibility. Deliberately unused: see above.
+    let _ = unsafe { ShowWindow(handle, SW_SHOWMINNOACTIVE) };
+    if unsafe { IsIconic(handle) }.as_bool() {
+        log::info!("region overlay: {title:?} is minimised for the length of the scan");
+    } else {
+        log::warn!(
+            "region overlay: {title:?} did not go down -- ShowWindow(SW_SHOWMINNOACTIVE) was \
+             issued on {hwnd:#x} and IsIconic still says no. The overlay will be on top of it \
+             either way, but the user will be dragging over a window they cannot see behind"
+        );
+    }
+}
+
+/// [`RegionOverlay::stand_aside`]'s way back, and **the one call in this
+/// module that must not be allowed to silently not happen.**
+///
+/// # Restoring is not un-minimising
+///
+/// The owner's sentence ends *"once back - it should be on top again"*, and
+/// that is two things. [`crate::foreground::raise_window`] is the crate's one
+/// way to do both, and it already does them in the right order: it picks this
+/// process's window by title, `SW_RESTORE`s it **because** it is iconic, then
+/// asks for the foreground. A bare `ShowWindow(SW_RESTORE)` would put the
+/// window back on screen behind whatever the user has since clicked on, which
+/// is not what was asked for.
+///
+/// # A refusal is reported, not swallowed
+///
+/// `foreground`'s whole design is that Windows declining to hand over the
+/// foreground is a **documented outcome** rather than an error: `raise_on`
+/// flashes the taskbar button and answers [`crate::foreground::Raised::Flashed`]
+/// rather than retrying or working around it, and that judgement is not this
+/// module's to revisit. What is this module's is that the answer reaches the
+/// log with *this* caller's stakes attached, because the four outcomes mean
+/// very different things here:
+///
+/// * `Front` / `AlreadyInFront` -- what was asked for.
+/// * `Flashed` -- the window is back and restored, but behind something. The
+///   user has to click its flashing taskbar button. Recoverable, and worth a
+///   `warn` because it is the difference between the feature working and the
+///   feature appearing to have eaten the app.
+/// * `NoWindow` -- nothing matched the title. At `warn`, loudly: it is the one
+///   outcome in which a window this module minimised has not been brought
+///   back by this call, and the only thing between the user and a lost app is
+///   a taskbar button. It is also why the window is minimised rather than
+///   hidden.
+fn bring_window_back(title: &str) {
+    use crate::foreground::Raised;
+
+    match crate::foreground::raise_window(title) {
+        outcome @ (Raised::Front | Raised::AlreadyInFront) => log::info!(
+            "region overlay: {title:?} is back in front after the scan ({outcome:?})"
+        ),
+        Raised::Flashed => log::warn!(
+            "region overlay: {title:?} was restored but Windows declined to bring it to the \
+             front, so its taskbar button is flashing instead. The scan is over and the window \
+             is no longer minimised"
+        ),
+        Raised::NoWindow => log::warn!(
+            "region overlay: nothing titled {title:?} to bring back after the scan. If that \
+             window was minimised by this overlay it is still minimised, and the user's only \
+             way back to it is its taskbar button"
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -3109,9 +3497,31 @@ mod tests {
     /// `id="6b"`, in the order the surface stacks.
     #[test]
     fn the_overlays_numbers_are_the_designs_own() {
-        // `background: #201e1d` with the desktop over it at `opacity: 0.32`,
-        // which is this ink at 68%: 0.68 * 255 = 173.4.
-        assert_eq!(DIM_ALPHA, 173);
+        // **The one number on this surface that is deliberately NOT the
+        // design's**, so it is asserted as the property it was changed to have
+        // rather than as a figure copied out of the CSS.
+        //
+        // The design is `background: #201e1d` with the desktop over it at
+        // `opacity: 0.32` -- this ink at 68%, `0.68 * 255 = 173.4`. The owner
+        // asked for a lighter wash ("don't do hard overlay - needs to be
+        // transparent enough") because the design's mock fakes a bright white
+        // desktop behind that 68% and a real one is darker. See `DIM_ALPHA`'s
+        // own doc for the whole argument.
+        //
+        // What is held here is the departure and its direction, not 115: the
+        // wash must let MORE of the desktop through than the design's 32%, and
+        // must still be a wash rather than a tint.
+        let through = 1.0 - f32::from(DIM_ALPHA) / 255.0;
+        assert!(
+            through > 0.32,
+            "the dim is back at or below the design's own 32% desktop; it was lightened on \
+             purpose -- see DIM_ALPHA"
+        );
+        assert!(
+            (0.40..0.65).contains(&through),
+            "the desktop now comes through at {through}, outside the band DIM_ALPHA argues for: \
+             under 0.40 the selection stops reading as lit, over 0.65 there is no dim left"
+        );
 
         // `box-shadow: 0 0 0 2px #1b3fa0, 0 0 0 8px rgba(27, 63, 160, 0.28)`
         // -- so two points solid and six more soft, at 0.28 * 255 = 71.4.
@@ -3850,6 +4260,44 @@ mod tests {
         assert_eq!(BAR_REASON_INK, theme::BLUE_SOFT);
     }
 
+    /// **Every piece of type on this surface sits on a plate of its own, not
+    /// on the dim -- which is why lightening the dim moved none of them.**
+    ///
+    /// Written when [`DIM_ALPHA`] was taken down from the design's 68% to 45%
+    /// on the owner's instruction. The reasonable worry is that a control
+    /// picked for a near-black ground stops working when the ground lightens;
+    /// the answer is that no control on this surface is on that ground. The
+    /// bar and the size readout carry the design's own plates, and those did
+    /// not move. This is the assertion that keeps it so: if somebody ever
+    /// lightens a plate toward the wash, the inks above become a real
+    /// question again and this fails rather than the screen quietly going
+    /// unreadable.
+    #[test]
+    fn the_bar_carries_its_own_ground_and_not_the_dim() {
+        // Both plates are far heavier than the wash, so type on them is on a
+        // near-opaque dark ground however transparent the dim becomes.
+        assert!(
+            BAR_BG_ALPHA > DIM_ALPHA + 80,
+            "the bottom bar's plate is closing on the dim; BAR_REASON_INK and BAR_HINT_INK are \
+             chosen for a dark ground and would need re-picking"
+        );
+        assert!(
+            SIZE_BG_ALPHA > DIM_ALPHA + 80,
+            "the size readout's plate is closing on the dim; its monospace ink would need \
+             re-picking"
+        );
+        // And they are the design's own numbers, untouched by the departure
+        // the dim made: `rgba(32, 30, 29, 0.92)` and `0.86`.
+        assert_eq!(BAR_BG_ALPHA, 235);
+        assert_eq!(SIZE_BG_ALPHA, 219);
+        // The only alpha-over-the-wash thing left is the halo, which is a glow
+        // around a solid ring rather than a control -- and the ring it
+        // surrounds is opaque, which is what actually separates lit from
+        // dimmed at the selection's edge.
+        assert_eq!(HALO_ALPHA, 71);
+        assert_eq!(SELECTION_RING, 2.0);
+    }
+
     /// **The vault window is masked for the scan and put back afterwards.**
     ///
     /// The mask is a `SetWindowDisplayAffinity` on a real window and cannot be
@@ -3901,6 +4349,241 @@ mod tests {
         // modal that started this is drawn in.
         assert_eq!(crate::vault_window::WINDOW_TITLE, "Deskwarden");
         assert_ne!(crate::vault_window::WINDOW_TITLE, REGION_TITLE);
+    }
+
+    /// **Deskwarden's own window goes down for the scan and comes back on
+    /// every single way out.**
+    ///
+    /// Held to exactly the shape `the_mask_is_bookkept_so_that_it_always_comes
+    /// _back_off` holds the mask to, and for a worse reason: a mask left on is
+    /// a window missing from screenshots, and a window left down is the user's
+    /// app apparently gone. `ShowWindow` is a call on a real window and there
+    /// is none in a test process, so what is asserted is the bookkeeping that
+    /// decides when it happens.
+    #[test]
+    fn the_window_is_bookkept_so_that_it_always_comes_back_up() {
+        let overlay = RegionOverlay::open(&[rect(0, 0, 800, 600)], 1.0).expect("opens");
+        let held = locked(&overlay.inner);
+        assert!(!held.aside, "a fresh overlay has sent nothing down");
+        assert!(held.aside_at.is_none(), "a fresh overlay has a stale settle deadline");
+        drop(held);
+
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            code.contains("if held.aside == away {"),
+            "standing aside is no longer idempotent, so the OS call no longer lands on the \
+             transitions"
+        );
+        // **The count is the whole test.** Two ways out of `show` -- the guard
+        // at the top that finds a finished overlay, and the frame the overlay
+        // ends on -- which between them cover a code found, none found,
+        // several found, a refusal, Escape and the close button, because all
+        // six end by clearing `open` and every frame after that takes one of
+        // the two.
+        assert_eq!(
+            code.matches("stand_aside(false);").count(),
+            2,
+            "`show` no longer brings the vault window back on every way out of it"
+        );
+        assert_eq!(
+            code.matches("stand_aside(true);").count(),
+            1,
+            "the vault window is sent down from somewhere other than the one hook that should"
+        );
+        // And the backstop for the ways out that are not `show` at all: the
+        // form closing under a live overlay, the vault locking, a panic
+        // unwinding through the frame.
+        let dropped = code
+            .split("impl Drop for Inner {")
+            .nth(1)
+            .expect("`Inner` no longer has a `Drop`");
+        assert!(
+            dropped.contains("if self.aside {") && dropped.contains("bring_window_back("),
+            "nothing brings the vault window back when the overlay is dropped rather than \
+             closed -- which is the path that loses the user their app"
+        );
+        // The window it sends down is the vault window, not this one. Sending
+        // the overlay itself down would be a full-screen always-on-top window
+        // minimising itself out of the user's reach.
+        assert_eq!(crate::vault_window::WINDOW_TITLE, "Deskwarden");
+        assert_ne!(crate::vault_window::WINDOW_TITLE, REGION_TITLE);
+    }
+
+    /// **The window goes down on the overlay's first painted frame, and not on
+    /// the frame that masks it -- which is the one thing here that was
+    /// measured rather than reasoned.**
+    ///
+    /// Between `PrescanStep::Mask` and `PrescanStep::Scan` this overlay has
+    /// registered no viewport, so the root is an eframe app whose only window
+    /// is the one about to be minimised -- and a minimised eframe root with no
+    /// other viewport takes **no further frames at all**. A settle deadline
+    /// set on that frame is never reached and the route hangs. `MINIMISE_SETTLE`'s
+    /// doc carries the measurement; this keeps the code on the right side of
+    /// it.
+    #[test]
+    fn the_window_goes_down_on_the_overlays_own_first_frame() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+
+        // Nothing in the prescan arms sends it down. `Mask` masks and returns.
+        let prescan = code
+            .split("match self.prescan_step(Instant::now()) {")
+            .nth(1)
+            .expect("`show` no longer drives the prescan through a match")
+            .split("let (origin, scale) = {")
+            .next()
+            .expect("the prescan match no longer ends where it did");
+        assert!(
+            !prescan.contains("stand_aside"),
+            "the vault window is sent down from inside the prescan, where the root is its own \
+             only window -- see MINIMISE_SETTLE for why that never comes back"
+        );
+        assert!(
+            prescan.contains("self.mask_own_window(true);"),
+            "the prescan no longer masks the vault window before it captures"
+        );
+
+        // It goes down in the first-frame hook, AFTER the overlay has taken
+        // the foreground. `SW_SHOWMINNOACTIVE` activates nothing, so a
+        // foreground this window already holds is one it keeps -- which is
+        // what leaves Escape working with the app minimised.
+        let hook = code
+            .split("if first_frame {")
+            .nth(1)
+            .expect("the first-frame hook is gone")
+            .split("// **The reveal owns its frames entirely.**")
+            .next()
+            .expect("the first-frame hook no longer ends where it did");
+        let raise = hook.find("raise_window(REGION_TITLE);").expect("the raise is gone");
+        let down = hook.find("stand_aside(true);").expect("the window is never sent down");
+        assert!(
+            raise < down,
+            "the vault window is sent down before the overlay has asked for the foreground, so \
+             the overlay may never get it and Escape may never reach it"
+        );
+        assert!(
+            hook.find("exclude_from_capture(REGION_TITLE);").expect("the mask is gone") < down,
+            "the overlay stopped excluding itself from captures before standing the vault \
+             window down"
+        );
+    }
+
+    /// **It is a minimise, not a hide, and the source says so in one place.**
+    ///
+    /// `SW_HIDE` would look better -- instant, no taskbar button -- and is the
+    /// one option whose failure mode cannot be recovered from: a hidden window
+    /// that does not come back is unreachable, where a minimised one is a
+    /// taskbar click away. It would also put the vault window into the state
+    /// `vault_window`'s `keep_ui_loaded` machinery believes only it produces,
+    /// with none of the bookkeeping (`hidden`, `close_or_hide`,
+    /// `spawn_show_waiter`) that goes with it -- the same distinction that
+    /// file's own `ChromeAction::Minimize` arm is built around.
+    #[test]
+    fn the_vault_window_is_minimised_rather_than_hidden() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        // **Comments cut off, because every needle below is a negative one.**
+        // The argument for minimising rather than hiding is written out above
+        // in prose, and that prose names `SW_HIDE` and `SW_MINIMIZE` -- so a
+        // bare `contains` over the raw source fails on the doc that explains
+        // why the code does not do those things. `foreground::tests::code`
+        // exists for the same reason and is copied rather than shared:
+        // it is `#[cfg(test)]` in a module this one cannot reach.
+        let code: String = source
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap()
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("SW_HIDE"),
+            "this module hides the vault window; a hidden window that fails to come back is \
+             unreachable, which is the one outcome the minimise exists to avoid"
+        );
+        assert!(
+            !code.contains("ViewportCommand::Visible"),
+            "this module drives the vault window's visibility, which is the state \
+             `vault_window`'s keep_ui_loaded machinery owns"
+        );
+        // `SW_MINIMIZE` also activates the next top-level window in Z order,
+        // which is somebody else's -- measured to cost this overlay the
+        // foreground, and with it Escape.
+        assert!(
+            code.contains("SW_SHOWMINNOACTIVE"),
+            "the vault window is no longer minimised without activation"
+        );
+        assert!(
+            !code.contains("SW_MINIMIZE"),
+            "SW_MINIMIZE activates the next window in Z order and takes the foreground away \
+             from this overlay; see `send_window_down`"
+        );
+    }
+
+    /// **Both halves report what Windows said rather than swallowing it.**
+    ///
+    /// This module's rule since three silently-failing Win32 calls cost a day
+    /// of debugging, and these two are the worst candidates for it yet: a
+    /// window that did not go down is a window sitting on top of what the user
+    /// is being asked to point at, and a raise Windows declined is a window
+    /// that is back but behind, which reads to the user as the app having
+    /// disappeared.
+    #[test]
+    fn neither_half_of_the_minimise_swallows_what_windows_said() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+
+        let down = code
+            .split("fn send_window_down(title: &str) {")
+            .nth(1)
+            .expect("`send_window_down` is gone")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        // `ShowWindow` returns the PREVIOUS visibility, not success, so the
+        // check has to be a readback rather than its return value.
+        assert!(
+            down.contains("IsIconic("),
+            "nothing checks whether the window actually went down"
+        );
+        assert!(
+            down.contains("log::info!") && down.matches("log::warn!").count() >= 2,
+            "`send_window_down` no longer reports both outcomes and the missing window"
+        );
+
+        let back = code
+            .split("fn bring_window_back(title: &str) {")
+            .nth(1)
+            .expect("`bring_window_back` is gone")
+            .split("\nfn ")
+            .next()
+            .unwrap();
+        // `foreground` answers a refusal with a documented outcome rather than
+        // an error, and all four of them mean different things to this caller.
+        for outcome in ["Raised::Front", "Raised::AlreadyInFront", "Raised::Flashed", "Raised::NoWindow"] {
+            assert!(
+                back.contains(outcome),
+                "`bring_window_back` no longer accounts for {outcome}, so that outcome leaves \
+                 no trail"
+            );
+        }
+        assert!(
+            back.matches("log::warn!").count() == 2,
+            "a refusal or a missing window is no longer a warning; those are the two outcomes \
+             in which the user's window may not be in front of them"
+        );
+        // And it goes through the crate's one way to do this, which restores
+        // BEFORE it activates -- "once back - it should be on top again" is
+        // two things, and `ShowWindow(SW_RESTORE)` alone is only the first.
+        assert!(
+            back.contains("foreground::raise_window(title)"),
+            "the restore no longer goes through `foreground::raise_window`, which is what makes \
+             it a raise and not just an un-minimise"
+        );
     }
 
     // -- the reveal --------------------------------------------------------
@@ -4150,6 +4833,102 @@ mod tests {
         assert_eq!(SCAN_FOUND, "Code read");
         assert_ne!(SCAN_FOUND, LOCKED_ON);
         assert!(!SCAN_FOUND.contains("release"));
+    }
+
+    /// **The reveal's clock does not start until the vault window has had time
+    /// to get off the screen.**
+    ///
+    /// The minimise is issued on the overlay's first painted frame, which is
+    /// the same frame the reveal would otherwise start on -- so without this
+    /// the front of the dwell is spent ringing a code behind the window the
+    /// ring exists to see past, by an amount that varies with the machine.
+    /// Exactly the argument `Reveal::Due` already makes about a window that
+    /// does not exist yet.
+    ///
+    /// Driven by a clock a test supplies, like every other timed thing here,
+    /// so no window and no sleeping is involved.
+    #[test]
+    fn the_reveal_waits_for_the_vault_window_to_get_out_of_the_way() {
+        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        let t0 = Instant::now();
+        // What the first-frame hook does, without the Win32 call it also
+        // makes: the window went down at `t0`.
+        locked(&overlay.inner).aside_at = Some(t0);
+
+        // Every frame inside the settle paints the mark -- the ring is not
+        // withheld, only the clock -- and leaves the reveal where it was.
+        for at in [0_u64, 1, 60, 119] {
+            assert_eq!(
+                overlay.reveal_step(t0 + Duration::from_millis(at)),
+                Some(FOUND_AT),
+                "the mark was withheld {at} ms into the settle"
+            );
+            assert!(
+                matches!(locked(&overlay.inner).reveal, Reveal::Due { .. }),
+                "the dwell started {at} ms in, before the window was out of the way"
+            );
+        }
+
+        // The first frame at or after the settle starts the clock, and the
+        // user gets the WHOLE dwell from there rather than what is left of it.
+        let started = t0 + MINIMISE_SETTLE;
+        assert_eq!(overlay.reveal_step(started), Some(FOUND_AT));
+        assert!(matches!(locked(&overlay.inner).reveal, Reveal::Showing { .. }));
+        assert_eq!(
+            overlay.reveal_step(started + REVEAL_DWELL - Duration::from_millis(1)),
+            Some(FOUND_AT),
+            "the dwell was cut short by the settle in front of it"
+        );
+        assert_eq!(overlay.reveal_step(started + REVEAL_DWELL), None);
+        assert!(!overlay.is_open());
+    }
+
+    /// **An overlay that never stood aside does not wait for a window that
+    /// never went down.**
+    ///
+    /// `aside_at` is `None` on exactly two overlays: one in a test process,
+    /// and one dropped before it ever had a window. Neither has anything to
+    /// wait for, and a settle applied to them would be a fixed delay in front
+    /// of every reveal for no reason at all.
+    #[test]
+    fn a_reveal_with_nothing_to_wait_for_starts_at_once() {
+        let overlay = found_on(&[rect(0, 0, 1920, 1080)], 1.0, FOUND_AT);
+        let t0 = Instant::now();
+        assert!(locked(&overlay.inner).aside_at.is_none());
+        assert_eq!(overlay.reveal_step(t0), Some(FOUND_AT));
+        assert!(
+            matches!(locked(&overlay.inner).reveal, Reveal::Showing { .. }),
+            "the clock did not start on the first painted frame"
+        );
+        assert_eq!(overlay.reveal_step(t0 + REVEAL_DWELL), None);
+    }
+
+    /// Production's minimise settle is the measured one.
+    ///
+    /// The measurement is in [`MINIMISE_SETTLE`]'s own doc: a window filled
+    /// with a colour nothing else is, minimised, and its rectangle captured
+    /// exactly once per process run at one delay; absent from the capture at
+    /// every delay tried, down to the ~60 ms floor of the instrument.
+    #[test]
+    fn the_production_minimise_settle_is_the_measured_one() {
+        assert_eq!(MINIMISE_SETTLE, Duration::from_millis(120));
+        assert!(MINIMISE_SETTLE > Duration::ZERO, "the settle is not a settle");
+        // Twice the shortest point at which the window was measured gone, so
+        // there is margin for a machine slower than the one it was measured
+        // on -- and more than PRESCAN_SETTLE, which buys two composes at 30 Hz
+        // for a flag that is only a message to the compositor. A minimise is
+        // more work than a flag.
+        assert!(
+            MINIMISE_SETTLE > PRESCAN_SETTLE,
+            "a minimise is now given less time to land than a display-affinity flag"
+        );
+        // And small enough not to dominate what it delays. It is spent once,
+        // in front of the dwell, at the end of a route whose scan binarises
+        // every monitor.
+        assert!(
+            MINIMISE_SETTLE < REVEAL_DWELL / 2,
+            "the wait in front of the reveal is now a large fraction of the reveal"
+        );
     }
 
     /// **The window asks DWM to composite its alpha, on the frame it first
