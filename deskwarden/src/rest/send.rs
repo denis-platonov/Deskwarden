@@ -135,6 +135,13 @@ fn field<'a>(row: &'a Value, name: &str) -> Result<&'a str, SendError> {
     })
 }
 
+/// A non-negative count, or `None` for absent, `null` or out of range.
+/// `send::count_field`'s rule, spelled on this side of the seam for the
+/// reason [`summary_from`]'s own body gives.
+fn count(row: &Value, name: &str) -> Option<u32> {
+    row.get(name).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok())
+}
+
 /// One server row, as a row of the Sends screen.
 ///
 /// A row missing what a revoke or a link needs is a **failure**, not a short
@@ -176,6 +183,28 @@ fn summary_from(row: &Value, keys: &VaultKeys, base: &str) -> Result<SendSummary
         // not recognise is treated as "not a text Send" so the screen says
         // it was made somewhere else rather than offering to edit it.
         is_file: row.get("type").and_then(Value::as_i64).unwrap_or(0) != 0,
+        // **The five state fields, read on exactly `send::parse_send_list`'s
+        // terms** -- leniently, each absence meaning the thing its absence
+        // means. That is not a stylistic echo: `send::send_state` is handed
+        // whichever of these two parsers produced the row, so a difference
+        // here is a Sends screen that paints one pill on `bw serve` and
+        // another on the built-in client for the same Send on the same
+        // server.
+        max_access_count: count(row, "maxAccessCount"),
+        access_count: count(row, "accessCount").unwrap_or(0),
+        disabled: row.get("disabled").and_then(Value::as_bool).unwrap_or(false),
+        expiration_date: row
+            .get("expirationDate")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        // `sends-shared.ts`'s `sendToResponse` puts the stored hash in
+        // `password`. It is looked at and never kept; see
+        // `SendSummary::has_password`.
+        has_password: row
+            .get("password")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| !hash.is_empty()),
     })
 }
 
@@ -486,12 +515,17 @@ pub fn delete_on_active_account(id: &str) -> Result<(), SendError> {
 /// Turns one Send's link off, or back on. **No sync and no key**, on
 /// [`delete_on_active_account`]'s terms exactly -- see [`set_disabled`].
 ///
-/// The fourth of these, and the first that is not yet wired to a screen.
-/// `vault_window`'s `BackendTasks` is where the other three are reached from
-/// and is where this one goes; it is left unwired here rather than half-wired
-/// because that trait has a `bw serve` arm as well, and `bw send` has no
-/// verb for this at all -- what the CLI backend should answer is a question
-/// about what the Sends screen says, not about this module.
+/// The fourth of these, and it is wired now: `vault_window`'s
+/// `backend_tasks::BackendTasks::send_set_disabled` is its one caller, and
+/// `send_ui::source_pins::the_switch_is_the_built_in_clients_and_the_cli_refuses_it_in_words`
+/// is what keeps it to one.
+///
+/// The question this doc used to leave open -- what the `bw serve` arm should
+/// answer, given that `bw send` has no verb for `disabled` at all -- was
+/// settled where it belonged, on that trait: the CLI arm returns a
+/// [`SendError::Rejected`] naming the alternative, because a control that
+/// vanished on one backend would leave a user who had used it on the other
+/// hunting for it.
 pub fn set_disabled_on_active_account(id: &str, disabled: bool) -> Result<(), SendError> {
     let (client, mut authenticated) = active_account()?;
     set_disabled(&client, &mut authenticated.session, id, disabled)

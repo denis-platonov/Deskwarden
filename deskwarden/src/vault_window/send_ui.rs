@@ -163,6 +163,14 @@ pub struct SendRow {
     pub is_file: bool,
     /// The public URL. What Copy link puts on the clipboard.
     pub access_url: String,
+    /// Design §5c's state, as [`crate::send::send_state`] derived it from the
+    /// summary and the same clock the expiry was worded against.
+    ///
+    /// Held on the row rather than re-derived in the painter for
+    /// [`expiry`](SendRow::expiry)'s reason: one clock read per list, decided
+    /// in a pure function, so two cells of one row cannot disagree about what
+    /// time it is.
+    pub state: crate::send::SendState,
 }
 
 /// What the pane shows this frame.
@@ -422,11 +430,75 @@ pub fn row_from(send: &SendSummary, now: &dyn SendClock) -> SendRow {
         } else {
             send.name.clone()
         },
-        expiry: expiry_words(&send.deletion_date, now),
+        expiry: row_subtitle(send, now),
         is_file: send.is_file,
         access_url: send.access_url.clone(),
+        state: crate::send::send_state(send, now),
     }
 }
+
+/// The row's second line, as design §5b writes it: what the link needs, how
+/// many views are left, and when it ends, separated by the design's own
+/// middot.
+///
+/// # What is here, what is not, and why
+///
+/// 5b's five rows read "to m.reyes - 40 min ago", "link only - 3 of 10 views
+/// - 6 d left", "to j.abara - expires in 3 h", "to contractor@vantage.io -
+/// never opened" and "revoked by you - 2 d ago". **Only the middle one is
+/// derivable today.** A recipient address is `emails` on the wire and this
+/// client neither sets it nor reads it; "40 min ago" and "2 d ago" are a
+/// `revisionDate` relative to now, which is available but says nothing until
+/// there is a per-access record to date -- see the `5c` timeline, which this
+/// pass deliberately did not build.
+///
+/// **"link only" is omitted and its opposite is not.** The design prints it
+/// on the one row that has no password, and printing it on every unprotected
+/// row here would put four words of nothing on the majority of Sends this app
+/// creates (the composer's password is off by default). A password, on the
+/// other hand, is the notable fact -- it is the difference between a link
+/// that is the whole credential and one that is not -- so it is said and its
+/// absence is not.
+///
+/// # Why a dead link has no expiry on it
+///
+/// The expiry is [`expiry_words`] unchanged and it is last, for 5b's reason:
+/// it is the only segment that keeps moving. But it is **omitted entirely
+/// unless the link is still live**, and that is not tidiness -- it is the one
+/// thing this line could say that would be false.
+///
+/// `expiry_words` reads `deletion_date`, and a Send can be dead for two
+/// reasons that date knows nothing about: its views can be spent, and its
+/// `expiration_date` can pass while the record lives on until deletion. Both
+/// leave a row whose pill says `Used` or `Expired` beside words that say
+/// "Expires in 7 days". The pill is right and the words are wrong, so the
+/// words go: a state that has ended is fully described by the pill that names
+/// it, and this line goes back to carrying only what the pill cannot say.
+pub fn row_subtitle(send: &SendSummary, now: &dyn SendClock) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if send.has_password {
+        parts.push(PASSWORD_SEGMENT.to_string());
+    }
+    match (send.max_access_count, send.access_count) {
+        // Capped: the design's own "3 of 10 views", which says the remaining
+        // budget and the spent one in one phrase.
+        (Some(cap), used) => parts.push(format!("{used} of {cap} views")),
+        // Uncapped and untouched: nothing. "0 views" on a link nobody has
+        // opened yet reads as a failure rather than as a beginning, and the
+        // state pill beside it already says `Waiting`.
+        (None, 0) => {}
+        (None, 1) => parts.push("opened once".to_string()),
+        (None, used) => parts.push(format!("opened {used} times")),
+    }
+    if crate::send::send_state(send, now) == crate::send::SendState::Waiting {
+        parts.push(expiry_words(&send.deletion_date, now));
+    }
+    parts.join(" \u{00b7} ")
+}
+
+/// What the subtitle says about a Send whose link is not the whole
+/// credential.
+pub const PASSWORD_SEGMENT: &str = "Password required";
 
 /// Milliseconds in a day. Same constant `send.rs` uses, spelled here because
 /// that one is private to it.
@@ -459,57 +531,21 @@ pub fn expiry_words(deletion_date: &str, now: &dyn SendClock) -> String {
     }
 }
 
-/// `2026-08-18T00:43:17.148Z` to milliseconds since the Unix epoch, or `None`
-/// if it is not that shape.
+/// **`crate::send`'s parser, re-exported rather than owned.**
 ///
-/// Hand-written rather than a new dependency, for the reason `send.rs`'s
-/// base64 is: this is the only date this app parses, the format is fixed by
-/// the CLI that emits it, and `chrono` is a large surface to add for one
-/// field. The fractional part is optional and ignored beyond being skipped --
-/// a Send's lifetime is measured in days, and no wording here can turn on a
-/// millisecond.
-pub fn parse_iso_utc_millis(text: &str) -> Option<i64> {
-    let text = text.trim();
-    let bytes = text.as_bytes();
-    // The fixed prefix is exactly `YYYY-MM-DDTHH:MM:SS`, 19 bytes.
-    if bytes.len() < 19 {
-        return None;
-    }
-    let num = |from: usize, to: usize| -> Option<i64> { text.get(from..to)?.parse::<i64>().ok() };
-    let sep = |at: usize, want: u8| -> Option<()> { (bytes[at] == want).then_some(()) };
-    sep(4, b'-')?;
-    sep(7, b'-')?;
-    sep(10, b'T')?;
-    sep(13, b':')?;
-    sep(16, b':')?;
-    let year = num(0, 4)?;
-    let month = num(5, 7)?;
-    let day = num(8, 10)?;
-    let hour = num(11, 13)?;
-    let minute = num(14, 16)?;
-    let second = num(17, 19)?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    if hour > 23 || minute > 59 || second > 60 {
-        return None;
-    }
-    let days = days_from_civil(year, month, day);
-    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1_000)
-}
-
-/// Days since 1970-01-01 for a proleptic-Gregorian civil date. Howard
-/// Hinnant's `days_from_civil`, which is the exact inverse of the
-/// `civil_from_days` `send.rs` already carries for the other direction.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
+/// This function was written here, and it moved when the states pass needed
+/// the same bytes read on the other side of the seam: `send::send_state`
+/// compares `expiration_date` and `deletion_date` against a clock, and it
+/// lives beside the type those are fields of. Two parsers for one wire format
+/// agree only by coincidence, and this file already carries the scar of that
+/// -- `send::lifetime_label` is here in re-export form for the same reason,
+/// after a duration was spelled twice and the two spellings drifted.
+///
+/// The name is kept and the path is kept, so `record_ui`'s certificate dates
+/// -- the one caller outside this file -- still read
+/// `send_ui::parse_iso_utc_millis` and are unaffected by where the arithmetic
+/// now lives.
+pub use crate::send::parse_iso_utc_millis;
 
 /// What a frame of this pane reports back to `vault_window::run`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -546,6 +582,19 @@ pub enum SendUiAction {
     /// The confirmation was declined. Its button occupies the pixels the
     /// Delete button was drawn in -- see [`draw_row`].
     CancelDelete,
+    /// **Design §5c's Revoke, and its undo**: switch this row's link off
+    /// (`disabled: true`) or back on.
+    ///
+    /// `disabled` is what the row ASKED for rather than what it currently is,
+    /// which is the same rule the id and the name follow here and for the
+    /// same reason: everything the far side needs is read off the row that
+    /// was clicked, so no second lookup can resolve to a different Send or to
+    /// a stale reading of this one.
+    ///
+    /// **One step, where a delete is two.** See
+    /// `vault_window::apply_send_action`: a confirmation exists because a
+    /// delete cannot be undone, and this can -- by pressing the button again.
+    SetDisabled { id: String, name: String, disabled: bool },
     /// The header's New Send button was pressed: put the composer on screen.
     OpenComposer,
     /// The composer's Discard button was pressed: take it off screen and wipe
@@ -737,6 +786,27 @@ const DELETE_BUTTON_WIDTH: f32 = 68.0;
 const CONFIRM_BUTTON_WIDTH: f32 = 128.0;
 /// The gap between two controls in a row.
 const BUTTON_GAP: f32 = 8.0;
+/// The link switch, wide enough for the longer of its two labels.
+const SWITCH_BUTTON_WIDTH: f32 = 84.0;
+/// **Design §5c's Revoke, under a name this screen can use.**
+///
+/// The design calls the `disabled` flag Revoke, and this screen cannot: the
+/// word is already spoken for. `DELETE_LABEL`'s own confirmation reads
+/// "Revoke this link for good? It cannot be undone", and every sentence,
+/// constant and test around the delete path in this crate calls it the
+/// revoke. Two controls on one row both called Revoke, one of which is
+/// permanent and one of which is not, is the worst outcome available here.
+///
+/// So the two say what they do to the link, which is also the one thing that
+/// distinguishes them from Delete: this takes the link down and keeps the
+/// Send, and it can be pressed again. **This is a departure from the design
+/// and it is the owner's to settle** -- the other way to resolve it is to
+/// rename the destructive path, which is a bigger change than a label and
+/// touches wording this screen's tests are pinned to.
+pub const SWITCH_OFF_LABEL: &str = "Switch off";
+/// The undo of [`SWITCH_OFF_LABEL`]. Drawn only on a row whose state is
+/// already `Revoked`, so the two are never offered at once.
+pub const SWITCH_ON_LABEL: &str = "Switch on";
 /// The row's first, non-destructive button.
 pub const DELETE_LABEL: &str = "Delete";
 /// The confirmation's destructive button. **Deliberately not "Delete"**: the
@@ -753,6 +823,77 @@ pub const DELETING_LABEL: &str = "Revoking\u{2026}";
 /// The gap between the name and its FILE tag, and between the tag's text and
 /// its own outline.
 const TAG_PAD_X: f32 = 6.0;
+
+/// The gap between the row's state pill and the expiry words that follow it.
+/// The design's own `gap: 11px` between a 5c pill and its gloss, trimmed to
+/// the 8px this row already uses between two controls, so the second line has
+/// one rhythm rather than two.
+const STATE_PILL_GAP: f32 = 8.0;
+
+/// Design §5c's four state words, exactly as the design spells them.
+///
+/// Public because the paint tests press on them and because the words are the
+/// whole of what a pill says -- a state pill whose label drifted from the
+/// design would be a pill nobody could look up.
+pub const WAITING_LABEL: &str = "Waiting";
+pub const USED_LABEL: &str = "Used";
+pub const EXPIRED_LABEL: &str = "Expired";
+pub const REVOKED_LABEL: &str = "Revoked";
+
+/// One [`crate::send::SendState`] as the word the design prints for it.
+pub fn state_label(state: crate::send::SendState) -> &'static str {
+    match state {
+        crate::send::SendState::Waiting => WAITING_LABEL,
+        crate::send::SendState::Used => USED_LABEL,
+        crate::send::SendState::Expired => EXPIRED_LABEL,
+        crate::send::SendState::Revoked => REVOKED_LABEL,
+    }
+}
+
+/// One [`crate::send::SendState`] as the colours and mark design §5c draws it
+/// in.
+///
+/// **A pure function returning a value, rather than four call sites into
+/// `theme::state_pill`.** The mapping is the thing worth testing -- that
+/// `Used` is the only one with a tick, that `Expired` and `Revoked` carry no
+/// mark at all, that `Waiting` is the only blue one -- and a test can read a
+/// returned `PillTone` without a frame.
+///
+/// Every colour is a `theme` constant. The three greens and three reds the
+/// design uses here were added to `theme` by this pass rather than written
+/// locally, because 5b draws this pill in the list and again in the detail
+/// header and 5d draws it on a record; see `theme::state_pill`.
+pub fn state_tone(state: crate::send::SendState) -> theme::PillTone {
+    match state {
+        crate::send::SendState::Waiting => theme::PillTone {
+            fill: theme::BLUE_WASH,
+            edge: theme::BLUE_EDGE,
+            ink: theme::BLUE_DEEP,
+            mark: theme::PillMark::Dot(theme::BLUE),
+        },
+        crate::send::SendState::Used => theme::PillTone {
+            fill: theme::DONE_WASH,
+            edge: theme::DONE_EDGE,
+            ink: theme::DONE_INK,
+            mark: theme::PillMark::Check(theme::DONE_MARK),
+        },
+        // **No mark, and that is the design's own distinction**, not an
+        // omission: a dot on these two would say the link is still doing
+        // something. See `theme::PillMark`.
+        crate::send::SendState::Expired => theme::PillTone {
+            fill: theme::CANVAS,
+            edge: theme::BORDER,
+            ink: theme::TEXT_FAINT,
+            mark: theme::PillMark::None,
+        },
+        crate::send::SendState::Revoked => theme::PillTone {
+            fill: theme::DANGER_WASH,
+            edge: theme::DANGER_EDGE,
+            ink: theme::DANGER_INK,
+            mark: theme::PillMark::None,
+        },
+    }
+}
 
 /// The heading the Sends PANE paints at the top of its own screen.
 ///
@@ -1066,11 +1207,43 @@ fn draw_row(
     } else {
         (row.expiry.as_str(), theme::TEXT_FAINT)
     };
-    painter.text(
-        egui::pos2(rect.left() + ROW_PAD_X, rect.bottom() - 12.0),
-        egui::Align2::LEFT_BOTTOM,
-        second_line,
-        small_font,
+    // **The state pill leads the second line, and the design right-aligns
+    // it.** That is a departure and here is the argument for it. 5b's list
+    // row carries no controls at all -- its Revoke lives in the detail pane,
+    // which this screen does not have -- so the design's right edge is free
+    // and this row's is not: Copy link and Delete already sit there, and the
+    // confirmation widens to 304px of buttons. A pill placed in that column
+    // would either be pushed off the pane at `MIN_VAULT_WINDOW_SIZE` or would
+    // move every time the row changed mode, which is the one thing a state
+    // readout must not do. Leading the second line keeps it in a column whose
+    // width nothing else competes for, and keeps it beside the expiry it
+    // qualifies.
+    //
+    // **It is drawn only in the resting state**, for the reason the second
+    // line is replaced rather than joined: a row that says "Revoke this link
+    // for good?" and "Waiting" at once is a row whose subject is ambiguous at
+    // the moment it matters most.
+    let second_galley =
+        painter.layout_no_wrap(second_line.to_string(), small_font, second_colour);
+    let second_bottom = rect.bottom() - 12.0;
+    // Measured off the galley rather than assumed, so a change of face or
+    // size moves the pill with the words instead of leaving it half a line
+    // above them.
+    let second_middle = second_bottom - second_galley.size().y / 2.0;
+    let text_left = if revoking || confirming {
+        rect.left() + ROW_PAD_X
+    } else {
+        let pill = theme::state_pill(
+            painter,
+            egui::pos2(rect.left() + ROW_PAD_X, second_middle),
+            state_tone(row.state),
+            state_label(row.state),
+        );
+        pill.right() + STATE_PILL_GAP
+    };
+    painter.galley(
+        egui::pos2(text_left, second_bottom - second_galley.size().y),
+        second_galley,
         second_colour,
     );
 
@@ -1095,6 +1268,11 @@ fn draw_row(
     // Cancel, and that is only true while these two rectangles are equal.
     let delete_rect = slot(button_rect.left() - BUTTON_GAP, DELETE_BUTTON_WIDTH);
     let confirm_rect = slot(delete_rect.left() - BUTTON_GAP, CONFIRM_BUTTON_WIDTH);
+    // The switch sits where the confirmation's destructive button would go,
+    // and the two are never on screen together -- see below. One expression
+    // for the same reason the Delete and Cancel slots are one: two rectangles
+    // that must not drift apart are written once.
+    let switch_rect = slot(delete_rect.left() - BUTTON_GAP, SWITCH_BUTTON_WIDTH);
 
     if revoking {
         // No widget of any kind. A disabled button would still be a button
@@ -1126,6 +1304,38 @@ fn draw_row(
                 .min_size(egui::vec2(COPY_BUTTON_WIDTH, COPY_BUTTON_HEIGHT)),
         )
         .clicked();
+
+    // **The switch, left of Delete, and hidden while the row is confirming.**
+    //
+    // Hidden and not disabled: the confirmation already widens this row to
+    // three controls, and a fourth beside a destructive question is a fourth
+    // thing to mis-click. The row that is asking to be deleted is asking
+    // about exactly one thing.
+    //
+    // It is drawn for a row with an id and for no other, on the Delete
+    // button's own rule: an id is what names the Send to the server, and a
+    // control that cannot name its subject must not report an action.
+    let switched = if confirming || !has_id {
+        None
+    } else {
+        let wants_on = row.state == crate::send::SendState::Revoked;
+        let label = if wants_on { SWITCH_ON_LABEL } else { SWITCH_OFF_LABEL };
+        let colour = if wants_on { theme::BLUE } else { theme::INK };
+        let pressed = ui
+            .put(
+                switch_rect,
+                egui::Button::new(egui::RichText::new(label).size(12.0).color(colour))
+                    .min_size(egui::vec2(SWITCH_BUTTON_WIDTH, COPY_BUTTON_HEIGHT)),
+            )
+            .clicked();
+        pressed.then(|| SendUiAction::SetDisabled {
+            id: row.id.clone(),
+            name: row.name.clone(),
+            // What the press ASKED for: a revoked row asks to come back on,
+            // and every other row asks to go off.
+            disabled: !wants_on,
+        })
+    };
 
     let destructive = if confirming {
         let confirmed = ui
@@ -1172,7 +1382,13 @@ fn draw_row(
     // stray copy cannot swallow a delete the user asked for. Belt and braces
     // on the URL: the guard is on the *returned action* as well as on the
     // widget, so no future re-layout of the button can reopen the path.
-    destructive.or_else(|| (copied && has_url).then(|| SendUiAction::CopyLink(row.access_url.clone())))
+    // The destructive control wins, then the switch, then Copy link. Both
+    // orderings are the same rule: the answer to an ambiguous frame is the
+    // one the user cannot have meant by accident, and a stray copy must never
+    // swallow a press on either of the other two.
+    destructive
+        .or(switched)
+        .or_else(|| (copied && has_url).then(|| SendUiAction::CopyLink(row.access_url.clone())))
 }
 
 /// The header button that opens the composer. Hidden while the composer is
@@ -2040,6 +2256,30 @@ mod tests {
             access_url: format!("https://send.bitwarden.com/#/{name}"),
             deletion_date: at(days),
             is_file,
+            ..live()
+        }
+    }
+
+    /// The five state fields of a Send nobody has touched: no cap, never
+    /// opened, not disabled, no separate expiry, no share password.
+    ///
+    /// **A base for `..`, not a `Default` on the type.** A defaulted
+    /// `SendSummary` would have no id and no link, which `parse_send_list`
+    /// refuses to produce and the screen refuses to act on; giving the
+    /// production type a constructor for that shape so that tests could be
+    /// three lines shorter is the trade this file has declined before.
+    fn live() -> SendSummary {
+        SendSummary {
+            id: String::new(),
+            name: String::new(),
+            access_url: String::new(),
+            deletion_date: String::new(),
+            is_file: false,
+            max_access_count: None,
+            access_count: 0,
+            disabled: false,
+            expiration_date: String::new(),
+            has_password: false,
         }
     }
 
@@ -2124,6 +2364,90 @@ mod tests {
         assert_eq!(row.access_url, "https://send.bitwarden.com/#/alpha");
         assert_eq!(row.expiry, "Expires in 3 days");
         assert!(!row.is_file);
+        assert_eq!(row.state, crate::send::SendState::Waiting);
+    }
+
+    /// **The second line says only what there is to say.**
+    ///
+    /// A plain Send is its expiry and nothing else; every other segment
+    /// appears because a fact exists to report. The case that would be easy
+    /// to get wrong is the last one: an uncapped link nobody has opened must
+    /// not say "0 views", which reads as a failure rather than as a
+    /// beginning.
+    #[test]
+    fn the_subtitle_adds_a_segment_only_where_there_is_a_fact_to_add() {
+        let clock = FixedClock(NOW);
+        let plain = summary("alpha", false, 7);
+        assert_eq!(row_subtitle(&plain, &clock), "Expires in 7 days");
+
+        assert_eq!(
+            row_subtitle(
+                &SendSummary { max_access_count: Some(10), access_count: 3, ..plain.clone() },
+                &clock
+            ),
+            "3 of 10 views \u{00b7} Expires in 7 days"
+        );
+        assert_eq!(
+            row_subtitle(&SendSummary { access_count: 1, ..plain.clone() }, &clock),
+            "opened once \u{00b7} Expires in 7 days"
+        );
+        assert_eq!(
+            row_subtitle(&SendSummary { access_count: 4, ..plain.clone() }, &clock),
+            "opened 4 times \u{00b7} Expires in 7 days"
+        );
+        assert_eq!(
+            row_subtitle(
+                &SendSummary {
+                    has_password: true,
+                    max_access_count: Some(1),
+                    ..plain.clone()
+                },
+                &clock
+            ),
+            "Password required \u{00b7} 0 of 1 views \u{00b7} Expires in 7 days",
+            "the segments are in the design's order: what it needs, how many are left, when \
+             it ends"
+        );
+        // **The absence of a password is not a segment.** See `row_subtitle`:
+        // the composer's password is off by default, so "link only" on every
+        // row is four words of nothing on the majority of this app's Sends.
+        assert!(
+            !row_subtitle(&plain, &clock).contains("link"),
+            "an unprotected Send announced that it is unprotected"
+        );
+
+        // **A dead link makes no promise about when it ends.** Each of the
+        // three ways to die, and none of them may carry a future expiry
+        // beside a pill that says the link is already gone.
+        for (why, send) in [
+            (
+                "out of views",
+                SendSummary { max_access_count: Some(1), access_count: 1, ..plain.clone() },
+            ),
+            (
+                "expired while the record lives on",
+                SendSummary {
+                    expiration_date: "2026-08-01T00:00:00.000Z".to_string(),
+                    ..plain.clone()
+                },
+            ),
+            ("revoked", SendSummary { disabled: true, ..plain.clone() }),
+        ] {
+            let line = row_subtitle(&send, &clock);
+            assert!(
+                !line.contains("Expires"),
+                "a Send that is {why} still says {line:?} -- the pill beside it says the link \
+                 is gone, so those words are the only false thing on the row"
+            );
+        }
+        assert_eq!(
+            row_subtitle(
+                &SendSummary { max_access_count: Some(1), access_count: 1, ..plain },
+                &clock
+            ),
+            "1 of 1 views",
+            "a spent Send lost the one fact that is still true about it"
+        );
     }
 
     #[test]
@@ -2443,6 +2767,7 @@ mod tests {
             access_url: "https://send.bitwarden.com/#/stale".into(),
             deletion_date: at(7),
             is_file: false,
+            ..live()
         }];
         assert!(
             !fetch.apply_answer(tag, Ok(stale)),
@@ -3578,9 +3903,219 @@ mod paint_tests {
                 access_url: format!("https://send.bitwarden.com/#/{i}"),
                 deletion_date: "2026-08-17T00:00:00.000Z".to_string(),
                 is_file: i % 2 == 1,
+                // Live and untouched, so every row here derives to `Waiting`
+                // and the geometry assertions below are measuring one pill
+                // rather than four different widths.
+                max_access_count: None,
+                access_count: 0,
+                disabled: false,
+                expiration_date: String::new(),
+                has_password: false,
             })
             .collect();
         pane_state(Some(&Ok(sends)), &FixedClock(NOW))
+    }
+
+    /// A one-row pane whose single Send really is in `state`.
+    ///
+    /// **The control is inside the fixture**: `send_state` is asserted on the
+    /// summary before it is handed to the pane, so a test below that finds no
+    /// `Revoked` pill is telling you the pane did not paint one, not that the
+    /// fixture was never revoked in the first place.
+    fn one_row(state: crate::send::SendState) -> SendPaneState {
+        use crate::send::SendState;
+        let base = SendSummary {
+            id: "id0".to_string(),
+            name: "SAP Production".to_string(),
+            access_url: "https://send.bitwarden.com/#/x".to_string(),
+            deletion_date: "2026-08-17T00:00:00.000Z".to_string(),
+            is_file: false,
+            max_access_count: None,
+            access_count: 0,
+            disabled: false,
+            expiration_date: String::new(),
+            has_password: false,
+        };
+        let send = match state {
+            SendState::Waiting => base,
+            SendState::Used => SendSummary {
+                max_access_count: Some(1),
+                access_count: 1,
+                ..base
+            },
+            SendState::Expired => SendSummary {
+                deletion_date: "2026-08-01T00:00:00.000Z".to_string(),
+                ..base
+            },
+            SendState::Revoked => SendSummary { disabled: true, ..base },
+        };
+        assert_eq!(
+            crate::send::send_state(&send, &FixedClock(NOW)),
+            state,
+            "control: the fixture for {state:?} does not derive to {state:?}"
+        );
+        pane_state(Some(&Ok(vec![send])), &FixedClock(NOW))
+    }
+
+    /// **Every one of design §5c's four states paints its own pill, in its
+    /// own ground, at the design's size.**
+    ///
+    /// Measured rather than merely found, for this module's stated reason: a
+    /// label at zero size satisfies "the word is on screen" and is invisible.
+    /// So each case reads the filled rectangle BEHIND the word -- which is
+    /// the pill itself -- and checks its height, its fill and that it is
+    /// wider than the word it wraps.
+    #[test]
+    fn each_state_paints_the_designs_own_pill_and_not_the_toolbar_readout() {
+        use crate::send::SendState;
+        for state in [
+            SendState::Waiting,
+            SendState::Used,
+            SendState::Expired,
+            SendState::Revoked,
+        ] {
+            let word = state_label(state);
+            let tone = state_tone(state);
+            let (painted, _) = paint(&one_row(state), None, min_pane_size());
+            assert_eq!(
+                painted.count(word),
+                1,
+                "{state:?} painted its word {} times, not once: {:?}",
+                painted.count(word),
+                painted.text
+            );
+            let (rect, fill) = painted.control_under(word);
+            assert_eq!(
+                fill, tone.fill,
+                "the {state:?} pill is filled {fill:?}, not the design's {:?}",
+                tone.fill
+            );
+            assert!(
+                (rect.height() - theme::PILL_HEIGHT).abs() < 0.51,
+                "the {state:?} pill is {} tall, not the design's {}. The design declares \
+                 `padding: 3px 8px` inside a `1px` border on a content-box page, so the box \
+                 is the line plus six plus two -- writing the padding sum alone is the \
+                 measurement slip this screen keeps being re-measured for",
+                rect.height(),
+                theme::PILL_HEIGHT
+            );
+            let word_rect = painted.rect_of(word).expect("the word was counted above");
+            assert!(
+                rect.width() > word_rect.width() + theme::PILL_PAD_X,
+                "the {state:?} pill is {} wide around a {} word -- it is not wrapping it",
+                rect.width(),
+                word_rect.width()
+            );
+            // **And it is not `theme::status_pill`.** That widget is 28 tall
+            // and unfilled; either property alone would be a pill the design
+            // does not have.
+            assert_ne!(
+                fill,
+                egui::Color32::TRANSPARENT,
+                "the {state:?} pill has no ground, which is `status_pill`'s treatment and not \
+                 this one's"
+            );
+        }
+    }
+
+    /// **`Used` is the only state with a mark that is not a dot, and two of
+    /// the four have no mark at all.**
+    ///
+    /// The distinction is the design's own and it carries meaning -- see
+    /// `theme::PillMark` -- so it is asserted on the mapping rather than
+    /// left to whoever next edits the four arms.
+    #[test]
+    fn only_the_two_live_states_carry_a_mark_and_only_one_of_them_is_a_tick() {
+        use crate::send::SendState;
+        assert!(matches!(
+            state_tone(SendState::Waiting).mark,
+            theme::PillMark::Dot(_)
+        ));
+        assert!(matches!(
+            state_tone(SendState::Used).mark,
+            theme::PillMark::Check(_)
+        ));
+        assert_eq!(state_tone(SendState::Expired).mark, theme::PillMark::None);
+        assert_eq!(state_tone(SendState::Revoked).mark, theme::PillMark::None);
+        // The four words are four words. A mapping that returned one label
+        // twice would leave two states indistinguishable on screen while
+        // every assertion above still passed.
+        let words = [
+            state_label(SendState::Waiting),
+            state_label(SendState::Used),
+            state_label(SendState::Expired),
+            state_label(SendState::Revoked),
+        ];
+        let mut sorted = words.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 4, "two states are drawn with the same word: {words:?}");
+    }
+
+    /// **The pill leads the second line and the expiry follows it, with no
+    /// overlap.**
+    ///
+    /// This is the one place this screen departs from 5b, which right-aligns
+    /// the pill -- see `draw_row` for the argument -- so the arrangement that
+    /// replaced it is pinned rather than left to the next re-layout.
+    #[test]
+    fn the_row_puts_its_pill_before_the_words_it_qualifies() {
+        let state = one_row(crate::send::SendState::Waiting);
+        let (painted, _) = paint(&state, None, min_pane_size());
+        let (pill, _) = painted.control_under(WAITING_LABEL);
+        let expiry = painted
+            .rect_of("Expires in")
+            .expect("the row painted no expiry at all, so there is nothing to be beside");
+        assert!(
+            expiry.left() >= pill.right(),
+            "the expiry starts at {} and the pill ends at {} -- they overlap",
+            expiry.left(),
+            pill.right()
+        );
+        assert!(
+            expiry.left() - pill.right() < STATE_PILL_GAP * 3.0,
+            "the expiry is {} away from the pill, which is not the gap the row uses between \
+             two things that belong together",
+            expiry.left() - pill.right()
+        );
+        // They are one line: the pill is centred on the words it leads.
+        assert!(
+            (pill.center().y - expiry.center().y).abs() < 2.0,
+            "the pill sits at y={} and the words it qualifies at y={}",
+            pill.center().y,
+            expiry.center().y
+        );
+    }
+
+    /// **A row that is asking to be revoked shows no state pill**, for the
+    /// reason the expiry is replaced rather than joined: a row that says
+    /// "Revoke this link for good?" and "Waiting" at once has two subjects at
+    /// the moment it matters most.
+    #[test]
+    fn the_pill_leaves_while_the_row_is_asking_or_working() {
+        let state = one_row(crate::send::SendState::Waiting);
+        // Control: it is there in the resting state.
+        let (resting, _) = paint(&state, None, min_pane_size());
+        assert_eq!(resting.count(WAITING_LABEL), 1, "control: the resting row has no pill");
+
+        for (why, view) in [
+            (
+                "asking",
+                SendDeleteView { confirming: Some("id0"), in_flight: None },
+            ),
+            (
+                "revoking",
+                SendDeleteView { confirming: None, in_flight: Some("id0") },
+            ),
+        ] {
+            let (painted, _) = paint_with(&state, None, min_pane_size(), view);
+            assert_eq!(
+                painted.count(WAITING_LABEL),
+                0,
+                "the row kept its state pill while {why}: {:?}",
+                painted.text
+            );
+        }
     }
 
     /// **The `FILE` tag is explained, and only where there is one.**
@@ -3626,6 +4161,7 @@ mod paint_tests {
             access_url: "https://vault.example.com/#/send/acc/AAAAAAAAAAAAAAAAAAAAAA".to_string(),
             expiry: "Expires in 7 days".to_string(),
             is_file,
+            state: crate::send::SendState::Waiting,
         }
     }
 
@@ -3773,6 +4309,143 @@ mod paint_tests {
         assert!(painted.has("something went wrong"));
     }
 
+    /// **A revoked row offers to switch ON and every other row offers to
+    /// switch OFF, and the two are never on screen together.**
+    ///
+    /// The rule is stated once, in `draw_row`, off the row's derived state --
+    /// so a row that came back from the server already disabled shows the way
+    /// back rather than offering to disable it again, which is a button that
+    /// would do nothing and report success.
+    #[test]
+    fn the_switch_offers_the_direction_the_row_is_not_already_in() {
+        use crate::send::SendState;
+        for (state, offered, hidden) in [
+            (SendState::Waiting, SWITCH_OFF_LABEL, SWITCH_ON_LABEL),
+            (SendState::Used, SWITCH_OFF_LABEL, SWITCH_ON_LABEL),
+            (SendState::Expired, SWITCH_OFF_LABEL, SWITCH_ON_LABEL),
+            (SendState::Revoked, SWITCH_ON_LABEL, SWITCH_OFF_LABEL),
+        ] {
+            let (painted, _) = paint(&one_row(state), None, min_pane_size());
+            assert_eq!(
+                painted.count(offered),
+                1,
+                "a {state:?} row does not offer {offered:?}: {:?}",
+                painted.text
+            );
+            assert_eq!(
+                painted.count(hidden),
+                0,
+                "a {state:?} row offers {hidden:?} as well, so one of the two buttons does \
+                 nothing and reports that it worked"
+            );
+            // Measured, not merely found: a control at zero size satisfies
+            // every "the word is on screen" assertion and is unclickable.
+            let rect = painted.rect_of(offered).expect("counted just above");
+            assert!(
+                rect.width() > 1.0 && rect.height() > 1.0,
+                "{offered:?} was painted at {rect:?} on a {state:?} row, which is not a \
+                 control a user can press"
+            );
+        }
+    }
+
+    /// **Pressing it reports the row's own id and name and the direction the
+    /// press asked for** -- read off the row that was clicked and off nothing
+    /// else, so no lookup on the far side can resolve to a different Send.
+    #[test]
+    fn pressing_the_switch_reports_the_row_and_the_direction() {
+        use crate::send::SendState;
+        assert_eq!(
+            click_nth(&one_row(SendState::Waiting), SWITCH_OFF_LABEL, 0),
+            SendUiAction::SetDisabled {
+                id: "id0".to_string(),
+                name: "SAP Production".to_string(),
+                disabled: true,
+            },
+        );
+        assert_eq!(
+            click_nth(&one_row(SendState::Revoked), SWITCH_ON_LABEL, 0),
+            SendUiAction::SetDisabled {
+                id: "id0".to_string(),
+                name: "SAP Production".to_string(),
+                disabled: false,
+            },
+            "a revoked row's button asked to revoke it again instead of asking to put it back"
+        );
+    }
+
+    /// **The row that is asking to be deleted asks about one thing.**
+    ///
+    /// The switch is not drawn while the confirmation is up, and it is not
+    /// drawn on a row whose worker is running. Both are geometry as much as
+    /// wording: the confirmation widens this row to three controls, and the
+    /// switch occupies the very rectangle the destructive button takes.
+    #[test]
+    fn the_switch_leaves_while_the_row_is_confirming_or_busy() {
+        let state = one_row(crate::send::SendState::Waiting);
+        let (resting, _) = paint(&state, None, min_pane_size());
+        assert_eq!(resting.count(SWITCH_OFF_LABEL), 1, "control: the resting row has no switch");
+
+        for (why, view) in [
+            ("asking", SendDeleteView { confirming: Some("id0"), in_flight: None }),
+            ("busy", SendDeleteView { confirming: None, in_flight: Some("id0") }),
+        ] {
+            let (painted, _) = paint_with(&state, None, min_pane_size(), view);
+            assert_eq!(
+                painted.count(SWITCH_OFF_LABEL) + painted.count(SWITCH_ON_LABEL),
+                0,
+                "the row kept its switch while {why}: {:?}",
+                painted.text
+            );
+        }
+
+        // And the confirmation's own destructive button really does take the
+        // switch's rectangle, which is why it may not share the frame with
+        // it. Measured rather than asserted in prose.
+        let (confirming, _) = paint_with(
+            &state,
+            None,
+            min_pane_size(),
+            SendDeleteView { confirming: Some("id0"), in_flight: None },
+        );
+        let confirm_rect = confirming
+            .rect_of(CONFIRM_LABEL)
+            .expect("the confirming row painted no destructive button");
+        let switch_rect = resting
+            .rect_of(SWITCH_OFF_LABEL)
+            .expect("counted above");
+        assert!(
+            confirm_rect.intersects(switch_rect),
+            "the confirmation's button at {confirm_rect:?} no longer overlaps the switch's \
+             slot at {switch_rect:?} -- the reason they may not be drawn together has gone, \
+             so the rule above is now arbitrary"
+        );
+    }
+
+    /// **A row with no id offers no switch**, on the Delete button's own
+    /// rule: an id is what names the Send to the server, and a control that
+    /// cannot name its subject must not report an action.
+    #[test]
+    fn a_row_with_no_id_is_offered_no_switch() {
+        let state = SendPaneState::Rows(vec![SendRow {
+            id: String::new(),
+            name: "no id".into(),
+            expiry: "Expires in 7 days".into(),
+            is_file: false,
+            access_url: "https://send.bitwarden.com/#/x".into(),
+            state: crate::send::SendState::Waiting,
+        }]);
+        let (painted, _) = paint(&state, None, min_pane_size());
+        assert_eq!(
+            painted.count(SWITCH_OFF_LABEL),
+            0,
+            "a row with no id was offered a switch it could not name a Send for"
+        );
+        // Control: the row is really drawn, so the absence above is about the
+        // switch and not about a pane that painted nothing.
+        assert_eq!(painted.count("Copy link"), 1, "control: the row was not drawn at all");
+    }
+
     // ---- clicks ----------------------------------------------------------
 
     /// Presses the widget whose painted text is `label`, `nth` occurrence,
@@ -3869,6 +4542,7 @@ mod paint_tests {
             expiry: "Expires in 7 days".into(),
             is_file: false,
             access_url: String::new(),
+            state: crate::send::SendState::Waiting,
         }]);
         let (painted, _) = paint(&state, None, min_pane_size());
         assert_eq!(
@@ -4268,6 +4942,7 @@ mod paint_tests {
             expiry: "Expires in 7 days".into(),
             is_file: false,
             access_url: "https://send.bitwarden.com/#/x".into(),
+            state: crate::send::SendState::Waiting,
         }]);
         assert_eq!(
             click_nth_with(&state, SendDeleteView::default(), DELETE_LABEL, 0),
@@ -5790,6 +6465,118 @@ mod source_pins {
                 .count(),
             1,
             "`receive_on_active_account` is called somewhere other than the built-in \
+             implementation of `BackendTasks`"
+        );
+    }
+
+    /// **The switch is three equalities**, on
+    /// [`the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account`]'s
+    /// terms and for its reasons, plus the census that keeps the REST entry
+    /// point to one caller.
+    ///
+    /// What each one holds:
+    ///
+    ///  1. **The worker asks `tasks_for` ONCE and then branches on what the
+    ///     ROW wanted.** This is the property that makes a seventh operation
+    ///     free: `the_backend_is_chosen_in_exactly_one_place` counts
+    ///     `tasks_for(` at seven, and a switch that asked again would be an
+    ///     eighth -- a second reading of the backend, which is the shape all
+    ///     six of this window's original defects had. A branch on
+    ///     `backend_policy::selected()` written in here fails this equality
+    ///     and that census at once.
+    ///  2. **The built-in arm is one call to the REST client**, and it reports
+    ///     what was ASKED for rather than what the server used to hold --
+    ///     `rest::send::set_disabled` already refuses to return `Ok` unless
+    ///     the server echoed the flag back, so `disabled` here is confirmed
+    ///     and not assumed.
+    ///  3. **The CLI arm is a refusal and nothing else.** It names no `bw`
+    ///     entry point, starts no child, and cannot: `bw send` has no verb
+    ///     for `disabled`. The equality is what stops that becoming a quiet
+    ///     `Ok(())` -- which would tell a `bw serve` user their link is off
+    ///     while it stayed live, the exact lie `rest::send::set_disabled`'s
+    ///     own doc is written against.
+    #[test]
+    fn the_switch_is_the_built_in_clients_and_the_cli_refuses_it_in_words() {
+        // 1. One backend read, then a branch on the row's own verb.
+        assert_eq!(
+            squashed(&sanitized(&body_of(concat!("real_send_", "delete"), "    "))),
+            squashed(
+                "id: &str, name: &str, session: &str, op: SendRowOp, ) -> SendDeleteReport { \
+                 let tasks = super::backend_tasks::tasks_for(Some(session)); match op { \
+                 SendRowOp::Delete => tasks.send_delete(id, name), SendRowOp::Disable => \
+                 tasks.send_set_disabled(id, name, true), SendRowOp::Enable => \
+                 tasks.send_set_disabled(id, name, false), }"
+            ),
+            "the Sends worker is no longer one backend choice followed by a branch on what \
+             the row asked for. A second `tasks_for` here is a second reading of the backend \
+             between the frame and the thread, and an account switch happens in that gap"
+        );
+
+        // 2. The built-in arm.
+        assert_eq!(
+            squashed(&sanitized(&body_in(
+                &tasks_impl("impl BackendTasks for DirectRestTasks"),
+                "send_set_disabled",
+                "        ",
+            ))),
+            squashed(&format!(
+                "&self, id: &str, name: &str, disabled: bool) -> SendDeleteReport {{ match \
+                 crate::rest::send::{}(id, disabled) {{ Ok(()) => \
+                 SendDeleteReport::Switched {{ name: name.to_string(), disabled }}, \
+                 Err(error) => {{ SendDeleteReport::SwitchFailed {{ name: name.to_string(), \
+                 disabled, error }} }} }}",
+                concat!("set_disabled_on_active_", "account"),
+            )),
+            "the built-in switch is no longer exactly one call to the REST client reporting \
+             the flag it asked for"
+        );
+
+        // 3. The CLI arm: a refusal, with no `bw` in it.
+        let cli = sanitized(&tasks_impl("impl BackendTasks for CliTasks<'_>"));
+        let body = squashed(&sanitized(&body_in(
+            &tasks_impl("impl BackendTasks for CliTasks<'_>"),
+            "send_set_disabled",
+            "        ",
+        )));
+        assert_eq!(
+            body,
+            squashed(
+                "&self, _id: &str, name: &str, disabled: bool) -> SendDeleteReport { \
+                 SendDeleteReport::SwitchFailed { name: name.to_string(), disabled, error: \
+                 crate::send::SendError::Rejected( \" \" .to_string(), ), }"
+            ),
+            "the CLI switch is no longer exactly a refusal. `bw send` has no verb that sets \
+             `disabled`, so anything here that is not a refusal either starts a child that \
+             cannot do the job or reports a success that did not happen"
+        );
+        // It takes the id by `_id` because there is nothing to name it TO --
+        // a body that started using it is a body that found something to run.
+        assert!(
+            body.contains("_id: &str"),
+            "the CLI switch has found a use for the Send's id, which means it is doing \
+             something with it: {body}"
+        );
+        assert!(
+            !body.contains(concat!("cli_send_", "")) && !body.contains(concat!("Self::", "job")),
+            "the CLI switch names a `bw send` entry point or this window's job: {body}"
+        );
+        // Control: the same impl really does spawn for its other operations,
+        // so the absence above is about this method and not about a slice
+        // that found nothing.
+        assert!(
+            cli.contains(concat!("cli_send_", "delete")),
+            "control: the `bw serve` implementation no longer spawns anything at all"
+        );
+
+        // 4. The REST entry point has exactly one caller. A second is
+        // unproven ground for which thread it runs on and which backend the
+        // account is on.
+        assert_eq!(
+            production()
+                .matches(concat!("crate::rest::send::set_disabled_on_active_", "account("))
+                .count(),
+            1,
+            "`set_disabled_on_active_account` is called somewhere other than the built-in \
              implementation of `BackendTasks`"
         );
     }
@@ -7416,6 +8203,49 @@ mod source_pins {
         "send.rs: pub access_url: String,",
         "send.rs: pub deletion_date: String,",
         "send.rs: pub is_file: bool,",
+        // **The five fields and two functions the §5b/§5c states pass adds,
+        // deliberately, and it is the whole of what that work adds to this
+        // wall.**
+        //
+        // The five fields are the server's own answer, which this client
+        // already received on every `bw send list` and every `GET /api/sends`
+        // and then dropped on the floor. They are read by
+        // `send_state` below them and by the row's subtitle, and not one of
+        // them reaches a runner, an invocation or a child -- they are two
+        // integers, two flags and a date string.
+        //
+        // **`has_password` is a `bool` where the wire carries a hash**, and
+        // that is a narrowing rather than a widening: the server's `password`
+        // field is a credential verifier, so the choice was between a new
+        // `String` on a type whose `Debug` is hand-written precisely because
+        // it already carries one secret, and the single bit the screen
+        // actually draws. It is the bit.
+        "send.rs: pub max_access_count: Option<u32>,",
+        "send.rs: pub access_count: u32,",
+        "send.rs: pub disabled: bool,",
+        "send.rs: pub expiration_date: String,",
+        "send.rs: pub has_password: bool,",
+        // The derivation and its four answers. A pure function of a summary
+        // and a clock, returning a fieldless enum: no runner, no invocation,
+        // no child, and nothing behind the door but four comparisons. It is
+        // `pub` rather than `pub(crate)` for the reason `lifetime_label`
+        // above it is -- the screen that draws the pill is a different module
+        // -- and it is in THIS module rather than in `send_ui` so that the
+        // rule lives beside the fields it reads.
+        "send.rs: pub enum SendState {",
+        "send.rs: pub fn send_state(send: &SendSummary, now: &dyn SendClock) -> SendState {",
+        // **Moved here from `send_ui`, and the move is the point.** It was
+        // the Sends screen's own date parser, and `send_state` needs the same
+        // bytes read the same way against the same clock. Two parsers for one
+        // wire format agree only by coincidence, which is the exact reason
+        // `lifetime_label` is on this list a few rows up. `send_ui`
+        // re-exports this one under its old name, so `record_ui` -- the only
+        // caller outside that file -- is untouched.
+        //
+        // Integer arithmetic over a `&str` and one call to
+        // `crate::local_time::days_from_civil`, which this file already made
+        // for the other direction.
+        "send.rs: pub fn parse_iso_utc_millis(text: &str) -> Option<i64> {",
         // Re-pinned deliberately. `ElidedAccessUrl` is a zero-sized `Debug`
         // stand-in and NOT a door out of the module in the sense this wall
         // guards: it carries no data, reaches no `bw` child, and its whole
@@ -9072,6 +9902,12 @@ mod frame_promptness {
                 // makes it expired, which would be a different row.
                 deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
                 is_file: false,
+                // Untouched, so the harness row is `Waiting` under any clock.
+                max_access_count: None,
+                access_count: 0,
+                disabled: false,
+                expiration_date: String::new(),
+                has_password: false,
             }]),
         ));
     }

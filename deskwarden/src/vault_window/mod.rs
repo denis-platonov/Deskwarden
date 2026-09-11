@@ -8622,6 +8622,22 @@ mod backend_tasks {
         fn send_list(&self) -> Result<Vec<crate::send::SendSummary>, crate::send::SendError>;
         fn send_create(&self, plan: &crate::send::SendPlan) -> SendCreateReport;
         fn send_delete(&self, id: &str, name: &str) -> SendDeleteReport;
+        /// **Design §5c's Revoke, which is not this window's Delete.** The
+        /// server's `disabled` flag: the link stops answering, the record
+        /// stays, the row stays in the list carrying a `Revoked` pill, and
+        /// the owner can put it back. `send_delete` above destroys the record
+        /// and the row with it, which is why 5b can show a revoked Send and
+        /// could never show a deleted one.
+        ///
+        /// **The two implementations do not both have one.** The built-in
+        /// client has `PUT /api/sends/{id}`; `bw send` has no verb for this
+        /// at all, so the CLI arm refuses in words. That asymmetry is the
+        /// reason this is on the trait rather than called directly: a refusal
+        /// both arms must answer for is a refusal the compiler enforces, and
+        /// the shape it takes -- a `SendDeleteReport::SwitchFailed` carrying
+        /// an ordinary `SendError` -- is one the Sends screen already knows
+        /// how to paint.
+        fn send_set_disabled(&self, id: &str, name: &str, disabled: bool) -> SendDeleteReport;
         fn send_receive(&self, link: &str) -> RecordImportReport;
     }
 
@@ -8731,6 +8747,15 @@ mod backend_tasks {
             match crate::rest::send::delete_on_active_account(id) {
                 Ok(()) => SendDeleteReport::Deleted { name: name.to_string() },
                 Err(error) => SendDeleteReport::Failed { name: name.to_string(), error },
+            }
+        }
+
+        fn send_set_disabled(&self, id: &str, name: &str, disabled: bool) -> SendDeleteReport {
+            match crate::rest::send::set_disabled_on_active_account(id, disabled) {
+                Ok(()) => SendDeleteReport::Switched { name: name.to_string(), disabled },
+                Err(error) => {
+                    SendDeleteReport::SwitchFailed { name: name.to_string(), disabled, error }
+                }
             }
         }
 
@@ -8872,6 +8897,39 @@ mod backend_tasks {
                     name: name.to_string(),
                     error,
                 },
+            }
+        }
+
+        /// **A refusal, and the only method on this trait that is one.**
+        ///
+        /// `bw send` has four verbs -- `create`, `list`, `delete`, `receive`
+        /// -- and none of them sets `disabled`. There is no flag to pass and
+        /// no `bw send edit` to pass it to, so this is not a wiring that was
+        /// left undone; it is a capability the CLI backend does not have.
+        ///
+        /// **It is a refusal in words rather than a hidden button**, which is
+        /// the same call `send_receive` below makes for `bw`'s absence and
+        /// the reason `RECEIVE_NEEDS_THE_CLI` exists. A control that silently
+        /// vanished on one backend would leave a user who had used it on the
+        /// other hunting for it, and the Sends screen has exactly one
+        /// sentence-shaped place to say why: `SendError::Rejected`, whose own
+        /// doc is "this module's own validation refused the request and said
+        /// why". Nothing ran, so it is unambiguous, so the screen offers a
+        /// plain retry rather than sending the user to check the list.
+        ///
+        /// It names the alternative, because there is one and it is one
+        /// setting away: this account can be moved to the built-in client,
+        /// which does have `PUT /api/sends/{id}`.
+        fn send_set_disabled(&self, _id: &str, name: &str, disabled: bool) -> SendDeleteReport {
+            SendDeleteReport::SwitchFailed {
+                name: name.to_string(),
+                disabled,
+                error: crate::send::SendError::Rejected(
+                    "Bitwarden's command-line tool cannot switch a Send's link off or on, so \
+                     nothing was changed. Delete the Send instead, or switch this account to \
+                     Deskwarden's built-in client in Preferences."
+                        .to_string(),
+                ),
             }
         }
 
@@ -9834,6 +9892,25 @@ enum SendDeleteReport {
         name: String,
         error: crate::send::SendError,
     },
+    /// **Design §5c's Revoke, and its undo.** The server confirmed the link's
+    /// `disabled` flag, so the Send is still there and the row will come back
+    /// wearing a different pill. `disabled` is what was asked for and
+    /// confirmed, not what it used to be.
+    ///
+    /// A separate variant from [`Self::Deleted`] rather than a `bool` on it,
+    /// because the sentence a user needs is different in kind: a delete is
+    /// final and a switch is not, and a report that said "was revoked" for
+    /// both would make the reversible one sound permanent.
+    Switched { name: String, disabled: bool },
+    /// The switch did not happen. `disabled` is what was ASKED for, which is
+    /// what the sentence has to name -- "could not be turned back on" and
+    /// "could not be turned off" are opposite worries and only one of them is
+    /// about a link that is still live.
+    SwitchFailed {
+        name: String,
+        disabled: bool,
+        error: crate::send::SendError,
+    },
 }
 
 impl SendDeleteReport {
@@ -9853,6 +9930,13 @@ impl SendDeleteReport {
         match self {
             SendDeleteReport::Deleted { .. } => true,
             SendDeleteReport::Failed { error, .. } => error.is_ambiguous(),
+            // A confirmed switch changes the row's pill and its button, and
+            // an ambiguous failure may have changed them too. The CLI arm's
+            // refusal is `Rejected`, which is not ambiguous, so a `bw serve`
+            // account does not refetch its whole Sends list every time it
+            // presses a button this backend does not have.
+            SendDeleteReport::Switched { .. } => true,
+            SendDeleteReport::SwitchFailed { error, .. } => error.is_ambiguous(),
         }
     }
 }
@@ -9901,6 +9985,46 @@ fn send_delete_message(report: &SendDeleteReport) -> (DeleteTone, String) {
             DeleteTone::Bad,
             format!(
                 "\u{201c}{name}\u{201d} was not revoked and its link is still live. {}",
+                error.user_message()
+            ),
+        ),
+        // **The switch says it can be undone and the delete does not**, which
+        // is the whole reason these are four arms and not two. Turning a link
+        // off is the only destructive thing on this screen a user can take
+        // back, and a sentence that read like the delete's would hide that.
+        SendDeleteReport::Switched { name, disabled: true } => (
+            DeleteTone::Good,
+            format!(
+                "\u{201c}{name}\u{201d} is switched off. Its link no longer works, and you can \
+                 switch it back on from the list."
+            ),
+        ),
+        SendDeleteReport::Switched { name, disabled: false } => (
+            // **`Bad`, on a call that succeeded.** The tone here is not
+            // "did it work"; it is how loudly to say it, and this is the one
+            // outcome on this screen that makes a private thing public again.
+            // `DeleteTone::Good` is the tone of a link that has been taken
+            // down, and painting "anyone with the link can read it again" in
+            // it would be the same lie the ambiguous arm above refuses, told
+            // the other way round.
+            DeleteTone::Bad,
+            format!(
+                "\u{201c}{name}\u{201d} is live again. Anyone holding its link can open it \
+                 until it expires."
+            ),
+        ),
+        SendDeleteReport::SwitchFailed { name, disabled: true, error } => (
+            DeleteTone::Bad,
+            format!(
+                "\u{201c}{name}\u{201d} could not be switched off and its link is still live. {}",
+                error.user_message()
+            ),
+        ),
+        SendDeleteReport::SwitchFailed { name, disabled: false, error } => (
+            DeleteTone::Bad,
+            format!(
+                "\u{201c}{name}\u{201d} could not be switched back on, so its link is still \
+                 dead. {}",
                 error.user_message()
             ),
         ),
@@ -9971,7 +10095,33 @@ type SendDeleteSender = mpsc::Sender<SendDeleteReport>;
 /// tests drive that function with and the value the frame closure passes are
 /// the same KIND of thing, and the only difference between the production run
 /// and the tested run is which of two `fn` items is named.
-type SendDeleteSpawn = fn(egui::Context, SendDeleteSender, zeroize::Zeroizing<String>, String, String);
+type SendDeleteSpawn =
+    fn(egui::Context, SendDeleteSender, zeroize::Zeroizing<String>, String, String, SendRowOp);
+
+/// Which of the three things a Sends row's destructive controls can ask for.
+///
+/// **One worker, one channel and one in-flight slot for all three**, rather
+/// than a second pipeline beside the revoke's. They are the same operation in
+/// every respect this window cares about: a row names itself, something
+/// blocking happens off-thread against the chosen backend, one report comes
+/// back, and the list is thrown away. A second channel would have bought a
+/// second drain to forget to call, a second in-flight flag to latch, and a
+/// second `tasks_for` call site -- and `send_ui`'s census of that call is
+/// exactly what stops this window growing a seventh hand-branch on the
+/// backend.
+///
+/// It also keeps the mutual exclusion that matters for free: at most one of
+/// these runs at a time, so a row cannot be deleted and switched on at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendRowOp {
+    /// Destroy the record. The row goes with it, and it cannot be undone.
+    Delete,
+    /// Design §5c's Revoke: `disabled = true`. The row stays, wearing a
+    /// `Revoked` pill.
+    Disable,
+    /// Put it back.
+    Enable,
+}
 
 /// The shape of "put this Send's access link on the clipboard", as a **`fn`
 /// pointer**.
@@ -10150,6 +10300,35 @@ fn apply_send_action(
                     session.clone(),
                     id,
                     name,
+                    SendRowOp::Delete,
+                );
+            }
+        }
+        // **Design §5c's Revoke, and its undo -- the same worker, the same
+        // lock, a different verb.**
+        //
+        // *One* step, where the delete has two, and that is deliberate rather
+        // than an omission. The two-step confirmation exists because
+        // `bw send delete` cannot be undone; this can, by pressing the
+        // button again, so a confirmation would be asking the user to think
+        // hard about a decision they can reverse in one click. What it shares
+        // with the delete is the lock: `in_flight` is the same slot, so a
+        // row cannot be switched while it is being deleted, or twice at once.
+        send_ui::SendUiAction::SetDisabled { id, name, disabled } => {
+            if delete.in_flight.is_none() {
+                // A confirmation standing on some other row is about a
+                // question the user has moved past, exactly as it is on a
+                // refresh.
+                delete.confirming = None;
+                delete.in_flight = Some(id.clone());
+                delete.report = None;
+                spawn(
+                    ctx.clone(),
+                    tx.clone(),
+                    session.clone(),
+                    id,
+                    name,
+                    if disabled { SendRowOp::Disable } else { SendRowOp::Enable },
                 );
             }
         }
@@ -10269,7 +10448,7 @@ mod send_delete_thread {
 
     use eframe::egui;
 
-    use super::{SendDeleteReport, SendDeleteSender};
+    use super::{SendDeleteReport, SendDeleteSender, SendRowOp};
 
     /// **One whole revoke, blocking, from the id to the verdict** -- and the
     /// wiring's own entry point, in the sense that everything above it is a
@@ -10283,12 +10462,28 @@ mod send_delete_thread {
     /// must be a call the test makes on its own thread -- which is why the
     /// blocking half is a plain function and not something only reachable
     /// through `std::thread::spawn`.
-    pub(super) fn real_send_delete(id: &str, name: &str, session: &str) -> SendDeleteReport {
+    pub(super) fn real_send_delete(
+        id: &str,
+        name: &str,
+        session: &str,
+        op: SendRowOp,
+    ) -> SendDeleteReport {
         // `real_send_list`'s line, in its position and for its reason: the
         // backend is chosen by `super::backend_tasks::tasks_for` and by nothing
         // written here, and it is asked on THIS thread because an account
         // switch replaces the choice between the frame and the thread.
-        super::backend_tasks::tasks_for(Some(session)).send_delete(id, name)
+        //
+        // **One `tasks_for`, three operations.** The branch below is on what
+        // the ROW asked for and never on which backend is in use -- that
+        // second question is asked once, on the line above, which is what
+        // `send_ui::source_pins::the_backend_is_chosen_in_exactly_one_place`
+        // counts.
+        let tasks = super::backend_tasks::tasks_for(Some(session));
+        match op {
+            SendRowOp::Delete => tasks.send_delete(id, name),
+            SendRowOp::Disable => tasks.send_set_disabled(id, name, true),
+            SendRowOp::Enable => tasks.send_set_disabled(id, name, false),
+        }
     }
 
     /// Revokes one Send on a background thread. The frame closure's one entry
@@ -10299,9 +10494,10 @@ mod send_delete_thread {
         session: zeroize::Zeroizing<String>,
         id: String,
         name: String,
+        op: SendRowOp,
     ) {
         spawn_send_delete_with(ctx_for_delete, tx, move || {
-            real_send_delete(&id, &name, &session)
+            real_send_delete(&id, &name, &session, op)
         });
     }
 
@@ -28434,6 +28630,7 @@ mod export_wiring {
         _: zeroize::Zeroizing<String>,
         _: String,
         _: String,
+        _: SendRowOp,
     ) {
         unreachable!("never called -- the revoke decoy exists only to have an address");
     }
@@ -30168,6 +30365,7 @@ mod send_delete_wiring {
         session: zeroize::Zeroizing<String>,
         id: String,
         name: String,
+        _op: SendRowOp,
     ) {
         *FRAME_TX.lock().expect("not poisoned") = Some(tx);
         FRAME_REVOKES
@@ -30223,6 +30421,12 @@ mod send_delete_wiring {
                     // it expired, which is a row with different buttons.
                     deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
                     is_file: false,
+                    // Live and untouched, so the row derives to Waiting.
+                    max_access_count: None,
+                    access_count: 0,
+                    disabled: false,
+                    expiration_date: String::new(),
+                    has_password: false,
                 },
                 crate::send::SendSummary {
                     id: FRAME_SECOND_SEND_ID.to_string(),
@@ -30230,6 +30434,12 @@ mod send_delete_wiring {
                     access_url: FRAME_SECOND_SEND_URL.to_string(),
                     deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
                     is_file: false,
+                    // Live and untouched, so the row derives to Waiting.
+                    max_access_count: None,
+                    access_count: 0,
+                    disabled: false,
+                    expiration_date: String::new(),
+                    has_password: false,
                 },
             ]),
         ));
@@ -30878,6 +31088,12 @@ mod send_delete_wiring {
                 access_url: "https://send.example.invalid/stale".to_string(),
                 deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
                 is_file: false,
+                // Live and untouched, so the row derives to Waiting.
+                max_access_count: None,
+                access_count: 0,
+                disabled: false,
+                expiration_date: String::new(),
+                has_password: false,
             }]),
         ));
         // Five frames painted and five asserted: the assert used to run
@@ -32994,6 +33210,12 @@ mod send_delete_wiring {
                     access_url: "https://send.example.invalid/stale".to_string(),
                     deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
                     is_file: false,
+                    // Live and untouched, so the row derives to Waiting.
+                    max_access_count: None,
+                    access_count: 0,
+                    disabled: false,
+                    expiration_date: String::new(),
+                    has_password: false,
                 }]),
             ));
             let mut settled = matrix_frame(&ctx, &mut frame_fn);
@@ -33210,7 +33432,7 @@ mod send_delete_wiring {
         /// Every revoke [`recording_spawn`] was asked to start, on this
         /// thread. Thread-local because `cargo test` runs tests in parallel
         /// and a global would let one test read another's spawns.
-        static SPAWNS: RefCell<Vec<(String, String, String)>> =
+        static SPAWNS: RefCell<Vec<(String, String, String, SendRowOp)>> =
             const { RefCell::new(Vec::new()) };
     }
 
@@ -33226,8 +33448,9 @@ mod send_delete_wiring {
         session: zeroize::Zeroizing<String>,
         id: String,
         name: String,
+        op: SendRowOp,
     ) {
-        SPAWNS.with(|s| s.borrow_mut().push((id, name, session.to_string())));
+        SPAWNS.with(|s| s.borrow_mut().push((id, name, session.to_string(), op)));
     }
 
     /// Runs the production [`apply_send_action`] and answers every revoke it
@@ -33236,7 +33459,7 @@ mod send_delete_wiring {
         action: send_ui::SendUiAction,
         delete: &mut SendDeleteState,
         fetch: &mut send_ui::SendFetch,
-    ) -> Vec<(String, String, String)> {
+    ) -> Vec<(String, String, String, SendRowOp)> {
         SPAWNS.with(|s| s.borrow_mut().clear());
         COPIES.with(|c| c.borrow_mut().clear());
         let ctx = egui::Context::default();
@@ -33350,7 +33573,8 @@ mod send_delete_wiring {
             vec![(
                 "send-id-42".to_string(),
                 "quarterly numbers".to_string(),
-                SESSION.to_string()
+                SESSION.to_string(),
+                SendRowOp::Delete
             )],
             "the revoke did not carry the id and name off the row that was confirmed, or was \
              started without the window's own session -- a `bw send delete` with no \
@@ -33371,6 +33595,108 @@ mod send_delete_wiring {
             delete.report.is_none(),
             "the previous revoke's banner is still up over this one, answering a question the \
              user has moved past"
+        );
+    }
+
+    /// **The switch starts one operation, for the row it names, in the
+    /// direction the row asked for** -- and it does so in ONE step.
+    ///
+    /// The one-step shape is the decision worth pinning. Every other
+    /// destructive control on this screen is two clicks because it cannot be
+    /// undone; this one can, by pressing the button again, and a
+    /// confirmation would be making the user think hard about a decision they
+    /// can reverse. The mutant this exists against is the tidy-looking one:
+    /// route the switch through `confirming` "for consistency", which puts a
+    /// modal question in front of an action that needs none and, worse, makes
+    /// switching a link back ON feel like a destructive act.
+    #[test]
+    fn switching_a_link_off_or_on_is_one_click_and_carries_its_own_direction() {
+        for (why, disabled, op) in
+            [("off", true, SendRowOp::Disable), ("on", false, SendRowOp::Enable)]
+        {
+            let mut delete = SendDeleteState::default();
+            let mut fetch = send_ui::SendFetch::default();
+            let spawns = apply(
+                send_ui::SendUiAction::SetDisabled {
+                    id: "send-id-42".to_string(),
+                    name: "quarterly numbers".to_string(),
+                    disabled,
+                },
+                &mut delete,
+                &mut fetch,
+            );
+            assert_eq!(
+                spawns,
+                vec![(
+                    "send-id-42".to_string(),
+                    "quarterly numbers".to_string(),
+                    SESSION.to_string(),
+                    op
+                )],
+                "switching {why} did not start exactly one {op:?} for the row it names with \
+                 the window's own session"
+            );
+            assert_eq!(
+                delete.in_flight.as_deref(),
+                Some("send-id-42"),
+                "the row is not marked as busy while its switch runs, so the pane redraws \
+                 its buttons and a second click starts a second one"
+            );
+            assert_eq!(
+                delete.confirming, None,
+                "switching {why} armed a confirmation -- this action has no second step and \
+                 a confirmation left standing is a destructive control aimed at a question \
+                 the user has moved past"
+            );
+        }
+    }
+
+    /// **The switch and the revoke share one lock, deliberately**, because
+    /// they share one worker and one in-flight slot. A row cannot be deleted
+    /// and switched at the same time, and neither can two rows.
+    #[test]
+    fn a_switch_and_a_revoke_cannot_run_at_the_same_time() {
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+        assert_eq!(apply(confirm(), &mut delete, &mut fetch).len(), 1);
+
+        let spawns = apply(
+            send_ui::SendUiAction::SetDisabled {
+                id: "another-send".to_string(),
+                name: "another".to_string(),
+                disabled: true,
+            },
+            &mut delete,
+            &mut fetch,
+        );
+        assert!(
+            spawns.is_empty(),
+            "a switch was started while a revoke was in flight: {spawns:?}"
+        );
+
+        // ...and the other way round, which is the direction a reader would
+        // assume rather than check.
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+        assert_eq!(
+            apply(
+                send_ui::SendUiAction::SetDisabled {
+                    id: "send-id-42".to_string(),
+                    name: "quarterly numbers".to_string(),
+                    disabled: true,
+                },
+                &mut delete,
+                &mut fetch,
+            )
+            .len(),
+            1,
+            "control: the switch started nothing, so the assertion below holds against a \
+             dead feature"
+        );
+        let spawns = apply(confirm(), &mut delete, &mut fetch);
+        assert!(
+            spawns.is_empty(),
+            "a revoke was started while a switch was in flight: {spawns:?}"
         );
     }
 
@@ -33508,6 +33834,12 @@ mod send_delete_wiring {
             access_url: "https://send.bitwarden.com/#/x".to_string(),
             deletion_date: "2026-08-18T00:00:00.000Z".to_string(),
             is_file: false,
+            // Live and untouched, so the row derives to Waiting.
+            max_access_count: None,
+            access_count: 0,
+            disabled: false,
+            expiration_date: String::new(),
+            has_password: false,
         }]));
         let (tx, rx): (SendDeleteSender, Receiver<SendDeleteReport>) = mpsc::channel();
         tx.send(report).expect("the receiver is alive");
@@ -33739,11 +34071,16 @@ mod send_delete_wiring {
         // on the frame's own thread. A trailing comment on a code line still
         // reds, deliberately -- see `export_wiring::code_squashed`.
         let squashed = super::export_wiring::code_squashed;
+        // Re-pinned when the row's switch joined the revoke on this worker.
+        // `op` is a `Copy` enum moved into the closure beside the three
+        // values that were already there; nothing else in this body moved,
+        // and in particular the branch on `op` is in `real_send_delete` --
+        // off this thread -- and not here.
         let body = concat!(
             "pub(super) fn spawn_send_", "delete( ctx_for_delete: egui::Context, tx: \
-             SendDeleteSender, session: zeroize::Zeroizing<String>, id: String, name: String, ) \
-             { spawn_send_delete_with(ctx_for_delete, tx, move || { real_send_delete(&id, \
-             &name, &session) }); }"
+             SendDeleteSender, session: zeroize::Zeroizing<String>, id: String, name: String, \
+             op: SendRowOp, ) { spawn_send_delete_with(ctx_for_delete, tx, move || { \
+             real_send_delete(&id, &name, &session, op) }); }"
         );
         assert_eq!(
             squashed(production()).matches(body).count(),
@@ -33826,7 +34163,8 @@ mod send_delete_wiring {
             r"C:\deskwarden-test\first\bw.exe",
         ));
         let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
-        let report = send_delete_thread::real_send_delete(id, "quarterly numbers", SESSION);
+        let report =
+            send_delete_thread::real_send_delete(id, "quarterly numbers", SESSION, SendRowOp::Delete);
         let attempts = probe.attempts();
         drop(probe);
         (report, attempts)
@@ -35111,6 +35449,7 @@ mod frame_env_seam {
         _: zeroize::Zeroizing<String>,
         id: String,
         _: String,
+        _: SendRowOp,
     ) {
         panic!(
             "a test confirmed the revoke of Send {id:?} on a `frame_env_seam::stubbed` \
@@ -35958,6 +36297,7 @@ mod send_create_wiring {
         _: zeroize::Zeroizing<String>,
         id: String,
         _: String,
+        _: SendRowOp,
     ) {
         panic!("a create-side action started a revoke of {id:?}");
     }

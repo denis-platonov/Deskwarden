@@ -73,6 +73,42 @@ pub const TOGGLE_OFF: Color32 = Color32::from_rgb(0xe4, 0xe2, 0xe0);
 /// only where it means something"), so this appears only on actual failures.
 pub const ERROR: Color32 = Color32::from_rgb(0xb4, 0x23, 0x18);
 
+/// The danger wash and its two companions: the ground, edge and ink of any
+/// tinted red surface the design draws (5a's password warning band, 5b's
+/// `Password` chip, 5c's `Revoked` pill, 4b's secret step).
+///
+/// **These three were already in the crate, three times over** --
+/// `preflight_card::SECRET_FILL`/`SECRET_INK`, `scratch_window`'s
+/// `BAND_FILL`/`BAND_EDGE`, `detail_edit`'s `SECRET_STEP_*` -- each a private
+/// copy of the same hex written where it was first needed. They are here now
+/// because [`state_pill`] is a design-system widget and a widget in this file
+/// may not reach into a window's private constants. The three older copies
+/// are deliberately left alone: this pass has no business editing four
+/// unrelated screens, and a fourth private copy would have been the actual
+/// mistake.
+pub const DANGER_WASH: Color32 = Color32::from_rgb(0xfd, 0xf3, 0xf2);
+/// Border of a [`DANGER_WASH`] surface.
+pub const DANGER_EDGE: Color32 = Color32::from_rgb(0xe8, 0xa9, 0xa2);
+/// Text on a [`DANGER_WASH`] surface. Darker than [`ERROR`], which is red on
+/// white; this is red on pink and needs the extra depth to hold its contrast.
+pub const DANGER_INK: Color32 = Color32::from_rgb(0x8c, 0x3c, 0x33);
+
+/// The design's one green, in the same three values.
+///
+/// **Green is as rationed as red.** The design uses it in exactly two places
+/// -- 4d's rehearsal tick and 5b/5c's `Used` pill -- both of which mean "this
+/// finished", never "this is good". `scratch_window::CHECK_GREEN` and
+/// `totp_add::VALID_MARK_INK` are the two existing private copies of
+/// [`DONE_MARK`], left where they are for [`DANGER_WASH`]'s reason.
+pub const DONE_WASH: Color32 = Color32::from_rgb(0xe8, 0xf3, 0xec);
+/// Border of a [`DONE_WASH`] surface.
+pub const DONE_EDGE: Color32 = Color32::from_rgb(0xa9, 0xd2, 0xba);
+/// Text on a [`DONE_WASH`] surface.
+pub const DONE_INK: Color32 = Color32::from_rgb(0x17, 0x67, 0x3a);
+/// The tick itself, one step brighter than [`DONE_INK`] because a 2.4px
+/// stroke at 10px reads lighter than type does at the same value.
+pub const DONE_MARK: Color32 = Color32::from_rgb(0x1b, 0x7a, 0x3f);
+
 // ---------------------------------------------------------------------------
 // Global style
 // ---------------------------------------------------------------------------
@@ -1333,6 +1369,163 @@ fn status_pill_impl(ui: &mut Ui, dot_color: Color32, text: &str, sense: Sense) -
     );
     ui.painter().galley(text_pos, galley, TEXT_SECONDARY);
     response
+}
+
+// ---------------------------------------------------------------------------
+// The state pill (design 5b/5c)
+// ---------------------------------------------------------------------------
+
+/// The leading mark inside a [`state_pill`], or the absence of one.
+///
+/// **The absence is a variant rather than an `Option`**, because the design
+/// uses all three and each means something: a dot for a state that is still
+/// running, a tick for one that completed, and nothing at all for one that
+/// simply ended. A pill drawn with a dot it does not mean is a pill that
+/// claims to be live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PillMark {
+    /// No mark. The label carries the whole meaning.
+    None,
+    /// A filled 5px dot.
+    Dot(Color32),
+    /// The design's tick: `M20 6 9 17l-5-5` at 10px, 2.4px stroke.
+    Check(Color32),
+}
+
+/// The three colours one [`state_pill`] is drawn in, plus its mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PillTone {
+    pub fill: Color32,
+    pub edge: Color32,
+    pub ink: Color32,
+    pub mark: PillMark,
+}
+
+/// Total height of a [`state_pill`].
+///
+/// **20, not 18, and the two are one border apart.** The design declares
+/// `padding: 3px 8px` on a `1px` border, and the page is content-box: the
+/// 10px line box is ~12 tall (the same measurement [`CHIP_HEIGHT`] is built
+/// on), so 12 + 3 + 3 = 18 of content-plus-padding and the border adds one
+/// pixel either side. Writing 18 here would have drawn the design's box minus
+/// its border, which is the exact arithmetic slip this screen has been
+/// re-measured for before.
+pub const PILL_HEIGHT: f32 = 20.0;
+/// Text size inside a [`state_pill`] (5b's list and detail pills;
+/// 5c's legend draws the same pill one point larger and is not a second
+/// component).
+pub const PILL_TEXT_PX: f32 = 10.0;
+/// Horizontal padding **inside the border**, per the design's `padding: 3px
+/// 8px`.
+pub const PILL_PAD_X: f32 = 8.0;
+/// Gap between a [`PillMark`] and the label. The design's `gap: 6px`.
+const PILL_GAP: f32 = 6.0;
+/// The dot's diameter, and the tick's box.
+const PILL_DOT: f32 = 5.0;
+const PILL_CHECK: f32 = 10.0;
+
+/// Width a [`state_pill`] will occupy, without drawing it.
+///
+/// Separate from the painter so a caller laying a row out right-to-left can
+/// reserve the slot before it knows where the slot starts -- which is how
+/// every control on the Sends row is placed, and why none of them can be
+/// pushed off the pane at the minimum window size.
+pub fn state_pill_width(painter: &egui::Painter, tone: PillTone, text: &str) -> f32 {
+    let galley = painter.layout_no_wrap(
+        text.to_string(),
+        FontId::new(PILL_TEXT_PX, FontFamily::Name(BOLD.into())),
+        tone.ink,
+    );
+    let lead = match tone.mark {
+        PillMark::None => 0.0,
+        PillMark::Dot(_) => PILL_DOT + PILL_GAP,
+        PillMark::Check(_) => PILL_CHECK + PILL_GAP,
+    };
+    // `+ 2.0` is the border, which the design's content-box padding excludes.
+    // See [`PILL_HEIGHT`].
+    lead + galley.size().x + PILL_PAD_X * 2.0 + 2.0
+}
+
+/// Paints design 5b's state pill with its left edge at `left_center`, and
+/// hands back the rectangle it covered.
+///
+/// # Why this is not [`status_pill`]
+///
+/// [`status_pill`] is the toolbar readout from design 2b and it differs in
+/// every dimension that matters here: it is 28 tall against this one's 20, it
+/// draws 12px text where this draws 10, it is **unfilled** where every one of
+/// these carries a tinted ground, its border and text colour are fixed by the
+/// design to one grey pair where these vary per state, and its dot is
+/// mandatory -- which is the disqualifying difference, because three of the
+/// design's four Send states carry no dot and one carries a tick instead.
+/// Reaching `status_pill` here would have meant four `Option` parameters on a
+/// widget whose own doc says the dot is "the only thing that varies".
+///
+/// So it is a second pill, and it is in this file rather than in the Sends
+/// screen for the reason the module doc gives: 5b draws it in the list, 5b
+/// draws it again in the detail header, 5d draws it a third time on a record,
+/// and a widget drawn in three places by three screens is the design
+/// language, not one screen's decoration.
+///
+/// **A painter and an anchor, not a `Ui`.** The Sends row places every one of
+/// its cells into an explicit rectangle against a painter, deliberately --
+/// see `send_ui::draw_row` -- because a nested horizontal layout is what has
+/// repeatedly pushed a control off this pane.
+pub fn state_pill(
+    painter: &egui::Painter,
+    left_center: Pos2,
+    tone: PillTone,
+    text: &str,
+) -> Rect {
+    let galley = painter.layout_no_wrap(
+        text.to_string(),
+        FontId::new(PILL_TEXT_PX, FontFamily::Name(BOLD.into())),
+        tone.ink,
+    );
+    let width = state_pill_width(painter, tone, text);
+    let rect = Rect::from_min_size(
+        Pos2::new(left_center.x, left_center.y - PILL_HEIGHT / 2.0),
+        Vec2::new(width, PILL_HEIGHT),
+    );
+    // `border-radius: 999px` on a fixed-height pill is "fully rounded"; half
+    // the height is the largest radius that still reads as a stadium.
+    let rounding = CornerRadius::same((PILL_HEIGHT / 2.0) as u8);
+    painter.rect_filled(rect, rounding, tone.fill);
+    painter.rect_stroke(rect, rounding, Stroke::new(1.0, tone.edge), StrokeKind::Inside);
+
+    let mut x = rect.min.x + 1.0 + PILL_PAD_X;
+    match tone.mark {
+        PillMark::None => {}
+        PillMark::Dot(colour) => {
+            painter.circle_filled(
+                Pos2::new(x + PILL_DOT / 2.0, rect.center().y),
+                PILL_DOT / 2.0,
+                colour,
+            );
+            x += PILL_DOT + PILL_GAP;
+        }
+        PillMark::Check(colour) => {
+            // The design's `M20 6 9 17l-5-5` in a 24-unit box, scaled to
+            // `PILL_CHECK` and centred on the pill's own baseline.
+            let unit = PILL_CHECK / 24.0;
+            let at = |ux: f32, uy: f32| {
+                Pos2::new(x + ux * unit, rect.center().y - PILL_CHECK / 2.0 + uy * unit)
+            };
+            painter.add(egui::Shape::line(
+                vec![at(20.0, 6.0), at(9.0, 17.0), at(4.0, 12.0)],
+                // `stroke-width: 2.4` in the same 24-unit box, so it scales
+                // with the glyph rather than being a second literal.
+                Stroke::new(2.4 * unit, colour),
+            ));
+            x += PILL_CHECK + PILL_GAP;
+        }
+    }
+    painter.galley(
+        Pos2::new(x, rect.center().y - galley.size().y / 2.0),
+        galley,
+        tone.ink,
+    );
+    rect
 }
 
 /// Height of the design's keyboard-hint chips: a 10px monospace line

@@ -15,6 +15,81 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### Your Sends now say what became of them
+
+The Sends screen listed a name, a link and an expiry, and left the question
+people actually have unanswered: *has anyone opened it?* Every Send now
+carries a state, read from what the server was already telling Deskwarden and
+what it used to throw away:
+
+- **Waiting** -- the link works.
+- **Used** -- every view you allowed has been spent, so the link is dead.
+- **Expired** -- it ran out of time.
+- **Revoked** -- you switched it off, and you can switch it back on.
+
+Exactly one of these is shown, even when several are true at once: a Send you
+switched off reads **Revoked** rather than whatever it would have become on its
+own, and one that hit its view limit before it expired reads **Used**.
+
+The line under each name now says what it can: whether the link needs a
+password, how many of its views are left, and when it ends -- and it stops
+promising an expiry once the link is already gone.
+
+### Sends can be switched off without being deleted
+
+**Delete** was the only way to take a link down, and it cannot be undone. Each
+row now also has **Switch off**, which stops the link working and leaves the
+Send where it is -- so you can put it back with **Switch on** when the person
+you sent it to comes back and asks. It takes one click in each direction; the
+two-step confirmation stays where it belongs, on the delete that is permanent.
+
+This one needs Deskwarden's built-in client. Bitwarden's command-line tool has
+no way to switch a Send's link off, so on an account using it the button says
+so and changes nothing rather than pretending.
+
+### Every dialog now closes from its corner
+
+Some cards in Deskwarden carried a **✕** in the corner and some did not, so the
+same reach for the same corner worked on one and did nothing on the next. The
+Preferences card had one; the delete confirmation, the icon picker, the folder
+editor, the discard-changes question and both of the record cards did not.
+
+They all have one now, and it is the same mark everywhere -- the same size, the
+same target, the same distance in from the corner, and the same darkening under
+the pointer. It answers exactly what **Esc** answers on that card and nothing
+else: on the *Discard your changes?* question it means **keep editing**, the
+safe answer, and on the delete confirmation it means cancel. Neither of them can
+be answered destructively by a reflex.
+
+One of these is a fix rather than a tidy-up. The **Import from a Send...** card
+had no way out at all: no Cancel button, no Esc, nothing -- once it was open,
+the only way past it was to finish the import. Its corner mark closes it.
+
+While a card is busy -- a Send being published, a link being fetched -- its mark
+greys out along with its Cancel button, rather than offering a way out of
+something already under way.
+
+### The screen-scan overlay stops flashing a solid screen at you
+
+Choosing **Scan the code on my screen** put a solid rectangle over every monitor
+for well over a second before the dimmed desktop appeared -- black and then
+white, on the machine it was reported from. If the scan found your code you saw
+that as a blink. If it did not, and Deskwarden asked you to drag a box around
+the code yourself, you spent that second looking at a blank screen with nothing
+on it to point at: *"if no QR the screen is pitch black - no way I can guess
+where the QR code is"*.
+
+The dimming was never the problem. Measured against a fixed backdrop, the
+overlay has been letting the desktop through correctly all along, minimised
+window and all. What was wrong is that the window went **on screen** before
+anything had been painted into it and before the compositor had been told to
+honour its transparency. That gap was 1315 milliseconds.
+
+Deskwarden now creates that window hidden, makes it see-through and takes it out
+of screen captures while nobody can see it, and only then puts it on screen. The
+same measurement of the same route, before and after: eighty consecutive samples
+of a solid white screen, then none.
+
 ### Deskwarden gets out of the way while it scans your screen
 
 Choosing **Scan the code on my screen** used to leave the Deskwarden window

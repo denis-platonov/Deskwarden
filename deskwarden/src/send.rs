@@ -1243,6 +1243,189 @@ pub struct SendSummary {
     /// File Sends are listed and can be revoked, but this app cannot create
     /// one; the screen says so rather than pretending they are the same thing.
     pub is_file: bool,
+    /// How many times the link may be opened, or `None` for "as often as the
+    /// recipient likes".
+    ///
+    /// **`Option<u32>` rather than `u32` with `0` meaning unlimited.** Zero is
+    /// a cap a Send can genuinely carry -- it is what `maxAccessCount: 1`
+    /// becomes the moment the one view is spent, and it is what
+    /// [`SendState::Used`] turns on -- so a sentinel here would make "nobody
+    /// may open this" and "anybody may" the same value.
+    pub max_access_count: Option<u32>,
+    /// How many times it already has been opened.
+    pub access_count: u32,
+    /// The owner turned the link off. See [`SendState::Revoked`].
+    ///
+    /// **This is the design's "Revoke", and it is NOT `bw send delete`.** 5b
+    /// lists a revoked Send -- "Atlas Studio - revoked by you - 2 d ago" --
+    /// which a deleted one could not be, because a deleted Send is gone from
+    /// the server and therefore from this list. So the state exists only
+    /// because this flag does.
+    pub disabled: bool,
+    /// When the link stops working, or empty for "it does not, until the
+    /// deletion date".
+    ///
+    /// Distinct from `deletion_date`, and both are read: Bitwarden lets a
+    /// Send stop answering (`expirationDate`) some time before the record
+    /// itself is removed (`deletionDate`), and a screen that read only the
+    /// second would call a dead link live for the gap between them.
+    pub expiration_date: String,
+    /// Whether opening the link needs the share password.
+    ///
+    /// **A `bool`, and the hash it is derived from is not carried.** The
+    /// server returns `password` as the stored hash; that is a credential
+    /// verifier, it has no use in this process, and a field holding it would
+    /// be a third thing this type's hand-written `Debug` had to remember to
+    /// elide. What the screen needs is the one bit.
+    pub has_password: bool,
+}
+
+/// What has become of one Send: design §5c's four states, and only those
+/// four.
+///
+/// # Why this is derived rather than recorded
+///
+/// Nothing in this app writes a Send's state down. Every one of these four is
+/// a reading of fields the server already puts on the wire and this client
+/// used to throw away -- `disabled`, `accessCount`, `maxAccessCount`,
+/// `expirationDate`, `deletionDate` -- so the state cannot drift from the
+/// Send, and there is no fifth "we think it is still live" to go stale.
+///
+/// # The names are the design's, and one of them is not what it sounds like
+///
+/// **`Revoked` means `disabled`, NOT deleted.** 5b lists a revoked Send in
+/// among the live ones ("Atlas Studio - revoked by you - 2 d ago"), which a
+/// deleted Send could never be: `bw send delete` removes the record, and a
+/// removed record is not in the list to carry a pill. So the state that
+/// exists here is the one the `disabled` flag describes, and the row that
+/// carries it can be turned back on. See [`SendSummary::disabled`].
+///
+/// **`Waiting` means "the link is live", not "nobody has opened it".** 5c's
+/// gloss says the latter, and 5b's own second row contradicts it: "3 of 10
+/// views - 6 d left" is drawn `Waiting`. The gloss describes the common case;
+/// the rule is the one that makes the four states total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendState {
+    /// The link works. Somebody may or may not have opened it already.
+    Waiting,
+    /// Every permitted view is spent. The link is dead and no date will
+    /// revive it.
+    Used,
+    /// Out of time -- past the expiry the owner set, or past the deletion
+    /// date the server holds it to.
+    Expired,
+    /// The owner turned it off. The one state a person caused, and the one
+    /// state that can be undone.
+    Revoked,
+}
+
+/// [`SendState`] for one row, at one instant.
+///
+/// # The precedence, and why it is this order
+///
+/// Several of the four can be true of one Send at once -- a disabled Send
+/// that is also out of views, an exhausted Send that has also expired -- so
+/// the order below is the whole of the answer, and it is deliberate:
+///
+/// 1. **`Revoked` first, over everything.** It is the only state a person
+///    caused, the only one that is news, and the only one with an action
+///    behind it: a revoked Send can be switched back on, and the row
+///    re-derives to whatever it then is. The argument against -- that
+///    switching a used-up Send back on will not make it openable, so `Used`
+///    is the more useful warning -- is real, and it is answered one state
+///    later rather than here: the moment the owner re-enables it the row says
+///    `Used`, which is the same warning at the moment it is actionable. What
+///    the other order would cost is worse: a link the owner deliberately
+///    pulled back would be described by a state nobody chose.
+///
+/// 2. **`Used` over `Expired`.** 5c's own subtitle says the question people
+///    actually have is whether it was used, and "views exhausted" answers it
+///    where "ran out of time" does not. A Send that hit its cap and then
+///    expired was ended by the cap; the expiry that arrived afterwards
+///    changed nothing about it.
+///
+/// 3. **`Expired` over `Waiting`**, which is not a choice so much as the
+///    definition of `Waiting`.
+///
+/// # What "out of time" reads
+///
+/// **Both dates, and either one is enough.** `expiration_date` is when the
+/// link stops answering and `deletion_date` is when the record goes; Bitwarden
+/// allows a gap between them, and a client that read only the second would
+/// paint `Waiting` on a link that already 404s for the whole of that gap. An
+/// empty or unparseable date is *not* treated as passed -- `expiry_words` has
+/// carried that rule since the Sends screen shipped, for the reason it gives:
+/// this app failing to understand a date is not the same fact as the link
+/// being dead, and guessing the safe-sounding one of those is how a live
+/// public link comes to be ignored.
+///
+/// A cap of `Some(0)` counts as exhausted, which is arithmetic rather than a
+/// special case: `0 >= 0`.
+pub fn send_state(send: &SendSummary, now: &dyn SendClock) -> SendState {
+    if send.disabled {
+        return SendState::Revoked;
+    }
+    if let Some(cap) = send.max_access_count {
+        if send.access_count >= cap {
+            return SendState::Used;
+        }
+    }
+    let at = now.now_unix_millis();
+    let passed = |date: &str| parse_iso_utc_millis(date).is_some_and(|when| when <= at);
+    if passed(&send.expiration_date) || passed(&send.deletion_date) {
+        return SendState::Expired;
+    }
+    SendState::Waiting
+}
+
+/// `2026-08-18T00:43:17.148Z` to milliseconds since the Unix epoch, or `None`
+/// if it is not that shape.
+///
+/// **This was `vault_window::send_ui`'s, and it moved here rather than being
+/// copied.** [`send_state`] has to compare two dates against a clock and it
+/// lives beside the type those dates are fields of; the screen's
+/// `expiry_words` has to do the same thing with the same bytes. Two parsers
+/// agreeing by coincidence is the shape this file already refused once -- see
+/// [`lifetime_label`], moved here for the same reason -- so `send_ui`
+/// re-exports this one instead of keeping its own.
+///
+/// Hand-written rather than a new dependency: this is the only date this app
+/// parses, the format is fixed by the server and by the CLI that both emit
+/// it, and `chrono` is a large surface to add for one field. The fractional
+/// part is optional and skipped rather than added -- a Send's lifetime is
+/// measured in days and no wording turns on a millisecond.
+pub fn parse_iso_utc_millis(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let bytes = text.as_bytes();
+    // The fixed prefix is exactly `YYYY-MM-DDTHH:MM:SS`, 19 bytes.
+    if bytes.len() < 19 {
+        return None;
+    }
+    let num = |from: usize, to: usize| -> Option<i64> { text.get(from..to)?.parse::<i64>().ok() };
+    let sep = |at: usize, want: u8| -> Option<()> { (bytes[at] == want).then_some(()) };
+    sep(4, b'-')?;
+    sep(7, b'-')?;
+    sep(10, b'T')?;
+    sep(13, b':')?;
+    sep(16, b':')?;
+    let year = num(0, 4)?;
+    let month = num(5, 7)?;
+    let day = num(8, 10)?;
+    let hour = num(11, 13)?;
+    let minute = num(14, 16)?;
+    let second = num(17, 19)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // `crate::local_time`'s own, which is the exact inverse of the
+    // `civil_from_days` this file already calls for the other direction. A
+    // third copy of Howard Hinnant's arithmetic was what moving this here
+    // deleted.
+    let days = crate::local_time::days_from_civil(year, month as u32, day as u32);
+    Some(((days * 24 + hour) * 60 + minute) * 60_000 + second * 1_000)
 }
 
 /// Stands in for an `access_url` in a `Debug`.
@@ -1306,6 +1489,15 @@ impl std::fmt::Debug for SendSummary {
             .field("access_url", &ElidedAccessUrl)
             .field("deletion_date", &self.deletion_date)
             .field("is_file", &self.is_file)
+            // The six added by the states pass. Every one of them is a count,
+            // a flag or a date -- nothing here is a credential, and the one
+            // field that WAS (`password`, the server's stored hash) is
+            // deliberately not on this type at all; see `has_password`.
+            .field("max_access_count", &self.max_access_count)
+            .field("access_count", &self.access_count)
+            .field("disabled", &self.disabled)
+            .field("expiration_date", &self.expiration_date)
+            .field("has_password", &self.has_password)
             .finish()
     }
 }
@@ -1499,6 +1691,18 @@ fn unwrap_envelope(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// A non-negative count, or `None` for absent, `null` or a value that is not
+/// one.
+///
+/// **A negative or oversized number is `None`, not a clamp.** These two
+/// fields decide whether a link is dead; a `-1` silently read as `0` would
+/// make an uncapped Send look exhausted, and this app not understanding the
+/// answer is the case [`SendState`]'s own date rule already refuses to guess
+/// at.
+fn count_field(obj: &serde_json::Value, key: &str) -> Option<u32> {
+    obj.get(key).and_then(serde_json::Value::as_u64).and_then(|n| u32::try_from(n).ok())
+}
+
 fn string_field(obj: &serde_json::Value, key: &str) -> Option<String> {
     obj.get(key)
         .and_then(serde_json::Value::as_str)
@@ -1557,6 +1761,21 @@ pub fn parse_send_list(stdout: &str) -> Result<Vec<SendSummary>, SendError> {
             access_url,
             deletion_date: string_field(row, "deletionDate").unwrap_or_default(),
             is_file,
+            // **The state fields are read leniently, unlike `id` and
+            // `accessUrl` above.** A row missing one of those cannot be shown
+            // or revoked and is a parse failure; a row missing one of these
+            // can still be drawn, and the state it derives to is the one its
+            // absence means -- no cap, never opened, not disabled, no
+            // expiry, no password. `bw send list` has emitted all five for
+            // years, but an older `bw` that omits one must list its Sends
+            // rather than refuse the whole account over a badge.
+            max_access_count: count_field(row, "maxAccessCount"),
+            access_count: count_field(row, "accessCount").unwrap_or(0),
+            disabled: row.get("disabled").and_then(serde_json::Value::as_bool).unwrap_or(false),
+            expiration_date: string_field(row, "expirationDate").unwrap_or_default(),
+            // The hash is looked at and never kept; see
+            // `SendSummary::has_password`.
+            has_password: string_field(row, "password").is_some(),
         });
     }
     Ok(out)
@@ -4542,6 +4761,11 @@ mod tests {
         "text": { "text": "hunter2", "hidden": true },
         "file": null,
         "deletionDate": "2026-08-18T00:43:17.148Z",
+        "maxAccessCount": 10,
+        "accessCount": 3,
+        "disabled": false,
+        "expirationDate": "2026-08-17T00:00:00.000Z",
+        "password": "b64hash==",
         "somethingNew": 42
       },
       {
@@ -4584,6 +4808,11 @@ mod tests {
             access_url: "https://send.bitwarden.com/#abcdefghijklmnop/somekeyhere".to_string(),
             deletion_date: "2026-08-17T14:20:00.000Z".to_string(),
             is_file: false,
+            max_access_count: Some(1),
+            access_count: 1,
+            disabled: false,
+            expiration_date: "2026-08-17T14:20:00.000Z".to_string(),
+            has_password: true,
         };
         let created = CreatedSend {
             id: "abc".to_string(),
@@ -4713,10 +4942,191 @@ mod tests {
                 access_url: "https://send.bitwarden.com/#aaaa/key1".to_string(),
                 deletion_date: "2026-08-18T00:43:17.148Z".to_string(),
                 is_file: false,
+                max_access_count: Some(10),
+                access_count: 3,
+                disabled: false,
+                expiration_date: "2026-08-17T00:00:00.000Z".to_string(),
+                has_password: true,
             }
         );
         assert!(rows[1].is_file, "a file Send was listed as a text Send");
         assert_eq!(rows[1].name, "Scan.pdf");
+
+        // **The second row carries none of the five state keys, and that is
+        // the point of it.** Every absence reads as the thing its absence
+        // means -- no cap, never opened, not disabled, no expiry, no password
+        // -- rather than as a reason to refuse the account's whole list. An
+        // older `bw` that omits one of these must still list Sends; see
+        // `parse_send_list`.
+        assert_eq!(rows[1].max_access_count, None);
+        assert_eq!(rows[1].access_count, 0);
+        assert!(!rows[1].disabled);
+        assert_eq!(rows[1].expiration_date, "");
+        assert!(!rows[1].has_password);
+    }
+
+    // -- the four states, and which one wins ------------------------------
+
+    /// A live, uncapped, unexpired Send at [`STATE_NOW`], to be spoiled one
+    /// field at a time. Everything below is `SendSummary { .., ..waiting() }`
+    /// so that each case names only the fact it is about.
+    fn waiting() -> SendSummary {
+        SendSummary {
+            id: "the-id".to_string(),
+            name: "SAP Production".to_string(),
+            access_url: "https://send.example.invalid/#a/b".to_string(),
+            // A week after `STATE_NOW`.
+            deletion_date: "2026-08-17T00:00:00.000Z".to_string(),
+            is_file: false,
+            max_access_count: None,
+            access_count: 0,
+            disabled: false,
+            expiration_date: String::new(),
+            has_password: false,
+        }
+    }
+
+    /// 2026-08-10T00:00:00Z, the same instant `send_ui`'s fixtures use, so a
+    /// reader moving between the two files is reading one clock.
+    const STATE_NOW: FixedClock = FixedClock(1_786_320_000_000);
+
+    #[test]
+    fn a_live_send_is_waiting_whether_or_not_anyone_has_opened_it() {
+        assert_eq!(send_state(&waiting(), &STATE_NOW), SendState::Waiting);
+        // **The design's own second row.** 5b draws "3 of 10 views - 6 d
+        // left" as `Waiting`, which is what makes 5c's gloss ("nobody has
+        // opened it") an illustration rather than the rule. A derivation that
+        // read the gloss literally would call this one `Used`.
+        assert_eq!(
+            send_state(
+                &SendSummary { max_access_count: Some(10), access_count: 3, ..waiting() },
+                &STATE_NOW
+            ),
+            SendState::Waiting
+        );
+    }
+
+    #[test]
+    fn a_send_is_used_the_moment_its_last_permitted_view_is_spent() {
+        for (why, access_count) in [("exactly the cap", 1u32), ("somehow past it", 2)] {
+            assert_eq!(
+                send_state(
+                    &SendSummary { max_access_count: Some(1), access_count, ..waiting() },
+                    &STATE_NOW
+                ),
+                SendState::Used,
+                "{why}"
+            );
+        }
+        // A cap of zero is exhausted by arithmetic and not by a special case.
+        assert_eq!(
+            send_state(
+                &SendSummary { max_access_count: Some(0), access_count: 0, ..waiting() },
+                &STATE_NOW
+            ),
+            SendState::Used
+        );
+    }
+
+    #[test]
+    fn either_date_can_end_a_send_and_a_date_this_app_cannot_read_ends_nothing() {
+        let past = "2026-08-09T23:59:59.000Z".to_string();
+        assert_eq!(
+            send_state(&SendSummary { deletion_date: past.clone(), ..waiting() }, &STATE_NOW),
+            SendState::Expired
+        );
+        // **The expiry alone is enough**, with the deletion date still a week
+        // out. This is the gap Bitwarden allows between "the link stops
+        // answering" and "the record goes", and a client that read only
+        // `deletionDate` would paint `Waiting` over a link that already 404s.
+        assert_eq!(
+            send_state(&SendSummary { expiration_date: past, ..waiting() }, &STATE_NOW),
+            SendState::Expired
+        );
+        // The boundary is inclusive: the instant it expires, it has.
+        assert_eq!(
+            send_state(
+                &SendSummary {
+                    expiration_date: "2026-08-10T00:00:00.000Z".to_string(),
+                    ..waiting()
+                },
+                &STATE_NOW
+            ),
+            SendState::Expired
+        );
+        // And a date this app cannot parse is **not** a date that has passed.
+        // `expiry_words` has carried this rule since the screen shipped: not
+        // understanding a date is not the same fact as the link being dead,
+        // and guessing the safe-sounding one is how a live public link comes
+        // to be ignored.
+        for unreadable in ["", "not a date", "2026-08-09", "2026-13-09T00:00:00Z"] {
+            assert_eq!(
+                send_state(
+                    &SendSummary { expiration_date: unreadable.to_string(), ..waiting() },
+                    &STATE_NOW
+                ),
+                SendState::Waiting,
+                "{unreadable:?} was read as an expiry that has passed"
+            );
+        }
+    }
+
+    /// **The whole of the precedence, in the cases where more than one state
+    /// is true at once.** See [`send_state`] for the argument; this is the
+    /// argument as assertions, and it is the part of this derivation most
+    /// likely to be quietly reordered by someone adding a fifth state.
+    #[test]
+    fn when_several_states_are_true_at_once_exactly_one_of_them_wins() {
+        let exhausted = SendSummary { max_access_count: Some(1), access_count: 1, ..waiting() };
+        let expired =
+            SendSummary { deletion_date: "2026-08-09T00:00:00.000Z".to_string(), ..waiting() };
+
+        // Revoked over everything: it is the only state a person caused.
+        assert_eq!(
+            send_state(&SendSummary { disabled: true, ..exhausted.clone() }, &STATE_NOW),
+            SendState::Revoked,
+            "a disabled Send that is also out of views reported as Used, so the row would not \
+             say that the owner is the one who ended it"
+        );
+        assert_eq!(
+            send_state(&SendSummary { disabled: true, ..expired.clone() }, &STATE_NOW),
+            SendState::Revoked
+        );
+
+        // Used over Expired: the cap is what ended it, and the expiry that
+        // arrived afterwards changed nothing about it.
+        assert_eq!(
+            send_state(
+                &SendSummary {
+                    max_access_count: Some(1),
+                    access_count: 1,
+                    deletion_date: "2026-08-09T00:00:00.000Z".to_string(),
+                    ..waiting()
+                },
+                &STATE_NOW
+            ),
+            SendState::Used,
+            "an exhausted Send that has since expired reported as Expired, which answers a \
+             question nobody asked in place of the one 5c says they do"
+        );
+
+        // Controls: each of the two is really in the state the case above
+        // claims it was overridden out of.
+        assert_eq!(send_state(&exhausted, &STATE_NOW), SendState::Used);
+        assert_eq!(send_state(&expired, &STATE_NOW), SendState::Expired);
+    }
+
+    #[test]
+    fn a_negative_or_oversized_count_is_unknown_rather_than_clamped_to_zero() {
+        // `-1` read as `0` would make an uncapped Send look exhausted, which
+        // is a dead pill on a live link.
+        let rows = parse_send_list(
+            r#"[{"id":"x","accessUrl":"https://x/#a/b","maxAccessCount":-1,"accessCount":-5}]"#,
+        )
+        .expect("a row with nonsense counts is still a showable row");
+        assert_eq!(rows[0].max_access_count, None);
+        assert_eq!(rows[0].access_count, 0);
+        assert_eq!(send_state(&rows[0], &STATE_NOW), SendState::Waiting);
     }
 
     #[test]
