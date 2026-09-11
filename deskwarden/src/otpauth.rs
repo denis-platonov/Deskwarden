@@ -128,7 +128,10 @@ impl fmt::Debug for OtpAuth {
 ///
 /// Holds no [`Zeroizing`] and no fragment of a seed -- [`Self::BadSecret`]
 /// deliberately carries nothing, because the thing that was wrong with it is
-/// the thing that must not be printed.
+/// the thing that must not be printed. [`Self::PartialSecret`] carries a
+/// **count** and no characters, which is the same rule kept: how long a seed
+/// is, is already on screen under the field the user typed it into; what is
+/// *in* it is not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OtpRefusal {
     /// Not an `otpauth://` URI at all -- a plain URL, or plain text.
@@ -140,6 +143,19 @@ pub enum OtpRefusal {
     NoSecret,
     /// A `secret` that is not base32.
     BadSecret,
+    /// A `secret` whose every character is base32 and whose **length cannot
+    /// decode**. Carries that length, in characters.
+    ///
+    /// Its own variant rather than a shade of [`Self::BadSecret`], because the
+    /// two send the reader to look at completely different things. "One of
+    /// those characters is not base32" is answered by hunting for the `0` that
+    /// should have been an `O`; "that many characters do not make whole bytes"
+    /// is answered by counting, and by noticing the character that was dropped
+    /// or doubled while copying. One sentence covering both would name neither,
+    /// which is the generic refusal this enum exists to avoid.
+    ///
+    /// See [`decodes_to_whole_bytes`] for which lengths those are and why.
+    PartialSecret(usize),
     /// A query parameter this module does not know. Carries the key **as it
     /// was written**, so the sentence can name it.
     UnknownParameter(String),
@@ -432,6 +448,36 @@ fn hex_pair(hex: &str) -> Option<u8> {
 /// The base32 alphabet, RFC 4648, uppercase. No `0`, `1` or `8`.
 const BASE32_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
+/// Whether `chars` base32 characters decode to a **whole number of bytes**.
+///
+/// Base32 packs **five bits into every character**, and bytes are eight, so
+/// the two only line up once every forty bits -- a group of **eight
+/// characters, five bytes**. An unpadded seed is some number of whole groups
+/// plus a prefix of one more, and only five prefixes carry whole bytes:
+///
+/// ```text
+///  chars mod 8  0    2    4    5    7      1     3     6
+///  bits         0   10   20   25   35      5    15    30
+///  bytes        0    1    2    3    4    0+5b  1+7b  3+6b
+/// ```
+///
+/// The three on the right are not seeds that a decoder is being fussy about;
+/// they are **impossible**. Three base32 characters are fifteen bits, which is
+/// one byte and seven bits of a byte that was never typed, and no amount of
+/// goodwill about the characters themselves recovers it. The reason this went
+/// unnoticed for so long is that `normalise_secret` only ever asked whether
+/// each character was in the alphabet -- a question `asd` answers yes to --
+/// and never asked whether the run of them was a length that could exist.
+///
+/// **This is a structural rule and not a length policy.** It says nothing
+/// about how *much* seed is enough; RFC 4226 recommends 128 bits and this
+/// function is happy with two characters, because a short seed from some
+/// issuer is that issuer's decision to make and refusing it would be this
+/// crate's. What it refuses is a length that does not decode at all.
+fn decodes_to_whole_bytes(chars: usize) -> bool {
+    matches!(chars % 8, 0 | 2 | 4 | 5 | 7)
+}
+
 /// Normalises a `secret` parameter value, or refuses it.
 ///
 /// Uppercased, spaces and hyphens dropped (sites print the seed in groups of
@@ -439,6 +485,16 @@ const BASE32_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 /// entirely base32; anything else is [`OtpRefusal::BadSecret`], and the
 /// refusal carries **nothing** of what was wrong, because the thing that was
 /// wrong is the thing that must not be printed.
+///
+/// **And what is left must be a length that decodes.** Every character being
+/// in the alphabet is necessary and not sufficient: `ASD` is three good
+/// characters and fifteen bits, which is a byte and seven bits over, so it is
+/// not a seed and cannot be made into one. That is
+/// [`OtpRefusal::PartialSecret`] -- see [`decodes_to_whole_bytes`]. The order
+/// matters and is the one below: a string with a `0` in it is reported as the
+/// bad character it has rather than as a length, because fixing the character
+/// is what the reader has to do first and the length may well be right once
+/// they have.
 ///
 /// Both allocations are made once at an exact upper bound, for
 /// [`percent_decoded`]'s reason.
@@ -459,6 +515,12 @@ fn normalise_secret(raw: &str) -> Result<Zeroizing<String>, OtpRefusal> {
     }
     if out.is_empty() {
         return Err(OtpRefusal::NoSecret);
+    }
+    // `out` is ASCII by construction -- every character in it came out of
+    // `BASE32_ALPHABET` -- so `len()` is the character count the sentence
+    // wants, and not a byte count that would differ.
+    if !decodes_to_whole_bytes(out.len()) {
+        return Err(OtpRefusal::PartialSecret(out.len()));
     }
     Ok(out)
 }
@@ -646,6 +708,74 @@ mod tests {
         // Control: the valid one really does parse, so the refusal is about
         // the secret and not about the URI shape.
         assert!(parse_otpauth("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP").is_ok());
+        // A BAD CHARACTER is reported ahead of a bad length, and both are
+        // wrong with `JBSWY3DP01`: ten characters, and `0` and `1` are not in
+        // the alphabet. The reader has to fix the characters before the length
+        // means anything, so that is what the refusal names.
+        assert_eq!(
+            parse_otpauth("otpauth://totp/x?secret=AB0"),
+            Err(OtpRefusal::BadSecret),
+            "a length refusal shadowed a character that is not base32"
+        );
+    }
+
+    /// **`asd` is not a seed**, and neither is any other run of good base32
+    /// characters whose length cannot decode.
+    ///
+    /// The reported defect: three characters, every one of them in the
+    /// alphabet, and the line beneath the field answered with a green check.
+    /// Base32 is five bits a character, so three of them are fifteen bits --
+    /// one byte and seven bits of a byte that was never typed.
+    #[test]
+    fn a_secret_whose_length_cannot_decode_is_its_own_refusal() {
+        assert_eq!(
+            parse_otpauth("otpauth://totp/x?secret=asd"),
+            Err(OtpRefusal::PartialSecret(3)),
+            "the reported defect: `asd` was accepted as a one-time code secret"
+        );
+
+        // Every residue that cannot decode, at the bottom of the range and one
+        // whole group up, so the rule is the `% 8` it claims to be rather than
+        // three special cases.
+        for chars in [1usize, 3, 6, 9, 11, 14] {
+            let uri = format!("otpauth://totp/x?secret={}", "A".repeat(chars));
+            assert_eq!(
+                parse_otpauth(&uri),
+                Err(OtpRefusal::PartialSecret(chars)),
+                "{chars} base32 characters are {} bits, which is not whole bytes",
+                chars * 5
+            );
+        }
+
+        // Paired, and this is the half that stops the rule becoming a
+        // minimum length: every OTHER residue is accepted, including the very
+        // short ones. Two characters are ten bits, which is one whole byte and
+        // two bits of padding, and that is a decodable seed however unwise a
+        // one-byte seed would be. Refusing it is a product decision nobody
+        // asked for.
+        for chars in [2usize, 4, 5, 7, 8, 10, 12, 13, 15, 16] {
+            let uri = format!("otpauth://totp/x?secret={}", "A".repeat(chars));
+            assert!(
+                parse_otpauth(&uri).is_ok(),
+                "{chars} base32 characters decode to whole bytes and were refused anyway"
+            );
+        }
+
+        // The count is of what SURVIVES normalising, not of what was typed:
+        // the separators a site prints between groups are dropped before the
+        // length is judged, so `AB C` is three characters and not four.
+        assert_eq!(
+            parse_otpauth("otpauth://totp/x?secret=AB%20C"),
+            Err(OtpRefusal::PartialSecret(3))
+        );
+        assert_eq!(
+            parse_otpauth("otpauth://totp/x?secret=A-B-C%3D%3D"),
+            Err(OtpRefusal::PartialSecret(3))
+        );
+        // ...and dropping them can make a length WORK, which is the same fact
+        // seen from the other side: `JBSW Y3DP` is nine characters written and
+        // eight base32 ones.
+        assert!(parse_otpauth("otpauth://totp/x?secret=JBSW%20Y3DP").is_ok());
     }
 
     #[test]
@@ -990,6 +1120,20 @@ mod tests {
         assert_eq!(refusal, OtpRefusal::BadSecret);
         let printed = format!("{refusal:?}");
         assert!(!printed.contains("JBSWY"), "{printed}");
+
+        // `PartialSecret` is the one refusal that carries a number derived
+        // from the seed, and the number is its LENGTH -- which the field's own
+        // validity line prints for every accepted secret anyway. What it must
+        // not carry is any of the characters, and this is a seed made entirely
+        // of a distinctive run so that a leak of even one of them shows.
+        let partial = parse_otpauth("otpauth://totp/x?secret=JBSWY3").unwrap_err();
+        assert_eq!(partial, OtpRefusal::PartialSecret(6));
+        let printed = format!("{partial:?}");
+        assert!(!printed.contains("JBSW"), "{printed}");
+        assert!(!printed.to_ascii_uppercase().contains("JBSW"), "{printed}");
+        // ...and not a prefix of it either, down to the first character.
+        assert!(!printed.contains('J'), "{printed}");
+
         // Paired: `UnknownParameter` DOES carry text, and it is the key, which
         // is not a secret -- so the absence above is a decision, not an
         // accident of the enum having no data anywhere.

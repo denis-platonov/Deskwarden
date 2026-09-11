@@ -957,6 +957,9 @@ pub fn validity_line(reading: &Reading) -> Option<String> {
 /// Carries **nothing of the secret** in any arm --
 /// [`OtpRefusal::BadSecret`] deliberately holds nothing, because what was
 /// wrong with it is the thing that must not be printed.
+/// [`OtpRefusal::PartialSecret`] holds a character count, which
+/// [`validity_line`] prints for every *accepted* secret anyway: a length is
+/// not a seed, and here it is the whole diagnosis.
 pub fn refusal_sentence(refusal: &OtpRefusal) -> String {
     match refusal {
         OtpRefusal::NotOtpAuth => {
@@ -975,6 +978,17 @@ pub fn refusal_sentence(refusal: &OtpRefusal) -> String {
              digits 2\u{2013}7; spaces and hyphens are ignored."
                 .to_string()
         }
+        // The characters are all fine, so saying anything about the alphabet
+        // here would send the reader hunting for a bad one that is not there.
+        // What is wrong is the count, so the count is what this names -- and a
+        // length in this class is always exactly one character away from one
+        // that works, in either direction, which is the thing worth telling
+        // someone who has just copied a seed off a card by eye.
+        OtpRefusal::PartialSecret(characters) => format!(
+            "Those are all base32 characters, but a secret cannot be {characters} of them. \
+             Base32 packs five bits into each character, so a run of that length stops part-way \
+             through a byte \u{2014} a character is missing, or one has been copied twice."
+        ),
         OtpRefusal::UnknownParameter(key) => format!(
             "That URI carries a parameter Deskwarden does not know: {key}. It is refused rather \
              than ignored, because a code saved from it would be wrong and nothing on screen \
@@ -1407,11 +1421,16 @@ impl TotpAdd {
     /// **A decoded payload becomes what is in the field.**
     ///
     /// The scanned routes do not get a confirmation card of their own: the
-    /// decoded URI is put in [`Self::typed`], and 6d's field, its validity
-    /// line and 6c's confirmation then say the same things about it that they
-    /// say about a pasted one. That is what makes "the same 6c confirmation"
-    /// true rather than merely intended -- there is one card, drawn by one
+    /// decoded URI is put in [`Self::typed`] and read by the same
+    /// [`read_field`] a pasted one is, so there is one card, drawn by one
     /// function, from one string.
+    ///
+    /// **[`Self::scanned`] is what that one card branches on**, in the two
+    /// places where the two routes are genuinely different surfaces: the
+    /// decoded URI is not put in a `TextEdit` (see [`CODE_READ_LABEL`]), and
+    /// 6c's heading and its field table are drawn only here (see
+    /// [`draw_confirmation`]). Both differences are about a payload no human
+    /// read -- which is exactly what this flag means.
     ///
     /// It also means a hostile QR is refused by exactly the sentence a hostile
     /// paste is: [`parse_otpauth`] is the only validator either reaches.
@@ -4148,19 +4167,55 @@ const PARAM_CHIP_GAP: f32 = 7.0;
 /// parameters (6d's own digit and period controls are the live version of
 /// that, a few rows up, and they already go dead when a pasted URI has spoken
 /// for them).
+///
+/// # 6c's heading and its table belong to the SCANNED path only
+///
+/// Fusing 6c into this card was the right call for a payload that was
+/// **scanned**: the whole point of a confirmation there is checking the issuer
+/// and the account against what the site displayed, because nobody read the
+/// QR -- a decoder did, and the user has no other view of what it said.
+///
+/// None of that is true of a secret the user **typed**. The rows would be
+/// their own keystrokes read back to them a few pixels below the box they are
+/// still in, which is not a check: there is no second source to disagree with.
+/// Design 6d draws the field, the validity line, the two parameter controls
+/// and the live-code panel, and stops -- so on the typed path, so does this.
+///
+/// **The live-code panel stays on both**, and is the one part of 6c that was
+/// never really 6c's to begin with: it is in 6d's own mockup, and it is the
+/// only check on this card that has a second source to be checked against --
+/// the code the site is showing at that moment. Comparing those two is what
+/// tells a user their seed is right; the rows never could.
+///
+/// The caution band for a record that already has a code is **not** part of
+/// this and is not drawn here anyway (see [`draw_add_form`]). It is a warning
+/// about what saving will destroy, not a field restating an input, and 6d's
+/// mockup simply has no record behind it with a code to lose.
 fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now_unix: u64) {
-    ui.label(egui::RichText::new(CONFIRM_HEADING).size(12.0).color(theme::INK).strong());
-    ui.add_space(6.0);
+    // Read out before `state` is lent to the table below.
+    let scanned = state.scanned;
+
+    if scanned {
+        ui.label(egui::RichText::new(CONFIRM_HEADING).size(12.0).color(theme::INK).strong());
+        ui.add_space(6.0);
+    }
 
     // The live code first: it is what the user is here to compare, and a
     // confirmation that buries it under four label rows is a confirmation
-    // nobody makes.
+    // nobody makes. On the typed path it is the only thing here.
     if let Some(code) = code_at(auth, now_unix) {
         draw_code_panel(ui, auth, &code, now_unix);
-        ui.add_space(CONFIRM_GAP);
+        // The gap is the one BETWEEN the panel and the table, so it goes
+        // wherever the table does. Left in on the typed path it would be a
+        // stripe of nothing above the footer.
+        if scanned {
+            ui.add_space(CONFIRM_GAP);
+        }
     }
 
-    draw_field_table(ui, auth, state);
+    if scanned {
+        draw_field_table(ui, auth, state);
+    }
 }
 
 /// **6c's live-code panel.** The label and the code down the left, the
@@ -4705,6 +4760,7 @@ mod tests {
             OtpRefusal::NotTotp,
             OtpRefusal::NoSecret,
             OtpRefusal::BadSecret,
+            OtpRefusal::PartialSecret(3),
             OtpRefusal::UnknownParameter("surprise".to_string()),
             OtpRefusal::BadParameter("period"),
             OtpRefusal::TooLong,
@@ -4725,6 +4781,71 @@ mod tests {
                 .contains("surprise")
         );
         assert!(refusal_sentence(&OtpRefusal::BadParameter("period")).contains("period"));
+        // Same, for the one other variant that carries something: the count,
+        // which is the whole diagnosis and the only part of a seed this app
+        // ever says out loud.
+        assert!(refusal_sentence(&OtpRefusal::PartialSecret(3)).contains('3'));
+    }
+
+    /// **The reported defect, at the surface the owner saw it on.**
+    ///
+    /// `asd` in 6d's field answered "Valid base32 · 3 characters · spaces
+    /// ignored", with a green check, for a string that is fifteen bits and
+    /// cannot decode to bytes. The line under the field now says why instead.
+    #[test]
+    fn three_good_characters_are_not_a_valid_secret() {
+        let Reading::Refused(refusal) = read_field("asd", 6, 30) else {
+            panic!("`asd` was accepted as a one-time code secret");
+        };
+        assert_eq!(refusal, OtpRefusal::PartialSecret(3));
+
+        // The line under the field is the refusal and not the green one. This
+        // is the assertion with the teeth in it: the bug was visible entirely
+        // through `validity_line`.
+        let line = validity_line(&read_field("asd", 6, 30)).expect("a typed field says something");
+        assert!(!line.contains("Valid base32"), "the green line survived: {line}");
+        assert!(line.contains('3'), "the line does not say how long it is: {line}");
+
+        // The sentence sends the reader to the LENGTH and not to the alphabet.
+        // Telling someone whose characters are all fine to check their
+        // characters is the generic refusal this module exists to avoid.
+        assert!(
+            !line.contains("A\u{2013}Z"),
+            "the length refusal borrowed the bad-character sentence: {line}"
+        );
+        assert_ne!(line, refusal_sentence(&OtpRefusal::BadSecret));
+
+        // Paired: `Valid base32 · N characters` is still design 6d's line for
+        // a secret that IS one, so nothing above is a wholesale removal of it.
+        let good = validity_line(&read_field("JBSW Y3DP EHPK 3PXP", 6, 30)).expect("a line");
+        assert!(good.starts_with("Valid base32"), "{good}");
+        assert!(good.contains("16 characters"), "{good}");
+    }
+
+    /// The new refusal never becomes a **minimum length**, which is a product
+    /// decision nobody asked for and which would refuse a legitimate short
+    /// seed from some issuer outright.
+    ///
+    /// Four characters are twenty bits -- two whole bytes and a nibble of
+    /// padding -- and are accepted, as they were before. What changed is only
+    /// which lengths *cannot exist*.
+    #[test]
+    fn a_short_secret_that_decodes_is_still_accepted() {
+        for typed in ["AB", "ABCD", "ABCDE", "ABCDEFG"] {
+            assert!(
+                matches!(read_field(typed, 6, 30), Reading::Ok(_)),
+                "a {}-character secret that decodes was refused",
+                typed.len()
+            );
+        }
+        // Paired, so the loop above is not vacuous: the neighbours of those
+        // lengths that do NOT decode are refused, at the same surface.
+        for (typed, chars) in [("A", 1usize), ("ABC", 3), ("ABCDEF", 6)] {
+            assert!(
+                matches!(read_field(typed, 6, 30), Reading::Refused(OtpRefusal::PartialSecret(n)) if n == chars),
+                "a {chars}-character secret that cannot decode was accepted"
+            );
+        }
     }
 
     #[test]
@@ -5059,8 +5180,12 @@ mod tests {
 
     #[test]
     fn the_confirmation_paints_the_live_code_the_countdown_and_the_parameters() {
+        // **A SCANNED card**, because 6c's heading and its field table are the
+        // scanned path's -- see `draw_confirmation`. The rows exist to be
+        // checked against what the site displayed, and a decoder is the only
+        // reader a scanned payload has had.
         let mut state = TotpAdd::opening("id-1", "Git Host", false);
-        state.typed = Zeroizing::new(UNUSUAL.to_string());
+        state.accept_decoded(Zeroizing::new(UNUSUAL.to_string()));
         let painted = paint(|ui| {
             draw_add_form(ui, &mut state, BOUNDARY);
         });
@@ -5181,13 +5306,15 @@ mod tests {
     #[test]
     fn the_secret_is_masked_until_reveal_is_pressed() {
         let mut state = TotpAdd::opening("id-1", "Git Host", false);
-        // Typed in the spaced grouping a site prints, so the text in the FIELD
-        // is not the normalised seed the confirmation row holds. Without that,
-        // the assertion below would be defeated by the user's own typing being
-        // painted back at them by the `TextEdit` -- which is not the row this
-        // test is about, and which is the shape a masked-secret test in this
-        // crate has been blind to before.
-        state.typed = Zeroizing::new("JBSW Y3DP EHPK 3PXP".to_string());
+        // **A SCANNED card**: the masked row lives in 6c's field table, which
+        // is the scanned path's. That also removes what used to be this test's
+        // one hazard -- a scanned payload is not put in a `TextEdit`, so there
+        // is no field painting the user's own typing back at them to defeat
+        // the assertion below. It was guarded against before by typing the
+        // seed in the spaced grouping a site prints; now it cannot arise.
+        state.accept_decoded(Zeroizing::new(
+            "otpauth://totp/Git%20Host:anovak?secret=JBSW%20Y3DP%20EHPK%203PXP".to_string(),
+        ));
         assert!(!state.revealed, "the form opened revealed");
 
         let masked_frame = paint(|ui| {
@@ -5263,7 +5390,11 @@ mod tests {
         }
         assert!(painted.has(HEADING), "the modal painted no form: {:?}", painted.0);
         assert!(painted.has(REPLACE_WARNING), "the modal dropped the warning");
-        assert!(painted.has(CONFIRM_HEADING), "the modal dropped the confirmation");
+        // The confirmation half, asked for by the part of it a TYPED card
+        // draws: the live-code panel. 6c's heading is the scanned path's now,
+        // and this state is a typed one -- asserting the heading here would be
+        // asserting the old fusion rather than that the modal drew the form.
+        assert!(painted.has(MATCH_QUESTION), "the modal dropped the confirmation");
     }
 
     // -----------------------------------------------------------------
@@ -6949,6 +7080,126 @@ mod tests {
         });
         assert!(painted.has(SECRET_HINT), "the by-hand field is gone: {:?}", painted.0);
         assert!(!painted.has(CODE_READ_LABEL), "the by-hand route drew the scanned row");
+    }
+
+    /// **6c's heading and its field table are the SCANNED card's**; a typed
+    /// secret gets design 6d's list and stops at the live-code panel.
+    ///
+    /// The rows restate the user's own keystrokes a few pixels below the box
+    /// they are still in, which is not a check -- a check needs a second
+    /// source to disagree with, and a typed seed has none. A scanned one does:
+    /// nobody read that QR, a decoder did, and Issuer and Account are the only
+    /// view of what it said.
+    ///
+    /// **Both halves are asserted in one test on purpose.** Either alone would
+    /// pass against a card that drew the table for nobody, or for everybody,
+    /// and this is the pair that has to hold -- the fusion of 6c into 6d was a
+    /// deliberate decision for the scanned path and stays exactly as it was.
+    ///
+    /// The live-code panel is the control running through both: it is in 6d's
+    /// own mockup, it is the one thing on this card with a second source
+    /// (the code the site is showing right now), and it must not have gone
+    /// out with the table.
+    #[test]
+    fn the_field_table_belongs_to_the_scanned_card_and_the_typed_one_stops_at_the_live_code() {
+        // 6d, typed by hand.
+        let mut typed = TotpAdd::opening("id-1", "Git Host", false);
+        typed.stage = Stage::Manual;
+        typed.typed = Zeroizing::new(UNUSUAL.to_string());
+        let typed_frame = paint(|ui| {
+            draw_stage(ui, &mut typed, BOUNDARY);
+        });
+
+        // 6c's furniture, gone: the heading and every row of the table.
+        assert!(
+            !typed_frame.has(CONFIRM_HEADING),
+            "a typed secret still got 6c's heading: {:?}",
+            typed_frame.0
+        );
+        // [`SECRET_ROW_LABEL`] is deliberately NOT in this list: it is
+        // `"Secret"`, which is a substring of 6d's own field caption
+        // [`SECRET_HINT`], and `has` matches by substring -- asserting its
+        // absence would assert 6d's field away. The secret row is pinned below
+        // by the two things only it draws.
+        for row in [ISSUER_ROW_LABEL, ACCOUNT_ROW_LABEL, PARAMETERS_ROW_LABEL] {
+            assert!(
+                !typed_frame.has(row),
+                "the field table's {row:?} row was drawn for a typed secret: {:?}",
+                typed_frame.0
+            );
+        }
+        // ...and with the secret row goes its mask and its Reveal, which are
+        // the table's and not the card's.
+        assert!(!typed_frame.has(REVEAL_LABEL), "the table's Reveal outlived the table");
+        assert!(!typed_frame.has("\u{2022}\u{2022}\u{2022}\u{2022}"), "the masked row outlived it");
+
+        // What 6d DOES draw, all of it, so the above is a gate and not a
+        // deletion: the field, its validity line, the parameter controls, and
+        // the live code with its countdown and its question.
+        assert!(typed_frame.has(SECRET_HINT), "6d's field is gone: {:?}", typed_frame.0);
+        let code = code_at(&auth(UNUSUAL), BOUNDARY).expect("the fixture decodes");
+        assert!(
+            typed_frame.has(grouped_code(&code).as_str()),
+            "the live code went out with the table: {:?}",
+            typed_frame.0
+        );
+        assert!(typed_frame.has(MATCH_QUESTION), "the question the code exists to answer is gone");
+        assert!(typed_frame.has("refreshes in 60 s"), "the countdown went out with the table");
+
+        // The same payload, SCANNED. Unchanged: 6c is a design in its own
+        // right and nothing here asks it to become something else.
+        let mut scanned = TotpAdd::opening("id-1", "Git Host", false);
+        scanned.accept_decoded(Zeroizing::new(UNUSUAL.to_string()));
+        let scanned_frame = paint(|ui| {
+            draw_stage(ui, &mut scanned, BOUNDARY);
+        });
+        assert!(
+            scanned_frame.has(CONFIRM_HEADING),
+            "the scanned card lost 6c's heading: {:?}",
+            scanned_frame.0
+        );
+        for row in
+            [SECRET_ROW_LABEL, ISSUER_ROW_LABEL, ACCOUNT_ROW_LABEL, PARAMETERS_ROW_LABEL]
+        {
+            assert!(
+                scanned_frame.has(row),
+                "the scanned card lost the field table's {row:?} row: {:?}",
+                scanned_frame.0
+            );
+        }
+        assert!(scanned_frame.has(REVEAL_LABEL), "the scanned card lost the way to unmask");
+        assert!(scanned_frame.has("Git Host"), "the issuer a scan must be checked against is gone");
+        assert!(scanned_frame.has("anovak"), "the account a scan must be checked against is gone");
+        // And the panel is on that card too, which is what makes it the one
+        // piece common to both paths rather than a consolation for one.
+        assert!(scanned_frame.has(MATCH_QUESTION));
+        assert!(scanned_frame.has(grouped_code(&code).as_str()));
+    }
+
+    /// The caution band is **not** part of the gate above.
+    ///
+    /// It is a warning about what saving will destroy rather than a field
+    /// restating an input, and 6d's mockup has no record behind it with a code
+    /// to lose -- so "6d draws no such band" says nothing about whether this
+    /// app should. A typed card over an item that already has a code still
+    /// shows it.
+    #[test]
+    fn the_replace_warning_is_not_gated_with_the_field_table() {
+        let mut typed = TotpAdd::opening("id-1", "Git Host", true);
+        typed.stage = Stage::Manual;
+        typed.typed = Zeroizing::new(UNUSUAL.to_string());
+        let painted = paint(|ui| {
+            draw_stage(ui, &mut typed, BOUNDARY);
+        });
+        assert!(
+            painted.has(REPLACE_WARNING),
+            "the caution band went out with 6c's table: {:?}",
+            painted.0
+        );
+        assert!(painted.has(REPLACE_LABEL), "the destructive button stopped saying so");
+        // Control, in the same frame: the table really is gone from this card,
+        // so the band above survived a gate rather than there being no gate.
+        assert!(!painted.has(CONFIRM_HEADING));
     }
 
     // -----------------------------------------------------------------
