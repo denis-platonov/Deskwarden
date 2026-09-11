@@ -365,6 +365,12 @@ mod tests {
     struct Painted {
         texts: Vec<(String, egui::Rect)>,
         rects: Vec<eframe::egui::epaint::RectShape>,
+        /// Every stroked line. The header band carries two controls that paint
+        /// no words at all -- the warning bang's upright bar, and the two
+        /// diagonals of the dismiss ✕ -- and a harness that could only see
+        /// text could not tell a card with a way out of its corner from one
+        /// without.
+        segments: Vec<[egui::Pos2; 2]>,
     }
 
     impl Painted {
@@ -453,6 +459,7 @@ mod tests {
                 egui::Rect::from_min_size(text.pos, text.galley.size()),
             )),
             egui::Shape::Rect(rect) => painted.rects.push(rect.clone()),
+            egui::Shape::LineSegment { points, .. } => painted.segments.push(*points),
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     walk(shape, painted);
@@ -833,5 +840,67 @@ mod tests {
             ))),
             "the delete modal draws no scrim under the id the keyboard gate watches"
         );
+    }
+
+    /// **The header's dismiss ✕ cancels, and cannot delete.**
+    ///
+    /// This file gained no line for that mark: it is on
+    /// [`theme::modal_card`]'s header band, and the band reports through
+    /// [`theme::ModalPress::dismissed`] -- the same flag the Cancel button
+    /// sets, which this function already turns into
+    /// [`DeleteConfirmAction::Cancel`]. That is the whole argument for putting
+    /// the mark on the frame rather than on each card, and it is exactly why
+    /// the claim needs testing HERE: the card whose confirm destroys a vault
+    /// item is the one where a crossed wire would cost something, and no
+    /// assertion in `theme` can see what this file does with the flag.
+    ///
+    /// Driven on both kinds, because `Forever` is the one with nothing behind
+    /// it -- a permanent delete answered by accident is not in the trash.
+    #[test]
+    fn the_header_dismiss_mark_cancels_and_never_deletes() {
+        for kind in [DeleteKind::ToTrash, DeleteKind::Forever] {
+            let ctx = styled_context();
+            let mut state = DeleteConfirmState::new(&login(), None, kind);
+            let painted = opened(&ctx, &mut state);
+
+            // The mark, found from the paint: two diagonals
+            // `theme::CLOSE_MARK_SPAN` across. The only other stroke on this
+            // card is the warning bang's upright bar, which is not one.
+            let arms: Vec<&[egui::Pos2; 2]> = painted
+                .segments
+                .iter()
+                .filter(|[a, b]| {
+                    ((b.x - a.x).abs() - theme::CLOSE_MARK_SPAN).abs() < 0.01
+                        && ((b.y - a.y).abs() - theme::CLOSE_MARK_SPAN).abs() < 0.01
+                })
+                .collect();
+            assert_eq!(
+                arms.len(),
+                2,
+                "{kind:?}: the header carries {} arms the size of a ✕; it needs exactly two",
+                arms.len()
+            );
+            let at = arms[0][0].lerp(arms[0][1], 0.5);
+            assert!(
+                (arms[1][0].lerp(arms[1][1], 0.5) - at).length() < 0.01,
+                "{kind:?}: the two arms do not cross, so this is not a ✕"
+            );
+
+            let (action, _) = frame(&ctx, &mut state, &click(at));
+            assert_eq!(
+                action,
+                DeleteConfirmAction::Cancel,
+                "{kind:?}: the header's ✕ at {at:?} did not cancel -- and the one thing it must \
+                 never do is answer the question this card is asking"
+            );
+
+            // The pairing: Escape gives the same answer, so the mark is the
+            // gesture this card already had and not a second one.
+            let ctx = styled_context();
+            let mut fresh = DeleteConfirmState::new(&login(), None, kind);
+            let _ = opened(&ctx, &mut fresh);
+            let (by_key, _) = frame(&ctx, &mut fresh, &escape());
+            assert_eq!(by_key, action, "{kind:?}: the ✕ and Escape disagree");
+        }
     }
 }

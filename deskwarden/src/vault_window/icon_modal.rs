@@ -639,13 +639,34 @@ mod tests {
             painted.rects.iter().all(|r| r.fill != theme::ERROR),
             "something on this card is painted in the destructive red"
         );
-        assert!(
-            painted
-                .segments
-                .iter()
-                .all(|[a, b]| !band.contains(*a) || !band.contains(*b)),
-            "the header drew a mark; this card is a question and has no warning to give"
+        // **The only strokes in this band are the dismiss ✕'s two diagonals.**
+        //
+        // This used to read "the band contains no line segments at all",
+        // which said the same thing until the band grew a ✕ -- the warning
+        // glyph's bang is a vertical bar and a dot, and neither is a diagonal.
+        // Asserting the exact pair keeps both halves: a warning mark appearing
+        // here would be a third segment and would fail, and a dismiss mark
+        // disappearing would leave two too few.
+        let strokes: Vec<&[Pos2; 2]> = painted
+            .segments
+            .iter()
+            .filter(|[a, b]| band.contains(*a) && band.contains(*b))
+            .collect();
+        assert_eq!(
+            strokes.len(),
+            2,
+            "the header band carries {} strokes; the dismiss ✕'s two arms are the only ones \
+             this card has -- it asks a question and has no warning to give",
+            strokes.len()
         );
+        for arm in &strokes {
+            let (dx, dy) = (arm[1].x - arm[0].x, arm[1].y - arm[0].y);
+            assert!(
+                dx.abs() > 0.5 && (dx.abs() - dy.abs()).abs() < 0.01,
+                "a stroke in the header band runs {dx}x{dy}, which is not an arm of a ✕ -- the \
+                 warning glyph's bang is exactly the upright bar this rules out"
+            );
+        }
         // And the footer really is the third band, so this is the frame's
         // card and not a plain one with a blue rectangle on it.
         let footer = painted.band(theme::CARD_TINT);

@@ -2926,27 +2926,205 @@ fn card_header_inner(ui: &mut Ui, right_text: &str, with_close: bool) -> bool {
     dismissed
 }
 
-/// The dismiss ✕ itself: a 16px hit target with the design's ghost-grey
-/// glyph, darkening to ink on hover so it reads as clickable despite having
-/// no button chrome (the design draws it as bare text).
+// ---------------------------------------------------------------------------
+// The dismiss ✕, and the ONE definition of it
+//
+// Every card in this app that can be got rid of carries this mark, and the
+// point of the family below is that there is nothing for a call site to
+// choose: the glyph, its size, its hit target, its hover treatment, its
+// cursor, its tooltip and how far it is held off the card's edge are all
+// settled here. A card asks for the mark and says which surface it is going
+// on; it does not say how big, how grey, or how far in.
+//
+// That is not tidiness for its own sake. The report this family answers was
+// "some modals have an ✕ and some don't", and the way that state is reached is
+// one mark per card, each written by hand at the moment that card was built --
+// which is also how you end up with a 16pt target on one card and a 20pt one
+// on the next, ghost-grey here and muted there. Two of them had already been
+// written by hand before this, and they had already drifted four points apart
+// (see [`MODAL_CLOSE_INSET`]).
+//
+// There are two entry points because there are two kinds of header in this
+// crate and no third:
+//
+// * [`close_glyph`] ALLOCATES, for a header assembled out of widgets in a
+//   layout -- `card_header_with_close`'s overlay strip.
+// * [`modal_dismiss_mark`] does NOT allocate: it is handed the rectangle of
+//   the line the mark belongs on and interacts at an absolute rect inside it.
+//   Every modal in this app takes this one, and not allocating is the half
+//   that matters -- it means the mark can be added to a card that already
+//   exists without moving one pixel of what that card already paints, which is
+//   why the paint tests on all seven of them still measure the same layout.
+// ---------------------------------------------------------------------------
+
+/// The mark's hit target, square.
+///
+/// Sixteen points around a glyph that is seven across, so more than half of
+/// what the pointer can hit is empty space. That is deliberate and it is the
+/// number that must not be shrunk to fit the drawing: the visible ✕ is the
+/// smallest control in this app, and a hit target cut down to the ink is a
+/// control a person with an ordinary hand misses.
+pub const CLOSE_MARK_HIT: f32 = 16.0;
+
+/// Half the diagonal extent of each arm, so the drawn ✕ is
+/// [`CLOSE_MARK_SPAN`] across -- seven points inside a sixteen-point box.
+const CLOSE_MARK_ARM: f32 = 3.5;
+
+/// How wide the ✕'s ink is, which is **not** [`CLOSE_MARK_HIT`].
+///
+/// `pub` because it is the number the paint tests in four other files find the
+/// mark BY: a headless frame sees two diagonal strokes, and the size of them
+/// is what tells the dismiss mark apart from every other line this app draws.
+/// Those tests must not re-type a 7.0, for the reason the mark itself is
+/// shared -- a stand-in that stopped matching would go on passing.
+pub const CLOSE_MARK_SPAN: f32 = CLOSE_MARK_ARM * 2.0;
+
+/// The arms' weight. Below 1.0 the mark disappears on a 100% display and
+/// above 1.5 it reads as a delete rather than as a dismiss.
+const CLOSE_MARK_STROKE: f32 = 1.3;
+
+/// What the pointer is told the mark does. One word, and the same word on
+/// every card: "Close" would be a promise about the window.
+const CLOSE_MARK_TOOLTIP: &str = "Dismiss";
+
+/// **How far the mark's hit box is held off the card's right-hand edge**, and
+/// the one number in this family that had to be CHOSEN rather than lifted.
+///
+/// The two marks that existed before this family disagreed. `prefs_ui` centred
+/// its 16pt box 22 points in from the card's edge -- a box whose right edge is
+/// therefore 14 points off it. `totp_add` right-aligned its box inside a
+/// header padded 18, so its box ended 18 points off the edge. Same glyph, same
+/// size, four points apart, and neither file knew the other had answered the
+/// question.
+///
+/// **Fourteen, and the argument is that it is the one that lines the GLYPH up
+/// rather than the box.** [`CLOSE_MARK_HIT`] carries 4.5 points of empty
+/// margin around the ink on every side, so a box inset 14 puts the visible arm
+/// tip 18.5 points off the card's edge -- which is within half a point of the
+/// 18 `totp_add`'s header pads its content by and inside the 20 the
+/// hand-built cards use. Inset 18 or 20 would align the invisible rectangle
+/// and push the mark a visible four to six points further in than the card's
+/// own content column, which is the arrangement that reads as a mark floating
+/// loose in the corner. Fourteen is also what the app's most-used modal
+/// already shipped, so the card a user opens most often does not move.
+pub const MODAL_CLOSE_INSET: f32 = 14.0;
+
+/// The mark's ink at rest on a coloured header band.
+///
+/// White at an alpha that is to an accent fill what [`TEXT_GHOST`] is to a
+/// white card: present, quiet, and clearly not the thing the card is asking
+/// about. Full white at rest would make the dismiss the loudest thing in a
+/// band whose job is to carry the card's title.
+/// Written out premultiplied -- white at alpha 190 is (190, 190, 190, 190) --
+/// because `Color32::from_white_alpha` is not a `const fn` and this has to be
+/// a constant to sit beside the rest of this app's inks.
+const CLOSE_MARK_ON_ACCENT: Color32 = Color32::from_rgba_premultiplied(190, 190, 190, 190);
+
+/// Which surface the mark is being drawn on, and therefore which pair of inks
+/// it wears.
+///
+/// **The surface, not the colours.** A call site that passed two `Color32`s
+/// could pass any two, and the first card to pass a red pair would be a
+/// dismiss control that reads as a delete. There are exactly two surfaces a
+/// modal in this app puts a header on, so there are exactly two answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseInk {
+    /// A white or near-white header: the hand-built cards' title line,
+    /// `prefs_ui`'s titlebar-style band, `totp_add`'s ruled strip.
+    OnCard,
+    /// [`modal_card`]'s accent band, where the card's own colour is behind the
+    /// mark and ghost-grey would be invisible.
+    OnAccent,
+}
+
+impl CloseInk {
+    /// `(at rest, under the pointer)`.
+    fn pair(self) -> (Color32, Color32) {
+        match self {
+            CloseInk::OnCard => (TEXT_GHOST, INK),
+            CloseInk::OnAccent => (CLOSE_MARK_ON_ACCENT, Color32::WHITE),
+        }
+    }
+}
+
+/// The mark's two strokes, its hover ink and its cursor, given a rectangle and
+/// the response that was already registered for it.
+///
+/// Shared by both entry points so that "what the mark looks like" is answered
+/// once. A disabled response hovers nothing, so a mark inside a disabled
+/// `Ui` paints at its resting ink and offers no pointing hand -- which is the
+/// treatment `login_ui`'s chrome already gives a ✕ that will not answer.
+fn paint_close_mark(ui: &Ui, rect: Rect, response: &Response, ink: CloseInk) {
+    let (rest, hot) = ink.pair();
+    let color = if response.hovered() { hot } else { rest };
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let stroke = Stroke::new(CLOSE_MARK_STROKE, color);
+    let arm = CLOSE_MARK_ARM;
+    let c = rect.center();
+    let painter = ui.painter();
+    painter.line_segment([c + Vec2::new(-arm, -arm), c + Vec2::new(arm, arm)], stroke);
+    painter.line_segment([c + Vec2::new(arm, -arm), c + Vec2::new(-arm, arm)], stroke);
+}
+
+/// The dismiss ✕ itself: a [`CLOSE_MARK_HIT`] hit target with the design's
+/// ghost-grey glyph, darkening to ink on hover so it reads as clickable
+/// despite having no button chrome (the design draws it as bare text).
 ///
 /// Stroked as two crossing lines rather than drawn as the character U+2715:
 /// neither the bundled Archivo faces nor egui's fallback stack carry that
 /// codepoint, so as text it renders as a tofu box. Two strokes are also
 /// sharper at this size than any glyph would be.
+///
+/// **This is the allocating half of the mark**, for a header built out of
+/// widgets in a layout. A card that knows the rectangle its header occupies --
+/// which is every modal in this crate -- wants [`modal_dismiss_mark`].
 pub fn close_glyph(ui: &mut Ui) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(16.0), Sense::click());
-    let color = if response.hovered() { INK } else { TEXT_GHOST };
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let stroke = Stroke::new(1.3, color);
-    let arm = 3.5;
-    let c = rect.center();
-    let painter = ui.painter();
-    painter.line_segment([c + Vec2::new(-arm, -arm), c + Vec2::new(arm, arm)], stroke);
-    painter.line_segment([c + Vec2::new(arm, -arm), c + Vec2::new(-arm, arm)], stroke);
-    response.on_hover_text("Dismiss")
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(CLOSE_MARK_HIT), Sense::click());
+    paint_close_mark(ui, rect, &response, CloseInk::OnCard);
+    response.on_hover_text(CLOSE_MARK_TOOLTIP)
+}
+
+/// The dismiss ✕ pinned to the right-hand end of `line`, which is the
+/// rectangle of the header row the mark belongs on -- a coloured band, a
+/// ruled strip, or just the line a hand-built card's title is set on.
+///
+/// The mark's box is [`MODAL_CLOSE_INSET`] off `line.right()` and centred on
+/// `line.center().y`, so a caller's only job is to hand over a rectangle whose
+/// right edge is the CARD's edge and whose vertical middle is the header's.
+///
+/// # It does not allocate, and that is what makes it safe to add
+///
+/// `ui.interact` at an absolute rect touches neither the `Ui`'s cursor nor its
+/// min rect, so dropping this into a card that already exists moves nothing
+/// the card already paints. Seven cards took the mark in one pass without a
+/// single layout test having to be re-measured, which would not have been true
+/// of a widget that claimed space on the title's line.
+///
+/// # It must be called AFTER [`modal_drag_handle`], and that is not a style
+/// note
+///
+/// egui hit-tests clicks and drags separately but not independently: where the
+/// topmost widget under the pointer senses drags and not clicks, it swallows
+/// the click rather than passing it down. Every modal in this app is dragged
+/// by its header, so the drag strip lies over exactly the band this mark sits
+/// in -- registered first it is UNDERNEATH, egui reports the mark for the
+/// click and the strip for the drag, and both work. Registered the other way
+/// round the mark is drawn, is hovered, and does nothing, which is the precise
+/// defect this app has shipped before. See [`modal_drag_handle`], and
+/// `modal_drag_tests::a_click_in_the_header_still_reaches_the_control_the_handle_lies_under`.
+pub fn modal_dismiss_mark(ui: &mut Ui, line: Rect, ink: CloseInk) -> Response {
+    let at = Rect::from_center_size(
+        Pos2::new(line.right() - MODAL_CLOSE_INSET - CLOSE_MARK_HIT / 2.0, line.center().y),
+        Vec2::splat(CLOSE_MARK_HIT),
+    );
+    // The `Ui`'s own id and not the layer's: `totp_add` draws its card inside
+    // the vault window's panel layer rather than in an `Area` of its own, so a
+    // layer-derived id would be shared with whatever else that layer marks.
+    let response = ui.interact(at, ui.id().with("modal-dismiss"), Sense::click());
+    paint_close_mark(ui, at, &response, ink);
+    response.on_hover_text(CLOSE_MARK_TOOLTIP)
 }
 
 // ---------------------------------------------------------------------------
@@ -5148,6 +5326,78 @@ pub struct ModalPress {
 /// the grab strip cannot reach a control.
 pub const MODAL_PLAIN_HEADER_HEIGHT: f32 = 40.0;
 
+/// The dismiss ✕ in the corner of a hand-built card: `card` is the rectangle
+/// that card's own `egui::Frame` measured out to, `line` the rectangle of the
+/// title the mark belongs beside. Answers whether it was pressed.
+///
+/// Call it from the card's OUTER `Ui`, immediately after the frame closes, so
+/// that `card` is `framed.response.rect` and `line` is the title's own rect
+/// carried out of the frame's closure.
+///
+/// # Why the frame's measured rect, and not the padding arithmetic
+///
+/// The inset has to be measured from the CARD's edge, and a `Ui` inside a
+/// padded frame cannot see that edge: `ui.max_rect().right()` is the content
+/// column's. The obvious repair -- add the frame's own inner margin back --
+/// assumes the card is exactly as wide as the column it was told to lay out
+/// in, and two of these cards are not. `record_ui`'s import form sets a
+/// 360-wide maximum and then overflows it, painting a 449-wide card around a
+/// 336-wide column; adding 12 to the column would have put the mark a hundred
+/// points adrift of the corner it is supposed to be in, on the one card in the
+/// app where the mark is the ONLY way out.
+///
+/// `egui::AreaState` was the other candidate and is worse: it is the
+/// rectangle from the PREVIOUS pass, which is right for
+/// [`modal_drag_handle`] -- that one has no choice, it must be registered
+/// before the card is laid out -- and needlessly stale here, where the frame
+/// has just finished measuring itself and can simply say.
+///
+/// # It claims no space
+///
+/// The mark goes down through [`modal_dismiss_mark`], which interacts at an
+/// absolute rect and allocates nothing, so dropping this onto a card that
+/// already exists moves nothing that card already paints. It is also the
+/// reason the call order works: registered after the frame's contents it is on
+/// top of them, and after [`modal_drag_handle`] it is on top of the drag strip
+/// -- which is what stops the strip swallowing the click.
+///
+/// The mark is vertically centred on the TITLE's own line rather than on
+/// [`MODAL_PLAIN_HEADER_HEIGHT`], because that constant measures from the top
+/// of the card and includes the frame's margin -- a mark centred in it would
+/// float nine points above the words it belongs beside.
+pub fn modal_corner_mark(ui: &mut Ui, card: Rect, line: Rect) -> bool {
+    modal_corner_mark_gated(ui, card, line, true)
+}
+
+/// [`modal_corner_mark`] for a card whose dismiss is not always available.
+///
+/// `dismissable` is `false` while the card is refusing to be closed -- a form
+/// with a child process in flight is the only case in this crate today, and
+/// `record_ui`'s two forms are it. The mark still PAINTS, faded the way egui
+/// fades any disabled widget, and reports nothing; it does not disappear,
+/// because a control that comes and goes reads as the card changing shape
+/// rather than as an answer being unavailable.
+///
+/// **Only the mark is gated, never the title.** The title is drawn by the
+/// caller inside the frame and is not touched by this at all, so a card that
+/// is busy does not appear to grey out its own heading -- which is a much
+/// louder statement than "the way out is not available for a moment".
+pub fn modal_corner_mark_gated(
+    ui: &mut Ui,
+    card: Rect,
+    line: Rect,
+    dismissable: bool,
+) -> bool {
+    let row = Rect::from_min_max(
+        Pos2::new(line.left(), line.top()),
+        Pos2::new(card.right(), line.bottom()),
+    );
+    ui.add_enabled_ui(dismissable, |ui| {
+        modal_dismiss_mark(ui, row, CloseInk::OnCard).clicked()
+    })
+    .inner
+}
+
 /// How far one modal has been dragged away from its centred position, and the
 /// pass it was last drawn on.
 ///
@@ -5538,7 +5788,7 @@ pub fn modal_card(
                     let inherited = ui.spacing().item_spacing;
                     ui.spacing_mut().item_spacing.y = 0.0;
 
-                    modal_header_band(ui, &card);
+                    let marked = modal_header_band(ui, &card);
                     egui::Frame::new()
                         .inner_margin(Margin::symmetric(MODAL_PAD_X, MODAL_BODY_PAD_Y))
                         .show(ui, |ui| {
@@ -5546,6 +5796,16 @@ pub fn modal_card(
                             body(ui);
                         });
                     press = modal_footer_band(ui, &card, confirm);
+                    // **The ✕ sets the SAME flag the footer's left-hand answer
+                    // does**, or-ed in after the footer has reported rather
+                    // than before it, because `modal_footer_band` returns a
+                    // whole [`ModalPress`] and assigning it would throw a
+                    // header press away. Or-ed rather than assigned so that a
+                    // frame in which both somehow reported still dismisses --
+                    // which on the delete card is the cautious answer winning,
+                    // the ordering `delete_modal` already argues for its own
+                    // two buttons. See [`modal_header_band`].
+                    press.dismissed |= marked;
                 });
             // **The border again, over everything.** Same rect, same colour,
             // same width as the one the `Frame` drew -- this is not a second
@@ -5564,9 +5824,19 @@ pub fn modal_card(
     press
 }
 
-/// The coloured band across the card's top: the glyph, then the title, on one
-/// line.
-fn modal_header_band(ui: &mut Ui, card: &ModalCard<'_>) {
+/// The coloured band across the card's top: the glyph, then the title, then
+/// the dismiss ✕ at the far end. Answers whether the ✕ was pressed.
+///
+/// **The ✕ is the footer's left-hand answer, not a third one.** It reports
+/// through [`ModalPress::dismissed`], which is the same flag
+/// [`ModalCard::dismiss`]'s button sets, so the two callers of this card --
+/// `delete_modal` and `icon_modal` -- get the mark wired to their own Cancel
+/// without either file changing a line. That is the rule the whole pass is
+/// built on: the mark is an existing gesture given a second surface, never a
+/// new outcome. On the delete card in particular it is the SAFE answer and
+/// could not be anything else, which is why the mark could be added there
+/// without touching the file that asks the destructive question.
+fn modal_header_band(ui: &mut Ui, card: &ModalCard<'_>) -> bool {
     let (band, _) =
         ui.allocate_exact_size(Vec2::new(card.width, MODAL_HEADER_HEIGHT), Sense::hover());
     let painter = ui.painter();
@@ -5602,6 +5872,19 @@ fn modal_header_band(ui: &mut Ui, card: &ModalCard<'_>) {
         FontId::new(MODAL_TITLE_PX, FontFamily::Name(BOLD.into())),
         Color32::WHITE,
     );
+
+    // `band` IS the card's inside edge -- it was allocated at `card.width`,
+    // which is the width the body and footer are laid out to -- so the mark
+    // ends up [`MODAL_CLOSE_INSET`] off the card exactly as it does on every
+    // other header in this crate. [`CloseInk::OnAccent`] because the surface
+    // under it is the card's own colour and ghost-grey on red is not a mark.
+    //
+    // Drawn AFTER the title rather than before: the title is painted straight
+    // onto the band and would run under a long enough one. It does not today
+    // -- the widest heading on either card stops well short -- and the order
+    // is still worth having, because the mark ending up on top is the
+    // failure that stays clickable while it is unreadable.
+    modal_dismiss_mark(ui, band, CloseInk::OnAccent).clicked()
 }
 
 /// An equilateral triangle's height as a fraction of its base, which is the
@@ -9257,6 +9540,15 @@ mod modal_card_tests {
         texts: Vec<(String, Rect)>,
         rects: Vec<RectShape>,
         segments: Vec<[Pos2; 2]>,
+        /// The same strokes as [`Self::segments`], carrying the INK as well.
+        ///
+        /// A second list rather than a widened first one, because the colour
+        /// only matters to one question and widening `segments` would have
+        /// touched every reader of it. That question is the dismiss ✕ on the
+        /// accent band: ghost-grey there is a mark nobody can see, and a test
+        /// that only found two diagonals in the right place would pass for a
+        /// mark painted in the band's own colour.
+        inked_segments: Vec<(Stroke, [Pos2; 2])>,
         /// Closed outlines, kept whole rather than as bounding boxes: the
         /// warning triangle is identified by its point count, which is the
         /// only thing that keeps it out of `icon_probe::envelopes`.
@@ -9332,7 +9624,10 @@ mod modal_card_tests {
                 Rect::from_min_size(text.pos, text.galley.size()),
             )),
             egui::Shape::Rect(rect) => painted.rects.push(rect.clone()),
-            egui::Shape::LineSegment { points, .. } => painted.segments.push(*points),
+            egui::Shape::LineSegment { points, stroke } => {
+                painted.segments.push(*points);
+                painted.inked_segments.push(((*stroke).into(), *points));
+            }
             egui::Shape::Path(path) => painted.paths.push(path.clone()),
             egui::Shape::Circle(circle) => painted.circles.push(*circle),
             egui::Shape::Vec(shapes) => {
@@ -9859,17 +10154,27 @@ mod modal_card_tests {
         );
 
         // The bang: one vertical bar and one dot, both inside the triangle.
+        //
+        // **Filtered to the VERTICAL segments**, which it did not have to be
+        // until the band grew a dismiss ✕ at its far end. That mark is two
+        // crossing diagonals and they are the only other segments the band
+        // carries, so "vertical" separates the bang's bar from them exactly
+        // and without naming a count that the next thing added to the band
+        // would break again. `the_header_band_carries_a_dismiss_mark` is the
+        // one that asserts about those two.
         let bars: Vec<&[Pos2; 2]> = warned
             .painted
             .segments
             .iter()
-            .filter(|[a, b]| band.contains(*a) && band.contains(*b))
+            .filter(|[a, b]| {
+                band.contains(*a) && band.contains(*b) && (a.x - b.x).abs() < 0.01
+            })
             .collect();
         assert_eq!(
             bars.len(),
             1,
-            "the band carries {} line segments; the bang's bar is the only one left now that \
-             the triangle is a path",
+            "the band carries {} vertical line segments; the bang's bar is the only one, now \
+             that the triangle is a path and the ✕ is two diagonals",
             bars.len()
         );
         assert!(
@@ -9903,13 +10208,16 @@ mod modal_card_tests {
 
         let (_plain_harness, plain) = Harness::opened(BLUE, ModalGlyph::None);
         let band = plain.painted.band(BLUE, "header band").rect;
+        // **Nothing UPRIGHT**, rather than nothing at all. The dismiss ✕ is on
+        // every header now, glyph or no glyph, and it is two diagonals; the
+        // bang this is looking for is a vertical bar. Counting strokes would
+        // have made this test a second assertion about the mark, which
+        // `the_header_band_carries_a_dismiss_mark` already owns.
         assert!(
-            plain
-                .painted
-                .segments
-                .iter()
-                .all(|[a, b]| !band.contains(*a) || !band.contains(*b)),
-            "the glyph-less header drew a mark anyway"
+            plain.painted.segments.iter().all(|[a, b]| {
+                !band.contains(*a) || !band.contains(*b) || (a.x - b.x).abs() > 0.01
+            }),
+            "the glyph-less header drew the warning's upright bar anyway"
         );
         assert!(
             plain.painted.paths.is_empty() && plain.painted.circles.is_empty(),
@@ -10049,6 +10357,150 @@ mod modal_card_tests {
             1,
             "a subject with no username painted more than its name: {:?}",
             alone.texts
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The dismiss ✕ on the header band
+    //
+    // This card is drawn by `delete_modal` and `icon_modal`, and neither file
+    // mentions a ✕: the mark is on the frame, so both got it in one edit and
+    // neither can lose it separately. That is exactly why the assertions have
+    // to live here, and why they are in two halves -- a mark that PAINTS and
+    // does not answer is the defect this app has shipped before, and a mark
+    // that answers while painted in the band's own colour is one nobody can
+    // find.
+    // -----------------------------------------------------------------------
+
+    /// The two arms of the dismiss ✕ inside `band`, as
+    /// `(stroke, [start, end])` each.
+    ///
+    /// Found by geometry and nothing else: a diagonal run inside the header.
+    /// The only other strokes this card ever paints in that band are the
+    /// warning bang's upright bar, which is not diagonal.
+    fn dismiss_arms(painted: &Painted, band: Rect) -> Vec<(Stroke, [Pos2; 2])> {
+        painted
+            .inked_segments
+            .iter()
+            .filter(|(_, [a, b])| {
+                band.contains(*a)
+                    && band.contains(*b)
+                    && (b.x - a.x).abs() > 0.5
+                    && ((b.x - a.x).abs() - (b.y - a.y).abs()).abs() < 0.01
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// **The mark is DRAWN: two crossing arms, the right size, in a white the
+    /// accent cannot swallow, at the card's own corner inset.**
+    ///
+    /// Every clause is a way the mark has failed elsewhere in this app. A
+    /// single arm is half a ✕. An arm at the wrong length is a mark that does
+    /// not match the six others. [`TEXT_GHOST`] on a red band is a mark that
+    /// is technically present and practically invisible, which is what
+    /// [`CloseInk`] exists to prevent. And an inset taken from the content
+    /// column rather than from the card is how `prefs_ui` and `totp_add` ended
+    /// up four points apart before this family existed.
+    #[test]
+    fn the_header_band_carries_a_dismiss_mark() {
+        let (_harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
+        let band = drawn.painted.band(ERROR, "header band").rect;
+        let arms = dismiss_arms(&drawn.painted, band);
+        assert_eq!(
+            arms.len(),
+            2,
+            "the header band carries {} diagonal strokes; a ✕ is exactly two",
+            arms.len()
+        );
+
+        for (stroke, [a, b]) in &arms {
+            assert!(
+                ((b.x - a.x).abs() - CLOSE_MARK_SPAN).abs() < 0.01,
+                "an arm spans {} points across; `CLOSE_MARK_SPAN` makes it {CLOSE_MARK_SPAN}",
+                (b.x - a.x).abs()
+            );
+            assert_eq!(
+                stroke.color,
+                CLOSE_MARK_ON_ACCENT,
+                "the mark is painted {:?} on an {ERROR:?} band. Ghost-grey is the ink for a \
+                 WHITE header; on the accent it is a mark the user cannot see",
+                stroke.color
+            );
+        }
+
+        // The two arms cross, so this is a ✕ and not two parallel slashes, and
+        // the crossing point is where the click below has to land.
+        let centre = arms[0].1[0].lerp(arms[0].1[1], 0.5);
+        assert!(
+            (arms[1].1[0].lerp(arms[1].1[1], 0.5) - centre).length() < 0.01,
+            "the two arms have different midpoints, so they do not cross"
+        );
+
+        // And the mark is `MODAL_CLOSE_INSET` off the CARD's edge, measured
+        // through the hit box the arms sit in the middle of.
+        let card = drawn.painted.card().rect;
+        let box_right = centre.x + CLOSE_MARK_HIT / 2.0;
+        assert!(
+            (card.right() - MODAL_STROKE - box_right - MODAL_CLOSE_INSET).abs() < 0.5,
+            "the mark's hit box ends {} points inside the card, not `MODAL_CLOSE_INSET`'s {}",
+            card.right() - MODAL_STROKE - box_right,
+            MODAL_CLOSE_INSET
+        );
+        assert!(
+            (centre.y - band.center().y).abs() < 1.0,
+            "the mark is not centred on the band it sits in"
+        );
+    }
+
+    /// **And pressing it DISMISSES -- as the footer's left-hand answer, not as
+    /// a third outcome.**
+    ///
+    /// The half that matters, and the half that a paint test alone cannot
+    /// reach: a keycap in this app was drawn and dead for weeks. It also pins
+    /// which answer the mark gives, which is the whole of why `delete_modal`
+    /// needed no edit: [`ModalPress::dismissed`] is that card's Cancel, so the
+    /// mark on the destructive card cannot be a delete.
+    ///
+    /// Driven against the DESTRUCTIVE card deliberately -- if the wiring were
+    /// ever crossed, this is the card where it would cost something.
+    #[test]
+    fn pressing_the_header_mark_dismisses_and_never_confirms() {
+        let (harness, drawn) = Harness::opened(ERROR, ModalGlyph::Warning);
+        let band = drawn.painted.band(ERROR, "header band").rect;
+        let arms = dismiss_arms(&drawn.painted, band);
+        assert_eq!(arms.len(), 2, "no mark was painted, so pressing it proves nothing");
+        let at = arms[0].1[0].lerp(arms[0].1[1], 0.5);
+
+        // The frame before carried no press, so what comes back is this click
+        // and not a flag that was already set.
+        let idle = harness.frame(&[]);
+        assert_eq!(idle.press, ModalPress::default(), "the card reported a press with no input");
+
+        let pressed = harness.frame(&click(at));
+        assert!(
+            pressed.press.dismissed,
+            "the header's ✕ painted at {at:?} reported nothing -- either the drag handle over \
+             the band swallowed the click, or the mark is drawn and dead"
+        );
+        assert!(
+            !pressed.press.confirmed,
+            "the header's ✕ reported the CONFIRM, which on `delete_modal` is the delete"
+        );
+    }
+
+    /// **The mark is on the card even when the card has no glyph**, which is
+    /// `icon_modal`'s shape. A version of this that only put the ✕ beside the
+    /// warning triangle would have left the app's ordinary question card
+    /// exactly as undismissable as it was.
+    #[test]
+    fn the_ordinary_card_carries_the_mark_too() {
+        let (_harness, drawn) = Harness::opened(BLUE, ModalGlyph::None);
+        let band = drawn.painted.band(BLUE, "header band").rect;
+        assert_eq!(
+            dismiss_arms(&drawn.painted, band).len(),
+            2,
+            "the glyph-less card's header carries no ✕"
         );
     }
 }
@@ -10198,11 +10650,21 @@ mod modal_drag_tests {
         }
 
         /// Where the header's own click target sits on a card: the right-hand
-        /// end of the band, `prefs_ui::tests::close_rect`'s geometry.
+        /// end of the band, at [`modal_dismiss_mark`]'s geometry exactly.
+        ///
+        /// **Derived from the shipped constants rather than from the literal
+        /// `card.max.x - 22.0` that stood here.** The two agreed -- 22 is
+        /// `MODAL_CLOSE_INSET + CLOSE_MARK_HIT / 2` -- and agreeing by
+        /// coincidence is the arrangement this whole pass exists to end: a
+        /// stand-in that stopped matching the real mark would leave this test
+        /// green while proving nothing about it.
         fn mark(&self, card: Rect) -> Rect {
             Rect::from_center_size(
-                Pos2::new(card.max.x - 22.0, card.min.y + HEADER / 2.0),
-                Vec2::splat(16.0),
+                Pos2::new(
+                    card.max.x - MODAL_CLOSE_INSET - CLOSE_MARK_HIT / 2.0,
+                    card.min.y + HEADER / 2.0,
+                ),
+                Vec2::splat(CLOSE_MARK_HIT),
             )
         }
     }

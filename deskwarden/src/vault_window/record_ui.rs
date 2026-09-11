@@ -642,18 +642,33 @@ pub enum RecordUiAction {
     Cancel,
 }
 
-fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::new()
+/// The card either form sits in, **and the rectangle it measured out to**.
+///
+/// The rect is new and it is what [`theme::modal_corner_mark`] needs: the
+/// dismiss ✕ is inset from the CARD's right-hand edge, and that edge is not
+/// the content column's plus the margin on these two cards. The import form
+/// sets a 360-wide maximum and overflows it, painting a 449-wide card around a
+/// 336-wide column, so arithmetic off the column would have put the mark a
+/// hundred points adrift of the corner. The frame has just measured itself and
+/// can simply say.
+fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> (egui::Rect, R) {
+    let framed = egui::Frame::new()
         .fill(theme::CARD)
         .corner_radius(CornerRadius::same(8))
         .inner_margin(egui::Margin::same(12))
-        .show(ui, add)
-        .inner
+        .show(ui, add);
+    (framed.response.rect, framed.inner)
 }
 
-fn heading(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(14.0).color(theme::INK).strong());
+/// Either form's first line, answering with **the rectangle the heading
+/// occupies** -- the line the dismiss ✕ is hung on once [`card`] has measured
+/// itself.
+fn heading(ui: &mut egui::Ui, text: &str) -> egui::Rect {
+    let line = ui
+        .label(egui::RichText::new(text).size(14.0).color(theme::INK).strong())
+        .rect;
     ui.add_space(8.0);
+    line
 }
 
 /// The top strip of either form, measured rather than guessed: [`card`]'s
@@ -750,8 +765,8 @@ pub fn draw_export_form(
 ) -> RecordUiAction {
     let mut action = RecordUiAction::None;
     let enabled = !in_flight;
-    card(ui, |ui| {
-        heading(ui, EXPORT_HEADING);
+    let (card_rect, title) = card(ui, |ui| {
+        let title = heading(ui, EXPORT_HEADING);
 
         // **§5a's `RECORD` block: the record is NAMED, not mentioned.**
         //
@@ -934,7 +949,23 @@ pub fn draw_export_form(
                 note(ui, problem, theme::TEXT_FAINT);
             }
         });
+        title
     });
+    // **The ✕ answers exactly what [`EXPORT_CANCEL_LABEL`] answers, and is
+    // gated by exactly what gates that button.** A mark that stayed live while
+    // Cancel was greyed would be a second exit from a state the card's own
+    // exit refuses -- the hazard this mark exists to remove rather than to
+    // create. Greyed, it still PAINTS: a control that vanished for the
+    // duration of a send and came back would read as the card changing shape.
+    //
+    // **Neither of this file's two modals binds Escape at all**, here or in
+    // `vault_window::mod`, so there is no keyboard gesture for the mark to
+    // have to agree with -- and one is deliberately not invented in passing,
+    // because binding a key to a card is a decision about that card's
+    // keyboard rather than about its corner.
+    if theme::modal_corner_mark_gated(ui, card_rect, title, enabled) {
+        action = RecordUiAction::Cancel;
+    }
     action
 }
 
@@ -953,8 +984,8 @@ pub fn draw_import_form(
 ) -> RecordUiAction {
     let mut action = RecordUiAction::None;
     let enabled = !in_flight;
-    card(ui, |ui| {
-        heading(ui, IMPORT_HEADING);
+    let (card_rect, title) = card(ui, |ui| {
+        let title = heading(ui, IMPORT_HEADING);
         ui.add_enabled(
             enabled,
             egui::TextEdit::singleline(&mut draft.link)
@@ -1112,7 +1143,24 @@ pub fn draw_import_form(
                 note(ui, problem, theme::TEXT_FAINT);
             }
         });
+        title
     });
+    // **On this card the ✕ is the ONLY way out**, which makes it the one mark
+    // in this pass that is a fix rather than a consistency. This form has no
+    // Cancel button -- the export's footer has one, this one's holds `Fetch`
+    // and the create -- and neither this function nor `vault_window::mod`
+    // binds Escape for it. `mod` has always had the `RecordUiAction::Cancel`
+    // arm that closes the card; nothing in the form ever produced one, so a
+    // user who opened `Import from a Send...` and changed their mind had no
+    // gesture at all that put it away. This is that gesture, and it reports
+    // the arm that was already waiting for it.
+    //
+    // Gated on `enabled` for the export card's reason, which is the same one:
+    // a `bw send receive` in flight is a child writing into state that goes
+    // away with the card.
+    if theme::modal_corner_mark_gated(ui, card_rect, title, enabled) {
+        action = RecordUiAction::Cancel;
+    }
     action
 }
 
@@ -2701,5 +2749,240 @@ mod paint_tests {
              an item is as quiet on screen as the one that does not"
         );
         assert_ne!(after.button_under(CREATE_SECOND_LABEL).1, theme::BLUE);
+    }
+
+    // -----------------------------------------------------------------------
+    // The dismiss ✕
+    //
+    // Driven through `draw_export_modal` / `draw_import_modal` and NOT through
+    // the two `draw_*_form` functions everything above uses, and that is the
+    // point: the mark sits under the modal's drag strip, which only exists in
+    // the modal wrapper. A test that pressed the mark on a bare form would
+    // pass against precisely the arrangement this app has shipped broken
+    // before -- a drag-sensing strip laid over a click-sensing mark, which
+    // egui resolves by swallowing the click.
+    // -----------------------------------------------------------------------
+
+    fn modal_input(events: &[egui::Event]) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 900.0),
+            )),
+            events: events.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn modal_context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(modal_input(&[]), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(modal_input(&[]), |_ui| {});
+        ctx
+    }
+
+    fn modal_click(at: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// Every line segment a frame laid down.
+    fn segments(output: &egui::FullOutput) -> Vec<[egui::Pos2; 2]> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<[egui::Pos2; 2]>) {
+            match shape {
+                egui::Shape::LineSegment { points, .. } => out.push(*points),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// Where the dismiss ✕ crosses on a card, found from the paint alone.
+    ///
+    /// The mark draws no galley, so it is two diagonals exactly
+    /// [`theme::CLOSE_MARK_SPAN`] across -- and nothing else on either of
+    /// these forms strokes a diagonal at all.
+    fn dismiss_mark(output: &egui::FullOutput) -> egui::Pos2 {
+        let arms: Vec<[egui::Pos2; 2]> = segments(output)
+            .into_iter()
+            .filter(|[a, b]| {
+                ((b.x - a.x).abs() - theme::CLOSE_MARK_SPAN).abs() < 0.01
+                    && ((b.y - a.y).abs() - theme::CLOSE_MARK_SPAN).abs() < 0.01
+            })
+            .collect();
+        assert_eq!(
+            arms.len(),
+            2,
+            "the card strokes {} arms the size of a ✕; it needs exactly two, and none is a \
+             modal with no mark in its corner",
+            arms.len()
+        );
+        let centre = arms[0][0].lerp(arms[0][1], 0.5);
+        assert!(
+            (arms[1][0].lerp(arms[1][1], 0.5) - centre).length() < 0.01,
+            "the two arms do not cross, so this is not a ✕"
+        );
+        centre
+    }
+
+    /// The mark is [`theme::MODAL_CLOSE_INSET`] off the card's own right-hand
+    /// edge, where the card's rect is the one egui measured for the modal's
+    /// `Area` -- not a number re-derived here from the form's padding.
+    fn assert_shared_inset(ctx: &egui::Context, area: &str, at: egui::Pos2) {
+        let card = egui::AreaState::load(ctx, egui::Id::new(area))
+            .expect("the modal has never been drawn")
+            .rect();
+        let box_right = at.x + theme::CLOSE_MARK_HIT / 2.0;
+        assert!(
+            (card.right() - box_right - theme::MODAL_CLOSE_INSET).abs() < 0.5,
+            "on {area} the mark's hit box ends {} points inside the card, not \
+             `theme::MODAL_CLOSE_INSET`'s {}",
+            card.right() - box_right,
+            theme::MODAL_CLOSE_INSET
+        );
+    }
+
+    /// **The composer's ✕ is drawn, and pressing it cancels -- the same answer
+    /// its own Cancel button gives.**
+    ///
+    /// **Neither of these two modals binds Escape**, here or in
+    /// `vault_window::mod`, so there is no keyboard gesture for the mark to
+    /// have to match; what it matches is [`EXPORT_CANCEL_LABEL`], which is the
+    /// card's existing way out. One is deliberately not invented in passing.
+    #[test]
+    fn the_composers_dismiss_mark_is_drawn_and_cancels() {
+        let ctx = modal_context();
+        let mut state = RecordSend::opening("itm-1", "SAP Production");
+        let run = |events: &[egui::Event], state: &mut RecordSend| {
+            let mut action = RecordUiAction::None;
+            let output = ctx.run_ui(modal_input(events), |ui| {
+                action = draw_export_modal(
+                    ui.ctx(),
+                    state,
+                    false,
+                    &FixedClock(NOW),
+                    &UTC,
+                );
+            });
+            (action, output)
+        };
+
+        // One sizing pass, then a live one -- an anchored `Area` paints
+        // nothing until egui has measured it.
+        let _ = run(&[], &mut state);
+        let (idle, drawn) = run(&[], &mut state);
+        assert_eq!(idle, RecordUiAction::None, "the card reported a press with no input");
+        let at = dismiss_mark(&drawn);
+        assert_shared_inset(&ctx, "record-send-modal", at);
+
+        let (action, _) = run(&modal_click(at), &mut state);
+        assert_eq!(
+            action,
+            RecordUiAction::Cancel,
+            "the composer's ✕ at {at:?} reported nothing -- either the card's drag strip \
+             swallowed the click, or the mark is drawn and dead"
+        );
+    }
+
+    /// **A composer with a `bw send create` in flight does not answer its
+    /// ✕**, for the same reason it greys its Cancel: walking away from the
+    /// card leaves a child writing into state nobody is watching. A mark that
+    /// stayed live beside a greyed Cancel would be a second exit from a state
+    /// the card's own exit refuses -- the exact hazard this pass exists to
+    /// remove rather than to add.
+    #[test]
+    fn the_composers_dismiss_mark_is_dead_while_the_send_is_in_flight() {
+        let ctx = modal_context();
+        let mut state = RecordSend::opening("itm-1", "SAP Production");
+        let run = |events: &[egui::Event], in_flight: bool, state: &mut RecordSend| {
+            let mut action = RecordUiAction::None;
+            let output = ctx.run_ui(modal_input(events), |ui| {
+                action = draw_export_modal(
+                    ui.ctx(),
+                    state,
+                    in_flight,
+                    &FixedClock(NOW),
+                    &UTC,
+                );
+            });
+            (action, output)
+        };
+
+        let _ = run(&[], true, &mut state);
+        let (_, drawn) = run(&[], true, &mut state);
+        // It is still PAINTED -- a control that vanished for the duration
+        // would read as the card changing shape.
+        let at = dismiss_mark(&drawn);
+
+        let (action, _) = run(&modal_click(at), true, &mut state);
+        assert_eq!(
+            action,
+            RecordUiAction::None,
+            "the ✕ closed a composer with a send in flight, which its own Cancel button \
+             refuses to do"
+        );
+    }
+
+    /// **The import card's ✕ is drawn, and pressing it cancels.**
+    ///
+    /// On this card the mark is not a consistency but a FIX. The import form
+    /// has no Cancel button -- its footer holds `Fetch` and the create -- and
+    /// nothing binds Escape for it, so before this mark existed a user who
+    /// opened `Import from a Send...` and changed their mind had no gesture at
+    /// all that put the card away. `vault_window::mod` has always had the
+    /// `RecordUiAction::Cancel` arm that closes it; nothing ever produced one.
+    #[test]
+    fn the_import_cards_dismiss_mark_is_drawn_and_cancels() {
+        let ctx = modal_context();
+        let mut state = RecordImport::opening();
+        let run = |events: &[egui::Event], state: &mut RecordImport| {
+            let mut action = RecordUiAction::None;
+            let output = ctx.run_ui(modal_input(events), |ui| {
+                action = draw_import_modal(
+                    ui.ctx(),
+                    state,
+                    &Collision::Fresh,
+                    &FixedClock(NOW),
+                );
+            });
+            (action, output)
+        };
+
+        let _ = run(&[], &mut state);
+        let (idle, drawn) = run(&[], &mut state);
+        assert_eq!(idle, RecordUiAction::None, "the card reported a press with no input");
+        let at = dismiss_mark(&drawn);
+        assert_shared_inset(&ctx, "record-import-modal", at);
+
+        let (action, _) = run(&modal_click(at), &mut state);
+        assert_eq!(
+            action,
+            RecordUiAction::Cancel,
+            "the import card's ✕ at {at:?} reported nothing -- and it is this card's only way \
+             out, so a dead mark here is a modal a user cannot leave"
+        );
     }
 }

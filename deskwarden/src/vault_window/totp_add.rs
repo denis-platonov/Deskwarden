@@ -2762,7 +2762,7 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
 // mean painting a coloured band the design does not draw and inventing two
 // answers it does not ask for, so the card is built here. What is NOT built
 // here is anything the design system already owns: the colours are `theme`'s,
-// the ✕ is `theme::close_glyph`, and the keycap is
+// the ✕ is `theme::modal_dismiss_mark`, and the keycap is
 // `theme::paint_return_keycap`.
 // ---------------------------------------------------------------------------
 
@@ -3524,18 +3524,23 @@ fn picker_header(ui: &mut egui::Ui) -> (bool, egui::Rect) {
         theme::INK,
     );
 
-    // The ✕ is `theme::close_glyph` and not a typed U+2715: that codepoint is
-    // in neither Archivo nor egui's fallback stack and reaches the screen as
-    // a tofu box, which is the measurement `theme` records beside it.
-    let mut inner = ui.new_child(
-        egui::UiBuilder::new()
-            .max_rect(egui::Rect::from_min_max(
-                egui::pos2(content.left() + HEADER_PAD_X, content.top() + HEADER_PAD_Y),
-                egui::pos2(content.right() - HEADER_PAD_X, content.bottom() - HEADER_PAD_Y),
-            ))
-            .layout(egui::Layout::right_to_left(egui::Align::Center)),
-    );
-    let close = theme::close_glyph(&mut inner);
+    // The ✕ is `theme::modal_dismiss_mark` and not a typed U+2715: that
+    // codepoint is in neither Archivo nor egui's fallback stack and reaches
+    // the screen as a tofu box, which is the measurement `theme` records
+    // beside it.
+    //
+    // **It moved four points out**, and that is the whole reason it goes
+    // through `theme` now. This header used to right-align the mark inside its
+    // own [`HEADER_PAD_X`], which put the 16pt box 18 points off the card;
+    // `prefs_ui` put its identical box 14 off. Same glyph, same size, two
+    // answers, neither file aware of the other. `theme::MODAL_CLOSE_INSET`
+    // settles it at 14 -- see that constant for why the smaller number is the
+    // one that lines the *ink* up with this card's 18-point content column
+    // rather than lining up the invisible box around it.
+    //
+    // `content` and not `band`: the band's last point is the rule under it,
+    // and centring the mark on that would drop it half a point low.
+    let close = theme::modal_dismiss_mark(ui, content, theme::CloseInk::OnCard);
     (close.clicked(), close.rect)
 }
 

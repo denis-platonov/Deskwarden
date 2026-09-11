@@ -6422,14 +6422,18 @@ fn draw_discard_confirm(ctx: &egui::Context) -> Option<DiscardAnswer> {
     theme::movable_modal(ctx, egui::Area::new(egui::Id::new("detail-edit-discard-modal")))
         .show(ctx, |ui| {
             theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
-            egui::Frame::new()
+            let framed = egui::Frame::new()
                 .fill(theme::CARD)
                 .corner_radius(CornerRadius::same(10))
                 .stroke(Stroke::new(1.0, theme::BORDER))
                 .inner_margin(Margin::same(20))
                 .show(ui, |ui| {
                     ui.set_width(320.0);
-                    ui.label(theme::bold(DISCARD_TITLE, 15.0).color(theme::INK));
+                    // The title's own rectangle goes back out to the caller:
+                    // it is the line the dismiss ✕ is hung on, once this frame
+                    // has measured the card. See `theme::modal_corner_mark`.
+                    let title =
+                        ui.label(theme::bold(DISCARD_TITLE, 15.0).color(theme::INK)).rect;
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new(DISCARD_BODY).size(12.0).color(theme::TEXT_FAINT),
@@ -6461,7 +6465,30 @@ fn draw_discard_confirm(ctx: &egui::Context) -> Option<DiscardAnswer> {
                             },
                         );
                     });
+                    title
                 });
+            // **The ✕ means "keep editing", and on this one card that had to
+            // be worked out rather than assumed.**
+            //
+            // Everywhere else in this app the dismiss mark is the harmless
+            // answer by construction: the card is a report, or a form whose
+            // Cancel throws away nothing that was not already provisional.
+            // Here both answers are real, one of them destroys typing the user
+            // has not saved, and the mark sits in the corner a person reaches
+            // for reflexively to make a dialog go away. If it resolved to
+            // Discard, this card would be a confirmation whose most reflexive
+            // gesture gives the answer it was put on screen to stop someone
+            // giving by accident -- with no second chance and nothing to undo.
+            //
+            // So it resolves to `DiscardAnswer::KeepEditing`, which is what
+            // Escape already resolves to here for the same reason (see this
+            // function's doc). The two get-me-out gestures agree, the
+            // destructive answer still requires the pointer on a button that
+            // says what it does, and nothing reachable through the mark is
+            // unreachable through the key.
+            if theme::modal_corner_mark(ui, framed.response.rect, framed.inner) {
+                answer = Some(DiscardAnswer::KeepEditing);
+            }
         });
 
     // Escape resolves to the SAFE answer. See this function's doc.
@@ -13791,6 +13818,114 @@ mod edit_pane_layout_tests {
                 );
             }
         }
+    }
+
+    /// Where the discard confirmation's dismiss ✕ crosses, found from the
+    /// paint.
+    ///
+    /// The mark draws no galley, so it is found by geometry: two strokes whose
+    /// visual bounds are the same square box [`theme::CLOSE_MARK_SPAN`]
+    /// across, sitting on the card's title line. Both arms of a ✕ share one
+    /// bounding box exactly because they cross, which is the cheap way to say
+    /// "this is a ✕ and not two parallel slashes".
+    fn discard_dismiss_mark(painted: &Painted) -> Pos2 {
+        let title = painted.rect_of(DISCARD_TITLE);
+        // The stroke widens the visual bounds by half its width on each side.
+        let span = theme::CLOSE_MARK_SPAN;
+        let arms: Vec<Rect> = painted
+            .marks
+            .iter()
+            .filter(|(kind, r)| {
+                *kind == "a line"
+                    && (r.width() - r.height()).abs() < 0.01
+                    && (r.width() - span).abs() < 2.0
+                    && (r.center().y - title.center().y).abs() < 1.0
+            })
+            .map(|(_, r)| *r)
+            .collect();
+        assert_eq!(
+            arms.len(),
+            2,
+            "the confirmation's title line carries {} strokes the size of a ✕ arm; it needs \
+             exactly two, and none at all is the card having no way out of its corner. It \
+             painted {:?}",
+            arms.len(),
+            painted.marks
+        );
+        assert_eq!(
+            arms[0], arms[1],
+            "the two arms do not share a bounding box, so they do not cross"
+        );
+        arms[0].center()
+    }
+
+    /// **The confirmation carries a dismiss ✕, and it means KEEP EDITING.**
+    ///
+    /// This is the one card in the app where the corner mark's meaning had to
+    /// be argued rather than assumed, and the argument is
+    /// [`draw_discard_confirm`]'s: both of this card's answers are real, one
+    /// of them destroys typing that was never saved, and the corner ✕ is the
+    /// gesture a person makes without reading. So it resolves to the safe
+    /// answer -- which is also exactly what Escape resolves to here. This test
+    /// and [`escape_on_the_discard_confirmation_keeps_editing`] are the same
+    /// assertion about the two gestures, deliberately written out twice: what
+    /// has to hold is that neither reaches a state the other cannot, and a
+    /// single test that drove one of them would say nothing about the pair.
+    ///
+    /// Asserted with the secrets, for
+    /// [`escape_on_the_discard_confirmation_keeps_editing`]'s reason: "the ✕
+    /// closed the dialog" and "the ✕ discarded the draft" look identical from
+    /// the outside if the only thing checked is that the dialog went away.
+    ///
+    /// It is also the guard that the card's drag strip does not swallow the
+    /// click. The strip covers `theme::MODAL_PLAIN_HEADER_HEIGHT`, which is
+    /// this whole title line, so a mark registered before it would paint,
+    /// hover, and do nothing.
+    #[test]
+    fn the_dismiss_mark_on_the_discard_confirmation_keeps_editing() {
+        let ctx = styled_context(ROOMY_PANE);
+        let mut draft = edited_draft_full_of_secrets();
+        let typed = draft.clone();
+        assert_eq!(click_labelled(&ctx, &mut draft, "Cancel"), EditAction::None);
+        assert!(draft.discard_prompt, "nothing is up for the ✕ to answer");
+
+        // Two frames with the card up: an `egui::Area` egui has not seen
+        // spends its first pass measuring and paints nothing, so the mark is
+        // only hittable from the pass after that.
+        let no_input: &[egui::Event] = &[];
+        let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, no_input);
+        let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, no_input);
+        let at = discard_dismiss_mark(&painted);
+
+        let (action, _) = acting_frame_for(
+            &ctx,
+            ROOMY_PANE,
+            &mut draft,
+            true,
+            &click(at),
+            None,
+            &detail::TotpState::NoSecret,
+        );
+
+        assert!(
+            !draft.discard_prompt,
+            "the ✕ at {at:?} did not dismiss the confirmation -- either it is drawn and dead, \
+             or the header's drag strip swallowed the click"
+        );
+        assert_eq!(
+            action,
+            EditAction::None,
+            "the ✕ on the discard confirmation DISCARDED the draft -- the corner gesture was \
+             wired to the destructive answer"
+        );
+        assert_eq!(draft.password, typed.password, "the ✕ wiped the password");
+        assert_eq!(draft.totp, typed.totp, "the ✕ wiped the TOTP seed");
+        assert_eq!(draft.note_body, typed.note_body, "the ✕ wiped the note body");
+        assert!(
+            draft.is_dirty(),
+            "a draft kept by the ✕ stopped counting as dirty, so the next Cancel walks straight \
+             out with the user's edits"
+        );
     }
 
     /// **Escape answers the confirmation SAFELY, and cannot answer it any

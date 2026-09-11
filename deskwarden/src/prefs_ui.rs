@@ -6226,20 +6226,16 @@ pub fn draw_prefs_modal(ctx: &egui::Context, state: &mut PrefsState) -> PrefsAct
                 theme::INK,
             );
 
-            // The ✕, in the header's right-hand end. `theme::close_glyph` is
-            // the same mark `card_header_with_close` puts on the overlay --
-            // drawn as two strokes, because U+2715 is a tofu box in this
-            // app's face.
-            let close_rect = Rect::from_center_size(
-                Pos2::new(header.max.x - 22.0, header.center().y),
-                Vec2::splat(16.0),
-            );
-            let mut close_ui = ui.new_child(
-                egui::UiBuilder::new()
-                    .max_rect(close_rect)
-                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-            );
-            if theme::close_glyph(&mut close_ui).clicked() {
+            // The ✕, in the header's right-hand end, through
+            // `theme::modal_dismiss_mark` -- which is the same mark this file
+            // used to place by hand, at the same place, and is now the only
+            // definition of it in the crate. The geometry did not move: the
+            // helper insets its 16pt box `theme::MODAL_CLOSE_INSET` from the
+            // rectangle's right edge, and 14 is the number this card's
+            // hand-placed `max.x - 22.0` centre already worked out to. The
+            // child `Ui` and the rectangle arithmetic went with the move;
+            // `header` is the band and the helper does the rest.
+            if theme::modal_dismiss_mark(ui, header, theme::CloseInk::OnCard).clicked() {
                 action = PrefsAction::Close;
             }
 

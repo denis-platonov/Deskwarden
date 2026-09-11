@@ -76,14 +76,18 @@ pub fn draw_folder_edit_modal(ctx: &egui::Context, state: &mut FolderEditState) 
     theme::movable_modal(ctx, egui::Area::new(egui::Id::new("folder-edit-modal")))
         .show(ctx, |ui| {
             theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
-            egui::Frame::new()
+            let framed = egui::Frame::new()
                 .fill(theme::CARD)
                 .corner_radius(CornerRadius::same(10))
                 .stroke(Stroke::new(1.0, theme::BORDER))
                 .inner_margin(Margin::same(20))
                 .show(ui, |ui| {
                     ui.set_width(320.0);
-                    ui.label(theme::bold("Edit folder", 15.0).color(theme::INK));
+                    // The title's own rectangle goes back out to the caller,
+                    // which is the line the dismiss ✕ is hung on once this
+                    // frame has measured the card. See `theme::modal_corner_mark`.
+                    let title =
+                        ui.label(theme::bold("Edit folder", 15.0).color(theme::INK)).rect;
                     ui.add_space(14.0);
                     theme::field_label(ui, "Folder name");
                     ui.add_space(6.0);
@@ -127,7 +131,24 @@ pub fn draw_folder_edit_modal(ctx: &egui::Context, state: &mut FolderEditState) 
                             }
                         });
                     });
+                    title
                 });
+            // The ✕ in the card's corner, drawn last so it is on top of both
+            // the card's own contents and the drag strip under them.
+            //
+            // **It is Cancel and nothing else.** This card has two other
+            // answers -- a Save that writes and a Delete that, once armed,
+            // destroys a folder -- and a dismiss control that resolved to
+            // either of those would be a gesture meaning something different
+            // here than on every other card in the app. It is exactly what
+            // Escape does at the bottom of this function, which is the rule:
+            // the mark is a second surface for a gesture that already exists,
+            // never a third outcome. A folder half-renamed in the box is
+            // thrown away either way, and that is already true of the Cancel
+            // button beside Save.
+            if theme::modal_corner_mark(ui, framed.response.rect, framed.inner) {
+                action = FolderEditAction::Cancel;
+            }
         });
 
     // Esc cancels, same as every other transient overlay in this app.
@@ -147,10 +168,15 @@ mod tests {
     /// with room around it, so "a point outside the card" is a real point.
     const BODY: Vec2 = Vec2::new(900.0, 700.0);
 
-    /// Every string this frame painted, with where it landed.
+    /// Every string this frame painted, with where it landed, and every line
+    /// it stroked.
     #[derive(Default)]
     struct Painted {
         texts: Vec<(String, Rect)>,
+        /// Strokes, for the one control on this card that paints no words:
+        /// the dismiss ✕ in the title line. A test that could only see text
+        /// could not tell a card with a mark from one without.
+        segments: Vec<[Pos2; 2]>,
     }
 
     impl Painted {
@@ -189,6 +215,7 @@ mod tests {
                 text.galley.text().to_string(),
                 Rect::from_min_size(text.pos, text.galley.size()),
             )),
+            egui::Shape::LineSegment { points, .. } => painted.segments.push(*points),
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     walk(shape, painted);
@@ -349,6 +376,133 @@ mod tests {
         assert!(
             !painted.has("Confirm delete"),
             "the modal opened already showing the delete confirmation"
+        );
+    }
+
+    // -- the dismiss ✕ --------------------------------------------------------
+
+    /// Where the dismiss ✕'s two arms cross, found from the paint.
+    ///
+    /// By geometry rather than by a computed rectangle, so the test cannot be
+    /// satisfied by a mark this file *thinks* it placed: the two arms are the
+    /// only diagonals this card strokes at all.
+    fn dismiss_mark(painted: &Painted) -> Pos2 {
+        let arms: Vec<&[Pos2; 2]> = painted
+            .segments
+            .iter()
+            .filter(|[a, b]| {
+                (b.x - a.x).abs() > 0.5 && ((b.x - a.x).abs() - (b.y - a.y).abs()).abs() < 0.01
+            })
+            .collect();
+        assert_eq!(
+            arms.len(),
+            2,
+            "the card strokes {} diagonals; the dismiss ✕ is exactly two, and a card with no \
+             mark on it is the defect this test exists for",
+            arms.len()
+        );
+        let centre = arms[0][0].lerp(arms[0][1], 0.5);
+        assert!(
+            (arms[1][0].lerp(arms[1][1], 0.5) - centre).length() < 0.01,
+            "the two arms do not cross, so this is not a ✕"
+        );
+        centre
+    }
+
+    /// **The mark is drawn, on the title's own line, at the app's one corner
+    /// inset.**
+    ///
+    /// The inset is asserted against `theme::MODAL_CLOSE_INSET` and the card's
+    /// own geometry rather than against a number typed here, because the whole
+    /// point of the shared primitive is that this card cannot have an inset of
+    /// its own. Get this wrong and the mark drifts card by card, which is the
+    /// state the ✕ pass was opened to end.
+    #[test]
+    fn the_title_line_carries_the_dismiss_mark_at_the_shared_inset() {
+        let ctx = styled_context();
+        let mut state = state();
+        let painted = opened(&ctx, &mut state);
+
+        let title = painted.rect_of("Edit folder");
+        let at = dismiss_mark(&painted);
+
+        // The card's right-hand edge, taken from the rectangle egui really
+        // laid the modal's `Area` out in -- not re-derived here from the
+        // column width and the frame's padding, which is exactly the
+        // arithmetic `theme::modal_corner_mark` refuses to trust.
+        let card = egui::AreaState::load(&ctx, egui::Id::new("folder-edit-modal"))
+            .expect("the modal has never been drawn")
+            .rect();
+        let box_right = at.x + theme::CLOSE_MARK_HIT / 2.0;
+        assert!(
+            (card.right() - box_right - theme::MODAL_CLOSE_INSET).abs() < 0.5,
+            "the mark's hit box ends {} points inside the card's edge, not \
+             `theme::MODAL_CLOSE_INSET`'s {}",
+            card.right() - box_right,
+            theme::MODAL_CLOSE_INSET
+        );
+        assert!(
+            (at.y - title.center().y).abs() < 1.0,
+            "the mark sits at y={} and the title's line is centred on {}; a mark centred on \
+             `MODAL_PLAIN_HEADER_HEIGHT` instead floats above the words it belongs beside",
+            at.y,
+            title.center().y
+        );
+    }
+
+    /// **And pressing it cancels -- the same answer Escape gives.**
+    ///
+    /// The half a paint test cannot reach, and the half this app has shipped
+    /// broken before. It is also the guard that the header's drag strip does
+    /// not swallow the click: that strip covers `MODAL_PLAIN_HEADER_HEIGHT`,
+    /// which is this whole title line, so a mark registered before it would be
+    /// drawn, hovered, and dead. `theme::modal_drag_handle` records why.
+    ///
+    /// The answer is `Cancel` and could not be Save or Delete: the mark is a
+    /// second surface for a gesture this card already had, never a third
+    /// outcome. The control below is that Escape reaches the same one.
+    #[test]
+    fn pressing_the_dismiss_mark_cancels_exactly_as_escape_does() {
+        let ctx = styled_context();
+        let mut state = state();
+        let at = dismiss_mark(&opened(&ctx, &mut state));
+
+        let (action, _) = frame(&ctx, &mut state, &click(at));
+        assert_eq!(
+            action,
+            FolderEditAction::Cancel,
+            "the ✕ at {at:?} did not cancel the folder modal"
+        );
+
+        // The control: Escape, on a freshly opened card, reaches the same
+        // answer -- so the mark is the existing gesture and not a new one.
+        let keyed_ctx = styled_context();
+        let mut keyed = FolderEditState::new("fld-7".into(), "Work/Clients".into());
+        let _ = opened(&keyed_ctx, &mut keyed);
+        let (by_key, _) = frame(&keyed_ctx, &mut keyed, &escape());
+        assert_eq!(
+            by_key, action,
+            "the ✕ and Escape give this card different answers"
+        );
+    }
+
+    /// **The mark does not answer the armed delete.** Arming Delete and then
+    /// pressing the ✕ must leave the folder alone -- the corner mark is the
+    /// way OUT of a card, and a card whose way out could destroy a folder is
+    /// the accident the two-click arm exists to prevent.
+    #[test]
+    fn the_dismiss_mark_over_an_armed_delete_still_only_cancels() {
+        let ctx = styled_context();
+        let mut state = state();
+        let _ = opened(&ctx, &mut state);
+        state.delete_armed = true;
+        let at = dismiss_mark(&frame(&ctx, &mut state, &[]).1);
+
+        let (action, _) = frame(&ctx, &mut state, &click(at));
+        assert_eq!(
+            action,
+            FolderEditAction::Cancel,
+            "the ✕ over an armed delete answered something other than cancel"
         );
     }
 
