@@ -2576,13 +2576,16 @@ pub(super) fn menu_command_button(ui: &mut egui::Ui, entry: &MenuCommand) -> egu
 }
 
 /// `box-shadow: 0 1px 2px rgba(45, 43, 43, 0.06)` -- the design's selected
-/// row. Alpha is `0.06 * 255`, rounded.
-const SELECTED_ROW_SHADOW: egui::Shadow = egui::Shadow {
-    offset: [0, 1],
-    blur: 2,
-    spread: 0,
-    color: egui::Color32::from_rgba_unmultiplied_const(45, 43, 43, 15),
-};
+/// row.
+///
+/// **The value moved to [`theme::SELECTED_ROW_SHADOW`]; this is the local
+/// name for it, not a second copy.** Design 5b's Sends screen takes this same
+/// column over and draws its own rows, and while this token was private here
+/// that screen's selected row simply had no shadow -- one of three ways the
+/// hand-rebuilt Send row came out looking like a different application in the
+/// same slot. The name is kept because `item_row` reads far better for it
+/// than for a fully-qualified path in the middle of a `Frame` builder.
+const SELECTED_ROW_SHADOW: egui::Shadow = theme::SELECTED_ROW_SHADOW;
 
 #[cfg(test)]
 mod tests {

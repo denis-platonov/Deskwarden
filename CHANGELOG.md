@@ -15,6 +15,121 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### The Sends screen wears the design system
+
+Design 5b's caption for this screen is *SAME LIST + DETAIL AS THE VAULT*, and
+the two columns did not look like the same application. Every box on the
+screen had been measured correctly; nobody had ever put it next to the design,
+because `examples/ui_preview.rs` -- which can render and self-screenshot the
+vault, the item list, the rail, the health screen and several modals -- had no
+flag for Sends. It has one now: `cargo run --example ui_preview -- --sends`
+writes six states of the screen into `target/ui_preview_sends/`, including the
+whole thing at the smallest window the app allows.
+
+What the picture showed, and what changed:
+
+* **The list rows were typeset a weight lighter than the vault rows beside
+  them.** A Send's name was drawn in the plain proportional face where an item's
+  name is Archivo SemiBold, its second line one grey fainter, and its selected
+  row had none of the shadow the item row lifts with. All three now come from
+  the same place -- the selected-row shadow has moved into `theme`, where "what
+  does a picked row look like" is answered once for both columns.
+* **Nothing in the list receded.** Design 5b draws a Send whose link has ended
+  at 72% opacity, so the live ones come forward; every row was at full
+  strength, and a revoked link had exactly the weight of one somebody was about
+  to open.
+* **Seventy points of grey prose sat above the first row.** Two standing
+  sentences -- what this app can and cannot do with a Send, and what the `FILE`
+  tag means -- were the first thing the eye met on the screen. Both are true
+  and both are worth saying; they are a footnote under the column now, where
+  the rail already keeps its own standing line.
+* **The strip had two equal grey buttons where the vault has one blue one.**
+  New Send is the primary now and Refresh is a secondary, so the column has one
+  emphasis rather than two.
+* **The detail header was a band, then a toolbar.** 5b puts the controls on the
+  title's own line, right-aligned, with a clear hierarchy; this pane had three
+  interchangeable grey boxes on a row of their own underneath. They sit on the
+  title's line whenever the window is wide enough to hold them there, and
+  Copy link -- what the screen is *for* -- is the primary.
+* **The line that answers the screen's question was the smallest thing on it.**
+  Design 5c argues that whether a Send was used is the first line and not a log
+  entry; it was drawn at caption size and weight under a header that outweighed
+  it.
+* **A long name in the detail header was cut off with nothing to say so.** At
+  the minimum window size the 21px title ran to the pane edge and stopped. It
+  is elided with the design's own ellipsis now, like every other run on the
+  screen.
+* **A Send somebody has opened now says so.** Design 5c ends its history with
+  an amber band -- *this has been seen, act on it* -- and that band, unlike the
+  per-access timeline above it, is a reading of one number this client already
+  holds. 5c's timeline is still deliberately not built: nothing records it.
+* `Shared with me` counted its rows as "3 sends". They are records somebody
+  shared *with* you; saying you published three was the opposite of the truth.
+* With no Sends at all, the detail column said *"Pick a Send to see its
+  link"* beside a column that had just said there were none. An instruction is
+  only drawn when it can be followed.
+
+Two defects in the design system itself came out of this. A button placed into
+a measured rectangle could silently grow past it -- egui adds its own padding
+and will wrap a label -- which made the Cancel that stands in Delete's exact
+rectangle two points wider and eight points taller than the Delete it replaces,
+and that equality is the whole mis-click defence. And placing a control inside
+a band that has already been allocated winds the layout cursor *backwards*, so
+the detail pane's body opened flush against the header's hairline with its own
+top margin applied from the wrong place.
+
+### A three-character secret is no longer accepted as a one-time code
+
+Typing `asd` into **Secret key or otpauth:// URI** was answered with a green
+check and *"Valid base32 · 3 characters · spaces ignored"*. It is not. Base32
+packs five bits into every character, so three of them are fifteen bits -- one
+byte and seven bits of a byte that was never typed. There is no seed in there
+to decode, and a code saved from it would never have matched anything.
+
+Deskwarden now checks that the length of a secret is one that can decode at
+all, and when it cannot, the line under the field says so in its own words:
+the characters are fine, the count is not, and a length like that is always
+exactly one character away from one that works -- a character dropped, or a
+character copied twice, which is what happens when a seed is read off a card
+by eye.
+
+Nothing has become stricter about secrets that are merely *short*. A
+four-character seed is still accepted, because how much seed is enough is the
+site's decision and not Deskwarden's.
+
+### Typing a code by hand no longer reads your own typing back to you
+
+Once a typed secret parsed, the card grew a **What was extracted** block:
+Secret, Issuer, Account and Parameters, one row each. Those rows belong to a
+code that was *scanned*, where nobody read the QR -- a decoder did -- and the
+issuer and the account are the only view anyone has of what it said. For a
+secret typed by hand they were your own keystrokes restated a few pixels under
+the box you were still typing in, which checks nothing.
+
+The by-hand card now ends where its design ends: the field, the line beneath
+it, the digits and period controls, and the live code with its countdown. The
+live code stays because it is the one thing on that card with a second source
+to be compared against -- the code the site is showing at that moment -- and
+comparing those two is the check that tells you the seed is right. Adding a
+code by scanning it is unchanged.
+
+### The scan overlay no longer blurs the screen you are trying to point at
+
+Choosing **Scan the code on my screen** dimmed the desktop, as it was meant to,
+and also blurred it -- so the QR code you were being asked to drag a box around
+was a soft smear with no edges. The bar at the bottom stayed sharp, which made
+it look like the screen behind it had simply gone dark.
+
+The cause was the call that asks Windows to let a window's transparency through.
+The twenty-year-old way to make that request is to ask for a blur behind the
+window and then hand Windows an empty list of places to blur; on Windows 11
+build 26200 the empty list is being read as "everywhere". Deskwarden now asks
+for the same transparency a different way, one that has no blur in it at all.
+
+While the overlay was opening, a small white window used to appear and then
+jump to its final size and position. It is created off-screen and placed before
+anything shows it now, so there is nothing to see until the dim arrives.
+
 ### Sends has a list and a detail pane, like the vault
 
 The Sends screen was a single column of rows with every control crammed onto

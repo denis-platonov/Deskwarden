@@ -19,8 +19,15 @@
 //! cargo run --example ui_preview -- --cli-setup --screenshot      # the CLI requirement modal
 //! cargo run --example ui_preview -- --backend-choice --screenshot # the self-hosted backend choice
 //! cargo run --example ui_preview -- --vault --screenshot        # the Vault page, both clients
+//! cargo run --example ui_preview -- --sends --screenshot        # design 5b's Sends screen, six states
 //! cargo run --example ui_preview -- --all                 # EVERY surface below
 //! ```
+//!
+//! `--sends` writes six PNGs into `target/ui_preview_sends/`: a Send picked,
+//! nothing picked, the composer, an account with none, `Shared with me`, and
+//! the whole screen at the app's minimum window size. It is a directory for
+//! the reason `--vault` and `--kinds` are -- the states are only worth
+//! looking at beside each other, and beside design 5b.
 //!
 //! `--all` is what CI runs. It walks [`Surface`] in one process -- one
 //! `run_native`, resized between surfaces -- and writes a PNG per surface into
@@ -66,6 +73,7 @@ use deskwarden::hello::HelloState;
 use deskwarden::login_ui::{self, BwStatus, LoginForm};
 use deskwarden::kind_mark;
 use deskwarden::local_time;
+use deskwarden::receive_history::{ReceiveHistory, ReceivedRecord};
 use deskwarden::send;
 use deskwarden::vault_bridge::{Folder, ItemKind, VaultItem};
 use deskwarden::vault_window::detail::{self, RevealState, TotpState};
@@ -75,6 +83,7 @@ use deskwarden::vault_window::password_health;
 use deskwarden::vault_window::sidebar::{self, SidebarFilter};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
 use deskwarden::vault_window::rehearsal;
+use deskwarden::vault_window::send_ui::{self, SendComposer};
 use deskwarden::vault_window::totp_add::{self, TotpAdd};
 use deskwarden::{app_identity::AppIdentityCache, prefs_ui, scratch_window, theme};
 use eframe::egui::{self, Margin};
@@ -390,6 +399,43 @@ enum Surface {
     /// The empty line is a result and not a blank pane, and this is where
     /// that is looked at.
     VaultHealthEmptyFilter,
+    /// **Design 5b's Sends screen, whole, with a Send picked.**
+    ///
+    /// The surface this example was missing for the whole of the Sends
+    /// feature's life, and the reason the owner could say "Send UI is very
+    /// basic - not even close to UI" about a screen every one of whose boxes
+    /// had been measured correctly. Every pass before this one verified
+    /// rectangles in isolation; nobody had put the screen beside 5b.
+    ///
+    /// It is drawn at the width the pane really gets -- the window minus the
+    /// rail -- because the whole question 5b asks is whether the list column
+    /// and the detail column read as ONE screen. A shot of either alone
+    /// cannot show that, which is exactly how a list row drawn in a lighter
+    /// face than the vault row it shares a column with survived this long.
+    SendsSelected,
+    /// The same screen with **nothing picked**: the list on its own beside
+    /// the prompt. The state the screen opens in, and therefore the one that
+    /// decides whether a user's eye goes to a row or to an empty column.
+    SendsList,
+    /// The same screen with the **composer open**, which takes the detail
+    /// column exactly as the vault's edit form takes the read pane.
+    SendsComposer,
+    /// The account with **no Sends at all**. The empty case is a sentence,
+    /// not a blank pane, and this is where whether it reads as one is looked
+    /// at.
+    SendsEmpty,
+    /// **`Shared with me`**: the received-records screen, which shares this
+    /// pane and has neither state pills nor a fetch behind it.
+    SendsReceived,
+    /// **The whole screen at `settings::MIN_VAULT_WINDOW_SIZE`.**
+    ///
+    /// 688x600 of pane, which leaves the detail column 298pt -- the width at
+    /// which this screen has broken every time it has broken. It is a
+    /// separate surface rather than a resize of [`Surface::SendsSelected`]
+    /// because the two have to be laid side by side: the defect is never
+    /// "something is missing", it is "the same pane reads differently", and
+    /// only the pair shows that.
+    SendsNarrow,
     /// **The vault window's item list**, at the exact width the window gives
     /// it, with a card of every network this app can name in it.
     ///
@@ -580,6 +626,27 @@ const SIDEBAR_WIDTH: f32 = 212.0;
 /// surface rather than the top of it. The shipped window is 740 high.
 const PANE_HEIGHT: f32 = 740.0;
 
+/// The Sends screen's own width: the whole window less the rail.
+///
+/// **The pane, not the detail column.** `send_ui::draw_send_pane` puts its
+/// own `Panel::left` at [`LIST_WIDTH`] inside whatever it is given and hangs
+/// the detail column off the remainder, so it has to be handed the width the
+/// `CentralPanel` in `vault_window::mod` hands it -- `1240 - 212`. Handed
+/// [`PANE_WIDTH`] it would draw a 390pt list beside a 248pt detail, which is
+/// a screen the app never shows.
+const SENDS_WIDTH: f32 = 1240.0 - 212.0;
+
+/// The same pane at `settings::MIN_VAULT_WINDOW_SIZE`, which is `(900, 600)`.
+///
+/// `900 - 212 = 688`, of which `draw_send_pane` gives 390 to the list and
+/// **298 to the detail column** -- the width this screen has broken at every
+/// time it has broken, and the one every new paint test on it is run at. A
+/// picture of it belongs beside the comfortable one for the same reason the
+/// two Vault-page shots belong beside each other: the thing under review is
+/// the difference.
+const SENDS_NARROW_WIDTH: f32 = 900.0 - 212.0;
+const SENDS_NARROW_HEIGHT: f32 = 600.0;
+
 /// The preferences window's body: its 1000x780 outer size less the 40pt
 /// chrome bar `draw_window_chrome` paints above `draw_prefs_body`. Spelled out
 /// rather than imported for the same reason [`PANE_WIDTH`] is -- an example is
@@ -645,6 +712,12 @@ const ALL: &[Surface] = &[
     Surface::VaultHealthWeakOnly,
     Surface::VaultHealthBreachedOnly,
     Surface::VaultHealthEmptyFilter,
+    Surface::SendsSelected,
+    Surface::SendsList,
+    Surface::SendsComposer,
+    Surface::SendsEmpty,
+    Surface::SendsReceived,
+    Surface::SendsNarrow,
     Surface::Rehearsal,
     Surface::VaultSetupSpinner,
     Surface::FirstWindowLoading,
@@ -715,6 +788,12 @@ impl Surface {
             Surface::VaultHealthWeakOnly => "vault_password_health_weak",
             Surface::VaultHealthBreachedOnly => "vault_password_health_breached_only",
             Surface::VaultHealthEmptyFilter => "vault_password_health_empty_filter",
+            Surface::SendsSelected => "sends_selected",
+            Surface::SendsList => "sends_list",
+            Surface::SendsComposer => "sends_composer",
+            Surface::SendsEmpty => "sends_empty",
+            Surface::SendsReceived => "sends_received",
+            Surface::SendsNarrow => "sends_narrow",
             Surface::Rehearsal => "rehearsal",
             Surface::VaultSetupSpinner => "vault_setup_spinner",
             Surface::FirstWindowLoading => "first_window_loading",
@@ -840,6 +919,14 @@ impl Surface {
             | Surface::VaultHealthWeakOnly
             | Surface::VaultHealthBreachedOnly
             | Surface::VaultHealthEmptyFilter => egui::vec2(LIST_WIDTH, PANE_HEIGHT),
+            // The Sends screen is TWO columns and is only worth looking at as
+            // one picture; see [`SENDS_WIDTH`].
+            Surface::SendsSelected
+            | Surface::SendsList
+            | Surface::SendsComposer
+            | Surface::SendsEmpty
+            | Surface::SendsReceived => egui::vec2(SENDS_WIDTH, PANE_HEIGHT),
+            Surface::SendsNarrow => egui::vec2(SENDS_NARROW_WIDTH, SENDS_NARROW_HEIGHT),
             // The viewport's own inner size, read off the module that builds
             // it -- so a window resized in the app is a preview resized with
             // it, rather than a picture of a layout nobody ships.
@@ -902,6 +989,12 @@ fn main() -> eframe::Result {
     let kinds = arg("--kinds");
     let rail = arg("--rail");
     let health = arg("--health");
+    // Design 5b's Sends screen, in every state that has a different SHAPE:
+    // a Send picked, nothing picked, the composer up, an account with none,
+    // `Shared with me`, and the whole thing at the app's minimum size. One
+    // flag for the six, exactly as `--vault` is one flag for a pair and
+    // `--kinds` is one for a trio -- what is under review is the set.
+    let sends = arg("--sends");
 
     // `--all` walks the whole list; otherwise the single surface the flags
     // name, exactly as this example has always behaved.
@@ -925,6 +1018,15 @@ fn main() -> eframe::Result {
         vec![Surface::VaultRail]
     } else if health {
         vec![Surface::VaultHealth]
+    } else if sends {
+        vec![
+            Surface::SendsSelected,
+            Surface::SendsList,
+            Surface::SendsComposer,
+            Surface::SendsEmpty,
+            Surface::SendsReceived,
+            Surface::SendsNarrow,
+        ]
     } else {
         vec![Surface::LoginUnlock]
     };
@@ -979,6 +1081,11 @@ fn main() -> eframe::Result {
         target_dir().join("ui_preview_vault_rail.png")
     } else if health {
         target_dir().join("ui_preview_vault_password_health.png")
+    } else if sends {
+        // A DIRECTORY, for `--vault`'s and `--kinds`' reason: this flag
+        // renders six states of one screen and the whole value of it is that
+        // they can be laid out together.
+        target_dir().join("ui_preview_sends")
     } else {
         target_dir().join("ui_preview_login.png")
     };
@@ -993,7 +1100,7 @@ fn main() -> eframe::Result {
             Ok(Box::new(Preview {
                 queue,
                 at: 0,
-                directory: all || vault || kinds,
+                directory: all || vault || kinds || sends,
                 out,
                 form: LoginForm::default(),
                 // The app name a real 3c card would have been pre-filled with,
@@ -1033,6 +1140,22 @@ fn main() -> eframe::Result {
                 // under its name, which is the taller of the row's two
                 // layouts.
                 health_selected: Some("health-weak".to_string()),
+                // 5b's own picked row: the Used Send whose link is dead and
+                // whose views are spent. Picked because it is the ONE row
+                // where every cell of the detail pane is in its interesting
+                // state at once -- a struck-through address, a full meter, a
+                // green pill and an activity sentence with something in it.
+                sends_selected: Some("send-sap".to_string()),
+                // A Waiting Send for the narrow shot, deliberately a
+                // different one: the pair is looked at side by side, and two
+                // pictures of the same Send would only show the width.
+                sends_narrow_selected: Some("send-wifi".to_string()),
+                // A record whose item IS still in `LIST_JSON`, so the received
+                // detail draws the present-tense sentence; the row below it
+                // in the same picture is the one whose item has gone.
+                sends_received_selected: Some("list-0001".to_string()),
+                sends_none_selected: None,
+                sends_composer: SendComposer::default(),
                 window_height: 0.0,
                 styled: false,
                 fixtures: Fixtures::new(),
@@ -1132,6 +1255,28 @@ struct Preview {
     rail_scope: sidebar::SendScope,
     /// The Password health shot's own selection state.
     health_selected: Option<String>,
+    /// Which row each Sends shot has picked.
+    ///
+    /// **One field per surface, not one shared field**, for
+    /// [`Preview::wide_selected`]'s reason and rather more sharply: the
+    /// Sends pane WRITES this -- a click is a write to `selected`, and the
+    /// screenshot run draws every surface in one process -- so a shared
+    /// selection would let the narrow shot's fixture decide what the wide
+    /// one showed, and a reviewer comparing the pair would be comparing two
+    /// different Sends.
+    sends_selected: Option<String>,
+    sends_narrow_selected: Option<String>,
+    sends_received_selected: Option<String>,
+    /// The two shots that are pictures of a column with NOTHING picked. A
+    /// field rather than a temporary, because the pane takes `&mut` and a
+    /// temporary would be a place a click could write to that nothing ever
+    /// read back.
+    sends_none_selected: Option<String>,
+    /// The composer shot's draft, held across frames because the composer is
+    /// `&mut` state the window owns and because the shot is of a form with
+    /// something typed in it -- an empty form shows neither the validation
+    /// line nor what a filled field looks like.
+    sends_composer: SendComposer,
     /// Last applied window height, for the login window's size-to-content.
     window_height: f32,
     /// Whether the theme has been applied yet. Done on the first update
@@ -1268,6 +1413,12 @@ impl eframe::App for Preview {
             | Surface::VaultHealthEmptyFilter => {
                 self.draw_vault_health(root, self.current())
             }
+            Surface::SendsSelected
+            | Surface::SendsList
+            | Surface::SendsComposer
+            | Surface::SendsEmpty
+            | Surface::SendsReceived
+            | Surface::SendsNarrow => self.draw_sends(root, self.current()),
             Surface::Rehearsal => self.draw_rehearsal(root),
             Surface::VaultSetupSpinner => self.draw_vault_setup_spinner(root),
             Surface::FirstWindowLoading
@@ -2146,6 +2297,109 @@ impl Preview {
             });
     }
 
+    /// **Design 5b's Sends screen**, drawn through `send_ui::draw_send_pane`
+    /// itself on the same `theme::CANVAS` `CentralPanel` -- margins included,
+    /// which here means NO margin: `vault_window::mod` gives that panel none,
+    /// because both of this screen's columns carry white strips that have to
+    /// span them edge to edge, and a margin on the container is exactly the
+    /// darker band the owner reported around the detail pane.
+    ///
+    /// **Nothing here reaches `bw`.** The pane is handed a `SendPaneState`
+    /// built by the shipped `pane_state` out of a `Result` stated outright,
+    /// so what these shots show is what the real screen shows for that
+    /// answer -- and the wording of every date on them comes from
+    /// `send_ui`'s own functions, against [`PREVIEW_MILLIS`] and
+    /// [`PREVIEW_ZONE`], so a shot does not change between runs.
+    ///
+    /// The verdict the pane returns is **applied and discarded here rather
+    /// than dropped**: `SendUiVerdict` counts its own abandonment, and the
+    /// shipped window `debug_assert!`s that count is zero. A preview that
+    /// let one fall on the floor would be a preview that trips that assertion
+    /// in a debug build -- which is the whole point of the counter, and not
+    /// something an example gets an exemption from.
+    fn draw_sends(&mut self, root: &mut egui::Ui, surface: Surface) {
+        // The composer's draft, seeded once and then left alone: it is `&mut`
+        // and the form writes into it, so re-seeding per frame would fight
+        // whatever the pane had just done and would re-allocate the secret
+        // body sixty times a second. `open` is the flag the shot turns on.
+        //
+        // **`open` is ASSIGNED on every surface, not just turned on for one.**
+        // One `Fixtures`-like value is shared by the whole walk, so a flag
+        // left standing put the composer on top of the surface drawn next --
+        // which is exactly what the first run of this preview showed, and is
+        // the same trap `draw_pane` records for `RevealState`.
+        let wants_composer = matches!(surface, Surface::SendsComposer);
+        if wants_composer && self.sends_composer.plan.name.is_empty() {
+            self.sends_composer.plan.name.push_str("Staging database");
+            self.sends_composer
+                .plan
+                .text
+                .push_str("host=db.staging.ledgerline.internal\nuser=deploy");
+            self.sends_composer.plan.max_access_count = Some(3);
+        }
+        self.sends_composer.open = wants_composer;
+
+        // Which answer the CLI is pretending to have given. `Empty` is the
+        // real empty ANSWER -- `Ok(vec![])` -- and not a filtered-away list,
+        // because those are two different screens and `pane_state` is the one
+        // place that difference is decided.
+        let answer: Result<Vec<send::SendSummary>, send::SendError> =
+            if matches!(surface, Surface::SendsEmpty) {
+                Ok(Vec::new())
+            } else {
+                Ok(self.fixtures.sends.clone())
+            };
+        let state = send_ui::pane_state(
+            Some(&answer),
+            &send::FixedClock(PREVIEW_MILLIS),
+            &PREVIEW_ZONE,
+        );
+
+        let received = send_ui::received_rows(
+            &self.fixtures.received,
+            &self.fixtures.list,
+            &send::FixedClock(PREVIEW_MILLIS),
+            &PREVIEW_ZONE,
+        );
+        let view = if matches!(surface, Surface::SendsReceived) {
+            send_ui::SendView::Received(&received)
+        } else {
+            send_ui::SendView::Mine(sidebar::SendScope::All)
+        };
+        // Each shot picks out of its OWN field; see `Preview::sends_selected`
+        // on why one shared selection would let one picture decide another's.
+        let selected: &mut Option<String> = match surface {
+            Surface::SendsSelected | Surface::SendsComposer => &mut self.sends_selected,
+            Surface::SendsNarrow => &mut self.sends_narrow_selected,
+            Surface::SendsReceived => &mut self.sends_received_selected,
+            // `SendsList` and `SendsEmpty` are the pictures of a column with
+            // nothing picked, so they are handed a selection that is None and
+            // stays None -- a field of their own would be a field nothing
+            // ever reads.
+            _ => &mut self.sends_none_selected,
+        };
+        let composer = &mut self.sends_composer;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::CANVAS))
+            .show(root, |ui| {
+                let verdict = send_ui::draw_send_pane(
+                    ui,
+                    &state,
+                    None,
+                    send_ui::SendDeleteView::default(),
+                    view,
+                    selected,
+                    composer,
+                    false,
+                    &send::FixedClock(PREVIEW_MILLIS),
+                    &PREVIEW_ZONE,
+                );
+                // Taken and thrown away: a preview has no window to act on.
+                // See the doc above for why it must not simply be dropped.
+                let _ = verdict.into_action();
+            });
+    }
+
     /// The surfaces that live *inside* the vault window rather than in one of
     /// their own, drawn on the window's own canvas so the PNG shows them
     /// against the background they actually sit on.
@@ -2318,6 +2572,10 @@ struct Fixtures {
     health: Vec<VaultItem>,
     /// One row of every kind -- see [`KINDS_JSON`].
     kinds: Vec<VaultItem>,
+    /// Design 5b's own five Sends plus a file one -- see [`SENDS_JSON`].
+    sends: Vec<send::SendSummary>,
+    /// The `Shared with me` screen's records -- see [`received_history`].
+    received: ReceiveHistory,
 }
 
 impl Fixtures {
@@ -2419,6 +2677,8 @@ impl Fixtures {
             rehearsal: rehearsal_view(),
             health: items(HEALTH_JSON),
             kinds: items(KINDS_JSON),
+            sends: sends(SENDS_JSON),
+            received: received_history(),
             // What a text field really holds after the design's sequence: the
             // Tab arrived as a tab, the Enter as a Windows line ending.
             rehearsal_arrived: format!(
@@ -2780,6 +3040,19 @@ fn items(json: &str) -> Vec<VaultItem> {
     serde_json::from_str(json).expect("the preview's fixture list must parse as VaultItems")
 }
 
+/// The Sends fixture, **through the shipped `bw send list` parser**.
+///
+/// Not a hand-built `Vec<SendSummary>`, for the reason every fixture in this
+/// file is a wire literal: a `SendSummary` written out by hand cannot stop
+/// describing the real thing, so it cannot warn anybody when the real thing
+/// changes. Taken through `parse_send_list`, a fixture that stops parsing is
+/// a fixture that stopped being what `bw` emits -- and `is_file`,
+/// `has_password` and the state derivation are then computed by the exact
+/// code the app runs, rather than asserted into the picture by the preview.
+fn sends(json: &str) -> Vec<send::SendSummary> {
+    send::parse_send_list(json).expect("the preview's Sends fixture must parse as a bw send list")
+}
+
 const LOGIN_JSON: &str = r#"{
   "id": "6f1c2f5e-0000-4a10-9c31-2b7a51d0a001",
   "type": 1,
@@ -2956,6 +3229,114 @@ const KINDS_JSON: &str = r#"[
     "id": "kinds-unknown", "type": 9, "name": "Something newer than this app"
   }
 ]"#;
+
+/// **Design 5b's own five Sends**, in `bw send list`'s wire shape, plus one
+/// this app could not have made.
+///
+/// The five are 5b's, name for name, and their dates are stated relative to
+/// [`PREVIEW_UNIX`] so each one derives -- through the shipped
+/// `send::send_state` and not through anything written here -- to the state
+/// 5b draws beside it:
+///
+/// * **SAP Production** is `Used`: one view of one is spent, which is the
+///   state that strikes its address through, fills its meter and makes its
+///   activity sentence say something.
+/// * **Office WiFi** and **Postgres** are `Waiting` and carry the two
+///   different subtitles a live Send has -- a view count, and a deadline.
+/// * **Remote Desktop** is `Expired`: its `expirationDate` has gone by while
+///   its `deletionDate` has not, which is the gap this client reads two dates
+///   to see and the one a screen reading `deletionDate` alone would call
+///   live.
+/// * **Atlas Studio** is `Revoked`, which is `disabled` and NOT deleted.
+///
+/// The sixth is a **file Send**, which 5b has none of and this screen must
+/// show: this app cannot create one, so the only way a user learns that a
+/// public link exists on their account is that it is listed here with its
+/// `FILE` tag and the paragraph that explains it. A fixture without one would
+/// leave both of those unlooked-at forever, which is precisely how they came
+/// to need looking at.
+const SENDS_JSON: &str = r#"[
+  {
+    "id": "send-sap", "name": "SAP Production", "type": 0,
+    "accessUrl": "https://send.deskwarden.app/g7HqK2mV3nQ8xLpR4tYw",
+    "deletionDate": "2023-11-15T22:13:00.000Z",
+    "expirationDate": "2023-11-15T21:13:00.000Z",
+    "maxAccessCount": 1, "accessCount": 1, "disabled": false,
+    "password": "$argon2id$v=19$m=65536,t=3,p=4$notarealhash"
+  },
+  {
+    "id": "send-wifi", "name": "Office WiFi — Guest", "type": 0,
+    "accessUrl": "https://send.deskwarden.app/4bNc8sQ1zEfT6uJvHy2d",
+    "deletionDate": "2023-11-20T22:13:00.000Z",
+    "expirationDate": "2023-11-20T22:13:00.000Z",
+    "maxAccessCount": 10, "accessCount": 3, "disabled": false
+  },
+  {
+    "id": "send-postgres", "name": "Postgres — Prod", "type": 0,
+    "accessUrl": "https://send.deskwarden.app/Kq9WmD3pXa7RbZt5Ln0c",
+    "deletionDate": "2023-11-21T22:13:00.000Z",
+    "expirationDate": "2023-11-15T01:13:00.000Z",
+    "accessCount": 0, "disabled": false,
+    "password": "$argon2id$v=19$m=65536,t=3,p=4$notarealhash"
+  },
+  {
+    "id": "send-bastion", "name": "Remote Desktop — Bastion", "type": 0,
+    "accessUrl": "https://send.deskwarden.app/P2yTf6VsMw9hJd1kGr4b",
+    "deletionDate": "2023-11-16T22:13:00.000Z",
+    "expirationDate": "2023-11-14T19:13:00.000Z",
+    "maxAccessCount": 5, "accessCount": 0, "disabled": false
+  },
+  {
+    "id": "send-atlas", "name": "Atlas Studio", "type": 0,
+    "accessUrl": "https://send.deskwarden.app/Ub7NxQ0eLc2SmFj8Zt5v",
+    "deletionDate": "2023-11-21T22:13:00.000Z",
+    "expirationDate": "2023-11-21T22:13:00.000Z",
+    "accessCount": 2, "disabled": true
+  },
+  {
+    "id": "send-boardpack", "name": "Q3 board pack.pdf", "type": 1,
+    "accessUrl": "https://send.deskwarden.app/Hv3RjE8wYn6tQz1aDs9m",
+    "deletionDate": "2023-11-20T22:13:00.000Z",
+    "expirationDate": "2023-11-20T22:13:00.000Z",
+    "maxAccessCount": 2, "accessCount": 0, "disabled": false
+  }
+]"#;
+
+/// The `Shared with me` screen's records.
+///
+/// Built rather than parsed from a literal, because this one is not a wire
+/// shape at all: `crate::receive_history` is a file this app writes itself,
+/// and its timestamps are milliseconds rather than the CLI's ISO strings.
+/// They are stated relative to [`PREVIEW_UNIX`] for the same reason every
+/// other date here is -- a shot carrying "today" is a shot no reviewer can
+/// diff against the last one.
+///
+/// **The first two name items that are in [`LIST_JSON`] and the third names
+/// one that is not.** That is the whole point of the third: the history
+/// outlives the item, and the row whose item has gone is an ordinary state of
+/// this screen rather than an error -- a picture with only the happy rows in
+/// it would never show the sentence that says so.
+fn received_history() -> ReceiveHistory {
+    ReceiveHistory {
+        entries: vec![
+            ReceivedRecord {
+                received_at_unix_millis: 1_699_997_580_000,
+                name: "Ledgerline".to_string(),
+                item_id: "list-0001".to_string(),
+            },
+            ReceivedRecord {
+                received_at_unix_millis: 1_699_740_780_000,
+                name: "Northwind staging keys".to_string(),
+                item_id: "list-0002".to_string(),
+            },
+            ReceivedRecord {
+                received_at_unix_millis: 1_699_222_380_000,
+                name: "Contractor VPN profile".to_string(),
+                item_id: "gone-from-the-vault".to_string(),
+            },
+        ],
+    }
+}
 
 const LIST_JSON: &str = r#"[
   {

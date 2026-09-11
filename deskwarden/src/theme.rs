@@ -10,7 +10,7 @@
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontFamily, FontId, Margin, Pos2, Rect, Response, RichText, Sense,
-    Stroke, StrokeKind, TextStyle, Ui, Vec2,
+    Shadow, Stroke, StrokeKind, TextStyle, Ui, Vec2,
 };
 use std::sync::{Arc, OnceLock};
 
@@ -92,6 +92,28 @@ pub const DANGER_EDGE: Color32 = Color32::from_rgb(0xe8, 0xa9, 0xa2);
 /// Text on a [`DANGER_WASH`] surface. Darker than [`ERROR`], which is red on
 /// white; this is red on pink and needs the extra depth to hold its contrast.
 pub const DANGER_INK: Color32 = Color32::from_rgb(0x8c, 0x3c, 0x33);
+
+/// The caution wash and its two inks: design 5c's warning band, 4c's caution
+/// note, and the first window's "this is taking a while" strip.
+///
+/// **The same story as [`DANGER_WASH`], one shade over.** These three were
+/// already in the crate twice -- `loading_ui`'s `WARN_FILL`/`WARN_INK` and
+/// `totp_add`'s `CAUTION_FILL`/`CAUTION_MARK_INK`/`CAUTION_TEXT_INK` -- each
+/// a private copy of the same hex written where it was first needed. They are
+/// here because design 5c's band is now drawn on a third screen, and a third
+/// private copy is the point at which the pattern stops being an accident.
+/// The two older copies are deliberately left alone for `DANGER_WASH`'s
+/// stated reason: this pass has no business editing two unrelated screens.
+///
+/// Two inks and not one, because the design uses two: the glyph is drawn in
+/// the darker [`CAUTION_MARK`] and the prose in [`CAUTION_INK`], which is
+/// what keeps a 12px sentence on a pale amber ground readable without the
+/// icon shouting.
+pub const CAUTION_WASH: Color32 = Color32::from_rgb(0xfe, 0xf6, 0xe7);
+/// The mark on a [`CAUTION_WASH`] surface -- 5c's `stroke="#8a5a06"`.
+pub const CAUTION_MARK: Color32 = Color32::from_rgb(0x8a, 0x5a, 0x06);
+/// Text on a [`CAUTION_WASH`] surface -- 5c's `color: #7a4f05`.
+pub const CAUTION_INK: Color32 = Color32::from_rgb(0x7a, 0x4f, 0x05);
 
 /// The design's one green, in the same three values.
 ///
@@ -1897,6 +1919,220 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
             .corner_radius(CornerRadius::same(7))
             .min_size(Vec2::new(0.0, BUTTON_HEIGHT)),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Design 5b's action row: design-system buttons placed into a MEASURED RECT
+// ---------------------------------------------------------------------------
+
+/// **Why this exists beside [`primary_button`] and friends, which look like
+/// they already do the job.**
+///
+/// Those three are `ui.add`: they take the space the surrounding layout gives
+/// them, which is right for a form footer and impossible for a pane that
+/// places every cell into a rectangle it measured first. Design 5b's Sends
+/// screen is exactly such a pane -- its detail column is 250pt of content at
+/// `settings::MIN_VAULT_WINDOW_SIZE` and its own history is of controls
+/// pushed off the edge by nested layouts, which is why it reserves each slot
+/// before it fills one.
+///
+/// So that screen built its controls out of bare `egui::Button`s, and the
+/// result is the defect [`primary_button_enabled`]'s own doc already records
+/// one screen earlier: *"the two footer buttons looked like they came from
+/// different families -- they did"*. A bare button picks up egui's fill,
+/// egui's radius and egui's proportional face; every button that came from
+/// this module is `semibold`, `CARD` over [`BORDER_STRONG`], and a design
+/// radius. On the Sends screen the difference was three grey system boxes
+/// where 5b draws an outlined control beside a solid red one.
+///
+/// This is the missing half: the design system's tones, in a rectangle the
+/// caller owns. It is NOT a fourth look -- [`ActionTone`] maps onto the three
+/// buttons above -- and it deliberately does not re-implement their bodies,
+/// because a second spelling of "the primary button" is the thing this
+/// module exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionTone {
+    /// [`primary_button`]'s look: [`BLUE`] fill, white label. The one thing
+    /// on the row the screen is *for*.
+    Primary,
+    /// [`secondary_button`]'s look: white over [`BORDER_STRONG`]. 5b's
+    /// `Open record`.
+    Secondary,
+    /// 5b's `Revoke`: [`ERROR`] fill, white label, [`destructive_button`]'s
+    /// meaning at this size.
+    Destructive,
+    /// **An outlined button whose LABEL is [`ERROR`].** Not in 5b, and it is
+    /// here for a reason 5b did not have to face: 5b's red button is the only
+    /// destructive control on its header, and this app's Sends header carries
+    /// a destructive control *beside* two ordinary ones. A solid red there is
+    /// the loudest thing on a screen whose subject is the link, not its
+    /// deletion -- and the confirmation that follows it is where this app
+    /// spends [`destructive_button`]. So the first step is red WORDS and the
+    /// second step is a red BUTTON, which is the same escalation the kebab's
+    /// Delete and the delete modal already use.
+    DestructiveQuiet,
+}
+
+/// 5b's action control: `height: 32px; padding: 0 14px; border-radius: 8px`.
+///
+/// **32 and not the 26 this screen used**, which is the whole of why its
+/// header read as a toolbar of system widgets rather than as the design's
+/// action row: at 26 with a 12px label the control is smaller than the pill
+/// beside it and smaller than every other button in the app.
+pub const ACTION_BUTTON_HEIGHT: f32 = 32.0;
+/// 5b's `border-radius: 8px` on the same control. One point off
+/// [`primary_button`]'s 7, because 5b says 8 and this is 5b's row.
+pub const ACTION_BUTTON_RADIUS: u8 = 8;
+/// 5b's `padding: 0 14px`.
+///
+/// The **comfortable** padding. A caller that cannot fit its row at this
+/// width passes a smaller one to [`action_button_width`]; see its doc for why
+/// shrinking the padding is the right thing to give up first.
+pub const ACTION_BUTTON_PAD_X: f32 = 14.0;
+/// The label: 5b's `font-size: 13px; font-weight: 600`, which is this
+/// module's [`semibold`] at 13 -- the same face and size every other button
+/// here wears.
+pub const ACTION_BUTTON_TEXT_PX: f32 = 13.0;
+/// A floor, so a one-word control is still a target rather than a sliver.
+pub const ACTION_BUTTON_MIN_WIDTH: f32 = 64.0;
+
+/// How wide `label` needs its button to be at `pad_x`.
+///
+/// **Measured rather than tabulated**, because the alternative is a table of
+/// widths that goes stale the first time a label is reworded -- and because
+/// the caller has to know the total before it can decide whether the row fits
+/// on one line, which is a question no `ui.add` can answer after the fact.
+///
+/// `pad_x` is a parameter and not [`ACTION_BUTTON_PAD_X`] for one reason: a
+/// row of three of these has to fit a 250pt pane, and when it cannot, the
+/// padding is the right thing to give up. Shrinking the LABEL would hide what
+/// the control does; shrinking the HEIGHT would make it a different component
+/// from the one beside it on a wider window; shrinking the padding leaves a
+/// button that is visibly the same button, slightly tighter.
+pub fn action_button_width(painter: &egui::Painter, label: &str, pad_x: f32) -> f32 {
+    let galley = painter.layout_no_wrap(
+        label.to_string(),
+        FontId::new(ACTION_BUTTON_TEXT_PX, FontFamily::Name(SEMIBOLD.into())),
+        INK,
+    );
+    (galley.size().x + pad_x * 2.0).max(ACTION_BUTTON_MIN_WIDTH)
+}
+
+/// One action button, drawn into `rect`.
+///
+/// The rect is the caller's: this allocates nothing of its own, which is what
+/// lets a pane reserve every slot on a row before it fills any of them. See
+/// [`ActionTone`] for why this exists at all.
+pub fn action_button(ui: &mut Ui, rect: Rect, label: &str, tone: ActionTone) -> Response {
+    let (fill, stroke, ink) = match tone {
+        ActionTone::Primary => (BLUE, Stroke::NONE, Color32::WHITE),
+        ActionTone::Secondary => (CARD, Stroke::new(1.0, BORDER_STRONG), INK),
+        ActionTone::Destructive => (ERROR, Stroke::NONE, Color32::WHITE),
+        ActionTone::DestructiveQuiet => (CARD, Stroke::new(1.0, BORDER_STRONG), ERROR),
+    };
+    // **`rect` is the button, exactly, and these two lines are what make that
+    // true.**
+    //
+    // `Ui::put` is not a promise about size: egui takes the widget's own
+    // desired size and grows past the rect whenever that is larger. A
+    // `Button`'s desired size is its galley plus `spacing.button_padding`
+    // (this app's is `12 x 6`) -- so a slot measured here at a tighter
+    // padding is a slot the button silently overflows, and a label egui
+    // decides to wrap makes it overflow downwards as well.
+    //
+    // Both were live. The Sends header measures its slots at a padding that
+    // shrinks to fit a 250pt pane, and its Cancel -- which must land in
+    // Delete's exact rectangle, because that equality IS the mis-click
+    // defence -- came out two points wider and eight points taller than the
+    // Delete it replaced. Zeroing the padding for this one widget makes the
+    // caller's measurement the whole story, which is what a rect-placed
+    // control needs; `Extend` stops the label wrapping inside a slot that was
+    // measured for one line.
+    // **Set and restored in place, NOT wrapped in a `Ui::scope`.** A scope is
+    // the obvious way to bound a style change and it is wrong here: it
+    // allocates its own content in the parent's flow, and this rect is
+    // routinely ABOVE the parent's cursor (the Sends strip draws its controls
+    // inside a band it has already allocated), so the scope's union reaches
+    // back up and advances the cursor by the whole distance. That is not a
+    // theory -- it pushed every row of the Sends list thirty points down the
+    // column. Two assignments around `put` change nothing but the style.
+    let saved = ui.spacing().button_padding;
+    ui.spacing_mut().button_padding = Vec2::ZERO;
+    let response = ui.put(
+        rect,
+        egui::Button::new(semibold(label, ACTION_BUTTON_TEXT_PX).color(ink))
+            .fill(fill)
+            .stroke(stroke)
+            .corner_radius(CornerRadius::same(ACTION_BUTTON_RADIUS))
+            .wrap_mode(egui::TextWrapMode::Extend)
+            .min_size(rect.size()),
+    );
+    ui.spacing_mut().button_padding = saved;
+    response
+}
+
+// ---------------------------------------------------------------------------
+// Design 5b's receded row
+// ---------------------------------------------------------------------------
+
+/// `box-shadow: 0 1px 2px rgba(45, 43, 43, 0.06)` -- the design's SELECTED
+/// list row. Alpha is `0.06 * 255`, rounded.
+///
+/// **Here rather than in `item_list`, where it lived**, because design 5b's
+/// caption for the Sends screen is `SAME LIST + DETAIL AS THE VAULT` and the
+/// two columns really do swap places in one slot of one window. A row
+/// treatment spelled privately in one of them is a row treatment the other
+/// re-invents -- which is exactly what happened: the Sends row was rebuilt by
+/// hand, and came out in a lighter face, a fainter subtitle and with no
+/// shadow under the selection. Whatever answers "what does a picked row look
+/// like" has to be one value, and this module is where that question is
+/// answered in this codebase.
+pub const SELECTED_ROW_SHADOW: Shadow = Shadow {
+    offset: [0, 1],
+    blur: 2,
+    spread: 0,
+    color: Color32::from_rgba_unmultiplied_const(45, 43, 43, 15),
+};
+
+/// Design 5b's `opacity: 0.72` on a Send whose link has ended.
+///
+/// **A whole-row property, not a colour**, which is why it is a number here
+/// rather than a fourth set of greys. 5b draws its Expired and Revoked rows
+/// at 72% of everything -- tile, name, subtitle and pill together -- and that
+/// is the point: a list where the ended rows are simply *quieter* lets the
+/// live ones come forward, which is the one thing a column of five identical
+/// bands cannot do. Recolouring the text instead would have said "this text
+/// is less important" about a name that is exactly as important as the one
+/// above it; it is the row's STATE that is over.
+pub const ENDED_ROW_OPACITY: f32 = 0.72;
+
+/// `colour` at `opacity`, for [`ENDED_ROW_OPACITY`]'s use.
+///
+/// Composited against nothing -- the alpha is simply scaled -- because every
+/// caller paints over a ground it has just filled, so blending here would
+/// mean knowing the ground twice.
+pub fn faded(colour: Color32, opacity: f32) -> Color32 {
+    let a = (colour.a() as f32 * opacity.clamp(0.0, 1.0)).round() as u8;
+    Color32::from_rgba_unmultiplied(colour.r(), colour.g(), colour.b(), a)
+}
+
+/// A whole [`PillTone`] faded by [`faded`], so 5b's row opacity reaches the
+/// pill as well as the words beside it.
+///
+/// The mark's colour goes with it: a tick or a dot left at full strength on a
+/// faded pill is the brightest thing in the row it is supposed to be
+/// receding.
+pub fn faded_pill(tone: PillTone, opacity: f32) -> PillTone {
+    PillTone {
+        fill: faded(tone.fill, opacity),
+        edge: faded(tone.edge, opacity),
+        ink: faded(tone.ink, opacity),
+        mark: match tone.mark {
+            PillMark::None => PillMark::None,
+            PillMark::Dot(c) => PillMark::Dot(faded(c, opacity)),
+            PillMark::Check(c) => PillMark::Check(faded(c, opacity)),
+        },
+    }
 }
 
 /// One cell of a [`segmented_control`]: what it says, and whether it is one

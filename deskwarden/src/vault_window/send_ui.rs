@@ -1002,6 +1002,13 @@ pub const SWITCH_OFF_LABEL: &str = "Switch off";
 /// The undo of [`SWITCH_OFF_LABEL`]. Drawn only on a row whose state is
 /// already `Revoked`, so the two are never offered at once.
 pub const SWITCH_ON_LABEL: &str = "Switch on";
+/// The detail header's **primary** control, and the one the screen is for: a
+/// Send exists so that a link can be handed to somebody.
+///
+/// Named now that [`action_labels`] has to measure the row before the row is
+/// drawn -- a literal in two places is one rewording away from a header
+/// measured for a label it does not carry.
+pub const COPY_LINK_LABEL: &str = "Copy link";
 /// The row's first, non-destructive button.
 pub const DELETE_LABEL: &str = "Delete";
 /// The confirmation's destructive button. **Deliberately not "Delete"**: the
@@ -1493,10 +1500,20 @@ fn draw_send_list(
     // The count, beside the word it counts. `badge_text` rather than a local
     // `match`, so an unanswered list draws the rail's own en dash here too
     // and the two readouts cannot disagree about what "not known" looks like.
+    //
+    // **`Shared with me` counts RECORDS, not sends.** Those rows are imports
+    // this app wrote down; calling them "3 sends" beside the heading SHARED
+    // WITH ME says the user published three, which is the opposite of what
+    // that screen is about. It is the kind of slip a picture catches and a
+    // rect assertion never can.
+    let (one, many) = match view {
+        SendView::Received(_) => (RECORD_NOUN, RECORDS_NOUN),
+        SendView::Mine(_) => (SEND_NOUN, SENDS_NOUN),
+    };
     let noun = match counted {
-        Some(1) => "1 send".to_string(),
-        Some(n) => format!("{n} sends"),
-        None => format!("{} sends", crate::vault_window::sidebar::UNKNOWN_COUNT),
+        Some(1) => format!("1 {one}"),
+        Some(n) => format!("{n} {many}"),
+        None => format!("{} {many}", crate::vault_window::sidebar::UNKNOWN_COUNT),
     };
     ui.painter().text(
         egui::pos2(strip.left() + STRIP_PAD_X + eyebrow_size.x + STRIP_GAP, strip.center().y),
@@ -1514,80 +1531,132 @@ fn draw_send_list(
     // that screen does not ask -- its rows come from a local file, not a
     // fetch -- and a control that visibly does nothing is worse than one that
     // is not there.
+    //
+    // **One of them is the primary and the other is not, which is the whole
+    // of what changed here.** Both used to be bare `egui::Button`s at 12px in
+    // egui's own grey, and laid beside the item list -- the column this one
+    // swaps places with -- the difference is not subtle: that column's strip
+    // carries a search field and ONE solid blue `+ New`, and this one carried
+    // two identical grey boxes taking up half its width and outweighing every
+    // row beneath them. A strip with two equal emphases has no emphasis.
+    //
+    // New Send is the primary because it is what the screen is for. Refresh
+    // is `Secondary` and not quieter still, because it is the only way back
+    // from a stale list and 5b's own strip keeps a control in that corner.
     if let SendView::Mine(_) = view {
         let slot = |right: f32, w: f32| {
             egui::Rect::from_min_size(
-                egui::pos2(right - w, strip.center().y - COPY_BUTTON_HEIGHT / 2.0),
-                egui::vec2(w, COPY_BUTTON_HEIGHT),
+                egui::pos2(right - w, strip.center().y - theme::ACTION_BUTTON_HEIGHT / 2.0),
+                egui::vec2(w, theme::ACTION_BUTTON_HEIGHT),
             )
         };
-        let refresh_rect = slot(strip.right() - STRIP_PAD_X, REFRESH_BUTTON_WIDTH);
-        if ui
-            .put(
-                refresh_rect,
-                egui::Button::new(egui::RichText::new(REFRESH_LABEL).size(12.0).color(theme::INK))
-                    .min_size(refresh_rect.size()),
-            )
+        let refresh_w =
+            theme::action_button_width(ui.painter(), REFRESH_LABEL, STRIP_BUTTON_PAD_X);
+        let new_w = theme::action_button_width(ui.painter(), NEW_SEND_LABEL, STRIP_BUTTON_PAD_X);
+        let refresh_rect = slot(strip.right() - STRIP_PAD_X, refresh_w);
+        if theme::action_button(ui, refresh_rect, REFRESH_LABEL, theme::ActionTone::Secondary)
             .clicked()
         {
             action = Some(SendUiAction::Refresh);
         }
-        let new_rect = slot(refresh_rect.left() - BUTTON_GAP, NEW_SEND_BUTTON_WIDTH);
-        if ui
-            .put(
-                new_rect,
-                egui::Button::new(
-                    egui::RichText::new(NEW_SEND_LABEL).size(12.0).color(theme::INK),
-                )
-                .min_size(new_rect.size()),
-            )
+        let new_rect = slot(refresh_rect.left() - BUTTON_GAP, new_w);
+        if theme::action_button(ui, new_rect, NEW_SEND_LABEL, theme::ActionTone::Primary)
             .clicked()
         {
             action = Some(SendUiAction::OpenComposer);
         }
     }
 
-    // --- the sentence under it -----------------------------------------
-    ui.add_space(LIST_PAD);
+    // The strip's two controls are `put` INSIDE the band allocated above, and
+    // `Ui::put` advances the cursor to the rect it drew at -- backwards, in
+    // this case, from the strip's foot to the buttons'. Everything below is
+    // laid out from the cursor, so it is put back where the strip left it.
+    // See the same note in `draw_send_card`.
+    ui.advance_cursor_after_rect(strip);
+
+    // --- the standing explanations, UNDER the column --------------------
+    //
+    // **They used to sit between the strip and the first row, and that is the
+    // change here.** Two wrapped grey paragraphs above the list came to some
+    // seventy points of prose at the top of a 390pt column: the first thing
+    // the eye met on this screen was a help note, and the rows -- the whole
+    // subject of the column -- began a third of the way down it. Design 5b's
+    // list column goes strip, then rows, with nothing in between, and the
+    // item list this column swaps places with does the same.
+    //
+    // They are not deleted, because both are true and both are things a user
+    // has to be told: this app cannot make a file Send, and it cannot edit
+    // one. They are demoted to a footnote, which is what a standing statement
+    // about a feature's edges is. The rail already does exactly this with
+    // "Locks in 11:42" -- a line the column always carries, at the bottom,
+    // at 11px in `TEXT_GHOST` -- so this is the window's own existing rule for
+    // "true, and not what you came here for", not a new one invented to get
+    // the prose out of the way.
     let text_width = (width - LIST_PAD * 2.0).max(0.0);
-    // **The width is imposed rather than inherited.** These lines WRAP, and a
-    // wrapping label takes its wrap width from the `Ui` it is added to; added
-    // straight to the column's own `Ui` they would run the full 390 and sit
-    // hard against both edges, which is the one thing a paragraph on a canvas
-    // must not do. The frame is the design's `padding: 10px` on the list
-    // container, applied to the text as it is applied to the rows below.
-    let paragraph = |ui: &mut egui::Ui, text: &str, colour: egui::Color32, size: f32| {
-        egui::Frame::new()
-            .inner_margin(Margin::symmetric(LIST_PAD as i8, 0))
-            .show(ui, |ui| {
-                ui.set_width(text_width);
-                ui.label(egui::RichText::new(text).size(size).color(colour));
-            });
-    };
-    paragraph(ui, view.gloss(), theme::TEXT_FAINT, 12.0);
-    // Only when there is one to explain. The gloss above says what this app
-    // does with Sends; this says what the `FILE` tag on a row in front of the
-    // user means, and a list with no such row has no tag to explain.
-    if matches!(state, SendPaneState::Rows(rows) if rows.iter().any(|r| r.is_file)) {
-        if let SendView::Mine(scope) = view {
-            if rows_in_scope(
-                match state {
-                    SendPaneState::Rows(rows) => rows,
-                    _ => &[],
-                },
-                *scope,
-            )
-            .iter()
-            .any(|r| r.is_file)
-            {
-                ui.add_space(2.0);
-                paragraph(ui, FILE_SEND_EXPLANATION, theme::TEXT_FAINT, 12.0);
-            }
-        }
+    // The `FILE` explanation only when there is a tag on screen to explain.
+    // The gloss above says what this app does with Sends; this says what the
+    // tag on a row in front of the user means, and a list with no such row
+    // has no tag to explain.
+    let file_note = matches!(view, SendView::Mine(scope)
+        if matches!(state, SendPaneState::Rows(rows)
+            if rows_in_scope(rows, *scope).iter().any(|r| r.is_file)));
+    //
+    // **The notes are LAID OUT before the panel is opened, and the panel is
+    // given their exact height.** A `Panel::bottom` left to size itself takes
+    // its height from what it drew, which is a frame late: on the first frame
+    // of a screen it uses a default and clips whatever does not fit. That is
+    // not a test artefact -- it is what a user sees the first time they open
+    // this screen -- and it is why the second note went missing under a paint
+    // harness that draws one frame. Measuring first is this file's standing
+    // discipline for exactly this class of bug.
+    let note_font = egui::FontId::new(NOTE_PX, egui::FontFamily::Proportional);
+    let mut notes: Vec<std::sync::Arc<egui::Galley>> = vec![ui.painter().layout(
+        view.gloss().to_string(),
+        note_font.clone(),
+        theme::TEXT_GHOST,
+        text_width,
+    )];
+    if file_note {
+        notes.push(ui.painter().layout(
+            FILE_SEND_EXPLANATION.to_string(),
+            note_font,
+            theme::TEXT_GHOST,
+            text_width,
+        ));
     }
-    ui.add_space(LIST_PAD);
+    let notes_height: f32 = notes.iter().map(|g| g.size().y).sum::<f32>()
+        + NOTE_GAP * (notes.len() - 1) as f32;
+    egui::Panel::bottom("send-list-note")
+        .exact_size(LIST_PAD * 3.0 + NOTE_RULE + notes_height)
+        .resizable(false)
+        .frame(egui::Frame::new().fill(theme::CANVAS))
+        .show_separator_line(false)
+        .show(ui, |ui| {
+            let area = ui.available_rect_before_wrap();
+            let p = ui.painter();
+            // A hairline over the footnote, so it reads as a note under the
+            // column rather than as a sentence that has come adrift from the
+            // last row. The rail's own footer does not need one because the
+            // rail's rows end in a flexed gap; a scrolled list ends wherever
+            // the scrolling stopped.
+            p.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(area.left() + LIST_PAD, area.top() + LIST_PAD),
+                    egui::vec2((area.width() - LIST_PAD * 2.0).max(0.0), NOTE_RULE),
+                ),
+                CornerRadius::ZERO,
+                theme::HAIRLINE,
+            );
+            let mut y = area.top() + LIST_PAD + NOTE_RULE + LIST_PAD;
+            for galley in notes {
+                let height = galley.size().y;
+                p.galley(egui::pos2(area.left() + LIST_PAD, y), galley, theme::TEXT_GHOST);
+                y += height + NOTE_GAP;
+            }
+        });
 
     // --- the rows -------------------------------------------------------
+    ui.add_space(LIST_PAD);
     let row_width = (width - LIST_PAD * 2.0).max(0.0);
     let rows_area = |ui: &mut egui::Ui, body: &mut dyn FnMut(&mut egui::Ui)| {
         egui::ScrollArea::vertical()
@@ -1603,7 +1672,13 @@ fn draw_send_list(
         ui.add_space(LIST_PAD);
         ui.indent("send-empty", |ui| {
             ui.set_width(text_width);
-            ui.label(egui::RichText::new(head).size(14.0).color(colour).strong());
+            // [`ANSWER_LINE_PX`] through `theme::semibold`, not `size(14).
+            // strong()`. `RichText::strong` is an EGUI treatment -- it swaps
+            // in `visuals.strong_text_color` and leaves the face alone -- so
+            // this line was the app's body face in a slightly darker grey
+            // while every other headline in the window is Archivo SemiBold.
+            // It is the same class of drift as the row's plain-face name.
+            ui.label(theme::semibold(head, ANSWER_LINE_PX).color(colour));
             ui.add_space(4.0);
             ui.label(egui::RichText::new(detail).size(12.0).color(theme::TEXT_MUTED));
         });
@@ -1660,15 +1735,12 @@ fn draw_send_list(
                         );
                     }
                     ui.add_space(10.0);
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(TRY_AGAIN_LABEL).size(12.0).color(theme::INK),
-                            )
-                            .min_size(egui::vec2(88.0, COPY_BUTTON_HEIGHT)),
-                        )
-                        .clicked()
-                    {
+                    // The design system's secondary, like every other control
+                    // on this screen now. It used to be a bare `egui::Button`
+                    // at 12px -- one more place where a screen built out of
+                    // egui defaults looked like it came from a different
+                    // application than the one around it.
+                    if theme::secondary_button(ui, TRY_AGAIN_LABEL).clicked() {
                         action = Some(SendUiAction::Refresh);
                     }
                 });
@@ -1697,13 +1769,18 @@ fn draw_send_list(
 /// The list column's strip: design 5b's `padding: 12px` on a 12px line, with
 /// room for the 26pt controls that sit in it.
 ///
-/// **50 and not 38**, and the arithmetic is the page's content box. `padding:
+/// **56 and not 38**, and the arithmetic is the page's content box. `padding:
 /// 12px` around a 12px line box (~15pt drawn) is 12 + 15 + 12 = 39 plus the
 /// 1px bottom rule, which is what a strip of TEXT would be; this strip also
-/// holds two `COPY_BUTTON_HEIGHT` controls, and 12 + 26 + 12 = 50 is the same
-/// padding around the taller thing in it. Sizing it to the text and letting
-/// the buttons overhang is the slip this file has paid for before.
-const LIST_STRIP_HEIGHT: f32 = 50.0;
+/// holds two `theme::ACTION_BUTTON_HEIGHT` controls, and 12 + 32 + 12 = 56 is
+/// the same padding around the taller thing in it. Sizing it to the text and
+/// letting the buttons overhang is the slip this file has paid for before.
+///
+/// It was 50 while those controls were 26pt boxes of egui's own making. They
+/// come from the design system now -- see `theme::action_button` -- and the
+/// design system's action is 32, so the strip around them grew by the same
+/// six points rather than cropping them.
+const LIST_STRIP_HEIGHT: f32 = 56.0;
 /// Design 5b's `padding: 12px` on the list strip.
 const STRIP_PAD_X: f32 = 12.0;
 /// The gap between the strip's eyebrow and the count beside it: 5b's own
@@ -1713,10 +1790,32 @@ const STRIP_GAP: f32 = 10.0;
 const LIST_PAD: f32 = 10.0;
 /// Design 5b's `gap: 6px` between two rows.
 const LIST_ROW_GAP: f32 = 6.0;
-/// The strip's two controls, wide enough for their own labels at 12px with
-/// the padding the design gives a secondary button.
-const REFRESH_BUTTON_WIDTH: f32 = 76.0;
-const NEW_SEND_BUTTON_WIDTH: f32 = 88.0;
+/// The list column's footnote: the rail's own footer size, because it is the
+/// same kind of line in the same kind of place. See the footnote's own
+/// argument in [`draw_send_list`].
+const NOTE_PX: f32 = 11.0;
+/// The gap between the two footnotes, and the hairline above them.
+const NOTE_GAP: f32 = 3.0;
+const NOTE_RULE: f32 = 1.0;
+
+/// What the strip's count counts, on each of the two screens this pane draws.
+///
+/// Four constants rather than two `format!`s with the word inlined, because
+/// the pair that is easy to get wrong is the SINGULAR: a count line reading
+/// "1 sends" is the defect this shape exists to make impossible to write.
+pub const SEND_NOUN: &str = "send";
+pub const SENDS_NOUN: &str = "sends";
+pub const RECORD_NOUN: &str = "record";
+pub const RECORDS_NOUN: &str = "records";
+/// The padding inside the strip's two controls.
+///
+/// **12 and not `theme::ACTION_BUTTON_PAD_X`'s 14**, deliberately: this strip
+/// carries a heading and a count as well as the pair, and the two buttons in
+/// 5b's own detail header have a whole row to themselves. The height, the
+/// radius and the face are the design system's; only the padding is tightened
+/// for the narrower home, which is the one dimension
+/// `theme::action_button_width` takes as a parameter and argues about.
+const STRIP_BUTTON_PAD_X: f32 = 12.0;
 /// The list column's Refresh. Named because the whole-window matrix presses
 /// it, and a bare literal there was one rewording away from pressing nothing.
 pub const REFRESH_LABEL: &str = "Refresh";
@@ -1769,12 +1868,45 @@ fn draw_row(
     if response.clicked() && !row.id.is_empty() {
         *selected = Some(row.id.clone());
     }
+
+    // **Design 5b's `opacity: 0.72`, and it is a property of the ROW.**
+    //
+    // 5b draws its Expired and Revoked rows at 72% of everything -- tile,
+    // name, subtitle, border and pill together -- and that is what makes its
+    // list read as a list rather than as five identical bands: the links that
+    // are still live come forward because the ones that are over have
+    // stepped back. Drawn at full strength, as this row was, "Remote Desktop
+    // -- Bastion" has exactly the same weight as the Send somebody is about
+    // to open, and the column has no shape at all.
+    //
+    // **Except when it is picked**, which 5b never had to decide because 5b's
+    // picked row happens to be live. A receded row whose detail pane is up is
+    // a row the user is looking AT, and fading the one thing they selected
+    // reads as the app having lost track of it. So a selection restores the
+    // row to full strength; nothing else does.
+    let ended = matches!(
+        row.state,
+        crate::send::SendState::Expired | crate::send::SendState::Revoked
+    );
+    let fade = if ended && !picked { theme::ENDED_ROW_OPACITY } else { 1.0 };
+    let dim = |colour: egui::Color32| theme::faded(colour, fade);
+
     let painter = ui.painter();
+    // **The design's selected-row shadow, from `theme` and not from a second
+    // spelling.** The item list has drawn one under its picked row since
+    // design 2b; this row, rebuilt by hand, had none -- so two rows in the
+    // same column of the same window lifted differently under the same
+    // gesture. See `theme::SELECTED_ROW_SHADOW`.
+    if picked {
+        painter.add(
+            theme::SELECTED_ROW_SHADOW.as_shape(rect, CornerRadius::same(ROW_RADIUS)),
+        );
+    }
     painter.rect_filled(rect, CornerRadius::same(ROW_RADIUS), theme::CARD);
     painter.rect_stroke(
         rect,
         CornerRadius::same(ROW_RADIUS),
-        egui::Stroke::new(1.0, if picked { theme::BLUE } else { theme::HAIRLINE }),
+        egui::Stroke::new(1.0, dim(if picked { theme::BLUE } else { theme::HAIRLINE })),
         egui::StrokeKind::Inside,
     );
 
@@ -1785,7 +1917,12 @@ fn draw_row(
     // `state_pill_width` before anything is drawn, which is the same
     // reserve-then-fill order every control on this row used to follow and
     // the reason none of them was ever pushed off the pane.
-    let tone = state_tone(row.state);
+    //
+    // The tone is faded with the rest of the row, through `theme::faded_pill`
+    // rather than by picking paler colours: an `Expired` pill in a fifth set
+    // of greys would be a fifth thing to keep true, and the design's rule is
+    // one opacity over the whole band.
+    let tone = theme::faded_pill(state_tone(row.state), fade);
     let label = state_label(row.state);
     let pill_width = theme::state_pill_width(painter, tone, label);
     theme::state_pill(
@@ -1804,7 +1941,7 @@ fn draw_row(
         egui::pos2(rect.left() + ROW_PAD_X, rect.center().y - ROW_TILE / 2.0),
         egui::Vec2::splat(ROW_TILE),
     );
-    paint_tile(painter, tile, &row.name, picked, 12.0);
+    paint_tile_faded(painter, tile, &row.name, picked, 12.0, fade);
 
     let text_left = tile.right() + ROW_TEXT_GAP;
     let text_area = egui::Rect::from_min_max(
@@ -1817,15 +1954,20 @@ fn draw_row(
         egui::pos2(text_area.left(), rect.center().y - 2.0),
         egui::Align2::LEFT_BOTTOM,
         &row.name,
+        // **`SEMIBOLD` unselected, not the plain proportional face**, which is
+        // the single most visible way this row differed from the item row it
+        // shares a column with. 5b's row name is `font-weight: 600` and
+        // `item_list`'s is `theme::semibold` at the same 13px; this one was
+        // `FontFamily::Proportional`, i.e. Regular. Laid side by side, the
+        // vault's names read as the subjects of their rows and the Sends'
+        // read as captions -- with every rectangle on both rows measured
+        // identically. A weight is not a measurement, which is exactly why
+        // no rect assertion ever saw it.
         egui::FontId::new(
             13.0,
-            if picked {
-                egui::FontFamily::Name(theme::BOLD.into())
-            } else {
-                egui::FontFamily::Proportional
-            },
+            egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
         ),
-        if picked { theme::BLUE_DEEP } else { theme::INK },
+        dim(if picked { theme::BLUE_DEEP } else { theme::INK }),
     );
     if row.is_file {
         // Beside the name, never instead of the row. See the module docs: an
@@ -1836,12 +1978,12 @@ fn draw_row(
             egui::Align2::LEFT_CENTER,
             FILE_TAG,
             small_font.clone(),
-            theme::TEXT_MUTED,
+            dim(theme::TEXT_MUTED),
         );
         clip.rect_stroke(
             tag_rect.expand2(egui::vec2(TAG_PAD_X, 2.0)),
             CornerRadius::same(4),
-            egui::Stroke::new(1.0, theme::HAIRLINE),
+            egui::Stroke::new(1.0, dim(theme::HAIRLINE)),
             egui::StrokeKind::Outside,
         );
     }
@@ -1852,17 +1994,24 @@ fn draw_row(
     // views" and "Revoking..." is a row whose subject is ambiguous at the
     // moment it matters most.
     let revoking = delete.in_flight == Some(row.id.as_str()) && !row.id.is_empty();
+    // **`TEXT_FAINT`, not `TEXT_GHOST`.** 5b's row subtitle is `#7d7979`,
+    // which is `TEXT_FAINT`; `TEXT_GHOST` (`#9b9797`) is the design's colour
+    // for a COUNT beside a rail row, not for the line that says what a Send
+    // is. The item row beside this one has always used `TEXT_FAINT` for its
+    // username, so this was a second way the two columns disagreed about what
+    // a secondary line looks like -- one step fainter, on every row, with the
+    // name one weight lighter above it.
     let (second, colour) = if revoking {
         (DELETING_LABEL, theme::TEXT_MUTED)
     } else {
-        (row.expiry.as_str(), theme::TEXT_GHOST)
+        (row.expiry.as_str(), theme::TEXT_FAINT)
     };
     clip.text(
         egui::pos2(text_area.left(), rect.center().y + 3.0),
         egui::Align2::LEFT_TOP,
         second,
         small_font,
-        colour,
+        dim(colour),
     );
 }
 
@@ -1886,6 +2035,13 @@ fn draw_received_row(
         *selected = Some(row.key.clone());
     }
     let painter = ui.painter();
+    // The same selection treatment the Send row and the item row wear; see
+    // `theme::SELECTED_ROW_SHADOW`.
+    if picked {
+        painter.add(
+            theme::SELECTED_ROW_SHADOW.as_shape(rect, CornerRadius::same(ROW_RADIUS)),
+        );
+    }
     painter.rect_filled(rect, CornerRadius::same(ROW_RADIUS), theme::CARD);
     painter.rect_stroke(
         rect,
@@ -1903,17 +2059,16 @@ fn draw_received_row(
         egui::pos2(rect.right() - ROW_PAD_X, rect.bottom()),
     );
     let clip = painter.with_clip_rect(text_area.intersect(ui.clip_rect()));
+    // `SEMIBOLD`/`TEXT_FAINT`, exactly as `draw_row` above and as the item
+    // row beside both: a received record is a row in the same column, and
+    // there is no reason for it to be typeset a third way.
     clip.text(
         egui::pos2(text_area.left(), rect.center().y - 2.0),
         egui::Align2::LEFT_BOTTOM,
         &row.name,
         egui::FontId::new(
             13.0,
-            if picked {
-                egui::FontFamily::Name(theme::BOLD.into())
-            } else {
-                egui::FontFamily::Proportional
-            },
+            egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
         ),
         if picked { theme::BLUE_DEEP } else { theme::INK },
     );
@@ -1922,7 +2077,7 @@ fn draw_received_row(
         egui::Align2::LEFT_TOP,
         &row.when,
         egui::FontId::new(11.0, egui::FontFamily::Proportional),
-        theme::TEXT_GHOST,
+        theme::TEXT_FAINT,
     );
 }
 
@@ -1939,20 +2094,42 @@ fn paint_tile(
     emphasised: bool,
     text_px: f32,
 ) {
+    paint_tile_faded(painter, tile, name, emphasised, text_px, 1.0);
+}
+
+/// [`paint_tile`], at design 5b's row opacity.
+///
+/// A separate entry point rather than a sixth argument on every call site,
+/// because exactly one caller has a faded row and the other three are the
+/// detail headers, which never do. See [`theme::ENDED_ROW_OPACITY`].
+fn paint_tile_faded(
+    painter: &egui::Painter,
+    tile: egui::Rect,
+    name: &str,
+    emphasised: bool,
+    text_px: f32,
+    opacity: f32,
+) {
     let (fill, edge, ink) = if emphasised {
         (theme::BLUE_WASH, theme::BLUE_EDGE, theme::BLUE)
     } else {
         (theme::CANVAS, theme::HAIRLINE, theme::TEXT_MUTED)
     };
+    let dim = |colour: egui::Color32| theme::faded(colour, opacity);
     let radius = CornerRadius::same((tile.width() / 4.0).round() as u8);
-    painter.rect_filled(tile, radius, fill);
-    painter.rect_stroke(tile, radius, egui::Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+    painter.rect_filled(tile, radius, dim(fill));
+    painter.rect_stroke(
+        tile,
+        radius,
+        egui::Stroke::new(1.0, dim(edge)),
+        egui::StrokeKind::Inside,
+    );
     painter.text(
         tile.center(),
         egui::Align2::CENTER_CENTER,
         theme::initials(name),
         egui::FontId::new(text_px, egui::FontFamily::Name(theme::BOLD.into())),
-        ink,
+        dim(ink),
     );
 }
 
@@ -1971,7 +2148,6 @@ const ROW_RADIUS: u8 = 10;
 /// block and the state pill, so the row has one rhythm rather than two.
 const ROW_TILE: f32 = 32.0;
 const ROW_TEXT_GAP: f32 = 11.0;
-const COPY_BUTTON_HEIGHT: f32 = 26.0;
 /// The gap between two controls in a row.
 const BUTTON_GAP: f32 = 8.0;
 /// The gap between the row's name and its FILE tag, and between the tag's
@@ -2086,6 +2262,17 @@ fn draw_send_detail(
                 .as_deref()
                 .and_then(|id| in_scope.iter().copied().find(|row| row.id == id));
             match picked {
+                // **An instruction is only drawn when it can be followed.**
+                // "Pick a Send to see its link" beside a column that says
+                // "You have no Sends" is a direction to do something the
+                // screen has just said is impossible, and it was the loudest
+                // thing on that screen. With no rows in scope the list
+                // column's own sentence is the whole answer and this column
+                // stays out of its way. It is not a blank pane for a blank
+                // pane's sake -- the reason `detail_prompt` exists at all is
+                // that a blank column beside a FULL list reads as a load that
+                // failed, and that case is unchanged.
+                None if in_scope.is_empty() => {}
                 None => detail_prompt(ui, NOTHING_PICKED),
                 Some(row) => action = draw_send_card(ui, row, delete),
             }
@@ -2094,6 +2281,9 @@ fn draw_send_detail(
             let picked =
                 selected.as_deref().and_then(|key| rows.iter().find(|row| row.key == key));
             match picked {
+                // The same rule as the SHARING screen's: nothing to pick,
+                // nothing telling you to pick it.
+                None if rows.is_empty() => {}
                 None => detail_prompt(ui, NOTHING_PICKED_RECEIVED),
                 Some(row) => draw_received_detail(ui, row),
             }
@@ -2130,8 +2320,42 @@ fn draw_send_card(
     let revoking = has_id && delete.in_flight == Some(row.id.as_str());
     let confirming = has_id && !revoking && delete.confirming == Some(row.id.as_str());
 
+    // --- how the header is laid out, decided before anything is painted ---
+    //
+    // **5b puts the actions ON the header line, right-aligned beside the
+    // title**, and this pane put them on a row of their own underneath. That
+    // one difference is most of why the detail column read as a stack of
+    // fields rather than as a page: 5b's header is one band -- who this is,
+    // what state it is in, and what you can do about it, left to right --
+    // and ours was a band, then a toolbar, then a sentence, then a card.
+    //
+    // It was not an arbitrary choice. At `MIN_VAULT_WINDOW_SIZE` this column
+    // is 298pt, its content box is 250, and 5b's own arrangement does not fit
+    // in it at any padding: a 42pt tile plus a title worth reading plus three
+    // controls is well past 250. So the answer is both, chosen by measurement
+    // rather than by picking one and living with it at the other end -- which
+    // is the same rule the `Views` meter and the card's label column already
+    // follow on this screen.
+    let labels = action_labels(row);
+    let content = (width - DETAIL_PAD_X_F * 2.0).max(0.0);
+    let action_pad = action_pad_for(ui, &labels, content);
+    let actions_width = actions_total(ui, &labels, action_pad);
+    // Inline only if the title still gets a readable run after the tile, the
+    // actions and the gap between the two columns. `TITLE_MIN_ROOM` is what
+    // "readable" means here and is argued at its own definition.
+    //
+    // Never while a revoke is running: that state draws a sentence where the
+    // controls were (see below), and a sentence is not a right-aligned row.
+    let inline = !revoking
+        && HEADER_TILE + ROW_TEXT_GAP + TITLE_MIN_ROOM + HEADER_ACTION_GAP + actions_width
+            <= content;
+
     // --- header strip ---------------------------------------------------
-    let strip_height = DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK + ACTION_ROW_GAP + COPY_BUTTON_HEIGHT;
+    let strip_height = if inline {
+        DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK
+    } else {
+        DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK + ACTION_ROW_GAP + theme::ACTION_BUTTON_HEIGHT
+    };
     let (strip, _) = ui.allocate_exact_size(egui::vec2(width, strip_height), egui::Sense::hover());
     {
         let p = ui.painter();
@@ -2155,7 +2379,11 @@ fn draw_send_card(
         paint_tile(p, tile, &row.name, true, 14.0);
 
         let text_left = tile.right() + ROW_TEXT_GAP;
-        let text_right = strip.right() - DETAIL_PAD_X_F;
+        // The text column stops where the actions begin when they are on this
+        // line, and at the pane's padding when they are not.
+        let text_right = strip.right()
+            - DETAIL_PAD_X_F
+            - if inline { actions_width + HEADER_ACTION_GAP } else { 0.0 };
         let clip = p.with_clip_rect(
             egui::Rect::from_min_max(
                 egui::pos2(text_left, strip.top()),
@@ -2163,13 +2391,21 @@ fn draw_send_card(
             )
             .intersect(ui.clip_rect()),
         );
-        clip.text(
-            egui::pos2(text_left, block_top),
-            egui::Align2::LEFT_TOP,
+        // **Elided, not clipped**, which is `elided`'s whole argument applied
+        // to the one run on this screen that had escaped it. A clipped galley
+        // keeps its full width, so at 298pt "Office WiFi -- Guest" was drawn
+        // at its natural size and simply stopped at the pane edge, with no
+        // ellipsis and no way for the reader to know a word had gone. The
+        // card rows below have been elided since they were written; the
+        // 21px title, the biggest run in the pane, was not.
+        let title = elided(
+            &clip,
             &row.name,
             egui::FontId::new(TITLE_PX, egui::FontFamily::Name(theme::BOLD.into())),
             theme::INK,
+            (text_right - text_left).max(0.0),
         );
+        clip.galley(egui::pos2(text_left, block_top), title, theme::INK);
         // The subtitle line: what kind of Send this is, then its pill. 5b
         // reads "Send - created 16 Aug, 14:20" here and this client has no
         // creation date, so the slot says the one thing it does know -- and
@@ -2192,30 +2428,49 @@ fn draw_send_card(
         );
     }
 
-    // --- the action row --------------------------------------------------
-    let action_y = strip.top() + DETAIL_PAD_Y_F + HEADER_BLOCK + ACTION_ROW_GAP;
-    let slot_at = |x: f32, w: f32| {
-        egui::Rect::from_min_size(egui::pos2(x, action_y), egui::vec2(w, COPY_BUTTON_HEIGHT))
+    // --- the actions -----------------------------------------------------
+    //
+    // Inline: 5b's own composition, right-aligned on the header line and
+    // centred on the header block. Stacked: their own row under it, at the
+    // pane's left padding, which is the only arrangement that fits 250pt.
+    let action_y = if inline {
+        strip.top() + DETAIL_PAD_Y_F + (HEADER_BLOCK - theme::ACTION_BUTTON_HEIGHT) / 2.0
+    } else {
+        strip.top() + DETAIL_PAD_Y_F + HEADER_BLOCK + ACTION_ROW_GAP
     };
-    let x0 = strip.left() + DETAIL_PAD_X_F;
+    let slot_at = |x: f32, w: f32| {
+        egui::Rect::from_min_size(
+            egui::pos2(x, action_y),
+            egui::vec2(w, theme::ACTION_BUTTON_HEIGHT),
+        )
+    };
+    let x0 = if inline {
+        strip.right() - DETAIL_PAD_X_F - actions_width
+    } else {
+        strip.left() + DETAIL_PAD_X_F
+    };
     if revoking {
         // **No widget of any kind**, which is the rule this screen has always
         // followed here: a disabled button is still a button the layout has
         // to hold, and sense-less controls in this window have a history of
         // coming back to life after a re-layout.
+        //
+        // `inline` is false whenever this is true -- see its definition --
+        // so this sentence always has the second row to itself and can never
+        // be laid over the title.
         ui.painter().text(
-            egui::pos2(x0, action_y + COPY_BUTTON_HEIGHT / 2.0),
+            egui::pos2(strip.left() + DETAIL_PAD_X_F, action_y + theme::ACTION_BUTTON_HEIGHT / 2.0),
             egui::Align2::LEFT_CENTER,
             DELETING_LABEL,
             egui::FontId::new(12.0, egui::FontFamily::Proportional),
             theme::TEXT_MUTED,
         );
     } else {
-        let copy_w = action_width(ui, "Copy link");
+        let copy_w = theme::action_button_width(ui.painter(), COPY_LINK_LABEL, action_pad);
         let switch_on = row.state == crate::send::SendState::Revoked;
         let switch_label = if switch_on { SWITCH_ON_LABEL } else { SWITCH_OFF_LABEL };
-        let switch_w = action_width(ui, switch_label);
-        let delete_w = action_width(ui, DELETE_LABEL);
+        let switch_w = theme::action_button_width(ui.painter(), switch_label, action_pad);
+        let delete_w = theme::action_button_width(ui.painter(), DELETE_LABEL, action_pad);
         let copy_rect = slot_at(x0, copy_w);
         let switch_rect = slot_at(copy_rect.right() + BUTTON_GAP, switch_w);
         // **The Delete slot and the Cancel slot are ONE expression, so they
@@ -2234,16 +2489,17 @@ fn draw_send_card(
         // The button is still drawn -- the pane must not lose its shape, and
         // a header that quietly has no control is harder to understand than
         // one that has a dead one.
+        //
+        // **The PRIMARY**, and the only one on this screen. 5b's header has
+        // an outlined control and a solid one, which is a hierarchy; this
+        // pane had three interchangeable grey boxes, which is a toolbar. What
+        // the screen is *for* is the link -- a Send exists to be handed to
+        // somebody -- so Copy link is the thing the eye should find, and the
+        // other two step back behind it.
         let has_url = !row.access_url.is_empty();
-        let copied = ui
-            .put(
-                copy_rect,
-                egui::Button::new(
-                    egui::RichText::new("Copy link").size(12.0).color(theme::INK),
-                )
-                .min_size(copy_rect.size()),
-            )
-            .clicked();
+        let copied =
+            theme::action_button(ui, copy_rect, COPY_LINK_LABEL, theme::ActionTone::Primary)
+                .clicked();
 
         // Hidden while confirming, and not disabled: the confirmation is
         // about exactly one thing, and a fourth control beside a destructive
@@ -2254,12 +2510,7 @@ fn draw_send_card(
         let switched = if confirming || !has_id {
             None
         } else {
-            let colour = if switch_on { theme::BLUE } else { theme::INK };
-            ui.put(
-                switch_rect,
-                egui::Button::new(egui::RichText::new(switch_label).size(12.0).color(colour))
-                    .min_size(switch_rect.size()),
-            )
+            theme::action_button(ui, switch_rect, switch_label, theme::ActionTone::Secondary)
             .clicked()
             .then(|| SendUiAction::SetDisabled {
                 id: row.id.clone(),
@@ -2275,23 +2526,20 @@ fn draw_send_card(
             // the confirmation is NOT here -- it is in the body, under the
             // question it answers; see below for why that is a stronger
             // defence than a wider button on this row.
-            ui.put(
-                delete_rect,
-                egui::Button::new(egui::RichText::new(CANCEL_LABEL).size(12.0).color(theme::INK))
-                    .min_size(delete_rect.size()),
-            )
-            .clicked()
-            .then_some(SendUiAction::CancelDelete)
+            theme::action_button(ui, delete_rect, CANCEL_LABEL, theme::ActionTone::Secondary)
+                .clicked()
+                .then_some(SendUiAction::CancelDelete)
         } else {
-            let asked = ui
-                .put(
-                    delete_rect,
-                    egui::Button::new(
-                        egui::RichText::new(DELETE_LABEL).size(12.0).color(theme::ERROR),
-                    )
-                    .min_size(delete_rect.size()),
-                )
-                .clicked();
+            // **`DestructiveQuiet` and not `Destructive`**: red words in an
+            // outlined button, not a solid red one. 5b's solid red is its
+            // `Revoke`, the one destructive control on its header; this
+            // header carries a destructive control beside two ordinary ones,
+            // and a filled red among them would be the loudest thing on a
+            // screen about a link. The solid red is spent one step later, on
+            // the confirmation this raises. See `theme::ActionTone`.
+            let asked =
+                theme::action_button(ui, delete_rect, DELETE_LABEL, theme::ActionTone::DestructiveQuiet)
+                    .clicked();
             (asked && has_id).then(|| SendUiAction::AskDelete(row.id.clone()))
         };
 
@@ -2307,6 +2555,16 @@ fn draw_send_card(
     }
 
     // --- the body --------------------------------------------------------
+    //
+    // **The cursor is put back at the foot of the strip first.** `Ui::put`
+    // does not merely draw at a rect, it advances the cursor to that rect's
+    // bottom -- and every control above is put INSIDE a band this function
+    // already allocated, so the last one moves the cursor BACKWARDS, from the
+    // strip's foot to the action row's. The body then opened flush against
+    // the header's hairline with its own 18pt top margin swallowed, which is
+    // visible in a picture and invisible in every rect assertion (the margin
+    // was applied; it was applied from the wrong place).
+    ui.advance_cursor_after_rect(strip);
     egui::Frame::new()
         .inner_margin(Margin::symmetric(DETAIL_PAD_X, DETAIL_PAD_Y))
         .show(ui, |ui| {
@@ -2322,7 +2580,7 @@ fn draw_send_card(
                     // subject is ambiguous at the moment it matters most.
                     if confirming {
                         ui.label(
-                            egui::RichText::new(CONFIRM_PROMPT).size(13.0).color(theme::ERROR),
+                            theme::semibold(CONFIRM_PROMPT, ANSWER_LINE_PX).color(theme::ERROR),
                         );
                         ui.add_space(10.0);
                         // **The destructive button, here rather than on the
@@ -2334,16 +2592,17 @@ fn draw_send_card(
                         // not manage -- and it is what lets the whole
                         // confirmation fit at `MIN_VAULT_WINDOW_SIZE`, where
                         // four controls on one 250pt row do not.
-                        let confirmed = ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(CONFIRM_LABEL)
-                                        .size(12.0)
-                                        .color(theme::ERROR),
-                                )
-                                .min_size(egui::vec2(CONFIRM_BUTTON_WIDTH, COPY_BUTTON_HEIGHT)),
-                            )
-                            .clicked();
+                        //
+                        // **`theme::destructive_button`, the app's own solid
+                        // red.** It was a bare `egui::Button` with red text,
+                        // which is the same look Delete wears one step
+                        // earlier -- so the escalation from "are you sure?"
+                        // to "yes, destroy it" was carried entirely by the
+                        // wording. This module already spends the filled red
+                        // on exactly this meaning; see `destructive_button`,
+                        // whose own doc argues why the second step must not
+                        // be blue and must not be quiet.
+                        let confirmed = theme::destructive_button(ui, CONFIRM_LABEL).clicked();
                         if confirmed && has_id {
                             // Cancel wins if both somehow report in one
                             // frame: the safe answer to an ambiguous frame on
@@ -2356,9 +2615,20 @@ fn draw_send_card(
                             }
                         }
                     } else {
+                        // **5c's own treatment for 5c's own line.** 5c opens
+                        // "Whether it was used is the question people
+                        // actually have -- so it is the first line, not a log
+                        // entry", and it draws that line at `font-size: 14px;
+                        // font-weight: 700`. This pane drew it at 13px
+                        // Regular, which is the size and weight of a caption:
+                        // the biggest claim on the screen was typeset as the
+                        // smallest thing on it, sitting under a header and
+                        // above a card that both outweighed it. One step up
+                        // in size and one in weight is the whole change, and
+                        // it is what makes the eye land on the answer rather
+                        // than on the `LINK` slab below.
                         ui.label(
-                            egui::RichText::new(row.activity.as_str())
-                                .size(13.0)
+                            theme::semibold(row.activity.as_str(), ANSWER_LINE_PX)
                                 .color(theme::INK),
                         );
                     }
@@ -2439,13 +2709,21 @@ fn draw_received_detail(ui: &mut egui::Ui, row: &ReceivedRow) {
                     } else {
                         (RECEIVED_ITEM_GONE, theme::TEXT_MUTED)
                     };
-                    ui.label(egui::RichText::new(sentence).size(13.0).color(colour));
+                    // [`ANSWER_LINE_PX`], like the Send pane's own first
+                    // line: the two panes swap places in this column and a
+                    // reader should not be able to tell which one they are
+                    // looking at from the type alone.
+                    ui.label(theme::semibold(sentence, ANSWER_LINE_PX).color(colour));
                     ui.add_space(14.0);
                     let short = if row.still_in_vault { IN_VAULT_YES } else { IN_VAULT_NO };
                     draw_fact_card(
                         ui,
                         RECEIVED_CARD_TITLE,
                         &[(ARRIVED_ROW, CardValue::Plain(&row.when)), (IN_VAULT_ROW, CardValue::Plain(short))],
+                        // No caution band: a record somebody shared WITH this
+                        // user carries no claim about who else has seen it.
+                        // See [`draw_link_card`], where there is one.
+                        false,
                     );
                 });
         });
@@ -2503,6 +2781,24 @@ fn draw_link_card(ui: &mut egui::Ui, row: &SendRow) {
             (EXPIRES_ROW, CardValue::Plain(row.expires.as_str())),
             (DELETED_ROW, CardValue::Plain(row.deletes.as_str())),
         ],
+        // **Design 5c's caution band, and the one part of 5c's Activity block
+        // this client can stand behind.**
+        //
+        // 5c ends its history with an amber strip -- "This password has been
+        // seen by someone else / Rotate it now" -- and that strip is not part
+        // of the per-access timeline this screen deliberately does not build.
+        // It is a reading of one number: `accessCount`. If somebody opened
+        // the link, whatever was behind it is out, and the useful thing to
+        // say is what to do about it. Every other line in 5c's block names a
+        // time, a browser and a city that no Bitwarden Send records; this one
+        // names none of them.
+        //
+        // It is also what stops this pane being a header and one card on a
+        // field of empty canvas. That is a happy consequence rather than the
+        // reason -- a band invented to fill the space would be worse than the
+        // space -- but it is worth saying, because the emptiness was real and
+        // is most of what "not even close to UI" was about.
+        row.access_count > 0,
     );
 }
 
@@ -2512,18 +2808,25 @@ fn draw_link_card(ui: &mut egui::Ui, row: &SendRow) {
 /// layouts, for this file's standing reason -- and because the label column
 /// has to be ONE width down the whole card, which a per-row layout can only
 /// achieve by every row agreeing to measure the same thing.
-fn draw_fact_card(ui: &mut egui::Ui, title: &str, rows: &[(&str, CardValue<'_>)]) {
+/// `caution` adds design 5c's amber band along the card's bottom edge; see
+/// [`draw_link_card`], which is the one caller that ever passes `true`.
+fn draw_fact_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    rows: &[(&str, CardValue<'_>)],
+    caution: bool,
+) {
     let width = ui.available_width();
-    let height = CARD_HEADER_HEIGHT + CARD_ROW_HEIGHT * rows.len() as f32;
+    // The band is LAID OUT before the card is allocated, for the list
+    // column's footnote's reason one screen over: its two lines wrap, so its
+    // height is a measurement and not a constant, and a card allocated to a
+    // guess would either crop the sentence or leave a gap under it.
+    let band = caution.then(|| caution_lines(ui, width));
+    let band_height = band.as_ref().map_or(0.0, |lines| caution_height(lines));
+    let height = CARD_HEADER_HEIGHT + CARD_ROW_HEIGHT * rows.len() as f32 + band_height;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
     let p = ui.painter();
     p.rect_filled(rect, CornerRadius::same(CARD_RADIUS), theme::CARD);
-    p.rect_stroke(
-        rect,
-        CornerRadius::same(CARD_RADIUS),
-        egui::Stroke::new(1.0, theme::HAIRLINE),
-        egui::StrokeKind::Inside,
-    );
     let header_bottom = rect.top() + CARD_HEADER_HEIGHT;
     let eyebrow = p.layout_job(theme::letterspaced(
         title,
@@ -2695,6 +2998,93 @@ fn draw_fact_card(ui: &mut egui::Ui, title: &str, rows: &[(&str, CardValue<'_>)]
             }
         }
     }
+
+    // --- design 5c's caution band, along the card's bottom edge ----------
+    if let Some(lines) = band {
+        let top = header_bottom + CARD_ROW_HEIGHT * rows.len() as f32;
+        let band_rect =
+            egui::Rect::from_min_max(egui::pos2(rect.left(), top), rect.right_bottom());
+        // Only the BOTTOM corners are rounded: this band is the foot of the
+        // card, not a card of its own, and a fully rounded tint inside a
+        // rounded card leaves two crescents of white in the corners.
+        p.rect_filled(
+            band_rect,
+            CornerRadius { nw: 0, ne: 0, sw: CARD_RADIUS, se: CARD_RADIUS },
+            theme::CAUTION_WASH,
+        );
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left(), top),
+                egui::pos2(rect.right(), top + 1.0),
+            ),
+            CornerRadius::ZERO,
+            theme::HAIRLINE,
+        );
+        // 5c's `width: 15; height: 15` triangle, through the theme's own
+        // glyph rather than a second drawing of one.
+        theme::paint_warning_glyph(
+            &p,
+            egui::Rect::from_min_size(
+                egui::pos2(band_rect.left() + CARD_PAD_X, top + CAUTION_PAD_Y + 1.0),
+                egui::Vec2::splat(CAUTION_GLYPH),
+            ),
+            theme::CAUTION_MARK,
+        );
+        let mut y = top + CAUTION_PAD_Y;
+        let x = band_rect.left() + CARD_PAD_X + CAUTION_GLYPH + CAUTION_GLYPH_GAP;
+        for line in lines {
+            let height = line.size().y;
+            p.galley(egui::pos2(x, y), line, theme::CAUTION_INK);
+            y += height + CAUTION_LINE_GAP;
+        }
+    }
+
+    // **The border last, over everything.** It used to be stroked straight
+    // after the fill, which was fine while nothing else reached the card's
+    // edge; the caution band does, and a band painted over its own card's
+    // outline is a tint that runs off the rounded corner.
+    p.rect_stroke(
+        rect,
+        CornerRadius::same(CARD_RADIUS),
+        egui::Stroke::new(1.0, theme::HAIRLINE),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// Design 5c's caution band, laid out to `width`.
+///
+/// Separate from the drawing for the reason every measurement on this screen
+/// is: the card that holds the band has to be allocated at its full height
+/// before anything is painted into it, and these two lines WRAP -- at 298pt
+/// the detail column leaves them about 190pt, which is three lines rather
+/// than two.
+fn caution_lines(ui: &egui::Ui, width: f32) -> Vec<std::sync::Arc<egui::Galley>> {
+    let text_width =
+        (width - CARD_PAD_X * 2.0 - CAUTION_GLYPH - CAUTION_GLYPH_GAP).max(1.0);
+    let p = ui.painter();
+    vec![
+        p.layout(
+            CAUTION_HEADLINE.to_string(),
+            egui::FontId::new(CAUTION_PX, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+            theme::CAUTION_INK,
+            text_width,
+        ),
+        p.layout(
+            CAUTION_ADVICE.to_string(),
+            egui::FontId::new(CAUTION_PX, egui::FontFamily::Proportional),
+            theme::CAUTION_INK,
+            text_width,
+        ),
+    ]
+}
+
+/// How tall the band those lines go in has to be.
+fn caution_height(lines: &[std::sync::Arc<egui::Galley>]) -> f32 {
+    let text: f32 = lines.iter().map(|g| g.size().y).sum::<f32>()
+        + CAUTION_LINE_GAP * (lines.len().saturating_sub(1)) as f32;
+    // The glyph is never the taller of the two, but saying so out loud costs
+    // nothing and is what stops a one-line band cropping its own icon.
+    CAUTION_PAD_Y * 2.0 + text.max(CAUTION_GLYPH)
 }
 
 /// One line of `text` laid out to fit `max_width`, with an ellipsis where it
@@ -2728,21 +3118,83 @@ fn elided(
     painter.layout_job(job)
 }
 
-/// A detail-pane control, wide enough for its own words.
+/// The **slots** the detail header's action row occupies, in the order it
+/// draws them.
 ///
-/// **Measured rather than fixed**, and that is what makes three controls fit
-/// this pane at `MIN_VAULT_WINDOW_SIZE`: the detail column is 298pt there, so
-/// its content box is 250, and three fixed 92/84/68 slots plus their gaps
-/// came to 260. Every width here is a galley plus the design's padding, with
-/// a floor so a short word does not produce a control too small to hit.
-fn action_width(ui: &egui::Ui, label: &str) -> f32 {
-    let galley = ui.painter().layout_no_wrap(
-        label.to_string(),
-        egui::FontId::new(12.0, egui::FontFamily::Proportional),
-        theme::INK,
-    );
-    (galley.size().x + ACTION_PAD_X * 2.0).max(ACTION_MIN_WIDTH)
+/// **Its own function, because the row's WIDTH has to be known before the
+/// strip that holds the row is allocated**, and the labels are what the width
+/// is measured from. It is the same reserve-then-fill discipline every cell
+/// on this screen follows, one level further out: here the thing being
+/// reserved is not a slot but the shape of the whole header -- see
+/// `draw_send_card` on why the actions sit on the title's line when they fit
+/// and under it when they do not.
+///
+/// # It measures three slots always, and that is the whole contract
+///
+/// Two of the three are sometimes not DRAWN -- the switch leaves while a
+/// confirmation is up or when the Send has no id, and Delete is replaced by
+/// Cancel -- and the row still reserves every one of them. That rule is not
+/// new and it is not cosmetic: the mis-click defence on this screen is that a
+/// second rapid click where Delete was lands on **Cancel**, which is true
+/// only while those two rectangles are equal, and equal rectangles require an
+/// equal row width on both frames.
+///
+/// So this returns the same three widths in every state, measured from
+/// `DELETE_LABEL` rather than from whichever of Delete/Cancel is showing.
+/// Returning only the visible labels is a real bug and was briefly written:
+/// it moved the right-aligned row's origin between the two frames and pushed
+/// Cancel clean off the pane.
+fn action_labels(row: &SendRow) -> [&'static str; 3] {
+    [
+        COPY_LINK_LABEL,
+        if row.state == crate::send::SendState::Revoked {
+            SWITCH_ON_LABEL
+        } else {
+            SWITCH_OFF_LABEL
+        },
+        DELETE_LABEL,
+    ]
 }
+
+/// What a row of `labels` occupies at `pad`, gaps included.
+fn actions_total(ui: &egui::Ui, labels: &[&str], pad: f32) -> f32 {
+    if labels.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 =
+        labels.iter().map(|l| theme::action_button_width(ui.painter(), l, pad)).sum();
+    sum + BUTTON_GAP * (labels.len() - 1) as f32
+}
+
+/// The widest padding at which this row of controls still fits `room`.
+///
+/// **Padding is the first thing given up, and the only thing**, which is
+/// `theme::action_button_width`'s own argument applied here: the detail
+/// column is 250pt of content at `MIN_VAULT_WINDOW_SIZE`, three controls at
+/// 5b's `padding: 0 14px` come to 258, and something has to go. Shrinking a
+/// LABEL hides what the control does. Shrinking the HEIGHT would make these
+/// a different component from the identical controls on a wider window, which
+/// is precisely the drift this screen is being repaired for. Shrinking the
+/// padding leaves a button that is visibly the same button, slightly tighter
+/// -- and only on the window sizes that cannot hold the comfortable one.
+///
+/// The floor is returned even when it does not fit, because a row that does
+/// not fit must still be drawn at its smallest rather than vanish: this pane
+/// has no narrower window to fall back to, and a missing Delete is worse than
+/// a cramped one. Nothing is painted outside the pane either way -- the
+/// labels are laid out inside their own rects.
+fn action_pad_for(ui: &egui::Ui, labels: &[&str], room: f32) -> f32 {
+    const LADDER: [f32; 4] = [theme::ACTION_BUTTON_PAD_X, 12.0, 10.0, ACTION_PAD_FLOOR];
+    for pad in LADDER {
+        if actions_total(ui, labels, pad) <= room {
+            return pad;
+        }
+    }
+    ACTION_PAD_FLOOR
+}
+
+/// The tightest an action button is ever drawn; see [`action_pad_for`].
+const ACTION_PAD_FLOOR: f32 = 8.0;
 
 /// Design 5b's `padding: 18px 24px` on the detail pane's header strip and on
 /// its body.
@@ -2767,14 +3219,36 @@ const SUBTITLE_GAP: f32 = 4.0;
 /// and hanging the column off the tile is what left one of them floating in
 /// the item detail's header before this window learnt the lesson.
 const HEADER_BLOCK: f32 = TITLE_LINE + SUBTITLE_GAP + theme::PILL_HEIGHT;
-/// The gap between the header's text block and the action row under it.
+/// The gap between the header's text block and the action row under it, on
+/// the windows too narrow to put the actions on the title's own line.
 const ACTION_ROW_GAP: f32 = 12.0;
-/// A detail action's horizontal padding, and the floor on its width.
-const ACTION_PAD_X: f32 = 12.0;
-const ACTION_MIN_WIDTH: f32 = 60.0;
-/// The confirmation's destructive button. Wider, because it is labelled with
-/// the whole of what it does rather than with one verb.
-const CONFIRM_BUTTON_WIDTH: f32 = 132.0;
+/// 5b's `gap: 14px` between the header's text column and the controls at its
+/// right edge.
+const HEADER_ACTION_GAP: f32 = 14.0;
+/// The narrowest run the title may be left with before the actions are moved
+/// off its line and onto their own.
+///
+/// **160 is roughly twenty characters at [`TITLE_PX`]**, which is where a
+/// name stops being a name and becomes an ellipsis with a hint in front of
+/// it. The number is a judgement and is written here rather than inlined so
+/// it can be argued with: below it, 5b's one-band header is worse than the
+/// two-row arrangement it replaces, because the whole point of that band is
+/// that the thing on the left is identifiable.
+const TITLE_MIN_ROOM: f32 = 160.0;
+
+/// The size and weight of the **one sentence** each detail pane opens with --
+/// a Send's activity, a received record's whereabouts, and the destructive
+/// confirmation that replaces the first of them.
+///
+/// 5c's own `font-size: 14px; font-weight: 700` for the line it argues is the
+/// question people actually have. Named, and shared by the three, because
+/// they occupy the same slot in the same column and a reader should not be
+/// able to tell which pane they are looking at from the type alone. It is
+/// [`theme::semibold`] rather than 5c's 700 for the reason every heading in
+/// this app is: 700 is the weight this design system spends on a SELECTED
+/// row's name and on a pill, and a sentence in it would outweigh the header
+/// above it.
+const ANSWER_LINE_PX: f32 = 14.0;
 
 /// Card geometry, measured as a border box from 5b's own CSS.
 ///
@@ -2794,6 +3268,29 @@ const CARD_GAP: f32 = 14.0;
 const CARD_LABEL_SHARE: f32 = 0.30;
 const CARD_LABEL_MIN: f32 = 68.0;
 const CARD_LABEL_MAX: f32 = 120.0;
+/// Design 5c's caution band: `padding: 13px 16px`, a 15px warning triangle
+/// with the design's `gap: 9px` beside it, two 12px lines `gap: 6px` apart.
+/// The horizontal padding is [`CARD_PAD_X`], because the band is a foot of
+/// the card and its text has to stand on the same column as the labels above.
+const CAUTION_PAD_Y: f32 = 13.0;
+const CAUTION_GLYPH: f32 = 15.0;
+const CAUTION_GLYPH_GAP: f32 = 9.0;
+const CAUTION_LINE_GAP: f32 = 6.0;
+const CAUTION_PX: f32 = 12.0;
+
+/// What design 5c's band says, in the one form this client can support.
+///
+/// **5c says "This password has been seen by someone else" and this cannot**,
+/// because a Send made here is arbitrary text: it may be a password, a
+/// connection string, a one-off token or a note. Naming it a password would
+/// be a guess, and a guess in the reassuring direction on the half of the
+/// cases where it is something worse. So the headline says what is certainly
+/// true -- somebody opened the link, and whatever was behind it is out -- and
+/// the advice is conditional in the one place where it has to be.
+pub const CAUTION_HEADLINE: &str = "Somebody has opened this link.";
+pub const CAUTION_ADVICE: &str =
+    "Treat whatever it held as known to them. If it was a password, change it.";
+
 /// 5b's view meter: `width: 90px; height: 4px; border-radius: 2px`.
 const VIEW_BAR_WIDTH: f32 = 90.0;
 const VIEW_BAR_HEIGHT: f32 = 4.0;
@@ -7491,6 +7988,352 @@ mod paint_tests {
 
         // An unreadable date is the caller's own word, never a guess.
         assert_eq!(date_words("not a date", &FixedClock(NOW), &UTC, "absent"), "absent");
+    }
+
+    // -----------------------------------------------------------------
+    // The pass that put this screen beside design 5b
+    // -----------------------------------------------------------------
+    //
+    // Every assertion below is run at BOTH pane widths, which is this
+    // screen's standing rule and is more than a formality here: three of
+    // these four properties are about a layout that deliberately differs
+    // between the two, and a test at one size would pin half of it.
+
+    /// The vault window's centre pane at the SHIPPED window size -- 1240 wide
+    /// less the rail -- which is the comfortable end of the range
+    /// [`min_pane_size`] is the floor of.
+    ///
+    /// Named beside its twin because almost nothing on this screen is
+    /// interesting at one width alone: what a reviewer is looking for is the
+    /// difference, and what a test is looking for is that BOTH ends behave.
+    fn roomy_pane_size() -> egui::Vec2 {
+        egui::vec2(1240.0 - crate::vault_window::SIDEBAR_WIDTH, 740.0)
+    }
+
+    /// The rect of a run of exactly `label` in the DETAIL column.
+    fn detail_rect(painted: &Painted, label: &str) -> egui::Rect {
+        painted
+            .rects_of_exact(label)
+            .into_iter()
+            .find(|r| r.center().x >= crate::vault_window::LIST_WIDTH)
+            .unwrap_or_else(|| {
+                panic!("{label:?} was not painted in the detail column: {:?}", painted.text)
+            })
+    }
+
+    /// **Design 5b's header is ONE band, and it is one band whenever it can
+    /// be.**
+    ///
+    /// 5b draws the detail pane's controls on the title's own line, right
+    /// aligned; this pane drew them on a row of their own underneath, which
+    /// is most of why the column read as a stack of parts rather than as a
+    /// page. It cannot always: at `MIN_VAULT_WINDOW_SIZE` the column is 298pt
+    /// and 5b's arrangement does not fit at any padding. So the rule is
+    /// measured, and this is the test that says the measurement really
+    /// switches -- a `let inline = true` would pass half of it and a
+    /// `let inline = false` the other half.
+    #[test]
+    fn the_detail_actions_share_the_title_line_when_there_is_room_and_take_their_own_when_there_is_not()
+    {
+        let state = one_row(crate::send::SendState::Waiting);
+
+        let (roomy, _) = paint(&state, None, roomy_pane_size());
+        let copy = detail_rect(&roomy, COPY_LINK_LABEL);
+        let title = detail_rect(&roomy, "SAP Production");
+        let pill = detail_rect(&roomy, WAITING_LABEL);
+        assert!(
+            copy.left() > title.right(),
+            "with room to spare the actions are not beside the title: Copy link at {copy:?}, \
+             title at {title:?}"
+        );
+        assert!(
+            copy.center().y < pill.bottom(),
+            "with room to spare the actions still sit BELOW the header block rather than on \
+             its line: Copy link centred at y={}, the pill ends at y={}",
+            copy.center().y,
+            pill.bottom()
+        );
+
+        let (tight, _) = paint(&state, None, min_pane_size());
+        let copy = detail_rect(&tight, COPY_LINK_LABEL);
+        let pill = detail_rect(&tight, WAITING_LABEL);
+        assert!(
+            copy.center().y > pill.bottom(),
+            "at the minimum window size the actions were squeezed onto the title's line, \
+             where 5b's own arrangement does not fit: Copy link centred at y={}, the pill \
+             ends at y={}",
+            copy.center().y,
+            pill.bottom()
+        );
+        // And the row is still INSIDE the pane, which is the whole reason the
+        // padding shrinks rather than the labels.
+        let right = min_pane_size().x;
+        for label in [COPY_LINK_LABEL, SWITCH_OFF_LABEL, DELETE_LABEL] {
+            let rect = detail_rect(&tight, label);
+            assert!(
+                rect.right() <= right,
+                "{label:?} runs past the right edge of a {right}pt pane: {rect:?}"
+            );
+        }
+    }
+
+    /// **Cancel lands in Delete's exact rectangle at BOTH widths.**
+    ///
+    /// The mis-click defence on this screen is that a second rapid click
+    /// where Delete was lands on Cancel, and that holds only while the two
+    /// rectangles are equal. It is asserted here at both ends because the
+    /// header now measures its own row: a measurement that counted only the
+    /// VISIBLE controls -- Cancel replaces Delete and the switch leaves --
+    /// made the right-aligned row narrower on the confirming frame and slid
+    /// Cancel away from Delete's pixels. That bug was written, and this is
+    /// what found it. See [`action_labels`].
+    #[test]
+    fn cancel_stands_exactly_where_delete_was_at_both_pane_widths() {
+        let state = one_row(crate::send::SendState::Waiting);
+        for size in [roomy_pane_size(), min_pane_size()] {
+            let (before, _) = paint_with(&state, None, size, SendDeleteView::default());
+            let (during, _) = paint_with(
+                &state,
+                None,
+                size,
+                SendDeleteView { confirming: Some("id0"), in_flight: None },
+            );
+            let delete = detail_rect(&before, DELETE_LABEL);
+            let cancel = detail_rect(&during, CANCEL_LABEL);
+            let delete_box = before
+                .fill_behind(delete)
+                .expect("Delete has no button behind it")
+                .0;
+            let cancel_box = during
+                .fill_behind(cancel)
+                .expect("Cancel has no button behind it")
+                .0;
+            // **The whole rectangle, not its centre.** A button eight points
+            // taller than the one it replaces has the same centre and is not
+            // the same target -- which is exactly the defect this test found
+            // on its first run: egui wrapped `Cancel` inside a slot measured
+            // for `Delete` and grew the button to fit. See
+            // `theme::action_button`'s wrap mode.
+            assert!(
+                (delete_box.min - cancel_box.min).length() < 0.5
+                    && (delete_box.max - cancel_box.max).length() < 0.5,
+                "at a {}pt pane Delete's button is at {:?} and Cancel's at {:?} -- the \
+                 second of two rapid clicks where Delete was no longer lands on Cancel",
+                size.x,
+                delete_box,
+                cancel_box
+            );
+        }
+    }
+
+    /// **Design 5b's `opacity: 0.72`: a Send whose link is over steps back,
+    /// and a live one does not.**
+    ///
+    /// Read off the PILL's own fill rather than off the words, because that
+    /// is the one cell of the row whose colour a test can see -- and because
+    /// it is the cell where a half-applied fade would be most obvious: a
+    /// receded row with a full-strength pill is a row whose loudest element
+    /// is its least important one.
+    #[test]
+    fn an_ended_row_is_drawn_back_and_a_live_one_is_not() {
+        use crate::send::{SendState, SendSummary};
+        let sends = vec![
+            SendSummary {
+                id: "id-live".to_string(),
+                name: "Office WiFi".to_string(),
+                access_url: "https://send.bitwarden.com/#/a".to_string(),
+                deletion_date: "2026-08-17T00:00:00.000Z".to_string(),
+                is_file: false,
+                max_access_count: None,
+                access_count: 0,
+                disabled: false,
+                expiration_date: String::new(),
+                has_password: false,
+            },
+            SendSummary {
+                id: "id-ended".to_string(),
+                name: "Atlas Studio".to_string(),
+                access_url: "https://send.bitwarden.com/#/b".to_string(),
+                deletion_date: "2026-08-17T00:00:00.000Z".to_string(),
+                is_file: false,
+                max_access_count: None,
+                access_count: 0,
+                // Revoked, and NOT the picked row: a selection restores a
+                // receded row to full strength, so a fixture that picked this
+                // one would be measuring the exception.
+                disabled: true,
+                expiration_date: String::new(),
+                has_password: false,
+            },
+        ];
+        // **The control is inside the fixture**, as `one_row`'s is: a test
+        // below that finds no faded pill should be telling you the pane did
+        // not fade one, never that the fixture was never revoked.
+        assert_eq!(
+            sends.iter().map(|s| crate::send::send_state(s, &FixedClock(NOW))).collect::<Vec<_>>(),
+            vec![SendState::Waiting, SendState::Revoked],
+            "control: the two fixtures do not derive to a live row and an ended one"
+        );
+        let state = pane_state(Some(&Ok(sends)), &FixedClock(NOW), &UTC);
+        for size in [roomy_pane_size(), min_pane_size()] {
+            let (painted, _) = paint(&state, None, size);
+            let live = painted.control_under(WAITING_LABEL).1;
+            let ended = painted.control_under(REVOKED_LABEL).1;
+            assert_eq!(
+                live.a(),
+                255,
+                "at a {}pt pane the LIVE row's pill is faded, so nothing in the column comes \
+                 forward",
+                size.x
+            );
+            assert!(
+                ended.a() < 255,
+                "at a {}pt pane the ended row's pill is drawn at full strength, so a revoked \
+                 link has exactly the weight of one somebody is about to open: alpha {}",
+                size.x,
+                ended.a()
+            );
+        }
+    }
+
+    /// **The standing notes are a footnote, under the rows.**
+    ///
+    /// They used to sit between the strip and the first row -- some seventy
+    /// points of grey prose at the top of the column, so the first thing the
+    /// eye met on this screen was a help note and the rows began a third of
+    /// the way down. 5b's list column goes strip, then rows. The sentences
+    /// are still here, because both are true and both are things a user has
+    /// to be told; they are simply no longer the headline.
+    #[test]
+    fn the_standing_notes_sit_below_the_rows_rather_than_above_them() {
+        let state = rows(3);
+        for size in [roomy_pane_size(), min_pane_size()] {
+            let (painted, _) = paint(&state, None, size);
+            let note = painted
+                .rect_of(SCOPE_SUBTEXT)
+                .unwrap_or_else(|| panic!("the standing note vanished: {:?}", painted.text));
+            let first = painted
+                .rect_of("send-number-0")
+                .expect("the first row was not painted");
+            assert!(
+                note.top() > first.bottom(),
+                "at a {}pt pane the standing note is still above the first row: note at \
+                 {note:?}, first row at {first:?}",
+                size.x
+            );
+            // And it really is at the FOOT of the column rather than merely
+            // after the rows: nothing of the list is drawn below it.
+            assert!(
+                note.bottom() <= size.y + 1.0,
+                "the note is drawn off the bottom of the pane: {note:?} in {size:?}"
+            );
+        }
+    }
+
+    /// **Design 5c's caution band, on exactly the Sends that have been
+    /// opened.**
+    ///
+    /// The band is the one part of 5c's history block this client can stand
+    /// behind -- it is a reading of `accessCount` and names no time, browser
+    /// or city. The half that is easy to lose is the second: a pane that drew
+    /// it unconditionally would warn every user about every link, including
+    /// the ones nobody has touched, which is how a warning stops being read.
+    #[test]
+    fn a_send_that_has_been_opened_is_cautioned_and_an_untouched_one_is_not() {
+        let opened = one_row(crate::send::SendState::Used);
+        let untouched = one_row(crate::send::SendState::Waiting);
+        for size in [roomy_pane_size(), min_pane_size()] {
+            let (painted, _) = paint(&opened, None, size);
+            assert!(
+                painted.has(CAUTION_HEADLINE),
+                "at a {}pt pane a Send somebody has opened says nothing about it: {:?}",
+                size.x,
+                painted.text
+            );
+            let text = painted.rect_of(CAUTION_HEADLINE).expect("just asserted");
+            let (band, fill) = painted
+                .fill_behind(text)
+                .expect("the caution sentence has no band behind it");
+            assert_eq!(
+                fill,
+                theme::CAUTION_WASH,
+                "the caution sentence is on something other than the design's amber ground"
+            );
+            assert!(
+                band.right() <= size.x + 1.0 && band.left() >= crate::vault_window::LIST_WIDTH,
+                "the caution band is not inside the detail column: {band:?} in {size:?}"
+            );
+
+            let (painted, _) = paint(&untouched, None, size);
+            assert!(
+                !painted.has(CAUTION_HEADLINE),
+                "at a {}pt pane a link nobody has opened is warned about anyway: {:?}",
+                size.x,
+                painted.text
+            );
+            // The control for that absence: the pane really drew, so what is
+            // missing is the band and not the screen.
+            assert!(painted.has(LINK_CARD_TITLE), "nothing was painted at all");
+        }
+    }
+
+    /// **The detail title is elided, not clipped.**
+    ///
+    /// `elided`'s whole argument, applied to the one run on this screen that
+    /// had escaped it: a clipped galley keeps its full width, so a 21px name
+    /// at 298pt was laid out at its natural size and simply stopped at the
+    /// pane edge -- a complete-looking title that is not the title, with
+    /// nothing to say a word had gone.
+    #[test]
+    fn a_long_detail_title_ends_in_an_ellipsis_inside_the_pane() {
+        use crate::send::SendSummary;
+        let send = SendSummary {
+            id: "id0".to_string(),
+            name: "Remote Desktop \u{2014} Bastion \u{2014} contractor access, third quarter"
+                .to_string(),
+            access_url: "https://send.bitwarden.com/#/x".to_string(),
+            deletion_date: "2026-08-17T00:00:00.000Z".to_string(),
+            is_file: false,
+            max_access_count: None,
+            access_count: 0,
+            disabled: false,
+            expiration_date: String::new(),
+            has_password: false,
+        };
+        let state = pane_state(Some(&Ok(vec![send])), &FixedClock(NOW), &UTC);
+        for size in [roomy_pane_size(), min_pane_size()] {
+            let (painted, _) = paint(&state, None, size);
+            // The DETAIL header's copy of the name. Found by its column
+            // rather than by its size, because the list row draws the very
+            // same string and the two are told apart by where they are.
+            let (text, rect) = painted
+                .text_rects
+                .iter()
+                .filter(|(t, r)| {
+                    t.starts_with("Remote Desktop")
+                        && r.center().x >= crate::vault_window::LIST_WIDTH
+                })
+                .max_by(|a, b| a.1.width().partial_cmp(&b.1.width()).expect("finite"))
+                .cloned()
+                .unwrap_or_else(|| panic!("no title was painted: {:?}", painted.text));
+            assert!(
+                rect.right() <= size.x + 1.0,
+                "at a {}pt pane the title runs past the edge: {text:?} at {rect:?}",
+                size.x
+            );
+            // At the minimum size this name cannot fit at 21px, so what is
+            // being asserted there is that the reader is TOLD it was cut. At
+            // the roomy size it may well fit, and a test that demanded an
+            // ellipsis would be demanding a defect.
+            if !text.ends_with("quarter") {
+                assert!(
+                    text.ends_with('\u{2026}'),
+                    "at a {}pt pane the title was cut short with no ellipsis to say so: \
+                     {text:?}",
+                    size.x
+                );
+            }
+        }
     }
 }
 
