@@ -65,10 +65,22 @@
 //! a camera pointed at one is exactly as sensitive as the seed. [`Frame`]'s
 //! buffer is a [`Zeroizing`], the frame the code was read out of is dropped
 //! rather than handed to the preview, and the slot [`Sink::show`] writes into
-//! wipes whatever it replaces. **Nothing here writes a file**: no capture is
-//! saved, no diagnostic path dumps one, and no `log` call carries pixels.
+//! wipes whatever it replaces. **Nothing here opens a file**: no capture is
+//! saved and no diagnostic path dumps one.
 //! [`Frame`]'s and [`Verdict`]'s `Debug` are hand-written so `debug_leak_guard`
 //! has nothing to catch.
+//!
+//! This module **does** log, and the rule about it is narrower than "it does
+//! not". `PRIVACY.md` promises that no picture, clip or still is written to
+//! disk or to the log, and that is the promise: what goes in the log is the
+//! *shape* of a failure -- the camera's friendly name, which call was made,
+//! what `HRESULT` came back, which reader flags were set, and how many frames
+//! have arrived -- and never the contents of one. It was the absence of all
+//! that which made this route's first real failure undiagnosable, since a
+//! driver refusing an output type and a lens with a cap on it reached the
+//! same sentence with no evidence between them. See [`failed`], and
+//! `this_module_writes_nothing_anywhere`, which now checks what a log call
+//! *interpolates* rather than banning the macro.
 //!
 //! The one copy this module cannot wipe is the **preview**: the surface hands
 //! each frame to `egui` as a texture, and a texture is not a `Zeroizing`. That
@@ -819,7 +831,8 @@ struct Platform;
 impl Platform {
     fn start() -> Result<Platform, CameraRefusal> {
         use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_LITE, MF_VERSION};
-        unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE) }.map_err(refusal_for)?;
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE) }
+            .map_err(|e| failed("starting Media Foundation", e))?;
         Ok(Platform)
     }
 }
@@ -860,6 +873,146 @@ fn refusal_for(error: windows::core::Error) -> CameraRefusal {
     CameraRefusal::Unavailable
 }
 
+/// **One failed Media Foundation call, written down and then turned into a
+/// refusal.**
+///
+/// Every `HRESULT` in this module used to go straight into [`refusal_for`] and
+/// the number was gone. That is what made the defect this function exists for
+/// undiagnosable: a driver that refuses the output media type, a device
+/// another app is holding, and a lens with a cap on it all arrived at the same
+/// sentence on screen, and the only evidence that told them apart -- the code
+/// -- had already been thrown away at the `?`.
+///
+/// So the number goes in the log and the *sentence* goes on screen. Those are
+/// different audiences and the module docs are emphatic about the second one:
+/// an `HRESULT` in front of a user is not a step they can take. `what` is a
+/// fixed string written at the call site, never anything derived from the
+/// device or from a frame, so this cannot become a way for pixels to reach a
+/// file by accident.
+fn failed(what: &str, error: windows::core::Error) -> CameraRefusal {
+    let why = refusal_for(error.clone());
+    log::warn!(
+        "camera: {what} failed with 0x{:08X} ({why:?})",
+        error.code().0 as u32
+    );
+    why
+}
+
+/// **`MF_MT_FRAME_SIZE`'s two halves, and THIS IS THE DEFECT THE WEBCAM ROUTE
+/// SHIPPED WITH.**
+///
+/// Media Foundation packs a frame size into one `UINT64`: the width in the
+/// high thirty-two bits, the height in the low thirty-two. Taking the height
+/// back out means **truncating to 32 bits** and then widening, and the code
+/// this replaces wrote `packed as usize`.
+///
+/// On a 32-bit target that is the truncation. On 64-bit Windows, which is the
+/// only thing this app ships for, `usize` is sixty-four bits wide and `as`
+/// therefore does *nothing at all*: the height came back as the entire word,
+/// width included. A 1280x720 camera reported a height of **5497558139600**,
+/// which is `(1280 << 32) | 720` read whole.
+///
+/// Nothing then failed in a way anybody could see, which is the part worth
+/// dwelling on. Media Foundation was happy, every `HRESULT` was `S_OK`, and
+/// `ReadSample` handed over real 3686400-byte pictures at ten a second.
+/// [`pack_rgba`] checked `row_bytes * height` against the buffer it was given,
+/// found 28147497674752000 bytes claimed against 3686400 delivered, and
+/// correctly answered `None` -- and the capture loop's `continue` for that
+/// case is commented *"one short buffer from a driver waking up is not a
+/// reason to close the camera"*, which is right for one buffer and hid this
+/// for every buffer. So every frame was dropped silently, no frame ever
+/// reached the sink, the eight-second grace expired, and the user was told
+/// *"That camera sent no picture"* by a camera that had sent seventy.
+///
+/// The enumeration loop a few lines above got this right -- it writes
+/// `packed as u32` because it is building `(u32, u32)` pairs -- so
+/// [`best_frame_size`] picked a correct mode and the negotiation logged a
+/// clean 1280x720. Only the read-back was wrong, and only on the axis nothing
+/// else printed.
+///
+/// A named function over the raw word, so both call sites do the same thing
+/// and `a_packed_frame_size_gives_up_both_halves` can drive it with no camera
+/// anywhere. `u32` first and `usize` second, in that order, is the whole fix.
+pub fn unpack_frame_size(packed: u64) -> (usize, usize) {
+    ((packed >> 32) as u32 as usize, packed as u32 as usize)
+}
+
+/// **What "the stream ended" means, which depends on whether it ever began.**
+///
+/// `MF_SOURCE_READERF_ENDOFSTREAM` used to be one sentence -- "That camera
+/// stopped" -- and that is right for a camera taken away mid-scan and wrong
+/// for one that accepted every call, sent nothing, and then said it was done.
+/// The user reading the second one is told something stopped that they never
+/// saw start, and the advice that comes with it ("plug it back in") is advice
+/// for a problem they do not have.
+///
+/// So the two are told apart by the one fact that distinguishes them: whether
+/// a frame ever arrived. A pure function over that count rather than an `if`
+/// inside the `unsafe` loop, because it is a decision about wording and the
+/// loop is not a place a test can reach.
+pub fn end_of_stream_refusal(delivered: u64) -> CameraRefusal {
+    if delivered == 0 {
+        CameraRefusal::Silent
+    } else {
+        CameraRefusal::Lost
+    }
+}
+
+/// How many `ReadSample` results are written down unconditionally at the start
+/// of a stream.
+///
+/// The beginning is where every failure this route has had lives -- a driver
+/// that accepts everything and then sends nothing looks identical to a working
+/// one until you can see that the reads came back empty -- and the middle of a
+/// healthy stream is six or seven lines a second for as long as the user holds
+/// a code up. So the first few are loud, and after that only a read carrying a
+/// flag says anything.
+const FIRST_READS_LOGGED: u64 = 12;
+
+/// How many buffers may be thrown away before the log stops calling it a
+/// driver waking up.
+///
+/// Small, because the thing it catches is total: the defect
+/// [`unpack_frame_size`] describes rejected every buffer from the first, and
+/// eight seconds of that is what the user saw. A real waking-up driver sends
+/// one or two short buffers, not four.
+const REJECTS_BEFORE_COMPLAINT: u64 = 4;
+
+/// The names of whichever `MF_SOURCE_READERF_*` bits are set, for the log.
+///
+/// Spelled out rather than left as the hex beside it because the two bits that
+/// matter here are the two that are easiest to misread: a stream tick is a
+/// read with **no sample and nothing wrong**, and a current-media-type change
+/// is a read after which the frame arithmetic above it is stale. A log that
+/// said `0x0100` would have both of those look like noise.
+fn read_flag_names(flags: u32) -> String {
+    use windows::Win32::Media::MediaFoundation::{
+        MF_SOURCE_READERF_ALLEFFECTSREMOVED, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED,
+        MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR,
+        MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED, MF_SOURCE_READERF_NEWSTREAM,
+        MF_SOURCE_READERF_STREAMTICK,
+    };
+    let mut names = Vec::new();
+    for (bit, name) in [
+        (MF_SOURCE_READERF_ERROR.0 as u32, "error"),
+        (MF_SOURCE_READERF_ENDOFSTREAM.0 as u32, "end-of-stream"),
+        (MF_SOURCE_READERF_NEWSTREAM.0 as u32, "new-stream"),
+        (MF_SOURCE_READERF_NATIVEMEDIATYPECHANGED.0 as u32, "native-type-changed"),
+        (MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32, "current-type-changed"),
+        (MF_SOURCE_READERF_STREAMTICK.0 as u32, "stream-tick"),
+        (MF_SOURCE_READERF_ALLEFFECTSREMOVED.0 as u32, "effects-removed"),
+    ] {
+        if flags & bit != 0 {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", names.join(", "))
+    }
+}
+
 /// **Every video capture device Windows knows about.**
 ///
 /// The one call in this module the UI thread makes; see the module docs for
@@ -881,19 +1034,21 @@ pub fn devices() -> Result<Vec<Device>, CameraRefusal> {
 
     unsafe {
         let mut attributes = None;
-        MFCreateAttributes(&mut attributes, 1).map_err(refusal_for)?;
+        MFCreateAttributes(&mut attributes, 1).map_err(|e| failed("creating enumeration attributes", e))?;
         let attributes = attributes.ok_or(CameraRefusal::Unavailable)?;
         attributes
             .SetGUID(
                 &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
                 &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
             )
-            .map_err(refusal_for)?;
+            .map_err(|e| failed("asking for video capture devices", e))?;
 
         let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
         let mut count = 0u32;
-        MFEnumDeviceSources(&attributes, &mut list, &mut count).map_err(refusal_for)?;
+        MFEnumDeviceSources(&attributes, &mut list, &mut count)
+            .map_err(|e| failed("enumerating device sources", e))?;
         if list.is_null() {
+            log::info!("camera: Media Foundation returned no device list");
             return Err(CameraRefusal::NoCamera);
         }
 
@@ -925,6 +1080,20 @@ pub fn devices() -> Result<Vec<Device>, CameraRefusal> {
             }
         }
         CoTaskMemFree(Some(list as *const core::ffi::c_void));
+
+        // **The friendly name and nothing else.** A camera's model is what the
+        // user is about to pick out of a list and is not vault data; the
+        // symbolic link beside it carries the USB path of a device on this
+        // machine and is deliberately not written down. The count is logged
+        // separately from the names because "Windows said 2 and we kept 1" is
+        // the shape of a bug that a list of names alone would hide.
+        log::info!(
+            "camera: Media Foundation offered {count} device(s), {} usable",
+            found.len()
+        );
+        for device in &found {
+            log::info!("camera: found \"{}\"", device.name);
+        }
 
         if found.is_empty() {
             return Err(CameraRefusal::NoCamera);
@@ -1002,7 +1171,8 @@ fn stream(device: &Device, decode: DecodeFn, sink: &Sink) -> Result<(), CameraRe
         MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, MF_MT_DEFAULT_STRIDE,
         MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
         MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-        MF_SOURCE_READERF_ENDOFSTREAM,
+        MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
+        MF_SOURCE_READERF_ERROR,
     };
 
     let stream_index = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
@@ -1011,24 +1181,28 @@ fn stream(device: &Device, decode: DecodeFn, sink: &Sink) -> Result<(), CameraRe
         // **Re-opened from the symbolic link, not from an `IMFActivate` handed
         // across the thread boundary.** See [`Device::id`].
         let mut source_attributes = None;
-        MFCreateAttributes(&mut source_attributes, 2).map_err(refusal_for)?;
+        MFCreateAttributes(&mut source_attributes, 2)
+            .map_err(|e| failed("creating source attributes", e))?;
         let source_attributes = source_attributes.ok_or(CameraRefusal::Unavailable)?;
         source_attributes
             .SetGUID(
                 &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE,
                 &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
             )
-            .map_err(refusal_for)?;
+            .map_err(|e| failed("setting the source type", e))?;
         source_attributes
             .SetString(
                 &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK,
                 &HSTRING::from(device.id.as_str()),
             )
-            .map_err(refusal_for)?;
+            .map_err(|e| failed("setting the device link", e))?;
         // Wrapped as it is created, so there is no window in which the
         // device is open and nothing is on the hook for closing it.
-        let source: Opened =
-            Opened(MFCreateDeviceSource(&source_attributes).map_err(refusal_for)?);
+        let source: Opened = Opened(
+            MFCreateDeviceSource(&source_attributes)
+                .map_err(|e| failed("opening the device", e))?,
+        );
+        log::info!("camera: opened \"{}\"", device.name);
 
         // **The reader is asked to do the colour conversion**, which is what
         // makes this file's pixel handling one function rather than a decoder
@@ -1037,16 +1211,17 @@ fn stream(device: &Device, decode: DecodeFn, sink: &Sink) -> Result<(), CameraRe
         // and the alternative is writing a YUV converter and a JPEG decoder
         // for a route whose whole job is to read a black-and-white square.
         let mut reader_attributes = None;
-        MFCreateAttributes(&mut reader_attributes, 1).map_err(refusal_for)?;
+        MFCreateAttributes(&mut reader_attributes, 1)
+            .map_err(|e| failed("creating reader attributes", e))?;
         let reader_attributes = reader_attributes.ok_or(CameraRefusal::Unavailable)?;
         reader_attributes
             .SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1)
-            .map_err(refusal_for)?;
+            .map_err(|e| failed("enabling video processing", e))?;
 
         // Declared AFTER the source, so it drops BEFORE it: the reader must
         // be gone before the source it was built on is shut down.
         let reader = MFCreateSourceReaderFromMediaSource(&source.0, &reader_attributes)
-            .map_err(refusal_for)?;
+            .map_err(|e| failed("creating the source reader", e))?;
 
         // What the device offers, so [`best_frame_size`] can choose. The loop
         // ends when `GetNativeMediaType` refuses an index, which is Media
@@ -1060,6 +1235,11 @@ fn stream(device: &Device, decode: DecodeFn, sink: &Sink) -> Result<(), CameraRe
                 offered.push(((packed >> 32) as u32, packed as u32));
             }
         }
+        log::info!(
+            "camera: device offers {} native mode(s), chose {:?}",
+            offered.len(),
+            best_frame_size(&offered)
+        );
         if let Some(wanted) = best_frame_size(&offered) {
             // Set the NATIVE type first: this is what tells the device which
             // of its modes to run in. Asking only for an output size would
@@ -1076,22 +1256,32 @@ fn stream(device: &Device, decode: DecodeFn, sink: &Sink) -> Result<(), CameraRe
                     .GetUINT64(&MF_MT_FRAME_SIZE)
                     .map(|packed| ((packed >> 32) as u32, packed as u32) == wanted)
                     .unwrap_or(false);
-                if matches && reader.SetCurrentMediaType(stream_index, None, &native).is_ok() {
-                    break;
+                if matches {
+                    match reader.SetCurrentMediaType(stream_index, None, &native) {
+                        Ok(()) => {
+                            log::info!("camera: running native mode {index}");
+                            break;
+                        }
+                        Err(error) => log::info!(
+                            "camera: native mode {index} refused with 0x{:08X}, trying the next",
+                            error.code().0 as u32
+                        ),
+                    }
                 }
             }
         }
 
-        let output = MFCreateMediaType().map_err(refusal_for)?;
+        let output = MFCreateMediaType().map_err(|e| failed("creating the output type", e))?;
         output
             .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-            .map_err(refusal_for)?;
+            .map_err(|e| failed("setting the output major type", e))?;
         output
             .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_RGB32)
-            .map_err(refusal_for)?;
+            .map_err(|e| failed("setting the output subtype", e))?;
         reader
             .SetCurrentMediaType(stream_index, None, &output)
-            .map_err(refusal_for)?;
+            .map_err(|e| failed("asking the reader for RGB32", e))?;
+        log::info!("camera: reader accepted an RGB32 output type");
 
         // Read BACK what the reader settled on rather than trusting what was
         // asked for: a device may deliver a different size than the mode that
@@ -1099,21 +1289,36 @@ fn stream(device: &Device, decode: DecodeFn, sink: &Sink) -> Result<(), CameraRe
         // failure `pack_rgba`'s doc describes.
         let settled = reader
             .GetCurrentMediaType(stream_index)
-            .map_err(refusal_for)?;
-        let packed = settled.GetUINT64(&MF_MT_FRAME_SIZE).map_err(refusal_for)?;
-        let (width, height) = ((packed >> 32) as usize, packed as usize);
+            .map_err(|e| failed("reading back the settled type", e))?;
+        let packed = settled
+            .GetUINT64(&MF_MT_FRAME_SIZE)
+            .map_err(|e| failed("reading back the frame size", e))?;
+        // `mut`, because `MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED` in the
+        // loop below can move all three of these mid-stream.
+        let (mut width, mut height) = unpack_frame_size(packed);
         if width == 0 || height == 0 {
+            log::warn!("camera: settled on a {width}x{height} frame, which is not a picture");
             return Err(CameraRefusal::Unavailable);
         }
         // The stride is stored as a `UINT32` and read as a signed number,
         // which is Media Foundation's own convention: the sign is the row
         // order. Absent, it is a packed top-down frame.
-        let stride = settled
+        let mut stride = settled
             .GetUINT32(&MF_MT_DEFAULT_STRIDE)
             .map(|raw| raw as i32)
             .unwrap_or((width * 4) as i32);
 
+        log::info!("camera: streaming {width}x{height} at stride {stride}");
+
         let mut cadence = DecodeCadence::new(DECODE_INTERVAL);
+        // **How many reads have happened**, only so the log can be loud about
+        // the beginning of a stream and quiet about the middle of one. The
+        // first reads are where every failure this route has had lives, and a
+        // line per frame for the life of a session would be a megabyte of log
+        // for a scan that worked.
+        let mut reads: u64 = 0;
+        let mut delivered: u64 = 0;
+        let mut rejected: u64 = 0;
         // **Checked before every read**, so a stop that lands while a read is
         // in flight costs one frame rather than two.
         while sink.wanted() {
@@ -1128,24 +1333,76 @@ fn stream(device: &Device, decode: DecodeFn, sink: &Sink) -> Result<(), CameraRe
                     None,
                     Some(&mut sample),
                 )
-                .map_err(refusal_for)?;
+                .map_err(|e| failed("reading a sample", e))?;
+            reads += 1;
+            if reads <= FIRST_READS_LOGGED || flags != 0 {
+                log::info!(
+                    "camera: read {reads} flags 0x{flags:04X}{} sample {}",
+                    read_flag_names(flags),
+                    if sample.is_some() { "yes" } else { "none" }
+                );
+            }
+            if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
+                log::warn!("camera: the reader reported an error flag");
+                return Err(CameraRefusal::Unavailable);
+            }
             if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
                 // The device said it is done. Not an ending this route has a
                 // use for: a camera that stops mid-scan has been unplugged or
-                // taken, and the user needs to be told which.
-                return Err(CameraRefusal::Lost);
+                // taken, and the user needs to be told which -- **unless it
+                // said so before it ever sent a picture**, which is a
+                // different thing and gets a different sentence. See
+                // [`CameraRefusal::Silent`].
+                log::warn!("camera: end of stream after {delivered} frame(s)");
+                return Err(end_of_stream_refusal(delivered));
+            }
+            // **A changed output type is not a gap, it is new arithmetic.**
+            // The width, height and stride above describe the buffers that
+            // were arriving before this flag; a buffer walked at the old
+            // numbers after it is the silent corruption `pack_rgba`'s own doc
+            // is about. Re-read them, and skip this sample rather than guess
+            // which side of the change it fell on.
+            if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32 != 0 {
+                match reader.GetCurrentMediaType(stream_index) {
+                    Ok(changed) => {
+                        let Ok(packed) = changed.GetUINT64(&MF_MT_FRAME_SIZE) else {
+                            continue;
+                        };
+                        let (w, h) = unpack_frame_size(packed);
+                        if w == 0 || h == 0 {
+                            continue;
+                        }
+                        width = w;
+                        height = h;
+                        stride = changed
+                            .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+                            .map(|raw| raw as i32)
+                            .unwrap_or((width * 4) as i32);
+                        log::info!("camera: now {width}x{height} at stride {stride}");
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "camera: the type changed and could not be read back (0x{:08X})",
+                            error.code().0 as u32
+                        );
+                    }
+                }
+                continue;
             }
             let Some(sample) = sample else {
                 // A gap. `ReadSample` answers with no sample when the device
-                // has nothing yet, and that is ordinary rather than an error.
+                // has nothing yet -- a stream tick, or a driver still waking
+                // up -- and that is ordinary rather than an error.
                 continue;
             };
-            let buffer = sample.ConvertToContiguousBuffer().map_err(refusal_for)?;
+            let buffer = sample
+                .ConvertToContiguousBuffer()
+                .map_err(|e| failed("flattening a sample", e))?;
             let mut data: *mut u8 = std::ptr::null_mut();
             let mut current = 0u32;
             buffer
                 .Lock(&mut data, None, Some(&mut current))
-                .map_err(refusal_for)?;
+                .map_err(|e| failed("locking a sample", e))?;
             // The conversion happens with the buffer locked and the result is
             // this module's own allocation, so the device's memory is unlocked
             // before anything slow (the decode) touches the pixels.
@@ -1165,12 +1422,46 @@ fn stream(device: &Device, decode: DecodeFn, sink: &Sink) -> Result<(), CameraRe
                 // A frame that does not match what the media type promised.
                 // Skipped rather than fatal: one short buffer from a driver
                 // waking up is not a reason to close the camera.
+                //
+                // **Counted and complained about, though**, because that
+                // sentence is true of ONE buffer and was the hiding place for
+                // a bug that made it true of every buffer: see
+                // [`unpack_frame_size`], where a height read sixty-four bits
+                // wide had `pack_rgba` reject the whole stream while every
+                // `HRESULT` stayed `S_OK`. A camera sending pictures that are
+                // all being thrown away is a different fault from a camera
+                // sending nothing, and the log now says which.
+                rejected += 1;
+                if rejected == REJECTS_BEFORE_COMPLAINT && delivered == 0 {
+                    log::warn!(
+                        "camera: {rejected} samples arrived and every one was rejected against \
+                         {width}x{height} at stride {stride} -- the device is sending pictures \
+                         this build cannot read"
+                    );
+                }
                 continue;
             };
             let Some(frame) = Frame::new(width, height, rgba) else {
+                rejected += 1;
                 continue;
             };
+            delivered += 1;
+            if delivered == 1 {
+                log::info!("camera: first frame after {reads} read(s)");
+            }
             if !offer(sink, &mut cadence, decode, frame, Instant::now()) {
+                // [`offer`] answers `false` for two different reasons and this
+                // line used to report only one of them: a code was read, OR
+                // the session was stopped while that frame was being decoded.
+                // The second is what every ordinary exit does -- the user
+                // leaves the stage and `Session::drop` sets the flag -- so a
+                // log that called it a successful scan would put a read that
+                // never happened in the record of every cancelled one.
+                if sink.wanted() {
+                    log::info!("camera: a code was read after {delivered} frame(s)");
+                } else {
+                    log::info!("camera: stopped after {delivered} frame(s)");
+                }
                 return Ok(());
             }
         }
@@ -1676,6 +1967,210 @@ mod tests {
         );
     }
 
+    /// **The defect the webcam route shipped with: a height read sixty-four
+    /// bits wide.**
+    ///
+    /// `packed as usize` is a no-op on 64-bit Windows, so the height came
+    /// back as the whole word. The real camera that found this reported
+    /// `1280x5497558139600`, and the number below is that exact one rather
+    /// than a round example, so this test fails against the bug that was
+    /// really there.
+    ///
+    /// The `usize` in the signature is why the wrong version type-checked and
+    /// why this assertion has to exist: there is no compiler error to lean
+    /// on, only arithmetic.
+    #[test]
+    fn a_packed_frame_size_gives_up_both_halves() {
+        // The value the C920 really produced, and what it has to mean.
+        assert_eq!(unpack_frame_size(5_497_558_139_600), (1280, 720));
+
+        // Built from both ends, so a version that happened to get 1280x720
+        // right by coincidence still reds.
+        for (width, height) in [
+            (640u32, 480u32),
+            (1280, 720),
+            (1920, 1080),
+            (2304, 1536),
+            (176, 144),
+            (1, 1),
+            (u32::MAX, u32::MAX),
+        ] {
+            let packed = (u64::from(width) << 32) | u64::from(height);
+            assert_eq!(
+                unpack_frame_size(packed),
+                (width as usize, height as usize),
+                "{width}x{height} packed as {packed} did not come back"
+            );
+        }
+
+        // The shape of the bug, stated directly: the height must not carry
+        // the width's bits.
+        let packed = (1280u64 << 32) | 720;
+        let (_, height) = unpack_frame_size(packed);
+        assert_ne!(height, packed as usize, "the height is the undivided word");
+    }
+
+    /// **A frame size that does not survive the round trip is caught by
+    /// `pack_rgba`, and that is how the defect stayed invisible.**
+    ///
+    /// The guard was doing its job perfectly -- it refused a buffer that did
+    /// not match what the media type promised -- and the capture loop's
+    /// `continue` turned "every picture is wrong" into "no picture arrived".
+    /// This pins both halves: the bad height really is rejected, and the good
+    /// one really is accepted, against a buffer the size a 1280x720 RGB32
+    /// camera actually hands over.
+    #[test]
+    fn the_bad_height_is_what_pack_rgba_was_refusing() {
+        let stride = 1280 * 4;
+        let buffer = vec![0u8; 1280 * 720 * 4];
+
+        let bad = 5_497_558_139_600usize;
+        assert!(
+            pack_rgba(&buffer, stride, 1280, bad).is_none(),
+            "the height that shipped was accepted, so this test proves nothing"
+        );
+
+        let (width, height) = unpack_frame_size(5_497_558_139_600);
+        let good = pack_rgba(&buffer, stride, width, height)
+            .expect("a real 1280x720 RGB32 buffer is refused at the corrected height");
+        assert_eq!(good.len(), 1280 * 720 * 4);
+        assert!(
+            Frame::new(width, height, good).is_some(),
+            "the corrected size does not build a frame either"
+        );
+    }
+
+    /// **Nothing in the capture loop unpacks a frame size by hand.**
+    ///
+    /// A source pin, because the defect was one `as usize` in one of three
+    /// places that all look alike, and the other two were right. The way that
+    /// cannot happen again is for there to be one function.
+    #[test]
+    fn every_frame_size_is_unpacked_through_the_one_function() {
+        let source = include_str!("webcam.rs");
+        let production = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .expect("this file has a test module")
+            .0;
+        assert_eq!(
+            production.matches("as usize, packed as usize").count(),
+            0,
+            "a frame size is being split by hand again, and `packed as usize` does nothing on \
+             64-bit Windows -- see `unpack_frame_size`"
+        );
+        assert_eq!(
+            production.matches("unpack_frame_size(").count(),
+            3,
+            "the settled type, the changed type and the definition are the three places this \
+             name should appear; a call site has been added or lost"
+        );
+    }
+
+    /// **A stream that ends without ever having begun is not "it stopped".**
+    ///
+    /// The two sentences send the user to different places -- one to the back
+    /// of the machine to re-seat a plug, one to the lens and the privacy
+    /// switch -- and before this the second case was told the first one's
+    /// story.
+    #[test]
+    fn a_stream_that_ended_before_any_picture_is_silence_and_not_a_loss() {
+        assert_eq!(end_of_stream_refusal(0), CameraRefusal::Silent);
+        assert_eq!(end_of_stream_refusal(1), CameraRefusal::Lost);
+        assert_eq!(end_of_stream_refusal(300), CameraRefusal::Lost);
+        // And the sentences really are the different ones, not two names for
+        // the same paragraph.
+        assert_ne!(
+            CameraRefusal::Silent.detail(),
+            CameraRefusal::Lost.detail(),
+            "the two endings would read identically, so telling them apart bought nothing"
+        );
+    }
+
+    /// **The reader's flags are named in the log, including the two that are
+    /// easiest to misread.**
+    ///
+    /// A stream tick is a read with no sample and nothing wrong; a
+    /// current-type change is a read after which the frame arithmetic is
+    /// stale. Both were invisible before, and a log that printed only hex
+    /// would have left them that way.
+    #[test]
+    fn the_reader_flags_are_written_down_by_name() {
+        use windows::Win32::Media::MediaFoundation::{
+            MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
+            MF_SOURCE_READERF_STREAMTICK,
+        };
+        assert_eq!(read_flag_names(0), "");
+        let tick = read_flag_names(MF_SOURCE_READERF_STREAMTICK.0 as u32);
+        assert!(tick.contains("stream-tick"), "{tick:?}");
+        let changed = read_flag_names(MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32);
+        assert!(changed.contains("current-type-changed"), "{changed:?}");
+        let both = read_flag_names(
+            MF_SOURCE_READERF_STREAMTICK.0 as u32 | MF_SOURCE_READERF_ENDOFSTREAM.0 as u32,
+        );
+        assert!(both.contains("stream-tick") && both.contains("end-of-stream"), "{both:?}");
+    }
+
+    /// **The capture loop answers a changed media type rather than reading on
+    /// through it.**
+    ///
+    /// A source pin, because the loop it is about is `unsafe` Media Foundation
+    /// code that no test in this crate may run: the assertion available is
+    /// that the flag is looked at at all, and that the numbers a buffer is
+    /// walked with are the ones it can move. Before this, the flag was not
+    /// mentioned anywhere in the file and `width`, `height` and `stride` were
+    /// bound once, immutably, above the loop -- so a device that changed its
+    /// output type mid-stream had every subsequent buffer read at the old
+    /// arithmetic.
+    #[test]
+    fn a_media_type_that_changes_mid_stream_is_re_read() {
+        let source = include_str!("webcam.rs");
+        let production = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .expect("this file has a test module")
+            .0;
+        assert!(
+            production.contains("MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED"),
+            "the capture loop no longer looks at the flag that says its frame arithmetic is stale"
+        );
+        assert!(
+            production.contains("let (mut width, mut height)") && production.contains("let mut stride"),
+            "the frame arithmetic is bound immutably again, so a changed media type cannot move it"
+        );
+        assert!(
+            production.contains("MF_SOURCE_READERF_ERROR"),
+            "a read that sets the error bit returns S_OK with no sample; unchecked, the loop \
+             spins on it forever"
+        );
+    }
+
+    /// **Every Media Foundation call that can fail says so in the log.**
+    ///
+    /// The defect this is about: `.map_err(refusal_for)` threw the `HRESULT`
+    /// away at every one of these, so a driver refusing an output type and a
+    /// lens with a cap on it produced the same sentence and the same silence,
+    /// and there was no evidence anywhere that told them apart.
+    #[test]
+    fn no_media_foundation_call_discards_its_hresult_silently() {
+        let source = include_str!("webcam.rs");
+        let production = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .expect("this file has a test module")
+            .0;
+        // `refusal_for` is still the one place a code becomes a sentence, but
+        // it is now reached through `failed`, which writes the code down on
+        // the way past.
+        assert_eq!(
+            production.matches("map_err(refusal_for)").count(),
+            0,
+            "a Media Foundation call still maps its error straight to a sentence, which is what \
+             made this route undiagnosable"
+        );
+        assert!(
+            production.contains("fn failed(what: &str, error: windows::core::Error)"),
+            "the one place an HRESULT is written down is gone"
+        );
+    }
+
     /// **Nothing in this module writes a file, opens a socket or logs a
     /// picture.**
     ///
@@ -1696,8 +2191,6 @@ mod tests {
             "fs::File",
             "TcpStream",
             "ureq::",
-            "log::info",
-            "log::debug",
             "println!",
         ] {
             assert!(
@@ -1705,6 +2198,35 @@ mod tests {
                 "the capture path contains {forbidden:?}, which the privacy page says it does not"
             );
         }
+
+        // **`log::` used to be on that list and is not any more.** It was put
+        // there to keep pixels out of the log file, which is the right thing
+        // to want; what it actually did was keep the `HRESULT` of every Media
+        // Foundation call out of the log file too, and that is how a camera
+        // that refused an output type and a camera with a cap on the lens came
+        // to produce the same sentence and the same silence. A whole-word ban
+        // was the wrong instrument for a rule about **what is interpolated**,
+        // so the rule is now written as what it always meant.
+        for (call, _) in production.match_indices("log::") {
+            let line = &production[call..];
+            let line = &line[..line.find('\n').unwrap_or(line.len())];
+            for forbidden in ["pixels", "rgba", "Zeroizing", "text", "payload", "secret"] {
+                assert!(
+                    !line.contains(forbidden),
+                    "a log call in the capture path mentions {forbidden:?}: {line:?}. The picture \
+                     a camera sends IS the seed; the log may carry the shape of a failure and \
+                     never the contents of a frame"
+                );
+            }
+        }
+        // The device's **symbolic link** is its USB path on this machine and
+        // is not written down either -- only the friendly name the user is
+        // about to read off a row.
+        assert!(
+            !production.contains("device.id)") && !production.contains("{device.id}"),
+            "the capture path logs a device's symbolic link, which is a hardware path and not a \
+             name"
+        );
         // Media Foundation is started without its network sources, which is
         // the other half of the same claim.
         assert!(
