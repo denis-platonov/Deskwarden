@@ -86,12 +86,73 @@ pub const ERROR: Color32 = Color32::from_rgb(0xb4, 0x23, 0x18);
 /// are deliberately left alone: this pass has no business editing four
 /// unrelated screens, and a fourth private copy would have been the actual
 /// mistake.
+///
+/// **Since then, one of the three has come home.** `detail_edit`'s
+/// `SECRET_STEP_*` are gone and its keystroke list draws [`secret_band`]. The
+/// other two are still out there and still need doing, and one of them has
+/// drifted in the meantime -- see [`SECRET_INK`] for the two spellings and
+/// [`secret_band`] for which caller gets which half.
 pub const DANGER_WASH: Color32 = Color32::from_rgb(0xfd, 0xf3, 0xf2);
 /// Border of a [`DANGER_WASH`] surface.
 pub const DANGER_EDGE: Color32 = Color32::from_rgb(0xe8, 0xa9, 0xa2);
 /// Text on a [`DANGER_WASH`] surface. Darker than [`ERROR`], which is red on
 /// white; this is red on pink and needs the extra depth to hold its contrast.
 pub const DANGER_INK: Color32 = Color32::from_rgb(0x8c, 0x3c, 0x33);
+
+/// **The ink on a [`secret_band`]. The one red, and a caller that is not
+/// drawing a secret is wrong.**
+///
+/// An ALIAS of [`DANGER_INK`] and deliberately not a fourth hex literal. The
+/// value was written out privately three times in this crate before it was
+/// written here once -- `preflight_card::SECRET_INK`,
+/// `detail_edit::SECRET_STEP_INK`, and `DANGER_INK` itself -- and the fourth
+/// copy is the one that would have drifted, exactly as
+/// `preflight_card::SECRET_EDGE` already has (`#f2dedb` where its two
+/// neighbours are `#e8a9a2`; two spellings of one token, and nothing on screen
+/// says which is right).
+///
+/// It is named separately from `DANGER_INK` because the two say different
+/// things about a caller. `DANGER_INK` is a PALETTE entry -- the ink of any
+/// tinted red surface, which includes a `Revoked` pill and a refusal band.
+/// `SECRET_INK` is a ROLE: design 4e's rule is that red means "this is a
+/// secret and not ordinary UI", and the value of one red is that exactly one
+/// kind of thing wears it. Reaching for this constant on something that is not
+/// a secret spends the only signal the product has.
+pub const SECRET_INK: Color32 = DANGER_INK;
+
+/// **The band a secret wears, with the rule attached.** Design 4a/4b's
+/// `#fdf3f2` on a `#e8a9a2` hairline: the keystroke list's password step, the
+/// preflight card's secret row, and nothing else.
+///
+/// **A primitive and not three loose tokens**, which is what design 4's own
+/// pass asked for in as many words and what `detail_edit`'s
+/// `SECRET_STEP_FILL` doc has been asking for since it was written: *"if a
+/// later pass wants one home for these, it should be a named secret-step
+/// primitive with the rule attached, not three loose `Color32`s"*. The
+/// argument is 4e's -- one red means something only while exactly one kind of
+/// thing wears it, and three bare constants in a shared palette are an
+/// invitation for a fourth surface to reach for a colour that then means
+/// nothing. A `Frame` cannot be half-adopted: a caller gets the tint and the
+/// edge together or not at all, so there is no way to end up with the pink
+/// ground and somebody else's border.
+///
+/// **The radius and the padding are deliberately NOT set here**, and that is
+/// the one thing this primitive leaves open. A secret's band is a row in a
+/// list on one surface (`detail_edit`, 10pt radius, tight `8x5` margin) and a
+/// band across a card on another (4b, 8pt radius, `11x10`); those are the
+/// SHAPE of the surface it sits on, and forcing one of them would have made
+/// the password step a different shape from the four ordinary steps above it
+/// in the same list. What must never vary is the pair of colours, and that is
+/// what this hands out.
+///
+/// **No `ui` parameter**, which is a departure from the shape the task
+/// suggested (`secret_band(ui) -> Frame`). The frame reads nothing off the
+/// `Ui` -- not its width, not its style, not its theme -- and a parameter that
+/// is accepted and ignored is a claim about a dependency that does not exist.
+/// A later pass that needs one can add it in the one place this is defined.
+pub fn secret_band() -> egui::Frame {
+    egui::Frame::new().fill(DANGER_WASH).stroke(Stroke::new(1.0, DANGER_EDGE))
+}
 
 /// The caution wash and its two inks: design 5c's warning band, 4c's caution
 /// note, and the first window's "this is taking a while" strip.
@@ -6085,7 +6146,19 @@ pub const SECTION_ROW_CONTROL_FLOOR: f32 = 180.0;
 /// differently from another on the same form -- which is what happens the
 /// moment two cards sit side by side in a grid.
 pub fn section_rows_fit(ui: &Ui) -> bool {
-    ui.available_width() >= SECTION_LABEL_WIDTH + SECTION_ROW_GAP + SECTION_ROW_CONTROL_FLOOR
+    section_rows_fit_at(ui.available_width())
+}
+
+/// [`section_rows_fit`], asked of a width rather than of a `Ui`.
+///
+/// The whole of the decision, so the `Ui` form above is one call and not a
+/// second copy of the arithmetic. It is separate because a TEST cannot build
+/// the `Ui` the row will be added to without drawing the form first, and a
+/// test that asserts about one of the two arms needs to be able to say which
+/// arm it is asserting about -- otherwise a floor that moved would turn a
+/// claim about the stacked row into a vacuous claim about the other one.
+pub fn section_rows_fit_at(width: f32) -> bool {
+    width >= SECTION_LABEL_WIDTH + SECTION_ROW_GAP + SECTION_ROW_CONTROL_FLOOR
 }
 
 /// §8a's card: white, edged in [`HAIRLINE`], rounded to
@@ -6196,37 +6269,145 @@ pub fn section_card_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 /// value -- which is precisely what a 640-point pane has the room for and a
 /// 298-point one does not.
 pub fn section_row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    section_row_impl(ui, label, None::<fn(&mut Ui)>, add)
+}
+
+/// **The same row with a CONTROL in its label cell**, under the caption.
+///
+/// This exists because the form was not consistent between its own cards. The
+/// `Item` and `Login credentials` cards drew §8a's label column; the Identity,
+/// Card and SSH bodies could not, because every optional row on them carries a
+/// `Remove` chip beside its caption and there was no row idiom that could hold
+/// one. Each card was internally consistent and the FORM was not -- one screen
+/// in two layouts, which is the thing a reader notices before they notice
+/// either layout.
+///
+/// **A closure over the whole label cell was the shape suggested, and this is
+/// narrower on purpose.** A cell-closure would hand every caller the caption
+/// as well as the chip, and the caption's treatment -- 12pt, [`TEXT_FAINT`],
+/// wrapped at [`SECTION_LABEL_WIDTH`], optically aligned against the first
+/// line of the control -- is precisely the kind of thing that becomes four
+/// slightly different spellings the moment four call sites own it. That is the
+/// same failure as the three private copies of one red this pass is also
+/// unpicking, one file up. So the theme keeps the caption and the caller
+/// supplies only the thing the theme cannot know about: the chip.
+///
+/// **The aside goes UNDER the caption, not beside it.** The cell is 130 points
+/// wide; `Cardholder name` at 12pt is about 95 of them and the chip is about
+/// 55, so "beside" is not a layout, it is a wish. Underneath, the chip lands in
+/// the dead space to the left of a 38-point field, which is the one part of a
+/// §8a row that has nothing in it -- the row costs no extra height at all.
+/// Below [`section_rows_fit`] there is no cell, so the stacked arm puts the two
+/// in a `horizontal_wrapped` instead, which is exactly the shape those rows
+/// already shipped and which has the whole card's width to spend.
+pub fn section_row_aside<R>(
+    ui: &mut Ui,
+    label: &str,
+    aside: impl FnOnce(&mut Ui),
+    add: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    section_row_impl(ui, label, Some(aside), add)
+}
+
+/// Both rows above, in one body.
+///
+/// `aside` is an `Option` rather than a no-op closure so that the plain row
+/// keeps its exact shape: an empty label with no aside draws NOTHING in the
+/// stacked arm, and a `horizontal_wrapped` holding nothing would still cost
+/// the row an `item_spacing.y` the early return does not.
+fn section_row_impl<R>(
+    ui: &mut Ui,
+    label: &str,
+    aside: Option<impl FnOnce(&mut Ui)>,
+    add: impl FnOnce(&mut Ui) -> R,
+) -> R {
     if !section_rows_fit(ui) {
         // An EMPTY label is a row that belongs to the one above it -- the
         // generator under its password box. Stacked, there is no label column
         // to indent it into, so the row simply follows its neighbour; drawing
         // the empty string would still cost a line box and a gap, which is a
         // blank the reader has to account for.
-        if !label.is_empty() {
-            field_label(ui, label);
-            ui.add_space(EYEBROW_GAP);
+        match aside {
+            None => {
+                if !label.is_empty() {
+                    field_label(ui, label);
+                    ui.add_space(EYEBROW_GAP);
+                }
+            }
+            // **Wrapped, not `horizontal`**, for the reason every multi-control
+            // row on the edit form is: an unwrapped row does not shrink to fit,
+            // it pushes the card past the pane and inflates every
+            // `available_width()` measured after it.
+            Some(aside) => {
+                ui.horizontal_wrapped(|ui| {
+                    if !label.is_empty() {
+                        field_label(ui, label);
+                    }
+                    aside(ui);
+                });
+                ui.add_space(EYEBROW_GAP);
+            }
         }
         return add(ui);
     }
     ui.horizontal_top(|ui| {
-        let (cell, _) = ui.allocate_exact_size(
+        // **The label column is a child `Ui`, not a bare allocation**, which is
+        // the one structural change the aside needed. A rect allocated in a
+        // `horizontal_top` advances the cursor ACROSS, so there is no way to
+        // put a second widget under the caption; a fixed-width vertical child
+        // gives the cell a cursor of its own and clips the chip to the column
+        // rather than letting it push the control sideways.
+        //
+        // The caption itself is still painted rather than added, so its
+        // position is byte-for-byte what it was before this variant existed.
+        ui.allocate_ui_with_layout(
             Vec2::new(SECTION_LABEL_WIDTH, FIELD_HEIGHT),
-            Sense::hover(),
-        );
-        let galley = ui.painter().layout(
-            label.to_string(),
-            FontId::new(12.0, FontFamily::Proportional),
-            TEXT_FAINT,
-            SECTION_LABEL_WIDTH,
-        );
-        // Top-aligned against the first line of the control beside it, not
-        // centred in the cell: a row whose control is three boxes tall would
-        // otherwise put its label level with the middle box. §8a's own
-        // `padding-top: 9px` on exactly those rows is this measurement.
-        ui.painter().galley(
-            Pos2::new(cell.left(), cell.top() + (FIELD_HEIGHT - galley.size().y) / 2.0),
-            galley,
-            TEXT_FAINT,
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(SECTION_LABEL_WIDTH);
+                let galley = ui.painter().layout(
+                    label.to_string(),
+                    FontId::new(12.0, FontFamily::Proportional),
+                    TEXT_FAINT,
+                    SECTION_LABEL_WIDTH,
+                );
+                // **The cell reserves the whole field's height, EXCEPT when
+                // something follows the caption inside it.**
+                //
+                // A §8a caption is optically centred against a 38-point field
+                // but is itself about 15 points tall, so the bottom half of
+                // the cell is slack. Reserving all 38 and then putting the
+                // chip below that is what the first render of this row did,
+                // and it cost the row 28 points -- an `Email` row half again
+                // as tall as the `First name` row above it, in a column whose
+                // whole job is to look like a column. Reserving down to the
+                // caption's own bottom edge instead spends the slack, and the
+                // row grows by only what the chip cannot fit inside it.
+                //
+                // The caption is painted at the same y either way, so a row
+                // with no aside is byte-for-byte what it was before this
+                // variant existed.
+                let top = (FIELD_HEIGHT - galley.size().y) / 2.0;
+                let reserved = if aside.is_some() { top + galley.size().y } else { FIELD_HEIGHT };
+                let (cell, _) = ui.allocate_exact_size(
+                    Vec2::new(SECTION_LABEL_WIDTH, reserved),
+                    Sense::hover(),
+                );
+                // Top-aligned against the first line of the control beside it,
+                // not centred in the cell: a row whose control is three boxes
+                // tall would otherwise put its label level with the middle box.
+                // §8a's own `padding-top: 9px` on exactly those rows is this
+                // measurement.
+                ui.painter().galley(Pos2::new(cell.left(), cell.top() + top), galley, TEXT_FAINT);
+                if let Some(aside) = aside {
+                    // Directly under the caption, with none of egui's usual
+                    // row spacing between them: the chip belongs to the word
+                    // above it, and every point of air here is a point the
+                    // whole row grows by.
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    aside(ui);
+                }
+            },
         );
         ui.add_space(SECTION_ROW_GAP - ui.spacing().item_spacing.x);
         ui.vertical(|ui| add(ui)).inner

@@ -1458,6 +1458,19 @@ pub struct EditDraft {
     /// argument [`GeneratorDraft::options_open`] already makes. See
     /// [`slot_add_block`].
     pub add_menu_open: bool,
+    /// The password-history list is open.
+    ///
+    /// **View state**, on the draft and excluded from [`Self::content_digest`]
+    /// for [`Self::add_menu_open`]'s reason, and a disclosure on the draft
+    /// rather than an egui popup for its other reason: a popup lives in its
+    /// own layer between one click and the next, so neither a layout test nor
+    /// a rendered preview can ever be put in front of it.
+    ///
+    /// Closed by default. The list is history -- the one thing on the
+    /// credentials card that is not being edited -- and a form that opens with
+    /// three rows of it under the password box spends the card's best space on
+    /// the past. See [`history_block`].
+    pub history_open: bool,
 }
 
 /// The four character classes, in a wrapper that **cannot hold all four off**.
@@ -1789,6 +1802,7 @@ impl Default for EditDraft {
             // the create form draws every slot regardless -- see [`Slot`].
             revealed: std::collections::BTreeSet::new(),
             add_menu_open: false,
+            history_open: false,
         }
         // A blank form has nothing to lose, and `is_dirty` has to say so from
         // the first frame. Every other constructor routes through this one or
@@ -1997,6 +2011,7 @@ impl EditDraft {
             // struct.
             revealed: std::collections::BTreeSet::new(),
             add_menu_open: false,
+            history_open: false,
         }
         // **What the item HAS is what the form shows.** See [`Slot`].
         .reveal_what_is_filled()
@@ -2341,6 +2356,7 @@ impl EditDraft {
             // shut it again.
             revealed: _,
             add_menu_open: _,
+            history_open: _,
         } = self;
         let CardDraft {
             cardholder_name,
@@ -3804,31 +3820,70 @@ pub const SLOT_ADD_HINT: &str =
 
 /// The chip that takes an optional row off the form.
 ///
-/// Beside the row's caption rather than under its box, so revealing a field
-/// costs one row of height and not two -- an identity has eighteen of them.
+/// In the row's LABEL CELL rather than under its box, so revealing a field
+/// costs no extra height at all -- an identity has eighteen of them. See
+/// [`slot_row`] for where in the cell, and [`theme::section_row_aside`] for
+/// why it is the theme that decides.
 ///
 /// **Drawn only on a row [`Slot::always_shown`] is false for.** A login with
 /// a Remove beside its password would be one click from a wiped credential,
 /// and [`EditDraft::hide_slot`] refuses that independently of the drawing.
 pub const SLOT_REMOVE_BUTTON: &str = "Remove";
 
-/// One optional row's caption, with its Remove chip beside it. Answers
-/// whether the chip was clicked.
+/// **One row on a per-kind card: §8a's label column, the row's control, and
+/// the Remove chip when the row is an optional one.** Answers whether the chip
+/// was clicked.
 ///
-/// **Wrapped, not `horizontal`**, for the reason every other multi-control
-/// row on this form is: an unwrapped row does not shrink to fit, it pushes
-/// the card past the pane and inflates every `available_width()` measured
-/// after it -- `aae9429`'s defect.
-fn slot_label(ui: &mut egui::Ui, label: &str, removable: bool) -> bool {
-    if !removable {
-        theme::field_label(ui, label);
-        return false;
-    }
+/// This replaces `slot_label`, which drew a caption and a chip and left the
+/// CONTROL to the caller on the next line. That was the whole of the form's
+/// remaining inconsistency: `Item` and `Login credentials` were built out of
+/// [`theme::section_row`] and read as §8a; Identity, Card, SSH and the
+/// one-time code stacked label-above-field and read as the flat column the
+/// redraw was supposed to have replaced -- and the reason they did was this
+/// function, because a caption with a chip beside it does not fit a 130-point
+/// label column. [`theme::section_row_aside`] is the row that holds one, and
+/// every card on the form is now the same kind of row.
+///
+/// **Non-removable rows go through the same call**, with `removable` false
+/// rather than through a separate branch. A card's brand and number, an SSH
+/// key's three parts and a note's body are floor rows (see
+/// [`Slot::always_shown`]) and used to be hand-drawn `field_label` + control
+/// pairs; that is how a card ends up with two row shapes in it, one per row's
+/// accident of being optional.
+fn slot_row<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    removable: bool,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> bool {
+    row_with_chip(ui, label, removable.then_some(SLOT_REMOVE_BUTTON), add)
+}
+
+/// [`slot_row`] with the chip's caption spelled out.
+///
+/// The websites list is the one place on the form whose Remove is not
+/// [`SLOT_REMOVE_BUTTON`]: it says [`WEBSITE_REMOVE_BUTTON`], because that list
+/// takes an ENTRY away rather than hiding a row the item type has, and the two
+/// gestures had better not share a word. Everything else about the row is the
+/// same row, which is the whole point of routing it through here rather than
+/// letting the list keep its own caption-plus-chip pair.
+fn row_with_chip<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    chip: Option<&str>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> bool {
     let mut clicked = false;
-    ui.horizontal_wrapped(|ui| {
-        theme::field_label(ui, label);
-        clicked = ui.add(small_chip_button(SLOT_REMOVE_BUTTON)).clicked();
-    });
+    theme::section_row_aside(
+        ui,
+        label,
+        |ui| {
+            if let Some(caption) = chip {
+                clicked = ui.add(small_chip_button(caption)).clicked();
+            }
+        },
+        add,
+    );
     clicked
 }
 
@@ -3878,11 +3933,156 @@ fn slot_add_block(ui: &mut egui::Ui, open: &mut bool, addable: &[Slot]) -> Optio
     chosen
 }
 
+/// §8a's own caption for the list, count and all: `Password history (3)`.
+///
+/// **The count is in the caption and not in a separate note**, which is 8a's
+/// arrangement and is also the only one that works closed. The control is shut
+/// by default (see [`EditDraft::history_open`]), so a count anywhere else
+/// would be a count the user has to open the list to read -- and the count is
+/// most of what they wanted: "has this password been changed before, and how
+/// often" is answerable without a single date.
+pub fn history_button(count: usize) -> String {
+    format!("Password history ({count})")
+}
+
+/// What the open list says under its rows.
+///
+/// **Because the list withholds the passwords themselves**, and a list of
+/// dates beside eight bullets each is a thing a user will otherwise go looking
+/// for a reveal on. It says where the reveal is instead.
+pub const HISTORY_READ_ONLY_NOTE: &str =
+    "Shown here read-only. Close this form to reveal or copy a previous password.";
+
+/// How the list says it is not showing everything.
+///
+/// Stated and never silent, exactly as the read pane's own card states it: a
+/// previous password quietly omitted is indistinguishable from one the user
+/// never had.
+fn history_truncation(hidden: usize) -> String {
+    format!(
+        "{hidden} older {} not shown here.",
+        if hidden == 1 { "password is" } else { "passwords are" }
+    )
+}
+
+/// **The credentials card's password history: §8a's `Password history (3)`,
+/// and the list behind it.**
+///
+/// The data has been decrypted on every sync since `rest/sync.rs` learned to
+/// (`passwordHistory[].password` is the one other in-place decryption that
+/// module does) and the READ pane has drawn it for as long; the edit form
+/// showed none of it, while its own footer promised that saving would add the
+/// current password to a history the form would not then show. This closes
+/// that loop on the screen that makes the promise.
+///
+/// **Read-only, masked, with no reveal and no copy, and that is a decision
+/// rather than an omission.** This is the one screen in the app whose whole
+/// purpose is to CHANGE the password; an old password in the clear on it has
+/// no use here that the read pane -- one Cancel away, with a per-row reveal
+/// and a copy shortcut already built -- does not serve better, and it is a
+/// standing liability on a form a user leaves open while they work. What the
+/// form needs from the history is the shape of it: how many, and when. That is
+/// what [`detail::password_history_dates`] hands over, and it hands over
+/// nothing else, so this block never holds a previous password at all.
+///
+/// **A disclosure, shut by default**, for the two reasons this form's other
+/// two disclosures already give: a popup is a state no test and no screenshot
+/// can be put in front of, and the credentials card's best space belongs to
+/// the password being typed rather than to the ones that are finished.
+///
+/// Drawn only when there is something in it. An item whose history is empty --
+/// every item, until the first save that replaces a password -- gets no
+/// control at all rather than one reading `Password history (0)`, which is a
+/// button that opens onto nothing.
+fn history_block(ui: &mut egui::Ui, open: &mut bool, dates: &[String]) {
+    if dates.is_empty() {
+        return;
+    }
+    // **Wrapped, not `horizontal`.** Same reason as every other multi-control
+    // row on this form: an unwrapped row does not shrink to fit, it pushes the
+    // card past the pane and inflates every `available_width()` after it.
+    ui.horizontal_wrapped(|ui| {
+        if ui.selectable_label(*open, history_button(dates.len())).clicked() {
+            *open = !*open;
+        }
+    });
+    if !*open {
+        return;
+    }
+    ui.add_space(6.0);
+    // `MAX_HISTORY_ROWS` is the read pane's cap, taken from the read pane
+    // rather than chosen again here: two screens over one list must not
+    // disagree about where it stops. Unreachable against today's backend --
+    // Bitwarden's own `adjustPasswordHistoryLength` slices every save to five
+    // -- which is exactly why the truncation is stated rather than commented.
+    // **The dates get a column of their own, measured off the widest of
+    // them.** `4d ago` and `1y 102d ago` are thirty points apart, and three
+    // rows of masks each starting somewhere different read as three unrelated
+    // lines rather than as one list -- which is what the first render of this
+    // block showed. Measured rather than fixed: the wording is
+    // `relative_time::ago`'s, it is unbounded at the year end, and a literal
+    // here would be a number that only held until an item had a four-year-old
+    // password on it.
+    let face = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+    let column = dates
+        .iter()
+        .take(detail::MAX_HISTORY_ROWS)
+        .map(|when| {
+            ui.painter().layout_no_wrap(when.clone(), face.clone(), theme::TEXT_MUTED).size().x
+        })
+        .fold(0.0f32, f32::max);
+    for (index, when) in dates.iter().take(detail::MAX_HISTORY_ROWS).enumerate() {
+        if index > 0 {
+            ui.add_space(4.0);
+        }
+        ui.horizontal_wrapped(|ui| {
+            // The date leads, because the date is what identifies one previous
+            // password among five -- the same argument `detail::history_label`
+            // makes for putting it in that pane's label column.
+            let galley = ui.painter().layout_no_wrap(
+                when.clone(),
+                face.clone(),
+                theme::TEXT_MUTED,
+            );
+            // Clamped to what the row actually has: the control column is
+            // around 200 points in the shipped pane, and a cell allocated
+            // wider than the row would push the mask off the card rather than
+            // wrap it.
+            let (cell, _) = ui.allocate_exact_size(
+                egui::vec2(column.min(ui.available_width()), galley.size().y),
+                egui::Sense::hover(),
+            );
+            ui.painter().galley(cell.min, galley, theme::TEXT_MUTED);
+            // The same mask the keystroke builder draws, in the ghost ink
+            // rather than an accent: a mask is not a value, and colouring it
+            // like one would offer the eye something to read that is not
+            // there.
+            ui.label(RichText::new(SECRET_MASK).size(12.0).color(theme::TEXT_GHOST));
+        });
+    }
+    let hidden = dates.len().saturating_sub(detail::MAX_HISTORY_ROWS);
+    if hidden > 0 {
+        ui.add_space(4.0);
+        ui.label(RichText::new(history_truncation(hidden)).size(11.0).color(theme::TEXT_FAINT));
+    }
+    ui.add_space(6.0);
+    ui.label(RichText::new(HISTORY_READ_ONLY_NOTE).size(11.0).color(theme::TEXT_FAINT));
+}
 
 fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     if creating {
-        theme::disabled_field_label(ui, WEBSITE_LABEL);
-        theme::disabled_text_field(ui, WEBSITE_CREATE_NOTICE);
+        // Through `theme::section_row`, with the caption in the label column
+        // at its ordinary weight and only the BOX greyed -- which is exactly
+        // what the `Item` card's `Type` row already does two cards up, and for
+        // the same reason: the row is real, the caption names a real thing,
+        // and what is unavailable is the control. Greying the caption as well
+        // was `disabled_field_label`'s job in the stacked shape, where a
+        // caption sitting alone above a grey box read as a live label over a
+        // dead field; in the label column it is one row among eight and the
+        // grey box carries the whole message.
+        theme::section_row(ui, WEBSITE_LABEL, |ui| {
+            theme::disabled_text_field(ui, WEBSITE_CREATE_NOTICE);
+        });
         return;
     }
 
@@ -3897,22 +4097,33 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
         ui.scope_builder(
             egui::UiBuilder::new().id(egui::Id::new(("login-uri", entry.row_id()))),
             |ui| {
-                // **The Remove is beside the caption, not under the box**, and
-                // that is `slot_label`'s own argument applied to this list:
-                // the button used to cost a whole 32-point row per website, so
-                // a login reached three ways spent a hundred points on three
-                // copies of one word. 8a puts its own remove -- a ✕ -- ON the
-                // row, in line with the field; a chip beside the caption is
-                // the same saving in the idiom this form already uses for
-                // every other optional row, and it keeps the caption a
-                // caption instead of turning it into a button's label.
-                ui.horizontal_wrapped(|ui| {
-                    theme::field_label(ui, &website_label(i));
-                    if ui.add(small_chip_button(WEBSITE_REMOVE_BUTTON)).clicked() {
-                        remove = Some(i);
-                    }
-                });
-                theme::text_field(ui, &mut entry.uri, false);
+                // **The Remove is in the row's LABEL CELL, not under the
+                // box**, and that is `slot_row`'s own argument applied to this
+                // list: the button used to cost a whole 32-point row per
+                // website, so a login reached three ways spent a hundred
+                // points on three copies of one word. 8a puts its own remove
+                // -- a ✕ -- ON the row, in line with the field; the label cell
+                // is where this form has room for one, and it keeps the
+                // caption a caption instead of turning it into a button's
+                // label.
+                //
+                // Through the same row as every other card, because this card
+                // was the last one that was not. With `Item`, `Login
+                // credentials` and the per-kind bodies all in §8a's label
+                // column, an `Autofill targets` card still stacking its
+                // captions was the whole reported defect over again, one card
+                // further down the form -- and this time on the card directly
+                // under the one it least resembles.
+                if row_with_chip(
+                    ui,
+                    &website_label(i),
+                    Some(WEBSITE_REMOVE_BUTTON),
+                    |ui| {
+                        theme::text_field(ui, &mut entry.uri, false);
+                    },
+                ) {
+                    remove = Some(i);
+                }
             },
         );
         ui.add_space(theme::BLOCK_GAP);
@@ -4989,7 +5200,8 @@ enum ChipEdit {
 }
 
 /// **The secret step's tint, edge and ink -- 4a's and 4c's `#fdf3f2`,
-/// `#e8a9a2` and `#8c3c33`.**
+/// `#e8a9a2` and `#8c3c33` -- now [`theme::secret_band`] and
+/// [`theme::SECRET_INK`].**
 ///
 /// 4e names this the one deliberate departure from the palette in the whole
 /// product: "The product is blue. Secrets are the only thing rendered in red
@@ -4998,22 +5210,38 @@ enum ChipEdit {
 /// that is one step off the card behind it -- so the step that types a
 /// password read as the same kind of thing as the Tab above it.
 ///
-/// **Named here and not in [`theme`].** They are deliberately not tokens: the
-/// value of one red is that exactly one kind of thing wears it, and a constant
-/// in the shared palette is an invitation for a second surface to reach for a
-/// colour that then means nothing. `scratch_window` and `preflight_card` each
-/// name their own band's colours locally for the same reason. (If a later pass
-/// wants one home for these, it should be a named *secret-step* primitive with
-/// the rule attached, not three loose `Color32`s.)
+/// **This block used to hold three private `Color32`s, and the argument for
+/// keeping them here was wrong.** It read: the value of one red is that
+/// exactly one kind of thing wears it, so a constant in the shared palette is
+/// an invitation for a second surface to reach for a colour that then means
+/// nothing -- and `scratch_window` and `preflight_card` name their own band's
+/// colours locally for the same reason.
 ///
-/// **The hatch is not reproduced.** 4a fills the password row with a
+/// The premise is right and the conclusion does not follow. Three files each
+/// naming the same hex privately does not stop a fourth surface reaching for
+/// red; it only stops anyone NOTICING when one of them gets it wrong, which is
+/// what happened -- `preflight_card::SECRET_EDGE` is `#f2dedb` where this file
+/// and `scratch_window` both say `#e8a9a2`, and there is nothing on any screen
+/// that says which of the two is the border of the one red. The rule is not
+/// enforced by hiding the value; it is enforced by naming the ROLE and putting
+/// the rule on it, which is what that same doc asked for in its last line: *a
+/// named secret-step primitive with the rule attached, not three loose
+/// `Color32`s*. [`theme::secret_band`] is that primitive and it carries the
+/// argument; this file now asks for it by name.
+///
+/// **The hatch is still not reproduced.** 4a fills the password row with a
 /// `repeating-linear-gradient` of two pinks at 135°. egui has no tiling brush;
 /// drawing one would mean a mesh of clipped parallelograms per row, rebuilt
 /// every frame, for a texture the flat tint and the red edge already say. The
 /// colour carries the meaning and the stripes carry none of it.
-const SECRET_STEP_FILL: egui::Color32 = egui::Color32::from_rgb(0xfd, 0xf3, 0xf2);
-const SECRET_STEP_EDGE: egui::Color32 = egui::Color32::from_rgb(0xe8, 0xa9, 0xa2);
-const SECRET_STEP_INK: egui::Color32 = egui::Color32::from_rgb(0x8c, 0x3c, 0x33);
+///
+/// The step row's 10pt radius and its `8x5` margin stay here, where they
+/// belong: they are the shape of a row in THIS list -- the four ordinary steps
+/// above the password wear the same ones -- and a band that changed shape as
+/// well as colour would read as a different kind of row rather than as the same
+/// row carrying a secret. See [`theme::secret_band`] for why the primitive
+/// hands out the two colours and nothing else.
+const SECRET_STEP_RADIUS: u8 = 10;
 
 /// The badge's ink. One accent hue and one exception: the understood kinds
 /// wear the blue, the two that are carried rather than acted on wear the faint
@@ -5049,13 +5277,16 @@ fn badge_ink(row: &StepRow) -> egui::Color32 {
 fn sequence_steps(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option<ChipEdit> {
     let mut edit = None;
     for row in rows {
-        egui::Frame::new()
-            .fill(if row.secret { SECRET_STEP_FILL } else { theme::CARD })
-            .stroke(Stroke::new(
-                1.0,
-                if row.secret { SECRET_STEP_EDGE } else { theme::HAIRLINE },
-            ))
-            .corner_radius(CornerRadius::same(10))
+        // The one branch, and the whole of it: a secret step wears the band,
+        // an ordinary one wears the card. Neither arm names a colour here --
+        // see `SECRET_STEP_RADIUS` for why the shape stays and the hexes went.
+        let ground = if row.secret {
+            theme::secret_band()
+        } else {
+            egui::Frame::new().fill(theme::CARD).stroke(Stroke::new(1.0, theme::HAIRLINE))
+        };
+        ground
+            .corner_radius(CornerRadius::same(SECRET_STEP_RADIUS))
             .inner_margin(Margin::symmetric(8, 5))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -5082,7 +5313,7 @@ fn sequence_steps(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option
                             // chip; on a tint this pale the design's own
                             // `#8c3c33` is what stays legible, and it is the
                             // ink 4c gives the same chip.
-                            _ if row.secret => SECRET_STEP_INK,
+                            _ if row.secret => theme::SECRET_INK,
                             _ => theme::INK,
                         }),
                     );
@@ -5096,7 +5327,7 @@ fn sequence_steps(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option
                         // row's own red instead -- it is part of the one thing
                         // on this list that is not ordinary UI, not a value.
                         ui.label(RichText::new(row.payload.clone()).size(12.0).color(
-                            if row.secret { SECRET_STEP_INK } else { theme::BLUE },
+                            if row.secret { theme::SECRET_INK } else { theme::BLUE },
                         ));
                     }
                     if editable {
@@ -6366,6 +6597,16 @@ pub fn draw_detail_edit(
     let changes = draft.changes();
     let kind = draft.kind;
 
+    // **Once per frame, and off the ITEM rather than the draft.** The password
+    // history is the one thing on this form that is not being edited: it is
+    // what the item arrived with, the form never writes it, and the entry the
+    // current password will become on save is added by the server and not by
+    // anything here. Taken at the top for `changes`' reason -- the credentials
+    // card is inside three nested closures by the time it needs this, and
+    // `password_history` walks and clones the whole array. Empty on a CREATE,
+    // where there is no item; `history_block` then draws nothing.
+    let history = item.map(detail::password_history_dates).unwrap_or_default();
+
     // **Which of the kind's rows this form is drawing, and which are behind
     // the Add control.** Both computed here, off the draft, before anything
     // borrows it mutably -- and both from `EditDraft`'s own predicates rather
@@ -7030,6 +7271,37 @@ pub fn draw_detail_edit(
                     }
                     });
 
+                    // **§8a's `Password history (3)`, in the control column
+                    // under the generator.**
+                    //
+                    // 8a puts it at the far right of the strength-meter line,
+                    // inside the password row itself. It cannot go there here
+                    // for the reason the generator is not on the password's
+                    // own line either: that line is a four-bar meter, a rating
+                    // and a count in a control column around 200 points wide,
+                    // and `strength_meter` already drops its own character
+                    // count to fit. What is kept from 8a is the part that is
+                    // not furniture -- the same column, the same caption, the
+                    // same count in it.
+                    //
+                    // **Below the generator rather than between it and the
+                    // box.** The generator is the password box's own tool set;
+                    // a list of old passwords wedged between a field and the
+                    // controls that fill it would separate the two things on
+                    // this card that act on each other, and the list GROWS
+                    // when it is opened, so it would push them further apart
+                    // the moment it was used.
+                    //
+                    // Another empty-labelled row, so it starts at the control
+                    // column and not at the card's left edge -- see the
+                    // generator's own row above for why that indent matters.
+                    if !history.is_empty() {
+                        ui.add_space(theme::BLOCK_GAP);
+                        theme::section_row(ui, "", |ui| {
+                            history_block(ui, &mut draft.history_open, &history);
+                        });
+                    }
+
                     // **The seed and the websites used to be drawn here and
                     // are not any more.** 8a gives each a card -- `One-time
                     // code` and `Autofill targets` -- and the reason is the
@@ -7042,16 +7314,27 @@ pub fn draw_detail_edit(
                 }
                 FormBody::Card => {
                     let card = &mut draft.card;
+                    // **Every row on this card is a `slot_row`**, optional or
+                    // not, and the gap between them is `theme::BLOCK_GAP` --
+                    // the same one the `Item` card above uses. What was here
+                    // was `slot_label` + control + a local `10.0`, which is
+                    // the other half of why the two cards did not read as one
+                    // form: not only a different row shape but a different
+                    // rhythm between the rows, two points apart, which is
+                    // exactly far enough to notice and not far enough to
+                    // explain.
                     if showing(Slot::CardholderName) {
-                        if slot_label(
+                        if slot_row(
                             ui,
                             Slot::CardholderName.label(),
                             removable(Slot::CardholderName),
+                            |ui| {
+                                theme::text_field(ui, &mut card.cardholder_name, false);
+                            },
                         ) {
                             hide = Some(Slot::CardholderName);
                         }
-                        theme::text_field(ui, &mut card.cardholder_name, false);
-                        ui.add_space(10.0);
+                        ui.add_space(theme::BLOCK_GAP);
                     }
 
                     // **The brand is floor** -- never hidden, never
@@ -7060,76 +7343,91 @@ pub fn draw_detail_edit(
                     // number's own digits, so a hidden brand would be a value
                     // this form sets and the user cannot see. See
                     // [`Slot::always_shown`].
-                    theme::field_label(ui, Slot::CardBrand.label());
-                    // A dropdown over `CARD_BRANDS` rather than a text box,
-                    // and the rows are derived from the enumeration rather
-                    // than written out here: a second hand-written list is
-                    // the "two enumerations that must agree" defect, and the
-                    // one that drifts would offer a spelling no other
-                    // Bitwarden client draws card art for.
-                    //
-                    // `selected_text` is the draft's own string, not a
-                    // resolved `CardBrand`, so a brand this build does not
-                    // know -- one a newer client wrote -- is still SHOWN
-                    // rather than silently reading as blank.
-                    egui::ComboBox::from_id_salt("card-brand")
-                        .selected_text(if card.brand.is_empty() {
-                            BRAND_UNSET
-                        } else {
-                            card.brand.as_str()
-                        })
-                        .width(BRAND_COMBO_WIDTH)
-                        .show_ui(ui, |ui| {
-                            for brand in CARD_BRANDS {
-                                let canonical = brand.canonical();
-                                let chosen = card.brand == canonical;
-                                if ui.selectable_label(chosen, canonical).clicked() {
-                                    // Through `pick_brand`, never by
-                                    // assigning `brand`: this is the click
-                                    // that makes the choice permanent.
-                                    card.pick_brand(canonical);
+                    theme::section_row(ui, Slot::CardBrand.label(), |ui| {
+                        // A dropdown over `CARD_BRANDS` rather than a text box,
+                        // and the rows are derived from the enumeration rather
+                        // than written out here: a second hand-written list is
+                        // the "two enumerations that must agree" defect, and
+                        // the one that drifts would offer a spelling no other
+                        // Bitwarden client draws card art for.
+                        //
+                        // `selected_text` is the draft's own string, not a
+                        // resolved `CardBrand`, so a brand this build does not
+                        // know -- one a newer client wrote -- is still SHOWN
+                        // rather than silently reading as blank.
+                        egui::ComboBox::from_id_salt("card-brand")
+                            .selected_text(if card.brand.is_empty() {
+                                BRAND_UNSET
+                            } else {
+                                card.brand.as_str()
+                            })
+                            .width(BRAND_COMBO_WIDTH)
+                            .show_ui(ui, |ui| {
+                                for brand in CARD_BRANDS {
+                                    let canonical = brand.canonical();
+                                    let chosen = card.brand == canonical;
+                                    if ui.selectable_label(chosen, canonical).clicked() {
+                                        // Through `pick_brand`, never by
+                                        // assigning `brand`: this is the click
+                                        // that makes the choice permanent.
+                                        card.pick_brand(canonical);
+                                    }
                                 }
-                            }
-                        });
-                    ui.add_space(10.0);
+                            });
+                    });
+                    ui.add_space(theme::BLOCK_GAP);
 
-                    theme::field_label(ui, Slot::CardNumber.label());
-                    theme::password_field(ui, &mut card.number, &mut card.reveal_number);
+                    theme::section_row(ui, Slot::CardNumber.label(), |ui| {
+                        theme::password_field(ui, &mut card.number, &mut card.reveal_number);
+                    });
                     // Every frame, unconditionally. `suggest_brand` is
                     // idempotent and returns immediately once the user has
                     // picked, so there is nothing to gate it on -- and gating
                     // it on "the number changed" would mean keeping a second
                     // plaintext copy of the number to compare against.
                     card.suggest_brand();
-                    ui.add_space(10.0);
+                    ui.add_space(theme::BLOCK_GAP);
 
                     if showing(Slot::CardExpMonth) {
-                        if slot_label(
+                        if slot_row(
                             ui,
                             Slot::CardExpMonth.label(),
                             removable(Slot::CardExpMonth),
+                            |ui| {
+                                theme::text_field(ui, &mut card.exp_month, false);
+                            },
                         ) {
                             hide = Some(Slot::CardExpMonth);
                         }
-                        theme::text_field(ui, &mut card.exp_month, false);
-                        ui.add_space(10.0);
+                        ui.add_space(theme::BLOCK_GAP);
                     }
 
                     if showing(Slot::CardExpYear) {
-                        if slot_label(ui, Slot::CardExpYear.label(), removable(Slot::CardExpYear))
-                        {
+                        if slot_row(
+                            ui,
+                            Slot::CardExpYear.label(),
+                            removable(Slot::CardExpYear),
+                            |ui| {
+                                theme::text_field(ui, &mut card.exp_year, false);
+                            },
+                        ) {
                             hide = Some(Slot::CardExpYear);
                         }
-                        theme::text_field(ui, &mut card.exp_year, false);
-                        ui.add_space(10.0);
+                        ui.add_space(theme::BLOCK_GAP);
                     }
 
                     if showing(Slot::CardCode) {
-                        if slot_label(ui, Slot::CardCode.label(), removable(Slot::CardCode)) {
+                        if slot_row(
+                            ui,
+                            Slot::CardCode.label(),
+                            removable(Slot::CardCode),
+                            |ui| {
+                                theme::password_field(ui, &mut card.code, &mut card.reveal_code);
+                            },
+                        ) {
                             hide = Some(Slot::CardCode);
                         }
-                        theme::password_field(ui, &mut card.code, &mut card.reveal_code);
-                        ui.add_space(10.0);
+                        ui.add_space(theme::BLOCK_GAP);
                     }
 
                     // The two namespaced custom fields. Withheld on a CREATE
@@ -7139,59 +7437,92 @@ pub fn draw_detail_edit(
                     // Save. A disabled box that says so beats a live box that
                     // lies.
                     if showing(Slot::CardBank) {
-                        if slot_label(ui, Slot::CardBank.label(), removable(Slot::CardBank)) {
+                        // The hint goes INSIDE the control column, under the
+                        // box it is about -- the same place the `Item` card
+                        // puts its un-file explanation. Left outside the row it
+                        // would start at the card's left edge, level with the
+                        // captions, and read as a sentence about the card
+                        // rather than about this field.
+                        if slot_row(
+                            ui,
+                            Slot::CardBank.label(),
+                            removable(Slot::CardBank),
+                            |ui| {
+                                if creating {
+                                    theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                                } else {
+                                    bank_domain_row(ui, card);
+                                }
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(BANK_HINT).size(11.0).color(theme::TEXT_FAINT),
+                                );
+                            },
+                        ) {
                             hide = Some(Slot::CardBank);
                         }
-                        if creating {
-                            theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
-                        } else {
-                            bank_domain_row(ui, card);
-                        }
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(BANK_HINT).size(11.0).color(theme::TEXT_FAINT));
-                        ui.add_space(10.0);
+                        ui.add_space(theme::BLOCK_GAP);
                     }
 
                     if showing(Slot::CardBillingZip) {
-                        if slot_label(
+                        if slot_row(
                             ui,
                             Slot::CardBillingZip.label(),
                             removable(Slot::CardBillingZip),
+                            |ui| {
+                                if creating {
+                                    theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                                } else {
+                                    // Free text, unlike the bank: a postcode
+                                    // has no closed set to pick from, and a
+                                    // wrong one fails in front of the user on
+                                    // the payment form rather than silently
+                                    // here.
+                                    theme::text_field(ui, &mut card.billing_zip, false);
+                                }
+                            },
                         ) {
                             hide = Some(Slot::CardBillingZip);
                         }
-                        if creating {
-                            theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
-                        } else {
-                            // Free text, unlike the bank: a postcode has no
-                            // closed set to pick from, and a wrong one fails
-                            // in front of the user on the payment form rather
-                            // than silently here.
-                            theme::text_field(ui, &mut card.billing_zip, false);
-                        }
-                        ui.add_space(10.0);
+                        ui.add_space(theme::BLOCK_GAP);
                     }
                 }
                 FormBody::Identity => {
                     // **The kind this feature earns its keep on.** Eighteen
                     // rows, of which a real identity fills two or three; the
                     // rest are behind the Add control below.
+                    //
+                    // And the kind the row idiom earns its keep on too: this
+                    // is the card the owner's screenshot showed stacked beside
+                    // an `Item` card in columns. Eighteen stacked captions is
+                    // eighteen rows of a second layout on one screen.
                     for (field, value) in identity_rows(&mut draft.identity) {
                         let slot = Slot::Identity(field);
                         if !showing(slot) {
                             continue;
                         }
-                        if slot_label(ui, field.label(), removable(slot)) {
+                        if slot_row(ui, field.label(), removable(slot), |ui| {
+                            theme::text_field(ui, value, false);
+                        }) {
                             hide = Some(slot);
                         }
-                        theme::text_field(ui, value, false);
-                        ui.add_space(10.0);
+                        ui.add_space(theme::BLOCK_GAP);
                     }
                 }
                 FormBody::Note => {
                     // Floor, and the only slot a note has: the body IS the
                     // item. See [`Slot::always_shown`].
+                    //
+                    // **The one row on this form that is NOT in the label
+                    // column**, and the departure is argued rather than
+                    // accidental: a secure note's body is the whole item, it
+                    // is eight rows tall, and a 130-point caption beside an
+                    // eight-row box would leave 130 points of white down the
+                    // left of the only thing on the card. §8a has no note card
+                    // to copy; what it does do everywhere is give the control
+                    // the width its content needs, and here that is all of it.
                     theme::field_label(ui, Slot::Note.label());
+                    ui.add_space(theme::EYEBROW_GAP);
                     // A multiline box rather than `theme::text_field`: a
                     // secure note's body is the whole item and is routinely
                     // several lines. `theme` has no multiline helper.
@@ -7200,7 +7531,7 @@ pub fn draw_detail_edit(
                             .desired_width(ui.available_width())
                             .desired_rows(8),
                     );
-                    ui.add_space(10.0);
+                    ui.add_space(theme::BLOCK_GAP);
                 }
                 FormBody::SshKey => {
                     let ssh = &mut draft.ssh_key;
@@ -7209,21 +7540,35 @@ pub fn draw_detail_edit(
                     // All three are floor: they exist on a CREATE only, where
                     // nothing is hidden, and `NewItem::ssh_key` posts all
                     // three. See [`Slot::always_shown`].
-                    theme::field_label(ui, Slot::SshPrivateKey.label());
-                    // The one secret of the three, so the one with a reveal.
-                    // Multiline would suit a PEM block better, but
-                    // `theme` has no masked multiline box and an unmasked one
-                    // would show the key by default.
-                    theme::password_field(ui, &mut ssh.private_key, &mut ssh.reveal_private_key);
-                    ui.add_space(10.0);
+                    //
+                    // Through `slot_row` with `removable` false rather than
+                    // through a bare `field_label`, so this card is built out
+                    // of the same row as every other one. The three captions
+                    // are the longest on the form -- `SSH private key`,
+                    // `Key fingerprint` -- which is the case a 130-point label
+                    // column has to survive, and it does: the column wraps.
+                    slot_row(ui, Slot::SshPrivateKey.label(), false, |ui| {
+                        // The one secret of the three, so the one with a
+                        // reveal. Multiline would suit a PEM block better, but
+                        // `theme` has no masked multiline box and an unmasked
+                        // one would show the key by default.
+                        theme::password_field(
+                            ui,
+                            &mut ssh.private_key,
+                            &mut ssh.reveal_private_key,
+                        );
+                    });
+                    ui.add_space(theme::BLOCK_GAP);
 
-                    theme::field_label(ui, Slot::SshPublicKey.label());
-                    theme::text_field(ui, &mut ssh.public_key, false);
-                    ui.add_space(10.0);
+                    slot_row(ui, Slot::SshPublicKey.label(), false, |ui| {
+                        theme::text_field(ui, &mut ssh.public_key, false);
+                    });
+                    ui.add_space(theme::BLOCK_GAP);
 
-                    theme::field_label(ui, Slot::SshFingerprint.label());
-                    theme::text_field(ui, &mut ssh.key_fingerprint, false);
-                    ui.add_space(10.0);
+                    slot_row(ui, Slot::SshFingerprint.label(), false, |ui| {
+                        theme::text_field(ui, &mut ssh.key_fingerprint, false);
+                    });
+                    ui.add_space(theme::BLOCK_GAP);
                 }
                 FormBody::UneditableNotice => {
                     ui.label(
@@ -7269,23 +7614,36 @@ pub fn draw_detail_edit(
                     changed(Section::OneTimeCode),
                     wanted,
                     |ui| {
-                        if slot_label(ui, Slot::Totp.label(), removable(Slot::Totp)) {
+                        if slot_row(
+                            ui,
+                            Slot::Totp.label(),
+                            removable(Slot::Totp),
+                            |ui| {
+                                if creating {
+                                    theme::disabled_text_field(ui, TOTP_CREATE_NOTICE);
+                                } else {
+                                    // Masked, like the password and for the
+                                    // same reason: it is a secret, and this
+                                    // form may be open in front of other
+                                    // people. `password_field` is the crate's
+                                    // one masked box -- reaching for a plain
+                                    // `text_field` here is the mutation
+                                    // `the_totp_seed_is_masked_and_never_painted_in_the_clear`
+                                    // exists to catch.
+                                    theme::password_field(
+                                        ui,
+                                        &mut draft.totp,
+                                        &mut draft.reveal_totp,
+                                    );
+                                }
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT),
+                                );
+                            },
+                        ) {
                             hide = Some(Slot::Totp);
                         }
-                        if creating {
-                            theme::disabled_text_field(ui, TOTP_CREATE_NOTICE);
-                        } else {
-                            // Masked, like the password and for the same
-                            // reason: it is a secret, and this form may be
-                            // open in front of other people. `password_field`
-                            // is the crate's one masked box -- reaching for a
-                            // plain `text_field` here is the mutation
-                            // `the_totp_seed_is_masked_and_never_painted_in_the_clear`
-                            // exists to catch.
-                            theme::password_field(ui, &mut draft.totp, &mut draft.reveal_totp);
-                        }
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT));
                     },
                 );
             }
@@ -13273,16 +13631,20 @@ mod sequence_builder_tests {
         assert_eq!(rows.iter().filter(|r| r.secret).count(), 1, "the fixture lost its secret");
 
         let red: Vec<&PaintedRect> =
-            open.rects.iter().filter(|r| r.fill == SECRET_STEP_FILL).collect();
+            open.rects.iter().filter(|r| r.fill == theme::secret_band().fill).collect();
         assert_eq!(
             red.len(),
             1,
             "{} boxes on this form are filled 4a's #fdf3f2; exactly one step types a secret",
             red.len()
         );
-        assert_eq!(red[0].stroke, SECRET_STEP_EDGE, "the secret row is not edged #e8a9a2");
         assert_eq!(
-            red[0].radius.nw, 10,
+            red[0].stroke,
+            theme::secret_band().stroke.color,
+            "the secret row is not edged #e8a9a2"
+        );
+        assert_eq!(
+            red[0].radius.nw, SECRET_STEP_RADIUS,
             "the secret row is not the same 10pt card the other steps are"
         );
 
@@ -13318,7 +13680,7 @@ mod sequence_builder_tests {
         let mut draft = draft_for(&item, "{ESC}{USERNAME}{TAB}{ENTER}");
         let open = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
         assert!(
-            !open.rects.iter().any(|r| r.fill == SECRET_STEP_FILL),
+            !open.rects.iter().any(|r| r.fill == theme::secret_band().fill),
             "a sequence that types no secret was still drawn with 4a's red on it"
         );
     }
@@ -13749,6 +14111,18 @@ mod edit_pane_layout_tests {
         /// non-vacuity assertion on this field still says what it says: that
         /// the tallest form really paints carets.
         marks: Vec<(&'static str, Rect)>,
+        /// The COLOUR each run was laid out in, by run text.
+        ///
+        /// The same blindness [`Painted::fonts`] was added to close, one
+        /// property over. Nothing else in this struct can see a grey: two
+        /// captions at 12pt in two different inks occupy identical boxes in
+        /// identical faces, and that is exactly what the form shipped -- the
+        /// `Item` card's captions in `theme::TEXT_FAINT` (§8a's label column,
+        /// painted by `theme::section_row`) directly above a `Card` card's in
+        /// `theme::TEXT_MUTED` (`theme::field_label`, stacked). One form, two
+        /// greys, every geometry assertion in this module green. See
+        /// [`every_per_kind_caption_is_the_same_grey_as_the_item_cards`].
+        inks: Vec<(String, egui::Color32)>,
         /// The ink each filled rect really lays down, which is not
         /// [`Painted::rects`]'s box.
         ///
@@ -13878,6 +14252,17 @@ mod edit_pane_layout_tests {
                     painted
                         .fonts
                         .push((text.galley.text().to_string(), section.format.font_id.clone()));
+                    // ... and the ink. `Color32::PLACEHOLDER` is egui's "the
+                    // shape decides", which is what a `Label` with no explicit
+                    // colour lays out as, so the shape's own fallback is read
+                    // in that case -- otherwise every unstyled run would
+                    // report one meaningless sentinel. See [`Painted::inks`].
+                    let ink = if section.format.color == egui::Color32::PLACEHOLDER {
+                        text.fallback_color
+                    } else {
+                        section.format.color
+                    };
+                    painted.inks.push((text.galley.text().to_string(), ink));
                 }
                 // ... and the box the ink really covers. See `Painted::glyphs`.
                 if let Some(ink) = glyph_ink(text) {
@@ -14003,6 +14388,382 @@ mod edit_pane_layout_tests {
         }));
         assert!(!draft.is_valid(), "the tall case wants the name error showing");
         draft
+    }
+
+    // -----------------------------------------------------------------------
+    // One row idiom across the whole form
+    // -----------------------------------------------------------------------
+
+    /// **A pane wide enough for §8a's label column and then some.**
+    ///
+    /// `ROOMY_PANE` above is 560, which leaves the card body 334 points once
+    /// the section rail and its gutter are off -- ten points clear of
+    /// `theme::section_rows_fit`'s own floor of 324. That is close enough that
+    /// a design change worth one point would silently flip these tests onto
+    /// the other arm and leave them green, so the wide shots get their own
+    /// width with room in it.
+    const WIDE_PANE_WIDTH: f32 = 700.0;
+
+    /// A saved card with every optional row on it filled in, so the form draws
+    /// all nine of the kind's rows and six Removes rather than hiding the
+    /// empty ones behind the Add control.
+    fn filled_card_item() -> VaultItem {
+        VaultItem {
+            id: "card-row-1".to_string(),
+            name: "Ledgerline corporate card".to_string(),
+            folder_id: None,
+            fields: Vec::new(),
+            login: None,
+            card: Some(crate::vault_bridge::CardData {
+                cardholder_name: Some("ANNA NOVAK".to_string()),
+                brand: Some("Visa".to_string()),
+                number: Some(Zeroizing::new("4111111111111111".to_string())),
+                exp_month: Some("11".to_string()),
+                exp_year: Some("2029".to_string()),
+                code: Some(Zeroizing::new("417".to_string())),
+                ..crate::vault_bridge::CardData::default()
+            }),
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(3),
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// The ink `label` was painted in, or a failure naming what was painted.
+    fn ink_of_run(painted: &Painted, label: &str) -> egui::Color32 {
+        let found: Vec<egui::Color32> =
+            painted.inks.iter().filter(|(t, _)| t == label).map(|(_, c)| *c).collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one {label:?} on the form, found {}; painted: {:?}",
+            found.len(),
+            painted.strings()
+        );
+        found[0]
+    }
+
+    /// **The whole of the report this row work answers, as one assertion.**
+    ///
+    /// The form drew §8a's label column on the `Item` and `Login credentials`
+    /// cards and stacked label-above-field on the per-kind ones, and the two
+    /// arms are not only different geometry: they are different GREYS.
+    /// `theme::section_row` paints its caption in `TEXT_FAINT`;
+    /// `theme::field_label` sets it in `TEXT_MUTED`. So a card whose rows had
+    /// quietly gone back to the stacked shape would show up here even if every
+    /// box on it still landed in the right place -- which is the failure mode
+    /// a geometry assertion cannot see and a reviewer notices immediately.
+    ///
+    /// Asked of a CARD because that is the kind with the most rows of both
+    /// sorts: three that can never be removed and four that can.
+    #[test]
+    fn every_per_kind_caption_is_the_same_grey_as_the_item_cards() {
+        let item = filled_card_item();
+        let mut draft = EditDraft::from_item(&item);
+        let ctx = styled_context(Vec2::new(WIDE_PANE_WIDTH, 2400.0));
+        let painted = frame_for(
+            &ctx,
+            Vec2::new(WIDE_PANE_WIDTH, 2400.0),
+            &mut draft,
+            false,
+            &[],
+            Some(&item),
+            &detail::TotpState::NoSecret,
+        );
+        // The reference is the `Item` card's own first row, read off the form
+        // rather than written out: if §8a's label column ever changes ink,
+        // this test wants to move with it and not against it.
+        let reference = ink_of_run(&painted, "Name");
+        assert_eq!(
+            reference,
+            theme::TEXT_FAINT,
+            "the Item card's caption is no longer §8a's label-column grey"
+        );
+        for caption in [
+            Slot::CardholderName.label(),
+            Slot::CardBrand.label(),
+            Slot::CardNumber.label(),
+            Slot::CardExpMonth.label(),
+            Slot::CardExpYear.label(),
+            Slot::CardCode.label(),
+        ] {
+            assert_eq!(
+                ink_of_run(&painted, caption),
+                reference,
+                "{caption:?} is drawn in a different grey from the Item card above it, which is \
+                 what a row that went back to the stacked shape looks like"
+            );
+        }
+    }
+
+    /// **And the same thing at the window floor, the other way round.**
+    ///
+    /// Below `theme::section_rows_fit` there IS no label column, so every
+    /// caption on the form -- the `Item` card's included -- goes through
+    /// `theme::field_label` and wears `TEXT_MUTED`. The claim is the same
+    /// claim: one idiom on the whole form. Without this half, a build that
+    /// left the per-kind cards stacked at every width would pass the test
+    /// above only by accident of the wide arm.
+    #[test]
+    fn every_caption_is_one_grey_at_the_apps_minimum_width_too() {
+        let item = filled_card_item();
+        let mut draft = EditDraft::from_item(&item);
+        let pane = Vec2::new(MIN_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let painted =
+            frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &detail::TotpState::NoSecret);
+        assert!(
+            !theme::section_rows_fit_at(MIN_PANE_WIDTH - 2.0 * theme::SECTION_CARD_PAD_X as f32),
+            "the floor now fits §8a's label column, so this test is asserting about the wrong arm"
+        );
+        let reference = ink_of_run(&painted, "Name");
+        assert_eq!(
+            reference,
+            theme::TEXT_MUTED,
+            "the stacked arm's caption is no longer `theme::field_label`'s grey"
+        );
+        for caption in [Slot::CardholderName.label(), Slot::CardExpMonth.label()] {
+            assert_eq!(
+                ink_of_run(&painted, caption),
+                reference,
+                "{caption:?} is drawn in a different grey from the Item card above it at the \
+                 app's minimum width"
+            );
+        }
+    }
+
+    /// The Remove chip survives the move into the label cell, at both widths.
+    ///
+    /// It moved from beside the caption to under it (wide) and stayed beside
+    /// it (stacked), and "the chip is still on the form" is exactly the thing
+    /// a layout change like that can quietly lose: the cell is a fixed 130
+    /// points and a widget that did not fit would simply be clipped.
+    #[test]
+    fn every_optional_row_still_offers_its_remove_at_both_widths() {
+        let item = filled_card_item();
+        let expected = EditDraft::from_item(&item)
+            .shown_slots(false)
+            .iter()
+            .filter(|slot| !slot.always_shown())
+            .count();
+        assert!(expected >= 4, "the card fixture has no optional rows, so this test is vacuous");
+        for width in [WIDE_PANE_WIDTH, MIN_PANE_WIDTH] {
+            let mut draft = EditDraft::from_item(&item);
+            let pane = Vec2::new(width, 2400.0);
+            let ctx = styled_context(pane);
+            let painted = frame_for(
+                &ctx,
+                pane,
+                &mut draft,
+                false,
+                &[],
+                Some(&item),
+                &detail::TotpState::NoSecret,
+            );
+            let drawn =
+                painted.strings().iter().filter(|s| **s == SLOT_REMOVE_BUTTON).count();
+            assert_eq!(
+                drawn, expected,
+                "{drawn} Remove chips on a {width}pt form that shows {expected} optional rows"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Password history
+    // -----------------------------------------------------------------------
+
+    /// The plaintext previous passwords the fixture below carries. Named so
+    /// the "never painted" assertion cannot drift from the fixture.
+    const OLD_PASSWORDS: [&str; 3] = ["correct-horse-6", "Tr0ub4dor&3", "ledgerline2024"];
+
+    /// A login with `count` previous passwords on it, in the wire shape
+    /// `rest/sync.rs` leaves behind after decrypting them in place.
+    fn item_with_history(count: usize) -> VaultItem {
+        let entries: Vec<serde_json::Value> = (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "password": OLD_PASSWORDS[i % OLD_PASSWORDS.len()],
+                    // One entry in three carries no date, which is the case
+                    // `detail::history_label` answers "Earlier" for.
+                    "lastUsedDate": if i % 3 == 2 {
+                        serde_json::Value::Null
+                    } else {
+                        serde_json::Value::String(format!(
+                            "202{}-01-01T00:00:00.000Z",
+                            i % 5
+                        ))
+                    },
+                })
+            })
+            .collect();
+        let mut other = serde_json::Map::new();
+        other.insert("passwordHistory".to_string(), serde_json::Value::Array(entries));
+        VaultItem {
+            id: "history-1".to_string(),
+            name: "Ledgerline".to_string(),
+            folder_id: None,
+            fields: Vec::new(),
+            login: Some(LoginData {
+                username: Some("a.novak@ledgerline.com".to_string()),
+                password: Some(Zeroizing::new("current-password".to_string())),
+                totp: None,
+                uris: Vec::new(),
+                other: serde_json::Map::new(),
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            favorite: false,
+            other,
+        }
+    }
+
+    /// §8a's `Password history (3)` is on the credentials card, and the list
+    /// behind it is shut.
+    #[test]
+    fn the_credentials_card_says_how_many_previous_passwords_there_are() {
+        let item = item_with_history(3);
+        let mut draft = EditDraft::from_item(&item);
+        assert!(!draft.history_open, "the history list opens open");
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let painted =
+            frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &detail::TotpState::NoSecret);
+        assert!(
+            painted.strings().contains(&history_button(3).as_str()),
+            "the credentials card does not say how many previous passwords there are: {:?}",
+            painted.strings()
+        );
+        assert!(
+            !painted.strings().contains(&HISTORY_READ_ONLY_NOTE),
+            "the shut list drew its contents anyway"
+        );
+    }
+
+    /// Opening it lists every entry, each with the date it stopped being the
+    /// current password.
+    #[test]
+    fn opening_the_password_history_lists_every_entry_with_its_date() {
+        let item = item_with_history(3);
+        let mut draft = EditDraft::from_item(&item);
+        draft.history_open = true;
+        for width in [WIDE_PANE_WIDTH, MIN_PANE_WIDTH] {
+            let pane = Vec2::new(width, 2400.0);
+            let ctx = styled_context(pane);
+            let painted = frame_for(
+                &ctx,
+                pane,
+                &mut draft,
+                false,
+                &[],
+                Some(&item),
+                &detail::TotpState::NoSecret,
+            );
+            let strings = painted.strings();
+            for when in detail::password_history_dates(&item) {
+                assert!(
+                    strings.iter().any(|s| *s == when),
+                    "the {width}pt form's open history is missing its {when:?} row: {strings:?}"
+                );
+            }
+            assert!(
+                strings.contains(&HISTORY_READ_ONLY_NOTE),
+                "the {width}pt open list does not say where the reveal is: {strings:?}"
+            );
+        }
+    }
+
+    /// **The one assertion this feature must never lose.**
+    ///
+    /// The list is read-only and masked: it shows when, not what. A reveal
+    /// added here for symmetry with the read pane would put every old password
+    /// of an item on the one screen a user leaves open while they work, and
+    /// nothing else in this module would notice -- a revealed row is a
+    /// perfectly ordinary-looking label.
+    ///
+    /// Asked in both states and at both widths, because "shut" is not a
+    /// defence: the block returns early on a shut list today, and a later
+    /// refactor that drew the rows and hid them behind a clip would still be
+    /// painting them.
+    #[test]
+    fn a_previous_password_is_never_painted_on_the_edit_form() {
+        let item = item_with_history(3);
+        for open in [false, true] {
+            for width in [WIDE_PANE_WIDTH, MIN_PANE_WIDTH] {
+                let mut draft = EditDraft::from_item(&item);
+                draft.history_open = open;
+                let pane = Vec2::new(width, 2400.0);
+                let ctx = styled_context(pane);
+                let painted = frame_for(
+                    &ctx,
+                    pane,
+                    &mut draft,
+                    false,
+                    &[],
+                    Some(&item),
+                    &detail::TotpState::NoSecret,
+                );
+                for old in OLD_PASSWORDS {
+                    assert!(
+                        !painted.strings().iter().any(|s| s.contains(old)),
+                        "a previous password was painted on the edit form (open={open}, \
+                         width={width}): {:?}",
+                        painted.strings()
+                    );
+                }
+            }
+        }
+    }
+
+    /// An item with no history gets no control at all, rather than one reading
+    /// `Password history (0)` that opens onto nothing.
+    #[test]
+    fn an_item_with_no_password_history_gets_no_control_at_all() {
+        let item = item_with_history(0);
+        let mut draft = EditDraft::from_item(&item);
+        draft.history_open = true;
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let painted =
+            frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &detail::TotpState::NoSecret);
+        assert!(
+            !painted.strings().iter().any(|s| s.starts_with("Password history")),
+            "an item with no previous passwords still got a history control: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// A history longer than the read pane's cap is cut and SAYS it was cut.
+    ///
+    /// Unreachable against today's backend -- Bitwarden slices every save to
+    /// five entries -- which is exactly why it would rot unnoticed if the
+    /// truncation were left to a comment.
+    #[test]
+    fn a_history_longer_than_the_cap_is_cut_and_says_so() {
+        let over = detail::MAX_HISTORY_ROWS + 2;
+        let item = item_with_history(over);
+        let mut draft = EditDraft::from_item(&item);
+        draft.history_open = true;
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let painted =
+            frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &detail::TotpState::NoSecret);
+        assert!(
+            painted.strings().contains(&history_button(over).as_str()),
+            "the caption's count is not the item's real one: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.strings().contains(&history_truncation(2).as_str()),
+            "an over-long history was cut silently: {:?}",
+            painted.strings()
+        );
     }
 
     /// The label the disabled Save wears while the name is empty.

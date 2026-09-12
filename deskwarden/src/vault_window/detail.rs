@@ -8104,12 +8104,43 @@ fn card_face_line(
 /// [`days_since`] parses a date, not a time. A password replaced three years
 /// ago is exactly the row where an unbounded day count was worst -- these
 /// entries are the oldest thing this pane shows.
-fn history_label(last_used_date: Option<&str>) -> String {
+pub fn history_label(last_used_date: Option<&str>) -> String {
     match last_used_date.and_then(days_since) {
         Some(n) if n <= 0 => "Today".to_string(),
         Some(n) => relative_time::ago_days(n as u64),
         None => "Earlier".to_string(),
     }
+}
+
+/// **When each of this item's previous passwords stopped being the current
+/// one, newest first, as the EDIT form needs it.**
+///
+/// The edit form surfaces the same history this pane draws -- design 8a puts
+/// `Password history (3)` on its `Login credentials` card, and the form's own
+/// footer already promises that saving a new password "will be added to
+/// history" -- so there are now two screens showing one list, and the wording
+/// of a date is exactly the kind of thing that ends up spelled two ways.
+/// [`history_label`] lives here because this pane wrote it; this function is
+/// how the other one asks for it.
+///
+/// **Dates and nothing else.** The entries themselves are
+/// `Zeroizing<String>` plaintext passwords, and the edit form has no use for
+/// them: it draws the list read-only, masked, with no reveal and no copy (see
+/// `detail_edit::history_block` for that argument). Handing it a
+/// `Vec<PasswordHistoryEntry>` would put every old password of the item on the
+/// other side of a module boundary for no drawing that needs one, and the
+/// vector would be rebuilt on every frame of an open form.
+///
+/// Filtered by [`masked_row_visible`], the same gate this pane's own card is
+/// drawn behind: an entry whose password is empty draws no row here and must
+/// not be counted there, or the two screens would disagree about how many
+/// previous passwords an item has.
+pub fn password_history_dates(item: &VaultItem) -> Vec<String> {
+    password_history(item)
+        .iter()
+        .filter(|entry| masked_row_visible(entry.password.as_str()))
+        .map(|entry| history_label(entry.last_used_date.as_deref()))
+        .collect()
 }
 
 /// The PREVIOUS PASSWORDS rows: one masked row per entry, each driven by its
@@ -20856,6 +20887,51 @@ mod tests {
         item.other
             .insert("passwordHistory".to_string(), serde_json::Value::Array(history));
         item
+    }
+
+    /// **What the EDIT form is handed, and what it is not.**
+    ///
+    /// `password_history_dates` exists so the two screens over one list say
+    /// the same words about a date, and so the form never gets the passwords
+    /// themselves. Both halves are asserted: the dates come back in
+    /// `history_label`'s own wording, and an entry whose password is empty is
+    /// not among them -- that entry draws no row on this pane either (see
+    /// `masked_row_visible`), and a count the form drew from a different rule
+    /// would be a second answer to "how many previous passwords has this item
+    /// got".
+    #[test]
+    fn the_edit_forms_history_is_this_panes_dates_and_nothing_else() {
+        let mut item = a_login_with_history(2);
+        // A third entry that this pane refuses to draw.
+        let history = item
+            .other
+            .get_mut("passwordHistory")
+            .and_then(|v| v.as_array_mut())
+            .expect("the fixture has a history");
+        history.push(serde_json::json!({ "password": "", "lastUsedDate": null }));
+
+        let dates = password_history_dates(&item);
+        assert_eq!(
+            dates.len(),
+            2,
+            "the empty entry was counted, so the form and this pane disagree about how many \
+             previous passwords the item has: {dates:?}"
+        );
+        let expected = history_label(Some(&super::test_clock::days_ago(
+            super::test_clock::HISTORY_AGE_DAYS,
+        )));
+        assert!(
+            dates.iter().all(|when| *when == expected),
+            "the form is handed a different wording from this pane's own rows: {dates:?} \
+             against {expected:?}"
+        );
+        // The positive control on the filter: an item with nothing drawable
+        // hands back nothing at all, which is what makes the count above a
+        // measurement rather than a coincidence.
+        assert!(
+            password_history_dates(&a_login()).is_empty(),
+            "an item with no history handed the form a non-empty list"
+        );
     }
 
     #[test]

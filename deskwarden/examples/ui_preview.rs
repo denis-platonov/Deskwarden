@@ -266,6 +266,39 @@ enum Surface {
     /// opened an item with a website on it and found no website on the form
     /// -- so this is the picture of the gap being closed.
     EditWebsites,
+    /// **The same form with its password history open.**
+    ///
+    /// Design 8a's `Password history (3)`, which the form did not surface at
+    /// all until this pass: `passwordHistory` has been decrypted on every sync
+    /// for as long as `rest/sync.rs` has existed and the READ pane has drawn
+    /// it, while the edit form -- whose own footer promises that saving will
+    /// add the current password to a history -- showed nothing of it.
+    ///
+    /// A surface of its own because the control is shut by default, so
+    /// [`Surface::EditLogin`] is a picture of one caption and a count. What
+    /// has to be looked at is the open list: three dates, three masks, the
+    /// read-only note under them, and whether all of that sitting under the
+    /// generator still reads as part of the credentials card rather than as a
+    /// panel that fell into it.
+    EditLoginHistory,
+    /// **A card item's edit form.** The kind whose body has the most optional
+    /// rows -- cardholder name, both expiry boxes, the security code, the bank
+    /// and the billing ZIP all carry a Remove -- and, until this pass, the
+    /// clearest picture of the form not being consistent between its own
+    /// cards: an `Item` card in §8a's label column directly above a `Card`
+    /// card stacking label-above-field.
+    ///
+    /// There was no edit surface for any kind but a login and an identity, so
+    /// the six-Remove case was never in a picture at all.
+    EditCard,
+    /// **The same card form at `settings::MIN_VAULT_WINDOW_SIZE`.**
+    ///
+    /// The row idiom has two arms -- §8a's label column above
+    /// `theme::section_rows_fit`, the stacked caption below it -- and the
+    /// Remove chip moves between them: in the column it sits under the
+    /// caption, stacked it sits beside it. Only the pair of shots shows that
+    /// both arms are a row a user can read.
+    EditCardNarrow,
     /// **A sparse item's edit form**: an identity that has a name and an
     /// email and nothing else, so the form is four rows and an Add control
     /// rather than eighteen empty boxes.
@@ -810,6 +843,9 @@ const ALL: &[Surface] = &[
     Surface::EditLogin,
     Surface::EditLoginDirty,
     Surface::EditLoginNarrow,
+    Surface::EditLoginHistory,
+    Surface::EditCard,
+    Surface::EditCardNarrow,
     Surface::EditWebsites,
     Surface::EditSparse,
     Surface::EditSparseAdding,
@@ -889,6 +925,9 @@ impl Surface {
             Surface::EditLogin => "edit_login",
             Surface::EditLoginDirty => "edit_login_dirty",
             Surface::EditLoginNarrow => "edit_login_narrow",
+            Surface::EditLoginHistory => "edit_login_history",
+            Surface::EditCard => "edit_card",
+            Surface::EditCardNarrow => "edit_card_narrow",
             Surface::EditWebsites => "edit_websites",
             Surface::EditSparse => "edit_sparse",
             Surface::EditSparseAdding => "edit_sparse_adding",
@@ -1020,6 +1059,23 @@ impl Surface {
                 egui::vec2(PANE_WIDTH, PANE_HEIGHT)
             }
             Surface::EditLoginNarrow => egui::vec2(EDIT_NARROW_WIDTH, EDIT_NARROW_HEIGHT),
+            // **Taller than the shipped pane, for `EditWebsites`' stated
+            // reason**: the list this surface exists to show sits under the
+            // password box on the SECOND card, and at the pane's own 740 it is
+            // below the fold. The width is the real one, which is the axis the
+            // layout can get wrong.
+            Surface::EditLoginHistory => egui::vec2(PANE_WIDTH, 1000.0),
+            // A card has six rows that carry a Remove and three that do not,
+            // and the whole point of the shot is the nine of them in one
+            // column -- so it gets the height that holds them rather than the
+            // pane's, for `EditWebsites`' reason.
+            Surface::EditCard => egui::vec2(PANE_WIDTH, 1100.0),
+            // The narrow arm at the window floor's real width. Taller than the
+            // floor's 600 on purpose: stacked, every row costs a caption line
+            // as well as a box, so the pane the app ships SCROLLS here -- and
+            // a screenshot of the top third of a scrolled form shows two rows
+            // and answers nothing about the other seven.
+            Surface::EditCardNarrow => egui::vec2(EDIT_NARROW_WIDTH, 1300.0),
             Surface::EditWebsites => egui::vec2(PANE_WIDTH, 1180.0),
             // The shipped pane's own size, and that is the point of these
             // two: a sparse identity FITS it, which the eighteen-row form it
@@ -1233,6 +1289,9 @@ fn main() -> eframe::Result {
             Surface::EditLogin,
             Surface::EditLoginDirty,
             Surface::EditLoginNarrow,
+            Surface::EditLoginHistory,
+            Surface::EditCard,
+            Surface::EditCardNarrow,
             Surface::EditWebsites,
             Surface::EditSparse,
         ]
@@ -1604,6 +1663,10 @@ impl eframe::App for Preview {
                 self.draw_pane(root, PaneKind::EditLogin(false))
             }
             Surface::EditLoginDirty => self.draw_pane(root, PaneKind::EditLogin(true)),
+            Surface::EditLoginHistory => self.draw_pane(root, PaneKind::EditLoginHistory),
+            Surface::EditCard | Surface::EditCardNarrow => {
+                self.draw_pane(root, PaneKind::EditCard)
+            }
             Surface::EditWebsites => self.draw_pane(root, PaneKind::EditWebsites),
             Surface::EditSparse => self.draw_pane(root, PaneKind::EditSparse(false)),
             Surface::EditSparseAdding => self.draw_pane(root, PaneKind::EditSparse(true)),
@@ -1721,6 +1784,15 @@ enum PaneKind {
     /// `PaneKind::TotpForm`'s note, and the `--all` walk that shares one
     /// `Fixtures`.
     EditLogin(bool),
+    /// The same form with its password-history list open -- see
+    /// [`Surface::EditLoginHistory`]. A third draft rather than a flag on the
+    /// clean one, for `EditLogin`'s stated reason: the `--all` walk shares one
+    /// `Fixtures`, and a disclosure opened for this shot would decide what
+    /// `edit_login` looked like if it happened to run after it.
+    EditLoginHistory,
+    /// The edit form of a CARD, which is the kind with six removable rows on
+    /// it -- see [`Surface::EditCard`].
+    EditCard,
     /// The edit form of a login carrying several websites.
     EditWebsites,
     /// The edit form of a sparse identity, with the Add menu open or shut.
@@ -2779,6 +2851,37 @@ impl Preview {
                         &fixtures.totp,
                     );
                 }
+                PaneKind::EditLoginHistory => {
+                    // **Set, never toggled**, for the reason
+                    // `PaneKind::EditSparse` sets its own menu that way: one
+                    // `Fixtures` is shared by the whole `--all` walk, and a
+                    // disclosure left open would change whichever surface ran
+                    // next.
+                    fixtures.history_draft.history_open = true;
+                    let _ = detail_edit::draw_detail_edit(
+                        ui,
+                        &mut fixtures.history_draft,
+                        &fixtures.folders,
+                        false,
+                        &mut fixtures.apps,
+                        Some(&fixtures.edit_login),
+                        &fixtures.totp,
+                    );
+                }
+                PaneKind::EditCard => {
+                    let _ = detail_edit::draw_detail_edit(
+                        ui,
+                        &mut fixtures.card_draft,
+                        &fixtures.folders,
+                        // An EDIT, not a create: a create hides nothing and so
+                        // draws no Remove at all, which is the one thing this
+                        // surface exists to show.
+                        false,
+                        &mut fixtures.apps,
+                        Some(&fixtures.card),
+                        &TotpState::NoSecret,
+                    );
+                }
                 PaneKind::EditWebsites => {
                     let _ = detail_edit::draw_detail_edit(
                         ui,
@@ -2870,6 +2973,11 @@ struct Fixtures {
     /// The same draft with two edits in it, so the dirty state has something
     /// to report. See [`Surface::EditLoginDirty`].
     dirty_draft: EditDraft,
+    /// A THIRD draft off the same item, opened only so its password-history
+    /// list can be left open -- see [`Surface::EditLoginHistory`].
+    history_draft: EditDraft,
+    /// The card fixture opened for editing -- see [`Surface::EditCard`].
+    card_draft: EditDraft,
     /// The item behind [`Self::clean_draft`] and [`Self::dirty_draft`], kept
     /// because `draw_detail_edit` takes the item as well as the draft -- the
     /// keystroke palette and its preview are resolved against it.
@@ -2977,6 +3085,32 @@ impl Fixtures {
         assert!(
             dirty_draft.is_dirty(),
             "the dirty shot's draft reads clean, so it is a second picture of the pristine form"
+        );
+        // The history shot's own draft. The LIST comes off the item rather
+        // than off the draft -- the form never edits it -- so what this third
+        // draft is for is the disclosure flag, and it exists rather than being
+        // flipped on `clean_draft` for the reason above: one `Fixtures`, one
+        // `--all` walk, and a flag left set decides the next surface.
+        let history_draft = EditDraft::from_item(&edit_login);
+        assert_eq!(
+            detail::password_history_dates(&edit_login).len(),
+            3,
+            "the 8a fixture lost its password history, so the history shot is a picture of a \
+             card with no control on it"
+        );
+        // The card fixture opened for editing. Checked for its Removes rather
+        // than for its rows: a card whose optional fields were all empty would
+        // draw them behind the Add control instead, and the shot would be a
+        // picture of the one thing it is not about.
+        let card_draft = EditDraft::from_item(&card);
+        assert_eq!(
+            card_draft
+                .shown_slots(false)
+                .iter()
+                .filter(|slot| !slot.always_shown())
+                .count(),
+            4,
+            "the card shot is not showing the removable rows it exists for"
         );
         // The same account reached three ways, which is the ordinary shape of
         // a multi-URI login and not a contrived one: the app, the SSO host it
@@ -3174,6 +3308,8 @@ impl Fixtures {
             edit_login,
             clean_draft,
             dirty_draft,
+            history_draft,
+            card_draft,
             websites_login,
             websites_draft,
             sparse_identity,
@@ -3566,6 +3702,21 @@ const LOGIN_JSON: &str = r#"{
 /// 8a's other two native targets are deliberately absent: `AppMatchDraft`
 /// models exactly one app per record, in a single JSON field, and a fixture
 /// carrying three would be a picture of a feature that does not exist.
+///
+/// **And three previous passwords**, because 8a's credentials card says
+/// `Password history (3)` and there was no fixture in this file carrying a
+/// `passwordHistory` at all -- not for this form and not for the read pane,
+/// which has drawn the same array since it learned to. The three are
+/// deliberately unlike each other: a recent one, one a year back, and one with
+/// **no `lastUsedDate`**, which is the case `detail::history_label` falls back
+/// to `Earlier` for and which nothing in this directory pictured.
+///
+/// **These two dates drift**, and the shot has to be read knowing it. The
+/// wording comes from `relative_time::ago`, which is relative to
+/// `SystemTime::now()`, so `3d` reads `9d` a week later; there is no fixed
+/// clock to pass it the way `PREVIEW_UNIX` is passed to the one-time-code
+/// card. What does not drift is everything the shot is FOR -- the count in the
+/// caption, the row rhythm, the mask, and where the list sits on the card.
 const EDIT_LOGIN_JSON: &str = r#"{
   "id": "6f1c2f5e-0000-4a10-9c31-2b7a51d0a002",
   "type": 1,
@@ -3583,6 +3734,11 @@ const EDIT_LOGIN_JSON: &str = r#"{
     { "name": "Client ID", "value": "LGL-4471", "type": 0 },
     { "name": "Security PIN", "value": "419077", "type": 1 },
     { "name": "deskwarden:app-match", "value": "{\"process\":\"ledgerline.exe\",\"trigger\":\"auto\"}", "type": 0 }
+  ],
+  "passwordHistory": [
+    { "password": "correct-horse-battery-staple-6", "lastUsedDate": "2026-09-08T09:12:00.000Z" },
+    { "password": "Tr0ub4dor&3", "lastUsedDate": "2025-06-02T17:41:00.000Z" },
+    { "password": "ledgerline2024" }
   ]
 }"#;
 
