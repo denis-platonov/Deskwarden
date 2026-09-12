@@ -595,9 +595,23 @@ const CHECK_GREEN: Color32 = Color32::from_rgb(0x1b, 0x7a, 0x3f);
 /// The design's near-white on the dark transcript panel.
 const PANEL_TEXT: Color32 = Color32::from_rgb(0xf7, 0xf6, 0xf5);
 
-/// 4d's refusal band, which is 4e's one red and appears nowhere else here.
-const BAND_FILL: Color32 = Color32::from_rgb(0xfd, 0xf3, 0xf2);
-const BAND_EDGE: Color32 = Color32::from_rgb(0xe8, 0xa9, 0xa2);
+/// 4d's refusal band, which is 4e's one red.
+///
+/// **The palette's own entries, not a third copy of the hexes.** These were
+/// `#fdf3f2` and `#e8a9a2` written out here, and they are `theme::DANGER_WASH`
+/// and `theme::DANGER_EDGE` to the byte -- one of three files that each named
+/// the same red privately, which does not stop a fourth surface reaching for
+/// red and only stops anyone noticing when one of them gets it wrong.
+///
+/// **NOT `theme::secret_band()`**, and that is the whole reason these are
+/// still named here rather than being one call. That helper carries 4e's rule
+/// about SECRETS with it, and this band is not one: it is 4d's refusal -- the
+/// rehearsal saying it will not type something -- which happens to be drawn
+/// in the same red. A band that took the secret primitive would be claiming a
+/// meaning this card does not have, and the primitive's own doc says so.
+const BAND_FILL: Color32 = theme::DANGER_WASH;
+/// See [`BAND_FILL`].
+const BAND_EDGE: Color32 = theme::DANGER_EDGE;
 
 /// **Everything the rehearsal surface draws, as data.**
 ///
