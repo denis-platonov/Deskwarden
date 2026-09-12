@@ -6323,6 +6323,30 @@ pub fn build_frame_with_search(
             }
             let mut close = false;
             match totp_add::draw_add_modal(ui.ctx(), state, now_unix) {
+                // **The live code on to the clipboard**, under the same timer
+                // every other secret this window copies gets. The owner: "most
+                // of the MFA require copy-paste it first before applying".
+                //
+                // The value is asked of `totp_add::code_to_copy` with THIS
+                // frame's `now_unix` -- the same argument the panel was drawn
+                // with -- so what lands on the clipboard is the code that was
+                // on screen when it was clicked, and not one recomputed a
+                // moment later across a period boundary. It is a `Zeroizing`
+                // from the moment it exists and is never named by the action
+                // that asked for it.
+                totp_add::TotpAddAction::CopyCode => {
+                    match totp_add::code_to_copy(state, now_unix) {
+                        Some(code) => crate::clipboard::copy_secret(&code),
+                        // Unreachable from the card, which draws no strip to
+                        // click when the field does not read as a code. A
+                        // warning rather than a silent drop, so a strip drawn
+                        // somewhere that CAN be codeless says so in the log.
+                        None => log::warn!(
+                            "the add-a-code card asked to copy a code it has no reading for; \
+                             the click was dropped"
+                        ),
+                    }
+                }
                 totp_add::TotpAddAction::Save => {
                     // Re-resolved by id, for the record composer's reason: the
                     // vault may have been re-read between the open and this

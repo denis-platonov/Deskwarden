@@ -68,6 +68,7 @@ use crate::screen_capture::CaptureRefusal;
 use crate::theme;
 use crate::webcam::{CameraRefusal, Session, WebcamSeams};
 use eframe::egui::{self, CornerRadius};
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 // The 26px button height this form used to declare is gone with the two bare
@@ -1461,6 +1462,23 @@ pub fn uri_to_write(state: &TotpAdd) -> Option<Zeroizing<String>> {
     }
 }
 
+/// **The code on screen right now**, for the caller to put on the clipboard.
+///
+/// Derived from the same reading and the same clock the panel draws from, so
+/// what is copied is what is shown rather than a second answer computed a
+/// moment later -- a code that rolled between the click and the copy would be
+/// the one defect this is most likely to have, and asking one function twice
+/// with the same `now_unix` is what rules it out.
+///
+/// `None` whenever the field does not read as a code, which is every state in
+/// which there is no panel on screen to click.
+pub fn code_to_copy(state: &TotpAdd, now_unix: u64) -> Option<Zeroizing<String>> {
+    match read_field(&state.typed, state.digits, state.period) {
+        Reading::Ok(auth) => code_at(&auth, now_unix),
+        Reading::Empty | Reading::Refused(_) => None,
+    }
+}
+
 /// Whether the submit button may be pressed at all.
 pub fn can_save(reading: &Reading) -> bool {
     matches!(reading, Reading::Ok(_))
@@ -1503,6 +1521,13 @@ pub struct TotpAdd {
     pub typed: Zeroizing<String>,
     /// The digits control. [`DEFAULT_DIGITS`] until the user says otherwise.
     pub digits: u8,
+    /// When the live code was last copied off the strip, for the word the
+    /// strip's hover text shows. See [`CODE_COPIED_HINT`].
+    ///
+    /// **In memory and nowhere near the item.** It is a fact about a click in
+    /// this form's lifetime; nothing is written, nothing is read back, and the
+    /// form is dropped when the card closes.
+    pub code_copied_at: Option<Instant>,
     /// The period control. [`DEFAULT_PERIOD`] until the user says otherwise.
     pub period: u16,
     /// Whether the secret row is unmasked. **Starts `false`** and is never
@@ -1549,6 +1574,7 @@ impl TotpAdd {
             already_has_code,
             typed: Zeroizing::new(String::new()),
             digits: DEFAULT_DIGITS,
+            code_copied_at: None,
             period: DEFAULT_PERIOD,
             revealed: false,
             stage: Stage::Picker,
@@ -1718,6 +1744,21 @@ pub enum TotpAddAction {
     /// row on it. The seam has to arrive from the caller for the same
     /// reason it exists at all.
     UseCamera(usize),
+    /// **Put the live six-digit code on the clipboard.**
+    ///
+    /// The owner: "make 6 digit code clickable and copiable - most of the MFA
+    /// require copy-paste it first before applying". The card that confirms a
+    /// code is exactly where that need lands -- the site asking for the code
+    /// is usually still open behind this modal, and the alternative is reading
+    /// six digits off one window and typing them into another before they
+    /// expire.
+    ///
+    /// **Carries nothing**, for [`Self::Save`]'s reason: the value is a
+    /// credential, and routing it through this `Copy` enum would give the
+    /// plaintext a second, non-zeroizing home. The caller asks
+    /// [`code_to_copy`] for it, which answers a `Zeroizing` and is the same
+    /// function the panel drew from.
+    CopyCode,
 }
 
 // ---------------------------------------------------------------------------
@@ -2983,6 +3024,9 @@ struct FooterPress {
 /// something this app has anywhere.
 pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> TotpAddAction {
     let mut action = TotpAddAction::None;
+    // Set by the live-code strip deep inside the body, and read after the
+    // card, for `back_to_picker`'s reason: `state` is borrowed in there.
+    let mut copy_asked = false;
     // Deferred to after the card, because `state` is borrowed inside it and
     // `back_to_picker` replaces the very `Zeroizing` the field is editing.
     let mut back_to_picker = false;
@@ -3114,7 +3158,13 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
                         }
 
                         if let Reading::Ok(auth) = &reading {
-                            draw_confirmation(ui, auth, state, now_unix);
+                            // The one thing this body reports: a press on the
+                            // live code. Everything else it draws is a
+                            // control the form owns.
+                            copy_asked |= matches!(
+                                draw_confirmation(ui, auth, state, now_unix),
+                                TotpAddAction::CopyCode
+                            );
                         }
                         reading
                     })
@@ -3150,6 +3200,14 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
     });
     if back_to_picker {
         state.back_to_picker();
+    }
+    // **A press on the live code cannot outrank a press on a button.** Save,
+    // Cancel and Back all end the form; a copy leaves it exactly where it was.
+    // A frame that somehow carried both is one in which the form is closing,
+    // and a clipboard write on the way out is a write the user cannot see the
+    // result of.
+    if copy_asked && action == TotpAddAction::None {
+        action = TotpAddAction::CopyCode;
     }
     action
 }
@@ -4528,7 +4586,12 @@ const PARAM_CHIP_GAP: f32 = 7.0;
 /// this and is not drawn here anyway (see [`draw_add_form`]). It is a warning
 /// about what saving will destroy, not a field restating an input, and 6d's
 /// mockup simply has no record behind it with a code to lose.
-fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now_unix: u64) {
+fn draw_confirmation(
+    ui: &mut egui::Ui,
+    auth: &OtpAuth,
+    state: &mut TotpAdd,
+    now_unix: u64,
+) -> TotpAddAction {
     // Read out before `state` is lent to the table below.
     let scanned = state.scanned;
 
@@ -4547,8 +4610,18 @@ fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now
     // The live code first: it is what the user is here to compare, and a
     // confirmation that buries it under four label rows is a confirmation
     // nobody makes. On the typed path it is the only thing here.
+    let mut action = TotpAddAction::None;
     if let Some(code) = code_at(auth, now_unix) {
-        draw_code_panel(ui, auth, &code, now_unix);
+        let copied = still_copied(state.code_copied_at, Instant::now());
+        if draw_code_panel(ui, auth, &code, now_unix, copied) {
+            // The moment is recorded here and the COPY is done by the caller
+            // -- see `TotpAddAction::CopyCode`. Recording it here rather than
+            // on the way back keeps the strip's wording a fact about the
+            // click, which is what the user just made, rather than about a
+            // clipboard call this surface cannot see the result of.
+            state.code_copied_at = Some(Instant::now());
+            action = TotpAddAction::CopyCode;
+        }
         // **No gap is added here**, and that is the fix for "vertical
         // paddings between elements are not the same - big after 6 digits
         // code for excample".
@@ -4567,8 +4640,44 @@ fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now
     if scanned {
         draw_field_table(ui, auth, state);
     }
+    action
 }
 
+/// What the strip offers on hover, and what it says once it has been used.
+///
+/// **The confirmation is the hover text, and that is a layout decision rather
+/// than a shortcut.** The owner asked for this strip to carry the code, a bar
+/// and the seconds and nothing else -- "blue strip also should only have code
+/// and progress bar with seconds - nothing else" -- so there is no room in it
+/// for a `Copy` control or a `Copied` badge. The app's own copy toast is no
+/// use either: it is painted by the READ pane, inside the pane's rect, and
+/// this card is a modal on a layer above it, so a toast raised from here
+/// would be drawn underneath the thing the user just clicked.
+///
+/// The pointer is on the strip at the moment of the click, so the tooltip it
+/// is already showing is the one surface guaranteed to be under the user's
+/// eye. It changes word, and changes back after [`COPIED_FOR`].
+pub const CODE_COPY_HINT: &str = "Click to copy this code";
+pub const CODE_COPIED_HINT: &str = "Copied";
+
+/// How long the strip says `Copied` before going back to offering.
+///
+/// Deliberately shorter than a code's own life: a confirmation still standing
+/// when the digits underneath it have rolled would be telling the user that
+/// what is on their clipboard is what is on their screen, which by then is not
+/// true. `clipboard::DEFAULT_CLEAR_AFTER` is the other bound and is far longer
+/// than this one -- what this word reports is the click, not the clipboard.
+const COPIED_FOR: Duration = Duration::from_secs(3);
+
+/// Whether the strip should still be saying [`CODE_COPIED_HINT`].
+///
+/// A pure function of the two, so the wording is decided somewhere a test can
+/// reach rather than inside a frame.
+pub fn still_copied(copied_at: Option<Instant>, now: Instant) -> bool {
+    copied_at.is_some_and(|at| now.duration_since(at) < COPIED_FOR)
+}
+
+/// Draws the strip, and answers whether it was clicked.
 /// **The live-code strip, and there is one of it.**
 ///
 /// The code, a `flex: 1` track and the seconds. Nothing else, on either card.
@@ -4590,8 +4699,14 @@ fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now
 ///
 /// The gap between the code and the track, and again between the track and
 /// the seconds, is §6d's `gap: 14px`; the padding is its `12px 14px`.
-fn draw_code_panel(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) {
-    egui::Frame::new()
+fn draw_code_panel(
+    ui: &mut egui::Ui,
+    auth: &OtpAuth,
+    code: &str,
+    now_unix: u64,
+    copied: bool,
+) -> bool {
+    let framed = egui::Frame::new()
         .fill(theme::BLUE_WASH)
         .stroke(egui::Stroke::new(1.0, theme::BLUE_EDGE))
         .corner_radius(CornerRadius::same(CODE_PANEL_RADIUS))
@@ -4639,6 +4754,22 @@ fn draw_code_panel(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64)
                 );
             });
         });
+    // **The whole strip is the target, not the digits alone.**
+    //
+    // Six characters at 22 points is a small thing to hit, and the user's own
+    // rule for the read pane's rows was that a click anywhere in the tile
+    // copies the value. The same rule here costs nothing: there is no other
+    // control inside this strip to steal a press from, which is the one thing
+    // that made that rule need arguing on the rows.
+    let hit = ui.interact(
+        framed.response.rect,
+        ui.id().with("totp-code-copy"),
+        egui::Sense::click(),
+    );
+    if hit.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    hit.on_hover_text(if copied { CODE_COPIED_HINT } else { CODE_COPY_HINT }).clicked()
 }
 
 /// The line box the live code is set in: the monospace face's ascent at
@@ -6935,6 +7066,141 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // The live code, pressed
+    // -----------------------------------------------------------------
+
+    /// **`Copied` is a word about a click, and it does not outstay the code
+    /// it is about.**
+    #[test]
+    fn the_strip_says_copied_for_a_while_and_then_offers_again() {
+        let now = Instant::now();
+        assert!(!still_copied(None, now), "an untouched strip claims a copy");
+        assert!(still_copied(Some(now), now), "the click itself is not reported");
+        assert!(still_copied(Some(now), now + Duration::from_secs(1)));
+        assert!(
+            !still_copied(Some(now), now + COPIED_FOR),
+            "the word outstays its own window"
+        );
+        assert!(
+            COPIED_FOR < Duration::from_secs(30),
+            "the confirmation can outlive the code it is about, so it would be telling the \
+             user that what is on their clipboard is what is on their screen when it is not"
+        );
+    }
+
+    /// **What is copied is what was drawn**, asked with the same clock.
+    #[test]
+    fn the_code_offered_to_the_clipboard_is_the_one_on_the_strip() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.accept_decoded(Zeroizing::new(
+            "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP".to_string(),
+        ));
+        let auth = match read_field(&state.typed, state.digits, state.period) {
+            Reading::Ok(auth) => auth,
+            // `Reading` has no `Debug`, and deliberately: it carries a
+            // decoded payload. So the failure names the fixture rather
+            // than printing what was read out of it.
+            _ => panic!("the fixture no longer reads as a code"),
+        };
+        let drawn = code_at(&auth, BOUNDARY).expect("the strip has a code to draw");
+        let copied = code_to_copy(&state, BOUNDARY).expect("and one to copy");
+        assert_eq!(*copied, *drawn, "the clipboard would get a different code");
+
+        // And a field that is not a code offers nothing -- which is every
+        // state in which there is no strip on screen to press.
+        let mut empty = TotpAdd::opening("id-1", "Git Host", false);
+        assert!(code_to_copy(&empty, BOUNDARY).is_none());
+        empty.typed = Zeroizing::new("https://example.com".to_string());
+        assert!(code_to_copy(&empty, BOUNDARY).is_none());
+    }
+
+    /// **The strip is pressed, not called**: laid out through the by-hand
+    /// card's own harness, found by the fill the design gives it, clicked
+    /// where it really is, and the action read back.
+    ///
+    /// The whole strip is the target and this presses its CENTRE, which is the
+    /// countdown track rather than the digits -- so it also asserts the half
+    /// of the decision that says the tile copies, not the six characters.
+    ///
+    /// It lives beside the other by-hand tests rather than in a harness of its
+    /// own for the reason `Manual` exists: a card laid out in a viewport too
+    /// small for it has its lower half culled, and a press that lands on
+    /// nothing is indistinguishable from a control that does not sense.
+    #[test]
+    fn pressing_the_live_code_asks_for_a_copy() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.accept_decoded(Zeroizing::new(
+            "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP".to_string(),
+        ));
+        let manual = Manual::new();
+        let laid_out = manual.idle(&mut state);
+        assert_eq!(
+            laid_out.action,
+            TotpAddAction::None,
+            "the card reported a press with no input"
+        );
+        // **The WIDEST wash**, because the segmented runs on this card wear
+        // the same fill: the digits and the period each paint a lit cell in
+        // it, and either of those is a control that would swallow a press and
+        // make this test pass for the wrong reason. The strip spans the card.
+        let strip = laid_out
+            .rects
+            .iter()
+            .filter(|r| r.fill == theme::BLUE_WASH)
+            .max_by(|a, b| a.rect.width().total_cmp(&b.rect.width()))
+            .copied()
+            .unwrap_or_else(|| panic!("the live-code strip was not painted"));
+        assert!(
+            strip.rect.width() > 300.0,
+            "the widest wash on this card is {:?}, which is a segmented cell rather than the              strip -- the strip is gone, or it no longer spans the body",
+            strip.rect
+        );
+
+        assert!(state.code_copied_at.is_none(), "the form opened claiming a copy");
+        let pressed = manual.click(&mut state, strip.rect.center());
+        assert_eq!(
+            pressed.action,
+            TotpAddAction::CopyCode,
+            "pressing the live code reported nothing -- either the strip senses no click or \
+             the report is swallowed on the way out of the body"
+        );
+        assert!(
+            still_copied(state.code_copied_at, Instant::now()),
+            "the strip does not say it was copied, so the click has no confirmation at all"
+        );
+
+        // And a press somewhere the strip is not reports nothing, so the
+        // assertion above is about the strip rather than about any click.
+        let mut elsewhere = TotpAdd::opening("id-2", "Git Host", false);
+        elsewhere.accept_decoded(Zeroizing::new(
+            "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP".to_string(),
+        ));
+        let idle = manual.idle(&mut elsewhere);
+        let above = egui::pos2(strip.rect.center().x, idle.rects[0].rect.top() - 20.0);
+        assert_eq!(
+            manual.click(&mut elsewhere, above).action,
+            TotpAddAction::None,
+            "a press outside the card reported a copy"
+        );
+    }
+
+    /// **A copy never travels with an answer that closes the form.**
+    ///
+    /// Read off the source, because producing the collision through a frame
+    /// would mean pressing two controls at once. What it pins is the order:
+    /// the copy is only adopted when nothing else was reported.
+    #[test]
+    fn a_copy_cannot_outrank_save_or_cancel() {
+        let source = include_str!("totp_add.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            code.contains("if copy_asked && action == TotpAddAction::None {"),
+            "the live code's press is adopted without checking what else the frame reported, \
+             so a frame that also pressed Save would copy on the way out"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // The picker as a surface -- pressed, not called
     // -----------------------------------------------------------------
 
@@ -7885,8 +8151,6 @@ mod tests {
     ///
     /// Read through `draw_add_modal` and not `draw_stage`, because the scrim
     /// is the modal's and a stage drawn on its own has none -- and the scrim
-    /// is half of what "nothing" has to mean here.
-    #[test]
       /// **The scan says it is working, and says nothing it cannot keep.**
     ///
     /// This test has been both ways round and the history is the point. It

@@ -1226,6 +1226,21 @@ struct Inner {
     open: bool,
     /// How far the whole-screen scan has got. See [`Prescan`].
     prescan: Prescan,
+    /// Whether the tail has already been logged, so it is logged once per
+    /// overlay rather than once per frame.
+    registered: bool,
+    /// When the prescan's worker finished, so the frames after it can be
+    /// measured against it.
+    ///
+    /// **The tail is the part the owner can still feel**: "it is still lagging
+    /// in the end". The worker itself is a few hundred milliseconds and says
+    /// so in the log; what follows is the frame that registers the viewport
+    /// (which is also the frame that uploads a 29 MB texture) and then
+    /// `eframe` building a full-screen window and its GL surface. Both are on
+    /// the event-loop thread by construction and neither can be moved off it,
+    /// so the only way to make the wait smaller is to know which of the two it
+    /// is -- which is what this measures.
+    answered: Option<Instant>,
     /// Whether the vault window is currently masked out of screen captures.
     /// The flag rather than a second call: `SetWindowDisplayAffinity` is an
     /// OS call, and this is what makes masking and unmasking idempotent and
@@ -1717,6 +1732,8 @@ impl RegionOverlay {
                 hwnd: None,
                 cloaked: false,
                 picture: None,
+                answered: None,
+                registered: false,
             })),
         })
     }
@@ -2636,7 +2653,10 @@ impl RegionOverlay {
                     // answer in hand" true rather than hopeful: every frame
                     // between the start and this line reads `Running` and
                     // returns.
-                    locked(&mine.inner).prescan = Prescan::Done;
+                    let mut held = locked(&mine.inner);
+                    held.prescan = Prescan::Done;
+                    held.answered = Some(Instant::now());
+                    drop(held);
                     // Nothing else is going to ask. The vault window is
                     // painting the waiting card on a repaint the bar asks for
                     // itself, but that is the CARD's clock, not this one's,
@@ -2700,6 +2720,27 @@ impl RegionOverlay {
         // moment the pointer paused, and the badge would then be stale for as
         // long as the user held still.
         ctx.request_repaint_of(region_viewport());
+
+        // **The first frame that registers the viewport, timed against the
+        // worker.** See `Inner::answered`: everything from here on is on the
+        // event-loop thread and cannot be moved off it, so the only useful
+        // thing to know is how it divides. This line closes the gap between
+        // the worker's own line and the `cloaked` line that follows -- the
+        // one the owner can still feel as a lag.
+        {
+            let mut held = locked(&self.inner);
+            if !held.registered {
+                held.registered = true;
+                if let Some(answered) = held.answered {
+                    log::info!(
+                        "region overlay: the viewport is registered {} ms after the prescan \
+                         answered; the window and its surface are built by `eframe` at the end \
+                         of this frame, and the `cloaked` line below closes the tail",
+                        answered.elapsed().as_millis()
+                    );
+                }
+            }
+        }
 
         let mine = self.clone();
         ctx.show_viewport_deferred(
