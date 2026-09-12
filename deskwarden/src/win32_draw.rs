@@ -10,14 +10,18 @@
 //! egui reads, so a theme change moves both renderers at once.
 
 use crate::app_candidates::Candidate;
+use std::ffi::c_void;
+use std::sync::OnceLock;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, GetStockObject,
-    GetTextExtentPoint32W, HBRUSH, NULL_BRUSH, Polygon, Polyline, RoundRect,
+    AddFontMemResourceEx, CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteObject,
+    DrawTextW, Ellipse, GetCurrentObject, GetObjectW, GetStockObject,
+    GetTextExtentPoint32W, HBRUSH, HGDIOBJ, NULL_BRUSH, Polygon, Polyline, RoundRect,
     ScreenToClient, SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, DRAW_TEXT_FORMAT,
     DT_CENTER,
     DT_END_ELLIPSIS,
-    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, PS_SOLID,
+    DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HDC, HFONT, LOGFONTW,
+    OBJ_FONT, PS_SOLID,
     TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{HTCAPTION, HTCLIENT};
@@ -29,6 +33,367 @@ use windows::Win32::UI::WindowsAndMessaging::{HTCAPTION, HTCLIENT};
 /// `win32` module, which had the only copy.
 pub(crate) fn rgb(c: eframe::egui::Color32) -> COLORREF {
     COLORREF((c.r() as u32) | ((c.g() as u32) << 8) | ((c.b() as u32) << 16))
+}
+
+// ---------------------------------------------------------------------------
+// Cyrillic on the GDI cards.
+//
+// **The defect.** A vault item called "Сбербанк" rendered on one of these
+// cards in a visibly different typeface from "Netflix" beside it. The reason
+// is not subtle once stated: all four bundled Archivo cuts carry **zero**
+// codepoints in U+0400-04FF, so there is nothing for GDI to rasterise. GDI
+// does not draw blanks -- it font-links the uncovered run to whatever the
+// system offers for that script, which on a stock Windows 11 is Segoe UI. So
+// the card drew Latin in Archivo and Cyrillic in Segoe UI, in the same line,
+// and the mismatch is exactly what the owner reported.
+//
+// **egui already solved this, and the fix here is to agree with it.**
+// `theme::CYRILLIC_FACES` bundles four Noto Sans *Cyrillic-subset* faces, one
+// per Archivo cut, and `theme::font_definitions` puts each one directly behind
+// its Archivo cut in that weight's family stack. Every egui surface in the app
+// therefore draws Cyrillic in Noto Sans at the weight the design asked for.
+// These cards were the only surfaces left with a second answer.
+//
+// **`lfCharSet` is NOT the cause, and is deliberately left alone.** Every
+// `LOGFONTW` on these cards leaves `lfCharSet` at its `Default` of 0, which is
+// `ANSI_CHARSET` rather than `DEFAULT_CHARSET` (1), and that looks like a
+// smoking gun until the fonts are actually read. The GDI font mapper's charset
+// penalty is levied against a face whose OS/2 `ulCodePageRange` does not
+// declare the requested code page; all four Archivo cuts and all four Noto
+// cuts declare bit 0 (cp1252, Latin-1), so `ANSI_CHARSET` costs nothing and
+// the exact `lfFaceName` match wins outright in both cases. Changing it would
+// be a real behaviour change for no benefit: `DEFAULT_CHARSET` tells the
+// mapper *any* charset is acceptable, which loosens matching on a machine
+// whose system locale is not Western and could quietly move a face that
+// resolves correctly today. The missing glyphs were the whole defect.
+//
+// **Why the face names here are not the ones in `theme`.** `theme`'s table
+// names the Noto faces `NotoSans-Cyrillic-Regular` and so on -- those are
+// egui's `font_data` *keys*, which are arbitrary strings egui never shows to
+// anything but itself. GDI matches on the font file's own legacy `name`
+// records (IDs 1 and 2), and those say something else entirely. Read out of
+// the files: Regular and Bold share the legacy family `Noto Sans` and are told
+// apart by weight, while SemiBold and ExtraBold each carry their own legacy
+// family and are `Regular` *within* it. That is the same four-styles-per-
+// family shape Archivo's cuts have, and for the same reason, and it is why a
+// GDI table has to exist separately from the egui one rather than reusing its
+// strings. `the_gdi_names_are_the_font_files_own_name_records` reads the
+// `name` and `OS/2` tables out of the bundled bytes and pins every row.
+// ---------------------------------------------------------------------------
+
+/// The four bundled Noto Sans Cyrillic-subset cuts, as `(theme's egui family
+/// name, GDI family name, GDI weight, bytes)` -- the same shape, and the same
+/// order, as [`crate::theme::ARCHIVO_FACES`], so a row here lines up with the
+/// Archivo row it stands behind.
+///
+/// **Why this table is in `win32_draw` and not in `theme`.** Two reasons, and
+/// the second is the one that settles it. First, `theme` is the design
+/// system's look -- what a weight *is* -- while this is how Win32's font
+/// mapper is made to resolve it; the crate already splits them that way, with
+/// `theme::gdi_face_for` as the seam. Second and decisively, `theme`'s
+/// `CYRILLIC_FACES` holds egui keys, not GDI names (see the block comment
+/// above), so there is no reading of it that this module could have reused --
+/// the GDI names had to be read out of the files whatever module they landed
+/// in.
+///
+/// **The `include_bytes!` is a second reference to the same four files, not a
+/// second copy of the design's assets.** `theme`'s table is private to that
+/// module, so its bytes cannot be reached from here, and `theme` is owned by
+/// another workstream right now. `the_cyrillic_assets_are_the_ones_theme_
+/// bundles` pins the four paths against `theme.rs`'s own source, so the two
+/// renderers cannot drift onto different files; if `CYRILLIC_FACES` is ever
+/// made `pub`, this table should keep its GDI names and take its bytes from
+/// there.
+const CYRILLIC_GDI_FACES: [(&str, &str, i32, &[u8]); 4] = [
+    (
+        crate::theme::REGULAR,
+        "Noto Sans",
+        400,
+        include_bytes!("../assets/fonts/NotoSans-Cyrillic-Regular.ttf"),
+    ),
+    (
+        crate::theme::SEMIBOLD,
+        "Noto Sans SemiBold",
+        400,
+        include_bytes!("../assets/fonts/NotoSans-Cyrillic-SemiBold.ttf"),
+    ),
+    (
+        crate::theme::BOLD,
+        "Noto Sans",
+        700,
+        include_bytes!("../assets/fonts/NotoSans-Cyrillic-Bold.ttf"),
+    ),
+    (
+        crate::theme::EXTRABOLD,
+        "Noto Sans ExtraBold",
+        400,
+        include_bytes!("../assets/fonts/NotoSans-Cyrillic-ExtraBold.ttf"),
+    ),
+];
+
+/// Registers every bundled face -- the four Archivo cuts **and** the four Noto
+/// Cyrillic cuts -- privately with GDI, once for the whole process.
+///
+/// `AddFontMemResourceEx` makes a face available to **this process only**:
+/// nothing is installed and nothing touches the user's font list. The handles
+/// are deliberately never released, because freeing one while a window still
+/// has it selected is how a surface repaints in the fallback face.
+///
+/// **This is one `OnceLock` where there were seven.** Each GDI card carried
+/// its own copy of this loop behind its own `OnceLock`, so a session that
+/// opened the picker and then the unlock prompt handed GDI a second private
+/// copy of all four Archivo cuts -- and `AddFontMemResourceEx` copies the font
+/// data into the process font table, so that is roughly 750 KB per repeat, not
+/// a refcount. Doubling the table to eight faces would have doubled the waste
+/// as well; instead the registration moved here, the cards call this, and the
+/// eight faces are installed exactly once however many cards the session
+/// opens. `crate::preflight_card` still registers Archivo itself -- it is
+/// owned by another workstream -- which costs one extra copy of the four
+/// Archivo cuts and nothing else, because it draws its text through
+/// [`draw_text`] like every other card and therefore reaches this function
+/// anyway on its first Cyrillic run.
+///
+/// **A failure here is cosmetic and must stay that way.** These cards are the
+/// app's fallback surfaces; a warn line and a card in the shell font is a bad
+/// afternoon, a card that refuses to open is a locked-out user. Nothing in
+/// this function can fail loudly.
+pub fn register_fonts() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        for (_, face, _, bytes) in crate::theme::ARCHIVO_FACES {
+            register_one(face, bytes);
+        }
+        for (_, face, _, bytes) in CYRILLIC_GDI_FACES {
+            register_one(face, bytes);
+        }
+    });
+}
+
+/// One `AddFontMemResourceEx`, so [`register_fonts`] does not spell the call
+/// out twice and the two tables cannot be registered on subtly different
+/// terms.
+fn register_one(face: &str, bytes: &'static [u8]) {
+    // A `Cell` rather than a `mut` local: GDI writes the count back through a
+    // `*const u32`, so a plain immutable binding read afterwards is a value
+    // the compiler may fold to its initialiser.
+    let installed = std::cell::Cell::new(0u32);
+    let handle = unsafe {
+        AddFontMemResourceEx(
+            bytes.as_ptr() as *const c_void,
+            bytes.len() as u32,
+            None,
+            installed.as_ptr(),
+        )
+    };
+    if handle.0.is_null() || installed.get() == 0 {
+        log::warn!("could not register the bundled face {face} with GDI; text set in it will fall back to whatever the system offers");
+    }
+}
+
+/// Every codepoint the bundled Noto Cyrillic subset can actually draw.
+///
+/// **This is the whole of it -- 104 usable codepoints.** The subset is 15 KB
+/// per weight precisely because it was cut down to Cyrillic and nothing else:
+/// `U+0400`-`U+045F` entire, the four Ukrainian/Kazakh letters `Ґґ` and `Ұұ`,
+/// the space, the no-break space, the combining acute, and `№`. It carries
+/// **no Latin letter, no digit, and no ASCII punctuation at all** -- no comma,
+/// no full stop, no hyphen, no parenthesis. (`U+0000` and `U+000D` are in the
+/// file's `cmap` too and are left out here on purpose: they are the notdef
+/// mapping and a control character, not text, and a run made of them is not a
+/// run this face should be chosen for.)
+///
+/// That emptiness is the entire reason [`gdi_face_for_text`] is conservative
+/// rather than clever, and
+/// `the_coverage_table_is_the_bundled_subsets_own_cmap` reads the `cmap` out
+/// of the shipped bytes and pins this function against it, so a future
+/// re-subset cannot silently widen or narrow what the app believes it can
+/// draw.
+const fn cyrillic_subset_covers(unit: u16) -> bool {
+    matches!(
+        unit,
+        0x0020 | 0x00A0 | 0x0301 | 0x2116 | 0x0400..=0x045F | 0x0490 | 0x0491 | 0x04B0 | 0x04B1
+    )
+}
+
+/// Whether `unit` is one of the Cyrillic **letters** the subset draws, as
+/// opposed to the space, the no-break space or `№`, which it also draws.
+///
+/// Separate from [`cyrillic_subset_covers`] because "every character is
+/// coverable" is not on its own a reason to switch face: a run of two spaces
+/// is fully covered and must keep Archivo, or a blank label would change
+/// width for no visible reason.
+const fn is_cyrillic_letter(unit: u16) -> bool {
+    matches!(unit, 0x0400..=0x045F | 0x0490 | 0x0491 | 0x04B0 | 0x04B1)
+}
+
+/// **Should this run be drawn in the Cyrillic face?** True only when every
+/// code unit is one the subset covers *and* at least one of them is a Cyrillic
+/// letter.
+///
+/// **The mixed-script decision, and the argument for it.** `DrawTextW` takes
+/// one font per call, so a per-*script-run* answer would mean splitting the
+/// string, measuring each piece with `GetTextExtentPoint32W` and advancing the
+/// rect by hand. That is not a tuning knob, it is a different text engine:
+/// `DT_END_ELLIPSIS` truncates against the rect it is given and would then be
+/// truncating each fragment rather than the line, `DT_CENTER` and `DT_VCENTER`
+/// would centre each fragment in the whole rect, and the crate's one-and-only
+/// `DrawTextW` -- the pin that exists because an empty run through the raw
+/// call kills the daemon in its window procedure with no log line -- would
+/// have to become a loop. On the app's crash-fallback surfaces that is a bad
+/// trade.
+///
+/// **So the answer is per string, and it is "all or nothing" rather than
+/// "mostly Cyrillic".** The reason is [`cyrillic_subset_covers`]: the bundled
+/// face has no Latin, no digits and no punctuation, so choosing it for
+/// "Netflix RU — Иван" would put *seventeen* characters into GDI's fallback to
+/// rescue four, and "Почта 2" would lose the digit that distinguishes it from
+/// "Почта". A rule that fires only on a fully covered run cannot make any
+/// string worse than it is today: either every character is drawn in Noto at
+/// the right weight, or nothing changes and the run is drawn exactly as it was
+/// before this function existed.
+///
+/// The practical reach is still most of the defect. "Сбербанк", "Почта",
+/// "Госуслуги", "Яндекс" -- the single-word item names, usernames and folder
+/// names that made the owner's report -- are all fully covered, and so is a
+/// multi-word Cyrillic name, because the space is in the subset.
+fn run_takes_the_cyrillic_face(units: impl Iterator<Item = u16>) -> bool {
+    let mut saw_a_letter = false;
+    for unit in units {
+        if !cyrillic_subset_covers(unit) {
+            return false;
+        }
+        saw_a_letter |= is_cyrillic_letter(unit);
+    }
+    saw_a_letter
+}
+
+/// **The `(GDI family, GDI weight)` to draw `run` in, at the design weight
+/// `family`.** [`crate::theme::gdi_face_for`] with the script taken into
+/// account.
+///
+/// This is the pure, testable core of the fix, and the function to reach for
+/// from any surface that builds its own `LOGFONTW` up front rather than
+/// letting [`draw_text`] swap for it.
+///
+/// **It falls back to Archivo rather than failing, twice over**: an unknown
+/// `family` and a run this face cannot draw both land on exactly what
+/// `theme::gdi_face_for` would have returned. That is the same promise
+/// `gdi_face_for`'s own doc makes and for the same reason -- a prompt in the
+/// wrong face is a cosmetic defect, and these are the surfaces whose whole
+/// reason for existing is that they must open when the heavier machinery
+/// cannot.
+pub fn gdi_face_for_text(family: &str, run: &str) -> (&'static str, i32) {
+    let archivo = crate::theme::gdi_face_for(family);
+    if !run_takes_the_cyrillic_face(run.encode_utf16()) {
+        return archivo;
+    }
+    CYRILLIC_GDI_FACES
+        .iter()
+        .find(|(egui_family, ..)| *egui_family == family)
+        .map(|(_, gdi, weight, _)| (*gdi, *weight))
+        .unwrap_or(archivo)
+}
+
+/// The Cyrillic `(GDI family, GDI weight)` standing behind an **already
+/// realised** Archivo `LOGFONTW`, or `None` if that font is not one of ours.
+///
+/// [`gdi_face_for_text`] answers for a caller that knows which design weight
+/// it asked for. This answers for [`draw_text_utf16`], which does not: by the
+/// time a run reaches the one `DrawTextW`, all that survives is an `HFONT`
+/// already selected into the DC. So the lookup runs backwards, from the GDI
+/// name and weight in that font's `LOGFONTW` to the design family, and from
+/// there to the paired Noto cut.
+///
+/// The weight comparison is `>= 700` on both sides rather than equality
+/// because the cards create their fonts with `FW_BOLD`/`FW_NORMAL` -- 700 and
+/// 400 -- while [`crate::theme::ARCHIVO_FACES`] carries the file's own weight;
+/// those agree on which side of bold each cut sits, which is all the legacy
+/// four-styles-per-family naming can distinguish anyway. `Consolas`, the
+/// stock shell font, and anything else the DC might be carrying match no row
+/// and get `None`, which is correct: Consolas covers U+0400-04FF itself, and
+/// nothing else here is ours to second-guess.
+fn cyrillic_pair_for_realised(face: &str, weight: i32) -> Option<(&'static str, i32)> {
+    let family = crate::theme::ARCHIVO_FACES
+        .iter()
+        .find(|(_, gdi, gdi_weight, _)| {
+            gdi.eq_ignore_ascii_case(face) && (*gdi_weight >= 700) == (weight >= 700)
+        })
+        .map(|(egui_family, ..)| *egui_family)?;
+    CYRILLIC_GDI_FACES
+        .iter()
+        .find(|(egui_family, ..)| *egui_family == family)
+        .map(|(_, gdi, gdi_weight, _)| (*gdi, *gdi_weight))
+}
+
+/// Swap the DC's font for the paired Cyrillic cut, if this run wants it.
+///
+/// Returns the font it created and the one it displaced, so the caller can put
+/// the DC back exactly as it found it; `None` means nothing was touched and
+/// the caller must not restore anything.
+///
+/// **Every step is allowed to decline.** `GetCurrentObject` returning nothing,
+/// `GetObjectW` refusing to fill the `LOGFONTW`, a face that is not one of
+/// ours, `CreateFontIndirectW` failing, `SelectObject` failing -- each of them
+/// returns `None` and the run is drawn exactly as it would have been before
+/// this existed. There is no path through here that can panic and none that
+/// can leave the DC in a state the caller did not expect. That is a
+/// requirement, not a courtesy: this code runs inside a window procedure on
+/// the cards the app opens when nothing else can open, and a fatal exception
+/// on that stack is not a panic Rust can catch -- Windows turns it into
+/// STATUS_FATAL_USER_CALLBACK_EXCEPTION and takes the process without
+/// unwinding.
+///
+/// **Registration is deliberately lazy and deliberately in here.** A card that
+/// only ever draws Latin never pays for the four extra faces, and -- more
+/// usefully -- a card that never calls [`register_fonts`] itself still gets
+/// them, because every run in the crate comes through this one function.
+/// `preflight_card`, which is not this workstream's to edit, is fixed by that
+/// alone.
+///
+/// **Every `LOGFONTW` field except the face name and the weight is inherited**
+/// from the font the card built: height, escapement, quality, and -- pointedly
+/// -- `lfCharSet`, which the cards leave at `ANSI_CHARSET` and which both
+/// families declare in their OS/2 code page ranges. A run that swaps face must
+/// not also quietly change size or antialiasing, or the fix would read as a
+/// second defect.
+unsafe fn select_cyrillic_face(hdc: HDC, chars: &[u16]) -> Option<(HFONT, HGDIOBJ)> {
+    if !run_takes_the_cyrillic_face(chars.iter().copied()) {
+        return None;
+    }
+    let current = GetCurrentObject(hdc, OBJ_FONT);
+    if current.0.is_null() {
+        return None;
+    }
+    let mut lf = LOGFONTW::default();
+    let read = GetObjectW(
+        current,
+        std::mem::size_of::<LOGFONTW>() as i32,
+        Some(&mut lf as *mut LOGFONTW as *mut c_void),
+    );
+    if read == 0 {
+        return None;
+    }
+    let end = lf.lfFaceName.iter().position(|&ch| ch == 0).unwrap_or(lf.lfFaceName.len());
+    let realised = String::from_utf16_lossy(&lf.lfFaceName[..end]);
+    let (noto, weight) = cyrillic_pair_for_realised(&realised, lf.lfWeight)?;
+
+    register_fonts();
+
+    lf.lfWeight = if weight >= 700 { FW_BOLD.0 as i32 } else { FW_NORMAL.0 as i32 };
+    lf.lfFaceName = [0u16; 32];
+    for (i, ch) in noto.encode_utf16().take(31).enumerate() {
+        lf.lfFaceName[i] = ch;
+    }
+    let font = CreateFontIndirectW(&lf);
+    if font.0.is_null() {
+        return None;
+    }
+    let previous = SelectObject(hdc, font);
+    if previous.0.is_null() {
+        let _ = DeleteObject(font);
+        return None;
+    }
+    Some((font, previous))
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +485,28 @@ pub fn draw_text_utf16(
     if chars.is_empty() {
         return 0;
     }
-    unsafe { DrawTextW(hdc, chars, rect, format) }
+    // The Cyrillic swap, and the reason it lives HERE rather than at the nine
+    // cards. This is the one place in the crate where a run of text and the
+    // font it is about to be rasterised with are both in hand, so it is the
+    // one place a per-run font decision can be made at all -- and making it
+    // here means every card is fixed at once, including the ones this
+    // workstream does not own and the tenth card nobody has written yet. See
+    // `select_cyrillic_face`: it declines unless the run is one the bundled
+    // subset can draw whole, and it restores the DC before returning.
+    let swapped = unsafe { select_cyrillic_face(hdc, chars) };
+    let height = unsafe { DrawTextW(hdc, chars, rect, format) };
+    if let Some((cyrillic, previous)) = swapped {
+        // Restore first, delete second. Deleting a font that is still selected
+        // into a DC is the documented way to leak it: GDI refuses, returns
+        // FALSE, and the handle stays in the process table until the daemon
+        // exits -- which for a long-running tray app means every repaint of
+        // every Cyrillic row costs one handle forever.
+        unsafe {
+            SelectObject(hdc, previous);
+            let _ = DeleteObject(cyrillic);
+        }
+    }
+    height
 }
 
 /// How one button is painted. Three colours and a radius, so a new kind of
@@ -601,14 +987,14 @@ pub fn draw_field_mark(hdc: HDC, gutter: RECT, mark: crate::theme::FieldMark, sc
 //
 // **Every card in this crate is frameless and is dragged by its background**,
 // so each one answers `WM_NCHITTEST` by turning `HTCLIENT` into `HTCAPTION`.
-// That is what made the close glyph unclickable on all seven of them: the
+// That is what made the close glyph unclickable on all of them: the
 // glyph is PAINTED BY THE PARENT rather than being a child control, so once
 // the whole client area reports itself as a title bar, a press on it starts a
 // window drag and `WM_LBUTTONDOWN` never fires there at all. The rows and the
 // footer buttons kept working only because they are child windows, with hit
 // tests of their own that this arm never sees.
 //
-// The decision lives here once rather than seven times, and the half that
+// The decision lives here once rather than once per card, and the half that
 // decides is PURE: it takes `DefWindowProcW`'s answer, a point in CLIENT
 // pixels and the glyph's rect in the same pixels, and returns the code to
 // answer with. That is what lets the pin decide a hit test without opening a
@@ -872,12 +1258,17 @@ mod tests {
     /// **Every frameless card in this crate answers its hit test through
     /// [`frameless_hit_test`].**
     ///
-    /// A defect class, not an instance. All seven cards were built from one
-    /// pattern -- `if hit.0 == 1 { HTCAPTION } else { hit }` -- and all seven
-    /// paint their ✕ on the parent, so all seven swallowed every click on it.
-    /// A source pin because the alternative is seven live windows; what it
-    /// buys is that the eighth card copied from any of them cannot quietly
+    /// A defect class, not an instance. All the cards were built from one
+    /// pattern -- `if hit.0 == 1 { HTCAPTION } else { hit }` -- and all of
+    /// them paint their ✕ on the parent, so all of them swallowed every click
+    /// on it. A source pin because the alternative is six live windows; what
+    /// it buys is that the next card copied from any of them cannot quietly
     /// reintroduce the arm.
+    ///
+    /// **Six, and it was seven.** `preflight_card.rs` -- design 4b's send
+    /// confirmation -- was the seventh and has been removed outright; see
+    /// `vault_window::preflight`'s module doc for why. The rule is unchanged
+    /// and so is every card still in the list.
     #[test]
     fn no_frameless_card_answers_its_whole_client_area_as_a_title_bar() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -891,7 +1282,6 @@ mod tests {
             "prompt_card.rs",
             "locked_card.rs",
             "save_login_card.rs",
-            "preflight_card.rs",
         ] {
             let raw = std::fs::read_to_string(src.join(card)).unwrap().replace("\r\n", "\n");
             let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
@@ -1333,6 +1723,548 @@ mod tests {
             disabled.border,
             ButtonSkin::primary().border,
             "disabling changes colour, not shape"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cyrillic on the GDI cards.
+    //
+    // **What can and cannot be proven from here.** These are Win32 windows, so
+    // the crate's paint harnesses -- which drive egui -- do not reach them,
+    // and nothing below opens a card or rasterises a glyph. What IS decidable
+    // is everything that decides the outcome *before* GDI is involved: the
+    // face names are a pure function of the run and the design weight, the
+    // registration list is a constant, and both of those can be checked
+    // against the shipped font files' own `name`, `OS/2` and `cmap` tables
+    // rather than against a second copy of this author's beliefs about them.
+    // That is the whole of the fix except the `SelectObject` call itself.
+    // -----------------------------------------------------------------------
+
+    /// A word in Cyrillic: "Sberbank", the bank whose vault entry is the one
+    /// the owner's report was looking at. Every character is inside the
+    /// bundled subset.
+    const CYRILLIC_ITEM: &str = "Сбербанк";
+
+    /// Big-endian `u16` at `at`. The font tables below are all big-endian and
+    /// this is spelled once rather than at every field.
+    fn be16(bytes: &[u8], at: usize) -> u16 {
+        u16::from_be_bytes([bytes[at], bytes[at + 1]])
+    }
+
+    /// The offset of one TrueType table in `bytes`, by its four-byte tag.
+    fn table_at(bytes: &[u8], tag: &[u8; 4]) -> usize {
+        let count = be16(bytes, 4) as usize;
+        for i in 0..count {
+            let entry = 12 + 16 * i;
+            if &bytes[entry..entry + 4] == tag {
+                return u32::from_be_bytes(bytes[entry + 8..entry + 12].try_into().unwrap())
+                    as usize;
+            }
+        }
+        panic!("the bundled face has no `{}` table", String::from_utf8_lossy(tag));
+    }
+
+    /// One Windows/Unicode/en-US `name` record, by name ID. ID 1 is the legacy
+    /// family and ID 2 the legacy subfamily -- the two records GDI's font
+    /// mapper actually matches `lfFaceName` against.
+    fn name_record(bytes: &[u8], want: u16) -> String {
+        let name = table_at(bytes, b"name");
+        let count = be16(bytes, name + 2) as usize;
+        let strings = name + be16(bytes, name + 4) as usize;
+        for i in 0..count {
+            let rec = name + 6 + 12 * i;
+            let (platform, encoding, language, id) =
+                (be16(bytes, rec), be16(bytes, rec + 2), be16(bytes, rec + 4), be16(bytes, rec + 6));
+            if (platform, encoding, language, id) != (3, 1, 0x409, want) {
+                continue;
+            }
+            let len = be16(bytes, rec + 8) as usize;
+            let at = strings + be16(bytes, rec + 10) as usize;
+            let units: Vec<u16> = (0..len / 2).map(|u| be16(bytes, at + 2 * u)).collect();
+            return String::from_utf16_lossy(&units);
+        }
+        panic!("the bundled face has no Windows/en-US `name` record {want}");
+    }
+
+    /// Every codepoint the font's `cmap` maps, read from its format-4
+    /// Windows/Unicode subtable.
+    fn cmap_coverage(bytes: &[u8]) -> std::collections::BTreeSet<u16> {
+        let cmap = table_at(bytes, b"cmap");
+        let count = be16(bytes, cmap + 2) as usize;
+        let mut subtable = None;
+        for i in 0..count {
+            let rec = cmap + 4 + 8 * i;
+            if (be16(bytes, rec), be16(bytes, rec + 2)) == (3, 1) {
+                subtable = Some(
+                    cmap + u32::from_be_bytes(bytes[rec + 4..rec + 8].try_into().unwrap()) as usize,
+                );
+            }
+        }
+        let subtable = subtable.expect("the bundled face has no (3, 1) `cmap` subtable");
+        assert_eq!(be16(bytes, subtable), 4, "the subtable is not format 4");
+        let seg_x2 = be16(bytes, subtable + 6) as usize;
+        let segments = seg_x2 / 2;
+        let mut covered = std::collections::BTreeSet::new();
+        for s in 0..segments {
+            let end = be16(bytes, subtable + 14 + 2 * s);
+            let start = be16(bytes, subtable + 16 + seg_x2 + 2 * s);
+            if start == 0xFFFF {
+                continue;
+            }
+            for unit in start..=end.min(0xFFFE) {
+                covered.insert(unit);
+            }
+        }
+        covered
+    }
+
+    /// **The GDI names in `CYRILLIC_GDI_FACES` are read out of the files, not
+    /// guessed.**
+    ///
+    /// This is the pin that matters most, because guessing here is exactly how
+    /// the defect could be "fixed" and still be broken. `theme`'s table calls
+    /// these faces `NotoSans-Cyrillic-Regular` and so on; those are egui
+    /// `font_data` keys and GDI has never heard of them. Asking GDI for a face
+    /// name no font declares does not fail loudly -- the mapper silently
+    /// returns its best other guess, which is precisely the substitution this
+    /// whole change exists to stop, and the card would look no different.
+    ///
+    /// So every row is checked against the file's own legacy `name` records,
+    /// and the weight against the legacy four-styles-per-family rule those
+    /// records encode: `lfWeight` is bold only when the file says its
+    /// subfamily is `Bold`. Noto's cuts spell themselves the same way
+    /// Archivo's do -- Regular and Bold sharing the family `Noto Sans` and
+    /// told apart by weight, SemiBold and ExtraBold each `Regular` inside a
+    /// family of their own -- and a re-subset that changed that would fail
+    /// here rather than on the owner's screen.
+    #[test]
+    fn the_gdi_names_are_the_font_files_own_name_records() {
+        for (family, gdi, weight, bytes) in CYRILLIC_GDI_FACES {
+            let legacy_family = name_record(bytes, 1);
+            let legacy_subfamily = name_record(bytes, 2);
+            assert_eq!(
+                gdi, legacy_family,
+                "`{family}` is handed to GDI as `lfFaceName = {gdi:?}`, but the file's own legacy \
+                 family record says {legacy_family:?}. GDI matches on that record, and a name no \
+                 font declares does not fail -- the mapper substitutes, which is the defect this \
+                 table exists to fix"
+            );
+            let expected = if legacy_subfamily == "Bold" { 700 } else { 400 };
+            assert_eq!(
+                weight, expected,
+                "`{family}` is asked for at weight {weight}, but {gdi:?}'s legacy subfamily is \
+                 {legacy_subfamily:?}. The legacy `name` records hold only four styles per \
+                 family, so weight is the ONLY thing that tells Regular from Bold inside one \
+                 family -- and is meaningless for a cut that carries its own family and is \
+                 `Regular` within it. Asking for ({gdi:?}, 600) returns a synthesised-looking \
+                 Regular, not SemiBold"
+            );
+        }
+    }
+
+    /// **Each Archivo cut is paired with the Noto cut of the same weight.**
+    ///
+    /// The `usWeightClass` in the file, not the legacy `lfWeight`: the whole
+    /// point of the Cyrillic faces is that a Cyrillic name set in the app's
+    /// semibold is semibold, and that is the property egui's stacks already
+    /// have. A pairing that put Regular behind SemiBold would compile, draw
+    /// real glyphs, and reintroduce the lighter-than-its-neighbours look the
+    /// Noto faces were bundled to cure.
+    #[test]
+    fn each_archivo_cut_is_paired_with_the_noto_cut_of_the_same_weight() {
+        for (family, _, _, archivo) in crate::theme::ARCHIVO_FACES {
+            let (_, _, _, noto) = CYRILLIC_GDI_FACES
+                .iter()
+                .find(|(paired, ..)| *paired == family)
+                .unwrap_or_else(|| panic!("`{family}` has no row in CYRILLIC_GDI_FACES"));
+            let os2 = |bytes: &[u8]| be16(bytes, table_at(bytes, b"OS/2") + 4);
+            assert_eq!(
+                os2(archivo),
+                os2(noto),
+                "the Cyrillic face paired with `{family}` has `usWeightClass` {} against \
+                 Archivo's {}. A Cyrillic item name would then render at a different weight from \
+                 the Latin one beside it -- a quieter version of the same defect",
+                os2(noto),
+                os2(archivo)
+            );
+        }
+    }
+
+    /// **`cyrillic_subset_covers` is the shipped subset's own `cmap`.**
+    ///
+    /// The face-selection rule is "switch only if the whole run is drawable",
+    /// so it is only as honest as this table. A codepoint claimed here that
+    /// the file does not carry is a run drawn in Noto with a hole in it; one
+    /// the file carries but this omits is a Cyrillic string left in the
+    /// fallback face for no reason.
+    ///
+    /// `U+0000` and `U+000D` are the two deliberate exclusions and are named
+    /// as such: the notdef mapping and a carriage return are not text.
+    #[test]
+    fn the_coverage_table_is_the_bundled_subsets_own_cmap() {
+        let deliberately_excluded = [0x0000u16, 0x000D];
+        for (family, _, _, bytes) in CYRILLIC_GDI_FACES {
+            let covered = cmap_coverage(bytes);
+            assert!(
+                covered.len() > 90,
+                "control: {family}'s Cyrillic face parsed to only {} codepoints, so this pin is \
+                 reading the file wrongly and would pass against nothing",
+                covered.len()
+            );
+            for unit in 0u16..=0xFFFE {
+                if deliberately_excluded.contains(&unit) {
+                    continue;
+                }
+                assert_eq!(
+                    cyrillic_subset_covers(unit),
+                    covered.contains(&unit),
+                    "`cyrillic_subset_covers` and the shipped {family} face disagree about \
+                     U+{unit:04X}: the table says {}, the file's `cmap` says {}",
+                    cyrillic_subset_covers(unit),
+                    covered.contains(&unit)
+                );
+            }
+        }
+    }
+
+    /// **All four cuts cover the same codepoints**, which is what lets one
+    /// coverage table stand for the whole family. If a re-subset ever shipped
+    /// a Bold that was missing a letter its Regular had, the "whole run is
+    /// drawable" test would be true at one weight and false at another, and a
+    /// heading would silently lose a character its body copy kept.
+    #[test]
+    fn every_cyrillic_cut_covers_the_same_codepoints() {
+        let regular = cmap_coverage(CYRILLIC_GDI_FACES[0].3);
+        for (family, _, _, bytes) in CYRILLIC_GDI_FACES {
+            assert_eq!(
+                cmap_coverage(bytes),
+                regular,
+                "{family}'s Cyrillic cut covers a different set of codepoints from Regular's, so \
+                 one coverage table can no longer stand for all four"
+            );
+        }
+    }
+
+    /// **A pure Cyrillic item name takes the paired face, at its own weight.**
+    /// The defect, stated as the thing that must now be true.
+    #[test]
+    fn a_cyrillic_item_name_takes_the_paired_face_at_its_own_weight() {
+        for (family, archivo, _, _) in crate::theme::ARCHIVO_FACES {
+            let (face, _) = gdi_face_for_text(family, CYRILLIC_ITEM);
+            assert_ne!(
+                face, archivo,
+                "{CYRILLIC_ITEM:?} is still asked of {archivo:?}, which carries no codepoint in \
+                 U+0400-04FF at all. GDI does not draw blanks: it font-links the run to whatever \
+                 the system offers, so the name renders in Segoe UI beside Archivo Latin -- which \
+                 is the report"
+            );
+            assert_eq!(
+                (face, gdi_face_for_text(family, CYRILLIC_ITEM).1),
+                CYRILLIC_GDI_FACES
+                    .iter()
+                    .find(|(paired, ..)| *paired == family)
+                    .map(|(_, gdi, weight, _)| (*gdi, *weight))
+                    .unwrap(),
+                "the face chosen for {CYRILLIC_ITEM:?} at `{family}` is not the one this weight \
+                 is paired with"
+            );
+        }
+    }
+
+    /// **Latin is untouched, at every weight.** The first thing a font change
+    /// has to promise: not one existing measurement moves. The Noto subset
+    /// carries no Latin codepoint at all, so a Latin run reaching it would not
+    /// merely look different -- it would be drawn entirely by GDI's fallback.
+    #[test]
+    fn a_latin_run_is_asked_of_exactly_the_face_it_always_was() {
+        for (family, ..) in crate::theme::ARCHIVO_FACES {
+            for run in ["Netflix", "1Password", "DESKWARDEN", "user@example.com", ""] {
+                assert_eq!(
+                    gdi_face_for_text(family, run),
+                    crate::theme::gdi_face_for(family),
+                    "{run:?} at `{family}` no longer resolves to the face it did before the \
+                     Cyrillic pairing existed"
+                );
+            }
+        }
+    }
+
+    /// **A mixed run keeps Archivo, and the reason is arithmetic rather than
+    /// taste.**
+    ///
+    /// `DrawTextW` takes one font per call, so the choice is one face for the
+    /// whole string. The bundled subset has no Latin, no digits and no
+    /// punctuation, so choosing it for a mixed string sends the *majority* of
+    /// the characters into GDI's fallback to rescue the minority: "Netflix RU
+    /// — Иван" would lose seventeen characters to save four, and "Почта 2"
+    /// would lose the digit that distinguishes it from "Почта".
+    ///
+    /// So the rule fires only on a fully covered run, and this pin is the
+    /// statement that it cannot make any string *worse* than it was: every
+    /// case here resolves to exactly what `theme::gdi_face_for` alone would
+    /// have returned.
+    #[test]
+    fn a_mixed_run_keeps_archivo_because_the_subset_has_no_latin() {
+        for run in [
+            "Netflix RU — Иван",
+            "Почта 2",
+            "Сбербанк (осн.)",
+            "Сбербанк, личный",
+            "Яндекс-Почта",
+            "ivan@почта.рф",
+        ] {
+            assert_eq!(
+                gdi_face_for_text(crate::theme::SEMIBOLD, run),
+                crate::theme::gdi_face_for(crate::theme::SEMIBOLD),
+                "{run:?} was switched to the Cyrillic subset, which carries no Latin letter, no \
+                 digit and no ASCII punctuation. Every character outside U+0400-04FF in it would \
+                 then be drawn by GDI's fallback -- more of the string wrong, not less"
+            );
+        }
+    }
+
+    /// **A run with no Cyrillic letter in it keeps Archivo even when every
+    /// character is technically drawable.**
+    ///
+    /// The subset carries the space, the no-break space and `№`, so " " and
+    /// " " are "fully covered" runs. Switching face for them would change the
+    /// width of a blank label for no visible reason, and a layout measured
+    /// against one face would be drawn in another.
+    #[test]
+    fn a_run_with_no_cyrillic_letter_keeps_archivo() {
+        for run in [" ", "  ", "\u{00A0}", "№", "№ №"] {
+            assert_eq!(
+                gdi_face_for_text(crate::theme::REGULAR, run),
+                crate::theme::gdi_face_for(crate::theme::REGULAR),
+                "{run:?} contains no Cyrillic letter, so there is nothing for the paired face to \
+                 fix and switching to it can only move a measurement"
+            );
+        }
+    }
+
+    /// **The backwards lookup maps every `LOGFONTW` the cards actually
+    /// build.**
+    ///
+    /// `draw_text_utf16` only ever sees a realised font, so
+    /// `cyrillic_pair_for_realised` is what decides the swap in practice --
+    /// and it is fed `FW_BOLD`/`FW_NORMAL`, 700 and 400, rather than the
+    /// file's own `usWeightClass`. This walks the same table the cards' `font`
+    /// helpers read and checks every row survives the round trip.
+    #[test]
+    fn the_realised_font_lookup_maps_every_face_the_cards_build() {
+        for (family, ..) in crate::theme::ARCHIVO_FACES {
+            let (face, weight) = crate::theme::gdi_face_for(family);
+            let as_created = if weight >= 700 { 700 } else { 400 };
+            assert_eq!(
+                cyrillic_pair_for_realised(face, as_created),
+                Some(gdi_face_for_text(family, CYRILLIC_ITEM)),
+                "a card's `{family}` font -- `lfFaceName = {face:?}`, `lfWeight = {as_created}` \
+                 -- is not recognised as one of ours when it comes back out of the DC, so a \
+                 Cyrillic run drawn with it would never be swapped"
+            );
+        }
+        assert_eq!(
+            cyrillic_pair_for_realised("archivo semibold", 400),
+            cyrillic_pair_for_realised("Archivo SemiBold", 400),
+            "the lookup is case sensitive. GDI's own face matching is not, and a `LOGFONTW` that \
+             came back spelled differently would silently stop being ours"
+        );
+    }
+
+    /// **Nothing that is not ours is second-guessed.**
+    ///
+    /// `Consolas` is the generated password's face and the keyboard chips',
+    /// and it covers U+0400-04FF itself; the stock shell font covers it too.
+    /// A swap there would be this module overriding a perfectly good face on a
+    /// surface it does not own.
+    #[test]
+    fn a_face_that_is_not_ours_is_left_alone() {
+        for face in [crate::theme::GDI_MONO_FACE, "Segoe UI", "MS Shell Dlg", ""] {
+            assert_eq!(
+                cyrillic_pair_for_realised(face, 400),
+                None,
+                "{face:?} is not one of the app's Archivo cuts, so nothing here has any business \
+                 replacing it"
+            );
+        }
+    }
+
+    /// **An unknown design family falls back rather than panicking.**
+    ///
+    /// `theme::gdi_face_for` makes exactly this promise, and for exactly this
+    /// reason: these are the surfaces whose whole reason for existing is that
+    /// they must open when the heavier machinery cannot, so a prompt in the
+    /// wrong weight is a cosmetic defect and a prompt that fails to draw is a
+    /// locked-out user. The Cyrillic lookup must not be the thing that turns
+    /// the first into the second.
+    #[test]
+    fn an_unknown_family_falls_back_instead_of_panicking() {
+        assert_eq!(
+            gdi_face_for_text("Archivo-Nonexistent", CYRILLIC_ITEM),
+            crate::theme::gdi_face_for("Archivo-Nonexistent"),
+            "an unknown design family must land on whatever `gdi_face_for` would have returned, \
+             not on a panic inside a window procedure"
+        );
+    }
+
+    /// **The GDI table and `theme`'s egui table bundle the same four files.**
+    ///
+    /// The one real cost of this module carrying its own `include_bytes!`:
+    /// `theme::CYRILLIC_FACES` is private, so the bytes cannot be shared, and
+    /// two tables naming font files by path is two tables that can drift onto
+    /// different ones. A drift would be invisible -- both renderers would draw
+    /// real Cyrillic glyphs, in two different cuts of Noto -- which is a
+    /// subtler version of the defect being fixed.
+    ///
+    /// So the paths are read out of this file's production half and each one
+    /// checked against `theme.rs`'s source. Nothing is hardcoded in the
+    /// assertion, so adding a fifth weight to one table and not the other
+    /// fails here.
+    #[test]
+    fn the_cyrillic_assets_are_the_ones_theme_bundles() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let raw =
+            std::fs::read_to_string(src.join("win32_draw.rs")).unwrap().replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        assert!(
+            production.len() < raw.len(),
+            "control: the `#[cfg(test)]` cut marker was not found in win32_draw.rs, so this pin \
+             would be reading its own assertions as production"
+        );
+
+        let marker = concat!("include_", "bytes!(\"../assets/fonts/");
+        let mut paths: Vec<&str> = Vec::new();
+        for piece in production.split(marker).skip(1) {
+            paths.push(piece.split('"').next().unwrap());
+        }
+        assert_eq!(
+            paths.len(),
+            CYRILLIC_GDI_FACES.len(),
+            "win32_draw.rs bundles {} font files but CYRILLIC_GDI_FACES has {} rows: {paths:?}",
+            paths.len(),
+            CYRILLIC_GDI_FACES.len()
+        );
+
+        let theme = std::fs::read_to_string(src.join("theme.rs")).unwrap();
+        assert!(
+            theme.contains("CYRILLIC_FACES"),
+            "control: theme.rs no longer has a CYRILLIC_FACES table, so this pin is comparing \
+             against nothing"
+        );
+        for path in paths {
+            assert!(
+                theme.contains(path),
+                "win32_draw.rs hands GDI `{path}`, which theme.rs does not bundle for egui. The \
+                 two renderers are now drawing Cyrillic from different files -- both will look \
+                 plausible and they will not match"
+            );
+        }
+    }
+
+    /// **The bundled faces are registered with GDI in ONE place.**
+    ///
+    /// A census in the shape this crate already uses for `DrawTextW`, and for
+    /// a related reason. `AddFontMemResourceEx` copies the font data into the
+    /// process font table; it does not refcount a shared buffer. Every card
+    /// used to carry its own copy of the registration loop behind its own
+    /// `OnceLock`, so a session that opened the picker and then the unlock
+    /// prompt paid for two private copies of all four Archivo cuts -- and
+    /// doubling the table to eight faces would have doubled that.
+    ///
+    /// The assertion is one-directional on purpose. `preflight_card.rs` is
+    /// named as a known exception because it belongs to another workstream;
+    /// it registers Archivo a second time, which costs memory and nothing
+    /// else, and its Cyrillic runs are fixed anyway because it draws through
+    /// `draw_text` like every other card. A tenth card growing its own loop
+    /// fails this; `preflight_card` losing its one passes, which is the
+    /// direction that is an improvement.
+    #[test]
+    fn the_bundled_faces_are_registered_in_one_place() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let needle = concat!("AddFontMem", "ResourceEx(");
+        let allowed = ["win32_draw.rs", "preflight_card.rs"];
+        let mut scanned = 0usize;
+        let mut callers: Vec<String> = Vec::new();
+
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+            let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+            let code: String = production
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n");
+            scanned += 1;
+            if code.contains(needle) {
+                callers.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+
+        assert!(
+            scanned > 20,
+            "control: only {scanned} `.rs` files were scanned under {}, so this census is not \
+             reading the crate and could not fail",
+            src.display()
+        );
+        assert!(
+            callers.contains(&"win32_draw.rs".to_string()),
+            "control: win32_draw.rs no longer registers the bundled faces at all, so no card \
+             gets Archivo or its Cyrillic pair and every surface falls back to the shell font. \
+             Found: {callers:?}"
+        );
+        for caller in &callers {
+            assert!(
+                allowed.contains(&caller.as_str()),
+                "`{caller}` registers fonts with GDI itself. `AddFontMemResourceEx` COPIES the \
+                 data into the process font table rather than refcounting it, so that is another \
+                 private ~750 KB of Archivo plus 64 KB of Noto for every card opened in a \
+                 session. Call `win32_draw::register_fonts()` instead -- it is behind a \
+                 process-wide `OnceLock`. Found: {callers:?}"
+            );
+        }
+    }
+
+    /// **The swap restores the DC before it deletes the font it created.**
+    ///
+    /// Source order again, for the same reason the empty-run guard is pinned
+    /// that way: the failure is not a panic a test could catch. `DeleteObject`
+    /// on a font that is still selected into a DC does not delete it -- GDI
+    /// returns FALSE and the handle stays in the process table for the life of
+    /// the daemon. On a tray app that repaints a list of Cyrillic rows all
+    /// day, that is a handle per row per repaint, forever, ending in a GDI
+    /// object limit and a window that stops drawing.
+    #[test]
+    fn the_cyrillic_swap_restores_before_it_deletes() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let raw =
+            std::fs::read_to_string(src.join("win32_draw.rs")).unwrap().replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            production.len() < raw.len(),
+            "control: the `#[cfg(test)]` cut marker was not found, so this pin is reading its \
+             own test module"
+        );
+        let restore = code.find("SelectObject(hdc, previous);").expect(
+            "the Cyrillic swap no longer puts the card's own font back into the DC. Everything \
+             painted after the swapped run would then be drawn in a Cyrillic-only subset face",
+        );
+        let delete = code
+            .find("DeleteObject(cyrillic)")
+            .expect("control: the swapped font is never deleted, which leaks it outright");
+        assert!(
+            restore < delete,
+            "the swapped font is deleted while it is still selected into the DC. GDI refuses \
+             that and returns FALSE, so the handle leaks for the life of the daemon -- one per \
+             Cyrillic run per repaint"
         );
     }
 }

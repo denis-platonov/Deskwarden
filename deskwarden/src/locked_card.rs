@@ -472,7 +472,7 @@ mod win32 {
     use windows::core::{w, HSTRING, PCWSTR};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
+        BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
         CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject,
         EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
         SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DT_END_ELLIPSIS, DT_LEFT,
@@ -510,22 +510,20 @@ mod win32 {
     static HOVERED: AtomicIsize = AtomicIsize::new(0);
     static ORIGINAL_PROC: AtomicIsize = AtomicIsize::new(0);
 
+    /// Registers every bundled face privately with GDI, once.
+    ///
+    /// **The loop that used to be here now lives in
+    /// [`crate::win32_draw::register_fonts`], behind one process-wide
+    /// `OnceLock` instead of one per card.** `AddFontMemResourceEx` copies the
+    /// font data into the process font table rather than refcounting a shared
+    /// buffer, so every card that carried its own copy of this loop handed GDI
+    /// another private copy of all four Archivo cuts -- roughly 750 KB of pure
+    /// duplicate per card opened in a session. Adding the four Noto Cyrillic
+    /// cuts the cards now need for Cyrillic runs would have made that worse
+    /// rather than better, so the registration moved to the one module every
+    /// card already draws its text through.
     fn register_fonts() {
-        static ONCE: OnceLock<()> = OnceLock::new();
-        ONCE.get_or_init(|| unsafe {
-            for (_, _, _, bytes) in crate::theme::ARCHIVO_FACES {
-                let installed = std::cell::Cell::new(0u32);
-                let handle = AddFontMemResourceEx(
-                    bytes.as_ptr() as *const c_void,
-                    bytes.len() as u32,
-                    None,
-                    installed.as_ptr(),
-                );
-                if handle.0.is_null() || installed.get() == 0 {
-                    log::warn!("could not register a bundled Archivo face with GDI");
-                }
-            }
-        });
+        crate::win32_draw::register_fonts();
     }
 
     fn font(family: &str, px: i32) -> HFONT {
