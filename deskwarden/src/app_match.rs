@@ -40,6 +40,26 @@ pub struct AppMatch {
     /// The executable's file name (`Speedtest.exe`), as attributed by
     /// [`crate::window_watch::attribute_window`] -- never the name of a window
     /// host.
+    ///
+    /// **Two classes of name are stored faithfully and then refused by the
+    /// matcher**, and both for the same reason: the name identifies a
+    /// *process* that is not an *application*, so a binding keyed on it is a
+    /// binding to a whole category of window rather than to the one the user
+    /// pointed at.
+    ///
+    ///  * A window host ([`crate::window_watch::is_host_process`]) --
+    ///    `ApplicationFrameHost.exe` owns the top-level window for every
+    ///    Microsoft Store app.
+    ///  * A web browser ([`crate::app::BROWSER_IMAGE_NAMES`]) -- `msedge.exe`
+    ///    is one process for every site on the web. This is the owner's
+    ///    report: a binding to it fired on every tab, forever.
+    ///
+    /// The refusal lives in [`crate::match_engine::MatchEngine`] and nowhere
+    /// near here, because this type's job is to round-trip what is in the
+    /// user's vault byte for byte. **Nothing rewrites the field**: a match
+    /// whose `process` is refused parses, serializes and compares exactly as
+    /// it always did, and what changes is only that autofill stops acting on
+    /// it.
     pub process: String,
     /// The window's title at the moment the user picked it -- recorded **only
     /// for a window a host frame owned** (see [`Self::hosted`]).
@@ -89,14 +109,43 @@ pub struct AppMatch {
     /// The command-line arguments to start [`Self::path`] with, **exactly as
     /// the user typed them** -- one string, not a parsed vector.
     ///
-    /// **This is what tells two windows of the same executable apart.** The
-    /// motivating case is a browser run under several profiles:
-    /// `chrome.exe --profile-directory="Profile 2"` is the *work* browser and
-    /// a different `--profile-directory` is the personal one, so two vault
-    /// items name the same `process` and the same `path` and differ only
-    /// here. It will serve two purposes -- the command line a launcher passes,
-    /// and the discriminator a future matcher uses -- and both of them need
-    /// the string the user wrote rather than this app's idea of it.
+    /// **This is the command line a launcher passes, and that is the whole of
+    /// what it is for.** The motivating case is a browser run under several
+    /// profiles: `chrome.exe --profile-directory="Profile 2"` is the *work*
+    /// browser and a different `--profile-directory` is the personal one, so
+    /// two vault items name the same `process` and the same `path` and differ
+    /// only here -- and Open must start the right one.
+    ///
+    /// **It is NOT, and will not become, a discriminator for matching.** This
+    /// doc used to promise exactly that ("the discriminator a future matcher
+    /// uses"), and the promise was withdrawn when the owner's Edge defect made
+    /// somebody go and check whether it could be kept. It cannot, for three
+    /// reasons, any one of which is sufficient:
+    ///
+    ///  * **It is the wrong question.** The owner's complaint is that
+    ///    `msedge.exe` matches every site they visit. A profile discriminator
+    ///    narrows "every site in every profile" to "every site in one
+    ///    profile", which is still every site. The thing that tells two
+    ///    browser windows apart is the **site**, and no command line carries
+    ///    it.
+    ///  * **It would not be readable even if it were right.** Matching on it
+    ///    means reading the *foreground window's* process command line at
+    ///    match time -- a `NtQueryInformationProcess` read across a process
+    ///    boundary, on every foreground change, on the path
+    ///    [`crate::app::PasswordFieldProbe`] already documents as too
+    ///    expensive to pay per event.
+    ///  * **The value would be a lie on the commonest browser.** Chromium runs
+    ///    one browser process per *user data directory*, and the profiles
+    ///    inside it share it -- so the `--profile-directory` on that process's
+    ///    command line is whichever profile happened to launch it, not the one
+    ///    whose window is in front. A matcher built on it would be right by
+    ///    accident and wrong silently, which is the failure mode this file's
+    ///    every other rule is written to avoid.
+    ///
+    /// So the string is still the user's, still verbatim, and still consulted
+    /// by nothing that matches -- see
+    /// [`crate::match_engine::MatchEngine::rebuild`], where a browser is
+    /// refused outright rather than narrowed.
     ///
     /// **Stored verbatim: never re-quoted, re-escaped, split or trimmed.**
     /// Windows has no single tokenisation of a command line (`CommandLineToArgvW`

@@ -124,6 +124,22 @@ pub fn process_image_path_for_pid(pid: u32) -> Option<String> {
 /// is not free: every name on it costs a real application the ability to be
 /// matched at all (see [`attribute_window`]'s `UnresolvedHost` arm). So this
 /// list grows only on evidence, never on a hunch.
+///
+/// **A web browser does NOT belong here, and the temptation to put one here is
+/// the reason this paragraph exists.** A browser has the same *symptom* as the
+/// host -- one process standing in for many things the user thinks of
+/// separately -- and [`crate::match_engine::MatchEngine::rebuild`] now refuses
+/// both. But being on this list does not mean "refused"; it means
+/// **"identified by its window title instead"**, because that is what this
+/// list routes a window to (see [`crate::match_engine::MatchEngine::lookup`]).
+/// For a suspended Store app the title is a real identity the system itself
+/// wrote. For a browser it is a string **the page chose**, and handing it the
+/// job of selecting a credential is precisely the attack `lookup`'s doc refuses
+/// at length. Adding a browser here would look like tightening a rule and would
+/// in fact hand every web page a way to claim a saved match, so the browser
+/// rule lives in `match_engine` -- where it can refuse both tables -- and the
+/// names live in [`crate::app::BROWSER_IMAGE_NAMES`], which is their single
+/// source.
 const HOST_PROCESSES: [&str; 1] = ["ApplicationFrameHost.exe"];
 
 /// The window class of the hosted application's own window inside a host

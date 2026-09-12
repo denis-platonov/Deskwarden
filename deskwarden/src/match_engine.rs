@@ -1,6 +1,31 @@
+use crate::app::{browser_window, BrowserWindow};
 use crate::app_match::AppMatch;
 use crate::window_watch::{is_host_process, ForegroundEvent};
 use std::collections::HashMap;
+
+/// True when `exe_name` names a web browser, as
+/// [`crate::app::BROWSER_IMAGE_NAMES`] defines one.
+///
+/// **A thin call into `app`, and deliberately not a second list.** The names
+/// live in `app.rs` because that is where the first consumer landed
+/// ([`crate::app::disposition`]'s browser suppressor), and
+/// `the_browser_list_is_the_only_place_a_browser_is_named` pins them as the
+/// single source. "Two enumerations that must agree" is the shape this
+/// codebase keeps finding defects in, and a copy of the list here would
+/// compile, ship, and disagree with that one on the first browser either of
+/// them forgot -- so the engine asks rather than remembers.
+/// `the_browser_rule_asks_app_rather_than_keeping_a_second_list` pins that this
+/// file names no browser at all outside its own tests.
+///
+/// The direction of the dependency is worth stating, because it looks
+/// backwards: `match_engine` sits under `app` and this is a call upward. It is
+/// a call to a **pure function over one `&str`** -- no window, no cache, no
+/// settings -- so it carries none of `app`'s state with it, and the
+/// alternative (a duplicate list, or moving the list into a file this pass
+/// does not own) is worse in both directions.
+fn is_browser_process(exe_name: &str) -> bool {
+    browser_window(exe_name) == BrowserWindow::Yes
+}
 
 /// The saved matches, indexed for the two questions a foreground window can be
 /// asked.
@@ -8,6 +33,12 @@ use std::collections::HashMap;
 /// **Two tables, and which one a window may consult is decided by the window,
 /// not by the match.** See [`MatchEngine::lookup`] -- that split is the whole
 /// safety argument for matching on a title at all.
+///
+/// **A third rule sits across both: a web browser is not an application
+/// identity, so a browser is in neither table.** See
+/// [`MatchEngine::rebuild`] and [`MatchEngine::lookup`]; the short version is
+/// that `msedge.exe` is one process for every site the user has ever visited,
+/// so a binding keyed on it is a binding to the whole web.
 pub struct MatchEngine {
     by_process: HashMap<String, (String, AppMatch)>,
     by_title: HashMap<String, (String, AppMatch)>,
@@ -64,6 +95,58 @@ impl MatchEngine {
     /// user's vault behind their back, so the field stays exactly as they
     /// saved it; what changes is that autofill stops acting on it.
     ///
+    /// # A web browser is dropped from the process table too, and for the same
+    /// reason said about a different kind of process
+    ///
+    /// The owner's report: *"But I still see that popup for Edge everytime"*,
+    /// and then *"Microsoft (tivity) fils msedge"*. They had bound a vault item
+    /// to the process `msedge.exe`, and **a browser is one process for every
+    /// site you visit**. So that binding matched every Edge window -- every
+    /// tab, every page, forever -- and the prompt appeared constantly, for the
+    /// wrong reason, offering an item that was right only by coincidence.
+    ///
+    /// That is [`crate::window_watch::HOST_PROCESSES`]'s defect in a second
+    /// shape. `ApplicationFrameHost.exe` is one process for every Store app;
+    /// `msedge.exe` is one process for every web site. In both cases the name
+    /// that was saved **carries no information about which thing the user
+    /// meant**, so honouring it literally is not honouring their intent -- and
+    /// in both cases it cannot be narrowed into a correct entry, because there
+    /// is nothing in the stored value to narrow it *with*.
+    ///
+    /// **What is deliberately NOT done: the host's repair does not transfer.**
+    /// A host-named entry can be rescued by a title, because
+    /// [`Self::lookup`] routes a host-owned window to the title table and
+    /// nothing else. A browser cannot be rescued that way, and the refusal is
+    /// the argument at [`Self::lookup`]'s own doc, written before any of this:
+    /// a page can name its own tab, so a browser title is the most
+    /// attacker-controlled string on the desktop. Putting browsers on the host
+    /// list -- the obvious "make it symmetrical" edit -- would route every
+    /// browser window straight into the title table and hand exactly that
+    /// string the job of choosing a credential. It is refused.
+    ///
+    /// So a browser binding contributes to **neither** table, and there is no
+    /// title-shaped escape hatch. What the user keeps is the whole of the
+    /// browser path this app already has and already prefers: `CTRL+ALT+B` in
+    /// the browser window reaches [`crate::app::Open::NoMatch`]'s account
+    /// picker (see [`crate::app::Trigger::Hotkey`], which exists so that a
+    /// chord press is never answered with silence), the item is filled from
+    /// there, and [`crate::fill_recall`] then offers that same item back at
+    /// that same window for five minutes -- which is the multi-page browser
+    /// sign-in the owner described, solved without a binding at all.
+    ///
+    /// **A browser that is not on the list keeps matching**, exactly as
+    /// [`crate::app::BROWSER_IMAGE_NAMES`] says of its own consumer: the list
+    /// is finite and honest, and the unrecognised browser gets today's
+    /// behaviour rather than a guess. The failure direction is the recoverable
+    /// one -- the user sees the over-eager prompt they can report, rather than
+    /// a match that went quiet for a reason no list explains.
+    ///
+    /// **Nothing is written to the vault here either.** The `msedge.exe` in
+    /// the owner's item stays exactly as they saved it. The `log::warn!` below
+    /// is a developer's trace, not a surface for the user; the surface is a
+    /// browser-shaped sibling of `picker_ui::existing_host_match_notice`, and
+    /// that window belongs to a different pass.
+    ///
     /// **The user is told by `picker_ui::existing_host_match_notice`, not by
     /// anything this type hands back.** A `Vec` of the dropped pairs and an
     /// `unmatchable_hosts()` accessor lived here for exactly that purpose and
@@ -84,7 +167,7 @@ impl MatchEngine {
     pub fn rebuild(&mut self, entries: &[(String, AppMatch)]) {
         self.by_process = entries
             .iter()
-            .filter(|(_, m)| !is_host_process(&m.process))
+            .filter(|(_, m)| !is_host_process(&m.process) && !is_browser_process(&m.process))
             .map(|(item_id, m)| (m.process.to_lowercase(), (item_id.clone(), m.clone())))
             .collect();
 
@@ -107,6 +190,26 @@ impl MatchEngine {
                  window for every Microsoft Store app, so this match would fire on all of them, \
                  and it recorded no window title to identify the app by instead. The vault is \
                  unchanged -- re-add the app from \"Add app...\" to replace it"
+            );
+        }
+
+        // The browser half, logged in the same place and for the same reason:
+        // four `rebuild` call sites in `main`, and a warning that only three of
+        // them carry is a warning that goes missing on the fourth.
+        //
+        // Unconditional, where the host loop above is gated on an empty title.
+        // That asymmetry is the whole browser argument in one line: a host
+        // entry that captured a title still has an identity left to be matched
+        // by, and a browser entry never does -- its title is whatever the page
+        // currently says it is.
+        for (item_id, m) in entries.iter().filter(|(_, m)| is_browser_process(&m.process)) {
+            let process = &m.process;
+            log::warn!(
+                "ignoring the app match on vault item {item_id}: {process} is a web browser, and \
+                 a browser runs one process for every site you visit -- so this match would fire \
+                 on every tab and every page rather than on the site you meant. The vault is \
+                 unchanged. Press the fill shortcut in that window and pick the item instead; \
+                 the pick is remembered for the rest of the sign-in"
             );
         }
     }
@@ -162,6 +265,33 @@ impl MatchEngine {
     /// never consults the process table for a host-owned window in the first
     /// place. Either alone would do; neither is load-bearing on the other.
     ///
+    /// **A web browser gets the same pair of guards, and for a reason this
+    /// very paragraph already wrote down.** The argument above refuses a saved
+    /// title as a second needle because "a saved title of `Mabl` would then
+    /// match a *browser tab* named Mabl, and a page can name its own tab". It
+    /// was making a point about titles; it was also, without saying so, the
+    /// complete argument against a browser being an app match. A browser
+    /// window has exactly two strings on it -- the image name, which is the
+    /// same for every site on the web, and the title, which the site itself
+    /// writes -- and neither is an identity a credential may be chosen by. So
+    /// the process table is not consulted for a browser window either, and
+    /// `rebuild` keeps browsers out of it.
+    ///
+    /// **This is a narrowing and not an inversion of the rule above.** The
+    /// shape refused there is "match if the process hits OR the title hits",
+    /// which turns every saved title into a live needle against every window
+    /// on the desktop and can only ever *add* matches. The shape added here is
+    /// "a browser matches nothing", which can only ever *remove* them. Nothing
+    /// becomes matchable that was not matchable before; a set of windows that
+    /// were matched for a reason that was never true stops being matched. No
+    /// window gains a new way to claim a credential, which is the property the
+    /// paragraph above exists to protect, and it is untouched.
+    ///
+    /// A browser is never also a host, so the two branches cannot disagree;
+    /// the browser guard sits directly in front of the table it guards rather
+    /// than being folded into the host branch, so that deleting either one is
+    /// a visible, separate deletion.
+    ///
     /// A title is matched whole and case-insensitively, never as a substring:
     /// a stored `Settings` must not match a window called `Settings for
     /// Something Else`. The cost is that an app which renames its window loses
@@ -190,6 +320,20 @@ impl MatchEngine {
                 .by_title
                 .get(&title.to_lowercase())
                 .map(|(id, m)| (id.as_str(), m));
+        }
+        // **The browser guard, and it is the whole of the owner's Edge
+        // defect.** One process, every site on the web; nothing saved against
+        // that name can say which site was meant. `rebuild` keeps such an
+        // entry out of `by_process` and this refuses to read `by_process` for
+        // such a window -- two guards that agree by hand, exactly as the host
+        // pair above does, because each one is the other's only backstop the
+        // day the other is refactored away as redundant.
+        //
+        // Note what it does NOT do: it does not fall through to `by_title`.
+        // That would be the title-as-second-needle shape the doc above
+        // refuses, aimed at the one process whose title a stranger writes.
+        if is_browser_process(exe_name) {
+            return None;
         }
         self.by_process
             .get(&exe_name.to_lowercase())
@@ -274,7 +418,16 @@ mod tests {
             Some("keepsolid"),
             "the public lookup dropped the event's process name"
         );
-        assert_eq!(engine.lookup(&window("chrome.exe", "KeepSolid")).map(|(id, _)| id), None);
+        // A third process carrying the right title matches nothing.
+        //
+        // **This used to say `chrome.exe`, and that spelling has stopped
+        // testing anything.** A browser is now refused by `lookup_parts`
+        // before either table is read, so the `None` would arrive whatever the
+        // wrapper did with its two arguments -- the assertion would pass
+        // against the very mutation the rest of this test exists to kill.
+        // `notepad.exe` is an ordinary process, so the answer still comes from
+        // the routing under test.
+        assert_eq!(engine.lookup(&window("notepad.exe", "KeepSolid")).map(|(id, _)| id), None);
     }
 
     #[test]
@@ -548,8 +701,26 @@ mod tests {
         // Changing `lookup` to fall back to `by_title` when the process misses
         // -- Keeper's "title OR process" shape -- gives
         //     left: Some(("mabl", ..))  right: None
+        //
+        // **The probe is `notepad.exe` and no longer `chrome.exe`.** The
+        // narrative is still the browser tab -- that is what the doc argues
+        // about -- but a browser is now refused before either table is read,
+        // so probing with one would make this assertion hold for a reason that
+        // has nothing to do with the fallback it is written against: the
+        // "title OR process" mutation would survive it. An editor showing a
+        // document called `Mabl` wears the same string for the same reason and
+        // still goes through the routing under test.
         assert_eq!(
-            engine.lookup_parts("chrome.exe", "Mabl").map(|(id, _)| id),
+            engine.lookup_parts("notepad.exe", "Mabl").map(|(id, _)| id),
+            None,
+            "a window that wears a saved title must not be able to claim that saved match"
+        );
+        // ...and the browser itself, which is now refused twice over: once by
+        // this rule and once by its own. Asserted beside the line above rather
+        // than instead of it, so neither reason can quietly become the only
+        // one.
+        assert_eq!(
+            engine.lookup_parts("msedge.exe", "Mabl").map(|(id, _)| id),
             None,
             "a page that names its own tab must not be able to claim a saved match"
         );
@@ -689,5 +860,301 @@ mod tests {
         engine.rebuild(&[("bank".to_string(), m)]);
 
         assert!(engine.by_title.is_empty(), "an old title became a needle: {:?}", engine.by_title);
+    }
+
+    // ---- A web browser is not an application identity -------------------
+
+    /// **THE DEFECT, in the owner's words:** *"But I still see that popup for
+    /// Edge everytime"*, then *"Microsoft (tivity) fils msedge"*.
+    ///
+    /// They bound a vault item to `msedge.exe`. A browser is one process for
+    /// every site, so the binding matched every Edge window there has ever
+    /// been -- every tab, every page -- and the prompt fired constantly. The
+    /// item it offered was right only by coincidence.
+    ///
+    /// Deleting either guard gives, for the first title below,
+    ///     left: Some("m365")  right: None
+    #[test]
+    fn a_process_only_browser_binding_matches_no_window_at_all() {
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[entry("m365", "msedge.exe", TriggerMode::Prompt)]);
+
+        for title in [
+            // The site they meant...
+            "Sign in to your account - Microsoft Edge",
+            // ...and every other site, which is the defect.
+            "Your bank - Microsoft Edge",
+            "Breaking news - Microsoft Edge",
+            "New tab - Microsoft Edge",
+            "",
+        ] {
+            assert_eq!(
+                engine.lookup_parts("msedge.exe", title).map(|(id, _)| id),
+                None,
+                "msedge.exe still matches {title:?}. A browser is one process for every site \
+                 you visit, so this binding fires on all of them and the item it offers is \
+                 right only by coincidence"
+            );
+        }
+    }
+
+    /// **`rebuild` keeps a browser out of the process table**, said about the
+    /// table rather than through `lookup_parts` -- the invariant that function
+    /// cannot state, exactly as
+    /// `rebuild_keeps_the_frame_host_out_of_the_process_table` cannot be
+    /// stated through it either.
+    ///
+    /// It matters because the two guards agree on `is_browser_process` by
+    /// hand. The day `lookup_parts` grows a caller that reads `by_process`
+    /// directly, or its browser branch is refactored away as "redundant", this
+    /// filter is the only thing left -- and if it has meanwhile rotted, the
+    /// owner's Edge popup is back.
+    ///
+    /// Built with a real app beside the browser one, so that a `rebuild` which
+    /// filtered out everything fails it too.
+    #[test]
+    fn rebuild_keeps_a_browser_out_of_the_process_table() {
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[
+            entry("m365", "msedge.exe", TriggerMode::Prompt),
+            entry("ledgerline", "Ledgerline.exe", TriggerMode::Auto),
+        ]);
+
+        // Deleting the `is_browser_process` half of the filter gives
+        //     left: ["ledgerline.exe", "msedge.exe"]
+        //     right: ["ledgerline.exe"]
+        let mut keys: Vec<&str> = engine.by_process.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["ledgerline.exe"],
+            "the process table is {keys:?}. msedge.exe is one process for every site on the \
+             web, so an entry keyed on it there is a match on all of them -- and the only \
+             other thing standing between that entry and the user is one `if` in the private \
+             `lookup_parts`"
+        );
+    }
+
+    /// The second, independent guard: even if a browser name somehow reached
+    /// the process table, a browser window would not read it. Built by hand
+    /// rather than through `rebuild` (which filters it out) so this tests
+    /// `lookup_parts` alone -- the same construction
+    /// `a_host_owned_window_is_never_answered_from_the_process_table` uses,
+    /// for the same reason.
+    #[test]
+    fn a_browser_window_is_never_answered_from_the_process_table() {
+        let mut engine = MatchEngine::new();
+        engine.by_process.insert(
+            "msedge.exe".to_string(),
+            ("m365".to_string(), AppMatch::for_process("msedge.exe", TriggerMode::Prompt)),
+        );
+
+        // Deleting the `is_browser_process` branch from `lookup_parts` gives
+        //     left: Some("m365")  right: None
+        assert_eq!(engine.lookup_parts("msedge.exe", "Anything").map(|(id, _)| id), None);
+        // Positive control: the table really does hold that entry, so the
+        // `None` above is the routing and not an empty engine.
+        assert_eq!(
+            engine.by_process.get("msedge.exe").map(|(id, _)| id.as_str()),
+            Some("m365")
+        );
+    }
+
+    /// **Every name `app` calls a browser is refused, and nothing near one
+    /// is.**
+    ///
+    /// Driven off [`crate::app::BROWSER_IMAGE_NAMES`] rather than off a list
+    /// written here, which is the point: this file keeps no second opinion
+    /// about what a browser is, so a name added there is covered here on the
+    /// same commit.
+    #[test]
+    fn every_browser_the_app_recognises_is_refused_and_nothing_else_is() {
+        assert!(!crate::app::BROWSER_IMAGE_NAMES.is_empty());
+        for name in crate::app::BROWSER_IMAGE_NAMES {
+            let mut engine = MatchEngine::new();
+            engine.rebuild(&[entry("item", name, TriggerMode::Prompt)]);
+            assert!(engine.by_process.is_empty(), "{name} reached the process table");
+            assert!(
+                engine.lookup_parts(name, "A Page").is_none(),
+                "{name} still matches, so a binding to it fires on every site"
+            );
+            // Case-folded, because Windows hands the same image back with
+            // different capitalisation depending on how it was launched -- and
+            // a case-sensitive guard is a guard with a trivial bypass.
+            assert!(engine.lookup_parts(&name.to_uppercase(), "A Page").is_none(), "{name}");
+        }
+
+        // **A browser this build does not recognise keeps matching**, which is
+        // the deliberate failure direction and the positive control for every
+        // assertion above: a guard that refused everything would pass them all
+        // and leave the whole feature inert. The unrecognised browser gets
+        // today's behaviour -- the over-eager prompt, which is a thing the user
+        // can see and report -- rather than a match that went quiet for a
+        // reason no list explains.
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[entry("pale", "palemoon.exe", TriggerMode::Prompt)]);
+        assert_eq!(engine.lookup_parts("palemoon.exe", "A Page").map(|(id, _)| id), Some("pale"));
+
+        // And not a substring, a prefix or a suffix of a listed name, which is
+        // how a real application loses the ability to be matched at all.
+        for near in ["notchrome.exe", "chrome.exe.exe", "chrome", "msedgewebview2.exe"] {
+            let mut engine = MatchEngine::new();
+            engine.rebuild(&[entry("real", near, TriggerMode::Prompt)]);
+            assert_eq!(
+                engine.lookup_parts(near, "A Window").map(|(id, _)| id),
+                Some("real"),
+                "{near} is not a browser this build names, and a real app must stay matchable"
+            );
+        }
+    }
+
+    /// **The escape hatch that is deliberately absent, and the reason it is.**
+    ///
+    /// The obvious way to "rescue" a browser binding is the one the frame host
+    /// already has: require a title needle. `lookup`'s own doc refuses it, and
+    /// refused it before any of this was written -- *"a page can name its own
+    /// tab"*. A browser is the one process on the desktop whose window title
+    /// is written by a stranger.
+    ///
+    /// So a browser entry carrying a title -- which is exactly the shape one
+    /// shipped commit wrote, for every row including browser rows -- must
+    /// reach neither table. Adding a "browsers may match on their title"
+    /// branch to `lookup_parts` fails the second assertion; adding browsers to
+    /// `window_watch::HOST_PROCESSES`, the other tempting symmetry, fails the
+    /// first.
+    #[test]
+    fn a_browser_binding_never_becomes_a_title_needle() {
+        let stored = r#"{"process":"msedge.exe","title":"Ledgerline - Invoices","path":"C:\\Apps\\msedge.exe","trigger":"prompt"}"#;
+        let m = AppMatch::from_field_value(stored).expect("the shipped four-key shape must parse");
+        assert_eq!(m.title, "Ledgerline - Invoices", "the premise: it carries a title");
+
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[("bank".to_string(), m)]);
+
+        assert!(
+            engine.by_title.is_empty(),
+            "a browser's title became a needle: {:?}. The page chose that string",
+            engine.by_title
+        );
+        assert!(engine.by_process.is_empty(), "a browser reached the process table");
+        // The page wearing its own saved title still gets nothing...
+        assert_eq!(engine.lookup_parts("msedge.exe", "Ledgerline - Invoices"), None);
+        // ...and neither does a host frame wearing it, which is the crossover
+        // `a_title_saved_for_an_ordinary_desktop_app_is_not_a_needle_for_a_store_frame`
+        // guards for ordinary apps and this guards for browsers.
+        assert_eq!(engine.lookup_parts(HOST, "Ledgerline - Invoices"), None);
+    }
+
+    #[test]
+    fn dropping_a_browser_entry_does_not_drop_the_good_ones_beside_it() {
+        // The positive control for the refusals above, in the shape
+        // `dropping_a_host_entry_does_not_drop_the_good_ones_beside_it` uses:
+        // a `rebuild` that filtered out everything, or a `lookup_parts` that
+        // answered `None` unconditionally, would satisfy every "the browser is
+        // not matched" assertion while making the whole feature inert.
+        // Inverting the browser filter's sense gives
+        //     "a real app stopped being matched"
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&[
+            entry("m365", "msedge.exe", TriggerMode::Prompt),
+            entry("ledgerline", "Ledgerline.exe", TriggerMode::Auto),
+            hosted("keepsolid", "KeepSolid.exe", "KeepSolid"),
+        ]);
+
+        assert!(
+            engine.lookup_parts("Ledgerline.exe", "").is_some(),
+            "a real app stopped being matched"
+        );
+        assert!(
+            engine.lookup_parts(HOST, "KeepSolid").is_some(),
+            "a suspended Store app stopped being matched by its title"
+        );
+        assert!(engine.lookup_parts("msedge.exe", "Anything").is_none());
+    }
+
+    /// **This file keeps no second opinion about what a browser is.**
+    ///
+    /// The sibling of `app`'s own
+    /// `the_browser_list_is_the_only_place_a_browser_is_named`, which pins the
+    /// list as the single source but can only see `app.rs` and `main.rs`. This
+    /// says the same thing about the file that has just become the list's
+    /// second consumer: the shipping half of `match_engine.rs` names no
+    /// browser at all and asks [`crate::app::browser_window`] instead.
+    ///
+    /// Pasting the list in here -- the change that makes the dependency arrow
+    /// point the tidy way -- would compile, ship, and disagree with `app`'s
+    /// copy on the first browser either of them forgot. That is the "two
+    /// enumerations that must agree" shape this codebase keeps finding defects
+    /// in, and it fails here instead.
+    ///
+    /// **Comments are stripped before the count, where `app`'s version counts
+    /// the whole production half.** The property being pinned is "no
+    /// executable statement here names a browser", and the docs above
+    /// deliberately do name one: the owner reported `msedge.exe` by name, and
+    /// a doc that would not say which browser broke is a worse doc. A sentence
+    /// cannot disagree with a list at runtime; a second `const` can. The
+    /// stripper is itself driven by `named_in_code`'s positive control below,
+    /// so "strip everything" cannot be how this test passes.
+    #[test]
+    fn the_browser_rule_asks_app_rather_than_keeping_a_second_list() {
+        let source = include_str!("match_engine.rs");
+        // Everything from the first test module on is test text -- the tests
+        // above name browsers as sample windows, quite properly. The claim is
+        // about the half of the file that ships.
+        let boundary = source.find(concat!("mod ", "tests {")).expect(
+            "match_engine.rs's test module is gone, so this pin no longer knows where the \
+             shipping half of the file ends",
+        );
+        let production = &source[..boundary];
+        assert!(
+            production.contains(concat!("fn is_browser", "_process(exe_name: &str)")),
+            "the boundary landed before `is_browser_process`, so `production` does not contain \
+             the rule this test is about"
+        );
+        let code = strip_comment_lines(production);
+        assert!(
+            code.contains(concat!("browser", "_window(exe_name)")),
+            "the stripper removed the one call this file makes, so a zero count below would \
+             mean nothing"
+        );
+        for name in crate::app::BROWSER_IMAGE_NAMES {
+            assert_eq!(
+                code.matches(*name).count(),
+                0,
+                "{name} is named by code in match_engine.rs, which must ask \
+                 `app::browser_window` rather than keep a second opinion about what a browser is"
+            );
+        }
+    }
+
+    /// Every line whose first non-whitespace characters are `//` removed --
+    /// which covers `///`, `//!` and a plain `//` alike. Block comments are
+    /// not handled because this file has none and a stripper that guessed at
+    /// them would be the untested thing the pin above depends on.
+    fn strip_comment_lines(source: &str) -> String {
+        source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The positive control for the stripper the pin above rests on: a
+    /// stripper that removed everything, or that removed nothing, would make
+    /// that test meaningless in one direction or fail it in the other.
+    #[test]
+    fn named_in_code() {
+        let planted = concat!(
+            "/// A doc naming chrome", ".exe\n",
+            "    // and a comment naming chrome", ".exe\n",
+            "    const X: &str = \"chrome", ".exe\";\n"
+        );
+        let stripped = strip_comment_lines(planted);
+        assert_eq!(
+            stripped.matches("chrome.exe").count(),
+            1,
+            "the stripper kept {stripped:?}"
+        );
+        assert!(stripped.contains("const X"), "the stripper ate the code: {stripped:?}");
     }
 }
