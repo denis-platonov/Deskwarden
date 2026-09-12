@@ -1229,6 +1229,13 @@ struct Inner {
     /// Whether the tail has already been logged, so it is logged once per
     /// overlay rather than once per frame.
     registered: bool,
+    /// When the viewport was registered, and how many ROOT frames have run
+    /// since. Together these two say whether the tail is the event loop
+    /// WORKING or the event loop WAITING -- which is the difference between a
+    /// spinner that freezes and one that keeps moving through the wait, and
+    /// therefore between two completely different fixes.
+    registered_at: Option<Instant>,
+    frames_since_registered: u32,
     /// When the prescan's worker finished, so the frames after it can be
     /// measured against it.
     ///
@@ -1734,6 +1741,8 @@ impl RegionOverlay {
                 picture: None,
                 answered: None,
                 registered: false,
+                registered_at: None,
+                frames_since_registered: 0,
             })),
         })
     }
@@ -2130,6 +2139,24 @@ impl RegionOverlay {
             // `compose` only answers `true` when told the window exists, so
             // the handle is there; kept for the reveal, a frame or more away.
             locked(&self.inner).hwnd = found;
+            // **The tail, closed.** How long `eframe` took to build this
+            // window and its surface after the frame that asked for it, and
+            // how many ROOT frames ran in the meantime. See
+            // `Inner::registered_at`: the two numbers together say whether the
+            // waiting card's bar kept moving through that wait or stood still
+            // in it, and those are two different defects with two different
+            // fixes.
+            {
+                let held = locked(&self.inner);
+                if let Some(at) = held.registered_at {
+                    log::info!(
+                        "region overlay: the window existed {} ms after the viewport was \
+                         registered, with {} root frame(s) painted in between",
+                        at.elapsed().as_millis(),
+                        held.frames_since_registered,
+                    );
+                }
+            }
             let Some(hwnd) = found else {
                 return;
             };
@@ -2721,6 +2748,17 @@ impl RegionOverlay {
         // long as the user held still.
         ctx.request_repaint_of(region_viewport());
 
+        // One per ROOT frame from here on, which is exactly the frame the
+        // waiting card is painted on: a tail with sixty of these in it is a
+        // loop that kept running and a spinner that kept moving, and a tail
+        // with two is a loop that was inside `eframe` building a window.
+        {
+            let mut held = locked(&self.inner);
+            if held.registered {
+                held.frames_since_registered = held.frames_since_registered.saturating_add(1);
+            }
+        }
+
         // **The first frame that registers the viewport, timed against the
         // worker.** See `Inner::answered`: everything from here on is on the
         // event-loop thread and cannot be moved off it, so the only useful
@@ -2731,6 +2769,7 @@ impl RegionOverlay {
             let mut held = locked(&self.inner);
             if !held.registered {
                 held.registered = true;
+                held.registered_at = Some(Instant::now());
                 if let Some(answered) = held.answered {
                     log::info!(
                         "region overlay: the viewport is registered {} ms after the prescan \

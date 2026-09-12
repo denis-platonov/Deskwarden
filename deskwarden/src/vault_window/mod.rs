@@ -6334,6 +6334,23 @@ pub fn build_frame_with_search(
                 // moment later across a period boundary. It is a `Zeroizing`
                 // from the moment it exists and is never named by the action
                 // that asked for it.
+                // **6c's rows, on the same terms as the live code.** The
+                // owner: "also make copiaeble the rest of the fields". The
+                // action names the ROW and the value is asked for here, so
+                // the seed -- which is one of the three -- never travels
+                // through an enum that does not wipe.
+                totp_add::TotpAddAction::CopyField(field) => {
+                    match totp_add::field_to_copy(state, field) {
+                        Some(value) => crate::clipboard::copy_secret(&value),
+                        // Unreachable from the card, whose rows do not sense a
+                        // press when there is nothing to copy. A warning
+                        // rather than a silent drop.
+                        None => log::warn!(
+                            "the add-a-code card asked to copy {field:?}, which has no value; \
+                             the click was dropped"
+                        ),
+                    }
+                }
                 totp_add::TotpAddAction::CopyCode => {
                     match totp_add::code_to_copy(state, now_unix) {
                         Some(code) => crate::clipboard::copy_secret(&code),
