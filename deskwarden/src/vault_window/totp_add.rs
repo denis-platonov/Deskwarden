@@ -1067,13 +1067,46 @@ pub fn refusal_sentence(refusal: &OtpRefusal) -> String {
 /// Length-shaped rather than a fixed run, so the row says how much seed there
 /// is without saying what it is -- and so an eight-character seed and a
 /// thirty-two-character one do not look identical.
+/// **This app's general rule is the opposite**, and the exception is this
+/// card's alone. `theme::MASKED_BULLETS` forbids a length-tracking mask -- it
+/// tells a shoulder-surfer how many characters to expect -- and the Send
+/// composer's password row obeys it. This row does not, because it is the
+/// CONFIRMATION of a seed the user has just captured off their own screen,
+/// with a Reveal sitting beside it: the question it answers is "is this the
+/// thing I scanned", and a mask the same shape for every seed answers
+/// nothing.
 pub fn masked(secret: &str) -> String {
-    let mut out = String::with_capacity(secret.len() + secret.len() / 4 + 1);
-    for (i, _) in secret.chars().enumerate() {
+    in_fours(&"\u{2022}".repeat(secret.chars().count()))
+}
+
+/// The same seed with the same grouping, for when it is actually shown.
+///
+/// **The masked row and the revealed row are one shape.** They were two: the
+/// mask came in groups of four and the seed came out as one unbroken run, so
+/// pressing Reveal changed the row's LENGTH as well as its contents -- a
+/// 26-character seed masked to 26 bullets plus six spaces, revealed to 26
+/// characters and none. The owner: "make secret lenths same as real - right
+/// now it is some random number and also diff formatting should be same".
+///
+/// The grouping is also what a seed being READ wants. This row exists to be
+/// checked against a screen or typed somewhere else; base32 in fours is how
+/// authenticators print it, and 6d's own field accepts spaces for the same
+/// reason (`spaces ignored`).
+pub fn grouped_secret(secret: &str) -> String {
+    in_fours(secret)
+}
+
+/// `text` with a space after every fourth character.
+///
+/// One function, so the mask and the seed cannot come to be grouped
+/// differently -- which is precisely what had happened.
+fn in_fours(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 4 + 1);
+    for (i, c) in text.chars().enumerate() {
         if i > 0 && i % 4 == 0 {
             out.push(' ');
         }
-        out.push('\u{2022}');
+        out.push(c);
     }
     out
 }
@@ -4721,8 +4754,11 @@ fn draw_field_table(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd) {
                 ui,
                 SECRET_ROW_LABEL,
                 |ui| {
+                    // Both forms go through the same grouping, so Reveal
+                    // changes what the row says and not how long it is.
+                    // See [`grouped_secret`].
                     let shown = if state.revealed {
-                        auth.secret.to_string()
+                        grouped_secret(&auth.secret)
                     } else {
                         masked(&auth.secret)
                     };
@@ -4799,6 +4835,11 @@ fn table_row(
             ui.allocate_exact_size(egui::vec2(FIELD_LABEL_W, 0.0), egui::Sense::hover());
         ui.add_space(FIELD_GAP);
         value(ui);
+        // Clear air between the value and whatever the row ends with. The
+        // trailing control is laid out right-to-left in what the value has
+        // LEFT, so a long value and a `Reveal` can end up touching -- which a
+        // 26-character seed does, and a 16-character one does not.
+        ui.add_space(FIELD_GAP);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(FIELD_PAD_X);
             trailing(ui);
@@ -4809,14 +4850,20 @@ fn table_row(
     let row = cell_and_row.response.rect;
     let font = egui::FontId::proportional(FIELD_LABEL_PX);
     let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), theme::TEXT_FAINT);
-    // Centred on the row, then dropped by the ink offset -- the face inks
-    // only the upper part of its row box, so a galley centred by its BOX
-    // reads high. See `theme::ink_drop`, which measures it.
+    // **Centred by its BOX, and deliberately NOT by its ink.**
+    //
+    // `theme::ink_drop` is the right correction for a line sitting alone in a
+    // band -- the face inks only the upper part of its row box, so box-centring
+    // reads high. It is the wrong correction HERE, because the thing this
+    // caption has to line up with is the VALUE beside it, and the value is
+    // placed by egui's own layout, which centres its box. Correcting one of
+    // the two and not the other is what put them a couple of points apart --
+    // "also feels that key and value not on the same level", reported against
+    // the first version of this fix.
+    //
+    // Both boxes, centred the same way, sit level whatever their faces do.
     ui.painter().galley(
-        egui::pos2(
-            cell.left(),
-            row.center().y - galley.size().y / 2.0 + theme::ink_drop(ui.ctx(), &font, None),
-        ),
+        egui::pos2(cell.left(), row.center().y - galley.size().y / 2.0),
         galley,
         theme::TEXT_FAINT,
     );
@@ -5959,7 +6006,11 @@ mod tests {
             draw_add_form(ui, &mut state, BOUNDARY);
         });
         assert!(
-            revealed.has("JBSWY3DPEHPK3PXP"),
+            // **Grouped**, because the revealed row and the masked one are
+            // one shape now -- see `grouped_secret`. Built through the same
+            // function the row uses rather than written out in fours, so a
+            // change to the grouping moves the assertion with it.
+            revealed.has(&grouped_secret("JBSWY3DPEHPK3PXP")),
             "Reveal showed nothing, so the masked assertion above proves nothing: {:?}",
             revealed.0
         );
@@ -7794,7 +7845,11 @@ mod tests {
             draw_stage(ui, &mut state, BOUNDARY);
         });
         assert!(
-            revealed.has("JBSWY3DPEHPK3PXP"),
+            // **Grouped**, because the revealed row and the masked one are
+            // one shape now -- see `grouped_secret`. Built through the same
+            // function the row uses rather than written out in fours, so a
+            // change to the grouping moves the assertion with it.
+            revealed.has(&grouped_secret("JBSWY3DPEHPK3PXP")),
             "Reveal showed nothing, so the masked assertions above prove nothing"
         );
     }
