@@ -6301,292 +6301,30 @@ fn section<R>(
     inner
 }
 
-/// **Which cards this draft is actually going to draw, and what number 8a
-/// puts beside each.**
+/// **The sections rail is gone, and this is where it was.**
 ///
-/// The rail is drawn BEFORE the cards -- it is a left panel and they are in
-/// the scroll area beside it -- so it cannot find out by watching. This is the
-/// one decision both read, which is what keeps a rail entry from scrolling to
-/// a card that is not there.
+/// A 212-point left column listing every card, with counts, a dirty dot, a
+/// `Changed` list and the form's shortcuts under it. §8a draws one
+/// (`grid-template-columns: 212px 1fr`), and it was built from that.
 ///
-/// The count is 8a's own: its rail reads `Autofill targets  4` and `Custom
-/// fields  2`, and the number is the number of ROWS in the card. `None` where
-/// there is nothing to count -- 8a leaves those entries bare rather than
-/// printing a `1`, and a `1` beside `Notes` would be a quantity of nothing.
-fn drawn_sections(
-    kind: ItemKind,
-    creating: bool,
-    draft: &EditDraft,
-    shown: &[Slot],
-) -> Vec<(Section, Option<usize>)> {
-    let mut sections = vec![(Section::Item, None), (Section::Details, None)];
-    if shown.contains(&Slot::Totp) {
-        sections.push((Section::OneTimeCode, None));
-    }
-    // Always: the app row is offered whether or not anything is bound, because
-    // this form is the only place a binding is made. See the card's own note.
-    let targets = draft.uris.len() + usize::from(draft.app.as_ref().is_some_and(|a| a.bound));
-    sections.push((Section::Autofill, (targets > 0).then_some(targets)));
-    if draft.app.as_ref().is_some_and(|app| app.bound) {
-        sections.push((Section::FillRule, None));
-    }
-    // The fields the form DRAWS, not the vector's length: a
-    // `deskwarden:app-match` rides in the same list and is not a custom field
-    // the user put there. See [`FieldRole`].
-    let fields = draft
-        .fields
-        .iter()
-        .filter(|f| matches!(f.role, FieldRole::Text | FieldRole::Hidden))
-        .count();
-    sections.push((Section::CustomFields, (fields > 0).then_some(fields)));
-    if draws_own_notes_box(kind, creating) {
-        sections.push((Section::Notes, None));
-    }
-    sections
-}
-
-/// **Design 8a's section rail**, or nothing at all when the pane cannot
-/// afford one.
+/// The owner took it out: "remove sections panel - that one is jsut our nav
+/// menu that wasn't exactly designed". §8a is a WHOLE WINDOW and its rail is
+/// that window's navigation; this form is a pane in a window that already has
+/// a sidebar and an item list down its left-hand side, so the rail was a
+/// third column of chrome in the same direction -- and the one thing it could
+/// do that they cannot, jumping to a card, is a scroll the user can do with
+/// the wheel they already have their hand on.
 ///
-/// # Why this is a panel inside the form and not the window's own rail
+/// **What went with it, and what did not.** Gone: the entries, their counts,
+/// the `SECTIONS` heading, the `Changed` list, the shortcut footnote, and the
+/// click-to-scroll machinery that carried a request between frames. Kept: the
+/// `Changed` MARK on each card, which was never the rail's -- it is
+/// `theme::section_card_header`'s, and that function's own doc argues for it
+/// on exactly this ground, that a dirty state visible only in a column that
+/// is only sometimes on screen is a dirty state the user cannot rely on.
 ///
-/// 8a's rail is 212 points wide and it REPLACES the sidebar and the item list:
-/// 8a is a full window whose left column is `SECTIONS` and whose right column
-/// is the card grid and the footer. This form is not a window. It is drawn
-/// into the vault window's detail pane by `vault_window::mod`, beside a
-/// sidebar and an item list that are still on screen and still that window's,
-/// and turning the editor into a full-window mode is a change to the window's
-/// own layout -- the panel order, the slide animation, the list -- in a file
-/// this work does not own. What is built here is the rail's JOB, in the room
-/// the form actually has.
-///
-/// # Why it is sometimes not drawn
-///
-/// The detail pane is [`RAIL_WIDTH`] + a little at the shipped window size and
-/// **298 points at `settings::MIN_VAULT_WINDOW_SIZE`**. A 212-point rail there
-/// would leave 86 points of card, which is not a narrower form, it is no form.
-/// So the rail appears when the cards can still keep at least the width they
-/// have at the window's floor, and vanishes below that. The form loses a
-/// navigation aid and keeps every control, which is the right way round; the
-/// `Changed` marks are on the cards themselves for this reason (see
-/// `theme::section_card_header`), so nothing the rail says is only said there.
-///
-/// # Why it NAVIGATES and does not filter
-///
-/// A filter was the other candidate and it is the wrong one, twice over:
-///
-/// * **The marks would contradict it.** The rail's whole second job is to say
-///   which sections have unsaved changes. That is a statement about cards the
-///   user is not looking at -- and a filter answers it by hiding them, which
-///   is the one response that makes the mark useless.
-/// * **Save would write what the user cannot see.** This form has one Save and
-///   it commits the whole draft. A filtered form would let a user narrow to
-///   `Notes`, look at one card, and press a button that writes a password
-///   they had edited and then filtered away. Scrolling leaves everything on
-///   screen and merely moves the viewport, so what Save writes is always what
-///   the form showed.
-///
-/// Answers whether it drew anything, because the card column has to inset
-/// itself from the rail's edge and must not inset itself from nothing.
-fn draw_section_rail(
-    ui: &mut egui::Ui,
-    kind: ItemKind,
-    sections: &[(Section, Option<usize>)],
-    changes: &[Change],
-) -> bool {
-    if ui.available_width() < RAIL_WIDTH + RAIL_CARD_FLOOR {
-        return false;
-    }
-    egui::Panel::left("detail-edit-rail")
-        .exact_size(RAIL_WIDTH)
-        .resizable(false)
-        .show_separator_line(false)
-        .frame(
-            egui::Frame::new()
-                // 8a's `background: #ffffff; border-right: 1px solid #eae7e7`
-                // and `padding: 16px 10px`. The right edge is drawn below
-                // rather than by the panel's own separator line, which is
-                // egui's darker stroke.
-                .fill(theme::CARD)
-                .inner_margin(Margin { left: 10, right: 10, top: 4, bottom: 14 }),
-        )
-        .show(ui, |ui| {
-            let edge = ui.max_rect();
-            ui.painter().rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(edge.right() + 10.0 - 1.0, edge.top() - 4.0),
-                    egui::vec2(1.0, edge.height() + 18.0),
-                ),
-                egui::CornerRadius::ZERO,
-                theme::HAIRLINE,
-            );
-            theme::eyebrow(ui, RAIL_HEADING);
-            ui.add_space(8.0);
-            for (section, count) in sections {
-                let marked = changes.iter().any(|change| change.section == *section);
-                if rail_entry(ui, section.title(kind), *count, marked) {
-                    ask_rail_for(ui.ctx(), *section);
-                }
-            }
-            ui.add_space(theme::BLOCK_GAP);
-            // 8a's `Changed` list, under a rule. Only when there is one --
-            // an empty heading is furniture.
-            if !changes.is_empty() {
-                theme::hairline(ui);
-                ui.add_space(theme::BLOCK_GAP);
-                theme::eyebrow(ui, theme::CHANGED_PILL);
-                ui.add_space(6.0);
-                for change in changes {
-                    ui.label(
-                        RichText::new(change.label).size(12.0).color(theme::TEXT_SECONDARY),
-                    );
-                }
-            }
-        });
-    true
-}
-
-/// The clear space between the rail's edge and the first card.
-///
-/// 8a's card column is `padding: 20px 28px 0` inside its own grid cell; 28
-/// there is 2.3% of a 1240-point window, and the same proportion of this pane
-/// is 15. It is 14 because that is what every other gap on this form already
-/// is -- [`theme::SECTION_ROW_GAP`] -- and because a card sitting flush
-/// against the rail's hairline reads as a panel welded to the chrome rather
-/// than as a card laid on the page, which is what the first render of this
-/// grid looked like.
-const RAIL_GUTTER: i8 = 14;
-
-/// One row of the rail: 8a's `padding: 8px 10px; border-radius: 8px;
-/// font-size: 13px`, with its count pushed to the right edge and the dirty dot
-/// beside it.
-///
-/// Answers whether it was clicked.
-fn rail_entry(ui: &mut egui::Ui, title: &str, count: Option<usize>, marked: bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), RAIL_ENTRY_HEIGHT),
-        egui::Sense::click(),
-    );
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        // 8a lights its CURRENT section `#eef2fc`. There is no current
-        // section here -- every card is on screen at once and the rail only
-        // scrolls -- so the wash is spent on the row under the pointer
-        // instead, which is the thing about to happen rather than a state
-        // this rail does not have.
-        ui.painter().rect_filled(
-            rect,
-            egui::CornerRadius::same(RAIL_ENTRY_RADIUS),
-            theme::BLUE_WASH,
-        );
-    }
-    let galley = ui.painter().layout(
-        title.to_string(),
-        egui::FontId::new(13.0, egui::FontFamily::Proportional),
-        theme::INK,
-        // Everything but the padding and the widest trailing mark, so a long
-        // title is elided rather than laid over its own count.
-        (rect.width() - RAIL_ENTRY_PAD_X * 2.0 - RAIL_TRAIL).max(1.0),
-    );
-    ui.painter().galley(
-        egui::pos2(
-            rect.left() + RAIL_ENTRY_PAD_X,
-            rect.center().y - galley.size().y / 2.0,
-        ),
-        galley,
-        theme::INK,
-    );
-    let mut right = rect.right() - RAIL_ENTRY_PAD_X;
-    if marked {
-        // 8a's `width: 6px; height: 6px; border-radius: 999px; background:
-        // #e0a419` beside `Credentials`. A dot and not the word, because the
-        // rail already spells the changed fields out below and nine repeats of
-        // `Changed` down one column is a column of one word.
-        ui.painter().circle_filled(
-            egui::pos2(right - RAIL_DOT / 2.0, rect.center().y),
-            RAIL_DOT / 2.0,
-            theme::CAUTION_MARK,
-        );
-        right -= RAIL_DOT + 6.0;
-    }
-    if let Some(count) = count {
-        let counted = ui.painter().layout_no_wrap(
-            count.to_string(),
-            egui::FontId::new(11.0, egui::FontFamily::Proportional),
-            theme::TEXT_GHOST,
-        );
-        ui.painter().galley(
-            egui::pos2(right - counted.size().x, rect.center().y - counted.size().y / 2.0),
-            counted,
-            theme::TEXT_GHOST,
-        );
-    }
-    response.clicked()
-}
-
-/// The rail's width: **`vault_window::SIDEBAR_WIDTH` exactly**, which is 8a's
-/// own `212px`.
-///
-/// The same constant the window's sidebar is, and not a same-valued literal,
-/// because 8a's rail is the sidebar's column: a user who resizes nothing sees
-/// the editor's rail begin and end where the sidebar they were just looking at
-/// did. A second 212 here is a second 212 to move.
-const RAIL_WIDTH: f32 = super::SIDEBAR_WIDTH;
-
-/// How much room the cards must keep for the rail to be worth drawing.
-///
-/// The detail pane's own content width at `settings::MIN_VAULT_WINDOW_SIZE` --
-/// `900 - 212 - 390 = 298`, less the central panel's 20-point margins either
-/// side. It is the floor the form already survives at, so the rule reads: the
-/// rail appears only when it costs the cards nothing they do not already
-/// cope with.
-const RAIL_CARD_FLOOR: f32 =
-    crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32 - super::SIDEBAR_WIDTH - super::LIST_WIDTH
-        - 40.0;
-
-/// 8a's `SECTIONS`, in the design's own case -- see `theme::eyebrow`, which
-/// deliberately does not uppercase for you.
-const RAIL_HEADING: &str = "SECTIONS";
-
-/// A rail row's height: 8a's `padding: 8px 10px` round a 13px line (~17
-/// points), read as a border-box.
-const RAIL_ENTRY_HEIGHT: f32 = 33.0;
-
-/// A rail row's horizontal padding and corner radius -- 8a's `10px` and `8px`.
-const RAIL_ENTRY_PAD_X: f32 = 10.0;
-const RAIL_ENTRY_RADIUS: u8 = 8;
-
-/// The dirty dot on a rail row: 8a's `width: 6px; height: 6px`.
-const RAIL_DOT: f32 = 6.0;
-
-/// Room kept clear at the right of a rail row for its count and its dot, so a
-/// long title elides instead of running under them.
-const RAIL_TRAIL: f32 = RAIL_DOT + 6.0 + 14.0;
-
-/// The id the rail's request lives under between the frame it is clicked in
-/// and the moment the card it names is drawn.
-fn rail_request_id() -> egui::Id {
-    egui::Id::new("detail-edit-rail-request")
-}
-
-/// Records the section the rail was just clicked on.
-fn ask_rail_for(ctx: &egui::Context, section: Section) {
-    ctx.data_mut(|data| data.insert_temp(rail_request_id(), section));
-}
-
-/// Reads the rail's request **and clears it**.
-///
-/// Taken rather than read, and that is the whole of it: a request left in
-/// place would re-run `scroll_to_rect` on every subsequent frame, so the form
-/// would spring back to the section the user last clicked the moment they
-/// tried to scroll anywhere else. One click, one scroll.
-fn take_rail_request(ctx: &egui::Context) -> Option<Section> {
-    ctx.data_mut(|data| {
-        let asked = data.get_temp::<Section>(rail_request_id());
-        data.remove::<Section>(rail_request_id());
-        asked
-    })
-}
+/// The cards now start at the pane's own margin, which is why the gutter that
+/// held them off the rail's hairline went too.
 
 /// What 8a's `Type` row says: the kind's own noun, in the case the row draws
 /// it in.
@@ -6776,7 +6514,6 @@ pub fn draw_detail_edit(
     let addable = draft.addable_slots(creating);
     let showing = |slot: Slot| shown.contains(&slot);
     let body = form_body(kind, creating);
-    let sections = drawn_sections(kind, creating, draft, &shown);
 
     // **8a's title bar, which is the READ pane's header band.**
     //
@@ -6862,12 +6599,6 @@ pub fn draw_detail_edit(
     // is, and the `ScrollArea` below then gets exactly the rest. The title
     // stays outside both, so it does not scroll away either -- see
     // `edit_pane_layout_tests`, which pins all three facts as geometry.
-    // **8a's section rail**, drawn first so it is full height and the footer
-    // band below it belongs to the card column -- which is the arrangement 8a
-    // itself has (`grid-template-columns: 212px 1fr`, with the footer inside
-    // the second column).
-    let railed = draw_section_rail(ui, kind, &sections, &changes);
-
     egui::Panel::bottom("detail-edit-actions")
         // The strip is part of the pane, not a docked tool window: the pane's
         // own card already carries the only edge this form draws.
@@ -7118,13 +6849,10 @@ pub fn draw_detail_edit(
     // any more, and there must not be: nine bordered cards inside a tenth
     // border is the "card in a card" the design has nowhere on the page.
     egui::Frame::new()
-        // Clear space between the rail's edge and the cards -- and none at all
-        // when there is no rail, where the pane's own margin is already the
-        // inset. See [`RAIL_GUTTER`].
-        .inner_margin(Margin {
-            left: if railed { RAIL_GUTTER } else { 0 },
-            ..Margin::ZERO
-        })
+        // No inset: the cards start at the pane's own margin. This used to
+        // hold them off the section rail's hairline -- see the note where
+        // that rail was.
+        .inner_margin(Margin::ZERO)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
 
@@ -7142,10 +6870,10 @@ pub fn draw_detail_edit(
             let changed = |section: Section| {
                 changes.iter().any(|change: &Change| change.section == section)
             };
-            // The section the rail asked for, TAKEN rather than read: a
-            // request left in place would re-scroll the form on every frame,
-            // so the user could not then scroll away from it by hand.
-            let wanted = take_rail_request(ui.ctx());
+            // Nothing asks this form to scroll to a card any more: the
+            // rail that did is gone, and the wheel is the only thing that
+            // moves this column now.
+            let wanted: Option<Section> = None;
 
             // **8a's `Item` card**: what the record is, as against what it
             // holds. 8a puts Folder, Owner and Type on it in a three-column
@@ -18856,20 +18584,26 @@ mod edit_pane_layout_tests {
             let painted = frame(&ctx, pane, &mut draft, false, &[]);
 
             let mut titles = 0;
-            for (section, _) in drawn_sections(draft.kind, false, &draft, &draft.shown_slots(false))
-            {
-                titles += 1;
+            // **Every section, and every one this draft draws must be a
+            // card.** The list used to come from `drawn_sections`, which was
+            // the RAIL's -- one decision both the rail and the cards read, so
+            // an entry could not scroll to a card that was not there. With
+            // the rail gone that function went too, and a parallel list kept
+            // alive for one test is a list nothing keeps true.
+            //
+            // So this walks `Section::ALL` and judges each on what was
+            // painted: a section this kind does not draw has no title, which
+            // is not a failure; one that DOES must have a card round it. The
+            // floor below is what stops that becoming vacuous.
+            for section in Section::ALL {
                 // **Uppercased**, because the card's band draws §8a's
-                // `text-transform` -- see `theme::section_card_header`. The
-                // rail beside it draws the same string untransformed, which
-                // is what makes this the CARD's title and not the rail's.
+                // `text-transform` -- see `theme::section_card_header`.
                 let title = section.title(draft.kind).to_uppercase();
                 let drawn: Vec<Rect> = painted.rects_of(&title);
-                assert!(
-                    !drawn.is_empty(),
-                    "{pane:?}: the {title:?} card has no title on it at all: {:?}",
-                    painted.strings()
-                );
+                if drawn.is_empty() {
+                    continue;
+                }
+                titles += 1;
                 // The card round it: a white box that contains the title and
                 // is a good deal wider than it -- so a `field_label` sitting
                 // in a flat column, with nothing behind it but the pane,
@@ -18910,226 +18644,71 @@ mod edit_pane_layout_tests {
         assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
     }
 
-    /// **The section rail appears where the cards can still be read, and
-    /// nowhere else.**
+    /// **The section rail is gone, and nothing draws it again by accident.**
     ///
-    /// Both directions, because the rule only means something as a pair: at
-    /// the shipped pane the rail is there, and at the window's floor -- where
-    /// 212 points of it would leave 86 of card -- it is not, and the form
-    /// keeps every control it had.
+    /// The owner took it out: "remove sections panel - that one is jsut our
+    /// nav menu that wasn't exactly designed". §8a has one because §8a is a
+    /// whole window and the rail is that window's navigation; this form is a
+    /// pane in a window whose sidebar and item list are already down its
+    /// left-hand side.
+    ///
+    /// Two tests went with it -- one that the rail appeared only where the
+    /// cards could afford it, and one that clicking an entry scrolled to that
+    /// card -- because their subject is deleted. This is what stands in their
+    /// place: the form draws no second column, at either width.
+    ///
+    /// Asserted on GEOMETRY as well as on the missing heading, because a rail
+    /// that came back under a different heading would satisfy a string test.
+    /// Every card starts at the pane's own left margin now, so nothing on
+    /// this form is laid out in a column of its own.
     #[test]
-    fn the_rail_is_drawn_only_where_the_cards_can_afford_it() {
-        let ctx = styled_context(GRID_PANE);
-        let mut draft = full_login_draft();
-        let _ = frame(&ctx, GRID_PANE, &mut draft, false, &[]);
-        let roomy = frame(&ctx, GRID_PANE, &mut draft, false, &[]);
-        assert!(
-            roomy.strings().contains(&RAIL_HEADING),
-            "the shipped detail pane is wide enough for the rail and has none: {:?}",
-            roomy.strings()
-        );
-        // ...and it really is the design's column, not a narrow strip that
-        // happens to carry the word.
-        let heading = roomy.rect_of(RAIL_HEADING);
-        assert!(
-            heading.left() < RAIL_WIDTH,
-            "the rail heading is at x = {} -- that is not the left column",
-            heading.left()
-        );
-
-        let ctx = styled_context(GRID_MIN_PANE);
-        let mut draft = full_login_draft();
-        let _ = frame(&ctx, GRID_MIN_PANE, &mut draft, false, &[]);
-        let narrow = frame(&ctx, GRID_MIN_PANE, &mut draft, false, &[]);
-        assert!(
-            !narrow.strings().contains(&RAIL_HEADING),
-            "a 212-point rail is being drawn in a {}-point pane, which leaves {} points of \
-             card: {:?}",
-            GRID_MIN_PANE.x,
-            GRID_MIN_PANE.x - RAIL_WIDTH,
-            narrow.strings()
-        );
-        // The control that makes the absence a decision rather than a
-        // casualty: the form is all still there.
-        // The CARDS' own titles, in the band's capitals -- the rail is what
-        // has gone, so a sentence-case hit here would be the rail surviving.
-        for label in ["ITEM", "LOGIN CREDENTIALS"] {
-            assert!(
-                narrow.strings().contains(&label),
-                "{label:?} went with the rail: {:?}",
-                narrow.strings()
-            );
-        }
-    }
-
-    /// **The band is the read pane's own strip, with the name in a box.**
-    ///
-    /// The owner, on the form this replaced: "Edit UI is wrong - it is more
-    /// like same as it is but with editable fields, but your is completely
-    /// off", then "Edit login title is wrong" and "this is not part of
-    /// design".
-    ///
-    /// Four claims, because the report was about the WHOLE strip and any one
-    /// of them alone would pass against three quarters of the old form:
-    ///
-    ///  * the record's name is drawn, and inside a field box -- not as a
-    ///    caption-and-row down in the `Item` card, where it used to be;
-    ///  * the box is §8a's `font-size: 20px`, so it is a TITLE and not one
-    ///    more setting;
-    ///  * the avatar is beside it, which is what makes this the read pane's
-    ///    band rather than a text field with a heading over it;
-    ///  * and the `Item` card no longer carries a `Name` row, so the name is
-    ///    in exactly one place. The old arrangement's own comment argued for
-    ///    the row on the grounds that a title bar and a name box would be
-    ///    "two titles arguing" -- true, and settled by deleting the heading.
-    #[test]
-    fn the_band_is_the_read_panes_own_strip_with_the_name_in_it() {
+    fn the_form_draws_no_section_rail_at_any_width() {
         for pane in GRID_PANES {
             let ctx = styled_context(pane);
             let mut draft = full_login_draft();
             let _ = frame(&ctx, pane, &mut draft, false, &[]);
             let painted = frame(&ctx, pane, &mut draft, false, &[]);
 
-            let name = painted.rect_of(&draft.name);
-            // The box round it: §8a's `height: 38px` field, which is the one
-            // measurement every box in this app shares (`theme::FIELD_HEIGHT`).
-            // Without this the name could be a bare label -- which is exactly
-            // what the READ pane draws, and the difference between the two
-            // panes is that here it can be typed into.
-            //
-            // `intersects` and not `contains_rect`: at the pane's floor the
-            // box is narrower than the name it holds, and a `TextEdit` lays
-            // its galley out at full width and scrolls it -- so the text's
-            // rect runs past the box clipping it. Containment would be
-            // asserting that the name FITS, which is a different claim and
-            // not one §8a makes.
             assert!(
-                painted.rects.iter().any(|(r, fill)| {
-                    *fill == theme::CARD
-                        && r.intersects(name)
-                        && (r.height() - theme::FIELD_HEIGHT).abs() <= 2.0
-                }),
-                "{pane:?}: the record's name is not in a field box, so the band is a heading \
-                 rather than the editable title §8a draws: {:?}",
+                !painted.strings().contains(&"SECTIONS"),
+                "{pane:?}: the rail's heading is back: {:?}",
                 painted.strings()
             );
 
-            // §8a's 20px, read off the galley rather than off the source.
+            // **The cards run the full width of the pane.** A rail would take
+            // a fixed column off their left, so the widest card would start
+            // well inside the pane; with none, the first card's own left edge
+            // is the pane's margin. Read off the ITEM card, found by its
+            // title, rather than off a width -- a card measured by width
+            // alone cannot tell a rail from a narrow window.
+            let title = Section::Item.title(draft.kind).to_uppercase();
+            let card = painted
+                .rects_of(&title)
+                .first()
+                .copied()
+                .unwrap_or_else(|| panic!("{pane:?}: no {title:?} card at all"));
             assert!(
-                (painted.font_of(&draft.name).size - theme::TITLE_FIELD_PX).abs() <= 0.5,
-                "{pane:?}: the name is set at {} and §8a's title is {}",
-                painted.font_of(&draft.name).size,
-                theme::TITLE_FIELD_PX
+                card.left() < SIDEBAR_WIDTH_FLOOR,
+                "{pane:?}: the first card starts at x = {}, which is a column's width \
+                 inside the pane -- something is drawing a rail",
+                card.left()
             );
 
-            // The avatar, which is the read pane's own tile: the monogram of
-            // the DRAFT's name, so it re-letters as the name is typed.
-            assert!(
-                painted.strings().contains(&theme::initials(&draft.name).as_str()),
-                "{pane:?}: the band has no avatar, so it is a text field and not the read \
-                 pane's strip: {:?}",
-                painted.strings()
-            );
-
-            // ...and the name is in ONE place. `Name` was the `Item` card's
-            // first caption; the card's first row is Folder now.
-            //
-            // Scoped to that card rather than to the whole frame, because the
-            // RAIL legitimately prints the word: its `Changed` list names the
-            // FIELDS that have moved, and a renamed record is one of them.
-            // That list is a report about the draft, not a row to type in.
-            let item_card = card_rect(&painted);
-            assert!(
-                !painted
-                    .rects_of("Name")
-                    .iter()
-                    .any(|r| item_card.intersects(*r)),
-                "{pane:?}: the `Item` card still draws a Name row, so the record's name is \
-                 on this form twice: {:?}",
-                painted.strings()
-            );
-        }
-    }
-
-    /// **Clicking a rail entry brings that card into view**, which is the one
-    /// thing the rail is for.
-    ///
-    /// A filter would satisfy "the card the user asked for is on screen" just
-    /// as well and is the wrong answer -- see `draw_section_rail` -- so the
-    /// other half is asserted too: the cards the user did NOT ask for are
-    /// still drawn.
-    #[test]
-    fn clicking_a_rail_entry_scrolls_that_card_into_view() {
-        // A pane the form really overflows, so scrolling is the only thing
-        // that can put the last card on screen.
-        let pane = egui::vec2(GRID_PANE.x, MIN_PANE_HEIGHT);
-        let ctx = styled_context(pane);
-        let mut draft = full_login_draft();
-        let _ = frame(&ctx, pane, &mut draft, false, &[]);
-        let before = frame(&ctx, pane, &mut draft, false, &[]);
-        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
-        // The rail prints this string as it is; the CARD prints it in §8a's
-        // capitals. Both are needed: the entry is found by the first and the
-        // card by the second, and telling them apart by CASE as well as by
-        // column is what stops this test passing on the rail alone.
-        let last = Section::Notes.title(draft.kind);
-        let last_card = last.to_uppercase();
-        // The control: the card is not already on screen, so a green run
-        // below is the rail's doing.
-        // **In the CARD column**, not merely on screen: the rail draws the
-        // very same word in its own entry, so an unqualified search would
-        // find the rail and call the card visible.
-        assert!(
-            !before
-                .rects_of(&last_card)
-                .iter()
-                .any(|r| bounds.contains_rect(*r) && r.left() > RAIL_WIDTH),
-            "the {last:?} card is already in view, so this test is not exercising the rail"
-        );
-
-        // The rail entry, found by its own text in the rail's column.
-        let entry = before
-            .rects_of(last)
-            .into_iter()
-            .find(|r| r.left() < RAIL_WIDTH)
-            .unwrap_or_else(|| {
-                panic!("the rail has no {last:?} entry: {:?}", before.strings())
-            });
-        let _ = frame(&ctx, pane, &mut draft, false, &click(entry.center()));
-        // **Drawn until it settles, not for a fixed count.** egui applies a
-        // scroll-to over several frames, and how many depends on the DISTANCE
-        // -- so a literal number here is a test that passes until the pane's
-        // viewport changes height, which is exactly what happened when 8a's
-        // title band replaced the form's old one-line heading: the same
-        // twelve frames stopped one card short of the target, and the
-        // failure read as "the rail is broken" rather than "the animation
-        // was still running". The bound is generous and the loop leaves the
-        // moment the card is there.
-        let in_card_column = |run: &Painted| {
-            run.rects_of(&last_card)
-                .iter()
-                .any(|r| bounds.contains_rect(*r) && r.left() > RAIL_WIDTH)
-        };
-        let mut after = frame(&ctx, pane, &mut draft, false, &[]);
-        for _ in 0..120 {
-            if in_card_column(&after) {
-                break;
+            // The control, so the assertion above cannot pass on a frame that
+            // drew nothing: the form itself is all still there.
+            for label in ["ITEM", "LOGIN CREDENTIALS", "Folder"] {
+                assert!(
+                    painted.strings().contains(&label),
+                    "{pane:?}: {label:?} went with the rail: {:?}",
+                    painted.strings()
+                );
             }
-            after = frame(&ctx, pane, &mut draft, false, &[]);
         }
-
-        assert!(
-            in_card_column(&after),
-            "clicking the rail's {last:?} entry did not bring the card into view: {:?}",
-            after.strings()
-        );
-        // ...and it did not hide anything: the first card is still drawn.
-        assert!(
-            after.strings().contains(&"Item"),
-            "the rail filtered the form instead of scrolling it: {:?}",
-            after.strings()
-        );
     }
+
+    /// The width a rail would have taken, and therefore the x no card may
+    /// start beyond. `super::SIDEBAR_WIDTH` is what the deleted rail was.
+    const SIDEBAR_WIDTH_FLOOR: f32 = super::super::SIDEBAR_WIDTH;
 
     /// **The footer counts the changes, and says so in words on every width.**
     ///

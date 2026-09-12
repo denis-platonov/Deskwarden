@@ -692,15 +692,17 @@ fn note(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
 }
 
 /// The tick list's own box, from design §5a: `border: 1px solid #eae7e7;
-/// border-radius: 10px`, its rows at `padding: 10px 12px`.
+/// border-radius: 10px`.
 ///
-/// The 10 is split either side of the row rule as [`TICK_ROW_GAP`] rather
-/// than spent as padding on each row, because egui lays these rows out as
-/// widgets in a column and there is no per-row box to pad.
+/// **The list carries no padding of its own**, and that is the change that
+/// made these rows §5a's. Its rows declare `padding: 10px 12px` and its rule
+/// runs edge to edge between them; a padded list would inset that rule and
+/// leave a hairline floating inside a box. So the padding is
+/// [`INCLUDE_PAD_X`]/[`INCLUDE_PAD_Y`], applied per row, and the three
+/// constants that spent it here -- a list padding and a gap split either side
+/// of the rule -- are gone with the column of `egui::Checkbox`es they were
+/// measured for.
 const TICK_LIST_RADIUS: u8 = 10;
-const TICK_LIST_PAD_X: i8 = 12;
-const TICK_LIST_PAD_Y: i8 = 8;
-const TICK_ROW_GAP: f32 = 5.0;
 
 /// The monogram tile beside the record's name in §5a's `RECORD` chip.
 ///
@@ -735,22 +737,307 @@ const RECORD_CHIP_TILE: f32 = 32.0;
 /// says `SP` because its record is called "SAP Production"; ours says
 /// whatever [`theme::initials`] makes of the record actually being sent,
 /// which is the same function the item list and the delete modal use.
-fn record_chip(ui: &mut egui::Ui, item_name: &str) {
+fn record_chip(ui: &mut egui::Ui, item_name: &str, kind_and_folder: &str) {
     egui::Frame::new()
         .fill(theme::BLUE_WASH)
         .stroke(egui::Stroke::new(1.0, theme::BLUE_EDGE))
         .corner_radius(CornerRadius::same(TICK_LIST_RADIUS))
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 theme::avatar(ui, &theme::initials(item_name), RECORD_CHIP_TILE, true);
                 ui.add_space(11.0);
-                // 13px and semibold in [`theme::BLUE_DEEP`], which is §5a's
-                // `#14307a` exactly, and is what this app already paints the
-                // chosen row's name in.
-                ui.label(theme::semibold(item_name, 13.0).color(theme::BLUE_DEEP));
+                // **Two lines, which is §5a's own shape.** The name, and
+                // under it what the record IS and where it lives -- `Login ·
+                // Engineering` in the design. One line was all this drew, and
+                // the owner's verdict on the card as a whole was "very plain
+                // and not even close to this design".
+                //
+                // The second line is the READ pane's subtitle, the same two
+                // facts in the same order, so the chip reads as the row the
+                // composer was opened from rather than as a new naming of it.
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(theme::semibold(item_name, 13.0).color(theme::BLUE_DEEP));
+                    if !kind_and_folder.is_empty() {
+                        ui.label(
+                            egui::RichText::new(kind_and_folder)
+                                .size(11.0)
+                                .color(theme::TEXT_MUTED),
+                        );
+                    }
+                });
             });
         });
+}
+
+/// **One row of §5a's include list.** Answers whether it was clicked.
+///
+/// The whole row is the target, not the 17-point square: §5a draws a row and
+/// a row is what a pointer aims at. `egui::Checkbox` cannot do this -- it
+/// draws its own square at its own size in its own palette and senses only
+/// itself -- which is why this is built out of `theme::opt_in_box` and an
+/// `interact` over the band.
+///
+/// **The password row is tinted, labelled and masked in §5a's red**, and the
+/// three together are the design making one point in the only three ways a
+/// row has: this is the field that travels in the clear. The pill beside the
+/// label says it in words.
+fn include_row(ui: &mut egui::Ui, row: &IncludeRow, enabled: bool) -> bool {
+    let danger = row.field == IncludeField::Password && row.ticked;
+    // §5a's `#b42318` on the ticked password, which is `theme::ERROR`
+    // exactly -- a step louder than the `DANGER_INK` its label is set in, so
+    // the three red things on this row do not all shout at one pitch.
+    let tone = if danger { theme::ERROR } else { theme::BLUE };
+    let mut clicked = false;
+    let band = egui::Frame::new()
+        .fill(if danger { theme::DANGER_WASH } else { egui::Color32::TRANSPARENT })
+        .inner_margin(egui::Margin::symmetric(INCLUDE_PAD_X, INCLUDE_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                theme::opt_in_box(ui, row.ticked, tone);
+                ui.add_space(INCLUDE_GAP);
+                let ink = if danger { theme::DANGER_INK } else { theme::INK };
+                if danger {
+                    ui.label(theme::semibold(row.label, INCLUDE_LABEL_PX).color(ink));
+                    ui.add_space(7.0);
+                    visible_pill(ui);
+                } else {
+                    ui.label(
+                        egui::RichText::new(row.label).size(INCLUDE_LABEL_PX).color(ink),
+                    );
+                }
+                // The value hangs off the right edge, which is §5a's own
+                // `flex: 1` on the label with the value after it. Measured and
+                // right-aligned rather than pushed, so a long address cannot
+                // walk the label off the row.
+                if !row.value.is_empty() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let text = if row.secret {
+                            theme::letterspaced_mono_in(
+                                &row.value,
+                                INCLUDE_VALUE_PX,
+                                0.0,
+                                theme::DANGER_QUIET,
+                                theme::ascent_of(
+                                    ui.ctx(),
+                                    &egui::FontId::new(
+                                        INCLUDE_VALUE_PX,
+                                        egui::FontFamily::Monospace,
+                                    ),
+                                ),
+                            )
+                        } else {
+                            egui::text::LayoutJob::simple_singleline(
+                                row.value.clone(),
+                                egui::FontId::proportional(INCLUDE_VALUE_PX),
+                                theme::TEXT_MUTED,
+                            )
+                        };
+                        ui.label(text);
+                    });
+                }
+            });
+        })
+        .response
+        .rect;
+    // Registered after the contents so it is on top of them -- nothing inside
+    // a row of this list is separately clickable, so there is nothing for it
+    // to steal. Greyed rows are inert, which is what `in_flight` means
+    // everywhere else on this card.
+    if enabled {
+        let hit = ui.interact(band, ui.next_auto_id().with(row.label), egui::Sense::click());
+        if hit.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        clicked = hit.clicked();
+    }
+    clicked
+}
+
+/// §5a's `visible to anyone with the link` pill, beside the password's name.
+///
+/// Its own drawing rather than [`theme::state_pill`]: that one is a 20-point
+/// bordered capsule for a STATE -- Waiting, Used, Changed -- and this is a
+/// `border-radius: 5px` tag with no border and no mark, sitting inline in a
+/// row of text. Two shapes that say different things about a row.
+fn visible_pill(ui: &mut egui::Ui) {
+    egui::Frame::new()
+        .fill(theme::DANGER_PILL)
+        .corner_radius(CornerRadius::same(5))
+        .inner_margin(egui::Margin::symmetric(7, 2))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(VISIBLE_PILL).size(11.0).color(theme::DANGER_QUIET),
+            );
+        });
+}
+
+/// §5a's caution band, minus the promise this build cannot keep.
+///
+/// The design reads "This Send contains a password. Rotate it after the
+/// recipient is done — Deskwarden will offer to when the Send expires."
+/// The second clause describes a feature that does not exist: nothing here
+/// watches a Send's expiry or offers anything when it passes. Shipping the
+/// whole sentence would have been a promise the app does not keep, which is
+/// the defect this project has now shipped twice and has notes about in two
+/// other modules. The first clause is true, is actionable, and is what a
+/// reader does something about.
+pub const PASSWORD_TRAVELS: &str =
+    "This Send contains a password. Rotate it after the recipient is done.";
+
+/// §5a's own words on the password row's pill.
+pub const VISIBLE_PILL: &str = "visible to anyone with the link";
+
+/// §5a's note beside the one-time code row.
+pub const TOTP_ROW_NOTE: &str = "rotates \u{2014} the recipient sees a live code";
+
+/// §5a's `padding: 10px 12px` on an include row.
+const INCLUDE_PAD_X: i8 = 12;
+/// See [`INCLUDE_PAD_X`].
+const INCLUDE_PAD_Y: i8 = 10;
+/// §5a's `gap: 11px` between the tick and the name.
+const INCLUDE_GAP: f32 = 11.0;
+/// §5a's `font-size: 13px` on a row's name.
+const INCLUDE_LABEL_PX: f32 = 13.0;
+/// §5a's `font-size: 12px` on the value beside it.
+const INCLUDE_VALUE_PX: f32 = 12.0;
+
+/// Which of [`RecordSelection`]'s five a row is about.
+///
+/// An enum rather than a `&mut bool` per row, because the seed's tick is not
+/// a plain assignment -- `RecordDraft::set_totp` drops the passphrase when it
+/// goes off -- and a list whose rows held `&mut bool` would have to make that
+/// one row a special case at the point of drawing. The write happens at the
+/// call site, where `draft` is not already borrowed by the row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IncludeField {
+    Username,
+    Password,
+    Uri,
+    Notes,
+    Totp,
+}
+
+/// One row of §5a's include list: the tick, the name, and what would travel.
+pub struct IncludeRow {
+    pub field: IncludeField,
+    /// §5a's label for the field.
+    pub label: &'static str,
+    /// Whether it is going.
+    pub ticked: bool,
+    /// The right-hand text: the value itself where the field has one, and
+    /// §5a's own note where it does not (`rotates — the recipient sees a live
+    /// code`, `3 apps`). Empty draws nothing, which is what §5a does on Notes.
+    pub value: String,
+    /// Whether the value is a secret, and therefore masked and set in the
+    /// monospace face §5a masks it in.
+    pub secret: bool,
+}
+
+/// **§5a's five rows, in §5a's order, with §5a's values beside them.**
+///
+/// Pure, and taking the item rather than reading one, for this file's
+/// standing reason: a decision reachable only from inside a paint closure is
+/// a decision no test can call. Every string a row shows is decided here.
+///
+/// **The value is elided, never the fact of it.** A field the record does not
+/// carry still gets its row -- §5a draws five rows whatever the record holds,
+/// and a list that grew and shrank with the item would make the counter
+/// beside its eyebrow a moving denominator.
+pub fn include_rows(
+    draft: &RecordDraft,
+    item: Option<&crate::vault_bridge::VaultItem>,
+) -> Vec<IncludeRow> {
+    let login = item.and_then(|i| i.login.as_ref());
+    let username = login.and_then(|l| l.username.as_deref()).unwrap_or_default().to_string();
+    // §5a's `3 apps` -- a COUNT and not the addresses themselves, because the
+    // list is unbounded and the row is one line. The word agrees with the
+    // number, so a record with one website does not read `1 apps`.
+    let uris = login.map(|l| l.uris.len()).unwrap_or(0);
+    let has_seed = login.and_then(|l| l.totp.as_ref()).is_some();
+    vec![
+        IncludeRow {
+            field: IncludeField::Username,
+            label: USERNAME_LABEL,
+            ticked: draft.selection.username,
+            value: username,
+            secret: false,
+        },
+        IncludeRow {
+            field: IncludeField::Password,
+            label: PASSWORD_LABEL,
+            ticked: draft.selection.password,
+            // **A fixed mask, not one that tracks the password's length.**
+            // §5a draws twelve bullets and this draws ten, and the difference
+            // is a rule this app already has: `theme::MASKED_BULLETS`'s doc
+            // forbids a length-tracking mask outright, because it tells a
+            // shoulder-surfer how many characters to expect. The row's job is
+            // to say a password is in the parcel, which a constant mask says
+            // exactly as well.
+            value: theme::masked_readout(),
+            secret: true,
+        },
+        IncludeRow {
+            field: IncludeField::Totp,
+            label: TOTP_LABEL,
+            ticked: draft.selection.totp,
+            value: if has_seed { TOTP_ROW_NOTE.to_string() } else { String::new() },
+            secret: false,
+        },
+        IncludeRow {
+            field: IncludeField::Notes,
+            label: NOTES_LABEL,
+            ticked: draft.selection.notes,
+            // §5a draws nothing beside Notes, and nor does this: a note is a
+            // paragraph, and a one-line preview of one is a paragraph's first
+            // few words pretending to be a summary.
+            value: String::new(),
+            secret: false,
+        },
+        IncludeRow {
+            field: IncludeField::Uri,
+            label: URI_LABEL,
+            ticked: draft.selection.uri,
+            value: uri_count(uris),
+            secret: false,
+        },
+    ]
+}
+
+/// §5a's `3 apps`, with the word agreeing with the number and nothing at all
+/// where there is nothing to count.
+pub fn uri_count(uris: usize) -> String {
+    match uris {
+        0 => String::new(),
+        1 => "1 address".to_string(),
+        n => format!("{n} addresses"),
+    }
+}
+
+/// §5a's second chip line: what the record IS, and where it lives.
+///
+/// The design reads `Login · Engineering`, and so does the READ pane's own
+/// subtitle -- `detail::header_subtitle_parts` builds the same two runs from
+/// the same two facts. Built here rather than borrowed from there because
+/// that one paints a folder MARK between the runs and this one is a line of
+/// plain text inside a chip; what is shared is the order and the separator,
+/// which is what makes the chip read as the row it was opened from.
+///
+/// Empty when there is no item, which is the one state that draws no second
+/// line at all rather than a lonely separator.
+fn chip_subtitle(item: Option<&crate::vault_bridge::VaultItem>, folder: Option<&str>) -> String {
+    let Some(item) = item else {
+        return String::new();
+    };
+    let kind = crate::vault_bridge::ItemKind::of(item).label();
+    match folder {
+        Some(name) => format!("{kind} \u{b7} {name}"),
+        None => kind.to_string(),
+    }
 }
 
 /// The export form.
@@ -762,6 +1049,31 @@ pub fn draw_export_form(
     ui: &mut egui::Ui,
     draft: &mut RecordDraft,
     item_name: &str,
+    // **What §5a draws beside each tick, borrowed for the frame and stored
+    // nowhere.**
+    //
+    // §5a's include list is not five bare labels: every row carries the
+    // value that would travel -- the address, the masked password, `3 apps`
+    // -- because the question the card asks is "what travels", and a tick
+    // beside the word `Password` does not answer it. The owner, of the
+    // version without them: "Current UI is very plain and not even close to
+    // this design".
+    //
+    // **This does not break [`RecordDraft`]'s rule**, which is that the form
+    // never holds a record's values BETWEEN frames: this is a borrow that
+    // lives for one paint, exactly as `detail::draw_detail_read` takes the
+    // item it draws. What is still re-resolved by id at submit time is the
+    // record that gets PUBLISHED, which is the half of that rule that
+    // matters.
+    //
+    // `None` where the window cannot find the item any more. The rows then
+    // draw their labels and no values, which is what this card looked like
+    // before -- a degradation, not a panic.
+    item: Option<&crate::vault_bridge::VaultItem>,
+    // The folder's NAME, already resolved by `sidebar::folder_name` -- see
+    // `detail::draw_detail_read`, which takes it for the same line and the
+    // same reason.
+    folder: Option<&str>,
     in_flight: bool,
     now: &dyn crate::send::SendClock,
     zone: &dyn crate::local_time::LocalOffset,
@@ -788,7 +1100,7 @@ pub fn draw_export_form(
             // say that with.
             theme::eyebrow(ui, RECORD_EYEBROW);
             ui.add_space(theme::EYEBROW_GAP);
-            record_chip(ui, item_name);
+            record_chip(ui, item_name, &chip_subtitle(item, folder));
             ui.add_space(theme::BLOCK_GAP);
 
             // **§5a's `INCLUDE` block**, with the design's own running count
@@ -822,50 +1134,32 @@ pub fn draw_export_form(
             egui::Frame::new()
                 .stroke(egui::Stroke::new(1.0, theme::HAIRLINE))
                 .corner_radius(CornerRadius::same(TICK_LIST_RADIUS))
-                .inner_margin(egui::Margin::symmetric(TICK_LIST_PAD_X, TICK_LIST_PAD_Y))
                 .show(ui, |ui| {
-                    let mut first = true;
-                    let rule_between = |ui: &mut egui::Ui, first: &mut bool| {
-                        if *first {
-                            *first = false;
-                        } else {
-                            ui.add_space(TICK_ROW_GAP);
-                            theme::row_rule(ui);
-                            ui.add_space(TICK_ROW_GAP);
+                    ui.set_width(ui.available_width());
+                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+                    // **§5a's rows, each a tick, a name and the value that
+                    // would travel** -- and the rule between them runs edge to
+                    // edge, so the list carries no inner margin of its own and
+                    // every padding below is a row's.
+                    let rows = include_rows(draft, item);
+                    let last = rows.len().saturating_sub(1);
+                    for (index, row) in rows.into_iter().enumerate() {
+                        if include_row(ui, &row, enabled) {
+                            let on = !row.ticked;
+                            match row.field {
+                                // The seed's tick goes through `set_totp`
+                                // rather than a `&mut bool`, so unticking it
+                                // drops the passphrase with it.
+                                IncludeField::Totp => draft.set_totp(on),
+                                IncludeField::Username => draft.selection.username = on,
+                                IncludeField::Password => draft.selection.password = on,
+                                IncludeField::Uri => draft.selection.uri = on,
+                                IncludeField::Notes => draft.selection.notes = on,
+                            }
                         }
-                    };
-
-                    for (label, ticked) in [
-                        (USERNAME_LABEL, &mut draft.selection.username),
-                        (PASSWORD_LABEL, &mut draft.selection.password),
-                        (URI_LABEL, &mut draft.selection.uri),
-                        (NOTES_LABEL, &mut draft.selection.notes),
-                    ] {
-                        rule_between(ui, &mut first);
-                        ui.add_enabled(
-                            enabled,
-                            egui::Checkbox::new(
-                                ticked,
-                                egui::RichText::new(label).size(12.0).color(theme::TEXT_SECONDARY),
-                            ),
-                        );
-                    }
-
-                    // The seed's tick goes through `set_totp` rather than a
-                    // `&mut bool`, so unticking it drops the passphrase.
-                    rule_between(ui, &mut first);
-                    let mut totp = draft.selection.totp;
-                    if ui
-                        .add_enabled(
-                            enabled,
-                            egui::Checkbox::new(
-                                &mut totp,
-                                egui::RichText::new(TOTP_LABEL).size(12.0).color(theme::TEXT_SECONDARY),
-                            ),
-                        )
-                        .changed()
-                    {
-                        draft.set_totp(totp);
+                        if index != last {
+                            theme::row_rule(ui);
+                        }
                     }
                 });
 
@@ -939,6 +1233,18 @@ pub fn draw_export_form(
         // are fixed together and by the same functions, because two composers
         // that publish the same object and end differently is the defect one
         // level up from the one the owner reported.
+        // **§5a's caution band**, drawn between the body and the answers, and
+        // only when the thing it cautions about is really in the parcel.
+        //
+        // §5a's own sentence continues "-- Deskwarden will offer to when the
+        // Send expires", and that half is NOT drawn: nothing in this build
+        // offers a rotation when a Send expires, and a card that promised one
+        // would be the drawn-and-dead defect this project has shipped twice
+        // already. What is left is the true half, and it is the half a reader
+        // does something about.
+        if draft.selection.password {
+            theme::form_card_caution(ui, PASSWORD_TRAVELS);
+        }
         theme::form_card_footer(ui, |ui| {
             // The footer's one right-hand slot, and the three things that
             // want it, exactly as `send_ui::draw_composer` arranges them --
@@ -1309,6 +1615,10 @@ const MODAL_WIDTH: f32 = 360.0;
 pub fn draw_export_modal(
     ctx: &egui::Context,
     state: &mut RecordSend,
+    // The item this composer was opened against, re-found by the window on
+    // every frame and borrowed for the paint -- see [`draw_export_form`].
+    item: Option<&crate::vault_bridge::VaultItem>,
+    folder: Option<&str>,
     in_flight: bool,
     now: &dyn crate::send::SendClock,
     zone: &dyn crate::local_time::LocalOffset,
@@ -1333,7 +1643,16 @@ pub fn draw_export_modal(
             // `theme::modal_drag_handle`.
             theme::modal_drag_handle(ui, FORM_HEADER_HEIGHT);
             ui.set_max_width(MODAL_WIDTH);
-            draw_export_form(ui, &mut state.draft, &state.item_name, in_flight, now, zone)
+            draw_export_form(
+                ui,
+                &mut state.draft,
+                &state.item_name,
+                item,
+                folder,
+                in_flight,
+                now,
+                zone,
+            )
         })
         .inner
 }
@@ -2208,6 +2527,158 @@ mod paint_tests {
         }
     }
 
+    /// **§5a's include list carries the values, and the password carries its
+    /// warning.**
+    ///
+    /// The owner's verdict on the list of bare labels this replaces: "Current
+    /// UI is very plain and not even close to this design". §5a's rows answer
+    /// "what travels" -- the address, a mask, `3 apps` -- and a tick beside
+    /// the word `Password` answers it only if you already know what is in the
+    /// record.
+    ///
+    /// Asserted on the pure function rather than on a painted frame, because
+    /// every string a row shows is decided there; the PAINTING of the
+    /// password's red is the next test's business.
+    #[test]
+    fn every_include_row_says_what_would_travel() {
+        let item = a_login();
+        let rows = include_rows(&RecordDraft::default(), Some(&item));
+        let by = |label: &str| {
+            rows.iter()
+                .find(|r| r.label == label)
+                .unwrap_or_else(|| panic!("no {label:?} row: {:?}", rows.iter().map(|r| r.label).collect::<Vec<_>>()))
+        };
+        assert_eq!(by(USERNAME_LABEL).value, "a.novak@ledgerline.com");
+        assert_eq!(by(URI_LABEL).value, "1 address", "the word has to agree with the number");
+        assert_eq!(by(TOTP_LABEL).value, TOTP_ROW_NOTE);
+        // §5a draws nothing beside Notes even on a record that has one.
+        assert!(item.notes.is_some(), "control: the fixture has a note to have elided");
+        assert!(by(NOTES_LABEL).value.is_empty());
+
+        // **The mask does not track the password's length.** §5a draws twelve
+        // bullets; `theme::MASKED_BULLETS`'s doc forbids a mask that counts,
+        // because it tells a shoulder-surfer how many characters to expect.
+        let password = by(PASSWORD_LABEL);
+        assert!(password.secret, "the password row is not marked a secret");
+        assert_eq!(password.value, theme::masked_readout());
+        let real = item.login.as_ref().and_then(|l| l.password.as_ref()).expect("fixture");
+        assert_ne!(
+            password.value.chars().count(),
+            real.chars().count(),
+            "control: the mask is the same length as the password, so this fixture cannot \
+             tell a counting mask from a constant one"
+        );
+
+        // A record with nothing in a field still gets the row: §5a draws five
+        // whatever the record holds, and a list that grew and shrank would
+        // make the counter beside its eyebrow a moving denominator.
+        let bare = include_rows(&RecordDraft::default(), None);
+        assert_eq!(bare.len(), rows.len(), "the list changed length with the record");
+        assert!(
+            bare.iter().all(|r| r.value.is_empty() || r.secret),
+            "a row invented a value for a record that is not there: {:?}",
+            bare.iter().map(|r| (r.label, r.value.clone())).collect::<Vec<_>>()
+        );
+    }
+
+    /// **The password row is red in all three of §5a's ways**, and only when
+    /// it is really going.
+    ///
+    /// The tint, the tick and the tag: the design makes one point in the only
+    /// three ways a row has, and any one of them alone would pass against a
+    /// row that had lost the other two.
+    #[test]
+    fn the_password_row_is_red_only_while_the_password_is_going() {
+        let item = a_login();
+        // **The password IS ticked by default** -- `RecordDraft::default`
+        // says so and argues it: a user sending a login is sending a
+        // password. So the quiet frame is one with it deliberately turned
+        // OFF, and the assertion below is that the red goes with it.
+        assert!(
+            RecordDraft::default().selection.password,
+            "control: this test has the default the wrong way round"
+        );
+        let quiet = paint(|ui| {
+            let mut draft = RecordDraft::default();
+            draft.selection.password = false;
+            draw_export_form(
+                ui,
+                &mut draft,
+                "SAP Production",
+                Some(&item),
+                Some("Engineering"),
+                false,
+                &FixedClock(NOW),
+                &UTC,
+            );
+        });
+        assert!(
+            !quiet.has(VISIBLE_PILL),
+            "the tag is on a row whose password is not going"
+        );
+        assert!(
+            !quiet.has(PASSWORD_TRAVELS),
+            "the caution band is up over a Send with no password in it"
+        );
+
+        let mut sending = RecordDraft::default();
+        assert!(sending.selection.password, "control: the loud frame is not sending one");
+        let loud = paint(|ui| {
+            draw_export_form(
+                ui,
+                &mut sending,
+                "SAP Production",
+                Some(&item),
+                Some("Engineering"),
+                false,
+                &FixedClock(NOW),
+                &UTC,
+            );
+        });
+        assert!(
+            loud.has(VISIBLE_PILL),
+            "the tag is missing from a password that is going: {:?}",
+            loud.text
+        );
+        assert!(
+            loud.has(PASSWORD_TRAVELS),
+            "§5a's caution band is missing from a Send carrying a password"
+        );
+        // The tint, which no glyph reader can see: §5a's `#fdf3f2` is painted
+        // on this card only by the password's row and by the caution band, and
+        // one of the two is enough to prove the colour reached the frame --
+        // so both are counted, and the quiet frame must have neither.
+        let washes = |p: &Painted| {
+            p.fills.iter().filter(|(_, fill)| *fill == theme::DANGER_WASH).count()
+        };
+        assert_eq!(washes(&quiet), 0, "the danger wash is on a card sending no password");
+        assert!(
+            washes(&loud) >= 2,
+            "only {} danger-washed bands on a card sending a password; §5a has the row and \
+             the caution strip",
+            washes(&loud)
+        );
+    }
+
+    /// The record these shots are about: a login with something in every
+    /// field §5a's include list draws a value for.
+    ///
+    /// A real `VaultItem` and not a hand-made row list, because the rows are
+    /// built by [`include_rows`] out of an item and a test that fed it
+    /// something else would be asserting about a fixture rather than about
+    /// the function.
+    fn a_login() -> crate::vault_bridge::VaultItem {
+        serde_json::from_str(
+            r#"{"id":"send-1","type":1,"name":"SAP Production","fields":[],
+                "notes":"Finance approves new seats on the first Monday.",
+                "login":{"username":"a.novak@ledgerline.com",
+                         "password":"correct-horse-battery-staple-7",
+                         "totp":"JBSWY3DPEHPK3PXP",
+                         "uris":[{"uri":"https://app.ledgerline.eu"}]}}"#,
+        )
+        .expect("the send fixture is valid item JSON")
+    }
+
     fn paint(draw: impl FnOnce(&mut egui::Ui)) -> Painted {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
@@ -2258,7 +2729,16 @@ mod paint_tests {
     fn the_export_card_is_the_banded_card_and_not_a_form_laid_flat() {
         let mut draft = RecordDraft::default();
         let painted = paint(|ui| {
-            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
+            draw_export_form(
+                ui,
+                &mut draft,
+                "SAP Production",
+                Some(&a_login()),
+                Some("Engineering"),
+                false,
+                &FixedClock(NOW),
+                &UTC,
+            );
         });
 
         let heading = painted.rect_of(EXPORT_HEADING).expect("the heading was not painted");
@@ -2320,7 +2800,16 @@ mod paint_tests {
     fn the_form_paints_the_warning_only_with_the_seed_ticked() {
         let mut draft = RecordDraft::default();
         let before = paint(|ui| {
-            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
+            draw_export_form(
+                ui,
+                &mut draft,
+                "SAP Production",
+                Some(&a_login()),
+                Some("Engineering"),
+                false,
+                &FixedClock(NOW),
+                &UTC,
+            );
         });
         assert!(before.has(EXPORT_HEADING), "control: the form drew nothing recognisable");
         assert!(before.has(TOTP_LABEL), "the seed tick is not on the form at all");
@@ -2332,7 +2821,16 @@ mod paint_tests {
         let mut ticked = RecordDraft::default();
         ticked.set_totp(true);
         let after = paint(|ui| {
-            draw_export_form(ui, &mut ticked, "SAP Production", false, &FixedClock(NOW), &UTC);
+            draw_export_form(
+                ui,
+                &mut ticked,
+                "SAP Production",
+                Some(&a_login()),
+                Some("Engineering"),
+                false,
+                &FixedClock(NOW),
+                &UTC,
+            );
         });
         assert!(
             after.has(SEED_WARNING),
@@ -2369,7 +2867,16 @@ mod paint_tests {
             "the fixture wants a submittable draft, or the fill below is a disabled one"
         );
         let painted = paint(|ui| {
-            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
+            draw_export_form(
+                ui,
+                &mut draft,
+                "SAP Production",
+                Some(&a_login()),
+                Some("Engineering"),
+                false,
+                &FixedClock(NOW),
+                &UTC,
+            );
         });
 
         let (submit, submit_fill) = painted.button_under(EXPORT_SUBMIT_LABEL);
@@ -2415,7 +2922,16 @@ mod paint_tests {
     fn the_record_block_names_the_record_under_its_own_eyebrow() {
         let mut draft = RecordDraft::default();
         let painted = paint(|ui| {
-            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
+            draw_export_form(
+                ui,
+                &mut draft,
+                "SAP Production",
+                Some(&a_login()),
+                Some("Engineering"),
+                false,
+                &FixedClock(NOW),
+                &UTC,
+            );
         });
 
         assert!(
@@ -2463,7 +2979,16 @@ mod paint_tests {
 
         let mut draft = RecordDraft::default();
         let painted = paint(|ui| {
-            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
+            draw_export_form(
+                ui,
+                &mut draft,
+                "SAP Production",
+                Some(&a_login()),
+                Some("Engineering"),
+                false,
+                &FixedClock(NOW),
+                &UTC,
+            );
         });
         for label in labels {
             assert!(painted.has(label), "{label} is not a row on the form: {:?}", painted.text);
@@ -2580,7 +3105,16 @@ mod paint_tests {
     fn the_access_block_is_on_the_record_composer() {
         let mut draft = RecordDraft::default();
         let painted = paint(|ui| {
-            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
+            draw_export_form(
+                ui,
+                &mut draft,
+                "SAP Production",
+                Some(&a_login()),
+                Some("Engineering"),
+                false,
+                &FixedClock(NOW),
+                &UTC,
+            );
         });
 
         assert!(
@@ -2681,7 +3215,16 @@ mod paint_tests {
             // The modal's own constraint, applied the way `draw_export_modal`
             // applies it, so this measures the card the user actually sees.
             ui.set_max_width(MODAL_WIDTH);
-            draw_export_form(ui, &mut draft, "SAP Production", false, &FixedClock(NOW), &UTC);
+            draw_export_form(
+                ui,
+                &mut draft,
+                "SAP Production",
+                Some(&a_login()),
+                Some("Engineering"),
+                false,
+                &FixedClock(NOW),
+                &UTC,
+            );
         });
 
         // The card's own left edge, taken from a control that is definitely
@@ -3007,6 +3550,8 @@ mod paint_tests {
                 action = draw_export_modal(
                     ui.ctx(),
                     state,
+                    Some(&a_login()),
+                    Some("Engineering"),
                     false,
                     &FixedClock(NOW),
                     &UTC,
@@ -3048,6 +3593,8 @@ mod paint_tests {
                 action = draw_export_modal(
                     ui.ctx(),
                     state,
+                    Some(&a_login()),
+                    Some("Engineering"),
                     in_flight,
                     &FixedClock(NOW),
                     &UTC,

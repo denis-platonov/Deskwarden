@@ -5633,9 +5633,21 @@ pub fn build_frame_with_search(
             // stated reason: nothing below this line reads either for itself,
             // so every assertion about that sentence is exact wherever the
             // suite runs. The same two values the Sends pane is handed.
+            // **The item, re-found on every frame and handed over borrowed.**
+            // §5a's include list draws the value beside each tick, and the
+            // chip's second line is the record's kind and folder. Found the
+            // same way the submit arm below finds it -- by id, in this
+            // window's own list -- so the card cannot draw one record's values
+            // while the press publishes another's. `None` if it has gone,
+            // which the form draws as labels without values.
+            let sent_item = items.iter().find(|i| i.id == state.item_id);
+            let sent_folder = sent_item
+                .and_then(|item| sidebar::folder_name(&folders, item.folder_id.as_deref()));
             match record_ui::draw_export_modal(
                 ui.ctx(),
                 state,
+                sent_item,
+                sent_folder,
                 send_create.in_flight,
                 &crate::send::SystemClock,
                 &crate::local_time::SystemZone,

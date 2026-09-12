@@ -3492,6 +3492,14 @@ pub const VIEWS_LABEL: &str = "Views";
 /// §5a's third Access row label.
 pub const OPEN_WITH_LABEL: &str = "Open with";
 
+/// §5a's own word on the link beside [`OPEN_WITH_LABEL`]'s box.
+pub const GENERATE_LABEL: &str = "Generate";
+
+/// §5a's `font-size: 12px` on that link, and the gap before it.
+const ACCESS_LINK_PX: f32 = 12.0;
+/// See [`ACCESS_LINK_PX`] -- §5a's `gap: 10px`.
+const ACCESS_LINK_GAP: f32 = 10.0;
+
 /// The view-limit field's placeholder, and the whole of how the row says its
 /// off position. See [`views_note`].
 pub const VIEWS_HINT: &str = "Any";
@@ -4081,10 +4089,44 @@ pub fn draw_access_block(
         .take()
         .unwrap_or_else(|| zeroize::Zeroizing::new(String::new()));
     access_row(ui, OPEN_WITH_LABEL, label_width, enabled, |ui| {
-        let room = ui.available_width();
+        // **§5a's `Generate`**, which this row did not have.
+        //
+        // The design puts it at the right end of this row and it is the one
+        // control on the card that makes the share password a realistic
+        // answer rather than an aspiration: a link password typed by hand is
+        // a link password the recipient can guess, and the alternative on
+        // offer -- opening the vault's own generator in another window,
+        // copying, coming back -- is why this box was usually left empty.
+        //
+        // Measured first and the field given what is left, for the reason
+        // every row in this app that ends in a control is laid out that way:
+        // a field taking `available_width` pushes whatever follows it off the
+        // card.
+        let link = ui
+            .painter()
+            .layout_no_wrap(
+                GENERATE_LABEL.to_string(),
+                egui::FontId::proportional(ACCESS_LINK_PX),
+                theme::BLUE,
+            )
+            .size()
+            .x;
+        let room = (ui.available_width() - link - ACCESS_LINK_GAP).max(0.0);
         ui.add_enabled_ui(enabled, |ui| {
             theme::inline_field(ui, &mut buffer, PASSWORD_HINT, room, true);
         });
+        ui.add_space(ACCESS_LINK_GAP);
+        if enabled && theme::link_label(ui, GENERATE_LABEL, ACCESS_LINK_PX).clicked() {
+            // The vault's own generator at its own defaults -- one generator
+            // in this app, not a second recipe written here. A refusal (the
+            // recipe cannot produce nothing at these defaults) leaves the box
+            // as it was rather than clearing a password the user had typed.
+            if let Ok(made) = crate::password_gen::generate_password(
+                &crate::vault_bridge::PasswordRecipe::default(),
+            ) {
+                buffer = made;
+            }
+        }
     });
     *controls.password = (!buffer.is_empty()).then_some(buffer);
 }

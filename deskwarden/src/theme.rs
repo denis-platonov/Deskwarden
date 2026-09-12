@@ -120,6 +120,21 @@ pub const DANGER_INK: Color32 = Color32::from_rgb(0x8c, 0x3c, 0x33);
 /// a secret spends the only signal the product has.
 pub const SECRET_INK: Color32 = DANGER_INK;
 
+/// §5a's quiet red: the ink on the password row's tag and on the masked value
+/// beside it (`#a2554d`).
+///
+/// A fourth entry in this trio and not a re-use of [`DANGER_INK`], because
+/// §5a draws both on the same row and means two different things by them: the
+/// name of the field is the loud one, and the tag and the mask are the two
+/// pieces of evidence under it. Collapsing them would make a row with three
+/// red things on it shout three times.
+pub const DANGER_QUIET: Color32 = Color32::from_rgb(0xa2, 0x55, 0x4d);
+
+/// §5a's tag ground on the password row (`#fbeae8`) -- a step darker than
+/// [`DANGER_WASH`], which is the row it sits on, so the tag reads as a tag
+/// and not as a gap in the tint.
+pub const DANGER_PILL: Color32 = Color32::from_rgb(0xfb, 0xea, 0xe8);
+
 /// **The band a secret wears, with the rule attached.** Design 4a/4b's
 /// `#fdf3f2` on a `#e8a9a2` hairline: the keystroke list's password step, the
 /// preflight card's secret row, and nothing else.
@@ -1635,6 +1650,58 @@ pub fn state_pill(
     );
     rect
 }
+
+/// **§5a's opt-in box: the square tick beside a field's name.**
+///
+/// `width: 17px; height: 17px; border-radius: 5px` -- filled in `tone` with a
+/// white tick when it is on, and white inside a [`BORDER_STRONG`] hairline
+/// when it is off. Painted rather than `egui::Checkbox`, which draws its own
+/// square at its own size in its own palette and cannot be told otherwise.
+///
+/// `tone` rather than [`BLUE`] outright because §5a tints ONE of these rows:
+/// the password's tick is `#b42318`, and a red tick beside a red label on a
+/// red row is the design saying, in the only three ways a row has, that this
+/// is the field that travels in the clear.
+///
+/// Answers the response so the caller can act on a click. The whole ROW is
+/// the target, not this square -- see the callers -- so this takes
+/// [`Sense::hover`] and the row does the clicking.
+pub fn opt_in_box(ui: &mut Ui, on: bool, tone: Color32) -> Rect {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(OPT_IN_BOX), Sense::hover());
+    let painter = ui.painter();
+    if on {
+        painter.rect_filled(rect, CornerRadius::same(OPT_IN_RADIUS), tone);
+        // §5a's `M20 6 9 17l-5-5` at `width: 11`, in the 24-unit box the
+        // path is written in -- the same tick `state_pill` draws, at this
+        // box's size rather than a pill's.
+        let unit = OPT_IN_CHECK / 24.0;
+        let origin = rect.center() - Vec2::splat(OPT_IN_CHECK / 2.0);
+        let at = |ux: f32, uy: f32| origin + Vec2::new(ux * unit, uy * unit);
+        painter.add(egui::Shape::line(
+            vec![at(20.0, 6.0), at(9.0, 17.0), at(4.0, 12.0)],
+            // §5a's `stroke-width: 3.2` in the same 24-unit box.
+            Stroke::new(3.2 * unit, CARD),
+        ));
+    } else {
+        painter.rect(
+            rect,
+            CornerRadius::same(OPT_IN_RADIUS),
+            CARD,
+            Stroke::new(1.0, BORDER_STRONG),
+            StrokeKind::Inside,
+        );
+    }
+    rect
+}
+
+/// §5a's `width: 17px; height: 17px` on the opt-in box.
+pub const OPT_IN_BOX: f32 = 17.0;
+
+/// §5a's `border-radius: 5px` on it.
+const OPT_IN_RADIUS: u8 = 5;
+
+/// §5a's `<svg width="11" height="11">` inside it.
+const OPT_IN_CHECK: f32 = 11.0;
 
 /// Height of the design's keyboard-hint chips: a 10px monospace line
 /// (~12px line box) inside 3px of vertical padding.
@@ -6271,6 +6338,68 @@ pub fn form_card_footer<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     );
     laid_out.inner
 }
+
+/// **§5a's caution band: the strip between a form's body and its footer.**
+///
+/// A rule, a tinted band, a warning mark and one sentence. §5a puts it under
+/// the composer and above the answers, which is the last thing crossed on the
+/// way to the button -- the same placement, and the same argument,
+/// `totp_add::caution_band` makes for 6c's.
+///
+/// **This one is RED where 6c's is amber**, and the two are not one component
+/// wearing two palettes. 6c warns that something is about to be overwritten;
+/// §5a warns that a secret is about to leave the machine in the clear. The
+/// design draws them in its two different reds and ambers on purpose, and
+/// this app's [`DANGER_WASH`]/[`ERROR`]/[`DANGER_INK`] trio is that red
+/// already.
+///
+/// Square at both ends: a footer follows it, so neither edge of it is the
+/// card's corner.
+pub fn form_card_caution(ui: &mut Ui, text: &str) {
+    hairline(ui);
+    let band = ui.painter().add(egui::Shape::Noop);
+    let laid_out = egui::Frame::new()
+        .inner_margin(Margin::symmetric(FORM_CARD_PAD_X, CAUTION_BAND_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                // §5a's `<svg width="15" height="15">` with its own
+                // `margin-top: 1px`: the mark sits on the sentence's first
+                // line rather than centred on a paragraph that may wrap.
+                let (mark, _) = ui.allocate_exact_size(
+                    Vec2::splat(CAUTION_BAND_GLYPH),
+                    Sense::hover(),
+                );
+                paint_warning_glyph(
+                    ui.painter(),
+                    mark.translate(Vec2::new(0.0, CAUTION_BAND_GLYPH_DROP)),
+                    ERROR,
+                );
+                ui.add_space(CAUTION_BAND_GAP);
+                ui.label(RichText::new(text).size(12.0).color(DANGER_INK));
+            });
+        });
+    ui.painter().set(
+        band,
+        egui::epaint::RectShape::filled(
+            laid_out.response.rect,
+            CornerRadius::ZERO,
+            DANGER_WASH,
+        ),
+    );
+}
+
+/// §5a's `padding: 13px 18px` on the caution band -- the x is
+/// [`FORM_CARD_PAD_X`]'s, which is the same 18.
+const CAUTION_BAND_PAD_Y: i8 = 13;
+/// §5a's `<svg width="15">` warning mark, its `margin-top: 1px`, and the
+/// `gap: 9px` after it.
+const CAUTION_BAND_GLYPH: f32 = 15.0;
+/// See [`CAUTION_BAND_GLYPH`].
+const CAUTION_BAND_GLYPH_DROP: f32 = 1.0;
+/// See [`CAUTION_BAND_GLYPH`].
+const CAUTION_BAND_GAP: f32 = 9.0;
 
 /// The footer's standing note: §5a's `Appears in Shared`, in §5a's own
 /// treatment -- 12px in [`TEXT_GHOST`], pushed to the right of the answers.
