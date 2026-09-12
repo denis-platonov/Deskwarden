@@ -157,7 +157,7 @@ fn item_takes_a_one_time_code(item: &VaultItem) -> bool {
     item.login.is_some()
 }
 /// `font-size: 22px` on the item title.
-const TITLE_SIZE: f32 = 22.0;
+pub(crate) const TITLE_SIZE: f32 = 22.0;
 /// `gap: 3px` between the title and its subtitle.
 pub(crate) const TITLE_GAP: f32 = 3.0;
 /// `font-size: 12px` on the subtitle under it. A constant rather than a

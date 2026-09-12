@@ -1998,11 +1998,6 @@ const SECRET_BOX_PAD_X: f32 = 11.0;
 const SECRET_TEXT_PX: f32 = 14.0;
 /// See [`SECRET_BOX_RADIUS`]. The design's em, which egui wants in points.
 const SECRET_TEXT_TRACKING: f32 = 0.1;
-/// How far the seed's row is pushed below the box's true centre, as a
-/// fraction of the row -- `theme::field_box`'s own 0.09, named here because
-/// this field allocates its own box rather than going through that helper.
-const SECRET_OPTICAL_NUDGE: f32 = 0.09;
-
 /// The halo's width, from `box-shadow: 0 0 0 3px`.
 const SECRET_FOCUS_RING: f32 = 3.0;
 
@@ -2315,18 +2310,13 @@ fn secret_field(ui: &mut egui::Ui, typed: &mut String) -> egui::Response {
     // `outer`. The box does not move -- its height is the design's and stays
     // the formula above -- and the padding is what absorbs the difference,
     // which is what padding is for.
-    let row = ui.fonts_mut(|f| {
-        f.row_height(&egui::FontId::new(SECRET_TEXT_PX, egui::FontFamily::Monospace))
-    });
-    // **Nudged down by the descent gap**, which is `theme::field_box`'s own
-    // correction and the last of the four things reported here. A row box is
-    // ascent plus descent tall, and a seed -- capitals and digits, no
-    // descenders at all -- fills only the upper part of it, so centring the
-    // BOX reads as text sitting high. Centring on the glyphs is what
-    // "centered" means to the eye, and the constant is the one every other
-    // field in this app is already nudged by.
+    let font = egui::FontId::new(SECRET_TEXT_PX, egui::FontFamily::Monospace);
+    let row = theme::ascent_of(ui.ctx(), &font);
+    // **The line box is the font's ASCENT**, which is what makes plain
+    // centring optically right and the caret the height of the capitals -- see
+    // `theme::ascent_of`, which carries the measurements and the report.
     let inner = egui::Rect::from_center_size(
-        egui::pos2(outer.center().x, outer.center().y + row * SECRET_OPTICAL_NUDGE),
+        outer.center(),
         egui::vec2(outer.width() - (SECRET_BOX_STROKE + SECRET_BOX_PAD_X) * 2.0, row),
     );
     let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _wrap: f32| {
@@ -2343,7 +2333,7 @@ fn secret_field(ui: &mut egui::Ui, typed: &mut String) -> egui::Response {
             egui::TextFormat {
                 extra_letter_spacing: SECRET_TEXT_PX * SECRET_TEXT_TRACKING,
                 line_height: Some(row),
-                font_id: egui::FontId::new(SECRET_TEXT_PX, egui::FontFamily::Monospace),
+                font_id: font.clone(),
                 color: theme::INK,
                 ..Default::default()
             },
@@ -2650,6 +2640,17 @@ fn caution_text(ui: &egui::Ui, width: f32) -> std::sync::Arc<egui::Galley> {
 /// `align-items: flex-start` on 6c's band: both children hang off the top
 /// padding, so it is as tall as the taller of them plus the two paddings and
 /// the rule over them.
+/// How far [`caution_band`]'s sentence drops to sit centred -- see
+/// [`theme::ink_drop`]. Its own function so [`caution_band_height`] and the
+/// placement cannot disagree about the number.
+fn caution_ink_drop(ui: &egui::Ui) -> f32 {
+    theme::ink_drop(
+        ui.ctx(),
+        &egui::FontId::new(FOOTER_TEXT_PX, egui::FontFamily::Proportional),
+        Some(FOOTER_TEXT_PX * FOOTER_LINE),
+    )
+}
+
 fn caution_band_height(text: &egui::Galley) -> f32 {
     RULE + MANUAL_FOOTER_PAD_Y * 2.0
         + text.size().y.max(FOOTER_GLYPH + FOOTER_GLYPH_DROP)
@@ -2725,10 +2726,15 @@ fn caution_band(ui: &mut egui::Ui, text: std::sync::Arc<egui::Galley>) {
         ),
         CAUTION_MARK_INK,
     );
+    // **Dropped by the ink offset.** The owner: "\"This record...\" text - not
+    // centered". The galley's rows are `FOOTER_LINE` tall and the face inks
+    // only the upper part of each, so a block hung off the top padding sits
+    // high in a band whose height was computed from that same galley -- the
+    // slack all lands underneath. See `theme::ink_drop`, which measures it.
     painter.galley(
         egui::pos2(
             band.left() + MANUAL_FOOTER_PAD_X + FOOTER_GLYPH + FOOTER_GAP,
-            band.top() + RULE + MANUAL_FOOTER_PAD_Y,
+            band.top() + RULE + MANUAL_FOOTER_PAD_Y + caution_ink_drop(ui),
         ),
         text,
         CAUTION_TEXT_INK,
@@ -4594,12 +4600,20 @@ fn draw_code_panel(
                         theme::BLUE_DEEP,
                     ));
                     ui.add_space(CODE_LABEL_GAP);
-                    ui.label(theme::letterspaced_mono(
-                        &grouped_code(code),
-                        CODE_PX,
-                        CODE_PX * CODE_TRACKING,
-                        theme::BLUE_DEEP,
-                    ));
+                    // §6c declares `line-height: 1` on its code, and the
+                    // ascent is this app's reading of that: the tightest box
+                    // the digits fit in. Without it the eyebrow above and the
+                    // code are separated by the face's descender band rather
+                    // than by the design's 4-point gap.
+                    ui.label(
+                        theme::letterspaced_mono_in(
+                            &grouped_code(code),
+                            CODE_PX,
+                            CODE_PX * CODE_TRACKING,
+                            theme::BLUE_DEEP,
+                            code_ascent(ui, CODE_PX),
+                        ),
+                    );
                 });
                 // The right-hand stack takes what the code left and hangs off
                 // the panel's right edge, which is 6c's `align-items:
@@ -4629,6 +4643,12 @@ fn draw_code_panel(
         });
 }
 
+/// The line box the live code is set in: the monospace face's ascent at
+/// `size`. See [`theme::ascent_of`] for the rule and the report behind it.
+fn code_ascent(ui: &egui::Ui, size: f32) -> f32 {
+    theme::ascent_of(ui.ctx(), &egui::FontId::new(size, egui::FontFamily::Monospace))
+}
+
 /// §6d's one row: the code, a track that takes what is left, and the seconds.
 ///
 /// The track is `flex: 1` -- §6d's own -- and not §6c's fixed 96, which is why
@@ -4639,12 +4659,20 @@ fn typed_code_row(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) 
     let seconds = seconds_line(seconds_left(auth, now_unix));
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        ui.label(theme::letterspaced_mono(
-            &grouped_code(code),
-            CODE_PX_TYPED,
-            CODE_PX_TYPED * CODE_TRACKING,
-            theme::BLUE_DEEP,
-        ));
+        // **The line box is the face's ascent**, so egui's vertical centring
+        // of this label against the track and the seconds beside it centres
+        // the DIGITS rather than a row box that reserves a descender band a
+        // six-digit code has no use for. The owner: "6 digit code is not
+        // centered either". See `theme::ascent_of`.
+        ui.label(
+            theme::letterspaced_mono_in(
+                &grouped_code(code),
+                CODE_PX_TYPED,
+                CODE_PX_TYPED * CODE_TRACKING,
+                theme::BLUE_DEEP,
+                code_ascent(ui, CODE_PX_TYPED),
+            ),
+        );
         // **The seconds are measured before the track is drawn**, because the
         // track is what gives way. Laid out in source order the bar would
         // take `available_width` and push `22 s` off the strip's right edge --

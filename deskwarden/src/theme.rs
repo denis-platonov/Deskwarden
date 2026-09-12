@@ -498,12 +498,28 @@ pub fn letterspaced_mono(
     tracking: f32,
     color: Color32,
 ) -> egui::text::LayoutJob {
+    letterspaced_in(text, FontId::new(size, FontFamily::Monospace), tracking, color, None)
+}
+
+/// [`letterspaced_mono`] in a line box of the caller's choosing.
+///
+/// For the one thing a `LayoutJob` cannot be given afterwards the way a
+/// `RichText` can. Every caller here passes [`ascent_of`]'s answer, which is
+/// the rule this app follows for a single line that has to sit centred
+/// against something beside it -- see that function for why.
+pub fn letterspaced_mono_in(
+    text: &str,
+    size: f32,
+    tracking: f32,
+    color: Color32,
+    line_height: f32,
+) -> egui::text::LayoutJob {
     letterspaced_in(
         text,
         FontId::new(size, FontFamily::Monospace),
         tracking,
         color,
-        None,
+        Some(line_height),
     )
 }
 
@@ -5408,6 +5424,83 @@ pub fn search_field(
     response
 }
 
+/// **The band a line of `font` actually INKS, as a height to lay it out in.**
+///
+/// egui's row box for a face is `ascent + descent`, and the faces this app
+/// bundles reserve a generous descender. Measured on the monospace cut at 14
+/// points: the row is 16.4, the baseline sits 10 below its top, and a capital
+/// inks from 1 to 10. So the ink occupies the row's UPPER two thirds, and
+/// anything that centres the ROW -- which is what centring a galley, a label
+/// or a `ui.put` rect does -- puts the text about two and a half points high.
+/// Two and a half points is invisible in a paragraph and unmistakable in a
+/// 38-point box, which is why this was reported on a field, on a code strip
+/// and on a card title within the same hour and never on a sentence.
+///
+/// **The rule is: make the line box the ascent.** Then the ink band and the
+/// row are concentric to within a third of a point, so geometric centring IS
+/// optical centring and no site needs a fudge factor of its own. It also
+/// fixes the caret, which egui draws at the row's height: against nine points
+/// of capital a 16.4-point caret is what the owner called huge, and the
+/// ascent is the band a caret is supposed to cover.
+///
+/// **For a single line only.** `line_height` applies to every row of a
+/// galley, so wrapped copy set this way would have its lines crash together.
+/// Every caller here is a box, a chip or a title that draws exactly one line.
+///
+/// Measured from the face rather than assumed: a ratio written out here
+/// would be one face's, and this app bundles four.
+pub fn ascent_of(ctx: &egui::Context, font: &FontId) -> f32 {
+    ctx.fonts_mut(|f| {
+        let galley = f.layout_no_wrap(ASCENT_PROBE.to_string(), font.clone(), Color32::BLACK);
+        galley
+            .rows
+            .first()
+            .and_then(|row| row.glyphs.first())
+            .map_or_else(|| f.row_height(font), |glyph| glyph.font_ascent)
+    })
+}
+
+/// **How far a galley of `font` has to move DOWN to sit optically centred**,
+/// for the callers that cannot set a line height.
+///
+/// [`ascent_of`]'s rule -- make the line box the ascent -- is the right one
+/// wherever a single line is being laid out, and it is wrong for a WRAPPED
+/// paragraph, where `line_height` is also the leading between its rows. A
+/// caution band's sentence is such a paragraph, so its rows keep their
+/// natural height and the whole block is offset instead.
+///
+/// The offset is half the difference between the slack under the ink and the
+/// slack over it: the face reserves a descender band the text mostly does not
+/// use, so a block top-aligned in its padding reads high by about that much.
+/// On the monospace cut at 14 points it is 2.7 of a 16.4-point row.
+/// `line_height` is the one the caller's `TextFormat` sets, or `None` for the
+/// face's own -- it is the ROW the ink has to be centred in, and overriding it
+/// moves only the row's bottom (egui leaves the baseline where the face puts
+/// it), so a generous one makes this bigger rather than smaller.
+pub fn ink_drop(ctx: &egui::Context, font: &FontId, line_height: Option<f32>) -> f32 {
+    ctx.fonts_mut(|f| {
+        let galley = f.layout_no_wrap(ASCENT_PROBE.to_string(), font.clone(), Color32::BLACK);
+        let Some(glyph) = galley.rows.first().and_then(|row| row.glyphs.first()) else {
+            return 0.0;
+        };
+        // The ink's top, as a distance from the row's top: the baseline plus
+        // the glyph's own (negative) offset from it.
+        let above = glyph.pos.y + glyph.uv_rect.offset.y;
+        // ...and the slack under it. `X` has no descender, so its ink ends at
+        // the baseline and everything below is the band being measured.
+        let below = line_height.unwrap_or(glyph.font_height) - glyph.pos.y;
+        ((below - above) / 2.0).max(0.0)
+    })
+}
+
+/// The character [`ascent_of`] measures.
+///
+/// A capital with no descender and no accent, so the glyph's own ink box is
+/// the band this is about. The value read is `font_ascent`, which is the
+/// FACE's metric and not this glyph's, so the choice only has to be a
+/// character the face certainly carries.
+const ASCENT_PROBE: &str = "X";
+
 /// The design's input-box height (sections 2a/3a/3b/3h).
 ///
 /// Public so a test can find these boxes in a painted frame by the one
@@ -5810,34 +5903,91 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
         Vec2::new(shape.width, shape.height),
         Sense::hover(),
     );
-    // The TextEdit gets a rect of exactly its row height, centered in the
-    // box: handing it the full box height leaves its text sitting at the
-    // top instead of vertically centered.
+    // **The TextEdit gets a rect of the font's ASCENT, centred in the box.**
+    //
+    // It used to get the font's full row -- ascent plus descent -- with a
+    // 9% fudge pushing it down, and that fudge was this file's own guess at
+    // the problem [`ascent_of`] now measures. On the bundled faces it is
+    // about a third of what the error actually is, which is why the owner
+    // read every box in this app as "text in field not centered" and, in the
+    // same breath, "cursor is huge": egui draws the caret at the ROW's
+    // height, so a descender band the value never uses was being drawn as
+    // caret on every field in the app.
+    //
+    // With the line box set to the ascent both go away at once and no fudge
+    // is left behind -- see [`ascent_of`], which carries the measurements.
     let font = shape.font.clone();
-    let row_height = ui.ctx().fonts_mut(|f| f.row_height(&font));
-    // Nudged down by the descent gap: a row box is ascent+descent tall, but
-    // typical field text (no descenders on most characters) fills only the
-    // upper part, so geometric centering of the *box* reads as text sitting
-    // high. Centering on the glyphs instead is what "vertically centered"
-    // actually looks like.
-    let optical_nudge = row_height * 0.09;
+    let ascent = ascent_of(ui.ctx(), &font);
     let inner = Rect::from_center_size(
-        Pos2::new(
-            (outer.min.x + 10.0 + outer.max.x - right_pad) / 2.0,
-            outer.center().y + optical_nudge,
-        ),
-        Vec2::new(outer.width() - 10.0 - right_pad, row_height),
+        Pos2::new((outer.min.x + 10.0 + outer.max.x - right_pad) / 2.0, outer.center().y),
+        Vec2::new(outer.width() - 10.0 - right_pad, ascent),
     );
+    // The face is carried in through a layouter rather than `.font()`, which
+    // takes a `FontId` and can express no line height -- the same reason
+    // `detail::title_text` and `totp_add::secret_field` reach for one.
+    let password = shape.password;
+    let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap = egui::text::TextWrapping::no_max_width();
+        let _ = wrap;
+        // **Masked here, because a custom layouter is handed the RAW text.**
+        // egui masks inside its DEFAULT layouter only (`mask_if_password`),
+        // so a field that sets a layouter and leaves `.password(true)` on
+        // draws the secret in the clear. The replacement character is
+        // epaint's own, so a masked field still looks like every masked
+        // field in every other egui app.
+        let shown: String = if password {
+            buffer
+                .as_str()
+                .chars()
+                .map(|_| egui::epaint::text::PASSWORD_REPLACEMENT_CHAR)
+                .collect()
+        } else {
+            buffer.as_str().to_owned()
+        };
+        job.append(
+            &shown,
+            0.0,
+            egui::TextFormat {
+                line_height: Some(ascent),
+                font_id: font.clone(),
+                color: ui.visuals().text_color(),
+                ..Default::default()
+            },
+        );
+        ui.fonts_mut(|f| f.layout_job(job))
+    };
+    // **The whole box takes a click, not just the line of text in it.**
+    //
+    // `ui.put` gives the `TextEdit` one rect for BOTH its layout and its hit
+    // area, and the rect that lays the text out correctly is one line tall --
+    // so in a 38-point field the top and bottom thirds did nothing when
+    // clicked. That was already true and is simply more true now the line box
+    // is the ascent, which is how it was noticed: a folder-modal test aimed
+    // at the gap between two labels, landed a point below the text row, and
+    // typed into nothing.
+    //
+    // Registered BEFORE the `TextEdit`, so egui's topmost-wins ordering leaves
+    // the text itself to the editor -- click-to-place-caret and
+    // drag-to-select are untouched -- and this catches only the padding round
+    // it.
+    let surround = ui.interact(outer, ui.next_auto_id().with("field-box"), Sense::click());
     let response = ui.put(
         inner,
         egui::TextEdit::singleline(value)
             .hint_text(shape.hint)
-            .password(shape.password)
             .frame(egui::Frame::new())
-            .font(font)
             .margin(Margin::ZERO)
-            .desired_width(inner.width()),
+            .desired_width(inner.width())
+            .layouter(&mut layouter),
     );
+
+    if surround.clicked() {
+        response.request_focus();
+    }
+    if surround.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+    }
 
     let border = field_border(ui, outer, response.has_focus());
     ui.painter().set(

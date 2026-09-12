@@ -605,7 +605,21 @@ const BADGE_SIZE: f32 = 38.0;
 /// does not.
 const BADGE_TO_LABEL: f32 = 16.0;
 
-const TITLE_SIZE: f32 = 17.0;
+/// **This app's item-title size, not §7a's 17.**
+///
+/// The owner, against 7a's own frame: "splash is same small size like
+/// Decpryting text". They are right about the drawing -- 17 over a 13-point
+/// sub-line is a ratio of 1.3, and at that distance a heading and its caption
+/// read as one block set slightly unevenly. The screen has four words on it
+/// and several seconds to be looked at; there is nothing here for a heading to
+/// be economical with.
+///
+/// 22 is `detail::TITLE_SIZE` -- what this app sets an ITEM's name at, one
+/// pane and one second later -- and it is taken rather than invented so the
+/// window the vault arrives in does not change what a title is on the way.
+/// Against `SUB_SIZE` that is 1.7, which is the difference between a title
+/// and a line under it.
+const TITLE_SIZE: f32 = crate::vault_window::detail::TITLE_SIZE;
 const SUB_SIZE: f32 = 13.0;
 const FOOT_SIZE: f32 = 12.0;
 const TITLE_TO_SUB: f32 = 7.0;
