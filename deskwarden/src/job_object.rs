@@ -2733,7 +2733,29 @@ mod tests {
             // implementation was first run against the PREVIOUS pinned pair and
             // reproduced (27359, 0x546e_fe01_2ee6_ade3) exactly, so it is measuring
             // what this test measures.
-            (27355, 0xcd71_663f_a7b0_6ba5_u64),
+            // **27359 bytes, new hash: the version goes back to a `-dev` suffix after
+            // the 0.15.22 release.** `version = "0.15.22"` became `"0.15.23-dev"`.
+            //
+            // This is the hop the release commit above it promised, and the one the
+            // 0.15.20 and 0.15.21 cuts forgot: without it every build from the working
+            // tree claims to BE the release it is sitting on top of, which is exactly
+            // what the changelog's Unreleased section promises it will not do.
+            //
+            // Five bytes longer -- `-dev` plus the digit that rolls -- so the length
+            // moves with the hash.
+            //
+            // No dependency was added, removed, re-pointed or re-featured, no
+            // `[patch]`/`[replace]`/`[workspace.dependencies]` table appeared, no
+            // path or fork appeared, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`.
+            //
+            // Recomputed the way every hop above records -- FNV-1a/64 over the file
+            // with CRLF normalised to LF, in a separate implementation outside this
+            // crate -- rather than copied out of the failure message. That
+            // implementation was first run against the PREVIOUS pinned pair and
+            // reproduced (27355, 0xcd71_663f_a7b0_6ba5) exactly, so it is measuring
+            // what this test measures.
+            (27359, 0xd36d_f891_e393_a962_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
