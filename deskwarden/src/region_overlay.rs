@@ -682,103 +682,6 @@ pub const DECODE_INTERVAL: Duration = Duration::from_millis(150);
 /// see the module header's list of what a real desktop is needed for.
 pub const PRESCAN_SETTLE: Duration = Duration::from_millis(80);
 
-/// **How long Deskwarden's own window takes to leave the screen after it has
-/// been sent down, and therefore how long the reveal waits before starting its
-/// clock.**
-///
-/// # What this is a settle for, which is not what it was expected to be
-///
-/// The obvious place to put the minimise was the `Mask` frame, beside
-/// [`exclude_from_capture`] -- window out of the capture and off the screen in
-/// one breath, [`PRESCAN_SETTLE`] lengthened to cover both, capture after.
-/// **That design is fatal and was measured to be**, which is the whole reason
-/// this is a second constant rather than a bigger first one.
-///
-/// Between `Mask` and `Scan` this overlay has registered **no viewport at
-/// all**: [`RegionOverlay::show`] returns early on those frames, so the root
-/// is an eframe application with exactly one window and that window is
-/// iconic. Measured with a probe that minimises such a root and counts its
-/// frames for the next five seconds: it takes **none**. Not a throttled
-/// trickle -- the last frame is the one that issued the minimise, and nothing
-/// follows it, however hard that frame asks for a repaint. A settle deadline
-/// set on a frame that is the last frame is a deadline nothing will ever
-/// reach, and a route that never reaches it is the hang this module was
-/// already fixed for once.
-///
-/// So the window goes down on the frame that **raises** the overlay instead --
-/// the second of [`Appearing`]'s two steps, one root frame after the one that
-/// composites the window and asks for it to be shown -- which is the first
-/// moment a live child viewport exists *and is visible*. It used to be the
-/// overlay's own first painted frame, and moved with the white-box fix; the
-/// guarantee got stronger rather than weaker, because "registered" became
-/// "on screen". The same probe, minimising
-/// there, measures the root going on at about 8 frames a second and this
-/// overlay at twice that, indefinitely. That is `eframe`'s deliberate
-/// `INVISIBLE_WINDOW_REPAINT_INTERVAL` throttle of a window Windows sends no
-/// `WM_PAINT` to; it is not a freeze.
-///
-/// **And it is not a cost the drag pays**, which an earlier version of this
-/// paragraph claimed and which was then reported as *"the rubber band runs
-/// at about 8 fps while the app is minimised"*. Re-measured with a probe
-/// built the way this overlay is -- a deferred viewport created hidden and
-/// shown by its own `ShowWindow`, the root asking for the child's repaint on
-/// every root frame, the root sent down with `SW_SHOWMINNOACTIVE`, and
-/// `WM_MOUSEMOVE` posted to the child at 125 Hz to stand in for a drag: with
-/// the root minimised and **no** input, the root ran at 9-12 fps (110 ms
-/// gaps: the 100 ms throttle plus `eframe`'s 10 ms sleep) and the child at
-/// 23 fps, twice the root, because every `request_repaint_of` buys two
-/// repaints. With input, the child ran at 350 fps minimised and at 360-1600
-/// fps with the root visible. The throttle keys on the window the repaint is
-/// FOR (`is_invisible_or_minimized` in `eframe::native::run`), and a pointer
-/// event on this window schedules a repaint of this window; the root's state
-/// never enters into it. So the throttle governs only the frames the root
-/// drives -- the idle ones -- and a drag is made of the other kind. Whatever
-/// the owner sees during a drag, it is not this; [`DragCadence`] is the
-/// instrument that says what it is.
-///
-/// Which leaves one thing that genuinely has to wait, and it is not the scan's
-/// capture -- that one is protected by the mask, set two frames earlier, which
-/// is exactly the belt this is braces to. It is the **reveal**. The reveal
-/// exists to show the user the code on their own screen, and it is issued on
-/// the same frame as the minimise: without a wait, the first part of
-/// [`REVEAL_DWELL`] would be spent ringing a code behind the window that is
-/// still on its way down. That is the argument [`Reveal::Due`] already makes
-/// about a window that does not exist yet, applied to a window that has not
-/// gone yet.
-///
-/// # Why 120 ms
-///
-/// Measured, on a real desktop, by minimising a window filled with a colour
-/// nothing else is and capturing its own rectangle exactly once, at one delay,
-/// per process run -- one shot rather than a sampling loop, because a
-/// `capture_rect` loop is a `BitBlt` off the screen DC every few milliseconds
-/// and three earlier versions of this measurement measured the probe instead
-/// of the minimise.
-///
-/// Across eight runs at requested delays from 0 to 320 ms, the window was
-/// fully present in the frame before the call (`filled = 1.000` every time)
-/// and **completely absent at every delay tried**, including the shortest the
-/// instrument can reach -- about 60 ms after `ShowWindow` returns, which is a
-/// floor set by a thread wake plus the ~30 ms a capture of that size costs,
-/// not by the compositor. `ShowWindow` itself returned in 4-6 ms.
-///
-/// So the honest reading is "gone within 60 ms, and probably much sooner",
-/// and 60 ms is an upper bound on a number this instrument cannot resolve
-/// rather than the number. 120 ms is twice that: margin for a machine slower
-/// than the one it was measured on, and comfortably more than
-/// [`PRESCAN_SETTLE`]'s 80 ms, which buys two composes at 30 Hz on the same
-/// reasoning.
-///
-/// It is also small enough not to matter. It is spent once, in front of a
-/// 450 ms reveal, at the end of a route whose scan is a full binarisation of
-/// every monitor -- so it moves the code onto the user's screen a fifth of a
-/// second later in exchange for the code being the thing they can actually
-/// see when it arrives.
-///
-/// **Not a proof**, on the same terms as [`PRESCAN_SETTLE`]: nothing in this
-/// crate can assert the compositor acted. See the module header's list.
-pub const MINIMISE_SETTLE: Duration = Duration::from_millis(120);
-
 /// **How long the overlay shows the user the code it just found, before it
 /// closes and 6c appears.**
 ///
@@ -896,9 +799,10 @@ impl DecodeThrottle {
 /// The report: *"the rubber band runs at about 8 fps while the app is
 /// minimised -- visibly steppy; unminimised it is smooth."* The mechanism
 /// that was suspected -- a minimised root throttling this viewport's repaints
-/// -- was measured and is not it: see [`MINIMISE_SETTLE`], whose probe puts
-/// the pointer-driven frames of a child viewport at 350 fps with the root
-/// minimised. What the owner sees during a real drag on a real display cannot
+/// -- was measured and is not it: a probe put the pointer-driven frames of a
+/// child viewport at 350 fps with the root minimised (the root is not
+/// minimised any more either; see `give_foreground_back`). What the owner
+/// sees during a real drag on a real display cannot
 /// be measured from inside this crate (`cargo test` opens no windows) or from
 /// outside this process (this window is out of captures), and the log's
 /// second-resolution timestamps say nothing about cadence. So the overlay
@@ -948,26 +852,27 @@ impl DragCadence {
         (self.frames > 1 && span > 0.0).then(|| (self.frames - 1) as f64 / span)
     }
 
-    /// The line. `aside` is whether Deskwarden's own window was minimised for
-    /// the drag; `rect` is what was framed.
-    fn report(&self, aside: bool, rect: ScreenRect) {
+    /// The line. `rect` is what was framed. It used to say whether
+    /// Deskwarden's own window was minimised for the drag; it never is now
+    /// (see `give_foreground_back`), and the line says so in words rather than
+    /// dropping the clause, so a log from this build is read against the
+    /// right arrangement.
+    fn report(&self, rect: ScreenRect) {
         match self.per_second() {
             Some(fps) => log::info!(
                 "region overlay: the drag ran {} frames over {:.0} ms ({fps:.0} fps, worst gap \
-                 {:.0} ms) framing {}x{}, with Deskwarden's window {}",
+                 {:.0} ms) framing {}x{}, with Deskwarden's window left where it was",
                 self.frames,
                 self.last.saturating_duration_since(self.started).as_secs_f64() * 1000.0,
                 self.worst_gap.as_secs_f64() * 1000.0,
                 rect.width(),
-                rect.height(),
-                if aside { "minimised" } else { "not minimised" }
+                rect.height()
             ),
             None => log::info!(
                 "region overlay: the drag was released on the frame it began, framing {}x{}, \
-                 with Deskwarden's window {}",
+                 with Deskwarden's window left where it was",
                 rect.width(),
-                rect.height(),
-                if aside { "minimised" } else { "not minimised" }
+                rect.height()
             ),
         }
     }
@@ -1301,10 +1206,11 @@ struct Inner {
     ///
     /// Resolved in [`RegionOverlay::open`] by
     /// [`crate::screen_capture::active_display`], at the moment the route
-    /// starts. It must not be recomputed later: by the time the window is up,
-    /// Deskwarden's own window has been minimised and the anchor that chose
-    /// this rectangle no longer exists. See that function for the argument
-    /// about what "active" means.
+    /// starts. It must not be recomputed later: by the time the window is up
+    /// the overlay covers the display and has the foreground, and the anchor
+    /// that chose this rectangle -- where the user was -- is a fact about an
+    /// earlier moment. See that function for the argument about what
+    /// "active" means.
     display: ScreenRect,
     points_per_pixel: f32,
     drag: Option<Drag>,
@@ -1325,19 +1231,18 @@ struct Inner {
     /// OS call, and this is what makes masking and unmasking idempotent and
     /// what [`Inner::drop`] reads to guarantee the mask comes off.
     masked: bool,
-    /// Whether Deskwarden's own window has been sent down for the length of
-    /// this overlay. A flag for [`Inner::masked`]'s reasons exactly --
-    /// `ShowWindow` is an OS call, this makes standing aside and coming back
+    /// Whether this overlay has taken the foreground from Deskwarden's own
+    /// window, and so owes it back. A flag for [`Inner::masked`]'s reasons
+    /// exactly -- the raise is an OS call, this makes the hand-back
     /// idempotent, and it is what [`Inner::drop`] reads to guarantee the
-    /// window comes back. **Of the two flags this is the one with the
-    /// catastrophic failure mode**: a mask left on is a window missing from
-    /// screenshots, and a window left down is the user's app gone.
-    aside: bool,
-    /// When it went down, so the reveal can wait out [`MINIMISE_SETTLE`]
-    /// before starting its clock. `None` on an overlay that never stood aside
-    /// -- a test's, or one dropped before it ever had a window -- and `None`
-    /// means "nothing to wait for", which is true of exactly those.
-    aside_at: Option<Instant>,
+    /// foreground goes back for the endings that never reach `show`.
+    ///
+    /// This used to be `aside`: whether the vault window had been
+    /// *minimised* for the length of the scan. It is not minimised any more
+    /// -- see [`RegionOverlay::give_foreground_back`] for why -- so the only
+    /// thing the overlay takes from that window is the foreground, and the
+    /// only thing it owes is a raise.
+    fronted: bool,
     /// Why 6b opened. `None` until the scan has answered.
     reason: Option<ScanMiss>,
     /// How far the reveal has got. See [`Reveal`].
@@ -1616,8 +1521,7 @@ enum Appearing {
     /// the callback. It stays here until the callback has painted a frame
     /// into it. Either way the user has not seen it, which is the name.
     Unseen,
-    /// It is on screen. Raised, and Deskwarden's own window has gone down
-    /// behind it.
+    /// It is on screen, and raised: it has the foreground, and owes it back.
     Up,
 }
 
@@ -1721,11 +1625,13 @@ impl RegionOverlay {
     ///
     /// [`crate::screen_capture::active_display`] carries the argument for what
     /// "active" means and why it must be resolved before anything moves. The
-    /// deadline is this function: a few frames later
-    /// [`RegionOverlay::stand_aside`] minimises the Deskwarden window this
-    /// anchor is the centre of, and a minimised window's `GetWindowRect` is
-    /// `-32000, -32000`. So the rectangle is resolved once, now, and stored in
-    /// [`Inner::display`] -- `show` reads it back and never asks again.
+    /// deadline is this function: a few frames later the overlay covers the
+    /// display and takes the foreground, and "where the user is" stops being
+    /// a question about their own window. (It used to be sharper still -- the
+    /// vault window was minimised, and a minimised window's `GetWindowRect`
+    /// is `-32000, -32000`.) So the rectangle is resolved once, now, and
+    /// stored in [`Inner::display`] -- `show` reads it back and never asks
+    /// again.
     ///
     /// # What did NOT narrow, deliberately
     ///
@@ -1774,8 +1680,7 @@ impl RegionOverlay {
                 open: true,
                 prescan: Prescan::Due,
                 masked: false,
-                aside: false,
-                aside_at: None,
+                fronted: false,
                 reason: None,
                 reveal: Reveal::Nothing,
                 drag_cadence: None,
@@ -1958,45 +1863,26 @@ impl RegionOverlay {
             // gets the whole dwell rather than whatever is left of it after
             // the OS has made a window.
             Reveal::Due { at } => {
-                // **...and not even that frame, while Deskwarden's own window
-                // is still on its way down.**
-                //
-                // The minimise is issued on the root frame that raises this
-                // window, which is at best this frame and may be the one after
-                // it -- so on a route that found a code, the window this
-                // reveal exists to get out of the way can still be on screen
-                // right now. Starting the clock here would spend the
-                // front of `REVEAL_DWELL` ringing a code behind it, by an
-                // amount that varies with the user's machine, which is exactly
-                // the defect `Reveal::Due` was introduced to avoid for a
-                // window that did not exist yet. `MINIMISE_SETTLE` carries the
-                // measurement and the argument.
-                //
-                // This cannot become a wait with no end: `aside_at` is set
-                // once, the comparison is against a clock that only moves
-                // forwards, and the reveal branch of the callback asks for the
-                // next frame itself. `None` -- an overlay that never stood
-                // aside -- has nothing to wait for and does not.
-                //
-                // **And not while the window is still hidden, either.**
+                // **...and not even that frame, while the window is unseen.**
                 // `Appearing::Unseen` means the callback is painting into a
-                // window nobody can see yet, and the root frame that shows
-                // it, raises it and minimises the vault window has not
-                // happened -- it is a root frame away, and guaranteed: every
-                // `Unseen` root frame asks for the next. Without this the
-                // dwell could start on a hidden window, spending the front of
-                // `REVEAL_DWELL` on a ring nobody can see -- the same defect
-                // `MINIMISE_SETTLE` carries the measurement for, reached from
-                // the other side. A test overlay is `Waiting` and never
-                // `Unseen`, so this waits for nothing there; and the state
-                // only moves forwards, so it cannot wait for ever.
+                // cloaked window nobody can see yet, and the root frame that
+                // reveals and raises it has not happened -- it is a root
+                // frame away, and guaranteed: every `Unseen` root frame asks
+                // for the next. Without this the dwell could start on a
+                // window nobody can see, spending the front of `REVEAL_DWELL`
+                // on a ring the user never gets. A test overlay is `Waiting`
+                // and never `Unseen`, so this waits for nothing there; and the
+                // state only moves forwards, so it cannot wait for ever.
+                //
+                // There used to be a second wait here, for the vault window
+                // to finish minimising out of the ring's way. The vault
+                // window is not minimised any more (see `give_foreground_back`)
+                // and the ring is painted on a picture that never contained
+                // it, so there is nothing left to wait for and this waits for
+                // nothing else. `a_reveal_on_a_window_that_is_up_starts_at_once`
+                // holds it there.
                 if matches!(held.appearing, Appearing::Unseen) {
                     return Some(at);
-                }
-                if let Some(down_at) = held.aside_at {
-                    if now < down_at + MINIMISE_SETTLE {
-                        return Some(at);
-                    }
                 }
                 held.reveal = Reveal::Showing {
                     at,
@@ -2036,92 +1922,37 @@ impl RegionOverlay {
         set_capture_exclusion(crate::vault_window::WINDOW_TITLE, on);
     }
 
-    /// **Sends Deskwarden's own window down out of the user's way, or brings
-    /// it back on top.**
+    /// **Gives the foreground back to Deskwarden's own window**, once, on the
+    /// way out of an overlay that took it.
     ///
-    /// # Why this exists at all
+    /// The second half of the owner's *"once back - it should be on top
+    /// again"*. The first half used to be a minimise, and is gone --
+    /// [`RegionOverlay::appear`] has the argument -- so what the overlay owes
+    /// the vault window is exactly what it took from it on the frame it was
+    /// raised: the foreground. [`bring_window_back`] is the crate's one way to
+    /// hand it back and reports what Windows said.
     ///
-    /// [`mask_own_window`](Self::mask_own_window) solves the machine's view
-    /// and not the user's. `WDA_EXCLUDEFROMCAPTURE` takes the vault window out
-    /// of the blit, so the scan reads what is behind it -- but the window is
-    /// still physically on screen, on top of the code, and both of the things
-    /// this overlay then does are things the user has to *look* at: the drag
-    /// fallback asks them to point at a code the window is covering, and the
-    /// reveal rings a code the window is covering. The owner said it in one
-    /// sentence: *"when Scan code clicked - that should minimize the DW window
-    /// so it doesn't obstruct the screen - obviously it doesn't have the QR
-    /// code but some other window has it, once back - it should be on top
-    /// again"*.
-    ///
-    /// # Minimise and not hide, and the difference is not aesthetic
-    ///
-    /// `SW_HIDE` is instant, leaves no taskbar button and looks better. It is
-    /// also the one choice whose failure mode is unrecoverable: a hidden
-    /// window that does not come back is a window the user cannot reach by any
-    /// means at all, whereas a minimised one that does not come back is one
-    /// taskbar click away. Everything below is built so that it always comes
-    /// back, and choosing the option that does not *need* that to be true is
-    /// how a safety argument is meant to be made.
-    ///
-    /// The second reason is this app's own state. `vault_window`'s
-    /// `keep_ui_loaded` machinery has a hidden state of its own -- a `hidden`
-    /// cell, `close_or_hide`, `spawn_show_waiter`, a named event the daemon
-    /// signals -- and `ChromeAction::Hide`'s neighbour argues at length that
-    /// *"Minimize is not a hide, and must not become one"*: a minimised window
-    /// is still in use, keeps its taskbar button, keeps `vault_is_in_use`
-    /// answering `true` and keeps its vault-service attachment, where a hidden
-    /// one has none of that. Hiding from here would put the window into a
-    /// state that machinery believes only it can produce, without any of the
-    /// bookkeeping it does; minimising puts it in exactly the state the app's
-    /// own minimise button produces, which that machinery already ignores by
-    /// design.
-    ///
-    /// # The mask stays on as well
-    ///
-    /// A minimised window is not composited, so the exclusion is redundant
-    /// while it is down -- and it is kept, because it is what covers the
-    /// window in the frames between the press and the minimise taking effect,
-    /// and because the scan's capture happens two frames *before* this is ever
-    /// called. See [`MINIMISE_SETTLE`] for why it cannot be called earlier.
-    ///
-    /// # Whether the minimise is still needed, stated
-    ///
-    /// For the user's view, it no longer is. Since the overlay started painting
-    /// a picture of the display ([`RegionOverlay::take_picture`]) it is an
-    /// opaque, always-on-top window over the whole display, and the picture
-    /// was taken with Deskwarden's own window already out of captures -- so the
-    /// vault window is behind an opaque sheet whose pixels do not contain it,
-    /// minimised or not. The two sentences above that begin "the drag
-    /// fallback asks them to point at a code the window is covering" were
-    /// true of the see-through overlay and are not true of this one.
-    ///
-    /// It stays, for two reasons that are not about the view. The owner asked
-    /// for it in those words, and the second half of the ask -- *"once back -
-    /// it should be on top again"* -- is [`bring_window_back`], which this is
-    /// the other half of. And it was checked for cost before being left alone:
-    /// the throttle a minimised root puts on `eframe` reaches only the frames
-    /// the root drives, not the pointer-driven frames a drag is made of -- see
-    /// [`MINIMISE_SETTLE`] for the measurement -- so keeping it costs the drag
-    /// nothing. If the owner wants the window left where it is, this call and
-    /// its settle are what to remove, and nothing about the picture has to
-    /// change.
-    ///
-    /// Idempotent through [`Inner::aside`], for
-    /// [`mask_own_window`](Self::mask_own_window)'s reasons.
-    fn stand_aside(&self, away: bool) {
+    /// Idempotent through [`Inner::fronted`], for
+    /// [`mask_own_window`](Self::mask_own_window)'s reasons: called on both of
+    /// `show`'s ways out and read by `Inner`'s `Drop`, so the raise happens
+    /// exactly once and only for an overlay that was ever up. A test overlay
+    /// and one whose window never appeared took nothing and give nothing back.
+    fn give_foreground_back(&self) {
         {
             let mut held = locked(&self.inner);
-            if held.aside == away {
+            if !held.fronted {
                 return;
             }
-            held.aside = away;
-            held.aside_at = if away { Some(Instant::now()) } else { None };
+            held.fronted = false;
         }
-        if away {
-            send_window_down(crate::vault_window::WINDOW_TITLE);
-        } else {
-            bring_window_back(crate::vault_window::WINDOW_TITLE);
-        }
+        bring_window_back(crate::vault_window::WINDOW_TITLE);
+    }
+
+    /// Whether the user can see the window: [`Appearing::Up`]. The callback
+    /// reads no input before this -- see it for why a cloaked window is a
+    /// window that takes clicks.
+    fn revealed(&self) -> bool {
+        matches!(locked(&self.inner).appearing, Appearing::Up)
     }
 
     /// **Takes the overlay's window from "created" to "on screen, painted,
@@ -2179,22 +2010,32 @@ impl RegionOverlay {
     ///   nothing captured, and the log says why.
     /// * `foreground::pick` skips invisible windows, so this is the first frame
     ///   a raise can find anything at all. `window_host::Reveal` splits show
-    ///   from raise for this same reason.
-    /// * The minimise must not land while this process's only live viewport is
-    ///   the one being minimised -- a minimised `eframe` root alone takes no
-    ///   further frames at all, measured twice at 5.5 s of nothing. By this
-    ///   frame the overlay is not merely registered but visible and painted,
-    ///   which is a stronger guarantee than the one the shipped arrangement
-    ///   had.
-    /// * The minimise stays after the raise: `SW_SHOWMINNOACTIVE` activates
-    ///   nothing, so a foreground this window has already taken is one it keeps
-    ///   -- which is what leaves Escape working with the app down. See
-    ///   [`send_window_down`].
+    ///   from raise for this same reason. The raise is the last act, and
+    ///   `Inner::fronted` is set beside it so that the foreground goes back
+    ///   however the overlay ends.
     ///
-    /// One thing moved with it. The reveal's dwell must not start before
-    /// Deskwarden is down, and the minimise is now a frame later than the
-    /// overlay's first paint, so [`RegionOverlay::reveal_step`] holds while
-    /// [`Appearing::Unseen`] as well as while `MINIMISE_SETTLE` runs.
+    /// # What is no longer here: the minimise
+    ///
+    /// Until *"transparent overlay blinks twice now"*, the raise was followed
+    /// by `ShowWindow(vault, SW_SHOWMINNOACTIVE)`, and the close by its
+    /// restore. That was the owner's own ask, made when the overlay was a
+    /// see-through sheet the vault window would have shown through, and it
+    /// was kept after the picture on the ground that it cost nothing. It
+    /// costs the one thing this sequence cannot afford: DWM draws its
+    /// minimise and restore animations *above* every window, topmost ones
+    /// included, so the vault window's thumbnail flew across the dim on the
+    /// way in and flew back across the desktop on the way out -- two
+    /// disturbances around one scan, a second or so after the reveal and
+    /// again at the close. Under an opaque picture taken with the vault
+    /// window already out of captures, minimising it changes nothing the
+    /// user sees or the drag captures; it only animates. So it is gone, and
+    /// [`RegionOverlay::give_foreground_back`] is what remains of the ask's
+    /// second half, *"once back - it should be on top again"*.
+    ///
+    /// Not measured, said plainly: the animation cannot be seen from inside
+    /// this process. What can be said is that it was the only thing left in
+    /// the sequence that draws over the overlay after the reveal, and that
+    /// removing it removes two `EnumWindows` and a 120 ms settle as well.
     fn appear(&self, ctx: &egui::Context) {
         // The lookup, and only while there is something to find.
         // `own_window_titled` does NOT skip invisible windows -- see its doc,
@@ -2268,12 +2109,12 @@ impl RegionOverlay {
             ctx.request_repaint_of(region_viewport());
             // A selection surface that opens behind the window being selected
             // from is useless, so this one raises; see its row in
-            // `foreground::OPENS_A_VIEWPORT_AND_RAISES_IT`.
+            // `foreground::OPENS_A_VIEWPORT_AND_RAISES_IT`. And it owes the
+            // foreground back: every exit from `show` returns it, and
+            // `Inner`'s `Drop` covers the exits that do not come through
+            // `show` at all.
             crate::foreground::raise_window(REGION_TITLE);
-            // **And Deskwarden's own window goes down.** Every exit from `show`
-            // puts it back, and `Inner`'s `Drop` covers the exits that do not
-            // come through `show` at all.
-            self.stand_aside(true);
+            locked(&self.inner).fronted = true;
         } else if matches!(locked(&self.inner).appearing, Appearing::Unseen) {
             // Unseen, being painted, and not painted yet. The overlay's own
             // paint is already asked for on every root frame by `show`; this
@@ -2482,6 +2323,14 @@ impl RegionOverlay {
     /// Ends the overlay with `outcome`, unless one is already recorded.
     fn finish(&self, outcome: Outcome) {
         let mut held = locked(&self.inner);
+        // What ended the overlay and how far it had got, in one line: the
+        // owner's log had an overlay end between `shown` and `revealed` and
+        // nothing to say what ended it. `Outcome`'s `Debug` is hand-written
+        // and prints no secret.
+        log::info!(
+            "region overlay: ended by {outcome:?} while {:?}",
+            held.appearing
+        );
         if held.outcome.is_none() {
             held.outcome = Some(outcome);
         }
@@ -2558,7 +2407,7 @@ impl RegionOverlay {
                     // The instrument's one line, before the decode that ends
                     // the overlay: see `DragCadence`.
                     if let Some(cadence) = held.drag_cadence.take() {
-                        cadence.report(held.aside, rect);
+                        cadence.report(rect);
                     }
                     drop(held);
                     self.finish(read_region_with(seams, rect));
@@ -2589,13 +2438,13 @@ impl RegionOverlay {
             if locked(&self.inner).picture.take().is_some() {
                 log::info!("region overlay: the display's picture is released with the window");
             }
-            // **Both, and in this order.** Standing aside was the last thing
-            // done on the way in, so coming back is the first thing done on
-            // the way out; and the window is put back before it is put back
-            // into captures, so it is never briefly on screen and invisible to
-            // the user's own screenshots at the same time. Both are no-ops on
-            // an overlay that never did either.
-            self.stand_aside(false);
+            // **Both, and in this order.** Taking the foreground was the last
+            // thing done on the way in, so giving it back is the first thing
+            // done on the way out; and the window is in front before it is
+            // put back into captures, so it is never briefly behind and
+            // invisible to the user's own screenshots at the same time. Both
+            // are no-ops on an overlay that never did either.
+            self.give_foreground_back();
             self.mask_own_window(false);
             return false;
         }
@@ -2674,8 +2523,9 @@ impl RegionOverlay {
         // unplug a monitor, change a resolution or drag a screen in Display
         // Settings and the position came from the old arrangement while the
         // extent came from the new one. Worse, the size was recomputed after
-        // Deskwarden's own window had been minimised, which is precisely the
-        // moment the anchor that chose it stopped existing. `Inner::display`
+        // the overlay had taken the screen (and, then, after Deskwarden's own
+        // window had been minimised), which is precisely the moment the
+        // anchor that chose it stopped meaning anything. `Inner::display`
         // is resolved once in `open` and carried; see it, and
         // `screen_capture::active_display`, for why.
         let (display, scale) = {
@@ -2844,7 +2694,18 @@ impl RegionOverlay {
                 // finished-overlay guard at the top of this callback exists to
                 // prevent, and this is the one path that reaches here with an
                 // answer already recorded.
-                if mine.is_open() {
+                //
+                // **And not before the user can see the window.** A cloaked
+                // window is shown -- to Windows it is on screen, topmost and
+                // full-display, so every click and key in that stretch lands
+                // here, in a window the user cannot see. The owner's log has
+                // an overlay that went from `shown` straight to released with
+                // no reveal in between: a press and release on the cloaked
+                // window was a released drag on nothing, and the answer ended
+                // the scan before it had been seen. Painting still happens on
+                // these frames -- it is what the reveal waits for -- and input
+                // does not.
+                if mine.is_open() && mine.revealed() {
                     let (pointer, pressed, down) = root.input(|i| {
                         (
                             i.pointer.latest_pos().map(|p| (p.x, p.y)),
@@ -2946,19 +2807,20 @@ impl RegionOverlay {
         let still_open = self.is_open();
         if !still_open {
             // Whatever ended it -- a code found, none found, several found, a
-            // refusal, Escape, the close button -- the vault window comes back
-            // up and back into screen captures here. `Inner`'s `Drop` is the
-            // backstop for the paths that do not come through this line: the
-            // form closing under a live overlay, the vault locking, or a panic
-            // unwinding past it. Order as in the early return above.
-            self.stand_aside(false);
+            // refusal, Escape, the close button -- the vault window gets the
+            // foreground back and comes back into screen captures here.
+            // `Inner`'s `Drop` is the backstop for the paths that do not come
+            // through this line: the form closing under a live overlay, the
+            // vault locking, or a panic unwinding past it. Order as in the
+            // early return above.
+            self.give_foreground_back();
             self.mask_own_window(false);
         }
         still_open
     }
 }
 
-/// **The window comes back, and the mask comes off, however the overlay
+/// **The foreground goes back, and the mask comes off, however the overlay
 /// ends.**
 ///
 /// `show` does both on the frame it answers `false`, which covers every
@@ -2970,23 +2832,21 @@ impl RegionOverlay {
 /// took once -- exactly the kind of thing a `Drop` exists to make impossible
 /// to forget.
 ///
-/// **The minimise is the same shape of obligation with a much worse failure
-/// mode, so it is on the same hook.** A mask left on is a window the user
-/// cannot screenshot. A window left down is the user's application gone: no
-/// window, nothing on screen, and only a taskbar button between them and
-/// concluding the app has crashed. That asymmetry is also why it is a
-/// minimise and not a hide -- there *is* a taskbar button -- but the point of
-/// this `Drop` is that the taskbar button should never be the thing that saves
-/// it.
+/// **The foreground is the same shape of obligation**, and a smaller one
+/// than the minimise that used to be on this hook: a window left minimised
+/// was the user's application gone but for a taskbar button; a window left
+/// behind is one click away. It is on the hook anyway, because "one click
+/// away" is still the feature appearing to have lost the app, and because the
+/// raise reports a refusal where a silent omission would not.
 ///
-/// Order is the reverse of the way in, as in `show`: back up first, back into
-/// captures second.
+/// Order is the reverse of the way in, as in `show`: in front first, back
+/// into captures second.
 ///
 /// It is on `Inner` rather than on [`RegionOverlay`] because the overlay is an
 /// `Arc` handle that is cloned per frame; this runs when the last one goes.
 impl Drop for Inner {
     fn drop(&mut self) {
-        if self.aside {
+        if self.fronted {
             bring_window_back(crate::vault_window::WINDOW_TITLE);
         }
         if self.masked {
@@ -3604,40 +3464,6 @@ fn set_capture_exclusion(title: &str, exclude: bool) {
     }
 }
 
-/// [`RegionOverlay::stand_aside`]'s way down: `ShowWindow` with
-/// `SW_SHOWMINNOACTIVE`.
-///
-/// # `SW_SHOWMINNOACTIVE` and not `SW_MINIMIZE`, which was measured
-///
-/// The two differ in one clause of the documentation and it turns out to
-/// decide whether this feature works. `SW_MINIMIZE` minimises the window
-/// **and activates the next top-level window in the Z order**, which is
-/// somebody else's -- so the moment Deskwarden goes down, the foreground
-/// leaves this process. Measured with a probe that opens the real overlay,
-/// minimises the root and then asks Windows which window has the foreground:
-/// with `SW_MINIMIZE` the answer was a browser, and the overlay -- which is
-/// always-on-top, so still perfectly visible -- was no longer the window the
-/// keyboard was going to. **Escape is how this surface is cancelled.** An
-/// overlay covering every monitor that cannot be dismissed from the keyboard
-/// is close to the worst thing this module could ship.
-///
-/// `SW_SHOWMINNOACTIVE` minimises and activates nothing. The same probe, same
-/// sequence, answered "the overlay" at every check afterwards.
-///
-/// # What is logged, and why it is not the return value
-///
-/// `ShowWindow` returns the window's **previous visibility**, not success, so
-/// its return value cannot answer "did this work" and is not treated as
-/// though it could. `IsIconic` can, and does -- on the handle already
-/// resolved, with no second `EnumWindows`, because that lookup was measured at
-/// hundreds of milliseconds in an unoptimised build and this is on the frame
-/// the overlay takes the screen -- a frame whose cost the user is watching.
-///
-/// Logged either way rather than discarded, which is this module's rule since
-/// three silently-failing Win32 calls cost a day: a window that did not go
-/// down is a user staring at Deskwarden sitting on top of the code they are
-/// being asked to point at, and without this line there is nothing in
-/// `deskwarden.log` that tells that apart from a window that went down fine.
 /// **Where the user is, read at the instant the route starts**: the centre of
 /// Deskwarden's own window in virtual-screen physical pixels.
 ///
@@ -3654,10 +3480,9 @@ fn set_capture_exclusion(title: &str, exclude: bool) {
 /// minimised window's rectangle on Windows is `-32000, -32000` -- a sentinel,
 /// not a position -- and handing it to a nearest-monitor rule would reliably
 /// pick the top-left screen of the desktop rather than the one the user is on.
-/// This function is only ever called from `RegionOverlay::open`, before
-/// anything in this module has minimised anything, so an iconic window here
-/// means the *user* had the app minimised when the press arrived, and the
-/// cursor is then the better answer.
+/// This module minimises nothing, so an iconic window here means the *user*
+/// had the app minimised when the press arrived, and the cursor is then the
+/// better answer.
 ///
 /// Logged either way, like every other Win32 call in this module: "the overlay
 /// came up on the wrong screen" is a report that cannot be answered without
@@ -4120,43 +3945,19 @@ fn log_window_rect(title: &str, step: &str, asked_for: ScreenRect) {
     }
 }
 
-fn send_window_down(title: &str) {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, ShowWindow, SW_SHOWMINNOACTIVE};
-
-    let Some(hwnd) = crate::foreground::own_window_titled(title) else {
-        log::warn!(
-            "region overlay: no window titled {title:?} to send down; it will stay on top of \
-             whatever the user is being asked to point at"
-        );
-        return;
-    };
-    let handle = HWND(hwnd as *mut _);
-    // The return is the PREVIOUS visibility. Deliberately unused: see above.
-    let _ = unsafe { ShowWindow(handle, SW_SHOWMINNOACTIVE) };
-    if unsafe { IsIconic(handle) }.as_bool() {
-        log::info!("region overlay: {title:?} is minimised for the length of the scan");
-    } else {
-        log::warn!(
-            "region overlay: {title:?} did not go down -- ShowWindow(SW_SHOWMINNOACTIVE) was \
-             issued on {hwnd:#x} and IsIconic still says no. The overlay will be on top of it \
-             either way, but the user will be dragging over a window they cannot see behind"
-        );
-    }
-}
-
-/// [`RegionOverlay::stand_aside`]'s way back, and **the one call in this
-/// module that must not be allowed to silently not happen.**
+/// [`RegionOverlay::give_foreground_back`]'s one call, and **the one call in
+/// this module that must not be allowed to silently not happen.**
 ///
-/// # Restoring is not un-minimising
+/// # A raise, through the crate's one way to raise
 ///
-/// The owner's sentence ends *"once back - it should be on top again"*, and
-/// that is two things. [`crate::foreground::raise_window`] is the crate's one
-/// way to do both, and it already does them in the right order: it picks this
-/// process's window by title, `SW_RESTORE`s it **because** it is iconic, then
-/// asks for the foreground. A bare `ShowWindow(SW_RESTORE)` would put the
-/// window back on screen behind whatever the user has since clicked on, which
-/// is not what was asked for.
+/// The owner's sentence ends *"once back - it should be on top again"*.
+/// [`crate::foreground::raise_window`] is the crate's one way to do that: it
+/// picks this process's window by title, `SW_RESTORE`s it **if** it is iconic
+/// -- which this module no longer makes it, but the user may have -- then
+/// asks for the foreground. A bare `SetForegroundWindow` on a handle would
+/// skip the restore, and a bare `ShowWindow(SW_RESTORE)` would put the window
+/// back behind whatever the user has since clicked on; neither is what was
+/// asked for.
 ///
 /// # A refusal is reported, not swallowed
 ///
@@ -4173,11 +3974,10 @@ fn send_window_down(title: &str) {
 ///   user has to click its flashing taskbar button. Recoverable, and worth a
 ///   `warn` because it is the difference between the feature working and the
 ///   feature appearing to have eaten the app.
-/// * `NoWindow` -- nothing matched the title. At `warn`, loudly: it is the one
-///   outcome in which a window this module minimised has not been brought
-///   back by this call, and the only thing between the user and a lost app is
-///   a taskbar button. It is also why the window is minimised rather than
-///   hidden.
+/// * `NoWindow` -- nothing matched the title. At `warn`, loudly: the window
+///   this overlay took the foreground from is not there to give it back to,
+///   which is either the vault closing under a live scan or something worse,
+///   and the line is the only trail either leaves.
 fn bring_window_back(title: &str) {
     use crate::foreground::Raised;
 
@@ -4240,8 +4040,8 @@ mod tests {
         assert!((fps - 10.0).abs() < 0.01, "9 intervals over 900 ms is 10 fps, not {fps}");
         // The report is a log line and cannot be observed here; that it does
         // not panic on either shape is what can be.
-        cadence.report(true, rect(0, 0, 40, 30));
-        DragCadence::started(t0).report(false, rect(0, 0, 1, 1));
+        cadence.report(rect(0, 0, 40, 30));
+        DragCadence::started(t0).report(rect(0, 0, 1, 1));
     }
 
     /// The same in the space the painter works in: egui points inside the
@@ -4419,8 +4219,8 @@ mod tests {
             code.matches("screen_capture::active_display(").count(),
             1,
             "the active display is resolved somewhere other than `open`, or not at all -- it \
-             has to be read before `stand_aside` minimises the window the anchor is the centre \
-             of, and carried from there"
+             has to be read while the anchor still means where the user is, and carried from \
+             there"
         );
         let opener = code
             .split("pub fn open(monitors: &[ScreenRect], points_per_pixel: f32)")
@@ -5890,90 +5690,130 @@ mod tests {
         assert_ne!(crate::vault_window::WINDOW_TITLE, REGION_TITLE);
     }
 
-    /// **Deskwarden's own window goes down for the scan and comes back on
-    /// every single way out.**
+    /// **The foreground the overlay took is given back, however the overlay
+    /// ends -- and nothing is minimised any more.**
     ///
-    /// Held to exactly the shape `the_mask_is_bookkept_so_that_it_always_comes
-    /// _back_off` holds the mask to, and for a worse reason: a mask left on is
-    /// a window missing from screenshots, and a window left down is the user's
-    /// app apparently gone. `ShowWindow` is a call on a real window and there
-    /// is none in a test process, so what is asserted is the bookkeeping that
-    /// decides when it happens.
+    /// The raise is a `SetForegroundWindow` on a real window and cannot be
+    /// asserted from here. What can be asserted is the bookkeeping that
+    /// decides when the hand-back happens: `Inner::fronted` is set on the
+    /// frame the overlay is revealed and raised, cleared by the one function
+    /// that gives the foreground back, and read by `Inner`'s `Drop` for the
+    /// endings that do not run through `show`.
+    ///
+    /// This pin used to hold the opposite of its first half: that the vault
+    /// window was *minimised* for the length of the scan and restored after.
+    /// The minimise was the owner's own ask, made when the overlay was a
+    /// see-through sheet and the vault window would have been visible under
+    /// it. The overlay is an opaque picture now, taken with the vault window
+    /// already out of captures, so the window under it is neither seen nor
+    /// photographed -- and the minimise had become the one thing in the
+    /// sequence that DWM draws *over* a topmost opaque window: its own
+    /// minimise animation on the way in, and the restore animation on the way
+    /// out. The owner's *"transparent overlay blinks twice now"* is the shape
+    /// of exactly that pair, and the other half of the ask -- *"once back - it
+    /// should be on top again"* -- is [`bring_window_back`], which is kept.
     #[test]
-    fn the_window_is_bookkept_so_that_it_always_comes_back_up() {
+    fn the_foreground_is_bookkept_so_that_it_always_goes_back() {
         let overlay = RegionOverlay::open(&[rect(0, 0, 800, 600)], 1.0).expect("opens");
         let held = locked(&overlay.inner);
-        assert!(!held.aside, "a fresh overlay has sent nothing down");
-        assert!(held.aside_at.is_none(), "a fresh overlay has a stale settle deadline");
+        assert!(!held.fronted, "a fresh overlay has taken nothing");
         drop(held);
 
         let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
         let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        let statements: String = code
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Set where the raise is made, and only there.
+        let appear = code
+            .split("fn appear(&self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("`appear` is gone")
+            .split("\n    }")
+            .next()
+            .unwrap();
+        let raise = appear.find("raise_window(REGION_TITLE);").expect("the raise is gone");
+        let fronted = appear
+            .find("locked(&self.inner).fronted = true;")
+            .expect("the raise no longer records that the foreground was taken");
         assert!(
-            code.contains("if held.aside == away {"),
-            "standing aside is no longer idempotent, so the OS call no longer lands on the \
-             transitions"
-        );
-        // **The count is the whole test.** Two ways out of `show` -- the guard
-        // at the top that finds a finished overlay, and the frame the overlay
-        // ends on -- which between them cover a code found, none found,
-        // several found, a refusal, Escape and the close button, because all
-        // six end by clearing `open` and every frame after that takes one of
-        // the two.
-        assert_eq!(
-            code.matches("stand_aside(false);").count(),
-            2,
-            "`show` no longer brings the vault window back on every way out of it"
+            raise < fronted && fronted - raise < 200,
+            "`fronted` is not set beside the raise, so the hand-back is decided by something \
+             other than whether the foreground was taken"
         );
         assert_eq!(
-            code.matches("stand_aside(true);").count(),
+            statements.matches("fronted = true;").count(),
             1,
-            "the vault window is sent down from somewhere other than the one hook that should"
+            "the foreground is recorded as taken from more than one place"
         );
-        // And the backstop for the ways out that are not `show` at all: the
-        // form closing under a live overlay, the vault locking, a panic
-        // unwinding through the frame.
+        // Given back from exactly one function, which is idempotent, and
+        // called on both of `show`'s ways out.
+        let back = code
+            .split("fn give_foreground_back(&self) {")
+            .nth(1)
+            .expect("`give_foreground_back` is gone")
+            .split("\n    }")
+            .next()
+            .unwrap();
+        assert!(
+            back.contains("if !held.fronted {") && back.contains("held.fronted = false;"),
+            "`give_foreground_back` is no longer idempotent, so the vault window is raised \
+             once per frame after the overlay closes"
+        );
+        assert!(
+            back.contains("bring_window_back(crate::vault_window::WINDOW_TITLE);"),
+            "`give_foreground_back` no longer raises the vault window"
+        );
+        assert_eq!(
+            code.matches("self.give_foreground_back();").count(),
+            2,
+            "the foreground is given back from a different number of `show` exits than two"
+        );
+        // And by `Drop`, for the endings that never reach `show` again.
         let dropped = code
             .split("impl Drop for Inner {")
             .nth(1)
-            .expect("`Inner` no longer has a `Drop`");
+            .expect("`Inner` no longer has a `Drop`")
+            .split("\n}")
+            .next()
+            .unwrap();
         assert!(
-            dropped.contains("if self.aside {") && dropped.contains("bring_window_back("),
-            "nothing brings the vault window back when the overlay is dropped rather than \
-             closed -- which is the path that loses the user their app"
+            dropped.contains("if self.fronted {") && dropped.contains("bring_window_back("),
+            "`Inner`'s `Drop` no longer gives the foreground back"
         );
-        // The window it sends down is the vault window, not this one. Sending
-        // the overlay itself down would be a full-screen always-on-top window
-        // minimising itself out of the user's reach.
-        assert_eq!(crate::vault_window::WINDOW_TITLE, "Deskwarden");
-        assert_ne!(crate::vault_window::WINDOW_TITLE, REGION_TITLE);
+        // **And nothing minimises.** The one `ShowWindow` verb that puts a
+        // window down is named nowhere in a statement; a minimise that comes
+        // back is an animation over the overlay, and one that does not is the
+        // user's application gone.
+        for gone in ["SW_SHOWMINNOACTIVE", "SW_MINIMIZE", "SW_SHOWMINIMIZED", "send_window_down"] {
+            assert!(
+                !statements.contains(gone),
+                "`{gone}` is back: this module minimises the vault window again. See \
+                 `the_foreground_is_bookkept_so_that_it_always_goes_back` for why it stopped"
+            );
+        }
     }
 
-    /// **The window goes down once the overlay is on screen, and not on the
-    /// frame that masks it -- which is the one thing here that was measured
-    /// rather than reasoned.**
+    /// **The overlay takes the foreground on the frame it is revealed, and
+    /// not before.**
     ///
-    /// Between `PrescanStep::Mask` and `PrescanStep::Scan` this overlay has
-    /// registered no viewport, so the root is an eframe app whose only window
-    /// is the one about to be minimised -- and a minimised eframe root with no
-    /// other viewport takes **no further frames at all**. A settle deadline
-    /// set on that frame is never reached and the route hangs. `MINIMISE_SETTLE`'s
-    /// doc carries the measurement; this keeps the code on the right side of
-    /// it.
-    ///
-    /// It used to say "the overlay's first painted frame" and meant the
-    /// viewport callback's first frame. The window is created hidden now, that
-    /// callback does not run until it is shown, and both the raise and the
-    /// minimise happen from [`RegionOverlay::appear`] on the root's frame --
-    /// one frame after the show, when the overlay is not merely registered but
-    /// visible. Same property, stronger guarantee, different place; see
-    /// [`Appearing`].
+    /// Escape and `A` are keyboard, and a full-screen overlay without the
+    /// keyboard is one the user cannot leave -- so the raise is not optional.
+    /// It has to come AFTER the reveal: `foreground::pick` skips invisible
+    /// windows, and a raise on a window nobody can see lands the foreground on
+    /// a surface the user cannot see it on.
     #[test]
-    fn the_window_goes_down_once_the_overlay_is_on_screen() {
+    fn the_overlay_takes_the_foreground_once_it_is_revealed() {
         let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
         let code = source.split("#[cfg(test)]").next().unwrap();
 
-        // Nothing in the prescan arms sends it down. `Mask` masks and returns.
+        // Nothing in the prescan arms raises. `Mask` masks and returns.
         let prescan = code
             .split("match self.prescan_step(Instant::now()) {")
             .nth(1)
@@ -5982,19 +5822,14 @@ mod tests {
             .next()
             .expect("the prescan match no longer ends where it did");
         assert!(
-            !prescan.contains("stand_aside"),
-            "the vault window is sent down from inside the prescan, where the root is its own \
-             only window -- see MINIMISE_SETTLE for why that never comes back"
+            !prescan.contains("raise_window"),
+            "the overlay is raised from inside the prescan, before it has a window"
         );
         assert!(
             prescan.contains("self.mask_own_window(true);"),
             "the prescan no longer masks the vault window before it captures"
         );
 
-        // It goes down in `appear`, AFTER the overlay has taken the
-        // foreground. `SW_SHOWMINNOACTIVE` activates nothing, so a foreground
-        // this window already holds is one it keeps -- which is what leaves
-        // Escape working with the app minimised.
         let hook = code
             .split("fn appear(&self, ctx: &egui::Context) {")
             .nth(1)
@@ -6003,70 +5838,50 @@ mod tests {
             .next()
             .expect("`appear` no longer ends where it did");
         let raise = hook.find("raise_window(REGION_TITLE);").expect("the raise is gone");
-        let down = hook.find("stand_aside(true);").expect("the window is never sent down");
-        assert!(
-            raise < down,
-            "the vault window is sent down before the overlay has asked for the foreground, so \
-             the overlay may never get it and Escape may never reach it"
-        );
-        assert!(
-            hook.find("exclude_from_capture(REGION_TITLE);").expect("the mask is gone") < down,
-            "the overlay stopped excluding itself from captures before standing the vault \
-             window down"
-        );
-        // **And both of those are in the step AFTER the one that shows the
-        // window.** `foreground::pick` skips invisible windows, so a raise on
-        // the frame that merely asked for the show finds nothing; and a
-        // minimise on that frame would be a minimise with no visible viewport
-        // of this process left, which is the hang `MINIMISE_SETTLE` records.
         let shown = hook
             .find("reveal_painted(hwnd, cloaked)")
             .expect("the overlay is never revealed, so it is a window nobody can see");
         assert!(
-            shown < raise && shown < down,
-            "the overlay is raised or minimised into before it is revealed -- a raise on a \
-             cloaked window lands the foreground on a surface the user cannot see"
+            shown < raise,
+            "the overlay is raised before it is revealed -- a raise on a cloaked window \
+             lands the foreground on a surface the user cannot see"
+        );
+        assert!(
+            hook.find("exclude_from_capture(REGION_TITLE);").expect("the mask is gone") < raise,
+            "the overlay stopped excluding itself from captures before taking the foreground"
         );
         assert!(
             hook.find("appearing.on_screen(painted)")
                 .expect("the second step's gate is gone, or no longer waits for a paint")
                 < raise,
-            "the raise and the minimise are no longer behind `Appearing::on_screen(painted)`, \
-             so they can run on the frame that only showed the window -- or twice, or before \
-             anything has been painted into it"
+            "the raise is no longer behind `Appearing::on_screen(painted)`, so it can run on \
+             the frame that only showed the window -- or twice"
         );
     }
 
-    /// **It is a minimise, not a hide, and the source says so in one place.**
+    /// **The vault window is never hidden, minimised or restyled by this
+    /// module, and the source says so in one place.**
     ///
-    /// `SW_HIDE` would look better -- instant, no taskbar button -- and is the
-    /// one option whose failure mode cannot be recovered from: a hidden window
-    /// that does not come back is unreachable, where a minimised one is a
-    /// taskbar click away. It would also put the vault window into the state
+    /// `SW_HIDE` would put the user's application into the state
     /// `vault_window`'s `keep_ui_loaded` machinery believes only it produces,
     /// with none of the bookkeeping (`hidden`, `close_or_hide`,
-    /// `spawn_show_waiter`) that goes with it -- the same distinction that
-    /// file's own `ChromeAction::Minimize` arm is built around.
+    /// `spawn_show_waiter`) that goes with it. A minimise was this module's
+    /// answer for a while and is gone for the reason
+    /// `the_foreground_is_bookkept_so_that_it_always_goes_back` gives. What is
+    /// left that touches the vault window is the capture mask and, on the way
+    /// out, a raise.
     ///
-    /// It used to forbid `ViewportCommand::Visible` outright, then allowed
-    /// exactly one addressed at the overlay's own viewport, and now forbids it
-    /// outright again -- for a new reason, which is the one worth pinning.
-    /// The addressed command was how the overlay was shown, and it went
-    /// through `winit`, which rewrote the window's ex-style on the way and
-    /// took the layering off: see [`show_unseen`]. So the overlay is shown by
-    /// `ShowWindow` and no `Visible` of any shape may exist here: not for
-    /// the vault window, which `keep_ui_loaded` owns, and not for the
-    /// overlay, which `winit` must never be given a reason to restyle.
+    /// The other half of this pin is about the OVERLAY's own window: it is
+    /// shown by `ShowWindow` and never by a `ViewportCommand`, because the
+    /// command goes through `winit`, which rewrote the window's styles on the
+    /// way and hid a window its flags believed hidden -- see
+    /// `show_window_noactivate`.
     #[test]
-    fn the_vault_window_is_minimised_rather_than_hidden() {
+    fn the_vault_window_is_never_hidden_or_minimised_by_this_module() {
         let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
         // **Comments cut off, because every needle below is a negative one.**
-        // The argument for minimising rather than hiding is written out above
-        // in prose, and that prose names `SW_HIDE` and `SW_MINIMIZE` -- so a
-        // bare `contains` over the raw source fails on the doc that explains
-        // why the code does not do those things. `foreground::tests::code`
-        // exists for the same reason and is copied rather than shared:
-        // it is `#[cfg(test)]` in a module this one cannot reach.
+        // The prose above and in the functions names `SW_HIDE` and the
+        // minimise verbs while explaining why the code does not use them.
         let code: String = source
             .split("#[cfg(test)]")
             .next()
@@ -6078,29 +5893,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        // **The vault window is never hidden**, and the check is now scoped to
-        // the function that touches it rather than to the whole file, because
-        // this module *does* hide one window: its own, in `hide_and_place`,
-        // before it has ever been shown. The two are opposites. Hiding the
-        // user's application is how it becomes unreachable; hiding the
-        // overlay's own window, which the user has not seen and which this
-        // module shows itself a frame later, is how the popup stops happening.
-        let down = code
-            .split("fn send_window_down(title: &str) {")
-            .nth(1)
-            .expect("`send_window_down` is gone")
-            .split("\n}")
-            .next()
-            .unwrap();
-        assert!(
-            !down.contains("SW_HIDE"),
-            "this module hides the vault window; a hidden window that fails to come back is \
-             unreachable, which is the one outcome the minimise exists to avoid"
-        );
-        // And `SW_HIDE` appears in exactly one place in the whole module: the
+        // `SW_HIDE` appears in exactly one place in the whole module: the
         // overlay's own window, before it is shown. A second use is a window
-        // this module put away without a way back.
-        // Twice: `hide_and_place`'s `use` line and its one call.
+        // this module put away without a way back. Twice: `hide_and_place`'s
+        // `use` line and its one call.
         assert_eq!(
             code.matches("SW_HIDE").count(),
             2,
@@ -6119,30 +5915,53 @@ mod tests {
             placer.contains("SW_HIDE"),
             "the one permitted `SW_HIDE` is not the one in `hide_and_place`"
         );
-        // **No `Visible` command at all, in any shape.**
-        //
-        // Two windows, two reasons, one needle. A `Visible` on the VAULT
-        // window drives the visibility of the window `vault_window`'s
-        // `keep_ui_loaded` machinery believes only it produces, with none of
-        // its bookkeeping. A `Visible` on the OVERLAY's own viewport is what
-        // shipped as its show, and `winit` answered it by rewriting the
-        // window's ex-style from its own flags -- `WS_EX_LAYERED` gone, window
-        // opaque, the owner's "pitch dark screen". See `show_unseen` for the
-        // `winit` lines and the log that proved it. The overlay is shown by
-        // that function's `ShowWindow` now, so there is no legitimate
-        // `Visible` left in this module and the count is zero.
+        // Every Win32 call on the VAULT window's title is one of two: the
+        // mask, and the raise on the way out.
+        let vault_calls: Vec<&str> = code
+            .match_indices("crate::vault_window::WINDOW_TITLE")
+            .map(|(at, _)| {
+                let line_start = code[..at].rfind('\n').map_or(0, |i| i + 1);
+                code[line_start..at].trim_start()
+            })
+            .collect();
+        for call in &vault_calls {
+            assert!(
+                call.contains("set_capture_exclusion(")
+                    || call.contains("bring_window_back(")
+                    || call.contains("own_window_titled(")
+                    // `own_window_centre` binds the title first and looks it
+                    // up on the next line; the binding is checked below.
+                    || call.trim() == "let title =",
+                "this module does something to the vault window other than mask it, raise it \
+                 or look it up: `{call}`"
+            );
+        }
+        let centre = code
+            .split("fn own_window_centre() -> Option<(i32, i32)> {")
+            .nth(1)
+            .expect("`own_window_centre` is gone")
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(
+            centre.contains("let title = crate::vault_window::WINDOW_TITLE;")
+                && centre.contains("own_window_titled(title)"),
+            "`own_window_centre` binds the vault window's title for something other than the \
+             lookup"
+        );
+        assert!(
+            vault_calls.iter().any(|c| c.contains("bring_window_back(")),
+            "control: the raise on the way out is gone, so the check above is over nothing"
+        );
+        // **No `Visible` command at all, in any shape.** On the vault window
+        // it is a hide the keep_ui_loaded machinery does not know about; on
+        // the overlay it is `winit` rewriting the window's styles -- see
+        // `show_window_noactivate`.
         assert_eq!(
             code.matches("ViewportCommand::Visible").count(),
             0,
-            "this module sends a `Visible` command. On the vault window that is a hide the \
-             keep_ui_loaded machinery does not know about; on the overlay it is `winit` \
-             rewriting the ex-style and taking `WS_EX_LAYERED` off -- see `show_unseen`"
+            "this module sends a `Visible` command; see `show_window_noactivate`"
         );
-        // Positive control, which would otherwise be true of a module whose
-        // overlay is created hidden and then never shown -- a full-screen
-        // window nobody can see and nobody can cancel. The show is one
-        // `ShowWindow(SW_SHOWNOACTIVATE)`, in `show_unseen`, and the constant
-        // is named exactly twice: its import and its one call.
         // Counted as the call and not as the constant: the constant is also
         // named by the two log lines that report the call's outcome.
         assert_eq!(
@@ -6163,51 +5982,18 @@ mod tests {
             shower.contains("ShowWindow(handle, SW_SHOWNOACTIVATE)"),
             "the one permitted show is not the one in `show_window_noactivate`"
         );
-        // `SW_MINIMIZE` also activates the next top-level window in Z order,
-        // which is somebody else's -- measured to cost this overlay the
-        // foreground, and with it Escape.
-        assert!(
-            code.contains("SW_SHOWMINNOACTIVE"),
-            "the vault window is no longer minimised without activation"
-        );
-        assert!(
-            !code.contains("SW_MINIMIZE"),
-            "SW_MINIMIZE activates the next window in Z order and takes the foreground away \
-             from this overlay; see `send_window_down`"
-        );
     }
 
-    /// **Both halves report what Windows said rather than swallowing it.**
+    /// **The hand-back reports what Windows said rather than swallowing it.**
     ///
-    /// This module's rule since three silently-failing Win32 calls cost a day
-    /// of debugging, and these two are the worst candidates for it yet: a
-    /// window that did not go down is a window sitting on top of what the user
-    /// is being asked to point at, and a raise Windows declined is a window
-    /// that is back but behind, which reads to the user as the app having
-    /// disappeared.
+    /// This module's rule since three silently-failing Win32 calls cost a
+    /// day, and this is the worst candidate for it left: a raise Windows
+    /// declined is a window that is behind the overlay's leftovers, which
+    /// reads to the user as the app having disappeared.
     #[test]
-    fn neither_half_of_the_minimise_swallows_what_windows_said() {
+    fn the_hand_back_does_not_swallow_what_windows_said() {
         let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
         let code = source.split("#[cfg(test)]").next().unwrap();
-
-        let down = code
-            .split("fn send_window_down(title: &str) {")
-            .nth(1)
-            .expect("`send_window_down` is gone")
-            .split("\nfn ")
-            .next()
-            .unwrap();
-        // `ShowWindow` returns the PREVIOUS visibility, not success, so the
-        // check has to be a readback rather than its return value.
-        assert!(
-            down.contains("IsIconic("),
-            "nothing checks whether the window actually went down"
-        );
-        assert!(
-            down.contains("log::info!") && down.matches("log::warn!").count() >= 2,
-            "`send_window_down` no longer reports both outcomes and the missing window"
-        );
-
         let back = code
             .split("fn bring_window_back(title: &str) {")
             .nth(1)
@@ -6229,15 +6015,16 @@ mod tests {
             "a refusal or a missing window is no longer a warning; those are the two outcomes \
              in which the user's window may not be in front of them"
         );
-        // And it goes through the crate's one way to do this, which restores
-        // BEFORE it activates -- "once back - it should be on top again" is
-        // two things, and `ShowWindow(SW_RESTORE)` alone is only the first.
+        // And it goes through the crate's one way to do this, which is what
+        // makes it a raise and not just a `SetForegroundWindow` on a handle.
         assert!(
             back.contains("foreground::raise_window(title)"),
-            "the restore no longer goes through `foreground::raise_window`, which is what makes \
-             it a raise and not just an un-minimise"
+            "the hand-back no longer goes through `foreground::raise_window`"
         );
     }
+
+    // -- the reveal --------------------------------------------------------
+
 
     // -- the reveal --------------------------------------------------------
 
@@ -6498,99 +6285,46 @@ mod tests {
         assert!(!SCAN_FOUND.contains("release"));
     }
 
-    /// **The reveal's clock does not start until the vault window has had time
-    /// to get off the screen.**
+    /// **The reveal's clock starts on the first painted frame once the window
+    /// is up, and waits for nothing else.**
     ///
-    /// The minimise is issued on the overlay's first painted frame, which is
-    /// the same frame the reveal would otherwise start on -- so without this
-    /// the front of the dwell is spent ringing a code behind the window the
-    /// ring exists to see past, by an amount that varies with the machine.
-    /// Exactly the argument `Reveal::Due` already makes about a window that
-    /// does not exist yet.
-    ///
-    /// Driven by a clock a test supplies, like every other timed thing here,
-    /// so no window and no sleeping is involved.
+    /// Two waits used to sit in front of it, and one is gone. The wait for
+    /// the window to be revealed is still here and is tested above: a ring
+    /// painted into a cloaked window is a ring nobody can see. The wait for
+    /// the vault window to finish minimising -- `MINIMISE_SETTLE`, 120 ms,
+    /// measured -- went with the minimise itself
+    /// (`the_foreground_is_bookkept_so_that_it_always_goes_back`): the vault
+    /// window stays where it is, under an opaque picture that does not
+    /// contain it, so there is no longer a window on its way out of the ring's
+    /// way. A settle applied anyway would be a fixed delay in front of every
+    /// reveal for no reason at all, which is the shape this test refuses.
     #[test]
-    fn the_reveal_waits_for_the_vault_window_to_get_out_of_the_way() {
+    fn a_reveal_on_a_window_that_is_up_starts_at_once() {
         let overlay = found_on(rect(0, 0, 1920, 1080), 1.0, FOUND_AT);
+        locked(&overlay.inner).appearing = Appearing::Up;
         let t0 = Instant::now();
-        // What the first-frame hook does, without the Win32 call it also
-        // makes: the window went down at `t0`.
-        locked(&overlay.inner).aside_at = Some(t0);
-
-        // Every frame inside the settle paints the mark -- the ring is not
-        // withheld, only the clock -- and leaves the reveal where it was.
-        for at in [0_u64, 1, 60, 119] {
-            assert_eq!(
-                overlay.reveal_step(t0 + Duration::from_millis(at)),
-                Some(FOUND_AT),
-                "the mark was withheld {at} ms into the settle"
-            );
-            assert!(
-                matches!(locked(&overlay.inner).reveal, Reveal::Due { .. }),
-                "the dwell started {at} ms in, before the window was out of the way"
-            );
-        }
-
-        // The first frame at or after the settle starts the clock, and the
-        // user gets the WHOLE dwell from there rather than what is left of it.
-        let started = t0 + MINIMISE_SETTLE;
-        assert_eq!(overlay.reveal_step(started), Some(FOUND_AT));
-        assert!(matches!(locked(&overlay.inner).reveal, Reveal::Showing { .. }));
-        assert_eq!(
-            overlay.reveal_step(started + REVEAL_DWELL - Duration::from_millis(1)),
-            Some(FOUND_AT),
-            "the dwell was cut short by the settle in front of it"
-        );
-        assert_eq!(overlay.reveal_step(started + REVEAL_DWELL), None);
-        assert!(!overlay.is_open());
-    }
-
-    /// **An overlay that never stood aside does not wait for a window that
-    /// never went down.**
-    ///
-    /// `aside_at` is `None` on exactly two overlays: one in a test process,
-    /// and one dropped before it ever had a window. Neither has anything to
-    /// wait for, and a settle applied to them would be a fixed delay in front
-    /// of every reveal for no reason at all.
-    #[test]
-    fn a_reveal_with_nothing_to_wait_for_starts_at_once() {
-        let overlay = found_on(rect(0, 0, 1920, 1080), 1.0, FOUND_AT);
-        let t0 = Instant::now();
-        assert!(locked(&overlay.inner).aside_at.is_none());
         assert_eq!(overlay.reveal_step(t0), Some(FOUND_AT));
         assert!(
             matches!(locked(&overlay.inner).reveal, Reveal::Showing { .. }),
             "the clock did not start on the first painted frame"
         );
         assert_eq!(overlay.reveal_step(t0 + REVEAL_DWELL), None);
-    }
-
-    /// Production's minimise settle is the measured one.
-    ///
-    /// The measurement is in [`MINIMISE_SETTLE`]'s own doc: a window filled
-    /// with a colour nothing else is, minimised, and its rectangle captured
-    /// exactly once per process run at one delay; absent from the capture at
-    /// every delay tried, down to the ~60 ms floor of the instrument.
-    #[test]
-    fn the_production_minimise_settle_is_the_measured_one() {
-        assert_eq!(MINIMISE_SETTLE, Duration::from_millis(120));
-        assert!(MINIMISE_SETTLE > Duration::ZERO, "the settle is not a settle");
-        // Twice the shortest point at which the window was measured gone, so
-        // there is margin for a machine slower than the one it was measured
-        // on -- and more than PRESCAN_SETTLE, which buys two composes at 30 Hz
-        // for a flag that is only a message to the compositor. A minimise is
-        // more work than a flag.
+        assert!(!overlay.is_open());
+        // And the source has no settle to wait for: the only `Instant` the
+        // reveal compares against is its own deadline.
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let stepper = code
+            .split("fn reveal_step(&self, now: Instant) -> Option<ScreenRect> {")
+            .nth(1)
+            .expect("`reveal_step` is gone")
+            .split("\n    }")
+            .next()
+            .unwrap();
         assert!(
-            MINIMISE_SETTLE > PRESCAN_SETTLE,
-            "a minimise is now given less time to land than a display-affinity flag"
-        );
-        // And small enough not to dominate what it delays. It is spent once,
-        // in front of the dwell, at the end of a route whose scan binarises
-        // every monitor.
-        assert!(
-            MINIMISE_SETTLE < REVEAL_DWELL / 2,
-            "the wait in front of the reveal is now a large fraction of the reveal"
+            !stepper.contains("SETTLE") && !stepper.contains("aside"),
+            "`reveal_step` waits for something other than the window being up and its own \
+             deadline; a settle in front of the dwell is a fixed delay on every reveal"
         );
     }
 
@@ -6717,9 +6451,9 @@ mod tests {
         // Released on the closing frame, before the vault window comes back:
         // the first thing `show` does once the overlay is over.
         let closing = show
-            .split("self.stand_aside(false);")
+            .split("self.give_foreground_back();")
             .next()
-            .expect("`show`'s early return no longer brings the vault window back");
+            .expect("`show`'s early return no longer gives the foreground back");
         assert!(
             closing.contains("locked(&self.inner).picture.take()"),
             "the picture is not released on the frame the overlay closes, so it lives for \
@@ -6826,7 +6560,7 @@ mod tests {
             "show_window_noactivate(",
             "exclude_from_capture(",
             "raise_window(",
-            "stand_aside(true)",
+            "bring_window_back(",
         ] {
             assert!(
                 !callback.contains(needle),
@@ -6881,8 +6615,8 @@ mod tests {
             );
             assert_eq!(appearing, Appearing::Unseen);
         }
-        // The first root frame after a paint is the one that raises the alpha,
-        // raises the window and stands the vault window aside.
+        // The first root frame after a paint is the one that reveals the
+        // window and raises it.
         assert!(appearing.on_screen(true));
         assert_eq!(appearing, Appearing::Up);
         // Absorbing, both ways. A `true` here is a window that re-raises itself
@@ -7034,16 +6768,14 @@ mod tests {
         }
     }
 
-    /// **The reveal's dwell does not start until the window it is getting out
-    /// of the way has been asked to go.**
+    /// **The reveal's dwell does not start until the window has been
+    /// revealed.**
     ///
-    /// `MINIMISE_SETTLE` covers the stretch after the minimise is issued. This
-    /// covers the stretch before it: the overlay's window is shown at the end
-    /// of one root frame and the minimise happens on the next, so there is one
-    /// frame in which the overlay is painting, the reveal is `Due`, and
-    /// Deskwarden is still sitting on top of the code being ringed. A dwell
-    /// started there is a dwell the user spends looking at a ring behind a
-    /// window.
+    /// The overlay's window is painted while cloaked and revealed on a later
+    /// root frame, so there are frames in which the overlay is painting, the
+    /// reveal is `Due`, and nobody can see the ring. A dwell started there is
+    /// a dwell the user spends looking at nothing, and what is left of it
+    /// when the window appears is shorter than the one that was argued for.
     #[test]
     fn the_reveal_waits_for_the_window_to_have_finished_appearing() {
         let overlay = found_on(rect(0, 0, 1920, 1080), 1.0, FOUND_AT);
@@ -7061,9 +6793,8 @@ mod tests {
             "the reveal ended while the window was still only just shown, so the user got \
              nothing at all"
         );
-        // Once the window is up -- and with nothing to wait for, because a
-        // test overlay never stands aside -- the clock starts on the next
-        // frame and runs its full length from there.
+        // Once the window is up there is nothing else to wait for: the clock
+        // starts on the next frame and runs its full length from there.
         locked(&overlay.inner).appearing = Appearing::Up;
         let t1 = t0 + REVEAL_DWELL * 4;
         assert_eq!(overlay.reveal_step(t1), Some(FOUND_AT));
