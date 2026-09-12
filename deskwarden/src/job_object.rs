@@ -1433,6 +1433,26 @@ mod tests {
         // and a gate could only make it rarer. The third is the test that
         // measures exactly that: eight threads of concurrent traffic, which is
         // the only way to observe the failure the listener exists to remove.
+        // One: the 6b overlay's prescan -- the capture of every monitor and
+        // the whole-screen QR decode that run between the press of *Scan the
+        // code* and the overlay appearing.
+        //
+        // It ran on the frame thread until the owner reported the waiting
+        // card's bar as "almost not moving". It was not moving because it was
+        // not being drawn: `show` held the vault window's frame for the whole
+        // of that work, so the window painted the card once and then painted
+        // nothing until the scan was over. An indeterminate bar is a claim
+        // that something is happening, and a frozen one says the opposite.
+        //
+        // Not a tick in a frame loop, for `clipboard.rs`'s reason turned
+        // around: the work is one unsplittable capture plus one unsplittable
+        // decode, so there is no unit of it small enough to do per frame. The
+        // thread starts once (`Prescan::Running` is reachable from exactly one
+        // arm and nothing leaves it but the worker), it ends by marking the
+        // state done and asking for a repaint, and it owns an `Arc` clone of
+        // the overlay so nothing it writes into can have gone away underneath
+        // it.
+        ("region_overlay.rs", 1),
         // Counted here like every other site, because a census with a "tests
         // don't count" rule in it is a rule-shaped exemption, which is
         // precisely what this table exists instead of.

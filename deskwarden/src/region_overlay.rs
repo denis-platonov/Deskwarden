@@ -1329,9 +1329,25 @@ impl std::fmt::Debug for Picture {
 enum Prescan {
     /// Nothing has happened yet.
     Due,
-    /// Deskwarden's own window is masked; the capture happens on the first
+    /// Deskwarden's own window is masked; the capture starts on the first
     /// frame at or after this instant.
     Settling { at: Instant },
+    /// **The capture and the decode are running on a worker thread**, and the
+    /// overlay registers no viewport while they are.
+    ///
+    /// This state is the whole of the owner's report that the waiting card's
+    /// bar was "almost not moving". It was not moving because it was not being
+    /// DRAWN: the capture of every monitor and the whole-screen decode ran on
+    /// the frame thread, inside `show`, so the window that had just painted
+    /// the card sat in that call for as long as the scan took and painted
+    /// nothing else. An indeterminate bar is a claim that something is
+    /// happening, and a frozen one says the opposite of what it is for.
+    ///
+    /// While this state lasts `show` answers `true` and returns, so the vault
+    /// window's frame completes, the card paints, and the bar moves. The
+    /// worker ends by marking [`Self::Done`] and asking for a repaint, and the
+    /// next frame registers the viewport with the answer already in hand.
+    Running,
     /// The scan has run, or was never going to.
     Done,
 }
@@ -1575,8 +1591,12 @@ enum PrescanStep {
     Mask,
     /// Still settling; come back after this long.
     Settling(Duration),
-    /// Capture and decode now.
+    /// Start the capture and the decode. See [`Prescan::Running`]: this is
+    /// asked for exactly once, and what it starts is a worker.
     Scan,
+    /// The worker is still out. Paint nothing of the overlay and let the
+    /// window that asked keep its frame.
+    Waiting,
     /// Nothing to do, now or ever again.
     Done,
 }
@@ -1787,14 +1807,20 @@ impl RegionOverlay {
                 if left > Duration::ZERO {
                     PrescanStep::Settling(left)
                 } else {
-                    // Marked `Done` BEFORE the scan runs, not after: the scan
-                    // is the slow part, and a state that only advanced on the
-                    // way out would let a re-entrant repaint start a second
-                    // one.
-                    held.prescan = Prescan::Done;
+                    // Marked BEFORE the scan starts, not after: the scan is
+                    // the slow part, and a state that only advanced on the way
+                    // out would let a re-entrant repaint start a second one.
+                    // It moves to `Running` rather than straight to `Done`
+                    // now, because the scan outlives this call -- see
+                    // `Prescan::Running`. `Done` is the WORKER's to set, and
+                    // it is still the case that nothing can start a second
+                    // scan: this arm is reachable only from `Settling`, and
+                    // `Settling` is left here.
+                    held.prescan = Prescan::Running;
                     PrescanStep::Scan
                 }
             }
+            Prescan::Running => PrescanStep::Waiting,
             Prescan::Done => PrescanStep::Done,
         }
     }
@@ -2555,38 +2581,75 @@ impl RegionOverlay {
                 return true;
             }
             PrescanStep::Scan => {
-                // `monitor_bounds()` enumerates the real desktop -- the one
-                // production call, exactly as `RegionOverlay::open` takes its
-                // monitors as an argument so the arithmetic can be tested
-                // without one.
-                let monitors = screen_capture::monitor_bounds();
-                self.apply_scan(scan_screen_with(&RegionSeams::production(), &monitors));
-                // **And the picture the surface will paint, on the same
-                // frame and for the same reason**: the vault window is
-                // masked, and the overlay's own window does not exist yet --
-                // it is registered below and created by `eframe` at the end
-                // of this frame -- so this is the one moment a capture of the
-                // display can contain neither. See `take_picture`.
-                self.take_picture(ctx);
-                // **The overlay opens either way now, and that is the
-                // change.** It used to end here when the scan found one code
-                // -- no window was ever registered and the user went from the
-                // modal straight to 6c, with nothing between the press and
-                // the card to say where the code had come from. `apply_scan`
-                // now opens the reveal instead: the window is registered
-                // below like any other 6b, paints the code it found ringed
-                // where it sits, and closes itself on a clock. The outcome is
-                // the same `Outcome::Decoded` it always was, and `take_outcome`
-                // still cannot be reached until `show` answers `false`.
+                // **Both readings of the desktop happen on a WORKER**, and
+                // the ordering that makes them safe is unchanged -- see
+                // `Prescan::Running` for why they left the frame thread, and
+                // `the_picture_is_taken_before_the_window_exists_and_released_with_it`
+                // for the ordering, which that test now reads here.
                 //
-                // The mask stays on for the life of the overlay. 6b is
-                // about to open, the user may press *Whole screen* on it, and
-                // its own release-capture is better off not seeing the vault
-                // window either -- a box dragged over a window Deskwarden is
-                // sitting on top of should read what the user can see behind
-                // it, which is the same reason the overlay excludes itself.
-                // Every way out of `show` puts it back, and `Inner`'s `Drop`
-                // covers the ways that do not come through `show` at all.
+                // The window the capture must not contain is masked already
+                // (`PrescanStep::Mask` was an earlier frame and the mask stays
+                // on for the overlay's life), and the overlay's own window
+                // does not exist and cannot exist until a later frame
+                // registers the viewport -- which this frame does not do,
+                // because it returns below. So the worker's two captures are
+                // taken in exactly the window of time they were before: after
+                // the mask, before any overlay window.
+                //
+                // `mine` is an `Arc` clone of the same overlay, which is the
+                // established idiom in this file (the All screens chip's
+                // callback holds one), so the worker writes its answer into
+                // the very state the next frame reads.
+                let mine = self.clone();
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    // `monitor_bounds()` enumerates the real desktop -- the
+                    // one production call, exactly as `RegionOverlay::open`
+                    // takes its monitors as an argument so the arithmetic can
+                    // be tested without one.
+                    let monitors = screen_capture::monitor_bounds();
+                    mine.apply_scan(scan_screen_with(&RegionSeams::production(), &monitors));
+                    mine.take_picture(&ctx);
+                    // **`Done` is set by the worker and only by the worker**,
+                    // which is what makes "the viewport is registered with the
+                    // answer in hand" true rather than hopeful: every frame
+                    // between the start and this line reads `Running` and
+                    // returns.
+                    locked(&mine.inner).prescan = Prescan::Done;
+                    // Nothing else is going to ask. The vault window is
+                    // painting the waiting card on a repaint the bar asks for
+                    // itself, but that is the CARD's clock, not this one's,
+                    // and a scan that finished between two of its frames must
+                    // not wait for the next.
+                    ctx.request_repaint();
+                });
+                return true;
+            }
+            // **The worker is still out**: no viewport, no capture, nothing
+            // of the overlay painted at all -- the window that asked for the
+            // scan keeps its frame, and the waiting card's bar keeps moving.
+            //
+            // **The overlay opens either way once the worker answers.** It
+            // used to end here when the scan found one code -- no window was
+            // ever registered and the user went from the modal straight to
+            // 6c, with nothing between the press and the card to say where
+            // the code had come from. `apply_scan` opens the reveal instead:
+            // the window is registered below like any other 6b, paints the
+            // code it found ringed where it sits, and closes itself on a
+            // clock. The outcome is the same `Outcome::Decoded` it always
+            // was, and `take_outcome` still cannot be reached until `show`
+            // answers `false`.
+            //
+            // The mask stays on for the life of the overlay. 6b is about to
+            // open, the user may press *Whole screen* on it, and its own
+            // release-capture is better off not seeing the vault window
+            // either -- a box dragged over a window Deskwarden is sitting on
+            // top of should read what the user can see behind it, which is
+            // the same reason the overlay excludes itself. Every way out of
+            // `show` puts it back, and `Inner`'s `Drop` covers the ways that
+            // do not come through `show` at all.
+            PrescanStep::Waiting => {
+                return true;
             }
             PrescanStep::Done => {}
         }
@@ -4383,8 +4446,13 @@ mod tests {
             "a `monitor_bounds()` reading was added or removed; the only two left should be the \
              prescan's and the All screens chip's, both feeding `scan_screen_with`"
         );
+        // `mine`, not `self`: the prescan's scan runs on a worker holding an
+        // `Arc` clone of this overlay -- see `Prescan::Running` -- so the
+        // receiver is the clone. What this pins is unchanged and is the whole
+        // of the claim: the list it scans is the list it just enumerated, on
+        // the same two lines, rather than a narrowed one or a second reading.
         assert!(
-            code.contains("self.apply_scan(scan_screen_with(&RegionSeams::production(), &monitors));"),
+            code.contains("mine.apply_scan(scan_screen_with(&RegionSeams::production(), &monitors));"),
             "the prescan no longer scans the monitor list it enumerated"
         );
         assert!(
@@ -5448,12 +5516,18 @@ mod tests {
         assert!(!overlay.view().found, "the stale lock-on survived a rescan");
     }
 
-    /// **The scan runs once, and then never again.**
+    /// **The scan is STARTED once, and then never again.**
     ///
     /// The property the module was fixed for once already: a repaint must not
-    /// be able to start another capture. Every transition here is forwards,
-    /// `Done` is absorbing, and a hundred further frames after it ask for
-    /// nothing.
+    /// be able to start another capture. Every transition here is forwards and
+    /// the last state is absorbing.
+    ///
+    /// What changed is where the scan runs. It is a worker now
+    /// (`Prescan::Running`), so the step after `Scan` is `Waiting` rather than
+    /// `Done` -- and `Waiting` is a state only the WORKER can leave, which
+    /// makes the guarantee stronger rather than weaker: a frame cannot reach
+    /// `Scan` a second time even in principle, because no arm of this function
+    /// writes `Done` and no arm leads back to `Settling`.
     #[test]
     fn the_screen_is_scanned_once_and_the_state_never_goes_back() {
         let overlay = RegionOverlay::open(&[rect(0, 0, 1920, 1080)], 1.0).expect("opens");
@@ -5472,16 +5546,77 @@ mod tests {
         // Exactly the settle is enough -- the bound is "at least", as the
         // decode throttle's is.
         assert_eq!(overlay.prescan_step(t0 + PRESCAN_SETTLE), PrescanStep::Scan);
-        // And from there, nothing. Not on the next frame, not an hour later,
-        // not with the clock going backwards.
+        // And from there, nothing is ever started again. Not on the next
+        // frame, not an hour later, not with the clock going backwards -- the
+        // answer is `Waiting` until the worker says otherwise, and `Waiting`
+        // starts nothing.
         for after in [0_u64, 1, 16, 5_000, 3_600_000] {
             assert_eq!(
                 overlay.prescan_step(t0 + PRESCAN_SETTLE + Duration::from_millis(after)),
-                PrescanStep::Done,
+                PrescanStep::Waiting,
                 "the scan was asked for again {after} ms later"
             );
         }
-        assert_eq!(overlay.prescan_step(t0), PrescanStep::Done);
+        assert_eq!(overlay.prescan_step(t0), PrescanStep::Waiting);
+
+        // The worker finishing is the one thing that ends the wait, and it is
+        // absorbing too.
+        locked(&overlay.inner).prescan = Prescan::Done;
+        for after in [0_u64, 1, 3_600_000] {
+            assert_eq!(
+                overlay.prescan_step(t0 + PRESCAN_SETTLE + Duration::from_millis(after)),
+                PrescanStep::Done,
+                "the state left `Done` {after} ms later"
+            );
+        }
+    }
+
+    /// **The frame that starts the scan returns without registering a
+    /// viewport, and so does every frame until the worker answers.**
+    ///
+    /// This is the owner's report -- the waiting card's bar "almost not
+    /// moving" -- as a property. The bar is drawn by the window that asked for
+    /// the scan, on that window's own frames, so the scan may not hold one.
+    /// Read off the source because the alternative is a compositor: what has
+    /// to be true is that both prescan arms leave `show` before it reaches
+    /// `show_viewport_deferred`, and that the slow pair really is inside the
+    /// worker rather than beside it.
+    #[test]
+    fn the_scan_holds_no_frame_of_the_window_that_asked_for_it() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let show = code
+            .split("pub fn show(&self, ctx: &egui::Context) -> bool {")
+            .nth(1)
+            .expect("`show` is gone");
+        let registered = show
+            .find("ctx.show_viewport_deferred(")
+            .expect("the viewport is no longer registered from `show`");
+        for arm in ["PrescanStep::Scan => {", "PrescanStep::Waiting => {"] {
+            let at = show.find(arm).unwrap_or_else(|| panic!("`show` no longer has {arm:?}"));
+            assert!(at < registered, "{arm:?} is below the viewport registration");
+            let body = &show[at..registered];
+            assert!(
+                body.contains("return true;"),
+                "{arm:?} does not return, so the frame runs on into the overlay's own \
+                 painting while the scan it started is still out"
+            );
+        }
+        // And the two slow calls are inside the spawned closure, not beside
+        // it: a `spawn` that captured nothing slow would pass the returns
+        // above while still blocking the frame.
+        let worker = show
+            .split("std::thread::spawn(move || {")
+            .nth(1)
+            .expect("the prescan no longer runs on a worker");
+        let worker = worker.split("\n                });").next().unwrap();
+        for needle in ["scan_screen_with(", "take_picture(", "Prescan::Done"] {
+            assert!(
+                worker.contains(needle),
+                "the prescan worker no longer does {needle:?}; it is back on the frame thread \
+                 or the state is left for a frame to set"
+            );
+        }
     }
 
     /// A clock that never reaches the deadline never scans -- which is the
@@ -6535,14 +6670,23 @@ mod tests {
             .split("pub fn show(&self, ctx: &egui::Context) -> bool {")
             .nth(1)
             .expect("`show` is gone");
-        // Taken on the frame the scan runs, which is after the mask
-        // (`PrescanStep::Mask` is an earlier frame) and before the viewport
-        // is registered on this one.
+        // **Taken by the prescan's WORKER**, which is started on the frame
+        // the scan is due and is still bounded by the same two events: the
+        // mask went on an earlier frame (`PrescanStep::Mask`) and stays on for
+        // the overlay's life, and no overlay window can exist until a later
+        // frame registers the viewport -- neither the frame that starts the
+        // worker nor any frame while it is out reaches that call, which
+        // `the_scan_holds_no_frame_of_the_window_that_asked_for_it` asserts
+        // arm by arm.
+        //
+        // So the ordering claim is unchanged and this still reads it off the
+        // source; what moved is the receiver (`mine`, an `Arc` clone) and the
+        // borrow of the context. See `Prescan::Running` for why.
         let scan_arm = show
             .find("PrescanStep::Scan => {")
             .expect("`show` no longer drives the scan through a match");
         let taken = show
-            .find("self.take_picture(ctx);")
+            .find("mine.take_picture(&ctx);")
             .expect("nothing takes the display's picture, so the overlay has no ground");
         let registered = show
             .find("ctx.show_viewport_deferred(")

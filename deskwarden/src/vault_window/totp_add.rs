@@ -436,7 +436,24 @@ pub const SCANNING_NOTE: &str = "This takes a moment on a large display.";
 const SCANNING_BAR: f32 = 200.0;
 
 /// Between the heading, the bar and the note.
-const SCANNING_GAP: f32 = 12.0;
+const SCANNING_GAP: f32 = 14.0;
+
+/// The waiting card's own padding.
+///
+/// `stage_card` carries none -- its three bands each supply their own, which
+/// is what lets 6a's header, body and footer meet edge to edge -- and this
+/// card has no bands, so the first version of it put a heading flush against
+/// the card's border. The owner: "that modal with spinner needs more
+/// paddings".
+///
+/// 18 across is the form card's own wide padding (`theme::form_card_pad_x`,
+/// which is §5a's and §6c's 18), so this card is indented like every other
+/// card in the app. 24 down is more than any of them, and deliberately: this
+/// card holds three short centred lines and nothing else, and a waiting
+/// surface that is mostly air reads as a pause rather than as a form that has
+/// lost its controls.
+const SCANNING_PAD_X: i8 = 18;
+const SCANNING_PAD_Y: i8 = 24;
 
 /// The heading over the camera preview.
 ///
@@ -4801,16 +4818,32 @@ fn table_line(ui: &egui::Ui, text: &str, font: egui::FontId, color: egui::Color3
 /// itself answers.
 fn draw_scanning(ui: &mut egui::Ui) -> TotpAddAction {
     stage_card(ui, MODAL_WIDTH, |ui| {
-        ui.vertical_centered(|ui| {
-            ui.label(theme::bold(SCANNING_HEADING, MANUAL_HEADER_TITLE_PX).color(theme::INK));
-            ui.add_space(SCANNING_GAP);
-            // Indeterminate on purpose: nothing here knows how far through a
-            // capture is, and a bar that filled at a made-up rate would be a
-            // measurement this app does not have.
-            theme::progress_bar(ui, SCANNING_BAR);
-            ui.add_space(SCANNING_GAP);
-            ui.label(theme::regular(SCANNING_NOTE, CHOICE_TEXT_PX).color(theme::TEXT_FAINT));
-        });
+        egui::Frame::new()
+            .inner_margin(egui::Margin::symmetric(SCANNING_PAD_X, SCANNING_PAD_Y))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        theme::bold(SCANNING_HEADING, MANUAL_HEADER_TITLE_PX).color(theme::INK),
+                    );
+                    ui.add_space(SCANNING_GAP);
+                    // **Indeterminate on purpose**: nothing here knows how far
+                    // through a capture is, and a bar that filled at a made-up
+                    // rate would be a measurement this app does not have.
+                    //
+                    // It really does move now. It did not when this card
+                    // shipped -- the capture and the decode ran on the frame
+                    // thread, so the card painted once and froze for the whole
+                    // wait. See `region_overlay::Prescan::Running`, which is
+                    // where that was fixed; the bar is only honest if the
+                    // frames keep coming.
+                    theme::progress_bar(ui, SCANNING_BAR);
+                    ui.add_space(SCANNING_GAP);
+                    ui.label(
+                        theme::regular(SCANNING_NOTE, CHOICE_TEXT_PX).color(theme::TEXT_FAINT),
+                    );
+                });
+            });
     });
     TotpAddAction::None
 }
@@ -4927,11 +4960,18 @@ fn table_seam(ui: &mut egui::Ui) {
 /// it sits inside a table of values rather than in running text, and the
 /// design leans on weight to separate it from the row it ends.
 fn row_action(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
-        egui::FontId::new(FIELD_ACTION_PX, egui::FontFamily::Name(theme::SEMIBOLD.into())),
-        theme::BLUE_DEEP,
-    );
+    // **The table's rule, applied to the one run that was left out of it.**
+    //
+    // The owner, after the caption and the values were levelled: "also Hide
+    // feels like higher now compared to Secret code". It was, and it is the
+    // same measurement in the same row -- this control was still being laid in
+    // the face's full line box, so the descender slack it reserves pushed its
+    // ink above the neighbours whose boxes had just become their ascents. A
+    // row is level when every run in it follows one rule, which is the whole
+    // of `table_line`'s note, and this is the last run that did not.
+    let font = egui::FontId::new(FIELD_ACTION_PX, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+    let job = table_line(ui, text, font, theme::BLUE_DEEP);
+    let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
     theme::link_galley(ui, galley)
 }
 
