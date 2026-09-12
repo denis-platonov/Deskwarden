@@ -6116,6 +6116,158 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
     });
 }
 
+/// **Whether the pane can afford §8a's whole title bar**, asked of the height
+/// the band is about to be drawn into.
+///
+/// The band costs about 110 points pinned to the top of a pane that also pins
+/// a Save strip to the bottom and gives the rest to a scroll area. On any
+/// window this app can actually open that is affordable -- it is what the
+/// READ pane already spends, and 8a spends more. Below the app's own floor it
+/// is not, and what a 300-point pane needs is the form.
+///
+/// So the threshold is [`crate::settings::MIN_VAULT_WINDOW_SIZE`]'s own
+/// height, and it is that number rather than a measured one on purpose: the
+/// window cannot be resized below it, so **every band a user can ever see is
+/// the full one**. The compact arm exists for the harness that renders this
+/// form into panes the app cannot produce, and for whatever makes such a pane
+/// possible later -- not as a shape anyone is expected to meet.
+///
+/// What it gives up, in order, is what the WINDOW still answers: the avatar
+/// (the item list one pane left draws the same tile on the selected row) and
+/// the kind-and-folder line (the sidebar says which folder you are in). What
+/// it never gives up is the name box, which is both the title and a control.
+fn band_fits(pane_height: f32) -> bool {
+    pane_height >= crate::settings::MIN_VAULT_WINDOW_SIZE.1 as f32
+}
+
+/// The compact band's padding: half [`detail::HEADER_PAD_Y`], because a strip
+/// holding one control does not need a title bar's air around it.
+const COMPACT_BAND_PAD_Y: i8 = detail::HEADER_PAD_Y / 2;
+
+/// **The height of the edit band's content row**, which is NOT
+/// [`detail::HEADER_ROW`] and cannot be.
+///
+/// The read pane's 44 holds a 22-point title over a 12-point subtitle. The
+/// same two lines here have the title inside a [`theme::FIELD_HEIGHT`] box --
+/// 8a's `height: 38px` -- which is 16 points taller than the text it holds.
+/// So the edit band is the taller of the two, by exactly the box, and that is
+/// the whole of the difference between them. Summed from its parts rather
+/// than written as a number, so a field height that moves takes the band with
+/// it.
+const EDIT_HEADER_ROW: f32 =
+    theme::FIELD_HEIGHT + detail::TITLE_GAP + detail::SUBTITLE_SIZE * 1.4;
+
+/// **8a's title bar: the item's avatar, its name in a box, and what it is.**
+///
+/// The read pane's header strip with three changes, each of which 8a draws:
+/// the tile carries [`theme::edit_badge`], the name is a [`theme::title_field`]
+/// instead of a label, and the right edge carries the `Unsaved changes` pill.
+/// Everything else -- the padding, the tile, the gap, the line under it -- is
+/// `detail`'s own constant, shared rather than copied, because the two bands
+/// are one click apart and a difference between them is a jump.
+///
+/// The avatar reads the DRAFT's name, not the item's, so renaming a record
+/// re-letters its monogram as you type -- the tile and the box are then two
+/// views of one value rather than a picture of what the name used to be.
+fn edit_header(
+    ui: &mut egui::Ui,
+    kind: ItemKind,
+    creating: bool,
+    draft: &mut EditDraft,
+    folder: Option<&str>,
+    dirty: bool,
+    full: bool,
+) {
+    let band = egui::vec2(
+        ui.available_width(),
+        if full { EDIT_HEADER_ROW } else { theme::FIELD_HEIGHT },
+    );
+    ui.allocate_ui_with_layout(band, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        // The gaps in this strip are `HEADER_GAP`, placed explicitly -- see
+        // `detail::header_row`, whose reasoning this band shares.
+        ui.spacing_mut().item_spacing.x = 0.0;
+        if full {
+            let tile = ui
+                .scope(|ui| {
+                    crate::kind_mark::avatar(
+                        ui,
+                        kind,
+                        &draft.name,
+                        detail::HEADER_AVATAR,
+                        true,
+                    );
+                })
+                .response
+                .rect;
+            theme::edit_badge(ui.painter(), tile);
+            ui.add_space(detail::HEADER_GAP);
+        }
+        // **The pill claims its width first**, exactly as the read pane's
+        // controls do and for the same reason: laid out the other way round
+        // the name box takes `available_width` and the pill is pushed off the
+        // pane. What is left is the name column's, and `title_field` caps
+        // itself at 8a's 480 before it gets anywhere near the far edge.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = detail::HEADER_GAP;
+            if dirty {
+                let width =
+                    theme::state_pill_width(ui.painter(), theme::CHANGED_TONE, UNSAVED_PILL);
+                // Measured before it is placed, and left off when it does not
+                // fit, for the reason `theme::section_card_header`'s own pill
+                // is: at the pane's floor a name box and a pill do not share a
+                // line, and a pill pushed off the pane is a pill drawn into
+                // the item list. The footer says the same thing in words and
+                // is never elided.
+                if ui.available_width() >= width {
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(width, theme::PILL_HEIGHT),
+                        egui::Sense::hover(),
+                    );
+                    theme::state_pill(
+                        ui.painter(),
+                        egui::pos2(rect.left(), rect.center().y),
+                        theme::CHANGED_TONE,
+                        UNSAVED_PILL,
+                    );
+                }
+            }
+            ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                ui.spacing_mut().item_spacing.y = detail::TITLE_GAP;
+                theme::title_field(ui, &mut draft.name);
+                if !full {
+                    return;
+                }                // The subtitle, in the read pane's own two runs with the
+                // folder mark between them: what this record IS, then where
+                // it lives. The lead is `form_title`'s word rather than the
+                // kind's bare noun, because the mode has to be said SOMEWHERE
+                // once the heading that used to say it is gone -- and a line
+                // that already names the kind is where it costs nothing.
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.label(
+                        RichText::new(form_title(kind, creating))
+                            .size(detail::SUBTITLE_SIZE)
+                            .color(theme::TEXT_FAINT),
+                    );
+                    if let Some(name) = folder {
+                        ui.label(
+                            RichText::new(" \u{b7} ")
+                                .size(detail::SUBTITLE_SIZE)
+                                .color(theme::TEXT_FAINT),
+                        );
+                        theme::folder_mark(ui, theme::TEXT_FAINT);
+                        ui.label(
+                            RichText::new(name)
+                                .size(detail::SUBTITLE_SIZE)
+                                .color(theme::TEXT_FAINT),
+                        );
+                    }
+                });
+            });
+        });
+    });
+}
+
 /// One card of design 8a's grid: its title band, its body, and the gap to the
 /// next card.
 ///
@@ -6626,40 +6778,55 @@ pub fn draw_detail_edit(
     let body = form_body(kind, creating);
     let sections = drawn_sections(kind, creating, draft, &shown);
 
-    // **8a's title bar.** The design draws a breadcrumb -- `Deskwarden /
-    // Logins / Ledgerline` -- because 8a is a WHOLE WINDOW and the record's
-    // name is the last crumb of it. This form is a pane inside a window that
-    // already has a sidebar saying which folder you are in and a list saying
-    // which item is open, so a breadcrumb here would be the third answer to a
-    // question nobody asked twice. What is taken from 8a is the part that is
-    // not furniture: the `Unsaved changes` pill, which is the only thing on
-    // that line that says something the rest of the window does not.
-    ui.horizontal(|ui| {
-        ui.label(theme::bold(form_title(kind, creating), 19.0).color(theme::INK));
-        if !changes.is_empty() {
-            ui.add_space(4.0);
-            let width = theme::state_pill_width(ui.painter(), theme::CHANGED_TONE, UNSAVED_PILL);
-            // Measured before it is placed, and left off when it does not fit,
-            // for the reason `theme::section_card_header`'s own pill is: at
-            // the pane's floor a 19-point title and a pill do not share a
-            // line, and a pill pushed off the pane is a pill drawn into the
-            // item list. The footer says the same thing in words and is never
-            // elided.
-            if ui.available_width() >= width {
-                let (rect, _) = ui.allocate_exact_size(
-                    egui::vec2(width, theme::PILL_HEIGHT),
-                    egui::Sense::hover(),
-                );
-                theme::state_pill(
-                    ui.painter(),
-                    egui::pos2(rect.left(), rect.center().y),
-                    theme::CHANGED_TONE,
-                    UNSAVED_PILL,
-                );
-            }
-        }
-    });
+    // **8a's title bar, which is the READ pane's header band.**
+    //
+    // The owner, on the form this replaces: "Edit UI is wrong - it is more
+    // like same as it is but with editable fields, but your is completely
+    // off", and then, of the heading itself: "Edit login title is wrong" and
+    // "this is not part of design".
+    //
+    // What was here was a 19-point `Edit login` on the pane's bare canvas,
+    // with the record's own name demoted to the first row of the `Item` card.
+    // 8a does the opposite and so does every other screen in this app: the
+    // NAME is the title, in a band with the item's avatar beside it and the
+    // kind and folder under it. A user who clicks Edit on `Ledgerline` should
+    // still be looking at `Ledgerline`.
+    //
+    // The band is `detail`'s own -- the same padding, the same 40-point tile,
+    // the same 44-point row, the same hairline closing it -- because the two
+    // panes are one strip apart and any difference between them is a jump at
+    // the moment the form opens. What 8a adds, and this takes, is the edit
+    // badge on the tile's corner and the name in a BOX; what it drops is the
+    // breadcrumb, because this pane sits in a window whose sidebar already
+    // says which folder you are in and whose list says which item is open.
+    //
+    // The `Unsaved changes` pill stays, on the band's right edge: it is the
+    // one thing on 8a's title bar that says something the rest of the window
+    // does not.
+    let folder_name = draft
+        .folder_id
+        .as_ref()
+        .and_then(|id| folders.iter().find(|f| &f.id == id))
+        .map(|f| f.name.as_str());
+    // **What the band gives up on a pane the app cannot actually be resized
+    // to**, decided before it is drawn and while `available_height` is still
+    // the whole pane's.
+    let full_band = band_fits(ui.available_height());
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .inner_margin(Margin::symmetric(
+            detail::HEADER_PAD_X,
+            if full_band { detail::HEADER_PAD_Y } else { COMPACT_BAND_PAD_Y },
+        ))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            edit_header(ui, kind, creating, draft, folder_name, !changes.is_empty(), full_band);
+        });
+    // The strip's `border-bottom: 1px solid #eae7e7`, exactly as the read
+    // pane closes its own.
+    theme::hairline(ui);
     ui.add_space(12.0);
+
 
     // A create of a kind `NewItem` cannot express has no payload at all (see
     // `EditDraft::to_new_item`), so Save is withheld rather than left to
@@ -6985,11 +7152,14 @@ pub fn draw_detail_edit(
             // grid; the name is in 8a's own TITLE BAR, at 20px/800, because 8a
             // is a whole window and the record's name is the window's subject.
             //
-            // Here the name is the card's first row instead. This form is a
-            // pane whose title line already says `Edit login`, and a second
-            // 20-point heading under it -- editable, in a box, saying
-            // `Ledgerline` -- would be two titles arguing about which one
-            // names the screen.
+            // **The name is in the title bar here too**, and this card no
+            // longer draws it. It used to: the form's heading was a 19-point
+            // `Edit login`, and a second 20-point heading under it would have
+            // been two titles arguing about which one named the screen. The
+            // owner settled that argument the other way -- "Edit login title
+            // is wrong", "this is not part of design" -- and with the heading
+            // gone there is exactly one title again, which is the record's
+            // name where 8a and the read pane both put it. See [`edit_header`].
             //
             // **`Owner` is not drawn**, and it is the one omission on this
             // card. It is an organisation picker, and nothing in this build
@@ -7000,10 +7170,6 @@ pub fn draw_detail_edit(
             // an existing item's type cannot be changed and the read-only row
             // is how 8a says so.
             section(ui, kind, Section::Item, changed(Section::Item), wanted, |ui| {
-                theme::section_row(ui, "Name", |ui| {
-                    theme::text_field(ui, &mut draft.name, false);
-                });
-                ui.add_space(theme::BLOCK_GAP);
                 theme::section_row(ui, "Folder", |ui| {
                     // Both the label and the rows read the *assignable* list,
                     // not the raw one, and the label matters as much as the
@@ -12672,7 +12838,16 @@ mod sequence_builder_tests {
     /// reach them. `horizontal_wrapped` is what holds it.
     #[test]
     fn every_chip_and_button_is_reachable_at_the_apps_minimum_width() {
-        let pane = egui::vec2(MIN_PANE_WIDTH, 2200.0);
+        // **Tall enough that nothing is culled vertically**, because the
+        // claim here is about the pane's RIGHT edge and a chip egui never
+        // painted cannot be judged against it. 2200 was that height until 8a's
+        // title band added about eighty points above the form, at which point
+        // the last chip fell off the bottom and the failure read as "the chip
+        // was not painted at all" -- true, and nothing to do with width. The
+        // number has slack now rather than sitting on the form's exact
+        // height, so the next row this form grows does not re-stage the same
+        // confusion.
+        let pane = egui::vec2(MIN_PANE_WIDTH, 3000.0);
         let item = item();
         let ctx = styled_context(pane);
         // A deliberately long sequence: more steps than fit on one row, so
@@ -14475,8 +14650,10 @@ mod edit_pane_layout_tests {
         );
         // The reference is the `Item` card's own first row, read off the form
         // rather than written out: if §8a's label column ever changes ink,
-        // this test wants to move with it and not against it.
-        let reference = ink_of_run(&painted, "Name");
+        // this test wants to move with it and not against it. `Folder` and
+        // not `Name` -- the name is §8a's title bar now and has no caption at
+        // all, so Folder is this card's first row. See [`edit_header`].
+        let reference = ink_of_run(&painted, "Folder");
         assert_eq!(
             reference,
             theme::TEXT_FAINT,
@@ -14519,7 +14696,8 @@ mod edit_pane_layout_tests {
             !theme::section_rows_fit_at(MIN_PANE_WIDTH - 2.0 * theme::SECTION_CARD_PAD_X as f32),
             "the floor now fits §8a's label column, so this test is asserting about the wrong arm"
         );
-        let reference = ink_of_run(&painted, "Name");
+        // `Folder`, for the reason the wide arm's reference is -- see there.
+        let reference = ink_of_run(&painted, "Folder");
         assert_eq!(
             reference,
             theme::TEXT_MUTED,
@@ -14775,7 +14953,30 @@ mod edit_pane_layout_tests {
     /// Taken from [`Section::title`] rather than written out, so a card
     /// reordered or renamed moves this test instead of leaving it asserting
     /// about a string the form no longer paints.
-    const LAST_CARD: &str = Section::Notes.title(ItemKind::Login);
+    /// [`FIELDS_BLOCK_HEADING`] as the card's band paints it.
+    ///
+    /// A literal because [`expected_controls`] answers with `&'static str`
+    /// and `to_uppercase` allocates. It cannot drift:
+    /// [`the_card_titles_this_module_writes_out_are_the_bands_own`] holds it
+    /// against the string the card is actually titled with.
+    const FIELDS_CARD_TITLE: &str = "CUSTOM FIELDS";
+
+    /// The two spellings agree -- see [`FIELDS_CARD_TITLE`].
+    #[test]
+    fn the_card_titles_this_module_writes_out_are_the_bands_own() {
+        assert_eq!(FIELDS_CARD_TITLE, FIELDS_BLOCK_HEADING.to_uppercase());
+        assert_eq!(last_card(), Section::Notes.title(ItemKind::Login).to_uppercase());
+    }
+
+    /// The last card's title **as the card's band paints it**, which is
+    /// §8a's `text-transform: uppercase` over `Section::title`'s own string.
+    ///
+    /// A function rather than a `const`, because `to_uppercase` is not one
+    /// -- and derived from `Section::title` rather than written out, so a
+    /// renamed section cannot leave this pointing at a word no card draws.
+    fn last_card() -> String {
+        Section::Notes.title(ItemKind::Login).to_uppercase()
+    }
 
     /// The suffix the generator's size spinner wears in each of the row's two
     /// states. One place, so a test that measures one state cannot silently
@@ -15931,7 +16132,7 @@ mod edit_pane_layout_tests {
     /// from are reachable. Scrolling brings the LAST thing in the form on
     /// screen, and it does not drag the buttons off.
     ///
-    /// **The last thing used to be "Folder" and is now [`LAST_CARD`]**, and
+    /// **The last thing used to be "Folder" and is now [`last_card()`]**, and
     /// the re-target is not a weakening: design 8a puts the folder on the
     /// `Item` card at the TOP of the form -- it is what the record IS -- so
     /// "Folder" is now visible before any scrolling at all, which would make
@@ -15955,7 +16156,7 @@ mod edit_pane_layout_tests {
             // unscrolled field is not merely painted out of bounds -- egui
             // culls it and paints NOTHING, which is exactly why the user saw
             // no Save button at all rather than a Save button off the edge.
-            !before.rects_of(LAST_CARD).iter().any(|r| bounds.contains_rect(*r)),
+            !before.rects_of(&last_card()).iter().any(|r| bounds.contains_rect(*r)),
             "the tall form already fits in a {}x{} pane, so this test is not \
              exercising scrolling at all",
             pane.x,
@@ -15986,7 +16187,7 @@ mod edit_pane_layout_tests {
         }
         let after = frame(&ctx, pane, &mut draft, true, &[]);
 
-        assert_inside("the last card's title", LAST_CARD, pane, &after);
+        assert_inside("the last card's title", &last_card(), pane, &after);
         assert_eq!(
             after.rect_of(SAVE),
             save_before,
@@ -16092,10 +16293,13 @@ mod edit_pane_layout_tests {
     }
 
     /// The white form card: every [`theme::CARD`] fill that contains the
-    /// "Name" label, unioned. A `Frame` with a corner radius paints itself as
-    /// more than one rectangle, so the union rather than one of them.
+    /// "Folder" label, unioned. A `Frame` with a corner radius paints itself
+    /// as more than one rectangle, so the union rather than one of them.
+    ///
+    /// The anchor is the `Item` card's FIRST caption, which is Folder since
+    /// the name moved into §8a's title bar -- see [`edit_header`].
     fn card_rect(painted: &Painted) -> Rect {
-        let name = painted.rect_of("Name");
+        let name = painted.rect_of("Folder");
         painted
             .rects
             .iter()
@@ -16596,8 +16800,19 @@ mod edit_pane_layout_tests {
         // What every kind gets in both states: its name, the custom-fields
         // section, the app section -- the two gaps this list exists for --
         // and its folder.
+        // **The name is NOT in this list and its absence is not a gap.** It
+        // is §8a's title bar now, where it is a box with no caption over it,
+        // so there is no string for this list to look for. What holds it is
+        // `the_band_is_the_read_panes_own_strip_with_the_name_in_it`, which
+        // reads the box rather than a label.
+        //
+        // [`FIELDS_BLOCK_HEADING`] is a CARD TITLE and is therefore painted
+        // in §8a's capitals; [`APP_BLOCK_HEADING`] is a row caption inside
+        // one and is painted as it is written. The difference is the band's
+        // `text-transform` and nothing else -- see
+        // `theme::section_card_header`.
         let mut expected =
-            vec!["Name", FIELDS_BLOCK_HEADING, APP_BLOCK_HEADING, APP_ADD_BUTTON, "Folder"];
+            vec![FIELDS_CARD_TITLE, APP_BLOCK_HEADING, APP_ADD_BUTTON, "Folder"];
         if creating {
             // `NewItem` has no `fields` payload, so the block says so instead
             // of offering boxes whose contents Save would discard. The notice
@@ -18377,8 +18592,8 @@ mod edit_pane_layout_tests {
             frame(&ctx, pane, &mut shut_draft, false, &[])
         };
         assert_eq!(
-            painted.rect_of("Name").left(),
-            shut.rect_of("Name").left(),
+            painted.rect_of("Folder").left(),
+            shut.rect_of("Folder").left(),
             "opening the add menu moved the card, so the chip row is widening it"
         );
     }
@@ -18498,8 +18713,8 @@ mod edit_pane_layout_tests {
         };
         assert!(without.rects_of(SLOT_REMOVE_BUTTON).is_empty(), "the create form drew chips");
         assert_eq!(
-            with.rect_of("Name").left(),
-            without.rect_of("Name").left(),
+            with.rect_of("Folder").left(),
+            without.rect_of("Folder").left(),
             "the Remove chips widened the card"
         );
     }
@@ -18644,8 +18859,12 @@ mod edit_pane_layout_tests {
             for (section, _) in drawn_sections(draft.kind, false, &draft, &draft.shown_slots(false))
             {
                 titles += 1;
-                let title = section.title(draft.kind);
-                let drawn: Vec<Rect> = painted.rects_of(title);
+                // **Uppercased**, because the card's band draws §8a's
+                // `text-transform` -- see `theme::section_card_header`. The
+                // rail beside it draws the same string untransformed, which
+                // is what makes this the CARD's title and not the rail's.
+                let title = section.title(draft.kind).to_uppercase();
+                let drawn: Vec<Rect> = painted.rects_of(&title);
                 assert!(
                     !drawn.is_empty(),
                     "{pane:?}: the {title:?} card has no title on it at all: {:?}",
@@ -18732,11 +18951,102 @@ mod edit_pane_layout_tests {
         );
         // The control that makes the absence a decision rather than a
         // casualty: the form is all still there.
-        for label in ["Item", "Login credentials"] {
+        // The CARDS' own titles, in the band's capitals -- the rail is what
+        // has gone, so a sentence-case hit here would be the rail surviving.
+        for label in ["ITEM", "LOGIN CREDENTIALS"] {
             assert!(
                 narrow.strings().contains(&label),
                 "{label:?} went with the rail: {:?}",
                 narrow.strings()
+            );
+        }
+    }
+
+    /// **The band is the read pane's own strip, with the name in a box.**
+    ///
+    /// The owner, on the form this replaced: "Edit UI is wrong - it is more
+    /// like same as it is but with editable fields, but your is completely
+    /// off", then "Edit login title is wrong" and "this is not part of
+    /// design".
+    ///
+    /// Four claims, because the report was about the WHOLE strip and any one
+    /// of them alone would pass against three quarters of the old form:
+    ///
+    ///  * the record's name is drawn, and inside a field box -- not as a
+    ///    caption-and-row down in the `Item` card, where it used to be;
+    ///  * the box is §8a's `font-size: 20px`, so it is a TITLE and not one
+    ///    more setting;
+    ///  * the avatar is beside it, which is what makes this the read pane's
+    ///    band rather than a text field with a heading over it;
+    ///  * and the `Item` card no longer carries a `Name` row, so the name is
+    ///    in exactly one place. The old arrangement's own comment argued for
+    ///    the row on the grounds that a title bar and a name box would be
+    ///    "two titles arguing" -- true, and settled by deleting the heading.
+    #[test]
+    fn the_band_is_the_read_panes_own_strip_with_the_name_in_it() {
+        for pane in GRID_PANES {
+            let ctx = styled_context(pane);
+            let mut draft = full_login_draft();
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+            let name = painted.rect_of(&draft.name);
+            // The box round it: §8a's `height: 38px` field, which is the one
+            // measurement every box in this app shares (`theme::FIELD_HEIGHT`).
+            // Without this the name could be a bare label -- which is exactly
+            // what the READ pane draws, and the difference between the two
+            // panes is that here it can be typed into.
+            //
+            // `intersects` and not `contains_rect`: at the pane's floor the
+            // box is narrower than the name it holds, and a `TextEdit` lays
+            // its galley out at full width and scrolls it -- so the text's
+            // rect runs past the box clipping it. Containment would be
+            // asserting that the name FITS, which is a different claim and
+            // not one §8a makes.
+            assert!(
+                painted.rects.iter().any(|(r, fill)| {
+                    *fill == theme::CARD
+                        && r.intersects(name)
+                        && (r.height() - theme::FIELD_HEIGHT).abs() <= 2.0
+                }),
+                "{pane:?}: the record's name is not in a field box, so the band is a heading \
+                 rather than the editable title §8a draws: {:?}",
+                painted.strings()
+            );
+
+            // §8a's 20px, read off the galley rather than off the source.
+            assert!(
+                (painted.font_of(&draft.name).size - theme::TITLE_FIELD_PX).abs() <= 0.5,
+                "{pane:?}: the name is set at {} and §8a's title is {}",
+                painted.font_of(&draft.name).size,
+                theme::TITLE_FIELD_PX
+            );
+
+            // The avatar, which is the read pane's own tile: the monogram of
+            // the DRAFT's name, so it re-letters as the name is typed.
+            assert!(
+                painted.strings().contains(&theme::initials(&draft.name).as_str()),
+                "{pane:?}: the band has no avatar, so it is a text field and not the read \
+                 pane's strip: {:?}",
+                painted.strings()
+            );
+
+            // ...and the name is in ONE place. `Name` was the `Item` card's
+            // first caption; the card's first row is Folder now.
+            //
+            // Scoped to that card rather than to the whole frame, because the
+            // RAIL legitimately prints the word: its `Changed` list names the
+            // FIELDS that have moved, and a renamed record is one of them.
+            // That list is a report about the draft, not a row to type in.
+            let item_card = card_rect(&painted);
+            assert!(
+                !painted
+                    .rects_of("Name")
+                    .iter()
+                    .any(|r| item_card.intersects(*r)),
+                "{pane:?}: the `Item` card still draws a Name row, so the record's name is \
+                 on this form twice: {:?}",
+                painted.strings()
             );
         }
     }
@@ -18758,7 +19068,12 @@ mod edit_pane_layout_tests {
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
         let before = frame(&ctx, pane, &mut draft, false, &[]);
         let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+        // The rail prints this string as it is; the CARD prints it in §8a's
+        // capitals. Both are needed: the entry is found by the first and the
+        // card by the second, and telling them apart by CASE as well as by
+        // column is what stops this test passing on the rail alone.
         let last = Section::Notes.title(draft.kind);
+        let last_card = last.to_uppercase();
         // The control: the card is not already on screen, so a green run
         // below is the rail's doing.
         // **In the CARD column**, not merely on screen: the rail draws the
@@ -18766,7 +19081,7 @@ mod edit_pane_layout_tests {
         // find the rail and call the card visible.
         assert!(
             !before
-                .rects_of(last)
+                .rects_of(&last_card)
                 .iter()
                 .any(|r| bounds.contains_rect(*r) && r.left() > RAIL_WIDTH),
             "the {last:?} card is already in view, so this test is not exercising the rail"
@@ -18781,18 +19096,30 @@ mod edit_pane_layout_tests {
                 panic!("the rail has no {last:?} entry: {:?}", before.strings())
             });
         let _ = frame(&ctx, pane, &mut draft, false, &click(entry.center()));
-        // egui's scroll-to is applied on the frame after the request and then
-        // settles; these are the frames the app would draw.
-        for _ in 0..12 {
-            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        // **Drawn until it settles, not for a fixed count.** egui applies a
+        // scroll-to over several frames, and how many depends on the DISTANCE
+        // -- so a literal number here is a test that passes until the pane's
+        // viewport changes height, which is exactly what happened when 8a's
+        // title band replaced the form's old one-line heading: the same
+        // twelve frames stopped one card short of the target, and the
+        // failure read as "the rail is broken" rather than "the animation
+        // was still running". The bound is generous and the loop leaves the
+        // moment the card is there.
+        let in_card_column = |run: &Painted| {
+            run.rects_of(&last_card)
+                .iter()
+                .any(|r| bounds.contains_rect(*r) && r.left() > RAIL_WIDTH)
+        };
+        let mut after = frame(&ctx, pane, &mut draft, false, &[]);
+        for _ in 0..120 {
+            if in_card_column(&after) {
+                break;
+            }
+            after = frame(&ctx, pane, &mut draft, false, &[]);
         }
-        let after = frame(&ctx, pane, &mut draft, false, &[]);
 
         assert!(
-            after
-                .rects_of(last)
-                .iter()
-                .any(|r| bounds.contains_rect(*r) && r.left() > RAIL_WIDTH),
+            in_card_column(&after),
             "clicking the rail's {last:?} entry did not bring the card into view: {:?}",
             after.strings()
         );

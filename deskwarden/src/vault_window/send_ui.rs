@@ -13658,11 +13658,27 @@ mod frame_promptness {
     /// the two panes drew something". Kept as the fixture's username because
     /// the item list still needs a username to put in a row.
     const LOGIN_USERNAME: &str = "harness-detail-username";
-    /// **The read detail pane's control.** The heading of its LOGIN
-    /// CREDENTIALS card, painted by `detail::draw_detail_read` and by nothing
+    /// **The read detail pane's control**: the copy chord drawn beside its
+    /// username row, painted by `detail::draw_detail_read` and by nothing
     /// else in this window -- not the item list, not the sidebar, not the
-    /// titlebar. See [`the_loaded_vault_returns_promptly`].
-    const DETAIL_PANE_ONLY: &str = "LOGIN CREDENTIALS";
+    /// titlebar, and not the edit form, which has no copy affordances at
+    /// all. See [`the_loaded_vault_returns_promptly`].
+    ///
+    /// **It used to be `LOGIN CREDENTIALS`**, the card's heading, and that
+    /// stopped being exclusive the day the EDIT form's cards took §8a's
+    /// `text-transform: uppercase` and started drawing the same words. The
+    /// tests here are about WHICH PANE is on screen, so a control both panes
+    /// paint answers nothing -- which is what
+    /// [`the_item_editor_returns_promptly`] caught.
+    ///
+    /// Not the sidebar's `CTRL+K` and not the composer's: this is `CTRL+U`,
+    /// and `detail::copy_shortcut_label` is the only thing in this window
+    /// that produces it.
+    fn detail_pane_only() -> &'static str {
+        super::super::detail::copy_shortcut_chord(
+            super::super::detail::CopyShortcut::Username,
+        )
+    }
     /// **The item list's control**: its search field's hint, which
     /// `item_list::search_hint` produces and `draw_item_list` is the sole
     /// caller of. The count is the fixture's own two items, so a list that
@@ -14553,7 +14569,7 @@ mod frame_promptness {
     /// drew" are different claims and only the second is worth having:
     ///
     ///  * [`ITEM_LIST_ONLY`], the search field's hint -- `draw_item_list` ran.
-    ///  * [`DETAIL_PANE_ONLY`], the LOGIN CREDENTIALS card's heading -- the
+    ///  * [`detail_pane_only`], the LOGIN CREDENTIALS card's heading -- the
     ///    read detail pane ran.
     ///
     /// **Both were vacuous before.** They were the fixture's name and its
@@ -14575,7 +14591,7 @@ mod frame_promptness {
              produce",
         );
         outcome.expect_painted(
-            DETAIL_PANE_ONLY,
+            detail_pane_only(),
             "the loaded window painted no LOGIN CREDENTIALS card, so the READ DETAIL PANE \
              never drew -- the list alone is half this screen, and a frame that waits in the \
              pane beside it is the same frozen window",
@@ -14598,7 +14614,7 @@ mod frame_promptness {
     ///  * [`EDITOR_EDIT_TITLE`] is on screen. Only `draw_detail_edit` with
     ///    `creating: false` paints it, and the button that was pressed reads
     ///    "Edit" alone, so the click really did change the mode.
-    ///  * [`DETAIL_PANE_ONLY`] is NOT. The editor REPLACES the read pane; a
+    ///  * [`detail_pane_only`] is NOT. The editor REPLACES the read pane; a
     ///    window showing both would mean the press landed somewhere else and
     ///    this test measured the read arm over again.
     #[test]
@@ -14611,10 +14627,11 @@ mod frame_promptness {
              was never entered and this test is measuring the read pane again",
         );
         assert!(
-            !outcome.painted(DETAIL_PANE_ONLY),
-            "the edit form is up and the read pane's {DETAIL_PANE_ONLY:?} card is still \
+            !outcome.painted(detail_pane_only()),
+            "the edit form is up and the read pane's {:?} control is still \
              painted, so the pane was not replaced -- the click did not take. What was \
              painted: {:?}",
+            detail_pane_only(),
             outcome.painted
         );
     }

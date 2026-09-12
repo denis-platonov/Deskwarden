@@ -385,6 +385,19 @@ pub const ROUTES: [RouteRow; 4] = [
 /// have one.
 pub const OTHER_WAYS_LABEL: &str = "Other ways to add it";
 
+/// §6d's own second answer, verbatim: *"Cancel"*.
+///
+/// The typed card and the scanned one do NOT share a footer any more, and
+/// that was the report: "Save code and Cancel buttons, no Esc descards unless
+/// same everywhere". §6d draws two buttons and nothing else; §6c draws
+/// `Replace code`, a way back, and `Esc discards` pushed to the far right.
+/// Fusing them gave the typed card §6c's furniture -- a route back to a
+/// picker it did not arrive from, and a hint no other modal in this app
+/// prints (`delete_modal`, `folder_modal`, `icon_modal` and the preferences
+/// capture all bind Escape and all say nothing about it).
+pub const CANCEL_LABEL: &str = "Cancel";
+
+
 /// The heading while the 6b overlay is up.
 pub const SCANNING_HEADING: &str = "Scanning your screen";
 
@@ -1089,6 +1102,17 @@ pub fn parameters_line(auth: &OtpAuth) -> String {
 /// in 22 s"*.
 pub fn refresh_line(seconds_left: u16) -> String {
     format!("refreshes in {seconds_left} s")
+}
+
+/// The same countdown in §6d's words, which are the number and the unit and
+/// nothing else: *"22 s"*.
+///
+/// §6c writes it out because its countdown is a stacked column with room for
+/// a sentence; §6d's strip is ONE ROW -- code, track, seconds -- and "refreshes
+/// in" beside a 4-point bar is the bar's caption twice. Built from the same
+/// `seconds_left` so the two cards cannot disagree about the number.
+pub fn seconds_line(seconds_left: u16) -> String {
+    format!("{seconds_left} s")
 }
 
 /// How much of 6c's countdown track is still filled: the seconds left over the
@@ -1943,8 +1967,10 @@ const SECRET_BLOCK_GAP: f32 = 7.0;
 const SECRET_LABEL_PX: f32 = 12.0;
 
 /// The box itself: `border-radius: 8px; padding: 9px 11px` inside a `1px`
-/// border, around monospace `font-size: 13px` set at `letter-spacing: 0.1em;
-/// line-height: 1.6` -- 40.8 tall on screen, and 6d draws it focused, in
+/// border, around a monospace seed set at `letter-spacing: 0.1em`. §6d's own
+/// `font-size: 13px; line-height: 1.6` -- a 40.8-tall box -- is NOT taken;
+/// see [`SECRET_TEXT_PX`] for the report that changed both numbers. What is
+/// taken is that 6d draws this box focused, in
 /// `border: 1px solid #1b3fa0` under `box-shadow: 0 0 0 3px #dbe4f7`
 /// ([`theme::BLUE`] and [`theme::FOCUS_RING`], which is the halo every other
 /// field in this app already wears).
@@ -1953,14 +1979,30 @@ const SECRET_BOX_RADIUS: u8 = 8;
 const SECRET_BOX_STROKE: f32 = 1.0;
 /// See [`SECRET_BOX_RADIUS`].
 const SECRET_BOX_PAD_X: f32 = 11.0;
-/// See [`SECRET_BOX_RADIUS`].
-const SECRET_BOX_PAD_Y: f32 = 9.0;
-/// See [`SECRET_BOX_RADIUS`].
-const SECRET_TEXT_PX: f32 = 13.0;
+/// The seed's type size -- **this app's own field size, not §6d's 13.**
+///
+/// The owner, on the 13: "text cursor is huge and text is not that big, text
+/// in field not centered and field looks higher". Three of those four are one
+/// measurement. The caret egui draws is the ROW's height, which for this face
+/// is 15.2 whether the glyphs in it are 13 points or 14; at 13 the caret
+/// stands a clear step taller than the letters beside it, and in a box whose
+/// interior is §6d's `line-height: 1.6` the pair sits in a field noticeably
+/// deeper than every other field on the same card.
+///
+/// So the seed is set at the size every box in this app sets its value at
+/// (`theme::field_box`'s own 14) in a box of [`theme::FIELD_HEIGHT`]. What is
+/// KEPT from §6d is everything that makes this field a seed field and not a
+/// name field: the monospace face, the `0.1em` tracking, the blue focused
+/// border and its halo. The design's proportions were drawn for a browser's
+/// caret, which is the glyph height; egui's is the line's.
+const SECRET_TEXT_PX: f32 = 14.0;
 /// See [`SECRET_BOX_RADIUS`]. The design's em, which egui wants in points.
 const SECRET_TEXT_TRACKING: f32 = 0.1;
-/// See [`SECRET_BOX_RADIUS`].
-const SECRET_TEXT_LINE: f32 = 1.6;
+/// How far the seed's row is pushed below the box's true centre, as a
+/// fraction of the row -- `theme::field_box`'s own 0.09, named here because
+/// this field allocates its own box rather than going through that helper.
+const SECRET_OPTICAL_NUDGE: f32 = 0.09;
+
 /// The halo's width, from `box-shadow: 0 0 0 3px`.
 const SECRET_FOCUS_RING: f32 = 3.0;
 
@@ -2247,12 +2289,16 @@ fn secret_field(ui: &mut egui::Ui, typed: &mut String) -> egui::Response {
     // A placeholder in the paint list, so the box lands UNDER the text egui
     // draws for the `TextEdit`. `theme::field_box`'s own trick.
     let under = ui.painter().add(egui::Shape::Noop);
-    let line = SECRET_TEXT_PX * SECRET_TEXT_LINE;
+    // **[`theme::FIELD_HEIGHT`], which is every other box on this card.**
+    //
+    // §6d's own height is `1px + 9px + 13×1.6 + 9px + 1px` = 40.8, and that is
+    // what this allocated. Two points is nothing to measure and plenty to
+    // SEE: the seed box sat a step deeper than the Digits and Period controls
+    // under it and than every field on the edit form behind it, which is what
+    // "field looks higher" was reading. The design draws this card alone on a
+    // page and could not have shown that.
     let (outer, _) = ui.allocate_exact_size(
-        egui::vec2(
-            ui.available_width(),
-            SECRET_BOX_STROKE * 2.0 + SECRET_BOX_PAD_Y * 2.0 + line,
-        ),
+        egui::vec2(ui.available_width(), theme::FIELD_HEIGHT),
         egui::Sense::hover(),
     );
     // **The text row is CENTRED in the box, not laid out to fill it.**
@@ -2272,12 +2318,16 @@ fn secret_field(ui: &mut egui::Ui, typed: &mut String) -> egui::Response {
     let row = ui.fonts_mut(|f| {
         f.row_height(&egui::FontId::new(SECRET_TEXT_PX, egui::FontFamily::Monospace))
     });
+    // **Nudged down by the descent gap**, which is `theme::field_box`'s own
+    // correction and the last of the four things reported here. A row box is
+    // ascent plus descent tall, and a seed -- capitals and digits, no
+    // descenders at all -- fills only the upper part of it, so centring the
+    // BOX reads as text sitting high. Centring on the glyphs is what
+    // "centered" means to the eye, and the constant is the one every other
+    // field in this app is already nudged by.
     let inner = egui::Rect::from_center_size(
-        outer.center(),
-        egui::vec2(
-            outer.width() - (SECRET_BOX_STROKE + SECRET_BOX_PAD_X) * 2.0,
-            row,
-        ),
+        egui::pos2(outer.center().x, outer.center().y + row * SECRET_OPTICAL_NUDGE),
+        egui::vec2(outer.width() - (SECRET_BOX_STROKE + SECRET_BOX_PAD_X) * 2.0, row),
     );
     let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _wrap: f32| {
         let mut job = egui::text::LayoutJob::default();
@@ -2724,7 +2774,12 @@ fn caution_band(ui: &mut egui::Ui, text: std::sync::Arc<egui::Galley>) {
 /// has a code the action behind this button destroys a seed that cannot be
 /// recovered. `theme::destructive_button` refuses a shortcut for the same
 /// reason in the delete modal.
-fn manual_footer(ui: &mut egui::Ui, primary: &str, enabled: bool) -> (bool, bool) {
+fn manual_footer(
+    ui: &mut egui::Ui,
+    primary: &str,
+    enabled: bool,
+    scanned: bool,
+) -> FooterPress {
     let width = ui.available_width();
     let (band, _) =
         ui.allocate_exact_size(egui::vec2(width, manual_footer_height()), egui::Sense::hover());
@@ -2771,15 +2826,42 @@ fn manual_footer(ui: &mut egui::Ui, primary: &str, enabled: bool) -> (bool, bool
     // point, against a footer whose answers would otherwise round differently
     // from every other footer in this app.
     let save = theme::primary_button_enabled(&mut inner, primary, None, enabled).clicked();
-    let back = theme::secondary_button(&mut inner, OTHER_WAYS_LABEL).clicked();
-    inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        ui.label(
-            egui::RichText::new(DISMISS_HINT)
-                .size(DISMISS_HINT_PX)
-                .color(theme::TEXT_GHOST),
-        );
-    });
-    (save, back)
+    // **§6c's second answer is the way back; §6d's is Cancel**, and the card
+    // knows which it is. The way back exists because a scan that decoded the
+    // wrong thing is fixed by choosing a route again -- and a card the user
+    // TYPED into arrived from no route, so there is nothing there to go back
+    // to and the button would be a door into a picker they never opened.
+    if scanned {
+        let back = theme::secondary_button(&mut inner, OTHER_WAYS_LABEL).clicked();
+        // §6c's hint, and §6c's alone -- see [`CANCEL_LABEL`].
+        inner.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(
+                egui::RichText::new(DISMISS_HINT)
+                    .size(DISMISS_HINT_PX)
+                    .color(theme::TEXT_GHOST),
+            );
+        });
+        FooterPress { save, back, cancel: false }
+    } else {
+        let cancel = theme::secondary_button(&mut inner, CANCEL_LABEL).clicked();
+        FooterPress { save, back: false, cancel }
+    }
+}
+
+/// Which of [`manual_footer`]'s answers was pressed.
+///
+/// A struct rather than the `(bool, bool)` this returned, because the band
+/// now has THREE possible answers across its two shapes and a third bare
+/// bool in a tuple is the kind of thing a call site gets the wrong way round
+/// once and nobody notices: `back` closes nothing and `cancel` closes
+/// everything.
+struct FooterPress {
+    /// The primary: write the seed.
+    save: bool,
+    /// §6c only: back to 6a's routes.
+    back: bool,
+    /// §6d only: close without writing, exactly as Escape does.
+    cancel: bool,
 }
 
 /// **Design 6d**, with 6c fused into the bottom of the same card: the header
@@ -2936,17 +3018,26 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
         if let Some(text) = caution {
             caution_band(ui, text);
         }
-        let (save, back) =
-            manual_footer(ui, submit_label(state.already_has_code), can_save(&reading));
-        if save {
+        let pressed = manual_footer(
+            ui,
+            submit_label(state.already_has_code),
+            can_save(&reading),
+            state.scanned,
+        );
+        if pressed.save {
             action = TotpAddAction::Save;
+        }
+        // The same value Escape and the ✕ produce, so §6d's three ways out
+        // cannot reach three different states.
+        if pressed.cancel {
+            action = TotpAddAction::Cancel;
         }
         // **The way back to 6a**, and the reason this form is not a dead end
         // when the user arrived at it by scanning: a decode that produced the
         // wrong card, or a seed typed off the wrong line, is fixed by
         // choosing a route again rather than by cancelling out of the whole
         // feature and re-opening it.
-        if back {
+        if pressed.back {
             back_to_picker = true;
         }
     });
@@ -4326,6 +4417,26 @@ const PANEL_SIDE_PX: f32 = 12.0;
 /// See [`PANEL_SIDE_PX`].
 const PANEL_SIDE_GAP: f32 = 7.0;
 
+/// §6d's code, which is smaller than §6c's: `font-size: 22px` against 26.
+///
+/// Not an inconsistency to be smoothed over. §6c is the card that has just
+/// captured something off the screen and whose whole job is *"is this the
+/// code you are looking at?"* -- the code is its subject. §6d is the card you
+/// are TYPING a secret into: the code is the proof the secret works, sitting
+/// under the field that produced it, and at 26 it would outweigh the thing
+/// being entered.
+const CODE_PX_TYPED: f32 = 22.0;
+
+/// §6d's strip: `padding: 12px 14px`, a point tighter than §6c's `14px 16px`
+/// because it holds one row rather than a two-line column.
+const TYPED_PANEL_PAD_X: i8 = 14;
+const TYPED_PANEL_PAD_Y: i8 = 12;
+
+/// §6d's `gap: 14px`, between the code and the track and again between the
+/// track and the seconds.
+const TYPED_PANEL_GAP: f32 = 14.0;
+
+
 /// The field table: `border: 1px solid #eae7e7; border-radius: 10px;
 /// overflow: hidden`.
 const TABLE_RADIUS: u8 = 10;
@@ -4414,7 +4525,7 @@ fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now
     // confirmation that buries it under four label rows is a confirmation
     // nobody makes. On the typed path it is the only thing here.
     if let Some(code) = code_at(auth, now_unix) {
-        draw_code_panel(ui, auth, &code, now_unix);
+        draw_code_panel(ui, auth, &code, now_unix, scanned);
         // The gap is the one BETWEEN the panel and the table, so it goes
         // wherever the table does. Left in on the typed path it would be a
         // stripe of nothing above the footer.
@@ -4428,15 +4539,46 @@ fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now
     }
 }
 
-/// **6c's live-code panel.** The label and the code down the left, the
-/// countdown stack right-aligned beside them.
-fn draw_code_panel(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) {
+/// **The live-code strip, in the design's two shapes.**
+///
+/// §6c, the card that has just read a code off the screen, draws a two-line
+/// block: a `CODE NOW` eyebrow over a 26px code, with `refreshes in 22 s`, the
+/// track and `Matches what the site shows?` stacked against the right edge.
+/// Its job is to be checked against a screen, so it says so in words.
+///
+/// §6d, the card you are typing a secret INTO, draws one row: the code, a
+/// `flex: 1` track and `22 s`. Nothing else. It is not asking a question --
+/// it is showing that what has been typed produces codes, under the field
+/// that produced them.
+///
+/// The owner, on the typed card wearing §6c's block: "blue strip also should
+/// only have code and progress bar with seconds - nothing else". Both shapes
+/// are drawn here rather than in two functions because they are one strip --
+/// same wash, same edge, same radius, same code, same countdown off the same
+/// `countdown_fraction` -- and the parts that differ are exactly the parts
+/// the design draws differently.
+fn draw_code_panel(
+    ui: &mut egui::Ui,
+    auth: &OtpAuth,
+    code: &str,
+    now_unix: u64,
+    scanned: bool,
+) {
+    let (pad_x, pad_y) = if scanned {
+        (CODE_PANEL_PAD_X, CODE_PANEL_PAD_Y)
+    } else {
+        (TYPED_PANEL_PAD_X, TYPED_PANEL_PAD_Y)
+    };
     egui::Frame::new()
         .fill(theme::BLUE_WASH)
         .stroke(egui::Stroke::new(1.0, theme::BLUE_EDGE))
         .corner_radius(CornerRadius::same(CODE_PANEL_RADIUS))
-        .inner_margin(egui::Margin::symmetric(CODE_PANEL_PAD_X, CODE_PANEL_PAD_Y))
+        .inner_margin(egui::Margin::symmetric(pad_x, pad_y))
         .show(ui, |ui| {
+            if !scanned {
+                typed_code_row(ui, auth, code, now_unix);
+                return;
+            }
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.vertical(|ui| {
@@ -4487,11 +4629,50 @@ fn draw_code_panel(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64)
         });
 }
 
+/// §6d's one row: the code, a track that takes what is left, and the seconds.
+///
+/// The track is `flex: 1` -- §6d's own -- and not §6c's fixed 96, which is why
+/// it is measured here instead of calling [`draw_countdown`]: the two cards
+/// draw the same bar at two widths, and a bar that ran to 96 in a row built
+/// to fill the strip would leave a hole between it and the seconds.
+fn typed_code_row(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) {
+    let seconds = seconds_line(seconds_left(auth, now_unix));
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        ui.label(theme::letterspaced_mono(
+            &grouped_code(code),
+            CODE_PX_TYPED,
+            CODE_PX_TYPED * CODE_TRACKING,
+            theme::BLUE_DEEP,
+        ));
+        // **The seconds are measured before the track is drawn**, because the
+        // track is what gives way. Laid out in source order the bar would
+        // take `available_width` and push `22 s` off the strip's right edge --
+        // the same defect the detail header's controls are laid out
+        // right-to-left to avoid.
+        let tail = ui.painter().layout_no_wrap(
+            seconds.clone(),
+            egui::FontId::proportional(PANEL_SIDE_PX),
+            theme::BLUE_DEEP,
+        );
+        let track = (ui.available_width() - tail.size().x - TYPED_PANEL_GAP * 2.0).max(0.0);
+        ui.add_space(TYPED_PANEL_GAP);
+        draw_countdown_at(ui, countdown_fraction(auth, now_unix), track);
+        ui.add_space(TYPED_PANEL_GAP);
+        ui.label(egui::RichText::new(seconds).size(PANEL_SIDE_PX).color(theme::BLUE_DEEP));
+    });
+}
+
 /// 6c's countdown track: a 96 by 4 rail of [`theme::BLUE_EDGE`] with
 /// `fraction` of it filled in [`theme::BLUE`] from the left.
 fn draw_countdown(ui: &mut egui::Ui, fraction: f32) {
+    draw_countdown_at(ui, fraction, COUNTDOWN_WIDTH);
+}
+
+/// [`draw_countdown`] at a width the caller measured -- §6d's `flex: 1`.
+fn draw_countdown_at(ui: &mut egui::Ui, fraction: f32, width: f32) {
     let (track, _) = ui.allocate_exact_size(
-        egui::vec2(COUNTDOWN_WIDTH, COUNTDOWN_HEIGHT),
+        egui::vec2(width, COUNTDOWN_HEIGHT),
         egui::Sense::hover(),
     );
     let radius = CornerRadius::same(COUNTDOWN_RADIUS);
@@ -5763,10 +5944,24 @@ mod tests {
         assert!(painted.has(HEADING), "the modal painted no form: {:?}", painted.0);
         assert!(painted.has(REPLACE_WARNING), "the modal dropped the warning");
         // The confirmation half, asked for by the part of it a TYPED card
-        // draws: the live-code panel. 6c's heading is the scanned path's now,
-        // and this state is a typed one -- asserting the heading here would be
-        // asserting the old fusion rather than that the modal drew the form.
-        assert!(painted.has(MATCH_QUESTION), "the modal dropped the confirmation");
+        // draws: §6d's live-code strip. 6c's heading and its *"Matches what the
+        // site shows?"* are the SCANNED card's now (see `draw_code_panel`), and
+        // this state is a typed one -- either would be asserting the old
+        // fusion rather than that the modal drew the form.
+        //
+        // The needle is the code itself, recomputed here from the same seed
+        // and the same clock the modal was given, so this cannot be satisfied
+        // by a strip that drew SOME code: it is the one this secret produces
+        // at this instant.
+        let expected = grouped_code(
+            &code_at(&auth("otpauth://totp/Git%20Host?secret=JBSWY3DPEHPK3PXP"), BOUNDARY)
+                .expect("the fixture's seed decodes"),
+        );
+        assert!(
+            painted.has(&expected),
+            "the modal dropped the confirmation: {:?}",
+            painted.0
+        );
     }
 
     // -----------------------------------------------------------------
@@ -7604,8 +7799,26 @@ mod tests {
             "the live code went out with the table: {:?}",
             typed_frame.0
         );
-        assert!(typed_frame.has(MATCH_QUESTION), "the question the code exists to answer is gone");
-        assert!(typed_frame.has("refreshes in 60 s"), "the countdown went out with the table");
+        // §6d's countdown is the NUMBER, not §6c's sentence, and the question
+        // beside it is §6c's too -- see `draw_code_panel`, which draws the
+        // design's two strips rather than one of them twice. Both halves are
+        // asserted, so a strip that quietly went back to 6c's block fails
+        // here and not only in a screenshot.
+        assert!(
+            typed_frame.has(&seconds_line(60)),
+            "the countdown went out with the table: {:?}",
+            typed_frame.0
+        );
+        assert!(
+            !typed_frame.has(MATCH_QUESTION),
+            "the typed strip is wearing §6c's question: {:?}",
+            typed_frame.0
+        );
+        assert!(
+            !typed_frame.has(&CODE_ROW_LABEL.to_uppercase()),
+            "the typed strip is wearing §6c's eyebrow: {:?}",
+            typed_frame.0
+        );
 
         // The same payload, SCANNED. Unchanged: 6c is a design in its own
         // right and nothing here asks it to become something else.
@@ -7923,7 +8136,7 @@ mod tests {
             assert_eq!(
                 found.len(),
                 2,
-                "6d's footer draws two answers and {} were painted: {found:?}",
+                "the footer draws two answers and {} were painted: {found:?}",
                 found.len()
             );
             found
@@ -8045,6 +8258,16 @@ mod tests {
             state.typed = Zeroizing::new(seed.to_string());
             state
         }
+
+        /// The same card reached the other way: §6c, a `uri` read off the
+        /// screen. `accept_decoded` is the real entry point the overlay uses,
+        /// so a state built here is the state a scan actually produces --
+        /// including `scanned`, which is what the card branches on.
+        fn scanning(uri: &str) -> TotpAdd {
+            let mut state = TotpAdd::opening("id-1", "Git Host \u{b7} anovak", false);
+            state.accept_decoded(Zeroizing::new(uri.to_string()));
+            state
+        }
     }
 
     /// **6d is 470 wide, and [`Stage::Scanning`] is not.**
@@ -8116,13 +8339,16 @@ mod tests {
         assert_eq!(rules.len(), 2, "6d rules the header off and the footer on: {rules:?}");
     }
 
-    /// **6d's field is 6d's box**: 436 x 40.8 at `border-radius: 8px`.
+    /// **6d's field at this app's field height**: 436 x [`theme::FIELD_HEIGHT`]
+    /// at `border-radius: 8px`.
     ///
     /// The width is what makes the rest of the card's arithmetic real -- 470
-    /// less the card's border and the body's 16px padding either side -- and
-    /// the height is the design's `padding: 9px 11px` around a 13px line set
-    /// at 1.6, which is the measurement a border-box reading of the same
-    /// declarations gets wrong by two points.
+    /// less the card's border and the body's 16px padding either side.
+    ///
+    /// The height is **not** 6d's 40.8, and the departure is deliberate: see
+    /// [`SECRET_TEXT_PX`], which carries the report. Read off the theme's own
+    /// constant rather than written out, so this asserts the field is the
+    /// app's field rather than that it is one particular number of points.
     #[test]
     fn the_secret_field_is_the_designs_own_box() {
         let mut state = Manual::typing("");
@@ -8131,9 +8357,10 @@ mod tests {
             r.radius == SECRET_BOX_RADIUS && (r.rect.width() - 436.0).abs() <= 1.0
         });
         assert!(
-            (field.rect.height() - 40.8).abs() <= 0.5,
-            "the field is {} tall and 6d's is 40.8",
-            field.rect.height()
+            (field.rect.height() - theme::FIELD_HEIGHT).abs() <= 0.5,
+            "the field is {} tall and this app's fields are {}",
+            field.rect.height(),
+            theme::FIELD_HEIGHT
         );
         assert_eq!(field.stroke, theme::BORDER_STRONG, "an unfocused field is bordered #d7d3d3");
         assert!(
@@ -8640,25 +8867,58 @@ mod tests {
         assert!(!frame.painted.has(SAVE_LABEL), "both button faces were painted at once");
     }
 
-    /// **The footer is one row for both of the design's two**: the primary,
-    /// the way back to 6a, and the Escape hint at the far right.
+    /// **The footer is the design's TWO, and each card wears its own.**
+    ///
+    /// §6d draws `Save code` and `Cancel` and nothing else; §6c draws
+    /// `Replace code`, a way back, and `Esc discards` pushed to the far right.
+    /// They were one fused band, which gave the typed card a route back to a
+    /// picker it had not arrived from and a hint no other modal in this app
+    /// prints. The owner: "Save code and Cancel buttons, no Esc descards
+    /// unless same everywhere".
+    ///
+    /// **Both cards are read in one test on purpose.** Either alone would pass
+    /// against a footer that drew one shape for everybody, which is the defect
+    /// this closes.
     #[test]
-    fn the_footer_carries_the_primary_the_way_back_and_the_escape_hint() {
+    fn each_card_wears_its_own_footer() {
         let manual = Manual::new();
-        let mut state = Manual::typing("JBSWY3DPEHPK3PXP");
-        let frame = manual.idle(&mut state);
+
+        // §6d, typed by hand: two buttons.
+        let mut typed = Manual::typing("JBSWY3DPEHPK3PXP");
+        let frame = manual.idle(&mut typed);
         assert!(frame.painted.has(SAVE_LABEL), "the primary answer is missing");
-        assert!(frame.painted.has(OTHER_WAYS_LABEL), "the way back to 6a is missing");
         assert!(
-            frame.painted.has(DISMISS_HINT),
-            "6c's Esc hint is not on the footer: {:?}",
+            frame.painted.has(CANCEL_LABEL),
+            "§6d's second answer is missing: {:?}",
             frame.painted.0
         );
-        // The hint carries the cancel, so there is no second button saying the
-        // same thing. See [`manual_footer`].
         assert!(
-            !frame.painted.0.iter().any(|t| t == "Cancel"),
-            "the footer draws both the Esc hint and a Cancel button for one action"
+            !frame.painted.has(OTHER_WAYS_LABEL),
+            "the typed card offers a way back to a picker it never came from"
+        );
+        assert!(
+            !frame.painted.has(DISMISS_HINT),
+            "the typed card prints an Escape hint no other modal in this app prints"
+        );
+
+        // §6c, scanned: the way back and the hint, exactly as before.
+        let mut scanned = Manual::scanning(UNUSUAL);
+        let frame = manual.idle(&mut scanned);
+        assert!(
+            frame.painted.has(OTHER_WAYS_LABEL),
+            "the way back to 6a is missing from the scanned card: {:?}",
+            frame.painted.0
+        );
+        assert!(
+            frame.painted.has(DISMISS_HINT),
+            "§6c's Esc hint is not on the footer: {:?}",
+            frame.painted.0
+        );
+        // The hint carries the cancel there, so there is no second button
+        // saying the same thing. See [`manual_footer`].
+        assert!(
+            !frame.painted.0.iter().any(|t| t == CANCEL_LABEL),
+            "the scanned footer draws both the Esc hint and a Cancel button for one action"
         );
 
         // And the key the hint names really answers, through the modal that
@@ -8712,7 +8972,10 @@ mod tests {
     #[test]
     fn the_footers_second_answer_goes_back_to_the_picker() {
         let manual = Manual::new();
-        let mut state = Manual::typing("JBSWY3DPEHPK3PXP");
+        // **A SCANNED card**, which is the only one that has a way back: see
+        // [`manual_footer`]. On the typed card the same slot is Cancel, and
+        // that half is asserted below.
+        let mut state = Manual::scanning(UNUSUAL);
         let laid_out = manual.idle(&mut state);
         let back = laid_out.answers()[1];
         assert_eq!(back.stroke, theme::BORDER_STRONG, "the second answer is not outlined");
@@ -8721,6 +8984,20 @@ mod tests {
         assert_eq!(after.action, TotpAddAction::None, "the way back asked the caller to act");
         assert_eq!(state.stage, Stage::Picker, "the second answer did not go back to 6a");
         assert!(state.typed.is_empty(), "a seed was left resident on the way back");
+
+        // And §6d's second answer in the same slot: it closes, and it does NOT
+        // quietly go back to the picker instead. Asserted through a press for
+        // the reason above -- the button's wiring is the claim, not its face.
+        let mut typed = Manual::typing("JBSWY3DPEHPK3PXP");
+        let laid_out = manual.idle(&mut typed);
+        let cancel = laid_out.answers()[1];
+        let after = manual.click(&mut typed, cancel.rect.center());
+        assert_eq!(
+            after.action,
+            TotpAddAction::Cancel,
+            "§6d's Cancel did not report the same value Escape does"
+        );
+        assert_eq!(typed.stage, Stage::Manual, "Cancel walked the user back to 6a");
     }
 
     // -----------------------------------------------------------------

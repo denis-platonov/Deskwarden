@@ -51,10 +51,10 @@ use zeroize::Zeroizing;
 // ---------------------------------------------------------------------------
 
 /// The white header strip's `padding: 20px 24px`.
-const HEADER_PAD_X: i8 = 24;
-const HEADER_PAD_Y: i8 = 20;
+pub(crate) const HEADER_PAD_X: i8 = 24;
+pub(crate) const HEADER_PAD_Y: i8 = 20;
 /// `gap: 14px` between the strip's avatar, title column and buttons.
-const HEADER_GAP: f32 = 14.0;
+pub(crate) const HEADER_GAP: f32 = 14.0;
 /// The strip's avatar tile, which is [`item_list`]'s row tile at exactly the
 /// same size.
 ///
@@ -74,7 +74,7 @@ const HEADER_GAP: f32 = 14.0;
 /// equal in the meantime.
 ///
 /// The strip's height no longer follows this number -- [`HEADER_ROW`] does.
-const HEADER_AVATAR: f32 = 40.0;
+pub(crate) const HEADER_AVATAR: f32 = 40.0;
 
 /// **The height of the strip's content row**, and therefore the strip's own
 /// height once `padding: 20px` is added above and below it: design 2b's 44px.
@@ -104,7 +104,7 @@ const HEADER_AVATAR: f32 = 40.0;
 /// It is deliberately NOT `HEADER_AVATAR.max(title height)`: the design gives
 /// a 44px row, and a row that quietly tracks whichever child is tallest is the
 /// thing that just went wrong.
-const HEADER_ROW: f32 = 44.0;
+pub(crate) const HEADER_ROW: f32 = 44.0;
 /// **How many controls the header strip draws for EVERY item**, because the
 /// strip *reserves* its room before it draws anything and drift between the
 /// two is the failure mode that painted a control at x = -34.5.
@@ -159,12 +159,12 @@ fn item_takes_a_one_time_code(item: &VaultItem) -> bool {
 /// `font-size: 22px` on the item title.
 const TITLE_SIZE: f32 = 22.0;
 /// `gap: 3px` between the title and its subtitle.
-const TITLE_GAP: f32 = 3.0;
+pub(crate) const TITLE_GAP: f32 = 3.0;
 /// `font-size: 12px` on the subtitle under it. A constant rather than a
 /// literal since the folder mark split that line into two labels: two runs of
 /// one sentence set at two sizes is a slip nothing else would catch, and
 /// `theme::FOLDER_MARK_SIZE`'s height is measured against this number.
-const SUBTITLE_SIZE: f32 = 12.0;
+pub(crate) const SUBTITLE_SIZE: f32 = 12.0;
 /// **The floor under the item title, and the thing the rest of the strip
 /// gives way to.** Not from the design: 2b draws this pane at one width and
 /// says nothing about what happens below it.
@@ -2050,7 +2050,7 @@ const COPY_SHORTCUTS: [(CopyShortcut, egui::Modifiers, egui::Key, &str); 8] = [
 
 /// How one binding is spelled to the user, read out of [`COPY_SHORTCUTS`] and
 /// never written out a second time.
-fn copy_shortcut_chord(which: CopyShortcut) -> &'static str {
+pub(crate) fn copy_shortcut_chord(which: CopyShortcut) -> &'static str {
     COPY_SHORTCUTS
         .iter()
         .find(|(candidate, _, _, _)| *candidate == which)

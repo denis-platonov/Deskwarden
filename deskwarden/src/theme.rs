@@ -4812,6 +4812,33 @@ pub fn pencil_glyph_at(ui: &mut Ui, rect: Rect, id: egui::Id) -> Response {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     let color = if response.hovered() { INK } else { TEXT_GHOST };
+    paint_pencil(ui.painter(), rect, color);
+    response.on_hover_text("Edit folder")
+}
+
+/// [`pencil_glyph_at`]'s SHAPE, with no interaction and no hover state: the
+/// same pencil painted into a rect at a colour the caller chooses.
+///
+/// Split out for §8a's edit badge, which is not a control -- it is the mark on
+/// the corner of the item's avatar that says the pane below is a form. Drawn
+/// from one place so the two pencils in this app cannot become two drawings
+/// of a pencil; `ui.interact` is what the other one adds, and it is exactly
+/// what a badge must not have (it would take the pointing hand and a click
+/// target over the avatar it sits on).
+pub fn paint_pencil(painter: &egui::Painter, rect: Rect, color: Color32) {
+    paint_pencil_scaled(painter, rect, color, 1.0);
+}
+
+/// [`paint_pencil`] at a fraction of its drawn size.
+///
+/// The shape is built in absolute local units -- a 13-point pencil however
+/// big the rect it is centred in -- which is right for the sidebar, where
+/// the rect is a row and the glyph is a glyph. It is wrong inside §8a's
+/// 18-point badge, where the same 13 points run corner to corner and the
+/// nib and tail are too small to tell apart: it reads as a line struck
+/// THROUGH the disc rather than as a pencil in it. Measured on the render,
+/// not foreseen.
+pub fn paint_pencil_scaled(painter: &egui::Painter, rect: Rect, color: Color32, scale: f32) {
 
     // Body: a thin rectangle running along the (1,-1) diagonal, capped with
     // a triangular tip at one end.
@@ -4843,19 +4870,65 @@ pub fn pencil_glyph_at(ui: &mut Ui, rect: Rect, id: egui::Id) -> Response {
     let bbox_center = (min + max) / 2.0;
     let offset = rect.center() - bbox_center.to_pos2();
 
-    let to_screen = |v: Vec2| Pos2::new(v.x, v.y) + offset;
-    ui.painter().add(egui::Shape::convex_polygon(
+    let to_screen =
+        |v: Vec2| Pos2::new(bbox_center.x, bbox_center.y) + (v - bbox_center) * scale + offset;
+    painter.add(egui::Shape::convex_polygon(
         body.iter().map(|p| to_screen(*p)).collect(),
         color,
         Stroke::NONE,
     ));
-    ui.painter().add(egui::Shape::convex_polygon(
+    painter.add(egui::Shape::convex_polygon(
         nib.iter().map(|p| to_screen(*p)).collect(),
         color,
         Stroke::NONE,
     ));
-    response.on_hover_text("Edit folder")
 }
+
+/// §8a's edit badge: the little white disc on the bottom-right corner of the
+/// item's avatar, with a pencil in it.
+///
+/// It is the one thing on the edit pane's header band that the READ pane's
+/// band does not draw, and that is deliberate -- the two bands are otherwise
+/// the same strip showing the same item, so the badge is what says which of
+/// them you are looking at. §8a draws it in exactly this place and this is
+/// where the design puts the answer to "am I editing this?"; the alternative
+/// the form used to ship -- a 19-point `Edit login` heading above the pane --
+/// was a second title arguing with the record's own name, which is the report
+/// this replaces.
+///
+/// Painted over the tile rather than allocated beside it, so it costs the
+/// band no width: the tile is 40 points and the badge hangs off its corner
+/// the way §8a's `right: -6px; bottom: -6px` does.
+pub fn edit_badge(painter: &egui::Painter, tile: Rect) {
+    let center = Pos2::new(
+        tile.right() - EDIT_BADGE / 2.0 + EDIT_BADGE_OVERHANG,
+        tile.bottom() - EDIT_BADGE / 2.0 + EDIT_BADGE_OVERHANG,
+    );
+    painter.circle(center, EDIT_BADGE / 2.0, CARD, Stroke::new(1.0, BORDER_STRONG));
+    // The pencil at §8a's own `width: 10`, inside an 18-point disc.
+    paint_pencil_scaled(
+        painter,
+        Rect::from_center_size(center, Vec2::splat(EDIT_BADGE_GLYPH)),
+        TEXT_MUTED,
+        EDIT_BADGE_GLYPH / PENCIL_DRAWN_SIZE,
+    );
+}
+
+/// The edit badge's disc: §8a's `width: 18px; height: 18px`.
+pub const EDIT_BADGE: f32 = 18.0;
+
+/// How far the badge hangs off the tile's corner: §8a's `right: -6px;
+/// bottom: -6px`.
+const EDIT_BADGE_OVERHANG: f32 = 6.0;
+
+/// The pencil inside the disc: §8a's `<svg width="10" height="10">`.
+const EDIT_BADGE_GLYPH: f32 = 10.0;
+
+/// The size [`paint_pencil`] draws at when it is not scaled -- the height of
+/// its own bounding box, which is what [`EDIT_BADGE_GLYPH`] is a fraction
+/// OF. Written out because the shape's points are literals inside that
+/// function and a caller cannot ask it.
+const PENCIL_DRAWN_SIZE: f32 = 13.0;
 
 /// A small folder outline, painted inline in a run of text: a tab on the
 /// left, a shoulder, and the body under it.
@@ -5350,6 +5423,44 @@ pub fn text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
     field_box(ui, value, FieldShape { password, ..FieldShape::wide(ui) }).0
 }
 
+/// §8a's item-name box: the record's own name, set as the heading it is.
+///
+/// `font-size: 20px; font-weight: 800` inside the design's ordinary field, at
+/// [`TITLE_FIELD_WIDTH`] and no wider. It is the ONE field on the edit form
+/// whose content is the subject of the screen rather than a property of it,
+/// and §8a marks that by size alone -- the box, the border and the focus halo
+/// are the same ones every other row draws, so a name being edited still
+/// reads as a field and not as a title someone has drawn a line under.
+///
+/// The ExtraBold cut, not [`BOLD`]: `800` is what §8a asks for, it is what the
+/// read pane's own title is set in (`detail::title_text`), and the two panes
+/// show the same name one keystroke apart -- a name that changed WEIGHT when
+/// the form opened would read as a different name.
+pub fn title_field(ui: &mut Ui, value: &mut String) -> Response {
+    field_box(
+        ui,
+        value,
+        FieldShape {
+            width: ui.available_width().min(TITLE_FIELD_WIDTH),
+            font: FontId::new(TITLE_FIELD_PX, FontFamily::Name(EXTRABOLD.into())),
+            ..FieldShape::wide(ui)
+        },
+    )
+    .0
+}
+
+/// The type size in [`title_field`]: §8a's `font-size: 20px`.
+pub const TITLE_FIELD_PX: f32 = 20.0;
+
+/// The widest [`title_field`] gets: §8a's own `max-width: 480px`.
+///
+/// A cap rather than the full line, because the band it sits in is as wide as
+/// the window and a name box running to the far edge of a 1240-point pane
+/// would be a text field the length of a sentence for a value that is three
+/// words. Below the cap it takes what it is given, so the narrow pane loses
+/// nothing.
+pub const TITLE_FIELD_WIDTH: f32 = 480.0;
+
 /// [`text_field`] **with a placeholder in it**.
 ///
 /// It exists because the two Send composers needed one and there was none, so
@@ -5393,7 +5504,14 @@ pub fn inline_field(
     field_box(
         ui,
         value,
-        FieldShape { hint, password, width, height: BUTTON_HEIGHT, right_pad: 10.0 },
+        FieldShape {
+            hint,
+            password,
+            width,
+            height: BUTTON_HEIGHT,
+            right_pad: 10.0,
+            font: FontId::new(14.0, FontFamily::Proportional),
+        },
     )
     .0
 }
@@ -5650,6 +5768,13 @@ struct FieldShape<'a> {
     height: f32,
     /// How much room to leave at the right for an in-field affordance.
     right_pad: f32,
+    /// The type size the box sets what is typed in it.
+    ///
+    /// A field rather than the 14 every box used to hardcode, because
+    /// [`title_field`] is a box whose CONTENT is a heading -- §8a's item name
+    /// at `font-size: 20px` -- and a 38-point box holding 14-point text is
+    /// what made the edit form's name row read as one more setting.
+    font: FontId,
 }
 
 impl<'a> FieldShape<'a> {
@@ -5662,6 +5787,7 @@ impl<'a> FieldShape<'a> {
             width: ui.available_width(),
             height: FIELD_HEIGHT,
             right_pad: 10.0,
+            font: FontId::new(14.0, FontFamily::Proportional),
         }
     }
 }
@@ -5687,7 +5813,7 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
     // The TextEdit gets a rect of exactly its row height, centered in the
     // box: handing it the full box height leaves its text sitting at the
     // top instead of vertically centered.
-    let font = FontId::new(14.0, FontFamily::Proportional);
+    let font = shape.font.clone();
     let row_height = ui.ctx().fonts_mut(|f| f.row_height(&font));
     // Nudged down by the descent gap: a row box is ascent+descent tall, but
     // typical field text (no descenders on most characters) fills only the
@@ -6208,9 +6334,19 @@ pub fn section_card_header(ui: &mut Ui, title: &str, note: &str, changed: bool) 
         .inner_margin(Margin::symmetric(SECTION_CARD_PAD_X, SECTION_CARD_HEADER_PAD_Y))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                // **Uppercased here rather than stored uppercased.** §8a's
+                // band declares `text-transform: uppercase` over titles
+                // written in sentence case, and the RAIL beside it prints the
+                // same strings untransformed -- `Item`, `One-time code`. So
+                // the capitals belong to this band and to nothing else, which
+                // is exactly what a render-time transform says and what an
+                // uppercase constant would not. It also puts these titles back
+                // in register with the READ pane's cards, whose headings are
+                // `LOGIN CREDENTIALS` and `AUTOFILL TARGETS`: the two panes
+                // are one click apart and were reading as two applications.
                 let title_rect = ui
                     .label(letterspaced(
-                        title,
+                        &title.to_uppercase(),
                         SECTION_TITLE_PX,
                         BOLD,
                         SECTION_TITLE_TRACKING,
