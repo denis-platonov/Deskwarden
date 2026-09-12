@@ -1230,6 +1230,47 @@ pub fn palette_shortcut(index: usize, rows: usize) -> Option<String> {
     palette_for_digit(index as u32 + 1, rows).map(|at| format!("{}", at + 1))
 }
 
+/// The chord shown on -- and accepted by -- the `index`th **search result**.
+///
+/// The owner: "Also within search show 1,2,3 shortcuts for found items, so
+/// user can continue using those instead of arrow down+Enter". Search was the
+/// one step of this card with no numbers on it, and the reason was good: it
+/// has a focused `EDIT`, and a bare `3` on the third result would have to
+/// fire instead of typing a `3` into the box somebody is searching with.
+///
+/// **So the digit is not bare here, and only here.** `CTRL` is held with it.
+/// That is the one modifier this card may use over that box:
+/// `CTRL+ALT` is `AltGr` on German, Polish and Portuguese layouts, so
+/// `CTRL+ALT+2` is the character `@` -- untypable while searching for an
+/// account by email, which is the reason the whole card left that chord
+/// behind and the reason it must not come back. `ALT` alone opens menus.
+/// `CTRL+<digit>` types nothing in an `EDIT` on any layout.
+///
+/// `None` past what is on screen, which is [`row_shortcut`]'s rule and
+/// [`palette_shortcut`]'s: a chip the card cannot honour is worse than no
+/// chip, and this list is as long as the last keystroke left it.
+pub fn search_shortcut(index: usize, shown: usize) -> Option<String> {
+    search_for_digit(index as u32 + 1, shown).map(|at| format!("CTRL+{}", at + 1))
+}
+
+/// **Which search result a digit chooses**, given how many are on screen.
+///
+/// [`palette_for_digit`]'s twin and written the same way, for the same
+/// reason: one rule, read by the window's key handling and by the chip the
+/// row draws, so the chord a row advertises and the chord that fires cannot
+/// become two answers.
+///
+/// Nine at most, because there are nine digits -- a tenth result is reachable
+/// by Up/Down and Enter, which never stopped working and which this does not
+/// replace.
+pub fn search_for_digit(digit: u32, shown: usize) -> Option<usize> {
+    if !(1..=9).contains(&digit) {
+        return None;
+    }
+    let at = digit as usize - 1;
+    (at < shown).then_some(at)
+}
+
 /// **Which second-step row a digit chooses**, given how many are on screen.
 ///
 /// [`candidate_for_digit`]'s twin, and deliberately written the same way: one
@@ -2115,6 +2156,31 @@ mod win32 {
         }
     }
 
+    /// Whether CTRL is held right now.
+    ///
+    /// `GetKeyState` and not a tracked flag: this window's pump sees
+    /// `WM_KEYDOWN` for the digit, and the modifier's own down-event went to
+    /// whatever had focus when it was pressed. The high bit is "down", which
+    /// is the documented reading of the return value.
+    ///
+    /// Read only in search mode -- see [`search_key`] -- because that is the
+    /// one step whose digits are characters.
+    fn ctrl_down() -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+        unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
+    }
+
+    /// The digit a virtual-key code is, or `None`.
+    ///
+    /// The number row's codes are its ASCII values, which is what makes the
+    /// comparison honest -- the same reading [`shortcut`] does for the bare
+    /// keys, written once so the two cannot disagree about what a `3` is.
+    fn digit_of(vk: u16) -> Option<u32> {
+        const DIGIT_1: u16 = b'1' as u16;
+        const DIGIT_9: u16 = b'9' as u16;
+        (DIGIT_1..=DIGIT_9).contains(&vk).then(|| (vk - DIGIT_1 + 1) as u32)
+    }
+
     /// **What a bare key does**, answering whether it was one of ours.
     ///
     /// **Never called in search mode** -- `next` gates it on `!in_search()` --
@@ -2199,6 +2265,20 @@ mod win32 {
     fn search_key(vk: u16, window: HWND) -> bool {
         use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_RETURN, VK_UP};
         let shown = SEARCH_SHOWN.lock().map(|s| s.len()).unwrap_or(0);
+        // **CTRL and a digit picks a result outright.** The chip on the row
+        // says so -- `super::search_shortcut` is the one rule both read, so
+        // the chord a row advertises and the chord that fires cannot differ.
+        //
+        // Read here rather than through `IsDialogMessageW` for the reason
+        // every key on this card is: the `EDIT` has focus, and a digit that
+        // reached it would be typed into the search rather than acted on.
+        // Only with CTRL down -- a bare digit still belongs to the box.
+        if ctrl_down() {
+            if let Some(at) = digit_of(vk).and_then(|d| super::search_for_digit(d, shown)) {
+                clicked(ID_ROW + at);
+                return true;
+            }
+        }
         if vk == VK_DOWN.0 || vk == VK_UP.0 {
             let current = SEARCH_SEL.load(Ordering::SeqCst).max(0) as usize;
             if let Some(next) = super::moved_selection(current, shown, vk == VK_DOWN.0) {
@@ -3225,12 +3305,17 @@ mod win32 {
             match row {
                 SearchRow::Result(at) => {
                     let Some(candidate) = shown.get(at) else { return };
-                    // **No chip, and the highlight comes from `SEARCH_SEL`
-                    // rather than from focus.** Bare keys type here -- see
-                    // `search_key` -- so a `3` on the third result would
-                    // promise something that must never fire over a text box.
-                    // What chooses a result is Up/Down and Enter, and the
-                    // highlight is how the card says which one that is; focus
+                    // **A CTRL chip, and the highlight comes from `SEARCH_SEL`
+                    // rather than from focus.** A BARE `3` on the third result
+                    // would promise something that must never fire over a text
+                    // box somebody is typing a search into -- which is why this
+                    // row carried no chip at all until the owner asked for one.
+                    // `CTRL+3` types nothing in an `EDIT` on any layout, and is
+                    // the one modifier left after `CTRL+ALT` was retired for
+                    // being `AltGr`. See `search_shortcut`.
+                    //
+                    // Up/Down and Enter are untouched, and the highlight is
+                    // still how the card says which result they are on; focus
                     // cannot say it, because focus is in the `EDIT`.
                     let state = RowState {
                         // Focus still counts: Tab can take the keyboard out of
@@ -3241,7 +3326,9 @@ mod win32 {
                             || SEARCH_SEL.load(Ordering::SeqCst) == at as isize,
                         hovered: state.hovered,
                     };
-                    draw_row(hdc, rect, candidate, state, fonts.name, fonts.username, None, dpi);
+                    let shortcut = super::search_shortcut(at, shown.len());
+                    let hint = shortcut.as_deref().map(|text| (text, fonts.hint));
+                    draw_row(hdc, rect, candidate, state, fonts.name, fonts.username, hint, dpi);
                 }
                 // **No chip on either.** Neither is an account, and a number on
                 // one would be a trap -- the same rule the *Search the vault*
@@ -4747,6 +4834,65 @@ mod tests {
             NEW_LOGIN_SHORTCUT, SEARCH_SHORTCUT,
             "the two letter keys are the same letter, so one of the two offers is unreachable"
         );
+    }
+
+    /// **The search results say which chord runs them, and it is never a bare
+    /// digit.**
+    ///
+    /// The owner: "Also within search show 1,2,3 shortcuts for found items, so
+    /// user can continue using those instead of arrow down+Enter". Search was
+    /// the one step with no numbers on it, and for a good reason -- it has a
+    /// focused `EDIT`, and a bare `3` would have to fire instead of being
+    /// typed by somebody searching for `1Password`.
+    ///
+    /// So both halves are asserted: the chip carries CTRL, and the rule the
+    /// chip is built from is the rule the pump answers. A chip that promised
+    /// a bare digit would be the defect this card has already shipped twice
+    /// -- a key drawn and dead, or a key that fires and should not.
+    #[test]
+    fn the_search_results_are_numbered_and_the_number_is_never_bare() {
+        // Every chip on a five-result list, and every one of them modified.
+        let chips: Vec<String> =
+            (0..5).map(|i| search_shortcut(i, 5).expect("numbered")).collect();
+        assert_eq!(chips, ["CTRL+1", "CTRL+2", "CTRL+3", "CTRL+4", "CTRL+5"]);
+        for chip in &chips {
+            assert!(
+                chip.starts_with("CTRL+"),
+                "{chip:?} is a bare key over a focused text box"
+            );
+        }
+
+        // **Never CTRL+ALT**, which is `AltGr` on German, Polish and
+        // Portuguese layouts -- `CTRL+ALT+2` is `@`, untypable while searching
+        // for an account by email. That is why the whole card left that chord
+        // behind, and this is what keeps it from coming back over the one box
+        // where it would hurt most.
+        for chip in &chips {
+            assert!(!chip.contains("ALT"), "{chip:?} is AltGr on three keyboard layouts");
+        }
+
+        // The chip and the key are one rule: the chord row N advertises picks
+        // row N and nothing else.
+        for (index, chip) in chips.iter().enumerate() {
+            let digit: u32 = chip.trim_start_matches("CTRL+").parse().expect("a digit");
+            assert_eq!(
+                search_for_digit(digit, 5),
+                Some(index),
+                "{chip:?} is drawn on row {index} and picks a different one"
+            );
+        }
+
+        // Past the end, nothing is drawn and nothing fires -- the rule
+        // `row_shortcut` and `palette_shortcut` both hold, for the same
+        // reason: a chip the card cannot honour is worse than no chip.
+        assert_eq!(search_shortcut(5, 5), None);
+        assert_eq!(search_for_digit(6, 5), None);
+        assert_eq!(search_for_digit(1, 0), None, "a digit fired on an empty result list");
+
+        // Nine at most, because there are nine digits. A tenth result is
+        // still reachable by Up/Down and Enter, which this does not replace.
+        assert_eq!(search_for_digit(9, 20), Some(8));
+        assert_eq!(search_shortcut(9, 20), None, "a tenth chip promises a key there is not");
     }
 
     /// **The second step's rows say which key runs them, and the key that
