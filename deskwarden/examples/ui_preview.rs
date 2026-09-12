@@ -21,6 +21,7 @@
 //! cargo run --example ui_preview -- --vault --screenshot        # the Vault page, both clients
 //! cargo run --example ui_preview -- --sends --screenshot        # design 5b's Sends screen, six states
 //! cargo run --example ui_preview -- --totp --screenshot         # designs 6a/6c/6d, the add-a-code card, seven states
+//! cargo run --example ui_preview -- --edit --screenshot         # design 8a's Edit login form, five states
 //! cargo run --example ui_preview -- --all                 # EVERY surface below
 //! ```
 //!
@@ -43,6 +44,17 @@
 //! and the whole card at the app's minimum window size. A directory for
 //! `--sends`' reason: the line under the field is only reviewable beside the
 //! states either side of it.
+//!
+//! `--edit` writes five PNGs into `target/ui_preview_edit/`, and it exists for
+//! `--totp`'s reason one step on: the **Edit login form** -- design 8a -- had
+//! no surface here at all. Two shots of individual BLOCKS of it did
+//! (`edit_websites`, `edit_sparse`), each drawn at a height chosen so its own
+//! block cleared the fold, and neither was a picture of the form. The owner
+//! screenshotted the whole pane, said "not as per design", and there was
+//! nothing in this directory a reviewer could have laid beside 8a to see what
+//! they meant. The five are the form as it opens, the same form with edits in
+//! it (the dirty state 8a is mostly about), the form at the pane's width at
+//! `settings::MIN_VAULT_WINDOW_SIZE`, and the two block shots.
 //!
 //! `--all` is what CI runs. It walks [`Surface`] in one process -- one
 //! `run_native`, resized between surfaces -- and writes a PNG per surface into
@@ -218,6 +230,32 @@ enum Surface {
     CardDetailRevealed,
     /// The edit form with the discard confirmation over it.
     DiscardConfirm,
+    /// **Design 8a's own subject: the Edit login form, as it opens.**
+    ///
+    /// The surface this file did not have. `EditWebsites` and `EditSparse`
+    /// below each exist to show ONE block of this form, at a height chosen so
+    /// that block is not below the fold -- neither of them is a picture of the
+    /// form, and neither is drawn at a height the app ships. The owner
+    /// screenshotted the whole pane and said "not as per design"; there was no
+    /// rendered surface a reviewer could have put beside 8a to see what they
+    /// meant.
+    ///
+    /// Untouched, because the report was about the form as it OPENS.
+    EditLogin,
+    /// **The same form with edits in it**, which is the half 8a is mostly
+    /// about: the `Unsaved changes` state, the per-section `Changed` marks and
+    /// the footer's change count only exist on a dirty draft, so a shot of a
+    /// pristine form shows none of the design's dirty state.
+    EditLoginDirty,
+    /// **The same form at the pane's width at `MIN_VAULT_WINDOW_SIZE`**, which
+    /// is [`EDIT_NARROW_WIDTH`] -- 298 points, not 638.
+    ///
+    /// Every card, every two-column split and every footer row on this form
+    /// has to survive that width, and 8a is drawn at a 1240-point window where
+    /// nothing has to. The `--sends` set learned this the expensive way and
+    /// carries `SendsNarrow` for it; this is the same shot for the same
+    /// reason.
+    EditLoginNarrow,
     /// **The edit form's websites block, with three of them on it.**
     ///
     /// A surface of its own because the block's whole shape is the thing a
@@ -705,6 +743,21 @@ const SIDEBAR_WIDTH: f32 = 212.0;
 /// surface rather than the top of it. The shipped window is 740 high.
 const PANE_HEIGHT: f32 = 740.0;
 
+/// The detail pane's width at `settings::MIN_VAULT_WINDOW_SIZE`, which is
+/// `(900, 600)`: `900 - 212 - 390 = 298`.
+///
+/// **The number design 8a never has to survive.** 8a is drawn on a 1240-point
+/// window whose rail and card grid have 1028 points between them; the edit
+/// form as this app actually ships it gets 298 at the floor, and every card,
+/// every two-column split and every footer row on it has to hold there. The
+/// `--sends` set carries `SENDS_NARROW_WIDTH` for exactly this and found real
+/// defects with it; this is the same measurement for the same reason.
+const EDIT_NARROW_WIDTH: f32 = 900.0 - 212.0 - 390.0;
+
+/// The window floor's own height, i.e. `MIN_VAULT_WINDOW_SIZE.1`. The pane
+/// gets all of it -- the vault window's chrome is drawn inside the viewport.
+const EDIT_NARROW_HEIGHT: f32 = 600.0;
+
 /// The Sends screen's own width: the whole window less the rail.
 ///
 /// **The pane, not the detail column.** `send_ui::draw_send_pane` puts its
@@ -754,6 +807,9 @@ const ALL: &[Surface] = &[
     Surface::CardDetail,
     Surface::CardDetailRevealed,
     Surface::DiscardConfirm,
+    Surface::EditLogin,
+    Surface::EditLoginDirty,
+    Surface::EditLoginNarrow,
     Surface::EditWebsites,
     Surface::EditSparse,
     Surface::EditSparseAdding,
@@ -830,6 +886,9 @@ impl Surface {
             Surface::CardDetail => "detail_card",
             Surface::CardDetailRevealed => "detail_card_revealed",
             Surface::DiscardConfirm => "edit_discard_confirm",
+            Surface::EditLogin => "edit_login",
+            Surface::EditLoginDirty => "edit_login_dirty",
+            Surface::EditLoginNarrow => "edit_login_narrow",
             Surface::EditWebsites => "edit_websites",
             Surface::EditSparse => "edit_sparse",
             Surface::EditSparseAdding => "edit_sparse_adding",
@@ -951,6 +1010,16 @@ impl Surface {
             // for a screenshot: the block this surface exists to show would
             // be below the fold in the PNG. The width is the real one, which
             // is the axis a layout can get wrong.
+            // **The shipped pane, to the point, and nothing taller.** This is
+            // the surface the owner's own screenshot is of, so the one thing
+            // it must not do is show more of the form than the app does: a
+            // preview stretched until everything fits answers "does it all
+            // fit" with a yes the user never sees. What falls below the fold
+            // here falls below the fold there.
+            Surface::EditLogin | Surface::EditLoginDirty => {
+                egui::vec2(PANE_WIDTH, PANE_HEIGHT)
+            }
+            Surface::EditLoginNarrow => egui::vec2(EDIT_NARROW_WIDTH, EDIT_NARROW_HEIGHT),
             Surface::EditWebsites => egui::vec2(PANE_WIDTH, 1180.0),
             // The shipped pane's own size, and that is the point of these
             // two: a sparse identity FITS it, which the eighteen-row form it
@@ -1112,6 +1181,17 @@ fn main() -> eframe::Result {
     // is a refusal in one shot and an acceptance in the next, and whether it
     // sits where the design puts it is a question about the pair.
     let totp = arg("--totp");
+    // **Design 8a's Edit login form**, which had no flag of its own until this
+    // one and could only be looked at by running the app and clicking Edit.
+    // The owner screenshotted it and said "not as per design"; there was no
+    // rendered picture to put beside 8a.
+    //
+    // Five states rather than one, for `--sends`' reason: pristine, dirty, at
+    // the window floor, the websites block, and the sparse form. What is under
+    // review is the SET -- the dirty state only exists on one of them, the
+    // floor is where the grid has to survive, and the two block shots are the
+    // parts of the form a one-shot picture crops.
+    let edit = arg("--edit");
 
     // `--all` walks the whole list; otherwise the single surface the flags
     // name, exactly as this example has always behaved.
@@ -1144,6 +1224,17 @@ fn main() -> eframe::Result {
             Surface::SendsReceived,
             Surface::SendsNarrow,
             Surface::SendsComposerNarrow,
+        ]
+    } else if edit {
+        // Pristine first, because that is the picture the report was about;
+        // then the dirty state beside it, then the floor, then the two blocks
+        // a single shot of a 740-point pane cannot hold.
+        vec![
+            Surface::EditLogin,
+            Surface::EditLoginDirty,
+            Surface::EditLoginNarrow,
+            Surface::EditWebsites,
+            Surface::EditSparse,
         ]
     } else if totp {
         // 6a first, because it is the door; then 6d in the three states of
@@ -1218,6 +1309,9 @@ fn main() -> eframe::Result {
         // renders six states of one screen and the whole value of it is that
         // they can be laid out together.
         target_dir().join("ui_preview_sends")
+    } else if edit {
+        // A DIRECTORY, for the same reason: five states of one form.
+        target_dir().join("ui_preview_edit")
     } else if totp {
         // A DIRECTORY, for the same reason: seven states of one card.
         target_dir().join("ui_preview_totp")
@@ -1235,7 +1329,7 @@ fn main() -> eframe::Result {
             Ok(Box::new(Preview {
                 queue,
                 at: 0,
-                directory: all || vault || kinds || sends || totp,
+                directory: all || vault || kinds || sends || totp || edit,
                 out,
                 form: LoginForm::default(),
                 // The app name a real 3c card would have been pre-filled with,
@@ -1506,6 +1600,10 @@ impl eframe::App for Preview {
                 self.draw_pane(root, PaneKind::Detail(DetailShot::CardRevealed))
             }
             Surface::DiscardConfirm => self.draw_pane(root, PaneKind::Discard),
+            Surface::EditLogin | Surface::EditLoginNarrow => {
+                self.draw_pane(root, PaneKind::EditLogin(false))
+            }
+            Surface::EditLoginDirty => self.draw_pane(root, PaneKind::EditLogin(true)),
             Surface::EditWebsites => self.draw_pane(root, PaneKind::EditWebsites),
             Surface::EditSparse => self.draw_pane(root, PaneKind::EditSparse(false)),
             Surface::EditSparseAdding => self.draw_pane(root, PaneKind::EditSparse(true)),
@@ -1618,6 +1716,11 @@ enum PaneKind {
     Detail(DetailShot),
     /// The edit form with its discard confirmation up.
     Discard,
+    /// Design 8a's subject: the Edit login form, pristine (`false`) or with
+    /// edits in it (`true`). **Two fixtures, never one re-typed** -- see
+    /// `PaneKind::TotpForm`'s note, and the `--all` walk that shares one
+    /// `Fixtures`.
+    EditLogin(bool),
     /// The edit form of a login carrying several websites.
     EditWebsites,
     /// The edit form of a sparse identity, with the Add menu open or shut.
@@ -2660,6 +2763,22 @@ impl Preview {
                     // take the dialog away before the capture.
                     fixtures.draft.discard_prompt = true;
                 }
+                PaneKind::EditLogin(dirty) => {
+                    let draft = if dirty {
+                        &mut fixtures.dirty_draft
+                    } else {
+                        &mut fixtures.clean_draft
+                    };
+                    let _ = detail_edit::draw_detail_edit(
+                        ui,
+                        draft,
+                        &fixtures.folders,
+                        false,
+                        &mut fixtures.apps,
+                        Some(&fixtures.edit_login),
+                        &fixtures.totp,
+                    );
+                }
                 PaneKind::EditWebsites => {
                     let _ = detail_edit::draw_detail_edit(
                         ui,
@@ -2745,6 +2864,16 @@ struct Fixtures {
     apps: AppIdentityCache,
     breaches: BreachCache,
     draft: EditDraft,
+    /// The login fixture opened for editing and NOT touched -- design 8a's
+    /// subject as it opens. See [`Surface::EditLogin`].
+    clean_draft: EditDraft,
+    /// The same draft with two edits in it, so the dirty state has something
+    /// to report. See [`Surface::EditLoginDirty`].
+    dirty_draft: EditDraft,
+    /// The item behind [`Self::clean_draft`] and [`Self::dirty_draft`], kept
+    /// because `draw_detail_edit` takes the item as well as the draft -- the
+    /// keystroke palette and its preview are resolved against it.
+    edit_login: VaultItem,
     /// The item behind [`Self::websites_draft`], kept because
     /// `draw_detail_edit` takes the item as well as the draft.
     websites_login: VaultItem,
@@ -2810,6 +2939,45 @@ impl Fixtures {
         // app does not reach.
         draft.password.push_str("-edited");
         draft.discard_prompt = true;
+
+        // **Design 8a's own two shots.** Two drafts off one item, never one
+        // re-typed between surfaces: the `--all` walk shares a single
+        // `Fixtures`, so a draft dirtied for the dirty shot would decide
+        // whichever surface ran next. The trap `PaneKind::TotpForm`'s comment
+        // records.
+        let edit_login = item(EDIT_LOGIN_JSON);
+        let clean_draft = EditDraft::from_item(&edit_login);
+        // The premise of the whole set: the card grid has something in every
+        // card. A fixture that lost its binding or its fields would render a
+        // form of empty states and look like a layout regression.
+        assert!(
+            clean_draft.app.is_some(),
+            "the 8a fixture carries no app binding, so the autofill card is a picture of an \
+             empty state"
+        );
+        // By NAME, not by count: the binding above rides on a
+        // `deskwarden:app-match` field of its own, which the draft carries and
+        // the form does not draw, so a length check here would be a check on
+        // an internal convention rather than on what is in the picture.
+        for named in ["Client ID", "Security PIN"] {
+            assert!(
+                clean_draft.fields.iter().any(|f| f.name == named),
+                "the 8a fixture lost its {named:?} field, so the custom-fields card is a \
+                 picture of an empty state"
+            );
+        }
+        let mut dirty_draft = EditDraft::from_item(&edit_login);
+        // Exactly 8a's own two changes -- "Password / Native app added" on its
+        // rail, "2 changes" in its footer -- so the picture beside the design
+        // is a picture of the same edit.
+        dirty_draft.password = "tq7Rvk29mzpLx4-hd8".to_string();
+        if let Some(app) = dirty_draft.app.as_mut() {
+            app.process = "LedgerlineSync.exe".to_string();
+        }
+        assert!(
+            dirty_draft.is_dirty(),
+            "the dirty shot's draft reads clean, so it is a second picture of the pristine form"
+        );
         // The same account reached three ways, which is the ordinary shape of
         // a multi-URI login and not a contrived one: the app, the SSO host it
         // redirects to, and the Android package. Untouched, so the shot is of
@@ -3003,6 +3171,9 @@ impl Fixtures {
             totp_scanned,
             totp_narrow,
             draft,
+            edit_login,
+            clean_draft,
+            dirty_draft,
             websites_login,
             websites_draft,
             sparse_identity,
@@ -3378,6 +3549,41 @@ const LOGIN_JSON: &str = r#"{
     "uris": [{ "uri": "https://app.ledgerline.eu/signin" }]
   },
   "fields": [{ "name": "Employee ID", "value": "LL-40912", "type": 0 }]
+}"#;
+
+/// **Design 8a's Ledgerline, as far as this app can model it.**
+///
+/// A login with a username, a password, a one-time code, a website, a bound
+/// native app and two custom fields -- so every card on the redrawn form has
+/// something in it and none of them is a picture of an empty state. 8a's own
+/// record is this one: the design's `ledgerline.exe` target is here, its
+/// `Client ID` and `Security PIN` fields are here.
+///
+/// **Its own fixture rather than a field added to [`LOGIN_JSON`]**, because
+/// that one is the READ pane's subject in three shots and a binding added to
+/// it would silently redraw all three.
+///
+/// 8a's other two native targets are deliberately absent: `AppMatchDraft`
+/// models exactly one app per record, in a single JSON field, and a fixture
+/// carrying three would be a picture of a feature that does not exist.
+const EDIT_LOGIN_JSON: &str = r#"{
+  "id": "6f1c2f5e-0000-4a10-9c31-2b7a51d0a002",
+  "type": 1,
+  "name": "Ledgerline",
+  "folderId": "f-work",
+  "favorite": true,
+  "notes": "Workspace SSO is disabled for the desktop client - use the direct login. Recovery codes live in the Engineering secure note.",
+  "login": {
+    "username": "a.novak@ledgerline.com",
+    "password": "correct-horse-battery-staple-7",
+    "totp": "otpauth://totp/Ledgerline:a.novak?secret=JBSWY3DPEHPK3PXP&issuer=Ledgerline",
+    "uris": [{ "uri": "https://app.ledgerline.com" }]
+  },
+  "fields": [
+    { "name": "Client ID", "value": "LGL-4471", "type": 0 },
+    { "name": "Security PIN", "value": "419077", "type": 1 },
+    { "name": "deskwarden:app-match", "value": "{\"process\":\"ledgerline.exe\",\"trigger\":\"auto\"}", "type": 0 }
+  ]
 }"#;
 
 /// A login reached at three addresses, each entry carrying a `match` key this

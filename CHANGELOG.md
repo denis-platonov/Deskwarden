@@ -15,6 +15,72 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### The Edit login form is design 8a's card grid
+
+The owner screenshotted the Edit login form and said "not as per design". They
+were right: it was a single stacked column -- Name, Username, Password, a
+generator row, Website, Remove website, Add a website, a match note, Note,
+Add..., Custom fields, Matched app, Folder -- running flat down the pane inside
+one white box, with nothing on screen saying where one subject ended and the
+next began.
+
+It had never been looked at, either. `examples/ui_preview.rs` can render and
+self-screenshot the vault, the item list, the rail, the health screen, the
+Sends screen and the add-a-code card; it had two shots of individual *blocks*
+of this form, each drawn at a height chosen so its own block cleared the fold,
+and no picture of the form. There is a flag now: `cargo run --example
+ui_preview -- --edit` writes five states into `target/ui_preview_edit/` --
+the form as it opens, the same form with edits in it, the form at the width
+the detail pane has at the smallest window the app allows, and the two block
+shots.
+
+What the picture showed, and what changed:
+
+* **The form is a grid of titled cards.** Design 8a draws nine; this draws the
+  seven there is data for -- `Item`, `Login credentials` (or the kind's own
+  name), `One-time code`, `Autofill targets`, `Fill rule`, `Custom fields`,
+  `Notes` -- each a white card edged in the design's hairline with its name in
+  a title band. A user looking for where a login is *offered* now has a word
+  to look for.
+* **There is a section rail.** 8a's left column, at the vault window's own
+  sidebar width, listing the cards with a count beside the ones that have one
+  and a dot beside the ones that have unsaved changes. Clicking an entry
+  scrolls that card into view; it does not filter, because Save commits the
+  whole draft and a form that hid a card would be a button that writes what
+  the user cannot see. The rail stands down on a narrow pane, where 212 points
+  of it would leave 86 points of card.
+* **The form knows which field changed, not just that something did.** The
+  draft's dirtiness was one digest over the whole form answering yes or no.
+  It is now a digest per field, folded back into that one number so the two
+  cannot disagree -- so the title bar can carry 8a's `Unsaved changes` pill,
+  each card can carry a `Changed` mark, the rail can list the fields by name,
+  and the footer can say `2 changes - password will be added to history`.
+  That last clause appears only when the password really moved and there is an
+  old value to file.
+* **Saving has a footer instead of two loose buttons.** `Save changes` and
+  `Cancel` now sit in a white band opened by a hairline, with the change
+  summary beside them and `Syncs to Bitwarden on save` pushed to the right --
+  8a's sticky footer. The band keeps one height whether or not anything has
+  been edited, because it is a bottom panel and a footer that grew as you
+  typed would move the form above it.
+* **The password box says how strong the password is.** Four bars and a word,
+  as 8a draws them. The read pane has rated passwords for a long time; the one
+  screen where a user can do something about a weak one was the screen that
+  would not say it was weak -- with a generator sitting directly under the
+  silence.
+* **A website costs one row instead of three.** Its Remove is a chip beside
+  the caption rather than a button on a line of its own, which is the idiom
+  every other optional row on this form already used.
+
+Deliberately not built, for want of data rather than layout: 8a's `Sharing`
+card (nothing links a vault item to a Send), its `History` card's
+`Filled 41 times - last 2 h ago in ledgerline.exe` (only the count is
+recorded), its second and third native-app targets (one binding per record is
+modelled), and its `On field focus`, `Require Windows Hello` and `Show
+preflight` controls, which would write settings nothing reads. 8a's `Ctrl+S`,
+`Ctrl+G` and `Esc` hints are not drawn either: none of the three is bound, and
+`Ctrl+S` belongs to Send-a-record.
+
 ### The Sends screen wears the design system
 
 Design 5b's caption for this screen is *SAME LIST + DETAIL AS THE VAULT*, and

@@ -9272,6 +9272,16 @@ mod tests {
     /// expectation from the very value they were checking.
     const PANE: f32 = 900.0;
 
+    /// A pane tall enough that egui culls nothing out of the EDIT form.
+    ///
+    /// Only one test here renders that form -- the one that checks the app
+    /// control still exists there -- and design 8a's card grid made it about
+    /// 1300 points of content on a login. egui paints no shape at all outside
+    /// the screen rect, so a pane shorter than the form turns "this control is
+    /// below the fold" into "this control does not exist", which is the exact
+    /// claim that test is making. Used for height alone.
+    const UNCULLED: f32 = 2400.0;
+
     /// One frame of `draw_detail_read`, as the filled rectangles it painted.
     ///
     /// The counterpart to [`painted_text`]: the pane surface, the header
@@ -13806,10 +13816,18 @@ mod tests {
     fn the_edit_form_offers_the_app_control_even_with_nothing_bound() {
         use crate::vault_window::detail_edit;
         let ctx = egui::Context::default();
+        // **Tall enough that nothing is culled**, which the square pane no
+        // longer is: design 8a turned the edit form into a grid of titled
+        // cards, and the matched-app block now sits on the fifth of them. egui
+        // paints nothing at all for a shape outside the screen rect, so a
+        // short pane would report an absence that is really a scroll position
+        // -- and this test's whole subject is whether the CONTROL still
+        // exists. Height only; the width is the real pane's, because that is
+        // the axis a layout can get wrong.
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(PANE, PANE),
+                egui::vec2(PANE, UNCULLED),
             )),
             ..Default::default()
         };

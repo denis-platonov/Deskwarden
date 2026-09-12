@@ -7,6 +7,7 @@ use crate::app_identity::{self, AppIdentityCache};
 use crate::app_match::{AppMatch, TriggerMode};
 use crate::card_brand::{brand_for_number, CARD_BRANDS};
 use crate::key_sequence::{self, FieldRef, PreviewPart, ResolveSource, Token};
+use crate::password_strength;
 use crate::theme;
 use crate::vault_bridge::{
     CardData, Folder, GenerateRequest, IdentityData, ItemKind, NewItem, PassphraseRecipe,
@@ -1053,6 +1054,209 @@ pub fn app_match_edit(existing: Option<&AppMatch>, draft: Option<&AppMatchDraft>
     }
 }
 
+/// **Design 8a's card grid, as a list of sections.**
+///
+/// One variant per card the form draws, in the order it draws them. It is an
+/// enumeration rather than a list of titles because three separate things
+/// have to agree about it and disagreeing silently is what makes a form look
+/// like a pile of boxes: the card that gets drawn, the rail entry that scrolls
+/// to it, and the `Changed` mark that says something in it moved.
+///
+/// # What is NOT here, and why
+///
+/// 8a draws nine cards. This draws seven, and the two missing ones are
+/// missing for want of data rather than for want of layout:
+///
+/// * **`Sharing`.** 8a shows the Sends this record is out on and offers to
+///   revoke them. Nothing in this app links a vault item to a Send -- a
+///   `send::SendSummary` carries no item id -- so the card could only ever be
+///   drawn empty, and a card that is always empty is a promise the app does
+///   not keep.
+/// * **`History`.** 8a's row reads `Filled 41 times \u{b7} last 2 h ago in
+///   ledgerline.exe`. `fill_stats` keeps the COUNT and nothing else: no
+///   timestamp, no process. Three of that line's four facts do not exist, and
+///   the read pane already draws the one that does.
+///
+/// Both are recorded here rather than left as absences, so that the next pass
+/// finds the reason instead of rediscovering it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Section {
+    /// 8a's `Item`: what the record IS -- its name and its folder.
+    Item,
+    /// 8a's `Login credentials`, and the same card under a different name for
+    /// every other kind -- see [`Section::title`].
+    Details,
+    /// 8a's `One-time code`.
+    OneTimeCode,
+    /// 8a's `Autofill targets`: the websites and the native app this record is
+    /// offered on.
+    Autofill,
+    /// 8a's `Fill rule`: what Deskwarden types once it has matched.
+    FillRule,
+    /// 8a's `Custom fields`.
+    CustomFields,
+    /// 8a's `Notes`.
+    Notes,
+}
+
+impl Section {
+    /// Every section, in the order the form draws them and the rail lists
+    /// them.
+    pub const ALL: [Section; 7] = [
+        Section::Item,
+        Section::Details,
+        Section::OneTimeCode,
+        Section::Autofill,
+        Section::FillRule,
+        Section::CustomFields,
+        Section::Notes,
+    ];
+
+    /// The card's own title, **which depends on the kind**: 8a's `LOGIN
+    /// CREDENTIALS` names a login's username and password, and a card item's
+    /// second card holds a number and an expiry.
+    ///
+    /// One function rather than a title written at each call site, because the
+    /// rail has to print the same word the card does and a rail that said
+    /// `Login credentials` over an identity form would be furniture from
+    /// another screen.
+    pub const fn title(self, kind: ItemKind) -> &'static str {
+        match self {
+            Section::Item => "Item",
+            Section::Details => match kind {
+                ItemKind::Login => "Login credentials",
+                ItemKind::Card => "Card details",
+                ItemKind::Identity => "Identity",
+                ItemKind::SecureNote => "Note",
+                ItemKind::SshKey => "Key",
+                ItemKind::Unknown(_) => "Contents",
+            },
+            Section::OneTimeCode => "One-time code",
+            Section::Autofill => "Autofill targets",
+            Section::FillRule => "Fill rule",
+            Section::CustomFields => "Custom fields",
+            Section::Notes => "Notes",
+        }
+    }
+
+    /// The line 8a sets beside the title in the same band, or nothing.
+    ///
+    /// 8a carries one on two of its cards -- `where this login is offered`
+    /// under `Autofill targets` -- and the sentence does real work: it is the
+    /// difference between a card a user reads as "addresses" and one they read
+    /// as "when does this fire".
+    pub fn note(self) -> &'static str {
+        match self {
+            Section::Autofill => "where this login is offered",
+            Section::FillRule => "what Deskwarden types",
+            _ => "",
+        }
+    }
+}
+
+/// One field that has moved since the form opened: what to call it, and which
+/// card it belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Change {
+    /// The word 8a's rail prints under `Changed`.
+    pub label: &'static str,
+    /// The card the change happened in, for the `Changed` mark on it.
+    pub section: Section,
+}
+
+/// One independently-diffed piece of an [`EditDraft`].
+///
+/// The partition [`EditDraft::change_digests`] hashes, and therefore the
+/// granularity of everything 8a's dirty state says. Roughly one unit per row
+/// the form draws, with the per-kind bodies (a card's six boxes, an identity's
+/// eighteen) taken as one each: 8a's rail names FIELDS, and "the card's
+/// details" is as fine as a form that draws them as one block can honestly be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChangeUnit {
+    Name,
+    Folder,
+    Username,
+    Password,
+    Totp,
+    Card,
+    Identity,
+    SshKey,
+    Note,
+    App,
+    Sequence,
+    Fields,
+    Uris,
+}
+
+impl ChangeUnit {
+    /// Every unit, in the order 8a's rail would list them -- which is the
+    /// order the form draws the rows, not the order the digest computes them.
+    const ALL: [ChangeUnit; Self::COUNT] = [
+        ChangeUnit::Name,
+        ChangeUnit::Folder,
+        ChangeUnit::Username,
+        ChangeUnit::Password,
+        ChangeUnit::Card,
+        ChangeUnit::Identity,
+        ChangeUnit::SshKey,
+        ChangeUnit::Totp,
+        ChangeUnit::Uris,
+        ChangeUnit::App,
+        ChangeUnit::Sequence,
+        ChangeUnit::Fields,
+        ChangeUnit::Note,
+    ];
+
+    /// How many units there are, i.e. the length of the digest array.
+    ///
+    /// Written once and checked against [`Self::ALL`] by
+    /// `every_change_unit_is_listed_once`: a unit added to the enumeration and
+    /// not to `ALL` would be digested, would make the draft dirty, and would
+    /// never be NAMED -- a footer reading "1 change" over a rail listing none.
+    const COUNT: usize = 13;
+
+    /// The word 8a's rail prints for this unit.
+    fn label(self) -> &'static str {
+        match self {
+            ChangeUnit::Name => "Name",
+            ChangeUnit::Folder => "Folder",
+            ChangeUnit::Username => "Username",
+            ChangeUnit::Password => "Password",
+            ChangeUnit::Totp => "One-time code",
+            ChangeUnit::Card => "Card details",
+            ChangeUnit::Identity => "Identity",
+            ChangeUnit::SshKey => "Key",
+            ChangeUnit::Note => "Note",
+            ChangeUnit::App => "Matched app",
+            ChangeUnit::Sequence => "Keystrokes",
+            ChangeUnit::Fields => "Custom fields",
+            ChangeUnit::Uris => "Websites",
+        }
+    }
+
+    /// Which card this unit's row is drawn on.
+    fn section(self) -> Section {
+        match self {
+            ChangeUnit::Name | ChangeUnit::Folder => Section::Item,
+            ChangeUnit::Username
+            | ChangeUnit::Password
+            | ChangeUnit::Card
+            | ChangeUnit::Identity
+            | ChangeUnit::SshKey => Section::Details,
+            ChangeUnit::Totp => Section::OneTimeCode,
+            ChangeUnit::Uris | ChangeUnit::App => Section::Autofill,
+            ChangeUnit::Sequence => Section::FillRule,
+            ChangeUnit::Fields => Section::CustomFields,
+            // A secure note's body is drawn by the `Details` card and by
+            // nothing else -- see `draws_own_notes_box` -- but it is the same
+            // string either way, and `Notes` is where every other kind reports
+            // it. A note item's `Notes` card is not drawn at all, so the
+            // section this points at is one nothing on screen contradicts.
+            ChangeUnit::Note => Section::Notes,
+        }
+    }
+}
+
 /// The edit form's state, for **one kind of item**.
 ///
 /// [`Self::kind`] is what makes this safe. Before it existed, `apply_to`
@@ -1194,6 +1398,18 @@ pub struct EditDraft {
     /// could assign it could declare a modified draft pristine, which is the
     /// whole guarantee.
     opened_digest: u64,
+    /// [`Self::change_digests`] as it was when this form OPENED, which is
+    /// what [`Self::changes`] compares against, field by field.
+    ///
+    /// **Digests and not a copy of the draft**, for exactly the reason
+    /// [`Self::opened_digest`] above gives and with the same arithmetic:
+    /// [`ChangeUnit::COUNT`] `u64`s carry no more plaintext than one does.
+    /// The per-unit collision reads as "this field did not move", which is
+    /// the same 2^-64 event confined to one row of one card.
+    ///
+    /// **Private**, and set only by [`Self::seal`], for
+    /// [`Self::opened_digest`]'s reason.
+    opened_units: [u64; ChangeUnit::COUNT],
     /// The discard confirmation is on screen.
     ///
     /// On the draft rather than in `egui::Memory` for the same reason
@@ -1551,6 +1767,7 @@ impl Default for EditDraft {
         Self {
             kind: ItemKind::Login,
             opened_digest: 0,
+            opened_units: [0; ChangeUnit::COUNT],
             discard_prompt: false,
             name: String::new(),
             folder_id: None,
@@ -1772,6 +1989,7 @@ impl EditDraft {
             // [`Self::fields`].
             fields: item.fields.iter().map(FieldDraft::from_field).collect(),
             opened_digest: 0,
+            opened_units: [0; ChangeUnit::COUNT],
             discard_prompt: false,
             // Filled in immediately below, off the draft this literal builds
             // -- see `reveal_what_is_filled`. It cannot be computed here:
@@ -2022,12 +2240,20 @@ impl EditDraft {
     /// does NOT reseal: switching the type on a create form clears every
     /// kind-specific box, and that is a change the user would lose.
     fn seal(mut self) -> Self {
+        self.opened_units = self.change_digests();
         self.opened_digest = self.content_digest();
         self
     }
 
-    /// A digest over everything on this form the user can type or choose,
-    /// and over nothing else.
+    /// A digest **per [`ChangeUnit`]** over everything on this form the user
+    /// can type or choose, and over nothing else.
+    ///
+    /// One digest per unit rather than one for the whole draft, because
+    /// design 8a's dirty state is per field: its rail prints `Password` and
+    /// `Native app added` under a `Changed` heading and its footer counts
+    /// them. [`Self::content_digest`] folds this array back into the single
+    /// number [`Self::is_dirty`] has always compared, so the two cannot
+    /// disagree -- see its doc.
     ///
     /// **The exclusions are the whole design of this function.** Revealing a
     /// password, opening the window picker, filtering it, previewing a
@@ -2048,14 +2274,12 @@ impl EditDraft {
     /// The app block is digested as **the binding it would save**
     /// ([`AppMatchDraft::to_match`]) plus its `bound` flag, rather than
     /// field by field, for the same reason: that struct is over half window
-    /// picker and template-editor state.
+    /// picker and template-editor state. It is split across two units, and
+    /// the split is argued where it is made.
     ///
-    /// The intermediate string is [`zeroize::Zeroize`]d before it is dropped.
-    /// It is the one place in this file that deliberately materialises the
-    /// password, the TOTP seed and the card's secrets into a single buffer,
-    /// and leaving that buffer to the allocator would be a new copy of every
-    /// secret on the screen once per frame.
-    fn content_digest(&self) -> u64 {
+    /// The intermediate string is [`zeroize::Zeroize`]d before it is dropped,
+    /// once per unit. See `close` in the body.
+    fn change_digests(&self) -> [u64; ChangeUnit::COUNT] {
         use std::fmt::Write as _;
         use std::hash::{Hash as _, Hasher as _};
         use zeroize::Zeroize as _;
@@ -2102,8 +2326,10 @@ impl EditDraft {
             generator: _,
             app,
             fields,
-            // The measurement itself, and the question being asked about it.
+            // The measurements themselves, and the question being asked about
+            // them.
             opened_digest: _,
+            opened_units: _,
             discard_prompt: _,
             // **View state, both.** Which rows are on screen and whether the
             // add menu is open are things the user does to the FORM: nothing
@@ -2150,26 +2376,83 @@ impl EditDraft {
         let SshKeyDraft { private_key, public_key, key_fingerprint, reveal_private_key: _ } =
             ssh_key;
 
-        // NUL between every part, so "ab" + "" and "a" + "b" are different
-        // drafts rather than the same digest.
+        // One buffer, filled and digested and wiped once per unit. NUL
+        // between every part, so "ab" + "" and "a" + "b" are different drafts
+        // rather than the same digest.
         let mut sketch = String::new();
+        let mut digests = [0u64; ChangeUnit::COUNT];
+        // `close` is what makes the partition safe: every unit's bytes go
+        // into the same buffer and every unit's buffer is hashed and wiped by
+        // the same three lines, so a unit added later cannot forget the
+        // zeroize. This function is the one place in this file that
+        // deliberately materialises the password, the TOTP seed and the
+        // card's secrets, and leaving any of those buffers to the allocator
+        // would be a new copy of every secret on the screen once per frame.
+        let mut close = |unit: ChangeUnit, sketch: &mut String| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            sketch.hash(&mut hasher);
+            sketch.zeroize();
+            sketch.clear();
+            digests[unit as usize] = hasher.finish();
+        };
+
+        // `kind` rides with the name, and it is not an arbitrary place to put
+        // it: `set_kind` clears every kind-specific box on a create form, so a
+        // kind that moved without the name moving is a change the user would
+        // lose -- and the row it is reported against is the one 8a's `Item`
+        // card draws it on.
+        let _ = write!(sketch, "{kind:?}\u{0}{name}\u{0}");
+        close(ChangeUnit::Name, &mut sketch);
+        let _ = write!(sketch, "{folder_id:?}\u{0}");
+        close(ChangeUnit::Folder, &mut sketch);
+        let _ = write!(sketch, "{username}\u{0}");
+        close(ChangeUnit::Username, &mut sketch);
+        let _ = write!(sketch, "{password}\u{0}");
+        close(ChangeUnit::Password, &mut sketch);
+        let _ = write!(sketch, "{totp}\u{0}");
+        close(ChangeUnit::Totp, &mut sketch);
         let _ = write!(
             sketch,
-            "{kind:?}\u{0}{name}\u{0}{folder_id:?}\u{0}{username}\u{0}{password}\u{0}{totp}\u{0}\
-             {cardholder_name}\u{0}{brand}\u{0}{number}\u{0}{exp_month}\u{0}{exp_year}\u{0}\
-             {code}\u{0}{bank_domain}\u{0}{billing_zip}\u{0}\
-             {private_key}\u{0}{public_key}\u{0}{key_fingerprint}\u{0}\
-             {identity:?}\u{0}{note_body}\u{0}"
+            "{cardholder_name}\u{0}{brand}\u{0}{number}\u{0}{exp_month}\u{0}{exp_year}\u{0}\
+             {code}\u{0}{bank_domain}\u{0}{billing_zip}\u{0}"
         );
+        close(ChangeUnit::Card, &mut sketch);
+        let _ = write!(sketch, "{identity:?}\u{0}");
+        close(ChangeUnit::Identity, &mut sketch);
+        let _ = write!(sketch, "{private_key}\u{0}{public_key}\u{0}{key_fingerprint}\u{0}");
+        close(ChangeUnit::SshKey, &mut sketch);
+        let _ = write!(sketch, "{note_body}\u{0}");
+        close(ChangeUnit::Note, &mut sketch);
+
+        // **The binding, split in two, and every byte of it still counted.**
+        //
+        // 8a draws the target (`Autofill targets`) and what gets typed into it
+        // (`Fill rule`) as two cards, so a draft that reports "changed" has to
+        // be able to say which. The split is taken off the AppMatch this draft
+        // would SAVE rather than off its boxes -- `to_match` zeroes a hosted
+        // binding's title and arguments, and a dirtiness that disagreed with
+        // the save would ask about a change that is not going to happen.
         match app {
             Some(app) => {
-                let _ = write!(sketch, "app\u{0}{}\u{0}{:?}\u{0}", app.bound, app.to_match());
+                let mut target = app.to_match();
+                let sequence = std::mem::take(&mut target.sequence);
+                let _ = write!(sketch, "app\u{0}{}\u{0}{target:?}\u{0}", app.bound);
+                close(ChangeUnit::App, &mut sketch);
+                let _ = write!(sketch, "{sequence}\u{0}");
+                close(ChangeUnit::Sequence, &mut sketch);
             }
-            None => sketch.push_str("no-app\u{0}"),
+            None => {
+                sketch.push_str("no-app\u{0}");
+                close(ChangeUnit::App, &mut sketch);
+                close(ChangeUnit::Sequence, &mut sketch);
+            }
         }
+
         for field in fields {
             let _ = write!(sketch, "{}\u{0}{}\u{0}{:?}\u{0}", field.name, field.value, field.role);
         }
+        close(ChangeUnit::Fields, &mut sketch);
+
         // The count first, so a form that has had a blank row added to it is
         // dirty even though the strings it writes are unchanged -- an empty
         // row IS something the user would lose to a silent Cancel.
@@ -2177,11 +2460,48 @@ impl EditDraft {
         for entry in uris {
             let _ = write!(sketch, "{}\u{0}", entry.uri);
         }
+        close(ChangeUnit::Uris, &mut sketch);
 
+        digests
+    }
+
+    /// The whole-draft digest [`Self::is_dirty`] compares, **derived from
+    /// [`Self::change_digests`] rather than computed beside it.**
+    ///
+    /// That derivation is the point. A per-field diff and a whole-draft
+    /// dirtiness are two answers to one question, and two functions that
+    /// computed them separately could disagree -- a form saying "no changes"
+    /// in its footer while its Cancel asks whether to discard them is the
+    /// exact defect a second mechanism would eventually produce. Folded like
+    /// this they cannot: the number IS the parts.
+    fn content_digest(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        sketch.hash(&mut hasher);
-        sketch.zeroize();
+        self.change_digests().hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// **Which of this draft's fields have moved since the form opened**, in
+    /// 8a's own order -- the list its rail prints under `Changed` and the
+    /// count its footer reports.
+    ///
+    /// Field-level and not section-level, because 8a's rail says `Password`
+    /// and `Native app added`, not `Login credentials` and `Autofill targets`.
+    /// A user who has changed two things in one card is told they changed two
+    /// things.
+    pub fn changes(&self) -> Vec<Change> {
+        let now = self.change_digests();
+        ChangeUnit::ALL
+            .iter()
+            .filter(|unit| now[**unit as usize] != self.opened_units[**unit as usize])
+            .map(|unit| Change { label: unit.label(), section: unit.section() })
+            .collect()
+    }
+
+    /// Whether any change this draft carries belongs to `section` -- the
+    /// per-card `Changed` mark.
+    pub fn section_changed(&self, section: Section) -> bool {
+        self.changes().iter().any(|change| change.section == section)
     }
 
     /// **Whether this draft has unsaved changes.** A pure function of the
@@ -3563,7 +3883,6 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     if creating {
         theme::disabled_field_label(ui, WEBSITE_LABEL);
         theme::disabled_text_field(ui, WEBSITE_CREATE_NOTICE);
-        ui.add_space(10.0);
         return;
     }
 
@@ -3578,15 +3897,25 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
         ui.scope_builder(
             egui::UiBuilder::new().id(egui::Id::new(("login-uri", entry.row_id()))),
             |ui| {
-                theme::field_label(ui, &website_label(i));
+                // **The Remove is beside the caption, not under the box**, and
+                // that is `slot_label`'s own argument applied to this list:
+                // the button used to cost a whole 32-point row per website, so
+                // a login reached three ways spent a hundred points on three
+                // copies of one word. 8a puts its own remove -- a ✕ -- ON the
+                // row, in line with the field; a chip beside the caption is
+                // the same saving in the idiom this form already uses for
+                // every other optional row, and it keeps the caption a
+                // caption instead of turning it into a button's label.
+                ui.horizontal_wrapped(|ui| {
+                    theme::field_label(ui, &website_label(i));
+                    if ui.add(small_chip_button(WEBSITE_REMOVE_BUTTON)).clicked() {
+                        remove = Some(i);
+                    }
+                });
                 theme::text_field(ui, &mut entry.uri, false);
-                ui.add_space(4.0);
-                if theme::secondary_button(ui, WEBSITE_REMOVE_BUTTON).clicked() {
-                    remove = Some(i);
-                }
             },
         );
-        ui.add_space(10.0);
+        ui.add_space(theme::BLOCK_GAP);
     }
     if let Some(i) = remove {
         uris.remove(i);
@@ -3610,17 +3939,18 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     });
     ui.add_space(4.0);
     ui.label(RichText::new(WEBSITE_MATCH_NOTE).size(11.0).color(theme::TEXT_FAINT));
-    ui.add_space(10.0);
 }
 
 fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating: bool) {
-    theme::hairline(ui);
-    ui.add_space(10.0);
-    theme::field_label(ui, FIELDS_BLOCK_HEADING);
-
+    // **No rule and no heading here any more.** Design 8a gives this block a
+    // card of its own, whose title band already says `Custom fields` in the
+    // design's own treatment -- see `Section::title`. A `field_label` under a
+    // card header that carries the same words is the heading drawn twice, and
+    // the hairline above it is a divider inside a box whose border is already
+    // one. [`FIELDS_BLOCK_HEADING`] is still the string the card is titled
+    // with, so nothing that looked for those words has lost them.
     if creating {
         ui.label(RichText::new(FIELDS_CREATE_NOTICE).size(11.0).color(theme::TEXT_FAINT));
-        ui.add_space(10.0);
         return;
     }
 
@@ -5198,29 +5528,40 @@ fn palette_button(label: &str) -> egui::Button<'static> {
 /// into the middle of a form whose scroll viewport is already the thing three
 /// separate commits in this file have pushed a control out of. The user clicks
 /// Add, and then chooses.
+/// **The hairline and the heading are gone from the top of this block**, and
+/// so they are from [`app_block`]: both used to open with a rule and a
+/// `field_label` because the form was one long column that had to divide
+/// itself. Design 8a's card does both -- the card's own edge is the division
+/// and its title band is the heading -- so a rule here would be a second
+/// divider inside a box that is already one. [`APP_BLOCK_HEADING`] is still
+/// drawn, one line down, as the row's own label: 8a calls the row `Native
+/// apps`, this app has called it `Matched app` on the read pane since the
+/// feature shipped, and two words for one thing on two panes is worse than
+/// departing from the design's noun.
 fn app_add_block(ui: &mut egui::Ui) -> bool {
-    theme::hairline(ui);
-    ui.add_space(10.0);
     theme::field_label(ui, APP_BLOCK_HEADING);
     ui.label(RichText::new(APP_NONE_NOTICE).size(11.0).color(theme::TEXT_FAINT));
     ui.add_space(6.0);
-    let asked = theme::secondary_button(ui, APP_ADD_BUTTON).clicked();
-    ui.add_space(10.0);
-    asked
+    theme::secondary_button(ui, APP_ADD_BUTTON).clicked()
 }
 
-/// The whole app block. Returns an [`EditAction`] when it needs the caller to
-/// do something the form cannot (open the file dialog).
+/// The app TARGET block -- which program this item is bound to. Returns an
+/// [`EditAction`] when it needs the caller to do something the form cannot
+/// (open the file dialog).
+///
+/// **It no longer takes the keystroke palette or the resolve source**, and the
+/// two parameters are gone rather than left unused: this block stopped drawing
+/// the sequence when design 8a split `Autofill targets` from `Fill rule`, and
+/// a function that still asked for a palette it never showed would be the next
+/// reader's fifteen minutes.
 fn app_block(
     ui: &mut egui::Ui,
     app: &mut AppMatchDraft,
     apps: &mut AppIdentityCache,
-    palette: &[FieldRef],
-    source: &ResolveSource<'_>,
 ) -> Option<EditAction> {
     let mut action = None;
-    theme::hairline(ui);
-    ui.add_space(10.0);
+    // No rule and no leading space -- see [`app_add_block`]'s doc; the card
+    // this now sits in is the division that used to be drawn here.
     theme::field_label(ui, APP_BLOCK_HEADING);
 
     if !app.bound {
@@ -5229,7 +5570,6 @@ fn app_block(
         if theme::secondary_button(ui, "Undo remove").clicked() {
             app.bound = true;
         }
-        ui.add_space(10.0);
         return action;
     }
 
@@ -5370,12 +5710,16 @@ fn app_block(
     // `AppMatchDraft::trigger`), because v0.5.0 cannot parse an `AppMatch`
     // that lacks it.
     //
-    // The sequence block answers what the pills used to sit above: not *when*
-    // this item fills, which is no longer a per-item question, but what it
-    // types once it does.
-    if let Some(asked) = app_sequence_block(ui, app, palette, source) {
-        action = Some(asked);
-    }
+    // **The sequence block used to be drawn here and is not any more.** It
+    // answers what the pills used to sit above: not *when* this item fills,
+    // which is no longer a per-item question, but what it types once it does
+    // -- and design 8a makes that its own card, `Fill rule`, beside the
+    // `Autofill targets` card this block is now the second row of. The split
+    // is 8a's and it is a real one: where a binding points and what it types
+    // into it are two questions, the second is a hundred points of builder
+    // when it is open, and a user who came to re-point a moved executable was
+    // being shown the keystroke palette on the way past. `draw_detail_edit`
+    // calls `app_sequence_block` directly now.
 
     // Staged, not immediate: unlike the read pane's card -- which writes
     // straight through because there is no Save to wait for -- this is one
@@ -5541,6 +5885,455 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
     });
 }
 
+/// One card of design 8a's grid: its title band, its body, and the gap to the
+/// next card.
+///
+/// `wanted` is the section the rail has asked to be scrolled to. Matched here
+/// rather than in the rail, because the rail is drawn in a panel BESIDE the
+/// scroll area and has no idea where any card is; the card knows its own
+/// rectangle, and `scroll_to_rect` is the only thing that needs it.
+fn section<R>(
+    ui: &mut egui::Ui,
+    kind: ItemKind,
+    section: Section,
+    changed: bool,
+    wanted: Option<Section>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let (rect, inner) = theme::section_card(ui, |ui| {
+        // The card takes the full width it is offered. Without this each card
+        // shrinks to its own widest row, so a card holding one short row would
+        // be narrower than the card above it -- a grid whose columns do not
+        // line up, which is worse than the flat column it replaced.
+        ui.set_width(ui.available_width());
+        theme::section_card_header(ui, section.title(kind), section.note(), changed);
+        theme::section_card_body(ui, add)
+    });
+    if wanted == Some(section) {
+        // `Align::TOP`: the rail says "take me to this section", and a card
+        // centred in the viewport puts its title band off the top of it.
+        ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+    }
+    ui.add_space(theme::SECTION_GAP);
+    inner
+}
+
+/// **Which cards this draft is actually going to draw, and what number 8a
+/// puts beside each.**
+///
+/// The rail is drawn BEFORE the cards -- it is a left panel and they are in
+/// the scroll area beside it -- so it cannot find out by watching. This is the
+/// one decision both read, which is what keeps a rail entry from scrolling to
+/// a card that is not there.
+///
+/// The count is 8a's own: its rail reads `Autofill targets  4` and `Custom
+/// fields  2`, and the number is the number of ROWS in the card. `None` where
+/// there is nothing to count -- 8a leaves those entries bare rather than
+/// printing a `1`, and a `1` beside `Notes` would be a quantity of nothing.
+fn drawn_sections(
+    kind: ItemKind,
+    creating: bool,
+    draft: &EditDraft,
+    shown: &[Slot],
+) -> Vec<(Section, Option<usize>)> {
+    let mut sections = vec![(Section::Item, None), (Section::Details, None)];
+    if shown.contains(&Slot::Totp) {
+        sections.push((Section::OneTimeCode, None));
+    }
+    // Always: the app row is offered whether or not anything is bound, because
+    // this form is the only place a binding is made. See the card's own note.
+    let targets = draft.uris.len() + usize::from(draft.app.as_ref().is_some_and(|a| a.bound));
+    sections.push((Section::Autofill, (targets > 0).then_some(targets)));
+    if draft.app.as_ref().is_some_and(|app| app.bound) {
+        sections.push((Section::FillRule, None));
+    }
+    // The fields the form DRAWS, not the vector's length: a
+    // `deskwarden:app-match` rides in the same list and is not a custom field
+    // the user put there. See [`FieldRole`].
+    let fields = draft
+        .fields
+        .iter()
+        .filter(|f| matches!(f.role, FieldRole::Text | FieldRole::Hidden))
+        .count();
+    sections.push((Section::CustomFields, (fields > 0).then_some(fields)));
+    if draws_own_notes_box(kind, creating) {
+        sections.push((Section::Notes, None));
+    }
+    sections
+}
+
+/// **Design 8a's section rail**, or nothing at all when the pane cannot
+/// afford one.
+///
+/// # Why this is a panel inside the form and not the window's own rail
+///
+/// 8a's rail is 212 points wide and it REPLACES the sidebar and the item list:
+/// 8a is a full window whose left column is `SECTIONS` and whose right column
+/// is the card grid and the footer. This form is not a window. It is drawn
+/// into the vault window's detail pane by `vault_window::mod`, beside a
+/// sidebar and an item list that are still on screen and still that window's,
+/// and turning the editor into a full-window mode is a change to the window's
+/// own layout -- the panel order, the slide animation, the list -- in a file
+/// this work does not own. What is built here is the rail's JOB, in the room
+/// the form actually has.
+///
+/// # Why it is sometimes not drawn
+///
+/// The detail pane is [`RAIL_WIDTH`] + a little at the shipped window size and
+/// **298 points at `settings::MIN_VAULT_WINDOW_SIZE`**. A 212-point rail there
+/// would leave 86 points of card, which is not a narrower form, it is no form.
+/// So the rail appears when the cards can still keep at least the width they
+/// have at the window's floor, and vanishes below that. The form loses a
+/// navigation aid and keeps every control, which is the right way round; the
+/// `Changed` marks are on the cards themselves for this reason (see
+/// `theme::section_card_header`), so nothing the rail says is only said there.
+///
+/// # Why it NAVIGATES and does not filter
+///
+/// A filter was the other candidate and it is the wrong one, twice over:
+///
+/// * **The marks would contradict it.** The rail's whole second job is to say
+///   which sections have unsaved changes. That is a statement about cards the
+///   user is not looking at -- and a filter answers it by hiding them, which
+///   is the one response that makes the mark useless.
+/// * **Save would write what the user cannot see.** This form has one Save and
+///   it commits the whole draft. A filtered form would let a user narrow to
+///   `Notes`, look at one card, and press a button that writes a password
+///   they had edited and then filtered away. Scrolling leaves everything on
+///   screen and merely moves the viewport, so what Save writes is always what
+///   the form showed.
+///
+/// Answers whether it drew anything, because the card column has to inset
+/// itself from the rail's edge and must not inset itself from nothing.
+fn draw_section_rail(
+    ui: &mut egui::Ui,
+    kind: ItemKind,
+    sections: &[(Section, Option<usize>)],
+    changes: &[Change],
+) -> bool {
+    if ui.available_width() < RAIL_WIDTH + RAIL_CARD_FLOOR {
+        return false;
+    }
+    egui::Panel::left("detail-edit-rail")
+        .exact_size(RAIL_WIDTH)
+        .resizable(false)
+        .show_separator_line(false)
+        .frame(
+            egui::Frame::new()
+                // 8a's `background: #ffffff; border-right: 1px solid #eae7e7`
+                // and `padding: 16px 10px`. The right edge is drawn below
+                // rather than by the panel's own separator line, which is
+                // egui's darker stroke.
+                .fill(theme::CARD)
+                .inner_margin(Margin { left: 10, right: 10, top: 4, bottom: 14 }),
+        )
+        .show(ui, |ui| {
+            let edge = ui.max_rect();
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(edge.right() + 10.0 - 1.0, edge.top() - 4.0),
+                    egui::vec2(1.0, edge.height() + 18.0),
+                ),
+                egui::CornerRadius::ZERO,
+                theme::HAIRLINE,
+            );
+            theme::eyebrow(ui, RAIL_HEADING);
+            ui.add_space(8.0);
+            for (section, count) in sections {
+                let marked = changes.iter().any(|change| change.section == *section);
+                if rail_entry(ui, section.title(kind), *count, marked) {
+                    ask_rail_for(ui.ctx(), *section);
+                }
+            }
+            ui.add_space(theme::BLOCK_GAP);
+            // 8a's `Changed` list, under a rule. Only when there is one --
+            // an empty heading is furniture.
+            if !changes.is_empty() {
+                theme::hairline(ui);
+                ui.add_space(theme::BLOCK_GAP);
+                theme::eyebrow(ui, theme::CHANGED_PILL);
+                ui.add_space(6.0);
+                for change in changes {
+                    ui.label(
+                        RichText::new(change.label).size(12.0).color(theme::TEXT_SECONDARY),
+                    );
+                }
+            }
+        });
+    true
+}
+
+/// The clear space between the rail's edge and the first card.
+///
+/// 8a's card column is `padding: 20px 28px 0` inside its own grid cell; 28
+/// there is 2.3% of a 1240-point window, and the same proportion of this pane
+/// is 15. It is 14 because that is what every other gap on this form already
+/// is -- [`theme::SECTION_ROW_GAP`] -- and because a card sitting flush
+/// against the rail's hairline reads as a panel welded to the chrome rather
+/// than as a card laid on the page, which is what the first render of this
+/// grid looked like.
+const RAIL_GUTTER: i8 = 14;
+
+/// One row of the rail: 8a's `padding: 8px 10px; border-radius: 8px;
+/// font-size: 13px`, with its count pushed to the right edge and the dirty dot
+/// beside it.
+///
+/// Answers whether it was clicked.
+fn rail_entry(ui: &mut egui::Ui, title: &str, count: Option<usize>, marked: bool) -> bool {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), RAIL_ENTRY_HEIGHT),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        // 8a lights its CURRENT section `#eef2fc`. There is no current
+        // section here -- every card is on screen at once and the rail only
+        // scrolls -- so the wash is spent on the row under the pointer
+        // instead, which is the thing about to happen rather than a state
+        // this rail does not have.
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(RAIL_ENTRY_RADIUS),
+            theme::BLUE_WASH,
+        );
+    }
+    let galley = ui.painter().layout(
+        title.to_string(),
+        egui::FontId::new(13.0, egui::FontFamily::Proportional),
+        theme::INK,
+        // Everything but the padding and the widest trailing mark, so a long
+        // title is elided rather than laid over its own count.
+        (rect.width() - RAIL_ENTRY_PAD_X * 2.0 - RAIL_TRAIL).max(1.0),
+    );
+    ui.painter().galley(
+        egui::pos2(
+            rect.left() + RAIL_ENTRY_PAD_X,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        theme::INK,
+    );
+    let mut right = rect.right() - RAIL_ENTRY_PAD_X;
+    if marked {
+        // 8a's `width: 6px; height: 6px; border-radius: 999px; background:
+        // #e0a419` beside `Credentials`. A dot and not the word, because the
+        // rail already spells the changed fields out below and nine repeats of
+        // `Changed` down one column is a column of one word.
+        ui.painter().circle_filled(
+            egui::pos2(right - RAIL_DOT / 2.0, rect.center().y),
+            RAIL_DOT / 2.0,
+            theme::CAUTION_MARK,
+        );
+        right -= RAIL_DOT + 6.0;
+    }
+    if let Some(count) = count {
+        let counted = ui.painter().layout_no_wrap(
+            count.to_string(),
+            egui::FontId::new(11.0, egui::FontFamily::Proportional),
+            theme::TEXT_GHOST,
+        );
+        ui.painter().galley(
+            egui::pos2(right - counted.size().x, rect.center().y - counted.size().y / 2.0),
+            counted,
+            theme::TEXT_GHOST,
+        );
+    }
+    response.clicked()
+}
+
+/// The rail's width: **`vault_window::SIDEBAR_WIDTH` exactly**, which is 8a's
+/// own `212px`.
+///
+/// The same constant the window's sidebar is, and not a same-valued literal,
+/// because 8a's rail is the sidebar's column: a user who resizes nothing sees
+/// the editor's rail begin and end where the sidebar they were just looking at
+/// did. A second 212 here is a second 212 to move.
+const RAIL_WIDTH: f32 = super::SIDEBAR_WIDTH;
+
+/// How much room the cards must keep for the rail to be worth drawing.
+///
+/// The detail pane's own content width at `settings::MIN_VAULT_WINDOW_SIZE` --
+/// `900 - 212 - 390 = 298`, less the central panel's 20-point margins either
+/// side. It is the floor the form already survives at, so the rule reads: the
+/// rail appears only when it costs the cards nothing they do not already
+/// cope with.
+const RAIL_CARD_FLOOR: f32 =
+    crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32 - super::SIDEBAR_WIDTH - super::LIST_WIDTH
+        - 40.0;
+
+/// 8a's `SECTIONS`, in the design's own case -- see `theme::eyebrow`, which
+/// deliberately does not uppercase for you.
+const RAIL_HEADING: &str = "SECTIONS";
+
+/// A rail row's height: 8a's `padding: 8px 10px` round a 13px line (~17
+/// points), read as a border-box.
+const RAIL_ENTRY_HEIGHT: f32 = 33.0;
+
+/// A rail row's horizontal padding and corner radius -- 8a's `10px` and `8px`.
+const RAIL_ENTRY_PAD_X: f32 = 10.0;
+const RAIL_ENTRY_RADIUS: u8 = 8;
+
+/// The dirty dot on a rail row: 8a's `width: 6px; height: 6px`.
+const RAIL_DOT: f32 = 6.0;
+
+/// Room kept clear at the right of a rail row for its count and its dot, so a
+/// long title elides instead of running under them.
+const RAIL_TRAIL: f32 = RAIL_DOT + 6.0 + 14.0;
+
+/// The id the rail's request lives under between the frame it is clicked in
+/// and the moment the card it names is drawn.
+fn rail_request_id() -> egui::Id {
+    egui::Id::new("detail-edit-rail-request")
+}
+
+/// Records the section the rail was just clicked on.
+fn ask_rail_for(ctx: &egui::Context, section: Section) {
+    ctx.data_mut(|data| data.insert_temp(rail_request_id(), section));
+}
+
+/// Reads the rail's request **and clears it**.
+///
+/// Taken rather than read, and that is the whole of it: a request left in
+/// place would re-run `scroll_to_rect` on every subsequent frame, so the form
+/// would spring back to the section the user last clicked the moment they
+/// tried to scroll anywhere else. One click, one scroll.
+fn take_rail_request(ctx: &egui::Context) -> Option<Section> {
+    ctx.data_mut(|data| {
+        let asked = data.get_temp::<Section>(rail_request_id());
+        data.remove::<Section>(rail_request_id());
+        asked
+    })
+}
+
+/// What 8a's `Type` row says: the kind's own noun, in the case the row draws
+/// it in.
+///
+/// Derived from [`form_title`]'s own vocabulary rather than spelled a second
+/// time -- the two have to agree, because the title says `Edit login` directly
+/// above a row that says `Login`.
+fn kind_noun(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Login => "Login",
+        ItemKind::Card => "Card",
+        ItemKind::Identity => "Identity",
+        ItemKind::SecureNote => "Secure note",
+        ItemKind::SshKey => "SSH key",
+        // The wire's own number is the only honest answer for a kind this
+        // build has never heard of. `form_title` says the same thing.
+        ItemKind::Unknown(_) => "Unknown type",
+    }
+}
+
+/// How many of [`theme::STRENGTH_BARS`] a rating fills.
+///
+/// A function and not `rating as usize + 1`, because the enumeration's
+/// discriminants are an implementation detail of `password_strength` and this
+/// is a statement about a picture: 8a draws four bars, `Strength` has four
+/// ratings, and the mapping between them should be the thing a reader can
+/// check rather than a cast they have to trust.
+pub fn strength_bars(rating: password_strength::Strength) -> usize {
+    match rating {
+        password_strength::Strength::Weak => 1,
+        password_strength::Strength::Fair => 2,
+        password_strength::Strength::Good => 3,
+        password_strength::Strength::Strong => 4,
+    }
+}
+
+/// 8a's `Unsaved changes` pill, in the form's title bar.
+pub const UNSAVED_PILL: &str = "Unsaved changes";
+
+/// 8a's `Save changes`. Named because the footer, its paint test and the
+/// summary beside it all have to agree on the word.
+pub const SAVE_BUTTON: &str = "Save changes";
+
+/// The other answer. Named for [`SAVE_BUTTON`]'s reason: the footer now
+/// MEASURES both captions before it lays either of them out, so a caption that
+/// lived only at its call site would be one the measurement could disagree
+/// with.
+pub const CANCEL_BUTTON: &str = "Cancel";
+
+/// What the Save button says, which is how the footer reports a fault beside
+/// the control that fault disables.
+///
+/// **A function, and this is the reason it stopped being a `let` inside the
+/// footer**: the change summary is laid out only if it fits beside the
+/// buttons, so the footer has to know how wide Save is going to be BEFORE it
+/// draws it. One function means the measured caption and the drawn caption are
+/// the same string by construction.
+///
+/// The chord 8a draws on this button -- `CTRL+S` -- is deliberately not drawn.
+/// `egui::Key::S` is Send-a-record's in `vault_window::mod`, and a guard there
+/// asserts the key is spelled nowhere else in production, so Ctrl+S cannot be
+/// bound here without taking a chord off another screen. A hint for a chord
+/// that does nothing is a control that lies, which is the one thing this file
+/// consistently refuses to ship; the same goes for 8a's rail hints `Esc
+/// cancel` and `Ctrl+G generate`, neither of which this form binds either.
+fn save_label(draft: &EditDraft) -> &'static str {
+    if !draft.is_valid() {
+        "Save (needs a name)"
+    } else if draft.sequence_fault().is_some() {
+        SAVE_TEMPLATE_BLOCKED
+    } else {
+        SAVE_BUTTON
+    }
+}
+
+/// 8a's `Syncs to Bitwarden on save`, pushed to the right of the footer.
+///
+/// **It is true rather than decorative**, which is why it is worth the room:
+/// `vault_window::mod`'s Save arm calls `cache.update_item` and reinstates
+/// the copy the SERVER sends back, so this form's Save really is a round trip
+/// to Bitwarden and not a local write. A user deciding whether to press it
+/// while offline is being told something they cannot otherwise see.
+pub const SYNC_NOTE: &str = "Syncs to Bitwarden on save";
+
+/// 8a's footer summary: `2 changes \u{b7} password will be added to history`.
+///
+/// # Why the second clause is conditional and the design's is not
+///
+/// 8a prints the history clause flat, because 8a's one rendered state has a
+/// changed password in it. It is only true when the password really moved --
+/// Bitwarden appends to `passwordHistory` on a password change and on nothing
+/// else -- so a rename that claimed it would be a sentence about a side effect
+/// that is not going to happen. Renaming an item and being told its password
+/// will be archived is exactly the kind of small lie that makes a user stop
+/// reading the footer.
+///
+/// It is also withheld when the password has been **cleared**: emptying the
+/// box is a change to the password, but there is no old value being filed
+/// away that the user would want warning of -- and "will be added to history"
+/// over an empty field reads as a threat to store the blank.
+///
+/// A free function on the change list rather than a method on the draft,
+/// because it needs no other part of the draft and that is what lets its
+/// wording be tested against a list of [`Change`]s alone.
+fn change_summary(changes: &[Change], password: &str) -> String {
+    if changes.is_empty() {
+        return NO_CHANGES_NOTE.to_string();
+    }
+    let count = changes.len();
+    let counted =
+        if count == 1 { "1 change".to_string() } else { format!("{count} changes") };
+    let password_moved = changes.iter().any(|c| c.label == ChangeUnit::Password.label());
+    if password_moved && !password.is_empty() {
+        format!("{counted} \u{b7} password will be added to history")
+    } else {
+        counted
+    }
+}
+
+/// What the footer says when nothing has been touched.
+///
+/// **Said rather than left blank**, and this is a departure from 8a, which
+/// only ever draws its footer dirty. A footer that is a row of two buttons and
+/// then, sometimes, a sentence is a footer whose height changes as the user
+/// types -- and this one is a bottom panel, so a change in its height moves
+/// the scroll viewport above it. Saying "No changes yet" keeps the band one
+/// height in both states AND answers the question the Save button raises on a
+/// form nobody has edited.
+const NO_CHANGES_NOTE: &str = "No changes yet";
+
 /// The ambiguous-characters chip's label. Named because two tests and the
 /// widget have to agree on it.
 const AVOID_AMBIGUOUS: &str = "Avoid lookalikes (0/O, 1/l)";
@@ -5565,8 +6358,66 @@ pub fn draw_detail_edit(
     let mut action = EditAction::None;
     // Read before the closure borrows `draft` mutably.
     let may_unfile = draft.may_unfile();
+    // **Once per frame, at the top, and shared by four things**: the pill on
+    // this line, the `Changed` mark on each card, the list down the rail and
+    // the count in the footer. `changes()` walks the whole draft and hashes
+    // every secret on it (see `change_digests`), so asking it four times a
+    // frame would be four materialisations of the password per repaint.
+    let changes = draft.changes();
+    let kind = draft.kind;
 
-    ui.label(theme::bold(form_title(draft.kind, creating), 19.0).color(theme::INK));
+    // **Which of the kind's rows this form is drawing, and which are behind
+    // the Add control.** Both computed here, off the draft, before anything
+    // borrows it mutably -- and both from `EditDraft`'s own predicates rather
+    // than from an `is_empty()` at each row, so the rule is one decision a
+    // test can call instead of twenty conditions no test can reach. See
+    // [`Slot`].
+    //
+    // They are read one line earlier than they used to be because the RAIL
+    // needs them: a rail entry for a card the form is not drawing would scroll
+    // to nothing.
+    //
+    // On a CREATE `shown` is every slot and `addable` is empty, so everything
+    // below draws exactly as it always has.
+    let shown = draft.shown_slots(creating);
+    let addable = draft.addable_slots(creating);
+    let showing = |slot: Slot| shown.contains(&slot);
+    let body = form_body(kind, creating);
+    let sections = drawn_sections(kind, creating, draft, &shown);
+
+    // **8a's title bar.** The design draws a breadcrumb -- `Deskwarden /
+    // Logins / Ledgerline` -- because 8a is a WHOLE WINDOW and the record's
+    // name is the last crumb of it. This form is a pane inside a window that
+    // already has a sidebar saying which folder you are in and a list saying
+    // which item is open, so a breadcrumb here would be the third answer to a
+    // question nobody asked twice. What is taken from 8a is the part that is
+    // not furniture: the `Unsaved changes` pill, which is the only thing on
+    // that line that says something the rest of the window does not.
+    ui.horizontal(|ui| {
+        ui.label(theme::bold(form_title(kind, creating), 19.0).color(theme::INK));
+        if !changes.is_empty() {
+            ui.add_space(4.0);
+            let width = theme::state_pill_width(ui.painter(), theme::CHANGED_TONE, UNSAVED_PILL);
+            // Measured before it is placed, and left off when it does not fit,
+            // for the reason `theme::section_card_header`'s own pill is: at
+            // the pane's floor a 19-point title and a pill do not share a
+            // line, and a pill pushed off the pane is a pill drawn into the
+            // item list. The footer says the same thing in words and is never
+            // elided.
+            if ui.available_width() >= width {
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(width, theme::PILL_HEIGHT),
+                    egui::Sense::hover(),
+                );
+                theme::state_pill(
+                    ui.painter(),
+                    egui::pos2(rect.left(), rect.center().y),
+                    theme::CHANGED_TONE,
+                    UNSAVED_PILL,
+                );
+            }
+        }
+    });
     ui.add_space(12.0);
 
     // A create of a kind `NewItem` cannot express has no payload at all (see
@@ -5603,19 +6454,53 @@ pub fn draw_detail_edit(
     // is, and the `ScrollArea` below then gets exactly the rest. The title
     // stays outside both, so it does not scroll away either -- see
     // `edit_pane_layout_tests`, which pins all three facts as geometry.
+    // **8a's section rail**, drawn first so it is full height and the footer
+    // band below it belongs to the card column -- which is the arrangement 8a
+    // itself has (`grid-template-columns: 212px 1fr`, with the footer inside
+    // the second column).
+    let railed = draw_section_rail(ui, kind, &sections, &changes);
+
     egui::Panel::bottom("detail-edit-actions")
         // The strip is part of the pane, not a docked tool window: the pane's
         // own card already carries the only edge this form draws.
         .show_separator_line(false)
+        // **8a's sticky footer band, and it is a BAND now.**
+        //
+        // It used to be two buttons standing on the pane's own canvas with 12
+        // points of air above them -- the same "the form just stops" the Send
+        // composer was reported for and which `theme::form_card_footer`'s doc
+        // argues at length. 8a closes the form with `border-top: 1px solid
+        // #eae7e7; background: #ffffff`, and the rule is what says the
+        // questions are over.
+        //
+        // White rather than `theme::CARD_TINT`: 8a's window footer is `#ffffff`
+        // where 5a's CARD footer is `#fbfaf9`, and the difference is not an
+        // inconsistency. A tinted band inside a white card reads as the card's
+        // last row; this band is the PANE's, sitting under a column of white
+        // cards on `theme::CANVAS`, and tinting it would make it look like one
+        // more card that had lost its border.
         .frame(
             egui::Frame::new()
-                .fill(theme::CANVAS)
-                // Replaces the `ui.add_space(12.0)` that used to separate the
-                // strip from the card; the card's own bottom edge is now the
-                // scrolled content's, and this is the gap above the buttons.
-                .inner_margin(Margin { top: 12, ..Margin::ZERO }),
+                .fill(theme::CARD)
+                // 8a's `padding: 12px 28px`, at the pane's own horizontal
+                // inset -- which is the central panel's margin and is applied
+                // outside this `Ui`, so only the vertical half is spent here.
+                .inner_margin(Margin::symmetric(0, 12)),
         )
         .show(ui, |ui| {
+            // The rule that opens the band, drawn INSIDE the frame's top
+            // margin rather than as a panel separator line, so it is the
+            // design's `#eae7e7` hairline and not egui's darker stroke -- and
+            // so it spans the band's full width including the pane's inset.
+            let top = ui.max_rect();
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(top.left(), top.top() - 12.0),
+                    egui::vec2(top.width(), 1.0),
+                ),
+                egui::CornerRadius::ZERO,
+                theme::HAIRLINE,
+            );
             if !creatable {
                 ui.label(
                     RichText::new(
@@ -5638,6 +6523,40 @@ pub fn draw_detail_edit(
             // is the silent no-op this file keeps refusing to ship.
             if let Some(fault) = draft.sequence_fault() {
                 ui.label(RichText::new(fault).size(12.0).color(theme::ERROR));
+                ui.add_space(6.0);
+            }
+
+            // **8a's `2 changes \u{b7} password will be added to history`.**
+            //
+            // The summary is the footer saying what the button below it is
+            // about to do, and it is the one part of 8a's dirty state that is
+            // never elided: the title bar's pill and the cards' marks both
+            // stand down when the pane is narrow (see their own comments), so
+            // this line is where a small window still says there is something
+            // unsaved. That promise is only worth making if the line cannot be
+            // squeezed out -- and measured against the two buttons in the
+            // shipped pane it was squeezed out immediately, because 8a's
+            // footer is 1028 points wide and this one is under 400.
+            //
+            // So it is measured, and it moves rather than disappearing: beside
+            // the buttons where 8a puts it and there is room, and on its own
+            // line above them where there is not. The errors above are already
+            // drawn that way, so the taller footer is a shape this band
+            // already has.
+            let summary = change_summary(&changes, &draft.password);
+            let summary_width = theme::form_footer_note_width(ui, &summary);
+            let note_width = theme::form_footer_note_width(ui, SYNC_NOTE);
+            let gap = ui.spacing().item_spacing.x;
+            // What the two buttons will take, laid out before either is drawn.
+            // `theme::action_button_width` is the measurement both of them are
+            // built from, so this is the width they really occupy rather than
+            // a guess that a longer caption would invalidate.
+            let buttons = theme::action_button_width(ui.painter(), save_label(draft), 14.0)
+                + gap
+                + theme::action_button_width(ui.painter(), CANCEL_BUTTON, 14.0);
+            let beside = ui.available_width() >= buttons + gap + 4.0 + summary_width;
+            if !beside {
+                ui.label(RichText::new(summary.clone()).size(12.0).color(theme::TEXT_FAINT));
                 ui.add_space(6.0);
             }
 
@@ -5678,16 +6597,9 @@ pub fn draw_detail_edit(
                 // (needs a name)" / `SAVE_TEMPLATE_BLOCKED`), which is how
                 // the strip says what is wrong beside the control it is wrong
                 // about; the width follows the label as it always did.
-                let save_label = if !draft.is_valid() {
-                    "Save (needs a name)"
-                } else if draft.sequence_fault().is_some() {
-                    SAVE_TEMPLATE_BLOCKED
-                } else {
-                    "Save"
-                };
                 if theme::primary_button_enabled(
                     ui,
-                    save_label,
+                    save_label(draft),
                     None,
                     draft.is_saveable() && creatable,
                 )
@@ -5695,7 +6607,7 @@ pub fn draw_detail_edit(
                 {
                     action = EditAction::Save;
                 }
-                if theme::secondary_button(ui, "Cancel").clicked() {
+                if theme::secondary_button(ui, CANCEL_BUTTON).clicked() {
                     // **Not `EditAction::Cancel` outright.** A draft with
                     // unsaved edits asks first; an untouched one closes now.
                     // See `EditDraft::is_dirty` for why the gate is on the
@@ -5704,6 +6616,35 @@ pub fn draw_detail_edit(
                         draft.discard_prompt = true;
                     } else {
                         action = EditAction::Cancel;
+                    }
+                }
+
+                // 8a's summary, on the buttons' line when it fits there --
+                // and the standing note pushed to the far right of it, which
+                // is the last thing to go: it says the same thing on every
+                // frame whether or not anything has changed, so it is the one
+                // line in this band a narrow window loses nothing by dropping.
+                if beside {
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(summary).size(12.0).color(theme::TEXT_FAINT));
+                    if ui.available_width() >= gap + note_width {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), theme::PILL_HEIGHT),
+                            egui::Sense::hover(),
+                        );
+                        let galley = ui.painter().layout_no_wrap(
+                            SYNC_NOTE.to_string(),
+                            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                            theme::TEXT_GHOST,
+                        );
+                        ui.painter().galley(
+                            egui::pos2(
+                                rect.right() - galley.size().x,
+                                rect.center().y - galley.size().y / 2.0,
+                            ),
+                            galley,
+                            theme::TEXT_GHOST,
+                        );
                     }
                 }
             });
@@ -5752,30 +6693,33 @@ pub fn draw_detail_edit(
                 // here puts the width jump back.
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
                 .show(ui, |ui| {
+    // **Design 8a's card grid, in place of the one box this form used to be.**
+    //
+    // What was here was a single `Frame` -- white, 10pt radius, a `HAIRLINE`
+    // edge, 14pt of margin -- with every row of every kind stacked inside it.
+    // That box is the thing the owner screenshotted: the name, the user name,
+    // the password, the generator, the seed, the websites, the notes, the
+    // custom fields, the app binding and the folder all running flat down one
+    // column at one weight, with nothing on screen saying where one subject
+    // ended and the next began. 8a's answer is nine titled cards, and the
+    // titles are most of the fix: a user looking for where this login is
+    // OFFERED now has a word to look for.
+    //
+    // The cards are drawn directly on the scroll area, on the pane's
+    // `theme::CANVAS`, which is 8a's `#f7f6f5` ground. There is no outer box
+    // any more, and there must not be: nine bordered cards inside a tenth
+    // border is the "card in a card" the design has nowhere on the page.
     egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(10))
-        .stroke(Stroke::new(1.0, theme::HAIRLINE))
-        .inner_margin(Margin::same(14))
+        // Clear space between the rail's edge and the cards -- and none at all
+        // when there is no rail, where the pane's own margin is already the
+        // inset. See [`RAIL_GUTTER`].
+        .inner_margin(Margin {
+            left: if railed { RAIL_GUTTER } else { 0 },
+            ..Margin::ZERO
+        })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
 
-            theme::field_label(ui, "Name");
-            theme::text_field(ui, &mut draft.name, false);
-            ui.add_space(10.0);
-
-            // **Which of the kind's rows this form is drawing, and which are
-            // behind the Add control.** Both computed here, off the draft,
-            // before the body borrows it -- and both from `EditDraft`'s own
-            // predicates rather than from an `is_empty()` at each row, so the
-            // rule is one decision a test can call instead of twenty
-            // conditions no test can reach. See [`Slot`].
-            //
-            // On a CREATE `shown` is every slot and `addable` is empty, so
-            // everything below draws exactly as it always has.
-            let shown = draft.shown_slots(creating);
-            let addable = draft.addable_slots(creating);
-            let showing = |slot: Slot| shown.contains(&slot);
             // A Remove is offered on a row that is optional, and on an edit.
             // The floor rows have none -- see [`Slot::always_shown`] -- and a
             // create hides nothing, so there is nothing there to take away.
@@ -5785,13 +6729,108 @@ pub fn draw_detail_edit(
             // hold `&mut` into the very boxes `hide_slot` empties.
             let mut hide: Option<Slot> = None;
 
-            // Exhaustive, no catch-all: `ItemKind`'s doc forbids one, and a
-            // `_ =>` here would render a login's username and password box
-            // over whatever kind Bitwarden ships next.
-            // Bound rather than matched in place: the notes block below asks
-            // which body was drawn, and re-deriving it there would be a
-            // second call that a future edit could let disagree with this one.
-            let body = form_body(draft.kind, creating);
+            // Which card a `Changed` mark goes on, off the list taken once at
+            // the top of the frame.
+            let changed = |section: Section| {
+                changes.iter().any(|change: &Change| change.section == section)
+            };
+            // The section the rail asked for, TAKEN rather than read: a
+            // request left in place would re-scroll the form on every frame,
+            // so the user could not then scroll away from it by hand.
+            let wanted = take_rail_request(ui.ctx());
+
+            // **8a's `Item` card**: what the record is, as against what it
+            // holds. 8a puts Folder, Owner and Type on it in a three-column
+            // grid; the name is in 8a's own TITLE BAR, at 20px/800, because 8a
+            // is a whole window and the record's name is the window's subject.
+            //
+            // Here the name is the card's first row instead. This form is a
+            // pane whose title line already says `Edit login`, and a second
+            // 20-point heading under it -- editable, in a box, saying
+            // `Ledgerline` -- would be two titles arguing about which one
+            // names the screen.
+            //
+            // **`Owner` is not drawn**, and it is the one omission on this
+            // card. It is an organisation picker, and nothing in this build
+            // models organisations: `VaultItem` carries no `organizationId`
+            // this form reads, `assignable_folders` knows only folders, and a
+            // dropdown whose only row was the user's own name would be a
+            // control that cannot be used. `Type` IS drawn, disabled, because
+            // an existing item's type cannot be changed and the read-only row
+            // is how 8a says so.
+            section(ui, kind, Section::Item, changed(Section::Item), wanted, |ui| {
+                theme::section_row(ui, "Name", |ui| {
+                    theme::text_field(ui, &mut draft.name, false);
+                });
+                ui.add_space(theme::BLOCK_GAP);
+                theme::section_row(ui, "Folder", |ui| {
+                    // Both the label and the rows read the *assignable* list,
+                    // not the raw one, and the label matters as much as the
+                    // rows: resolving a draft's folder id against the virtual
+                    // bucket is what let an item carrying `folderId: ""`
+                    // display the bucket's name and look correctly filed while
+                    // belonging to nothing. Unresolvable now falls through to
+                    // "No folder", which is at least a state the sidebar
+                    // agrees exists.
+                    let assignable = assignable_folders(folders);
+                    egui::ComboBox::from_id_salt("edit-folder")
+                        .selected_text(
+                            assignable
+                                .iter()
+                                .find(|f| Some(&f.id) == draft.folder_id.as_ref())
+                                .map(|f| f.name.as_str())
+                                .unwrap_or("No folder"),
+                        )
+                        .show_ui(ui, |ui| {
+                            // "No folder" is offered only when it can actually
+                            // take effect -- see `EditDraft::may_unfile`. Shown
+                            // disabled rather than hidden, so the option's
+                            // absence is a visible limitation instead of a
+                            // missing row.
+                            let unfile =
+                                egui::Button::selectable(draft.folder_id.is_none(), "No folder");
+                            if ui.add_enabled(may_unfile, unfile).clicked() {
+                                draft.folder_id = None;
+                            }
+                            for folder in &assignable {
+                                let selected =
+                                    draft.folder_id.as_deref() == Some(folder.id.as_str());
+                                if ui.selectable_label(selected, &folder.name).clicked() {
+                                    draft.folder_id = Some(folder.id.clone());
+                                }
+                            }
+                        });
+                    if !may_unfile {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(
+                                "This item can be moved to another folder, but the Bitwarden \
+                                 CLI this app talks to cannot remove an item from a folder. \
+                                 Un-file it in the web vault or app.",
+                            )
+                            .size(11.0)
+                            .color(theme::TEXT_FAINT),
+                        );
+                    }
+                });
+                ui.add_space(theme::BLOCK_GAP);
+                theme::section_row(ui, "Type", |ui| {
+                    theme::disabled_text_field(ui, kind_noun(kind));
+                });
+            });
+
+            // `body` is bound once at the top of the frame rather than matched
+            // in place, for two reasons that have both had to be paid for: the
+            // notes card below asks which body was drawn, and the RAIL has to
+            // know before any of them are. Exhaustive, no catch-all --
+            // `ItemKind`'s doc forbids one, and a `_ =>` here would render a
+            // login's username and password box over whatever kind Bitwarden
+            // ships next.
+            // **8a's `Login credentials` card**, and the same card under the
+            // kind's own name for everything else -- see [`Section::title`].
+            // Its body is the kind's own rows, unchanged, minus the two that
+            // 8a gives cards of their own: the one-time code and the websites.
+            section(ui, kind, Section::Details, changed(Section::Details), wanted, |ui| {
             match body {
                 FormBody::Login => {
                     // Username and password are the floor for a login -- see
@@ -5799,13 +6838,57 @@ pub fn draw_detail_edit(
                     // neither carries a Remove. Their captions still come
                     // from `Slot::label`, so the Add menu could never name
                     // one of them differently from the row it reveals.
-                    theme::field_label(ui, Slot::Username.label());
-                    theme::text_field(ui, &mut draft.username, false);
-                    ui.add_space(10.0);
+                    theme::section_row(ui, Slot::Username.label(), |ui| {
+                        theme::text_field(ui, &mut draft.username, false);
+                    });
+                    ui.add_space(theme::BLOCK_GAP);
 
-                    theme::field_label(ui, Slot::Password.label());
-                    theme::password_field(ui, &mut draft.password, &mut draft.reveal_password);
+                    theme::section_row(ui, Slot::Password.label(), |ui| {
+                        theme::password_field(
+                            ui,
+                            &mut draft.password,
+                            &mut draft.reveal_password,
+                        );
+                        ui.add_space(8.0);
+                        // **8a's strength meter, on the form that CHANGES the
+                        // password.**
+                        //
+                        // The read pane has rated passwords since
+                        // `detail::metadata_line` was written; the edit form
+                        // rated nothing at all, so the one screen where a user
+                        // can do something about a weak password was the one
+                        // screen that would not say it was weak. A generator
+                        // sits directly under this line and its whole job is
+                        // to fix what the meter reports.
+                        //
+                        // Withheld on an empty box, which is not the same as
+                        // rating it: `password_strength::rate` answers `Weak`
+                        // for `""`, and a create form that opened by telling
+                        // the user their blank password is weak would be
+                        // scolding them for not having typed yet.
+                        if !draft.password.is_empty() {
+                            let rating = password_strength::rate(&draft.password);
+                            theme::strength_meter(
+                                ui,
+                                strength_bars(rating),
+                                rating.label(),
+                                draft.password.chars().count(),
+                            );
+                        }
+                    });
                     ui.add_space(6.0);
+                    // **Indented to the control column, by being a row whose
+                    // label is empty.** 8a hangs `Hide`, `Generate CTRL+G` and
+                    // `Copy` off the right of the password box itself; there is
+                    // no room for that here (the control column is around 200
+                    // points in the shipped pane, and one of these controls is
+                    // a 110-point combo), so the generator keeps its own line.
+                    // What it must not do is start at the CARD's left edge,
+                    // which is where the label column is: a row of buttons
+                    // under `Password` and level with it reads as another
+                    // field's worth of chrome rather than as the password's own
+                    // tools.
+                    theme::section_row(ui, "", |ui| {
                     // The generator, in this form's own idiom rather than
                     // design block 3d's. 3d is the OVERLAY's generator, and it
                     // lives in a file this work does not own.
@@ -5945,45 +7028,17 @@ pub fn draw_detail_edit(
                         ui.add_space(6.0);
                         generator_options(ui, &mut draft.generator);
                     }
-                    ui.add_space(10.0);
+                    });
 
-                    // Below the password and its generator, because that is
-                    // the order the user meets them in when setting an
-                    // account up, and because the seed is the one field on
-                    // this body the generator has nothing to do with.
-                    if showing(Slot::Totp) {
-                    if slot_label(ui, Slot::Totp.label(), removable(Slot::Totp)) {
-                        hide = Some(Slot::Totp);
-                    }
-                    if creating {
-                        theme::disabled_text_field(ui, TOTP_CREATE_NOTICE);
-                    } else {
-                        // Masked, like the password above it and for the same
-                        // reason: it is a secret, and this form may be open
-                        // in front of other people. `password_field` is the
-                        // crate's one masked box -- reaching for a plain
-                        // `text_field` here is the mutation
-                        // `the_totp_seed_is_masked_and_never_painted_in_the_clear`
-                        // exists to catch.
-                        theme::password_field(ui, &mut draft.totp, &mut draft.reveal_totp);
-                    }
-                    ui.add_space(4.0);
-                    ui.label(RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT));
-                    ui.add_space(10.0);
-                    }
-
-                    // Last of the login's own rows, matching the order
-                    // Bitwarden's own clients use (credentials, then the
-                    // one-time code, then where they are used) and the order
-                    // the read pane puts them in.
-                    //
-                    // **The block carries its own Remove per row**, so the
-                    // slot has none of its own: removing the last website is
-                    // what takes the block away, which is handled below the
-                    // match. See [`Slot::Websites`].
-                    if showing(Slot::Websites) {
-                        websites_block(ui, &mut draft.uris, creating);
-                    }
+                    // **The seed and the websites used to be drawn here and
+                    // are not any more.** 8a gives each a card -- `One-time
+                    // code` and `Autofill targets` -- and the reason is the
+                    // one Bitwarden's own clients give by ordering them the
+                    // same way: what you sign in WITH, the second factor, and
+                    // WHERE it is offered are three subjects, and a form that
+                    // runs them together is the flat column the owner
+                    // reported. They are drawn below the match, in their own
+                    // cards, from the same slots and with the same Removes.
                 }
                 FormBody::Card => {
                     let card = &mut draft.card;
@@ -6184,7 +7239,180 @@ pub fn draw_detail_edit(
                 }
             }
 
-            // **The notes, on every kind that is not already all notes.**
+            // **Immediately under the kind's own rows, inside the card they
+            // belong to.** The Add control names the rows this item has not
+            // filled in, so it belongs at the end of the rows it is talking
+            // about -- not below the custom-fields and matched-app cards,
+            // which are about different things and carry their own Adds.
+            //
+            // A slot it reveals may well belong to a LATER card -- `Website`
+            // is on `Autofill targets`, the seed is on `One-time code` -- and
+            // that is not a flaw in the placement: the menu lists the rows
+            // this KIND could have, which is a statement about the kind, and
+            // the row appears in whichever card it is a row of. 8a has no
+            // equivalent control to copy, because 8a draws one fully-populated
+            // record and never shows the sparse case this menu exists for.
+            if let Some(slot) = slot_add_block(ui, &mut draft.add_menu_open, &addable) {
+                draft.reveal_slot(slot);
+            }
+            });
+
+            // **8a's `One-time code` card.** Its own card and not a row on the
+            // credentials one, because it is the second factor and not part of
+            // the first: a user changing a password must not be one mis-click
+            // from replacing the seed that lets them back in.
+            if showing(Slot::Totp) {
+                section(
+                    ui,
+                    kind,
+                    Section::OneTimeCode,
+                    changed(Section::OneTimeCode),
+                    wanted,
+                    |ui| {
+                        if slot_label(ui, Slot::Totp.label(), removable(Slot::Totp)) {
+                            hide = Some(Slot::Totp);
+                        }
+                        if creating {
+                            theme::disabled_text_field(ui, TOTP_CREATE_NOTICE);
+                        } else {
+                            // Masked, like the password and for the same
+                            // reason: it is a secret, and this form may be
+                            // open in front of other people. `password_field`
+                            // is the crate's one masked box -- reaching for a
+                            // plain `text_field` here is the mutation
+                            // `the_totp_seed_is_masked_and_never_painted_in_the_clear`
+                            // exists to catch.
+                            theme::password_field(ui, &mut draft.totp, &mut draft.reveal_totp);
+                        }
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT));
+                    },
+                );
+            }
+            // **The deferred Remove**, applied once for every card that can
+            // ask for one -- see `hide` above. `hide_slot` empties the box as
+            // well as taking the row away, which is why it cannot run while a
+            // card's body still holds a `&mut` into it; one application after
+            // the last card that can set it is also what keeps two cards from
+            // fighting over the variable.
+            if let Some(slot) = hide {
+                draft.hide_slot(slot);
+            }
+
+            // **8a's `Autofill targets` card**: the websites this login is
+            // offered on and the native app it is bound to, together, because
+            // 8a's own subtitle for the card -- `where this login is offered`
+            // -- is the one sentence that covers both. They were a hundred
+            // points apart on the old column with the custom fields between
+            // them.
+            //
+            // Drawn whenever either half has something to say. A login with no
+            // websites still gets the card, because the app row is always
+            // offered: the form that cannot answer "bind this to a program" is
+            // the form that cannot create a binding at all.
+            //
+            // `source` and `palette` are built immediately before the blocks
+            // that read them and dropped immediately after: `source` borrows
+            // the draft's own user-name and password boxes (never a copy of
+            // either), and splitting them from `draft.app` is only possible
+            // field by field like this. See `sequence_source`.
+            let palette = sequence_palette(draft, item);
+            let source = sequence_source(&draft.username, &draft.password, item, totp);
+            section(ui, kind, Section::Autofill, changed(Section::Autofill), wanted, |ui| {
+                // **The block carries its own Remove per row**, so the slot
+                // has none of its own: removing the last website is what takes
+                // the block away, which is handled below. See
+                // [`Slot::Websites`].
+                if showing(Slot::Websites) {
+                    websites_block(ui, &mut draft.uris, creating);
+                    ui.add_space(theme::BLOCK_GAP);
+                }
+                match draft.app.as_mut() {
+                    Some(app) => {
+                        if let Some(requested) = app_block(ui, app, apps) {
+                            action = requested;
+                        }
+                    }
+                    // One assignment, and the block above draws it from the
+                    // next frame on. Nothing is written to the vault by this
+                    // click: the draft is blank until the user picks a
+                    // program, and `app_match_edit` leaves a blank draft
+                    // alone.
+                    None => {
+                        if app_add_block(ui) {
+                            draft.app = Some(AppMatchDraft::unbound());
+                        }
+                    }
+                }
+            });
+
+            // **8a's `Fill rule` card**: what Deskwarden types once it has
+            // matched, as against where it matches.
+            //
+            // Drawn only for a binding that is actually in force. A keystroke
+            // sequence with nothing to type it into is not a setting waiting
+            // to be used, it is a card about a feature the item does not have
+            // -- and the card would sit there, titled and empty, on every
+            // unbound login in the vault. The `Remove app match` on the card
+            // above takes this one away with it, which is the honest reading
+            // of what Remove did.
+            //
+            // 8a's other two rows on this card are NOT drawn, and the reasons
+            // are the same shape as `Section`'s two missing cards:
+            //
+            // * **`On field focus`** -- a per-record Show list / Best match /
+            //   Hotkey only / Never. It would write `AppMatch::trigger`, which
+            //   nothing in this build reads: what a matched foreground window
+            //   does is one global preference, `settings::prompt_on_match`.
+            //   The per-item control was REMOVED for exactly that reason (see
+            //   `app_block`'s own note), and putting it back because a later
+            //   design drew it would be undoing a documented decision on the
+            //   strength of a picture.
+            // * **`Require Windows Hello` / `Show preflight`** -- two toggles
+            //   with no setting behind either. There is no per-record Hello
+            //   gate in this build and no per-record preflight flag; two
+            //   switches that persist nothing are two controls that lie.
+            if draft.app.as_ref().is_some_and(|app| app.bound) {
+                section(ui, kind, Section::FillRule, changed(Section::FillRule), wanted, |ui| {
+                    if let Some(app) = draft.app.as_mut() {
+                        if let Some(requested) = app_sequence_block(ui, app, &palette, &source) {
+                            action = requested;
+                        }
+                    }
+                });
+            }
+            // The websites block's own Remove, one level up: taking the last
+            // website away takes the block with it, so "Website" goes back
+            // into the Add list rather than leaving a heading and an Add
+            // button behind. See [`Slot::Websites`].
+            //
+            // **Below the Fill rule card and not beside the block that asked
+            // for it**, because `source` above borrows the draft's own boxes
+            // and lives until the last card that resolves a preview against
+            // them. One frame of a heading with no rows under it is the cost;
+            // the alternative is a second copy of the user name and password
+            // built for the sake of an earlier line number.
+            if draft.uris.is_empty() {
+                draft.hide_slot(Slot::Websites);
+            }
+
+            // **8a's `Custom fields` card.** The user's own extra data about
+            // the item, which is why it sits below what Deskwarden does with
+            // the item rather than among the kind's own boxes: a PIN the user
+            // added is theirs, and a login's password is the item's.
+            section(
+                ui,
+                kind,
+                Section::CustomFields,
+                changed(Section::CustomFields),
+                wanted,
+                |ui| {
+                    custom_fields_block(ui, &mut draft.fields, creating);
+                },
+            );
+
+            // **8a's `Notes` card**, on every kind that is not already all
+            // notes.
             //
             // Reported: an item's notes were "just not visible on Edit
             // screen". The read pane draws a NOTES card for any item carrying
@@ -6193,9 +7421,9 @@ pub fn draw_detail_edit(
             // every kind all along. Only the editor and the write-back were
             // missing.
             //
-            // Skipped for `FormBody::Note`, whose editor above IS this one: a
-            // secure note's body is item-level `notes`, so drawing it twice
-            // would be two boxes bound to one string.
+            // Skipped for `FormBody::Note`, whose editor in the details card
+            // IS this one: a secure note's body is item-level `notes`, so
+            // drawing it twice would be two boxes bound to one string.
             //
             // Skipped for `UneditableNotice` too, and that one is a judgement
             // rather than a technicality. That body is shown for an item this
@@ -6209,134 +7437,23 @@ pub fn draw_detail_edit(
             // does not -- a box the user has to go looking for is the defect
             // being fixed, not a smaller version of it.
             if draws_own_notes_box(draft.kind, creating) {
-                theme::field_label(ui, Slot::Note.label());
-                // The same multiline box the note kind gets, and for the same
-                // reason: notes run to several lines on any kind. `theme` has
-                // no multiline helper, so this is egui's own, as above.
-                ui.add(
-                    egui::TextEdit::multiline(&mut draft.note_body)
-                        .desired_width(ui.available_width())
-                        .desired_rows(4),
-                );
-                ui.add_space(10.0);
-            }
-
-            // **Immediately under the kind's own rows, and above everything
-            // else.** The Add control names the rows this item has not
-            // filled in, so it belongs at the end of the rows it is talking
-            // about -- not below the custom-fields and matched-app blocks,
-            // which are about different things and carry their own Adds.
-            if let Some(slot) = slot_add_block(ui, &mut draft.add_menu_open, &addable) {
-                draft.reveal_slot(slot);
-            }
-            // The deferred Remove -- see `hide` above. `hide_slot` empties
-            // the box as well as taking the row away, which is why it cannot
-            // run while the body still holds a `&mut` into it.
-            if let Some(slot) = hide {
-                draft.hide_slot(slot);
-            }
-            // ... and the websites block's own Remove, one level up: taking
-            // the last website away takes the block with it, so "Website"
-            // goes back into the Add list rather than leaving a heading and
-            // an Add button behind. See [`Slot::Websites`].
-            if draft.uris.is_empty() {
-                draft.hide_slot(Slot::Websites);
-            }
-
-            // Between the kind's own boxes and the app block: a custom field
-            // is the user's own extra data about the item, so it belongs with
-            // the item's contents and above the section that is about what
-            // Deskwarden does with the item.
-            custom_fields_block(ui, &mut draft.fields, creating);
-
-            // Between the kind's own fields and the folder, because a
-            // binding is neither: it is about what Deskwarden does with this
-            // item, which is the same argument that puts the read pane's
-            // `MATCHED APP` card last among the body cards.
-            //
-            // **Drawn in both states.** An item that HAS a binding gets the
-            // block that edits it; an item that has none gets the heading, a
-            // line saying so, and the button that makes one -- because a form
-            // that can only edit what is already there cannot answer "add an
-            // app", which is what this form is for. The read pane is the other
-            // way round and deliberately so: it shows the MATCHED APP card only
-            // when there is one, since there is nothing to add from there.
-            // Built here, immediately before the block that reads them, and
-            // dropped immediately after: `source` borrows the draft's own
-            // user-name and password boxes (never a copy of either), and
-            // splitting them from `draft.app` is only possible field by field
-            // like this. See `sequence_source`.
-            let palette = sequence_palette(draft, item);
-            let source = sequence_source(&draft.username, &draft.password, item, totp);
-            match draft.app.as_mut() {
-                Some(app) => {
-                    if let Some(requested) = app_block(ui, app, apps, &palette, &source) {
-                        action = requested;
-                    }
-                }
-                // One assignment, and the block above draws it from the next
-                // frame on. Nothing is written to the vault by this click: the
-                // draft is blank until the user picks a program, and
-                // `app_match_edit` leaves a blank draft alone.
-                None => {
-                    if app_add_block(ui) {
-                        draft.app = Some(AppMatchDraft::unbound());
-                    }
-                }
-            }
-            ui.add_space(4.0);
-
-            theme::field_label(ui, "Folder");
-            // Both the label and the rows read the *assignable* list, not the
-            // raw one, and the label matters as much as the rows: resolving a
-            // draft's folder id against the virtual bucket is what let an
-            // item carrying `folderId: ""` display the bucket's name and look
-            // correctly filed while belonging to nothing. Unresolvable now
-            // falls through to "No folder", which is at least a state the
-            // sidebar agrees exists.
-            let assignable = assignable_folders(folders);
-            egui::ComboBox::from_id_salt("edit-folder")
-                .selected_text(
-                    assignable
-                        .iter()
-                        .find(|f| Some(&f.id) == draft.folder_id.as_ref())
-                        .map(|f| f.name.as_str())
-                        .unwrap_or("No folder"),
-                )
-                .show_ui(ui, |ui| {
-                    // "No folder" is offered only when it can actually take
-                    // effect -- see `EditDraft::may_unfile`. Shown disabled
-                    // rather than hidden, so the option's absence is a
-                    // visible limitation instead of a missing row.
-                    let unfile = egui::Button::selectable(draft.folder_id.is_none(), "No folder");
-                    if ui.add_enabled(may_unfile, unfile).clicked() {
-                        draft.folder_id = None;
-                    }
-                    for folder in &assignable {
-                        let selected = draft.folder_id.as_deref() == Some(folder.id.as_str());
-                        if ui.selectable_label(selected, &folder.name).clicked() {
-                            draft.folder_id = Some(folder.id.clone());
-                        }
-                    }
+                section(ui, kind, Section::Notes, changed(Section::Notes), wanted, |ui| {
+                    // The same multiline box the note kind gets, and for the
+                    // same reason: notes run to several lines on any kind.
+                    // `theme` has no multiline helper, so this is egui's own.
+                    ui.add(
+                        egui::TextEdit::multiline(&mut draft.note_body)
+                            .desired_width(ui.available_width())
+                            .desired_rows(4),
+                    );
                 });
-
-            if !may_unfile {
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(
-                        "This item can be moved to another folder, but the Bitwarden CLI this \
-                         app talks to cannot remove an item from a folder. Un-file it in the \
-                         web vault or app.",
-                    )
-                    .size(11.0)
-                    .color(theme::TEXT_FAINT),
-                );
             }
         });
                 })
         })
         .inner;
     note_form_overflow(ui.ctx(), scrolled.content_size.y > scrolled.inner_rect.height());
+
 
     // **Last, and over everything.** Drawn after the form so the overlay's
     // scrim sits on top of the boxes it is asking about, and only ever in
@@ -10833,13 +11950,35 @@ mod sequence_builder_tests {
     /// not a claim about the app: the form scrolls, and what the app can
     /// really be resized to is asserted against `MIN_PANE_WIDTH` below and in
     /// `edit_pane_layout_tests`.
-    /// Raised from 1700 when the login body gained its websites block: the
-    /// builder's own controls went below the fold, egui culled them, and four
-    /// tests here reported "found 0" for a control that was drawn. That is
-    /// the harness measuring itself, not the form -- these tests are about
-    /// the builder's wiring, and the height it needs is whatever the form
-    /// above it happens to be.
-    const PANE: Vec2 = egui::vec2(560.0, 1900.0);
+    /// Raised from 1700 when the login body gained its websites block, and
+    /// from 1900 when design 8a's card grid landed: the builder's own
+    /// controls went below the fold, egui culled them, and several tests here
+    /// reported "found 0" for a control that was drawn. That is the harness
+    /// measuring itself, not the form -- these tests are about the builder's
+    /// wiring, and the height it needs is whatever the form above it happens
+    /// to be.
+    ///
+    /// **The 8a raise is the card chrome, and it is worth naming.** Seven
+    /// titled cards cost a 38-point header band and 24 points of body padding
+    /// each, plus the twelve between them: around 500 points of structure the
+    /// one flat box did not spend. That is the price of the thing being
+    /// bought -- a form whose sections are named -- and it is paid in scroll,
+    /// not in anything going off the pane, which is what
+    /// `edit_pane_layout_tests` is for.
+    ///
+    /// **The WIDTH moved too, by exactly `SIDEBAR_WIDTH`**, and for a reason
+    /// that is the same kind of thing: 8a's section rail takes a 212-point
+    /// panel out of the pane before the cards are laid out, so a 560-point
+    /// pane now offers the builder around 330 points where it used to offer
+    /// 546. At 330 the builder's own control row WRAPS -- the eye, `Use the
+    /// default` and `Done` fall onto two lines -- and `row_below` then finds
+    /// the row's own continuation instead of the preview under it. That is
+    /// the harness measuring the rail, not the builder. Widening by the
+    /// rail's own constant hands the card column back the width every
+    /// assertion in this module was written against; the wrapping itself is
+    /// tested where it belongs, at `MIN_PANE_WIDTH`, by
+    /// `every_chip_and_button_is_reachable_at_the_apps_minimum_width`.
+    const PANE: Vec2 = egui::vec2(560.0 + crate::vault_window::SIDEBAR_WIDTH, 2600.0);
 
     /// The narrowest the detail pane can be -- the same derivation, and the
     /// same reason, as `edit_pane_layout_tests`'s.
@@ -12869,6 +14008,14 @@ mod edit_pane_layout_tests {
     /// The label the disabled Save wears while the name is empty.
     const SAVE: &str = "Save (needs a name)";
 
+    /// The title of the last card design 8a's grid draws on a login --
+    /// `Notes` -- which is what "the bottom of the form" means now.
+    ///
+    /// Taken from [`Section::title`] rather than written out, so a card
+    /// reordered or renamed moves this test instead of leaving it asserting
+    /// about a string the form no longer paints.
+    const LAST_CARD: &str = Section::Notes.title(ItemKind::Login);
+
     /// The suffix the generator's size spinner wears in each of the row's two
     /// states. One place, so a test that measures one state cannot silently
     /// be measuring the other's widget.
@@ -13291,7 +14438,7 @@ mod edit_pane_layout_tests {
     /// draft's validity.
     #[test]
     fn the_button_strips_controls_share_one_baseline() {
-        for (what, name) in [(true, "Save"), (false, SAVE)] {
+        for (what, name) in [(true, SAVE_BUTTON), (false, SAVE)] {
             let ctx = styled_context(ROOMY_PANE);
             let mut draft = tallest_draft();
             if what {
@@ -13344,7 +14491,7 @@ mod edit_pane_layout_tests {
         // `RichText`, whose font id is private.
         let expected =
             egui::FontId::new(13.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
-        for name in [SAVE, SAVE_TEMPLATE_BLOCKED, "Save"] {
+        for name in [SAVE, SAVE_TEMPLATE_BLOCKED, SAVE_BUTTON] {
             let ctx = styled_context(ROOMY_PANE);
             let mut draft = tallest_draft();
             if name != SAVE {
@@ -13365,7 +14512,7 @@ mod edit_pane_layout_tests {
                     draft.sequence_fault().is_some(),
                     "the blocked case wants a template this build cannot read back"
                 );
-            } else if name == "Save" {
+            } else if name == SAVE_BUTTON {
                 assert!(draft.is_saveable(), "the plain case wants a saveable draft");
             }
             let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
@@ -13525,7 +14672,7 @@ mod edit_pane_layout_tests {
 
         let mut enabled = tallest_draft();
         enabled.name = "Ledgerline".to_string();
-        let (_, on) = fill_of(&mut enabled, "Save");
+        let (_, on) = fill_of(&mut enabled, SAVE_BUTTON);
 
         let mut disabled = tallest_draft();
         assert!(!disabled.is_valid(), "the disabled case wants an invalid draft");
@@ -13591,7 +14738,7 @@ mod edit_pane_layout_tests {
         let mut valid = tallest_draft();
         valid.name = "Ledgerline".to_string();
         assert!(valid.is_valid(), "the control case wants a saveable draft");
-        let (idle, saved) = press(&mut valid, "Save");
+        let (idle, saved) = press(&mut valid, SAVE_BUTTON);
         assert_eq!(
             idle,
             EditAction::None,
@@ -14019,9 +15166,17 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// The other half of the fix: the fields the buttons were pinned away from
-    /// are reachable. Scrolling brings the LAST thing in the form ("Folder")
-    /// on screen, and it does not drag the buttons off.
+    /// The other half of the fix: the fields the buttons were pinned away
+    /// from are reachable. Scrolling brings the LAST thing in the form on
+    /// screen, and it does not drag the buttons off.
+    ///
+    /// **The last thing used to be "Folder" and is now [`LAST_CARD`]**, and
+    /// the re-target is not a weakening: design 8a puts the folder on the
+    /// `Item` card at the TOP of the form -- it is what the record IS -- so
+    /// "Folder" is now visible before any scrolling at all, which would make
+    /// this test's own control assertion fail and the scroll a no-op. The
+    /// property asserted is unchanged: whatever the form draws last is
+    /// reachable, and reaching it leaves the buttons where they were.
     #[test]
     fn the_form_scrolls_to_its_last_field_while_the_buttons_stay_put() {
         let pane = egui::vec2(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
@@ -14039,7 +15194,7 @@ mod edit_pane_layout_tests {
             // unscrolled field is not merely painted out of bounds -- egui
             // culls it and paints NOTHING, which is exactly why the user saw
             // no Save button at all rather than a Save button off the edge.
-            !before.rects_of("Folder").iter().any(|r| bounds.contains_rect(*r)),
+            !before.rects_of(LAST_CARD).iter().any(|r| bounds.contains_rect(*r)),
             "the tall form already fits in a {}x{} pane, so this test is not \
              exercising scrolling at all",
             pane.x,
@@ -14070,7 +15225,7 @@ mod edit_pane_layout_tests {
         }
         let after = frame(&ctx, pane, &mut draft, true, &[]);
 
-        assert_inside("the last field's label (Folder)", "Folder", pane, &after);
+        assert_inside("the last card's title", LAST_CARD, pane, &after);
         assert_eq!(
             after.rect_of(SAVE),
             save_before,
@@ -15539,23 +16694,57 @@ mod edit_pane_layout_tests {
                 );
             }
 
+            // **Walked down in steps, not flung to the bottom.**
+            //
+            // One -4000 point wheel used to do it, because the app block was
+            // the last thing on the form. Design 8a's grid puts two more cards
+            // under it -- `Custom fields` and `Notes` -- so a scroll to the
+            // end now goes PAST the control this test is about, and the old
+            // single flick would have reported a button that is perfectly
+            // reachable as unreachable. Stepping is the honest statement of
+            // the property anyway: the user turns a wheel, and somewhere in
+            // the form's scroll the control and its sentence are both fully on
+            // screen at once.
             let middle = Pos2::new(pane.x / 2.0, pane.y / 2.0);
-            let scroll = vec![
-                egui::Event::PointerMoved(middle),
-                egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: egui::vec2(0.0, -4000.0),
-                    modifiers: egui::Modifiers::NONE,
-                    phase: egui::TouchPhase::Move,
-                },
-            ];
-            let _ = frame(&ctx, pane, &mut draft, true, &scroll);
-            let after = frame(&ctx, pane, &mut draft, true, &[]);
-
+            let mut reached = None;
+            for _ in 0..40 {
+                let scroll = vec![
+                    egui::Event::PointerMoved(middle),
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point,
+                        delta: egui::vec2(0.0, -60.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                    },
+                ];
+                let _ = frame(&ctx, pane, &mut draft, true, &scroll);
+                // egui smooths a wheel step out over several frames.
+                for _ in 0..6 {
+                    let _ = frame(&ctx, pane, &mut draft, true, &[]);
+                }
+                let after = frame(&ctx, pane, &mut draft, true, &[]);
+                // The button AND the notice above it, on one frame: the
+                // sentence that says what the button is for is useless where
+                // it cannot be read, which is the state `aae9429` shipped.
+                let shown = |label: &str| {
+                    after
+                        .rects_of(label)
+                        .iter()
+                        .any(|r| bounds.contains_rect(*r) && within_pane(*r, pane))
+                };
+                if shown(APP_ADD_BUTTON) && shown(APP_NONE_NOTICE) {
+                    reached = Some(after);
+                    break;
+                }
+            }
+            let after = reached.unwrap_or_else(|| {
+                panic!(
+                    "the Add an app button and its notice were never both fully on a {}x{} \
+                     pane at any scroll position",
+                    pane.x, pane.y
+                )
+            });
             assert_inside("the Add an app button", APP_ADD_BUTTON, pane, &after);
-            // ...and the notice above it, which is the sentence that says what
-            // the button is for. A button alone, with its explanation scrolled
-            // off, is the state `aae9429` shipped.
             assert_inside("the unbound notice", APP_NONE_NOTICE, pane, &after);
             // The action strip did not come with it.
             assert_inside("Save", SAVE, pane, &after);
@@ -16606,6 +17795,413 @@ mod edit_pane_layout_tests {
             "two runs that share an edge ({grazed:?}) are being called an overlap"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Design 8a -- the card grid, the rail, the sticky footer, the dirty
+    // state
+    // -----------------------------------------------------------------
+    //
+    // Every test below runs at TWO sizes: a pane the app really ships (the
+    // detail pane at the 1240-point window) and the pane's width at
+    // `settings::MIN_VAULT_WINDOW_SIZE`. The two are not the same layout --
+    // the rail is drawn at one and not the other, and section rows are a
+    // label column at one and a stack at the other -- so a test that ran at
+    // either alone would be a test of half the form.
+
+    /// The shipped detail pane, tall enough that nothing is culled.
+    ///
+    /// `1240 - 212 - 390` wide, derived from the three constants that produce
+    /// it, so a window resized elsewhere moves this rather than leaving it
+    /// asserting about a pane nobody has.
+    const GRID_PANE: Vec2 = egui::vec2(
+        1240.0 - crate::vault_window::SIDEBAR_WIDTH - crate::vault_window::LIST_WIDTH,
+        UNCULLED_PANE_HEIGHT,
+    );
+
+    /// The same pane at the window's floor.
+    const GRID_MIN_PANE: Vec2 = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+
+    /// Both, for the loops below. Named so that a test that forgets one does
+    /// not compile as a test that quietly checks a single width.
+    const GRID_PANES: [Vec2; 2] = [GRID_PANE, GRID_MIN_PANE];
+
+    /// A saved login, as JSON, so `EditDraft::from_item` produces an EDIT
+    /// draft -- the state design 8a is about, and the one `empty_of` cannot
+    /// give: a create form hides the websites block, the seed and the custom
+    /// fields behind "can be added once this item has been saved".
+    fn a_login() -> VaultItem {
+        serde_json::from_str(
+            r#"{"id":"grid-1","type":1,"name":"Ledgerline","fields":[],
+                "login":{"username":"a.novak@ledgerline.com",
+                         "password":"correct-horse-battery-staple-7"}}"#,
+        )
+        .expect("the grid fixture is valid item JSON")
+    }
+
+    /// A login carrying something in every card 8a draws: a user name, a
+    /// password, a seed, a website, a binding with a sequence, a custom field
+    /// and a note.
+    fn full_login_draft() -> EditDraft {
+        let mut draft = tallest_draft();
+        draft.name = "Ledgerline".to_string();
+        draft.username = "a.novak@ledgerline.com".to_string();
+        draft.password = "correct-horse-battery-staple-7".to_string();
+        draft.totp = "JBSWY3DPEHPK3PXP".to_string();
+        draft.uris = vec![UriDraft::new()];
+        draft.uris[0].uri = "https://app.ledgerline.com".to_string();
+        draft.note_body = "Workspace SSO is disabled.".to_string();
+        draft.fields = vec![FieldDraft::new_of(FieldRole::Text)];
+        draft.fields[0].name = "Client ID".to_string();
+        draft.fields[0].value = "LGL-4471".to_string();
+        if let Some(app) = draft.app.as_mut() {
+            app.sequence = "{USERNAME}{TAB}{PASSWORD}".to_string();
+        }
+        draft
+    }
+
+    /// **Every card design 8a draws is TITLED, and the title sits in a white
+    /// band on a bordered card.**
+    ///
+    /// This is the report, stated as geometry. What the owner screenshotted
+    /// was a single box with every row of the form stacked inside it; the
+    /// titles are the fix, and a title painted with no card round it would be
+    /// a heading in a flat column -- the same defect with extra words.
+    ///
+    /// So both halves are asserted: the string is drawn, AND there is a
+    /// `theme::CARD` rectangle edged in `theme::HAIRLINE` that contains it.
+    #[test]
+    fn every_section_card_is_titled_and_carries_the_designs_own_edge() {
+        let mut panes = 0;
+        for pane in GRID_PANES {
+            panes += 1;
+            let ctx = styled_context(pane);
+            let mut draft = full_login_draft();
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+            let mut titles = 0;
+            for (section, _) in drawn_sections(draft.kind, false, &draft, &draft.shown_slots(false))
+            {
+                titles += 1;
+                let title = section.title(draft.kind);
+                let drawn: Vec<Rect> = painted.rects_of(title);
+                assert!(
+                    !drawn.is_empty(),
+                    "{pane:?}: the {title:?} card has no title on it at all: {:?}",
+                    painted.strings()
+                );
+                // The card round it: a white box that contains the title and
+                // is a good deal wider than it -- so a `field_label` sitting
+                // in a flat column, with nothing behind it but the pane,
+                // cannot satisfy this.
+                let title_rect = drawn[0];
+                let card = painted
+                    .rects
+                    .iter()
+                    .find(|(r, fill)| {
+                        *fill == theme::CARD
+                            && r.contains_rect(title_rect)
+                            && r.width() > title_rect.width() + 24.0
+                    })
+                    .map(|(r, _)| *r)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{pane:?}: {title:?} is painted but no white card contains it -- \
+                             the titles are back in a flat column"
+                        )
+                    });
+                // ...and the rule that closes the title band, inside that
+                // card and under the title. A card whose header ran straight
+                // into its rows would be a box with a bold first line, which
+                // is what the flat column already had.
+                assert!(
+                    painted.rects.iter().any(|(r, fill)| {
+                        *fill == theme::HAIRLINE
+                            && r.height() <= 2.0
+                            && r.top() >= title_rect.bottom()
+                            && r.left() >= card.left() - 1.0
+                            && r.right() <= card.right() + 1.0
+                    }),
+                    "{pane:?}: the {title:?} card's title band is not closed by a hairline"
+                );
+            }
+            assert!(titles >= 5, "{pane:?}: only {titles} cards were checked");
+        }
+        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
+    }
+
+    /// **The section rail appears where the cards can still be read, and
+    /// nowhere else.**
+    ///
+    /// Both directions, because the rule only means something as a pair: at
+    /// the shipped pane the rail is there, and at the window's floor -- where
+    /// 212 points of it would leave 86 of card -- it is not, and the form
+    /// keeps every control it had.
+    #[test]
+    fn the_rail_is_drawn_only_where_the_cards_can_afford_it() {
+        let ctx = styled_context(GRID_PANE);
+        let mut draft = full_login_draft();
+        let _ = frame(&ctx, GRID_PANE, &mut draft, false, &[]);
+        let roomy = frame(&ctx, GRID_PANE, &mut draft, false, &[]);
+        assert!(
+            roomy.strings().contains(&RAIL_HEADING),
+            "the shipped detail pane is wide enough for the rail and has none: {:?}",
+            roomy.strings()
+        );
+        // ...and it really is the design's column, not a narrow strip that
+        // happens to carry the word.
+        let heading = roomy.rect_of(RAIL_HEADING);
+        assert!(
+            heading.left() < RAIL_WIDTH,
+            "the rail heading is at x = {} -- that is not the left column",
+            heading.left()
+        );
+
+        let ctx = styled_context(GRID_MIN_PANE);
+        let mut draft = full_login_draft();
+        let _ = frame(&ctx, GRID_MIN_PANE, &mut draft, false, &[]);
+        let narrow = frame(&ctx, GRID_MIN_PANE, &mut draft, false, &[]);
+        assert!(
+            !narrow.strings().contains(&RAIL_HEADING),
+            "a 212-point rail is being drawn in a {}-point pane, which leaves {} points of \
+             card: {:?}",
+            GRID_MIN_PANE.x,
+            GRID_MIN_PANE.x - RAIL_WIDTH,
+            narrow.strings()
+        );
+        // The control that makes the absence a decision rather than a
+        // casualty: the form is all still there.
+        for label in ["Item", "Login credentials"] {
+            assert!(
+                narrow.strings().contains(&label),
+                "{label:?} went with the rail: {:?}",
+                narrow.strings()
+            );
+        }
+    }
+
+    /// **Clicking a rail entry brings that card into view**, which is the one
+    /// thing the rail is for.
+    ///
+    /// A filter would satisfy "the card the user asked for is on screen" just
+    /// as well and is the wrong answer -- see `draw_section_rail` -- so the
+    /// other half is asserted too: the cards the user did NOT ask for are
+    /// still drawn.
+    #[test]
+    fn clicking_a_rail_entry_scrolls_that_card_into_view() {
+        // A pane the form really overflows, so scrolling is the only thing
+        // that can put the last card on screen.
+        let pane = egui::vec2(GRID_PANE.x, MIN_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = full_login_draft();
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let before = frame(&ctx, pane, &mut draft, false, &[]);
+        let bounds = Rect::from_min_size(Pos2::ZERO, pane);
+        let last = Section::Notes.title(draft.kind);
+        // The control: the card is not already on screen, so a green run
+        // below is the rail's doing.
+        // **In the CARD column**, not merely on screen: the rail draws the
+        // very same word in its own entry, so an unqualified search would
+        // find the rail and call the card visible.
+        assert!(
+            !before
+                .rects_of(last)
+                .iter()
+                .any(|r| bounds.contains_rect(*r) && r.left() > RAIL_WIDTH),
+            "the {last:?} card is already in view, so this test is not exercising the rail"
+        );
+
+        // The rail entry, found by its own text in the rail's column.
+        let entry = before
+            .rects_of(last)
+            .into_iter()
+            .find(|r| r.left() < RAIL_WIDTH)
+            .unwrap_or_else(|| {
+                panic!("the rail has no {last:?} entry: {:?}", before.strings())
+            });
+        let _ = frame(&ctx, pane, &mut draft, false, &click(entry.center()));
+        // egui's scroll-to is applied on the frame after the request and then
+        // settles; these are the frames the app would draw.
+        for _ in 0..12 {
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        }
+        let after = frame(&ctx, pane, &mut draft, false, &[]);
+
+        assert!(
+            after
+                .rects_of(last)
+                .iter()
+                .any(|r| bounds.contains_rect(*r) && r.left() > RAIL_WIDTH),
+            "clicking the rail's {last:?} entry did not bring the card into view: {:?}",
+            after.strings()
+        );
+        // ...and it did not hide anything: the first card is still drawn.
+        assert!(
+            after.strings().contains(&"Item"),
+            "the rail filtered the form instead of scrolling it: {:?}",
+            after.strings()
+        );
+    }
+
+    /// **The footer counts the changes, and says so in words on every width.**
+    ///
+    /// The count is the part of 8a's dirty state that must never be elided --
+    /// the title-bar pill and the cards' marks both stand down on a narrow
+    /// pane, so if this went too a user at the window's floor would have
+    /// nothing on screen saying there was anything to lose.
+    #[test]
+    fn the_footer_says_what_is_waiting_to_be_saved_at_every_width() {
+        let mut panes = 0;
+        for pane in GRID_PANES {
+            panes += 1;
+            // Pristine first: the footer still says something.
+            let ctx = styled_context(pane);
+            let mut clean = EditDraft::from_item(&a_login());
+            assert!(!clean.is_dirty(), "the pristine case starts dirty");
+            let _ = frame(&ctx, pane, &mut clean, false, &[]);
+            let painted = frame(&ctx, pane, &mut clean, false, &[]);
+            assert_inside("the no-changes note", NO_CHANGES_NOTE, pane, &painted);
+
+            // ...then two real edits, which 8a reports as `2 changes`.
+            let ctx = styled_context(pane);
+            let mut dirty = EditDraft::from_item(&a_login());
+            dirty.name = "Renamed".to_string();
+            dirty.username = "somebody.else@ledgerline.com".to_string();
+            let expected = change_summary(&dirty.changes(), &dirty.password);
+            assert_eq!(expected, "2 changes", "the fixture is not two changes");
+            let _ = frame(&ctx, pane, &mut dirty, false, &[]);
+            let painted = frame(&ctx, pane, &mut dirty, false, &[]);
+            assert_inside("the change count", &expected, pane, &painted);
+        }
+        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
+    }
+
+    /// **A changed field marks its own card and no other.**
+    ///
+    /// The mark is the rail's and the card's shared claim, and a mark that
+    /// appeared on every card once anything moved would be no information at
+    /// all -- which is exactly what the whole-draft `is_dirty` could have
+    /// supported, and the reason the diff is per field.
+    #[test]
+    fn a_changed_field_marks_its_own_card_and_leaves_the_others_alone() {
+        let mut panes = 0;
+        for pane in GRID_PANES {
+            panes += 1;
+            let ctx = styled_context(pane);
+            let mut draft = EditDraft::from_item(&a_login());
+            draft.password.push_str("-edited");
+
+            assert!(draft.section_changed(Section::Details), "the password's own card is clean");
+            for other in [Section::Item, Section::Autofill, Section::CustomFields, Section::Notes]
+            {
+                assert!(
+                    !draft.section_changed(other),
+                    "{other:?} is marked changed by a password edit"
+                );
+            }
+            let named: Vec<&str> = draft.changes().iter().map(|c| c.label).collect();
+            assert_eq!(
+                named,
+                vec!["Password"],
+                "the change list does not name the field that moved"
+            );
+
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+            // One `Changed` pill on the card, plus -- where the rail is drawn
+            // -- one `Changed` heading in it. Never zero.
+            assert!(
+                painted.strings().contains(&theme::CHANGED_PILL),
+                "{pane:?}: nothing on screen says a field changed: {:?}",
+                painted.strings()
+            );
+            assert!(
+                painted.strings().contains(&"Password"),
+                "{pane:?}: the form does not name the changed field anywhere"
+            );
+        }
+        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
+    }
+
+    /// **The password box carries a strength readout, at both widths.**
+    ///
+    /// The read pane has rated passwords since `detail::metadata_line` was
+    /// written and this form rated nothing -- so the one screen where a user
+    /// can do something about a weak password was the screen that would not
+    /// say it was weak, with a generator sitting directly under the silence.
+    ///
+    /// The word, not the bars: four blue rectangles are a picture, and a
+    /// picture with no word beside it is a meter whose scale the user has to
+    /// guess.
+    #[test]
+    fn the_password_box_says_how_strong_the_password_is() {
+        let mut cases = 0;
+        for pane in GRID_PANES {
+            for (password, word) in [
+                ("aA1!", password_strength::Strength::Weak.label()),
+                ("correct-horse-battery-staple-7", password_strength::Strength::Strong.label()),
+            ] {
+                cases += 1;
+                let ctx = styled_context(pane);
+                let mut draft = EditDraft::from_item(&a_login());
+                draft.password = password.to_string();
+                let _ = frame(&ctx, pane, &mut draft, false, &[]);
+                let painted = frame(&ctx, pane, &mut draft, false, &[]);
+                assert!(
+                    painted.rendered.iter().any(|(_, drawn, _)| drawn.starts_with(word)),
+                    "{pane:?}: a {word} password draws no rating at all: {:?}",
+                    painted.strings()
+                );
+            }
+            // ...and an EMPTY box rates nothing, which is not the same as
+            // rating it `Weak`: a create form that opened by scolding the user
+            // for not having typed yet would be a form arguing with them.
+            cases += 1;
+            let ctx = styled_context(pane);
+            let mut empty = EditDraft::empty_of(ItemKind::Login);
+            let _ = frame(&ctx, pane, &mut empty, true, &[]);
+            let painted = frame(&ctx, pane, &mut empty, true, &[]);
+            assert!(
+                !painted
+                    .rendered
+                    .iter()
+                    .any(|(_, drawn, _)| drawn.starts_with(password_strength::Strength::Weak.label())),
+                "{pane:?}: an empty password box is being rated: {:?}",
+                painted.strings()
+            );
+        }
+        assert_eq!(cases, 6, "the case loop visited {cases} cases, not six");
+    }
+
+    /// **Ctrl+S is not advertised.**
+    ///
+    /// 8a puts a `CTRL+S` chip on its Save button and `Ctrl+S save \u{b7} Esc
+    /// cancel \u{b7} Ctrl+G generate` down its rail. None of the three is
+    /// bound by this form -- `egui::Key::S` belongs to Send-a-record and a
+    /// guard in `vault_window::mod` asserts it is spelled nowhere else in
+    /// production -- so drawing the hints would be three controls that lie.
+    ///
+    /// Pinned rather than left to judgement, because the next person to put
+    /// this form beside 8a will see three missing hints and reach for them.
+    #[test]
+    fn the_form_advertises_no_keyboard_shortcut_it_does_not_have() {
+        let mut panes = 0;
+        for pane in GRID_PANES {
+            panes += 1;
+            let ctx = styled_context(pane);
+            let mut draft = full_login_draft();
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+            for chord in ["CTRL+S", "Ctrl+S", "Ctrl+G", "Esc cancel"] {
+                assert!(
+                    !painted.strings().iter().any(|s| s.contains(chord)),
+                    "{pane:?}: the form advertises {chord:?}, which nothing in it binds: {:?}",
+                    painted.strings()
+                );
+            }
+        }
+        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
+    }
 }
 
 /// **"Has this draft changed?" as a decision about a value**, tested by
@@ -16692,7 +18288,147 @@ mod draft_dirtiness_tests {
                 "changing {what} left the draft looking untouched -- Cancel would walk out \
                  with it without asking"
             );
+            // **...and the per-field diff agrees with the whole-draft one.**
+            //
+            // This is the property that makes design 8a's footer and its
+            // rail trustworthy: a draft that is dirty must be able to say
+            // WHICH field moved. A `changes()` that came back empty over a
+            // dirty draft would print "no changes yet" above a Cancel that
+            // asks whether to discard them.
+            assert!(
+                !draft.changes().is_empty(),
+                "changing {what} made the draft dirty but named no field: the footer would \
+                 count nothing while Cancel asked about something"
+            );
         }
+    }
+
+    /// **Every [`ChangeUnit`] appears in `ALL` exactly once.**
+    ///
+    /// `COUNT` sizes the digest array and `ALL` is what `changes()` walks, so
+    /// a unit added to the enumeration and left out of `ALL` would be
+    /// digested -- making the draft dirty -- and never named. A footer
+    /// reading "1 change" over a rail listing none is the visible form of it,
+    /// and nothing else in the crate would fail.
+    #[test]
+    fn every_change_unit_is_listed_once() {
+        assert_eq!(
+            ChangeUnit::ALL.len(),
+            ChangeUnit::COUNT,
+            "ALL and COUNT disagree, so a unit is either unnamed or named twice"
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for unit in ChangeUnit::ALL {
+            assert!(seen.insert(unit as usize), "{unit:?} is listed in ALL twice");
+            // ...and the label is a real word rather than a placeholder,
+            // because the rail prints it verbatim.
+            assert!(!unit.label().is_empty(), "{unit:?} has no label for the rail to print");
+        }
+        assert_eq!(seen.len(), ChangeUnit::COUNT);
+    }
+
+    /// **Each editable field is reported under its own name.**
+    ///
+    /// The whole point of replacing one whole-draft digest with a partition:
+    /// 8a's rail says `Password`, not `something changed`. Checked field by
+    /// field, because a partition that mapped two fields onto one unit would
+    /// report the wrong word and nothing else would notice.
+    #[test]
+    fn a_change_is_named_after_the_field_that_moved() {
+        let cases: Vec<(&str, fn(&mut EditDraft))> = vec![
+            ("Name", |d| d.name = "Renamed".to_string()),
+            ("Folder", |d| d.folder_id = Some("f2".to_string())),
+            ("Username", |d| d.username = "other@example.invalid".to_string()),
+            ("Password", |d| d.password = "changed".to_string()),
+            ("One-time code", |d| d.totp = "JBSWY3DPEHPK3PXP".to_string()),
+            ("Note", |d| d.note_body = "rewritten".to_string()),
+            ("Card details", |d| d.card.number = "4111111111111111".to_string()),
+            ("Identity", |d| d.identity.first_name = "Ada".to_string()),
+            ("Key", |d| d.ssh_key.private_key = "-----BEGIN".to_string()),
+            ("Custom fields", |d| d.fields.push(FieldDraft::new_of(FieldRole::Text))),
+            ("Websites", |d| d.uris.push(UriDraft::new())),
+        ];
+        let mut checked = 0;
+        for (label, edit) in cases {
+            checked += 1;
+            let mut draft = EditDraft::from_item(&item());
+            edit(&mut draft);
+            let named: Vec<&str> = draft.changes().iter().map(|c| c.label).collect();
+            assert_eq!(
+                named,
+                vec![label],
+                "an edit to {label:?} was reported as {named:?}"
+            );
+        }
+        assert_eq!(checked, 11, "the case list walked {checked} cases, not eleven");
+    }
+
+    /// **The binding's target and its keystrokes are two changes, not one.**
+    ///
+    /// 8a draws them as two cards -- `Autofill targets` and `Fill rule` -- so
+    /// the diff has to be able to tell them apart. They live in one struct
+    /// and are digested off one `AppMatch`, which is exactly the arrangement
+    /// that would let a lazy split report both for either.
+    #[test]
+    fn re_pointing_an_app_and_re_typing_its_keystrokes_are_different_changes() {
+        let bound = item();
+        let mut draft = EditDraft::from_item(&bound);
+        draft.app = Some(AppMatchDraft::unbound());
+        let sealed = draft.clone().seal();
+
+        let mut target = sealed.clone();
+        target.app.as_mut().expect("the fixture carries a binding").process =
+            "msedge.exe".to_string();
+        assert_eq!(
+            target.changes().iter().map(|c| c.section).collect::<Vec<_>>(),
+            vec![Section::Autofill],
+            "re-pointing the binding was not reported against the autofill card"
+        );
+
+        let mut typed = sealed;
+        typed.app.as_mut().expect("the fixture carries a binding").sequence =
+            "{USERNAME}{TAB}{PASSWORD}".to_string();
+        assert_eq!(
+            typed.changes().iter().map(|c| c.section).collect::<Vec<_>>(),
+            vec![Section::FillRule],
+            "re-typing the keystrokes was not reported against the fill-rule card"
+        );
+    }
+
+    /// **What the footer says, as a decision about a value.**
+    ///
+    /// 8a prints `2 changes \u{b7} password will be added to history` flat,
+    /// because 8a has exactly one rendered state. The history clause is only
+    /// true when the password really moved and there is an old value to file,
+    /// and a rename that claimed it would be a small lie in the one place the
+    /// user is deciding whether to press Save.
+    #[test]
+    fn the_footer_summary_only_promises_a_history_entry_when_there_will_be_one() {
+        let none: Vec<Change> = Vec::new();
+        assert_eq!(change_summary(&none, "anything"), NO_CHANGES_NOTE);
+
+        let renamed = vec![Change { label: "Name", section: Section::Item }];
+        assert_eq!(change_summary(&renamed, "unchanged"), "1 change");
+
+        let two = vec![
+            Change { label: "Name", section: Section::Item },
+            Change { label: "Username", section: Section::Details },
+        ];
+        assert_eq!(change_summary(&two, "unchanged"), "2 changes");
+
+        let moved = vec![
+            Change { label: ChangeUnit::Password.label(), section: Section::Details },
+            Change { label: "Name", section: Section::Item },
+        ];
+        assert_eq!(
+            change_summary(&moved, "a-new-password"),
+            "2 changes \u{b7} password will be added to history"
+        );
+
+        // ...and a CLEARED password promises nothing: there is no old value
+        // being archived that the user would want warning of, and the
+        // sentence over an empty box reads as a threat to store the blank.
+        assert_eq!(change_summary(&moved, ""), "2 changes");
     }
 
     /// **...and the things that are NOT edits do not.**

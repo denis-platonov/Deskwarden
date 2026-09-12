@@ -114,6 +114,15 @@ pub const CAUTION_WASH: Color32 = Color32::from_rgb(0xfe, 0xf6, 0xe7);
 pub const CAUTION_MARK: Color32 = Color32::from_rgb(0x8a, 0x5a, 0x06);
 /// Text on a [`CAUTION_WASH`] surface -- 5c's `color: #7a4f05`.
 pub const CAUTION_INK: Color32 = Color32::from_rgb(0x7a, 0x4f, 0x05);
+/// Border of a [`CAUTION_WASH`] surface -- 8a's `border: 1px solid #f2d99b`,
+/// on its `Unsaved changes` pill and on the `Changed now` note beside the
+/// password it is about.
+///
+/// The third of the trio, added when a caution surface finally needed an
+/// EDGE: 5c's band is a full-width strip that reads as a band without one,
+/// and a pill without a border is a smear of amber. [`DANGER_EDGE`] and
+/// [`DONE_EDGE`] have been here since their washes were.
+pub const CAUTION_EDGE: Color32 = Color32::from_rgb(0xf2, 0xd9, 0x9b);
 
 /// The design's one green, in the same three values.
 ///
@@ -5955,6 +5964,382 @@ pub fn form_footer_note_width(ui: &Ui, text: &str) -> f32 {
         .size()
         .x
 }
+
+// ---------------------------------------------------------------------------
+// The section card -- design §8a
+// ---------------------------------------------------------------------------
+//
+// **§8a's grid card, which is not §5a's composer card**, and the distinction
+// is worth a paragraph because the two are four values apart and it would be
+// easy to read them as one control drawn twice.
+//
+// §5a is ONE card that IS the form: `border: 1px solid #d7d3d3`, `radius:
+// 12px`, a `0 14px 34px` shadow, a 14px/800 heading. It is a thing laid ON the
+// pane, and the shadow is what says so.
+//
+// §8a is NINE cards laid out in a grid on `#f7f6f5`: `border: 1px solid
+// #eae7e7`, `radius: 10px`, **no shadow at all**, and a 12px/700 uppercase
+// title tracked at 0.06em in `#605d5d`. They are regions OF the page, not
+// objects on it, and nine shadowed cards stacked twelve points apart would
+// read as nine floating panels -- the visual noise the design avoids by
+// spending one grey on a border and nothing on elevation.
+//
+// So this is a second card, sharing §5a's padding constants (a card inside
+// this app's detail pane has the same width problem whichever design drew it)
+// and differing in exactly the four values above. The band helpers below are
+// the same three-band idiom for the same reason `form_card_header` gives.
+//
+// Both families live in this file rather than in the two screens that draw
+// them, because a user who has seen the Send composer must not be able to
+// tell that the item form was drawn by a different hand -- the standing rule
+// the §5a block's own comment states, applied one design turn later.
+
+/// §8a's `border-radius: 10px`. Two less than [`FORM_CARD_RADIUS`]; see the
+/// block comment for why the two cards are not one.
+pub const SECTION_CARD_RADIUS: u8 = 10;
+
+/// §8a's `padding: 11px 16px` header and `12px 16px` rows, in the horizontal
+/// axis: **12, and not §8a's 16**, for exactly the reason
+/// [`FORM_CARD_PAD_X`]'s doc argues at length and which is sharper here.
+///
+/// §8a is drawn at 1240 points with a 1028-point card column. This card is
+/// drawn in the vault window's DETAIL PANE, which is 298 points at
+/// `settings::MIN_VAULT_WINDOW_SIZE` -- around 224 of card body once the
+/// pane's own margins, the scroll gutter and this padding are off it. At that
+/// width 16 a side is 14% of the card, taken from the one thing that cannot
+/// spare it: the box the user is typing into.
+///
+/// It is [`FORM_CARD_PAD_X`] itself rather than a same-valued constant beside
+/// it, because two cards in one app padded to two different numbers is the
+/// drift this module exists to prevent, and neither design's number is more
+/// right than the other's at 298 points.
+pub const SECTION_CARD_PAD_X: i8 = FORM_CARD_PAD_X;
+
+/// §8a's header band padding: `padding: 11px 16px`.
+///
+/// Kept at the design's 11 rather than folded into [`FORM_CARD_PAD_Y`]'s 12,
+/// because a section card's header is a NAME and §5a's is a heading: one
+/// point of air either side is the difference between a strip that labels the
+/// card and a strip that competes with it, and nine of these are stacked down
+/// one column where §5a draws one.
+pub const SECTION_CARD_HEADER_PAD_Y: i8 = 11;
+
+/// §8a's row band padding: `padding: 12px 16px`.
+pub const SECTION_CARD_PAD_Y: i8 = 12;
+
+/// The gap between one section card and the next. §8a's `gap: 14px` on the
+/// card column, drawn at the 12 [`BLOCK_GAP`] already sets for every other
+/// stacked block in this app.
+///
+/// **The same constant, not a same-valued one.** A form whose cards sit 14
+/// apart and whose blocks inside them sit 12 apart is a form with two
+/// rhythms, and the two points are not visible at any width this pane is
+/// drawn at -- whereas the disagreement is visible the moment one of them
+/// moves.
+pub const SECTION_GAP: f32 = BLOCK_GAP;
+
+/// The section card title's type size: §8a's `font-size: 12px`.
+pub const SECTION_TITLE_PX: f32 = 12.0;
+
+/// The section card title's tracking: §8a's `letter-spacing: 0.06em` at
+/// [`SECTION_TITLE_PX`], which is 0.72 points.
+///
+/// **Not [`EYEBROW_TRACKING`], and not an oversight.** §8a draws BOTH on the
+/// same screen and means two different things by them: its rail's `SECTIONS`
+/// is the eyebrow exactly -- 11px, `0.1em`, `#9b9797` -- naming a region of
+/// chrome, while a card's own title is 12px, `0.06em`, `#605d5d`: one step
+/// larger, one step tighter and one step darker, because it names a thing the
+/// user is about to edit rather than a heading over a list. Collapsing the
+/// two would make every card on this form as quiet as the rail above it.
+pub const SECTION_TITLE_TRACKING: f32 = 0.72;
+
+/// The width of a section row's label column: §8a's `width: 130px`.
+pub const SECTION_LABEL_WIDTH: f32 = 130.0;
+
+/// The gap between a section row's label and its control: §8a's `gap: 16px`,
+/// at the 14 §8a's own card grid uses and this app's rows already do.
+pub const SECTION_ROW_GAP: f32 = 14.0;
+
+/// The narrowest a section row's CONTROL may be before the row stops being a
+/// row.
+///
+/// **The measurement behind [`section_rows_fit`], and the one number on this
+/// card that §8a never had to have.** §8a's rows are a 130-point label beside
+/// a control with 850 points to spend. In the detail pane the whole card body
+/// is about 224 points at `settings::MIN_VAULT_WINDOW_SIZE`; a 130-point
+/// label and a 14-point gap leave **80**, which is not a text field, it is a
+/// slot. `https://app.ledgerline.com` in an 80-point box is six characters and
+/// an ellipsis.
+///
+/// 180 is the floor a single-line URL, an email address or a program path
+/// stays readable in, measured against the strings this form actually holds.
+/// Below `130 + 14 + 180` the label goes back above its control, which is the
+/// shape this form already ships and which works -- so the narrow pane loses
+/// §8a's label column and nothing else.
+pub const SECTION_ROW_CONTROL_FLOOR: f32 = 180.0;
+
+/// Whether a section card this wide can draw §8a's label-beside-control rows,
+/// or must stack the label above the control instead.
+///
+/// Asked of the `Ui` the row is about to be added to, so one card can answer
+/// differently from another on the same form -- which is what happens the
+/// moment two cards sit side by side in a grid.
+pub fn section_rows_fit(ui: &Ui) -> bool {
+    ui.available_width() >= SECTION_LABEL_WIDTH + SECTION_ROW_GAP + SECTION_ROW_CONTROL_FLOOR
+}
+
+/// §8a's card: white, edged in [`HAIRLINE`], rounded to
+/// [`SECTION_CARD_RADIUS`] and **unshadowed**, with no padding of its own --
+/// the band helpers below pad themselves, because a band has to reach the
+/// card's edge to be a band.
+///
+/// Answers with the card's rectangle, which is what the section rail scrolls
+/// to.
+///
+/// **The border is painted AFTER the contents**, for the reason
+/// [`form_card`]'s doc sets out in full: a `Frame`'s stroke is reserved before
+/// its body, so anything the body paints edge to edge -- a row rule, by
+/// definition -- lands on top of it.
+pub fn section_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> (Rect, R) {
+    let framed = egui::Frame::new()
+        .fill(CARD)
+        .corner_radius(CornerRadius::same(SECTION_CARD_RADIUS))
+        .show(ui, add);
+    let rect = framed.response.rect;
+    ui.painter().rect_stroke(
+        rect,
+        CornerRadius::same(SECTION_CARD_RADIUS),
+        Stroke::new(1.0, HAIRLINE),
+        StrokeKind::Inside,
+    );
+    (rect, framed.inner)
+}
+
+/// The section card's first band: its name in §8a's treatment, an optional
+/// trailing note, and the [`HAIRLINE`] that closes the band.
+///
+/// `note` is §8a's own second element on this strip -- its `One-time code`
+/// carries a `2FA` chip, its `Autofill targets` the sentence `where this
+/// login is offered` -- drawn at [`TEXT_GHOST`] because it explains the title
+/// rather than competing with it.
+///
+/// `changed` draws the dirty mark: [`CHANGED_PILL`] in the caution tone,
+/// pushed to the right edge of the band. §8a puts its `Changed` list in the
+/// rail; this puts a mark on each card as well, and the reason is the pane
+/// this form lives in -- the rail is chrome the form cannot always afford
+/// (see `section_rows_fit`'s neighbours), and a dirty state that is only
+/// visible in a column that is only sometimes on screen is a dirty state the
+/// user cannot rely on.
+pub fn section_card_header(ui: &mut Ui, title: &str, note: &str, changed: bool) -> Rect {
+    let line = egui::Frame::new()
+        .inner_margin(Margin::symmetric(SECTION_CARD_PAD_X, SECTION_CARD_HEADER_PAD_Y))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let title_rect = ui
+                    .label(letterspaced(
+                        title,
+                        SECTION_TITLE_PX,
+                        BOLD,
+                        SECTION_TITLE_TRACKING,
+                        TEXT_MUTED,
+                    ))
+                    .rect;
+                if !note.is_empty() {
+                    ui.label(RichText::new(note).size(12.0).color(TEXT_GHOST));
+                }
+                if changed {
+                    // Right-aligned by measuring rather than by a
+                    // `Layout::right_to_left` scope, because the pill has to
+                    // be able to give up its place: at the pane's floor a
+                    // card title and a pill do not both fit, and a
+                    // right-to-left layout would push the pill out of the
+                    // card rather than leave it off.
+                    let width = state_pill_width(ui.painter(), CHANGED_TONE, CHANGED_PILL);
+                    if ui.available_width() >= width {
+                        let (rect, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), PILL_HEIGHT),
+                            Sense::hover(),
+                        );
+                        state_pill(
+                            ui.painter(),
+                            Pos2::new(rect.right() - width, rect.center().y),
+                            CHANGED_TONE,
+                            CHANGED_PILL,
+                        );
+                    }
+                }
+                title_rect
+            })
+            .inner
+        })
+        .inner;
+    hairline(ui);
+    line
+}
+
+/// The section card's body band: its rows, at the card's padding.
+pub fn section_card_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(SECTION_CARD_PAD_X, SECTION_CARD_PAD_Y))
+        .show(ui, add)
+        .inner
+}
+
+/// One §8a row: a [`SECTION_LABEL_WIDTH`] label column, a
+/// [`SECTION_ROW_GAP`], and the control -- **or, below
+/// [`section_rows_fit`], the label stacked above the control instead.**
+///
+/// The stacked arm is not a degraded fallback: it is the shape this form has
+/// always had, it is what every other form in this app draws, and it is the
+/// only shape a 224-point card body can hold. What the wide arm buys is §8a's
+/// reading order -- the eye runs down a column of labels and across to the
+/// value -- which is precisely what a 640-point pane has the room for and a
+/// 298-point one does not.
+pub fn section_row<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    if !section_rows_fit(ui) {
+        // An EMPTY label is a row that belongs to the one above it -- the
+        // generator under its password box. Stacked, there is no label column
+        // to indent it into, so the row simply follows its neighbour; drawing
+        // the empty string would still cost a line box and a gap, which is a
+        // blank the reader has to account for.
+        if !label.is_empty() {
+            field_label(ui, label);
+            ui.add_space(EYEBROW_GAP);
+        }
+        return add(ui);
+    }
+    ui.horizontal_top(|ui| {
+        let (cell, _) = ui.allocate_exact_size(
+            Vec2::new(SECTION_LABEL_WIDTH, FIELD_HEIGHT),
+            Sense::hover(),
+        );
+        let galley = ui.painter().layout(
+            label.to_string(),
+            FontId::new(12.0, FontFamily::Proportional),
+            TEXT_FAINT,
+            SECTION_LABEL_WIDTH,
+        );
+        // Top-aligned against the first line of the control beside it, not
+        // centred in the cell: a row whose control is three boxes tall would
+        // otherwise put its label level with the middle box. §8a's own
+        // `padding-top: 9px` on exactly those rows is this measurement.
+        ui.painter().galley(
+            Pos2::new(cell.left(), cell.top() + (FIELD_HEIGHT - galley.size().y) / 2.0),
+            galley,
+            TEXT_FAINT,
+        );
+        ui.add_space(SECTION_ROW_GAP - ui.spacing().item_spacing.x);
+        ui.vertical(|ui| add(ui)).inner
+    })
+    .inner
+}
+
+/// The word on the dirty mark. §8a's rail says `Changed`; the pill says the
+/// same word, because two spellings of one state is how a user learns that
+/// they are two states.
+pub const CHANGED_PILL: &str = "Changed";
+
+/// The dirty mark's colours: §8a's `Unsaved changes` pill exactly --
+/// `color: #7a4f05; background: #fef6e7; border: 1px solid #f2d99b`, which is
+/// [`CAUTION_INK`] on [`CAUTION_WASH`] inside [`CAUTION_EDGE`].
+///
+/// [`PillMark::None`]: the word carries the whole meaning, and a dot would
+/// say "running" -- see [`PillMark`]'s own doc.
+pub const CHANGED_TONE: PillTone = PillTone {
+    fill: CAUTION_WASH,
+    edge: CAUTION_EDGE,
+    ink: CAUTION_INK,
+    mark: PillMark::None,
+};
+
+/// §8a's password strength readout: four bars followed by the rating and the
+/// length, e.g. `Strong \u{b7} 20 characters`.
+///
+/// **Four bars, always, with the unearned ones drawn in [`TOGGLE_OFF`]** --
+/// §8a shows four filled and says nothing about the empty state, and a meter
+/// that drew only the bars it had earned would be a meter whose TRACK changed
+/// length with the score. A two-bar meter and a four-bar meter side by side
+/// say nothing about each other.
+///
+/// The word is [`BLUE_DEEP`] and semibold at full strength (§8a's
+/// `color: #14307a; font-weight: 600`) and [`TEXT_FAINT`] below it: the
+/// design colours the readout only when there is something to be pleased
+/// about, and a `Weak` painted in the brand's own blue would be praise.
+pub fn strength_meter(ui: &mut Ui, filled: usize, word: &str, characters: usize) {
+    ui.horizontal(|ui| {
+        let full = filled >= STRENGTH_BARS;
+        for bar in 0..STRENGTH_BARS {
+            let (rect, _) =
+                ui.allocate_exact_size(Vec2::new(STRENGTH_BAR.x, STRENGTH_BAR.y), Sense::hover());
+            // Centred on the row rather than sitting on its baseline: these
+            // are 4 points tall beside a 12-point line, and left to egui they
+            // would hang off the top of it.
+            let bar_rect = Rect::from_center_size(
+                Pos2::new(rect.center().x, rect.center().y),
+                STRENGTH_BAR,
+            );
+            ui.painter().rect_filled(
+                bar_rect,
+                CornerRadius::same((STRENGTH_BAR.y / 2.0) as u8),
+                if bar < filled { BLUE } else { TOGGLE_OFF },
+            );
+        }
+        ui.add_space(STRENGTH_GAP);
+        let ink = if full { BLUE_DEEP } else { TEXT_FAINT };
+        let face = FontId::new(
+            12.0,
+            if full { FontFamily::Name(SEMIBOLD.into()) } else { FontFamily::Proportional },
+        );
+        // **The count is dropped before the word is.**
+        //
+        // 8a's readout is `Strong \u{b7} 20 characters` on a card with 850
+        // points to spend. This one sits in a section row's control column,
+        // which is around 200 points in the shipped detail pane once a
+        // 130-point label column and four 26-point bars are off it -- and an
+        // unwrapped label in a horizontal row does not shrink, it runs past
+        // the card's edge. That is exactly what it did on the first render of
+        // this meter.
+        //
+        // So the row is measured and the LENGTH goes first. The word is the
+        // rating; the count is context for it, and "Strong" alone still says
+        // the thing the user needs. Truncating instead would produce
+        // `Strong \u{b7} 20 char\u{2026}`, which spends the width on the half
+        // that matters least.
+        let counted = if characters == 1 {
+            "1 character".to_string()
+        } else {
+            format!("{characters} characters")
+        };
+        let long = format!("{word} \u{b7} {counted}");
+        let room = ui.available_width();
+        let fits = |text: &str| {
+            ui.painter().layout_no_wrap(text.to_string(), face.clone(), ink).size().x <= room
+        };
+        let text = if fits(&long) { long } else { word.to_string() };
+        // Still elided if even the word does not fit -- a 40-point column is
+        // not a width this row can be honest in, and a galley running under
+        // the card's border is worse than an ellipsis.
+        let styled = if full {
+            semibold(text, 12.0).color(ink)
+        } else {
+            RichText::new(text).size(12.0).color(ink)
+        };
+        let galley = truncated_galley(ui, styled, room, TextStyle::Body);
+        ui.add(egui::Label::new(galley));
+    });
+}
+
+/// How many bars [`strength_meter`] draws. §8a's four, which is also how many
+/// ratings `password_strength::Strength` has -- the two agreeing is what lets
+/// the meter be a picture of the rating rather than a second scale.
+pub const STRENGTH_BARS: usize = 4;
+
+/// One bar's box: §8a's `width: 26px; height: 4px; border-radius: 2px`.
+pub const STRENGTH_BAR: Vec2 = Vec2::new(26.0, 4.0);
+
+/// The gap between the last bar and the word. §8a's `gap: 12px`, less the
+/// item spacing egui has already put there.
+const STRENGTH_GAP: f32 = 6.0;
 
 // ---------------------------------------------------------------------------
 // The modal card
