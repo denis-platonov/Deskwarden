@@ -133,25 +133,21 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
             ui.vertical_centered(|ui| {
                 theme::progress_bar(ui, NARROW_BAR);
                 ui.add_space(BAR_TO_LABEL);
-                // **Body weight, not the 600 cut.** Reported twice, as
-                // "Setting up your vcault text is wrong font" and then
-                // "Setting up your vault is bold for some reason".
+                // **Design 7a's heading, not a status line.** 7a sets this
+                // sentence at `TITLE_SIZE` in the 700 cut, in `INK`, and it is
+                // the only copy on the screen. The owner, seeing it at body
+                // size: "no text is tiny like description not like title text".
                 //
-                // It was `theme::semibold`, which `theme` reserves for
-                // "buttons, row titles, field emphasis" -- and this is none of
-                // those. It is a status line: one sentence in
-                // `TEXT_SECONDARY`, at `LABEL_SIZE`, which is 13.0 and
-                // therefore exactly the size `TextStyle::Body` already
-                // resolves to. Plain text lands on `FontFamily::Proportional`,
-                // whose stack IS Archivo Regular (see `theme::REGULAR`), so
-                // asking for nothing is asking for the right thing.
-                //
-                // The weight was never specified: no design covers this
-                // screen. It came from this module setting every string it
-                // owns in SemiBold, headings and body copy alike -- see the
-                // other call sites, whose titles are correctly emphasised and
-                // whose sub-lines have the same defect this fixes here.
-                ui.label(theme::regular(message, LABEL_SIZE).color(theme::TEXT_SECONDARY));
+                // It had been 13px `theme::regular` in `TEXT_SECONDARY`, from
+                // an earlier report -- "Setting up your vault is bold for some
+                // reason" -- whose fix reached for body weight because no
+                // design was then known to cover this screen. 7a does cover it,
+                // and its answer is neither of the two tried here: the SIZE is
+                // the half that was missing both times. A 600 cut at 13px is
+                // emphasis with nothing to be emphasised against, which is what
+                // "bold for some reason" was reading; the cure was a heading,
+                // not a demotion.
+                ui.label(theme::bold(message, TITLE_SIZE).color(theme::INK));
             });
         });
     action
@@ -183,17 +179,18 @@ const NARROW_BAR: f32 = 200.0;
 /// 28px and a tight gap under it reads as an underline on the heading.
 const BAR_TO_LABEL: f32 = 22.0;
 
-const LABEL_SIZE: f32 = 13.0;
-
 /// What [`draw_spinner_body`]'s stack occupies, used to centre it.
 ///
-/// Summed from the pieces above rather than written as one number, so it
-/// cannot drift from them -- a hand-written total is the kind of constant
-/// that stays put while the thing it describes changes underneath it. The
-/// label's line box is its font size times egui's default line height for
-/// this face; being a pixel or two out is invisible in a centring, whereas
-/// the top-anchored version this replaces was out by hundreds.
-const CONTENT_HEIGHT: f32 = theme::BAR_HEIGHT + BAR_TO_LABEL + LABEL_SIZE * 1.4;
+/// Summed from the pieces it is made of rather than written as one number, so
+/// it cannot drift from them -- a hand-written total is the kind of constant
+/// that stays put while the thing it describes changes underneath it. It takes
+/// [`TITLE_SIZE`] rather than a size of its own because the line under the bar
+/// IS design 7a's heading, and a stack measured at the old body size would
+/// centre four points high the moment the heading grew. The line box is that
+/// size times egui's default line height for this face; being a pixel or two
+/// out is invisible in a centring, whereas the top-anchored version this
+/// replaces was out by hundreds.
+const CONTENT_HEIGHT: f32 = theme::BAR_HEIGHT + BAR_TO_LABEL + TITLE_SIZE * 1.4;
 
 /// This window GREW when the heading arrived: 320×150 had exactly enough room
 /// for a mark, a 22px spinner and a line of text, and none at all for a 46px bar
@@ -671,7 +668,7 @@ pub fn draw_first_window_body(
                 FirstWindowBody::Loading => {
                     theme::progress_bar(ui, WIDE_BAR);
                     ui.add_space(BAR_TO_LABEL);
-                    ui.label(theme::semibold("Loading your vault", TITLE_SIZE).color(theme::INK));
+                    ui.label(theme::bold("Loading your vault", TITLE_SIZE).color(theme::INK));
                     ui.add_space(TITLE_TO_SUB);
                     ui.label(
                         theme::regular("This stays on your machine", SUB_SIZE)
@@ -682,7 +679,7 @@ pub fn draw_first_window_body(
                     theme::progress_bar(ui, WIDE_BAR);
                     ui.add_space(BAR_TO_LABEL);
                     ui.label(
-                        theme::semibold("Still syncing with Bitwarden", TITLE_SIZE)
+                        theme::bold("Still syncing with Bitwarden", TITLE_SIZE)
                             .color(theme::INK),
                     );
                     ui.add_space(TITLE_TO_SUB);
@@ -701,7 +698,7 @@ pub fn draw_first_window_body(
                 FirstWindowBody::Unreachable { retry: offer, local } => {
                     draw_warning_badge(ui);
                     ui.add_space(BADGE_TO_LABEL);
-                    ui.label(theme::semibold(UNREACHABLE_TITLE, TITLE_SIZE).color(theme::INK));
+                    ui.label(theme::bold(UNREACHABLE_TITLE, TITLE_SIZE).color(theme::INK));
                     ui.add_space(TITLE_TO_SUB);
                     let copy = match offer {
                         RetryOffer::Offered => UNREACHABLE_OFFERED,
@@ -955,12 +952,17 @@ mod spinner_body_tests {
     }
 
     /// **Every sentence this module owns is body weight; only its headings
-    /// are emphasised.**
+    /// are emphasised, and they are the design's 700 cut.**
     ///
     /// The rule, rather than the case. This module set EVERY string it owned
     /// in SemiBold -- headings and body copy alike -- and the case-by-case
     /// pin below caught only the one sentence that was reported. The other
     /// screens had the same defect and nothing was watching them.
+    ///
+    /// The middle cut then left this module entirely: design turn 7 sets its
+    /// headings at `w700`, so the 600 one is now a weight no loading screen
+    /// has a design for, and the pin says so rather than leaving it as a gap
+    /// between two counted sets.
     ///
     /// A source pin because the sub-lines live on states this module's frame
     /// harness reaches one at a time, and because what is being checked is a
@@ -973,27 +975,36 @@ mod spinner_body_tests {
     fn the_body_copy_on_every_loading_screen_is_body_weight() {
         let source = include_str!("loading_ui.rs");
         let production = source.split_once("\n#[cfg(test)]").map_or(source, |(p, _)| p);
-        let semibold = concat!("theme::semi", "bold(");
 
-        // Only the three headings, and each is named so a fourth has to be
-        // argued for here rather than added quietly.
+        assert_eq!(
+            production.matches(concat!("theme::semi", "bold(")).count(),
+            0,
+            "a loading screen is back on the 600 cut. Design turn 7 sets its headings in the \
+             700 one and everything else in body weight; there is no string on these screens \
+             the middle cut is the design's answer for"
+        );
+
+        // Only the four headings and the warning badge's glyph, and each is
+        // named so a fifth has to be argued for here rather than added
+        // quietly.
         let emphasised: Vec<&str> = production
             .lines()
-            .filter(|line| line.contains(semibold))
+            .filter(|line| line.contains(concat!("theme::b", "old(")))
             .collect();
         assert_eq!(
             emphasised.len(),
-            3,
-            "this module has {} emphasised string(s), not the three headings. Anything else \
-             set in the 600 cut is body copy wearing a heading's weight, which is the report \
-             this fixed: {emphasised:?}",
+            5,
+            "this module has {} emphasised string(s), not the four headings and the badge's \
+             glyph. Anything else set in the 700 cut is body copy wearing a heading's weight, \
+             which is the report this fixed: {emphasised:?}",
             emphasised.len()
         );
         for line in &emphasised {
             assert!(
-                line.contains("TITLE_SIZE"),
-                "`{}` is emphasised but is not a heading -- `theme` reserves SemiBold for \
-                 buttons, row titles and field emphasis, and a sentence is none of those",
+                line.contains("TITLE_SIZE") || line.contains("WARN_INK"),
+                "`{}` is emphasised but is neither a heading nor the warning badge -- `theme` \
+                 reserves the named cuts for buttons, row titles and field emphasis, and a \
+                 sentence is none of those",
                 line.trim()
             );
         }
@@ -1004,26 +1015,27 @@ mod spinner_body_tests {
         let body = production.matches(concat!("theme::reg", "ular(")).count();
         assert!(
             body >= 7,
-            "only {body} body-weight string(s) in this module; the sub-lines, the footnotes \
-             and the spinner's own status line are all body copy and there were seven"
+            "only {body} body-weight string(s) in this module; the sub-lines and the footnotes \
+             are all body copy and there were seven"
         );
     }
 
-    /// **The status line is set in body weight, not the design's 600 cut.**
+    /// **The waiting line is design 7a's heading: 17px, 700 cut.**
     ///
-    /// Reported twice by the owner -- "wrong font", then "bold for some
-    /// reason" -- about the same sentence, because nothing pinned it. The
-    /// weight is not decorative here: `theme` reserves SemiBold for "buttons,
-    /// row titles, field emphasis", and a one-sentence status line in
-    /// `TEXT_SECONDARY` is none of those.
+    /// Reported three times by the owner about this one sentence -- "wrong
+    /// font", then "bold for some reason", then "no text is tiny like
+    /// description not like title text". The first two were answered by
+    /// dropping the WEIGHT, and that was half an answer: the size was never
+    /// touched, and a 13px line is a description whichever cut it is set in.
+    /// 7a's answer is a heading at a heading's size, which is what this pins.
     ///
     /// Read off the galley's own `font_id`, which is what the renderer was
     /// actually asked for, rather than off the source text -- the same reason
     /// `rendered` walks glyphs instead of trusting `Galley::text()`.
     #[test]
-    fn the_spinner_message_is_drawn_in_the_body_family_and_not_a_named_weight() {
-        fn families(output: &egui::FullOutput, wanted: &str) -> Vec<egui::FontFamily> {
-            fn walk(shape: &egui::Shape, wanted: &str, out: &mut Vec<egui::FontFamily>) {
+    fn the_spinner_message_is_drawn_as_the_designs_heading() {
+        fn fonts(output: &egui::FullOutput, wanted: &str) -> Vec<egui::FontId> {
+            fn walk(shape: &egui::Shape, wanted: &str, out: &mut Vec<egui::FontId>) {
                 match shape {
                     egui::Shape::Text(text) => {
                         let drawn: String = text
@@ -1034,7 +1046,7 @@ mod spinner_body_tests {
                             .collect();
                         if drawn.contains(wanted) {
                             for section in &text.galley.job.sections {
-                                out.push(section.format.font_id.family.clone());
+                                out.push(section.format.font_id.clone());
                             }
                         }
                     }
@@ -1053,29 +1065,40 @@ mod spinner_body_tests {
             out
         }
 
+        let bold = egui::FontFamily::Name(crate::theme::BOLD.into());
         let message = "Setting up your vault...";
-        let seen = families(&frame(message), message);
+        let seen = fonts(&frame(message), message);
         assert!(
             !seen.is_empty(),
             "control: the message was not found on any galley, so this test is reading nothing"
         );
-        for family in &seen {
+        for font in &seen {
             assert_eq!(
-                *family,
-                egui::FontFamily::Proportional,
-                "the status line is drawn in {family:?}. `Proportional` is Archivo Regular -- \
-                 see `theme::REGULAR` -- and a named family here is one of the emphasis cuts, \
-                 which is what the owner reads as bold"
+                font.size, TITLE_SIZE,
+                "the waiting line is drawn at {}px. Design 7a's is {TITLE_SIZE}px, and the \
+                 owner's report about this exact sentence was that it reads as a description \
+                 rather than a title",
+                font.size
+            );
+            assert_eq!(
+                font.family, bold,
+                "the waiting line is drawn in {:?}, not the design's 700 cut. `Proportional` \
+                 here is Archivo Regular -- see `theme::REGULAR` -- and this is the one string \
+                 on the screen",
+                font.family
             );
         }
         // Control on the reader itself: the window's own TITLE, drawn by the
-        // chrome one call above, IS deliberately a named weight. Without this
-        // a reader that answered `Proportional` for everything would pass.
-        let heading = families(&frame(message), WINDOW_TITLE);
+        // chrome one call above, is the chrome's own size and cut -- 14px in
+        // the 800 one. Without this, a reader that answered "17px Bold" for
+        // every galley would pass both assertions on an unchanged frame.
+        let heading = fonts(&frame(message), WINDOW_TITLE);
         assert!(
-            heading.iter().any(|f| *f != egui::FontFamily::Proportional),
-            "control: nothing on this window is drawn in a named family, so the assertion \
-             above cannot tell a body weight from an emphasis one: {heading:?}"
+            heading
+                .iter()
+                .any(|f| f.size != TITLE_SIZE || f.family != bold),
+            "control: every galley on this window reports the same font, so the assertions \
+             above cannot tell the heading from anything else: {heading:?}"
         );
     }
 
