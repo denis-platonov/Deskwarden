@@ -835,7 +835,9 @@ mod tests {
         let _ = opened(&ctx, &mut state);
         assert!(
             ctx.memory(|m| m.areas().is_visible(&egui::LayerId::new(
-                egui::Order::Foreground,
+                // The gate looks the scrim up by LAYER, which is an order as
+                // well as an id -- see `item_list::a_modal_is_up`.
+                crate::theme::SCRIM_ORDER,
                 egui::Id::new("delete-confirm-scrim"),
             ))),
             "the delete modal draws no scrim under the id the keyboard gate watches"

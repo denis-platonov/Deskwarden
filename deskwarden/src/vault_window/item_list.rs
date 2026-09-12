@@ -1335,7 +1335,16 @@ fn a_modal_is_up(ctx: &egui::Context) -> bool {
     ctx.memory(|m| {
         MODAL_SCRIM_AREAS.iter().any(|name| {
             m.areas()
-                .is_visible(&egui::LayerId::new(egui::Order::Foreground, egui::Id::new(*name)))
+                // **`theme::SCRIM_ORDER`, which is not `Foreground`.** A
+                // `LayerId` is an order AND an id, so this lookup went blind
+                // the moment the scrims moved down a layer -- and a blind
+                // gate is an arrow key reaching the item list behind an open
+                // modal. Read off the constant the scrims are drawn on rather
+                // than written out, so the two cannot part again.
+                .is_visible(&egui::LayerId::new(
+                    crate::theme::SCRIM_ORDER,
+                    egui::Id::new(*name),
+                ))
         })
     })
 }
@@ -10097,20 +10106,19 @@ mod keyboard_selection_tests {
         }]
     }
 
-    /// A modal's scrim, drawn the way every one of them draws it: a
-    /// full-window click-catcher `Area` on `Order::Foreground`. Copied from
-    /// `folder_modal::draw_folder_edit_modal` rather than called, so this
-    /// module needs none of that modal's state -- and named with ITS id, so
-    /// if the id there changes, `every_modal_scrim_in_the_crate_is_named_here`
-    /// is what fails.
+    /// A modal's scrim, drawn by **the function every one of them calls**.
+    ///
+    /// It used to be a COPY of `folder_modal`'s, "copied rather than called,
+    /// so this module needs none of that modal's state" -- and the copy went
+    /// stale the day the real scrims moved off `Order::Foreground`, leaving
+    /// this test asserting that a gate it had blinded still worked. That is
+    /// the same hazard, one level down, that put six hand-written scrims in
+    /// this crate on the wrong layer together; see `theme::SCRIM_ORDER`.
+    ///
+    /// Named with `folder_modal`'s own id, so if the id there changes,
+    /// `every_modal_scrim_in_the_crate_is_named_here` is what fails.
     fn draw_a_modal_scrim(ctx: &egui::Context) {
-        egui::Area::new(egui::Id::new("folder-edit-scrim"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(egui::Pos2::ZERO)
-            .show(ctx, |ui| {
-                let screen = ctx.content_rect();
-                ui.allocate_response(screen.size(), egui::Sense::click());
-            });
+        crate::theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("folder-edit-scrim")));
     }
 
     /// A live item pane across frames: the selection and the scroll offset

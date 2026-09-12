@@ -55,18 +55,10 @@ pub fn draw_folder_edit_modal(ctx: &egui::Context, state: &mut FolderEditState) 
     let mut action = FolderEditAction::None;
 
     // Dimmed scrim: a full-window click-catcher (so a click outside the
-    // card can't reach whatever is behind it) painted at a low alpha, on the
-    // `Foreground` layer so it sits above the sidebar/list/detail panels
-    // regardless of draw order.
-    egui::Area::new(egui::Id::new("folder-edit-scrim"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
-        .show(ctx, |ui| {
-            let screen = ctx.content_rect();
-            ui.allocate_response(screen.size(), egui::Sense::click());
-            ui.painter()
-                .rect_filled(screen, CornerRadius::ZERO, egui::Color32::from_black_alpha(90));
-        });
+    // card can't reach whatever is behind it) painted at a low alpha, on
+    // `theme::SCRIM_ORDER` -- above the sidebar, list and detail panels and
+    // BELOW this card. See that constant for the freeze the order fixes.
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("folder-edit-scrim")));
 
     // Centred on the frame it opens and wherever the user has dragged it
     // after that -- `theme::movable_modal` replaces the `.anchor(CENTER_CENTER,

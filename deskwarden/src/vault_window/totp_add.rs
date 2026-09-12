@@ -1949,6 +1949,32 @@ const MANUAL_BODY_GAP: f32 = 14.0;
 /// The value centres the bar in the padding it floats in, so the clear space
 /// either side of it is equal and neither the border nor the body's own right
 /// edge is the thing it crowds.
+///
+/// # The inset was not enough, because the TRACK is a rule
+///
+/// The owner, after the inset shipped: *"two lines on the right edge"*. Still
+/// two, five points apart instead of one. A floating egui bar is two shapes,
+/// not one: a **handle** the length of the visible fraction, and behind it a
+/// **track** the full height of the scroll area, painted at
+/// `active_background_opacity` the moment the pointer is over the card --
+/// which, on a card the user is filling in, is always. A full-height 6pt
+/// strip five points inside a full-height 1pt stroke is two parallel rules
+/// whatever the gap between them; moving it further in only makes the gap a
+/// third stripe of card colour.
+///
+/// So [`draw_add_form`] zeroes the track's three opacities and leaves the
+/// handle's alone. What remains beside the border is a short rounded pill
+/// that starts and ends inside the body -- the one shape on the card that is
+/// not a rule -- and it still says "this scrolls" and still takes the drag.
+/// Hiding the whole bar was rejected for that reason: a body that scrolls
+/// with no mark to say so is a card whose lower fields the user does not
+/// know are there. Moving the bar back onto the border was rejected as the
+/// first report. `theme::hide_scrollbar` is the same six-opacity idiom and
+/// is not used here because it zeroes the handle too.
+///
+/// `the_cards_scroll_bar_is_a_handle_and_not_a_second_rule` pins it as a
+/// count: with the pointer over an overflowing card, exactly one shape of
+/// scroll-bar width carries any ink.
 const MANUAL_SCROLLBAR_INSET: f32 = (MANUAL_BODY_PAD as f32 - theme::SCROLLBAR_WIDTH) / 2.0;
 
 /// The field's block: `gap: 7px` between the caption, the box and the line
@@ -2941,6 +2967,17 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
             scroll.bar_width = theme::SCROLLBAR_WIDTH;
             scroll.floating_width = theme::SCROLLBAR_WIDTH;
             scroll.bar_outer_margin = MANUAL_SCROLLBAR_INSET;
+            // **And no track.** The bar is a handle and a full-height track
+            // behind it, and the track is the second of the "two lines on the
+            // right edge" the owner still saw with the bar inset. The handle
+            // keeps its three opacities -- it is what says the body scrolls
+            // and what takes the drag -- and the track loses all of its.
+            // Measured: the hovered, overflowing card painted two shapes at
+            // bar width, 46..269 and 46..231; it paints the shorter one now.
+            // See `MANUAL_SCROLLBAR_INSET`'s last section.
+            scroll.dormant_background_opacity = 0.0;
+            scroll.active_background_opacity = 0.0;
+            scroll.interact_background_opacity = 0.0;
         }
         let reading = egui::ScrollArea::vertical()
             .max_height(room)
@@ -4891,18 +4928,7 @@ pub fn draw_add_modal(
     state: &mut TotpAdd,
     now_unix: u64,
 ) -> TotpAddAction {
-    egui::Area::new(egui::Id::new("totp-add-scrim"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
-        .show(ctx, |ui| {
-            let screen = ctx.content_rect();
-            ui.allocate_response(screen.size(), egui::Sense::click());
-            ui.painter().rect_filled(
-                screen,
-                CornerRadius::ZERO,
-                egui::Color32::from_black_alpha(90),
-            );
-        });
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("totp-add-scrim")));
 
     // **The one card in the app that is four cards, and the size it was last
     // pass is what egui will anchor this pass by.** On the frame a stage
@@ -5714,6 +5740,41 @@ mod tests {
                  {content_right}"
             );
         }
+    }
+
+    /// **"two lines on the right edge"**, the second time, with the bar
+    /// already inset five points from the border.
+    ///
+    /// The second line was the bar's TRACK: a floating egui bar paints a
+    /// full-height background strip behind its handle whenever the pointer is
+    /// over the area, and a full-height strip beside a full-height stroke is
+    /// two rules however far apart they sit. See [`MANUAL_SCROLLBAR_INSET`]'s
+    /// last section for what was kept and what was rejected.
+    ///
+    /// Pinned as a count of inked shapes at scroll-bar width in the hovered,
+    /// overflowing frame: the handle and nothing else. Before the fix the
+    /// same frame carried two.
+    #[test]
+    fn the_cards_scroll_bar_is_a_handle_and_not_a_second_rule() {
+        let rects = painted_rects(true);
+        let bar_wide: Vec<egui::Rect> = rects
+            .iter()
+            .copied()
+            .filter(|rect| (rect.width() - theme::SCROLLBAR_WIDTH).abs() < 0.01)
+            .collect();
+        assert_eq!(
+            bar_wide.len(),
+            1,
+            "expected the handle alone at scroll-bar width, found {bar_wide:?}: a second shape \
+             is the full-height track, which reads as a rule beside the card's border"
+        );
+        // And the one that is there is a handle: shorter than the body it
+        // scrolls, which on this fixture overflows a 420pt window.
+        assert!(
+            bar_wide[0].height() < 300.0,
+            "the one bar-width shape is {:?}, tall enough to be the track rather than a handle",
+            bar_wide[0]
+        );
     }
 
     /// **The card that fits paints no bar at all, and no narrower body.**

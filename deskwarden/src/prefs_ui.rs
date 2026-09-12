@@ -6027,9 +6027,6 @@ const MODAL_HEADER_HEIGHT: f32 = 44.0;
 const MODAL_SCREEN_MARGIN: f32 = 24.0;
 const MODAL_RADIUS: u8 = 12;
 const MODAL_TITLE: &str = "Preferences";
-/// The scrim's alpha, taken from `folder_modal` and the launch confirmation
-/// verbatim rather than picked again.
-const MODAL_SCRIM_ALPHA: u8 = 90;
 
 /// What a frame of the modal asks its host to do.
 ///
@@ -6073,7 +6070,7 @@ pub fn modal_body_rect(card: Rect) -> Rect {
 /// Draws the preferences form as a modal card over a dimmed scrim covering the
 /// whole window, returning what the host should do about it.
 ///
-/// **The scrim is a full-window click-catcher on `Order::Foreground`**, the
+/// **The scrim is a full-window click-catcher on `theme::SCRIM_ORDER`**, the
 /// idiom `draw_folder_edit_modal` and `draw_launch_confirm_modal` already use:
 /// it sits above the sidebar, list and detail panels *and* above the titlebar,
 /// so nothing behind it can be clicked while this is up.
@@ -6133,17 +6130,7 @@ pub fn draw_prefs_modal(ctx: &egui::Context, state: &mut PrefsState) -> PrefsAct
     // than a fix; the point is that the blocked region and the painted region
     // are now derived from the same rectangle instead of agreeing by
     // coincidence.
-    egui::Area::new(egui::Id::new("prefs-modal-scrim"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(screen.min)
-        .show(ctx, |ui| {
-            ui.allocate_response(screen.size(), Sense::click());
-            ui.painter().rect_filled(
-                screen,
-                CornerRadius::ZERO,
-                egui::Color32::from_black_alpha(MODAL_SCRIM_ALPHA),
-            );
-        });
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("prefs-modal-scrim")));
 
     // `fixed_pos`, not `anchor`. An anchored `Area` has to measure its content
     // before it can centre it, so its first frame paints nothing at all -- and
@@ -14292,8 +14279,14 @@ mod modal_tests {
         );
         assert_eq!(
             scrim.a(),
-            MODAL_SCRIM_ALPHA,
-            "the scrim's alpha is not the one `folder_modal` and the launch confirmation use"
+            // Read off `theme`, which is where the app's ONE scrim lives now.
+            // This file used to carry its own copy of the number, "taken from
+            // `folder_modal` and the launch confirmation verbatim rather than
+            // picked again" -- and five other files had copies of the whole
+            // scrim beside it, which is how they all ended up on the wrong
+            // ORDER together. See `theme::SCRIM_ORDER`.
+            crate::theme::MODAL_SCRIM_ALPHA,
+            "the scrim's alpha is not `theme::modal_scrim`'s"
         );
         assert!(
             scrim.a() < 255,

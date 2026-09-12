@@ -7772,18 +7772,7 @@ fn draw_discard_confirm(ctx: &egui::Context) -> Option<DiscardAnswer> {
     // decides nothing -- neither answer is safe to give by accident, and
     // "dismiss by clicking away" would give the destructive one to anyone who
     // read the two buttons as a toolbar.
-    egui::Area::new(egui::Id::new("detail-edit-discard-scrim"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
-        .show(ctx, |ui| {
-            let screen = ctx.content_rect();
-            ui.allocate_response(screen.size(), egui::Sense::click());
-            ui.painter().rect_filled(
-                screen,
-                CornerRadius::ZERO,
-                egui::Color32::from_black_alpha(90),
-            );
-        });
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("detail-edit-discard-scrim")));
 
     // Movable by its title line, centred again the next time it opens --
     // `theme::movable_modal`, which is where the `.anchor(CENTER_CENTER, ZERO)`

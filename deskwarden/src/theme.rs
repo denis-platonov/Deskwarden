@@ -6965,7 +6965,7 @@ const STRENGTH_GAP: f32 = 6.0;
 /// `prefs_ui`'s own modal each already dim by. It is a constant here so that
 /// the next one to be built cannot arrive at a fifth copy of the number and
 /// then quietly disagree with it.
-const MODAL_SCRIM_ALPHA: u8 = 90;
+pub const MODAL_SCRIM_ALPHA: u8 = 90;
 
 /// The card's corner radius, applied to the outer frame **and to nothing
 /// inside it except the two bands that touch a corner**.
@@ -7645,9 +7645,42 @@ pub fn modal_drag_handle_at(ui: &mut Ui, header: Rect) {
 /// where it does not the scrim looks whole while blocking a box that starts
 /// at the wrong corner. `prefs_ui::draw_prefs_modal` records the measurement;
 /// this is the same fix, applied once for every caller.
+/// **The order a scrim sits on, and it is BELOW the card it dims.**
+///
+/// # The freeze this fixes
+///
+/// The owner: "if open Send popup and then click outside of the parent app -
+/// it gets dimmed and not responsive, so only restart app".
+///
+/// Every scrim in this app was on `Order::Foreground`, which is the order its
+/// CARD is on. Within one order egui keeps a list and promotes an area to the
+/// top of it when the pointer is pressed on that area, when it is dragged or
+/// clicked, or when it was not visible on the previous frame
+/// (`containers/area.rs:546-551`). All three happen here: the first click
+/// anywhere outside the card lands on the scrim, and coming back to an
+/// occluded window trips the third.
+///
+/// Once promoted, the scrim is a full-screen `Sense::click` rectangle ON TOP
+/// of the card. It swallows every press from then on, the card can never be
+/// reached again, and `record_ui`'s two modals bind no Escape by design -- so
+/// the window is dimmed, inert, and only killable. Exactly the report.
+///
+/// # Why an order and not a re-promotion of the card
+///
+/// Moving the CARD back to the top each frame would work and is a race: it
+/// fixes the symptom one frame after the press that caused it, and it needs
+/// every modal to remember to do it. Two different orders cannot interleave
+/// at all -- egui sorts by order first and by the within-order list second --
+/// so a scrim on `Middle` is below a card on `Foreground` no matter what the
+/// pointer does.
+///
+/// `Middle` and not `Background`: the scrim still has to cover the sidebar,
+/// the list and the detail pane, which are ordinary panels on `Background`.
+pub const SCRIM_ORDER: egui::Order = egui::Order::Middle;
+
 pub fn modal_scrim(ctx: &egui::Context, area: egui::Area) {
     let screen = ctx.content_rect();
-    area.order(egui::Order::Foreground)
+    area.order(SCRIM_ORDER)
         .fixed_pos(screen.min)
         .show(ctx, |ui| {
             // Allocating the full screen is what makes the block real; an
@@ -12016,7 +12049,7 @@ mod modal_card_tests {
         // allocated nothing looks identical on screen and catches the pointer
         // nowhere, so the corners -- the furthest a click can land from the
         // card -- are asked who would receive it.
-        let shade_layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new(SHADE_ID));
+        let shade_layer = egui::LayerId::new(SCRIM_ORDER, egui::Id::new(SHADE_ID));
         assert!(ctx.memory(|m| m.areas().is_visible(&shade_layer)));
         for corner in [
             screen.min + Vec2::splat(2.0),

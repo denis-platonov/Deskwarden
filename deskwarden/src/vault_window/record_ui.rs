@@ -1607,7 +1607,7 @@ const MODAL_WIDTH: f32 = 360.0;
 /// the moment the user is deciding what to send from it.
 ///
 /// Built exactly the way [`super::folder_modal::draw_folder_edit_modal`] is —
-/// a full-window click-catching scrim on the `Foreground` layer, then a
+/// a full-window click-catching scrim on `theme::SCRIM_ORDER`, then a
 /// centred card — because that is this window's established modal, and a
 /// second one built differently is two modals that dim, layer and swallow
 /// clicks two ways. Nothing about the form itself moves in here: every
@@ -1623,18 +1623,7 @@ pub fn draw_export_modal(
     now: &dyn crate::send::SendClock,
     zone: &dyn crate::local_time::LocalOffset,
 ) -> RecordUiAction {
-    egui::Area::new(egui::Id::new("record-send-scrim"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
-        .show(ctx, |ui| {
-            let screen = ctx.content_rect();
-            ui.allocate_response(screen.size(), egui::Sense::click());
-            ui.painter().rect_filled(
-                screen,
-                CornerRadius::ZERO,
-                egui::Color32::from_black_alpha(90),
-            );
-        });
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-send-scrim")));
 
     theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-send-modal")))
         .show(ctx, |ui| {
@@ -1737,18 +1726,7 @@ pub fn draw_import_modal(
     collision: &Collision,
     now: &dyn crate::send::SendClock,
 ) -> RecordUiAction {
-    egui::Area::new(egui::Id::new("record-import-scrim"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
-        .show(ctx, |ui| {
-            let screen = ctx.content_rect();
-            ui.allocate_response(screen.size(), egui::Sense::click());
-            ui.painter().rect_filled(
-                screen,
-                CornerRadius::ZERO,
-                egui::Color32::from_black_alpha(90),
-            );
-        });
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-import-scrim")));
 
     theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-import-modal")))
         .show(ctx, |ui| {

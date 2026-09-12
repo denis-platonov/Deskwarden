@@ -13489,15 +13489,7 @@ fn draw_launch_confirm_modal(ctx: &egui::Context, pending: &PendingLaunch) -> La
 
     let mut action = LaunchConfirmAction::None;
 
-    egui::Area::new(egui::Id::new("launch-confirm-scrim"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(egui::Pos2::ZERO)
-        .show(ctx, |ui| {
-            let screen = ctx.content_rect();
-            ui.allocate_response(screen.size(), egui::Sense::click());
-            ui.painter()
-                .rect_filled(screen, CornerRadius::ZERO, egui::Color32::from_black_alpha(90));
-        });
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("launch-confirm-scrim")));
 
     // Movable by its title line. It matters more here than on most cards:
     // this one shows a command line in full, and a command line long enough
