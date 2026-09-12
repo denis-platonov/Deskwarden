@@ -2711,7 +2711,29 @@ mod tests {
             // against the PREVIOUS pinned pair and reproduced
             // (27355, 0x28a8_aa4b_8b1a_805a) exactly, so it is measuring
             // what this test measures.
-            (27359, 0x546e_fe01_2ee6_ade3_u64),
+            // **27355 bytes, new hash: the 0.15.22 release, and nothing else.**
+            // `version = "0.15.22-dev"` became `"0.15.22"`. Four bytes shorter, the
+            // mirror of the hop above it: that one put the `-dev` suffix back so a
+            // working-tree build would stop claiming to BE a release, and this one
+            // takes it off for the build that IS the release. The length moves with
+            // the hash again, because the suffix is four characters.
+            //
+            // The hop above it exists so that this one is not the last word: the
+            // commit that follows this release puts `-dev` back, which is the step
+            // the 0.15.20 and 0.15.21 cuts both forgot.
+            //
+            // No dependency was added, removed, re-pointed or re-featured, no
+            // `[patch]`/`[replace]`/`[workspace.dependencies]` table appeared, no
+            // path or fork appeared, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`.
+            //
+            // Recomputed the way every hop above records -- FNV-1a/64 over the file
+            // with CRLF normalised to LF, in a separate implementation outside this
+            // crate -- rather than copied out of the failure message. That
+            // implementation was first run against the PREVIOUS pinned pair and
+            // reproduced (27359, 0x546e_fe01_2ee6_ade3) exactly, so it is measuring
+            // what this test measures.
+            (27355, 0xcd71_663f_a7b0_6ba5_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

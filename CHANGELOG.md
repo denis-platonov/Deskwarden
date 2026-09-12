@@ -15,6 +15,184 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.22 - 2026-09-12
+
+### Scanning a code shows your own desktop, dimmed, with the box you drag cut out of it
+
+> Drag a box completely black and user cannot find where to put the box
+
+The overlay spent four rounds asking Windows to make it see-through -- DWM
+blur, winit's transparent attribute, per-pixel alpha, and a layered window's
+uniform alpha. Every one of them was accepted by the API and wrong on the
+glass, the last one silently: the log recorded the bit set and the alpha
+accepted while the screen stayed black, because an OpenGL window presents its
+content directly and a layered window's alpha stops applying once it does.
+
+So it asks for nothing. The overlay is an ordinary opaque window that **takes
+a picture of your display and paints it**, with the dim laid over the picture
+in its own framebuffer. No compositor, no driver, no swap chain in the way.
+
+That also buys the thing no amount of window alpha could: **the rectangle you
+drag is not dimmed.** The picture is at full strength inside it and washed
+outside, which is what makes it possible to see what you are pointing at --
+the report this screen first got, and one a uniformly faded window could never
+have answered.
+
+The picture is taken before the overlay exists and with Deskwarden already
+excluded from screen capture, so it is exactly what a drag captures on
+release. It is released with the window. If the capture is refused -- a
+protected window somewhere on screen -- the overlay falls back to a plain dark
+ground and says so in the log.
+
+### The scan no longer flashes, minimises your window, or shows a card first
+
+Four things were happening between pressing *Scan the code* and being able to
+drag.
+
+**A white flash.** A hidden window has no surface to draw into, so the frame
+painted before showing it was never presented; the show created an empty
+surface and the compositor drew *that* once. Windows' own cloaking fixes it: a
+cloaked window is shown, painted and composited, and simply not drawn to the
+screen, so the first real frame is finished before anything is visible.
+
+**A blink a second in.** The overlay asked for the foreground after it was
+already on screen, and activation is a focus and z-order change the compositor
+re-orders around. The tell was the owner's: the drag only started working
+after the blink -- the blink and the window becoming usable were the same
+event. The foreground is asked for while the window is still cloaked now,
+where that happens off the glass by construction.
+
+**Your window being minimised.** Deskwarden used to duck out of the way so it
+was not in the shot. It does not need to: the picture is taken with it already
+excluded from capture. The minimise was also visible -- a window flying to the
+taskbar over a full-screen overlay -- and is gone.
+
+**And the card reading "Scanning your screen -- drag a box".** On the path
+where the scan finds a code there is never an overlay and never a box to drag,
+so the card asked for something that would not exist. There is no card now:
+the scan stage paints nothing at all, and the overlay says what to do in its
+own strip, where there is something to say.
+
+### A click outside a dialog no longer freezes the app
+
+> if open Send popup and then click outside of the parent app - it gets dimmed
+> and not responsive, so only restart app
+
+Every dimmed backdrop in the app sat on the same layer as the card it dimmed.
+egui moves an area to the top of its layer when the pointer is pressed on it
+-- or when it was not visible on the previous frame -- so the first click
+outside a card, or simply coming back from another application, put the
+backdrop **in front of** the card. From then on a full-screen click-catcher
+swallowed everything, and the two record dialogs bind no Escape by design.
+Killing the app was the only way out.
+
+Backdrops are on a lower layer than their cards now, and two different layers
+cannot interleave however the pointer is used. Six of the seven were
+hand-written near-copies of one another, which is how they all came to be
+wrong together; they are one function now.
+
+### Text sits where its letters are, not where its box is
+
+> text cursor is huge and text is not that big, text in field not centered
+
+One defect, reported on four screens. The faces this app bundles reserve a
+generous descender, so a line's box is meaningfully taller than the ink in it
+-- and everything that centred a line centred the box. Every field, chip, pill
+and code strip sat about two and a half points high. The same measurement made
+the text caret, which is drawn at the box's height, tower over the letters
+beside it.
+
+Making the line box the ascent fixes both at once: centring the box is then
+centring the ink, and the caret covers the band a caret is meant to cover.
+
+Two things came out with it. **A field now takes a click anywhere in its box**
+-- the top and bottom thirds of every field in the app used to do nothing. And
+a masked field with a custom layout no longer risks drawing the password in
+the clear, which is a trap egui sets and this app had walked up to.
+
+### Edit is the item you were reading, with the fields switched on
+
+> Edit UI is wrong - it is more like same as it is but with editable fields,
+> but your is completely off
+
+The form opened with a 19-point *Edit login* heading and put the record's own
+name in a box in the middle of the first card. Clicking Edit on `Ledgerline`
+took you to a screen titled *Edit login* on which `Ledgerline` was a setting.
+
+It is the read pane's own strip now -- the same tile, the same name in the
+same place, the same kind and folder under it -- with the name in a box and a
+pencil on the corner of the tile. Card titles match the read pane's. The
+sections rail is gone at the owner's request: this form sits in a window whose
+sidebar and item list are already down the left-hand side.
+
+Two new cards at the foot of it, **Sharing** and **History**, say what a
+record is rather than what it will become: when it was made and last changed,
+how many previous passwords it has, how many times it has been filled, and who
+else can see it. Where a fact is not kept, no row claims it -- the fill count
+is real, and "last filled two hours ago in chrome.exe" is not, so it is not
+drawn.
+
+### Send a record, and the link is actually on your clipboard
+
+The button read *Create link*, because nothing copied anything. That was
+honest about a gap that should not have existed: until now the only copy of a
+new Send's link was a sentence in a notice, unselectable and gone when
+dismissed -- the app could publish a link and then fail to hand it to you.
+
+It reads *Create & copy link* and does that, under the same clipboard timer a
+password gets, because the link carries the Send's decryption key.
+
+The composer is design 5a's card besides: every row carries the value that
+would travel, the password row is tinted with a plain warning that it is
+visible to anyone holding the link, there is a caution strip above the
+buttons, and *Open with* has a **Generate** beside it -- which is what makes a
+link password a realistic answer rather than an aspiration.
+
+**Not built, and not pretended:** the design's *Recipient* field and its two
+toggles. A Bitwarden Send has no recipient and no open-notification; it is a
+link, and anyone holding it can open it. Three controls that cannot act would
+be three lies on the card that is specifically about who can see what.
+
+### The add-a-code card
+
+The blue strip is one row -- the code, a bar, the seconds -- on both the
+scanned and the typed card. The footer is *Save code* and *Cancel*, with no
+Escape hint that no other dialog in this app prints. The secret is shown as
+plain text, masked at its real length and with no separators in either form,
+so revealing it changes what the row says and not how long it is.
+
+The code is drawn in a bold monospace, which is what both designs asked for
+and what this app could not previously do -- the monospace family had one
+weight, and a comment recorded that as settled fact.
+
+A heading reading *What was extracted* is gone. It was lifted from the design
+document's own caption for the figure -- the words beside the `6c` badge that
+name the picture for a reader -- and shipped as if it were part of the card.
+
+### Search results in the account picker are numbered too
+
+> Also within search show 1,2,3 shortcuts for found items, so user can
+> continue using those instead of arrow down+Enter
+
+The card's own rows have taken bare digits for a while; search could not,
+because it has a focused text box and a bare `3` would fire instead of being
+typed by somebody searching for `1Password`. The digit is held with **CTRL**
+there, and only there.
+
+Not `CTRL+ALT`: that is `AltGr` on German, Polish and Portuguese layouts,
+where `CTRL+ALT+2` is the character `@` -- untypable while searching for an
+account by email.
+
+### Windows no longer flash white when they open, or when they come back
+
+The white box at startup was the same defect as the scan overlay's, in the
+code every window shares: painted while hidden, shown into an empty surface,
+composited once before the real frame landed. All seven windows this app opens
+hidden now cloak while they paint.
+
+So does the vault window when it comes back from the tray, which had been
+showing an empty surface on every restore.
+
 ### A browser is no longer something an item can be bound to
 
 > But I still see that popup for Edge everytime
