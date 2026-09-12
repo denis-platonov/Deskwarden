@@ -5107,30 +5107,39 @@ fn row_action(ui: &mut egui::Ui, text: &str) -> egui::Response {
 }
 
 /// One parameter chip, as 6c draws them.
+///
+/// **The chip follows the table's rule and not its own**, which is the fix for
+/// the owner's "labels not centered I think" -- a report that was right about
+/// there being a gap and, understandably, wrong about which run had moved.
+/// Measured on the card: every label sat exactly on its row's centre, every
+/// value beside it sat on the same line to a tenth of a point, and the
+/// parameter chips' text sat **1.9 points lower** than the `Parameters` label
+/// it belongs to. A label level with three rows and two points off the fourth
+/// reads as the label being wrong.
+///
+/// The two points are the two corrections meeting. `theme::centred_galley_top`
+/// -- which is what this chip used, and which was itself a fix for "also param
+/// text within pill not centered" -- takes a FULL-height line box and pushes
+/// the ink down by [`theme::ink_drop`] to centre it. Every other run in this
+/// table takes [`table_line`], whose box IS the ascent, so no push is needed
+/// and none is applied. Both are optical centring and either is right on its
+/// own; what is wrong is using one of them in a row that uses the other.
+///
+/// So the chip is built the table's way: an ascent-boxed galley, padded evenly
+/// and centred plainly. The chip's own geometry is unchanged -- same padding,
+/// same radius, same fill -- and its text now sits where the label does.
 fn param_chip(ui: &mut egui::Ui, text: &str) {
     let font = egui::FontId::new(PARAM_CHIP_PX, egui::FontFamily::Monospace);
-    let galley =
-        ui.painter().layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT_SECONDARY);
+    let job = table_line(ui, text, font, theme::TEXT_SECONDARY);
+    let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
     let size = galley.size() + egui::vec2(PARAM_CHIP_PAD_X * 2.0, PARAM_CHIP_PAD_Y * 2.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::same(PARAM_CHIP_RADIUS), theme::CANVAS);
-    // **Optically centred, not padded.** The chip is sized from the galley's
-    // BOX and the padding was then applied to that box, which is geometrically
-    // even and reads high: the face inks only the upper part of its row, so
-    // equal padding above and below a box puts unequal air above and below the
-    // letters. The owner: "also param text within pill not centered".
-    //
-    // `theme::centred_galley_top` is the same correction the app's other
-    // single-line bands take, so a chip here and a pill elsewhere sit their
-    // text at the same height.
-    let at = theme::centred_galley_top(
-        ui.ctx(),
-        rect,
-        &galley,
-        &font,
-        rect.min.x + PARAM_CHIP_PAD_X,
+    ui.painter().galley(
+        egui::pos2(rect.min.x + PARAM_CHIP_PAD_X, rect.min.y + PARAM_CHIP_PAD_Y),
+        galley,
+        theme::TEXT_SECONDARY,
     );
-    ui.painter().galley(at, galley, theme::TEXT_SECONDARY);
 }
 
 /// [`draw_add_form`] over a dimmed scrim, centred, for `vault_window::mod` to
@@ -7112,6 +7121,76 @@ mod tests {
         assert!(code_to_copy(&empty, BOUNDARY).is_none());
         empty.typed = Zeroizing::new("https://example.com".to_string());
         assert!(code_to_copy(&empty, BOUNDARY).is_none());
+    }
+
+    /// **Every run in 6c's field table sits on one line, row by row.**
+    ///
+    /// The owner's reports about this table have all been one measurement seen
+    /// from different rows -- "labels are not centered", "also feels that key
+    /// and value not on the same level", "secret clearly higher that the rest",
+    /// "also Hide feels like higher now compared to Secret code", "labels not
+    /// centered I think" -- and each was answered by moving one run. This is
+    /// the assertion that stops that being a sequence: it measures the label,
+    /// the value and the trailing control of every row against each other, so
+    /// a run given a different vertical rule from its neighbours reds here
+    /// rather than on the next screenshot.
+    ///
+    /// **A point of tolerance**, because these are galley boxes and two faces
+    /// at two sizes do not round identically; the gap this test was written
+    /// for was 1.9 points, and the differences it must not accept are the ones
+    /// an eye can see on a 43-point row.
+    #[test]
+    fn the_field_tables_rows_all_sit_on_one_line() {
+        let mut state = TotpAdd::opening("id-1", "Git Host", false);
+        state.accept_decoded(Zeroizing::new(
+            "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&issuer=Git%20Host"
+                .to_string(),
+        ));
+        let manual = Manual::new();
+        let run = manual.idle(&mut state);
+        // **In the value column**, because two of these words are painted
+        // twice on this card: the record's name is in the `Adding to` strip a
+        // hundred points up as well as in the `Issuer` row. The column's left
+        // edge is what tells the two apart, and a run found outside it would
+        // make this test compare a row against the header.
+        let centre = |needle: &str| -> f32 {
+            run.texts
+                .iter()
+                .filter(|t| t.rect.left() >= FIELD_LABEL_W)
+                .find(|t| t.text == needle)
+                .unwrap_or_else(|| {
+                    panic!("{needle:?} was not painted: {:?}", run.texts.iter().map(|t| &t.text).collect::<Vec<_>>())
+                })
+                .rect
+                .center()
+                .y
+        };
+        // Label, value, and -- on the row that has one -- the trailing
+        // control. `Parameters` is the row the chips are on, and the chips are
+        // what this test was written for.
+        for (label, beside) in [
+            (ISSUER_ROW_LABEL, "Git Host"),
+            (ACCOUNT_ROW_LABEL, "anovak"),
+            (SECRET_ROW_LABEL, REVEAL_LABEL),
+            (PARAMETERS_ROW_LABEL, "SHA1"),
+        ] {
+            let a = run
+                .texts
+                .iter()
+                .find(|t| t.text == label)
+                .unwrap_or_else(|| panic!("{label:?} was not painted"))
+                .rect
+                .center()
+                .y;
+            let b = centre(beside);
+            assert!(
+                (a - b).abs() <= 1.0,
+                "{label:?} is painted at y = {a} and {beside:?} beside it at y = {b} -- the \
+                 two runs in one row are {} points apart, so one of them is following a \
+                 different vertical rule from the other (see `table_line`)",
+                (a - b).abs()
+            );
+        }
     }
 
     /// **The strip is pressed, not called**: laid out through the by-hand
