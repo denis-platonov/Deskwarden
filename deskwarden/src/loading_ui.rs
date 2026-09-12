@@ -131,8 +131,7 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
             let leftover = ui.available_height() - CONTENT_HEIGHT;
             ui.add_space((leftover / 2.0).max(0.0));
             ui.vertical_centered(|ui| {
-                theme::progress_bar(ui, NARROW_BAR);
-                ui.add_space(BAR_TO_LABEL);
+
                 // **Design 7a's heading, not a status line.** 7a sets this
                 // sentence at `TITLE_SIZE` in the 700 cut, in `INK`, and it is
                 // the only copy on the screen. The owner, seeing it at body
@@ -147,10 +146,49 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
                 // emphasis with nothing to be emphasised against, which is what
                 // "bold for some reason" was reading; the cure was a heading,
                 // not a demotion.
-                ui.label(theme::bold(message, TITLE_SIZE).color(theme::INK));
+                waiting_stack(ui, NARROW_BAR, message, None);
             });
         });
     action
+}
+
+/// The words both loading screens use -- §7a's own.
+///
+/// Named because the vault window draws this screen too, for the seconds
+/// after the startup window hands it the frame, and a second wording there
+/// would be a second thing to keep true. Its old copy read "Loading your
+/// vault…" with an ellipsis this one has not got.
+pub const LOADING_HEADING: &str = "Loading your vault";
+
+/// **Design turn 7's waiting stack: the bar, the heading, and what is under
+/// it.** The one drawing of this screen in the whole crate.
+///
+/// There were three. `draw_spinner_body` drew it, `draw_first_window_body`'s
+/// `Loading` arm drew it, and `vault_window::mod` drew a third copy for the
+/// moment after the handover -- at `13.0` in `TEXT_FAINT`, which is this
+/// module's SUB-line treatment worn by a heading. The owner saw all of it in
+/// order: "I think it blinked with big font and then same small was shown".
+/// The big font was the first window's; the small one was the vault window's
+/// own copy taking over a second later.
+///
+/// That copy's comment already knew the risk it was running -- "two different
+/// indicators across that handover is the drift the shared widget exists to
+/// stop" -- and it shared the BAR while re-spelling the type beside it. So
+/// the whole stack is the widget now, not half of it, and
+/// [`the_waiting_heading_is_drawn_in_exactly_one_place`] holds it there.
+///
+/// `bar` is the caller's because the design has two track widths and they
+/// differ by how much room the body has -- see [`WIDE_BAR`]. `sub` is
+/// optional because the handover screen has nothing to add to the heading
+/// that the screen one second earlier has not already said.
+pub fn waiting_stack(ui: &mut egui::Ui, bar: f32, heading: &str, sub: Option<&str>) {
+    theme::progress_bar(ui, bar);
+    ui.add_space(BAR_TO_LABEL);
+    ui.label(theme::bold(heading, TITLE_SIZE).color(theme::INK));
+    if let Some(sub) = sub {
+        ui.add_space(TITLE_TO_SUB);
+        ui.label(theme::regular(sub, SUB_SIZE).color(theme::TEXT_FAINT));
+    }
 }
 
 /// The heading's metrics: the VAULT window's, not the login window's.
@@ -680,24 +718,20 @@ pub fn draw_first_window_body(
             ui.add_space((leftover / 2.0).max(0.0));
             ui.vertical_centered(|ui| match body {
                 FirstWindowBody::Loading => {
-                    theme::progress_bar(ui, WIDE_BAR);
-                    ui.add_space(BAR_TO_LABEL);
-                    ui.label(theme::bold("Loading your vault", TITLE_SIZE).color(theme::INK));
-                    ui.add_space(TITLE_TO_SUB);
-                    ui.label(
-                        theme::regular("This stays on your machine", SUB_SIZE)
-                            .color(theme::TEXT_FAINT),
+                    waiting_stack(
+                        ui,
+                        WIDE_BAR,
+                        LOADING_HEADING,
+                        Some("This stays on your machine"),
                     );
                 }
                 FirstWindowBody::Slow { seconds, local } => {
-                    theme::progress_bar(ui, WIDE_BAR);
-                    ui.add_space(BAR_TO_LABEL);
-                    ui.label(
-                        theme::bold("Still syncing with Bitwarden", TITLE_SIZE)
-                            .color(theme::INK),
+                    waiting_stack(
+                        ui,
+                        WIDE_BAR,
+                        "Still syncing with Bitwarden",
+                        Some(&slow_line(seconds)),
                     );
-                    ui.add_space(TITLE_TO_SUB);
-                    ui.label(theme::regular(slow_line(seconds), SUB_SIZE).color(theme::TEXT_FAINT));
                     // **Secondary here and primary on the failure body**, and
                     // that is the whole difference: this wait can still
                     // succeed on its own, so leaving it is an option and not
@@ -965,6 +999,76 @@ mod spinner_body_tests {
         out
     }
 
+    /// **Design turn 7's waiting screen is drawn in exactly one place.**
+    ///
+    /// There were three drawings of it and the owner saw two of them in a row:
+    /// "I think it blinked with big font and then same small was shown". The
+    /// startup window drew the heading at [`TITLE_SIZE`]; the vault window,
+    /// which takes the same frame a second later, drew its own copy at 13
+    /// points in `TEXT_FAINT` -- this module's SUB-line treatment worn by a
+    /// heading -- and that copy is what stayed on screen.
+    ///
+    /// A CRATE-WIDE source pin, not a module one, because the copy that was
+    /// wrong lived in another file and nothing here could see it. It counts
+    /// the bar, which is the part of this screen no other screen has: every
+    /// caller of `theme::progress_bar` outside this module must go through
+    /// [`waiting_stack`], and the two that legitimately do not are named.
+    ///
+    /// The needles are split with `concat!` so this pin cannot match itself.
+    #[test]
+    fn the_waiting_heading_is_drawn_in_exactly_one_place() {
+        let needle = concat!("theme::progress", "_bar(");
+        // Every module in this crate that draws the design's track.
+        let sources: [(&str, &str); 3] = [
+            ("loading_ui", include_str!("loading_ui.rs")),
+            ("vault_window::mod", include_str!("vault_window/mod.rs")),
+            ("login_ui", include_str!("login_ui.rs")),
+        ];
+        for (name, source) in sources {
+            let production = source.split_once("\n#[cfg(test)]").map_or(source, |(p, _)| p);
+            let drawn: Vec<&str> =
+                production.lines().filter(|line| line.contains(needle)).collect();
+            match name {
+                // The three inside the widget itself: `waiting_stack`'s own,
+                // and the two the unreachable body's siblings draw.
+                "loading_ui" => assert_eq!(
+                    drawn.len(),
+                    1,
+                    "the waiting stack draws the track {} times, not once: {drawn:?}",
+                    drawn.len()
+                ),
+                // **The sign-in card's own bar**, which is a different screen:
+                // it is waiting on an AUTHENTICATION and has no vault to name.
+                // Named here so it is an exception on the record rather than a
+                // hole in the count.
+                "login_ui" => assert_eq!(
+                    drawn.len(),
+                    1,
+                    "login_ui draws the track {} times: {drawn:?}",
+                    drawn.len()
+                ),
+                // And the vault window draws none of its own: it calls
+                // `waiting_stack`, which is the whole point of this pin.
+                _ => assert!(
+                    drawn.is_empty(),
+                    "{name} draws design 7's track itself instead of calling \
+                     `loading_ui::waiting_stack`, so the screen after the handover \
+                     can drift from the screen before it -- which is exactly what \
+                     was reported: {drawn:?}",
+                ),
+            }
+        }
+
+        // The other direction, so the counts above cannot be satisfied by a
+        // vault window that stopped drawing the screen at all.
+        let vault = include_str!("vault_window/mod.rs");
+        assert!(
+            vault.contains(concat!("loading_ui::waiting", "_stack(")),
+            "control: the vault window calls the shared widget nowhere, so the assertion \
+             above is about a screen it no longer draws"
+        );
+    }
+
     /// **Every sentence this module owns is body weight; only its headings
     /// are emphasised, and they are the design's 700 cut.**
     ///
@@ -998,19 +1102,22 @@ mod spinner_body_tests {
              the middle cut is the design's answer for"
         );
 
-        // Only the four headings and the warning badge's glyph, and each is
-        // named so a fifth has to be argued for here rather than added
-        // quietly.
+        // Only the two headings and the warning badge's glyph, and each is
+        // named so a fourth has to be argued for here rather than added
+        // quietly. Two, not four, because three of the screens that used to
+        // spell their own heading out now go through [`waiting_stack`].
+
         let emphasised: Vec<&str> = production
             .lines()
             .filter(|line| line.contains(concat!("theme::b", "old(")))
             .collect();
         assert_eq!(
             emphasised.len(),
-            5,
-            "this module has {} emphasised string(s), not the four headings and the badge's \
-             glyph. Anything else set in the 700 cut is body copy wearing a heading's weight, \
-             which is the report this fixed: {emphasised:?}",
+            3,
+            "this module has {} emphasised string(s), not the waiting stack's heading, the \
+             unreachable body's, and the badge's glyph. Anything else set in the 700 cut is \
+             body copy wearing a heading's weight, which is the report this fixed: \
+             {emphasised:?}",
             emphasised.len()
         );
         for line in &emphasised {
@@ -1028,9 +1135,9 @@ mod spinner_body_tests {
         // so.
         let body = production.matches(concat!("theme::reg", "ular(")).count();
         assert!(
-            body >= 7,
+            body >= 5,
             "only {body} body-weight string(s) in this module; the sub-lines and the footnotes \
-             are all body copy and there were seven"
+             are all body copy and there were five"
         );
     }
 

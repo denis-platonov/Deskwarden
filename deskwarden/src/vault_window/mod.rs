@@ -2806,19 +2806,29 @@ pub fn build_frame_with_search(
                             // pair sits centred rather than the bar alone.
                             // Half of 3 + 22 + ~18 is ~21.
                             ui.add_space((available / 2.0 - 21.0).max(0.0));
-                            // **Design turn 7's sliding bar, not a disc.**
-                            // This body is the last screen before the item
-                            // list and is seen seconds after `loading_ui`'s
-                            // own -- often in the same window, because the
-                            // startup host hands this one the frame. Two
-                            // different indicators across that handover is
-                            // the drift the shared widget exists to stop.
-                            theme::progress_bar(ui, 260.0);
-                            ui.add_space(22.0);
-                            ui.label(
-                                egui::RichText::new("Loading your vault…")
-                                    .size(13.0)
-                                    .color(theme::TEXT_FAINT),
+                            // **Design turn 7's whole waiting stack, not a
+                            // local drawing of it.** This body is the last
+                            // screen before the item list and is seen seconds
+                            // after `loading_ui`'s own -- often in the same
+                            // window, because the startup host hands this one
+                            // the frame.
+                            //
+                            // It used to share only the BAR and spell the line
+                            // beside it out here, at 13 points in `TEXT_FAINT`
+                            // -- which is that module's SUB-line treatment worn
+                            // by a heading. The owner watched the handover and
+                            // reported exactly that: "I think it blinked with
+                            // big font and then same small was shown". The
+                            // comment this replaces already named the risk it
+                            // was running.
+                            //
+                            // No sub-line: the screen a second earlier has
+                            // already said where the vault is being decrypted.
+                            crate::loading_ui::waiting_stack(
+                                ui,
+                                260.0,
+                                crate::loading_ui::LOADING_HEADING,
+                                None,
                             );
                         });
                     });
