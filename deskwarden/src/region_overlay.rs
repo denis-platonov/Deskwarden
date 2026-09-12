@@ -715,8 +715,26 @@ pub const PRESCAN_SETTLE: Duration = Duration::from_millis(80);
 /// there, measures the root going on at about 8 frames a second and this
 /// overlay at twice that, indefinitely. That is `eframe`'s deliberate
 /// `INVISIBLE_WINDOW_REPAINT_INTERVAL` throttle of a window Windows sends no
-/// `WM_PAINT` to, and it is a real cost paid by the drag fallback; it is not a
-/// freeze.
+/// `WM_PAINT` to; it is not a freeze.
+///
+/// **And it is not a cost the drag pays**, which an earlier version of this
+/// paragraph claimed and which was then reported as *"the rubber band runs
+/// at about 8 fps while the app is minimised"*. Re-measured with a probe
+/// built the way this overlay is -- a deferred viewport created hidden and
+/// shown by its own `ShowWindow`, the root asking for the child's repaint on
+/// every root frame, the root sent down with `SW_SHOWMINNOACTIVE`, and
+/// `WM_MOUSEMOVE` posted to the child at 125 Hz to stand in for a drag: with
+/// the root minimised and **no** input, the root ran at 9-12 fps (110 ms
+/// gaps: the 100 ms throttle plus `eframe`'s 10 ms sleep) and the child at
+/// 23 fps, twice the root, because every `request_repaint_of` buys two
+/// repaints. With input, the child ran at 350 fps minimised and at 360-1600
+/// fps with the root visible. The throttle keys on the window the repaint is
+/// FOR (`is_invisible_or_minimized` in `eframe::native::run`), and a pointer
+/// event on this window schedules a repaint of this window; the root's state
+/// never enters into it. So the throttle governs only the frames the root
+/// drives -- the idle ones -- and a drag is made of the other kind. Whatever
+/// the owner sees during a drag, it is not this; [`DragCadence`] is the
+/// instrument that says what it is.
 ///
 /// Which leaves one thing that genuinely has to wait, and it is not the scan's
 /// capture -- that one is protected by the mask, set two frames earlier, which
@@ -869,6 +887,91 @@ impl DecodeThrottle {
 // ---------------------------------------------------------------------------
 // Reading a region
 // ---------------------------------------------------------------------------
+
+/// **How one drag's frames came**, said in one log line when the button comes
+/// up.
+///
+/// # Why an instrument
+///
+/// The report: *"the rubber band runs at about 8 fps while the app is
+/// minimised -- visibly steppy; unminimised it is smooth."* The mechanism
+/// that was suspected -- a minimised root throttling this viewport's repaints
+/// -- was measured and is not it: see [`MINIMISE_SETTLE`], whose probe puts
+/// the pointer-driven frames of a child viewport at 350 fps with the root
+/// minimised. What the owner sees during a real drag on a real display cannot
+/// be measured from inside this crate (`cargo test` opens no windows) or from
+/// outside this process (this window is out of captures), and the log's
+/// second-resolution timestamps say nothing about cadence. So the overlay
+/// counts its own drag frames: how many, over how long, the worst gap between
+/// two, the rectangle at release, and whether Deskwarden's window was down at
+/// the time. One line per drag, at `info`, which is what the next report is
+/// answered from -- a worst gap of 120 ms with the window down says one
+/// thing, a steady 60 fps with the owner still seeing steps says another.
+///
+/// A "frame" here is one call to [`RegionOverlay::advance`] with the button
+/// held, which is one callback frame that read the pointer; the callback
+/// paints on every frame it reads input on, so it is one painted frame of the
+/// band. The decode this same call may run ([`DECODE_INTERVAL`]) is inside
+/// the gap it measures, deliberately: a decode that stalls the band is a gap
+/// the owner sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DragCadence {
+    /// The frame the drag began on.
+    started: Instant,
+    /// The most recent frame.
+    last: Instant,
+    /// Frames so far, counting the first.
+    frames: u32,
+    /// The longest gap between two consecutive frames.
+    worst_gap: Duration,
+}
+
+impl DragCadence {
+    fn started(now: Instant) -> Self {
+        Self { started: now, last: now, frames: 1, worst_gap: Duration::ZERO }
+    }
+
+    /// One more frame with the button held.
+    fn frame(&mut self, now: Instant) {
+        let gap = now.saturating_duration_since(self.last);
+        if gap > self.worst_gap {
+            self.worst_gap = gap;
+        }
+        self.last = now;
+        self.frames += 1;
+    }
+
+    /// Frames per second over the drag. `None` for a drag that never made a
+    /// second frame, which has no rate.
+    fn per_second(&self) -> Option<f64> {
+        let span = self.last.saturating_duration_since(self.started).as_secs_f64();
+        (self.frames > 1 && span > 0.0).then(|| (self.frames - 1) as f64 / span)
+    }
+
+    /// The line. `aside` is whether Deskwarden's own window was minimised for
+    /// the drag; `rect` is what was framed.
+    fn report(&self, aside: bool, rect: ScreenRect) {
+        match self.per_second() {
+            Some(fps) => log::info!(
+                "region overlay: the drag ran {} frames over {:.0} ms ({fps:.0} fps, worst gap \
+                 {:.0} ms) framing {}x{}, with Deskwarden's window {}",
+                self.frames,
+                self.last.saturating_duration_since(self.started).as_secs_f64() * 1000.0,
+                self.worst_gap.as_secs_f64() * 1000.0,
+                rect.width(),
+                rect.height(),
+                if aside { "minimised" } else { "not minimised" }
+            ),
+            None => log::info!(
+                "region overlay: the drag was released on the frame it began, framing {}x{}, \
+                 with Deskwarden's window {}",
+                rect.width(),
+                rect.height(),
+                if aside { "minimised" } else { "not minimised" }
+            ),
+        }
+    }
+}
 
 /// What a region came to.
 ///
@@ -1239,6 +1342,9 @@ struct Inner {
     reason: Option<ScanMiss>,
     /// How far the reveal has got. See [`Reveal`].
     reveal: Reveal,
+    /// **How the current drag's frames have been coming**, logged when the
+    /// button comes up. `None` between drags. See [`DragCadence`].
+    drag_cadence: Option<DragCadence>,
     /// The bar's two chips in points, as [`draw`] last painted them.
     /// `Rect::NOTHING` before the first paint, which contains no point, so a
     /// press on the frame before there are chips hits none of them.
@@ -1672,6 +1778,7 @@ impl RegionOverlay {
                 aside_at: None,
                 reason: None,
                 reveal: Reveal::Nothing,
+                drag_cadence: None,
                 chips: [egui::Rect::NOTHING; 2],
                 chip_press: None,
                 painted: false,
@@ -1976,6 +2083,28 @@ impl RegionOverlay {
     /// window in the frames between the press and the minimise taking effect,
     /// and because the scan's capture happens two frames *before* this is ever
     /// called. See [`MINIMISE_SETTLE`] for why it cannot be called earlier.
+    ///
+    /// # Whether the minimise is still needed, stated
+    ///
+    /// For the user's view, it no longer is. Since the overlay started painting
+    /// a picture of the display ([`RegionOverlay::take_picture`]) it is an
+    /// opaque, always-on-top window over the whole display, and the picture
+    /// was taken with Deskwarden's own window already out of captures -- so the
+    /// vault window is behind an opaque sheet whose pixels do not contain it,
+    /// minimised or not. The two sentences above that begin "the drag
+    /// fallback asks them to point at a code the window is covering" were
+    /// true of the see-through overlay and are not true of this one.
+    ///
+    /// It stays, for two reasons that are not about the view. The owner asked
+    /// for it in those words, and the second half of the ask -- *"once back -
+    /// it should be on top again"* -- is [`bring_window_back`], which this is
+    /// the other half of. And it was checked for cost before being left alone:
+    /// the throttle a minimised root puts on `eframe` reaches only the frames
+    /// the root drives, not the pointer-driven frames a drag is made of -- see
+    /// [`MINIMISE_SETTLE`] for the measurement -- so keeping it costs the drag
+    /// nothing. If the owner wants the window left where it is, this call and
+    /// its settle are what to remove, and nothing about the picture has to
+    /// change.
     ///
     /// Idempotent through [`Inner::aside`], for
     /// [`mask_own_window`](Self::mask_own_window)'s reasons.
@@ -2402,6 +2531,7 @@ impl RegionOverlay {
                         cursor,
                     });
                     held.found = false;
+                    held.drag_cadence = Some(DragCadence::started(now));
                     None
                 }
                 // A drag continues: the rectangle changed, so the badge's
@@ -2412,6 +2542,9 @@ impl RegionOverlay {
                         cursor,
                     };
                     held.drag = Some(drag);
+                    if let Some(cadence) = held.drag_cadence.as_mut() {
+                        cadence.frame(now);
+                    }
                     let rect = drag.rect();
                     if held.throttle.should_attempt(rect, now) {
                         Some(rect)
@@ -2422,6 +2555,11 @@ impl RegionOverlay {
                 // Released: 6b's "reads it the moment you let go".
                 (Some(drag), false) => {
                     let rect = drag.rect();
+                    // The instrument's one line, before the decode that ends
+                    // the overlay: see `DragCadence`.
+                    if let Some(cadence) = held.drag_cadence.take() {
+                        cadence.report(held.aside, rect);
+                    }
                     drop(held);
                     self.finish(read_region_with(seams, rect));
                     return;
@@ -4073,6 +4211,37 @@ mod tests {
             right,
             bottom,
         }
+    }
+
+    /// **The drag instrument counts what it says it counts.** Frames from the
+    /// first, the rate over the span between first and last, and the worst
+    /// gap -- which is the number the next "steppy" report is answered from,
+    /// so it must be the LARGEST gap and not the last one.
+    #[test]
+    fn the_drag_cadence_reports_frames_rate_and_the_worst_gap() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut cadence = DragCadence::started(t0);
+        assert_eq!(cadence.frames, 1);
+        assert_eq!(
+            cadence.per_second(),
+            None,
+            "a drag released on the frame it began has no rate, and reporting one would be a \
+             division by nothing"
+        );
+        // Nine more frames over 900 ms, one of them 300 ms late.
+        for i in 1..=9u64 {
+            let at = if i == 5 { t0 + ms(100 * i + 200) } else { t0 + ms(100 * i) };
+            cadence.frame(at.max(cadence.last));
+        }
+        assert_eq!(cadence.frames, 10);
+        assert_eq!(cadence.worst_gap, ms(300), "the worst gap is not the largest gap seen");
+        let fps = cadence.per_second().expect("ten frames have a rate");
+        assert!((fps - 10.0).abs() < 0.01, "9 intervals over 900 ms is 10 fps, not {fps}");
+        // The report is a log line and cannot be observed here; that it does
+        // not panic on either shape is what can be.
+        cadence.report(true, rect(0, 0, 40, 30));
+        DragCadence::started(t0).report(false, rect(0, 0, 1, 1));
     }
 
     /// The same in the space the painter works in: egui points inside the
