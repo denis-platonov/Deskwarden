@@ -2603,13 +2603,34 @@ impl RegionOverlay {
                 let mine = self.clone();
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
+                    // **The two halves are timed separately**, because they
+                    // are two different costs and the owner has now reported
+                    // both of them: "spinner almost not moving" was the whole
+                    // of it holding the frame, and "last movements of spinner
+                    // are slow and then popup with code poppin up very slowly"
+                    // is the tail. Without these lines the only way to tell a
+                    // slow DECODE from a slow PICTURE is to guess, and the two
+                    // have opposite fixes -- one is the scan's resolution, the
+                    // other is a second full-screen capture of a display this
+                    // worker has already read once.
+                    let began = Instant::now();
                     // `monitor_bounds()` enumerates the real desktop -- the
                     // one production call, exactly as `RegionOverlay::open`
                     // takes its monitors as an argument so the arithmetic can
                     // be tested without one.
                     let monitors = screen_capture::monitor_bounds();
                     mine.apply_scan(scan_screen_with(&RegionSeams::production(), &monitors));
+                    let scanned = Instant::now();
                     mine.take_picture(&ctx);
+                    log::info!(
+                        "region overlay: the prescan read {} monitor(s) in {} ms and took the \
+                         display's picture in {} ms ({} ms in all) -- all of it off the frame \
+                         thread, so the card that asked kept painting",
+                        monitors.len(),
+                        scanned.duration_since(began).as_millis(),
+                        scanned.elapsed().as_millis(),
+                        began.elapsed().as_millis(),
+                    );
                     // **`Done` is set by the worker and only by the worker**,
                     // which is what makes "the viewport is registered with the
                     // answer in hand" true rather than hopeful: every frame
