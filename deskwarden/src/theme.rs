@@ -6313,22 +6313,55 @@ pub const FORM_CARD_SHADOW: Shadow = Shadow {
     color: Color32::from_rgba_unmultiplied_const(45, 43, 43, 46),
 };
 
-/// The card's horizontal padding: **12, and NOT §5a's 18.**
+/// The card's horizontal padding **in a narrow column**. See
+/// [`form_card_pad_x`], which is what the bands actually ask.
 ///
-/// This is the one measurement on the card that is deliberately not the
-/// design's, and the departure is argued here because it is where it is made.
-///
-/// §5a is drawn as a free-standing 690-point card, where 18 points a side is
-/// 5% of the width. This card lives in the Sends screen's DETAIL COLUMN,
-/// which is 298 points at `settings::MIN_VAULT_WINDOW_SIZE` -- 250 of card
-/// once the column's own 24-point margins are off it. At that width 18 a side
-/// is 14% of the card, and it comes out of the one block that cannot spare
-/// it: §5a's Access rows are a 96-point label column plus a 14-point gap plus
-/// a control, and every point of padding is a point that block has to give
-/// back. 12 is what both composers already used, it is what `record_ui`'s
-/// 360-point export modal was measured against, and it is the number
-/// `send_ui::EXPIRY_FIELD_WIDTH`'s own doc does the arithmetic with.
+/// §5a and §6c both say 18. This card lives in two places, and in one of them
+/// 18 does not fit: the Sends screen's DETAIL COLUMN is 298 points at
+/// `settings::MIN_VAULT_WINDOW_SIZE` -- 250 of card once the column's own
+/// 24-point margins are off it -- where 18 a side is 14% of the card, and it
+/// comes out of the one block that cannot spare it. §5a's Access rows are a
+/// 96-point label column plus a 14-point gap plus a control, and every point
+/// of padding is a point that block has to give back.
 pub const FORM_CARD_PAD_X: i8 = 12;
+
+/// The card's horizontal padding **at the width the design draws it**:
+/// §5a's and §6c's own 18.
+pub const FORM_CARD_PAD_X_WIDE: i8 = 18;
+
+/// The width at which a form card takes the design's padding.
+///
+/// §6c's card is 470 and §5a's is 690, and both say `padding: ... 18px`. 470
+/// is therefore the narrowest card the design itself draws at 18, so it is
+/// the threshold rather than a number chosen between the two.
+pub const FORM_CARD_WIDE_AT: f32 = 470.0;
+
+/// **How much air a form card's bands put either side of their contents, for
+/// a card this wide.**
+///
+/// One rule rather than one constant, because the two answers are both right
+/// and which one applies is a fact about the card in front of the reader.
+/// This used to be a single 12 with a doc admitting it was "the one
+/// measurement on the card that is deliberately not the design's" -- and that
+/// departure was argued entirely from the narrow case, the 250-point card in
+/// the Sends screen's detail column. It was then paid for by the wide case:
+/// `record_ui`'s composer is §5a's own 690-point card and was drawing §5a's
+/// rows inside 5a's card at somebody else's padding, which is part of what
+/// the owner was looking at when they asked for the layout to match "1 to 1
+/// like sizes, paddings etc".
+///
+/// The threshold is measured, not chosen: see [`FORM_CARD_WIDE_AT`].
+///
+/// Asked of the width the band has to fill, so a card that is resized -- the
+/// Sends composer is, with its column -- answers for the width it is being
+/// drawn at on this frame rather than for the one it opened at.
+pub fn form_card_pad_x(width: f32) -> i8 {
+    if width >= FORM_CARD_WIDE_AT {
+        FORM_CARD_PAD_X_WIDE
+    } else {
+        FORM_CARD_PAD_X
+    }
+}
 
 /// The card's vertical band padding. §5a runs 15 / 16 / 13 down its three
 /// bands; this is one number for all three, because three near-identical
@@ -6422,7 +6455,7 @@ pub fn form_card_header(ui: &mut Ui, title: &str) -> Rect {
 /// it -- and two headers a point apart is this file's most-repeated defect.
 pub fn form_card_header_marked(ui: &mut Ui, title: &str, plane: bool) -> Rect {
     let line = egui::Frame::new()
-        .inner_margin(Margin::symmetric(FORM_CARD_PAD_X, FORM_CARD_PAD_Y))
+        .inner_margin(Margin::symmetric(form_card_pad_x(ui.available_width()), FORM_CARD_PAD_Y))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
@@ -6466,7 +6499,7 @@ const SEND_PLANE_GAP: f32 = 10.0;
 /// card's padding.
 pub fn form_card_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
-        .inner_margin(Margin::symmetric(FORM_CARD_PAD_X, FORM_CARD_PAD_Y))
+        .inner_margin(Margin::symmetric(form_card_pad_x(ui.available_width()), FORM_CARD_PAD_Y))
         .show(ui, add)
         .inner
 }
@@ -6494,7 +6527,7 @@ pub fn form_card_footer<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     // has to reach the card's rounded bottom corners.
     let band = ui.painter().add(egui::Shape::Noop);
     let laid_out = egui::Frame::new()
-        .inner_margin(Margin::symmetric(FORM_CARD_PAD_X, FORM_CARD_PAD_Y))
+        .inner_margin(Margin::symmetric(form_card_pad_x(ui.available_width()), FORM_CARD_PAD_Y))
         .show(ui, add);
     let rect = laid_out.response.rect;
     ui.painter().set(
@@ -6533,7 +6566,7 @@ pub fn form_card_caution(ui: &mut Ui, text: &str) {
     hairline(ui);
     let band = ui.painter().add(egui::Shape::Noop);
     let laid_out = egui::Frame::new()
-        .inner_margin(Margin::symmetric(FORM_CARD_PAD_X, CAUTION_BAND_PAD_Y))
+        .inner_margin(Margin::symmetric(form_card_pad_x(ui.available_width()), CAUTION_BAND_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_top(|ui| {
@@ -12646,6 +12679,63 @@ mod modal_card_tests {
             dismiss_arms(&drawn.painted, band).len(),
             2,
             "the glyph-less card's header carries no ✕"
+        );
+    }
+}
+
+#[cfg(test)]
+mod form_card_padding_tests {
+    use super::*;
+
+    /// **The two answers, and the measured threshold between them.**
+    ///
+    /// 5a is a 690-point card and 6c a 470-point one, and both say
+    /// `padding: ... 18px`; the Sends screen's detail column is 250 points of
+    /// card at the app's minimum window size, where 18 a side is 14% of it.
+    /// So the rule is a fact about the card's width, and this pins both ends
+    /// of it against the numbers the design and the window really are.
+    #[test]
+    fn a_form_card_takes_the_designs_padding_at_the_width_the_design_draws_it() {
+        // 5a's card, and 6c's -- the two the design draws at 18.
+        assert_eq!(form_card_pad_x(690.0), FORM_CARD_PAD_X_WIDE);
+        assert_eq!(form_card_pad_x(470.0), FORM_CARD_PAD_X_WIDE);
+        // The Sends screen's detail column at `MIN_VAULT_WINDOW_SIZE`: 298
+        // points of column, 250 of card.
+        assert_eq!(form_card_pad_x(250.0), FORM_CARD_PAD_X);
+        // And the threshold is a threshold rather than a range: one point
+        // under it is the narrow answer.
+        assert_eq!(form_card_pad_x(FORM_CARD_WIDE_AT - 1.0), FORM_CARD_PAD_X);
+        assert!(
+            FORM_CARD_PAD_X_WIDE > FORM_CARD_PAD_X,
+            "the wide answer is meant to be the roomier one"
+        );
+    }
+
+    /// **Every band of the card asks the RULE**, and none of them still holds
+    /// the narrow constant.
+    ///
+    /// The four bands -- header, body, footer and the caution strip -- are
+    /// four separate `inner_margin` calls, and a card whose header indented
+    /// 18 while its body indented 12 would be a worse defect than the one
+    /// this rule fixes. Counted off the source because that is the only way
+    /// to see all four at once.
+    #[test]
+    fn all_four_bands_ask_the_rule_rather_than_the_narrow_constant() {
+        let source = include_str!("theme.rs");
+        let asks = concat!("form_card_pad_x(ui.", "available_width())");
+        assert_eq!(
+            source.matches(asks).count(),
+            4,
+            "expected all four of the card's bands to ask {asks:?} -- header, body, footer \
+             and the caution strip. One that did not would indent differently from the \
+             other three on the same card"
+        );
+        let hard_coded = concat!("Margin::symmetric(FORM_CARD_PAD_X", ",");
+        assert_eq!(
+            source.matches(hard_coded).count(),
+            0,
+            "a band is still padded with the narrow constant directly ({hard_coded:?}), so it \
+             stays at 12 on a card the design draws at 18"
         );
     }
 }
