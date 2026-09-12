@@ -102,12 +102,19 @@
 //! * that Windows grants this window the foreground when it opens. The raise
 //!   is asked for; the OS may refuse it and flash a taskbar button instead.
 //! * that the window is see-through at all. [`let_the_desktop_through`] makes
-//!   the DWM call `winit` skips, and whether the compositor honours it is a
-//!   fact about a real desktop with a real driver. What is asserted is that
-//!   the call is made, on the frame the window first exists and **before that
-//!   window is shown** -- see [`Appearing`], which carries a measurement of
-//!   both: the compositor does honour it, and the window used to be on screen
-//!   for 1315 ms before it was asked to.
+//!   it a layered window at one uniform alpha, and whether the compositor
+//!   honours that is a fact about a real desktop. What is asserted is that the
+//!   calls are made, on the frame the window first exists and **before that
+//!   window is shown** -- see [`Appearing`], which carries the measurement of
+//!   the second half: the window used to be on screen for 1315 ms before
+//!   anything had asked.
+//! * **and NOT whether the result is legible, which is new and is the
+//!   expensive lesson in this module.** Two DWM recipes were accepted by the
+//!   compositor, measured see-through by a capture-based probe to a model
+//!   error of 0.37, and were a haze on the owner's monitor. DWM composites its
+//!   effects for the *display*; a `BitBlt` of the desktop reads a composition
+//!   without them, so no instrument inside this process can tell the two
+//!   apart. [`let_the_desktop_through`] has the whole of it.
 //! * that the viewport covers **the display the user is on**. The rectangle
 //!   handed to the builder is [`crate::screen_capture::active_display`]'s
 //!   answer, and that choice is tested there as a pure function -- but a
@@ -373,11 +380,80 @@ pub fn scan_miss_line(miss: ScanMiss) -> String {
 ///   enough" means for a surface whose whole purpose is to point at something
 ///   already on it.
 ///
-/// It stays **one** constant. Every wash on this surface that is not the
-/// design's own plate -- [`SIZE_BG_ALPHA`] and [`BAR_BG_ALPHA`] are plates and
-/// keep their own numbers -- comes from here, so there is one place to move it
-/// again.
+/// # Where it is applied now: the WINDOW, not the paint
+///
+/// **This is no longer an alpha in the framebuffer.** It is the `bAlpha`
+/// argument of [`let_the_desktop_through`]'s `SetLayeredWindowAttributes`,
+/// which the compositor applies uniformly to the whole finished window. The
+/// arithmetic every paragraph above argues about is unchanged by the move: a
+/// fill of [`DIM_INK`] under a window at `115 / 255` reaches the display as
+/// exactly what a fill of `DIM_INK` *at* `115 / 255` used to reach it as on a
+/// per-pixel-alpha surface. 55% of the desktop still comes through, and 115 is
+/// still the owner's own number.
+///
+/// What changed is that it is **uniform**, and every consequence of that lives
+/// somewhere else: the selection hole is gone ([`SURROUND_INK`]), the bar's
+/// plate no longer buys the bar any opacity of its own ([`BAR_BG_ALPHA`]), and
+/// [`draw`] must now paint every pixel **opaquely** -- a second alpha in the
+/// framebuffer would compound with this one and dim the surface twice.
+///
+/// It stays **one** constant, and it is now used in exactly one place: that
+/// one call. `the_dim_is_painted_opaque_and_the_window_carries_the_alpha` is
+/// what keeps that true.
 pub const DIM_ALPHA: u8 = 115;
+
+/// **The dim's ink, opaque**: the design's `background: #201e1d` with no alpha
+/// of its own, because [`DIM_ALPHA`] is now the window's and not the paint's.
+///
+/// Painted over the whole surface before a drag starts, and inside the
+/// selection once there is one -- see [`SURROUND_INK`] for why the selection
+/// is the part that keeps this value rather than the part that departs from
+/// it.
+pub const DIM_INK: egui::Color32 = egui::Color32::from_rgb(0x20, 0x1e, 0x1d);
+
+/// **What is painted outside the selection**, now that the selection cannot be
+/// a hole.
+///
+/// # What was lost
+///
+/// 6b's selection is *unpainted*: the window is see-through there, so the
+/// rectangle the user framed shows at full brightness while everything around
+/// it is washed. That reads instantly, and it is the grammar of the whole
+/// screen. `LWA_ALPHA` is uniform over the window, so it cannot be expressed
+/// at all -- whatever is painted inside the selection reaches the display at
+/// the same [`DIM_ALPHA`] as everything else. The owner was told this trade
+/// and took it: a slightly wrong dim they can aim through beats a blur they
+/// cannot.
+///
+/// # Why this, and not a lighter fill inside the selection
+///
+/// The obvious substitute is to fill the selection with something *lighter*
+/// than the dim, and it was rejected on the arithmetic. Under a uniform alpha
+/// every framebuffer colour is an offset added to the desktop at the same 45%:
+/// a lighter fill does not clear the region, it raises the region's black
+/// level. The region is exactly where the QR code the user is aiming at lives,
+/// so the one part of the screen that must not get murkier is the one part a
+/// lighter fill makes murkier. It would also move a value the owner has
+/// already judged, on the only part of the screen they judged it on.
+///
+/// So the step is made from the other side. The **selection keeps
+/// [`DIM_INK`]** -- precisely the wash the owner approved, and precisely what
+/// the whole screen already looks like before a drag begins -- and the four
+/// bands around it drop to this. `rgb(0, 0, 0)` is as far as that direction
+/// goes, and the step it buys is the dim's own weight: `115 / 255 * 32`, about
+/// **14 levels out of 255**. On a flat field that is visible; on busy desktop
+/// content it is not. It is a supporting cue and this doc will not pretend it
+/// is more than one.
+///
+/// # The signal is [`paint_selection_edge`], and it always was
+///
+/// Two points of solid `#1b3fa0`, a six-point halo outside that, four
+/// fourteen-point corner brackets, the lock-on badge above the rectangle and
+/// the pixel readout inside its corner. Not one of those needed the hole and
+/// not one of them moved. What the hole contributed was a *field* cue on top
+/// of an already emphatic edge; what replaces it is a weaker field cue in the
+/// same direction, which is the honest description of the trade.
+pub const SURROUND_INK: egui::Color32 = egui::Color32::from_rgb(0x00, 0x00, 0x00);
 
 /// The solid ring around the selection: `box-shadow: 0 0 0 2px #1b3fa0`.
 pub const SELECTION_RING: f32 = 2.0;
@@ -430,9 +506,42 @@ pub const BAR_PAD_X: f32 = 18.0;
 /// See [`BAR_PAD_X`].
 pub const BAR_PAD_Y: f32 = 14.0;
 /// Its ground, `rgba(32, 30, 29, 0.92)` -- ink at `0.92 * 255`, rounded.
-/// **Not opaque**, and that matters on this window: the bar sits over the
-/// desktop like everything else here, and an opaque one would read as a strip
-/// of chrome bolted on rather than as part of the dim.
+///
+/// # What this alpha stopped buying, which is the layered window's one real cost
+///
+/// It used to compose *over the dim* on a per-pixel-alpha surface, and the two
+/// alphas stacked: `1 - (1 - 0.451)(1 - 0.922)` is **0.957**, so the bar
+/// reached the display 96% opaque while the dim around it was 45%. That is
+/// where the bar's readability came from, and it is gone. On a layered window
+/// the compositor applies one [`DIM_ALPHA`] to the finished surface, so this
+/// plate composes only against what is already painted underneath it --
+/// [`DIM_INK`] before a drag, [`SURROUND_INK`] during one -- and lands on
+/// `rgb(32, 30, 29)` or `rgb(30, 28, 27)` respectively. Both are the dim. **The
+/// bar now reaches the display at exactly the same 45% as everything else.**
+///
+/// Two consequences, neither of them hidden:
+///
+/// * The bar is no longer a *plate*. Against the dim it is the same value as
+///   the dim, so what marks it out is [`BAR_EDGE`]'s one-pixel border and the
+///   type on it, and nothing else.
+/// * Its type loses contrast, and the numbers are worth writing down rather
+///   than guessing at. [`BAR_HINT_INK`]'s `#bab6b6` on this ground was about
+///   **8.4:1**; at a uniform 45% over a desktop it is about **2.6:1** on a
+///   dark desktop and **2.1:1** on a white one. The white title fares better,
+///   about 4.1:1 and 2.8:1. And 55% of whatever window is behind the bar is
+///   now visible through it, which on a busy desktop is text under text.
+///
+/// **Nothing here can fix that**, and the arithmetic is why: the ground is
+/// already within 30 levels of black, so there is no room below the dim to
+/// give the bar a darker plate of its own, and a lighter one would cost the
+/// type more than it gained. The only two levers are [`DIM_ALPHA`], which is
+/// the owner's number and the whole point of the surface, and a second
+/// non-layered window for the bar, which is a different feature. It is
+/// recorded here as a known cost of the mechanism rather than worked around.
+///
+/// The number itself is unchanged at the design's 0.92 -- there is no reason
+/// to move a value whose effect is now this small, and moving it would lose
+/// the design's own figure for nothing.
 pub const BAR_BG_ALPHA: u8 = 235;
 /// Its `border-top: 1px solid #3a3736`.
 pub const BAR_EDGE: egui::Color32 = egui::Color32::from_rgb(0x3a, 0x37, 0x36);
@@ -460,23 +569,37 @@ pub const BAR_REASON_PX: f32 = 12.0;
 /// that has one. `BLUE_SOFT` is that same blue, lightened for a dark ground,
 /// which is what this bar is.
 ///
-/// **Re-examined when [`DIM_ALPHA`] was lightened, and deliberately left
-/// alone.** The worry was the right one to have and its premise turns out to
-/// be false: this ink is not on the dim. [`paint_bar`] fills the bar with its
-/// own plate at [`BAR_BG_ALPHA`] -- the design's `rgba(32, 30, 29, 0.92)`,
-/// which is not the wash and did not move -- and only then sets type on it.
-/// "A dark ground" is still exactly what this sits on. The same goes for
-/// [`BAR_HINT_INK`] and the white title beside them, for the size readout on
-/// [`SIZE_BG_ALPHA`], for the chips, and for the lock-on badge and the
-/// reveal's, which are solid fills.
+/// **Re-examined twice, and left alone both times -- but the second answer is
+/// weaker than the first and is written down as such.**
 ///
-/// The one thing on this surface that really is alpha over the wash is the
-/// selection's **halo** ([`HALO_ALPHA`], the design's 28% blue outside the
-/// solid ring), and it is not a control: it is a glow around a fully opaque
-/// two-point ring, and a dark blue glow is if anything easier to see against a
-/// lighter field than against a near-black one. So nothing here was changed on
-/// a hunch, and `the_bar_carries_its_own_ground_and_not_the_dim` is what stops
-/// the premise quietly becoming false later.
+/// The first re-examination was when [`DIM_ALPHA`] was lightened from the
+/// design's 68% to 45%. The worry was whether an ink picked for a near-black
+/// ground survives the ground lightening, and the premise turned out to be
+/// false: this ink was never on the wash. [`paint_bar`] laid the design's own
+/// plate down first, and the type went on that.
+///
+/// The second was the move to a **layered window**, and there the worry is
+/// real. Every colour in this framebuffer, plate and type together, now
+/// reaches the display at one uniform [`DIM_ALPHA`]. The *ground* under this
+/// ink is unchanged -- it is still `rgb(32, 30, 29)`-ish, so "a dark ground"
+/// is still the right thing to have picked for -- but the contrast between the
+/// two, measured against the display rather than against the framebuffer,
+/// falls by roughly a factor of three. [`BAR_BG_ALPHA`] carries the numbers.
+///
+/// It is left alone anyway, and not out of inertia: lightening the inks costs
+/// less than it looks like it gains (the ground rises with nothing, but the
+/// desktop behind it does not move), and the readable answer to this is a
+/// change to the mechanism or to `DIM_ALPHA`, both of which are the owner's to
+/// make. What would be wrong is to quietly leave this doc saying the type sits
+/// on a near-opaque plate, because it no longer does.
+///
+/// The one thing on this surface that is alpha over the dim in the framebuffer
+/// is the selection's **halo** ([`HALO_ALPHA`], the design's 28% blue outside
+/// the solid ring), and it is not a control: it is a glow around a fully
+/// opaque two-point ring. Everything else -- the chips, the lock-on badge, the
+/// reveal's badge, the rings and the brackets -- is a solid fill, which is
+/// what `the_dim_is_painted_opaque_and_the_window_carries_the_alpha` exists to
+/// keep true.
 pub const BAR_REASON_INK: egui::Color32 = theme::BLUE_SOFT;
 
 /// A shortcut chip's height (`height: 28px`).
@@ -1831,11 +1954,12 @@ impl RegionOverlay {
     ///
     /// # Step one, on a window nobody can see yet
     ///
-    /// 1. [`let_the_desktop_through`] **first**. It is the call `winit` skips
-    ///    and the only thing that makes this surface a dimmed desktop rather
-    ///    than a rectangle. DWM attributes set on a hidden window are honoured
-    ///    when it appears -- the same property `foreground::own_window_titled`
-    ///    records for `login_ui`'s rounded corners.
+    /// 1. [`let_the_desktop_through`] **first**. It makes this window layered
+    ///    and is the only thing that makes the surface a dimmed desktop rather
+    ///    than a rectangle. Window attributes set on a hidden window are
+    ///    honoured when it appears -- the same property
+    ///    `foreground::own_window_titled` records for `login_ui`'s rounded
+    ///    corners.
     /// 2. [`exclude_from_capture`], also while hidden, so there is no frame in
     ///    which this window is on screen and *in* a capture. A region dragged
     ///    on this surface is captured through where this surface is, and a
@@ -1911,7 +2035,7 @@ impl RegionOverlay {
             // after, is what tells "it was never the right size" apart from
             // "it was, and then it moved".
             log_window_rect(REGION_TITLE, "shown", display);
-            // **The DWM call, a second time, now that the window is really on
+            // **The layering, a second time, now that the window is really on
             // screen.** See [`let_the_desktop_through`]'s "Twice, and why"
             // -- this is the half that is made on a visible window, and it is
             // here rather than in the callback so that it lands before the
@@ -2190,27 +2314,37 @@ impl RegionOverlay {
                 .with_decorations(false)
                 .with_always_on_top()
                 .with_taskbar(false)
-                // **Asked for, and NOT what makes this window see-through.**
-                // `glutin_winit::finalize_window` -- which `eframe` calls to
-                // create every window -- strips this flag whenever the GL
-                // config answers `supports_transparency() == Some(false)`,
-                // and on Windows/WGL that answer is read off
-                // `WGL_TRANSPARENT_ARB`, a *colour-key* attribute essentially
-                // no driver advertises. So it is always stripped, `eframe`
-                // logs `Cannot create transparent window: the GL config does
-                // not support it`, and `winit` never makes the DWM call the
-                // flag exists to trigger. `let_the_desktop_through` makes
-                // that call itself.
+                // **`.with_transparent(true)` is deliberately NOT here, and
+                // its absence is the last piece of the blur fix.**
                 //
-                // It stays anyway, and not out of superstition: it is the
-                // correct declaration of intent for this window on every
-                // platform and backend where it is honoured, it is what
-                // `egui_winit` reads to decide this viewport's own clear
-                // behaviour, and it costs nothing here -- unlike the same
-                // flag on the ROOT viewport, which feeds the GL config
-                // template and was removed from `vault_window` for that
-                // reason.
-                .with_transparent(true)
+                // It was here, on the reasoning that it is the correct
+                // declaration of intent and costs nothing. The first half is
+                // still true and the second is not. What that flag does on
+                // Windows, when it survives, is make `winit` call
+                // `DwmEnableBlurBehindWindow` on this window -- the exact call
+                // that blurred the owner's desktop, and the one
+                // `the_overlay_makes_itself_a_layered_window_before_it_is_shown`
+                // now forbids this module from making itself. Leaving a flag
+                // in the builder whose only Windows effect is to ask somebody
+                // else to make it would be keeping the landmine and removing
+                // the sign.
+                //
+                // It costs nothing to drop, and that is measured rather than
+                // assumed: `glutin_winit::finalize_window` strips the flag
+                // whenever the GL config answers
+                // `supports_transparency() == Some(false)`, which on
+                // Windows/WGL it always does -- the attribute behind that
+                // answer is `WGL_TRANSPARENT_ARB`, a *colour-key* attribute
+                // essentially no driver advertises -- and `deskwarden.log`
+                // carries twenty-six `Cannot create transparent window: the
+                // GL config does not support it` lines saying so on this
+                // machine. The flag has never once reached the window here.
+                //
+                // The surface does not need it either way:
+                // `let_the_desktop_through` makes this a layered window, whose
+                // opacity is a constant the compositor applies and not the
+                // framebuffer's alpha channel.
+
                 // **Created hidden, and shown by [`RegionOverlay::appear`]
                 // once it is composited.**
                 //
@@ -2469,8 +2603,16 @@ impl Drop for Inner {
 /// **Painting order is the design's DOM order and is load-bearing.** 6b
 /// stacks the dim, then the selection and its furniture, then the bottom bar
 /// last -- so a selection dragged down over the bar is covered by it rather
-/// than punching a lit hole through the one part of this surface that has to
+/// than lifting a lit patch out of the one part of this surface that has to
 /// stay readable.
+///
+/// **Every fill here is opaque, and that is a rule and not a habit.** This
+/// window's transparency is one uniform [`DIM_ALPHA`] applied by the
+/// compositor to the finished surface -- see [`let_the_desktop_through`] --
+/// so an alpha in the framebuffer does not make that pixel more see-through,
+/// it dims it a second time. For the same reason there must be no pixel of
+/// `full` this function leaves unpainted: the clear behind it is
+/// `rgb(0, 0, 0)`, not a hole.
 ///
 /// **Returns the two chips' rectangles**, which is the one thing the painter
 /// knows and the pointer handling needs. They cannot be computed ahead of the
@@ -2480,28 +2622,29 @@ impl Drop for Inner {
 pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> [egui::Rect; 2] {
     let full = ui.max_rect();
     let painter = ui.painter().clone();
-    let dim = egui::Color32::from_rgba_unmultiplied(0x20, 0x1e, 0x1d, DIM_ALPHA);
 
     // **The reveal is the whole surface while it lasts**, and it takes
     // precedence over everything below because everything below is about a
     // drag that is not happening. It returns before the bar is drawn: see
     // `paint_reveal` for why this state has no bar and therefore no chips.
     if let Some(found) = view.reveal {
-        paint_reveal(&painter, full, found, dim);
+        paint_reveal(&painter, full, found);
         return [egui::Rect::NOTHING; 2];
     }
 
     match view.selection {
-        // Nothing selected yet: the whole desktop dims.
+        // Nothing selected yet: the whole desktop dims, at the one value the
+        // owner picked. Opaque, like every fill on this surface: the window
+        // itself carries `DIM_ALPHA`. See `DIM_INK`.
         None => {
-            painter.rect_filled(full, 0.0, dim);
+            painter.rect_filled(full, 0.0, DIM_INK);
         }
-        // The selection stays lit -- left entirely unpainted, so the
-        // transparent viewport shows the desktop through it -- and the four
-        // bands around it dim.
+        // The selection keeps the dim it already had and the four bands around
+        // it go darker, which is what stands in for 6b's hole on a window whose
+        // alpha is uniform. See `SURROUND_INK`.
         Some(sel) => {
             let sel = sel.intersect(full);
-            paint_dim_around(&painter, full, sel, dim);
+            paint_dim_around(&painter, full, sel);
             paint_selection_edge(&painter, sel);
             if let Some((w, h)) = view.size {
                 paint_size_readout(&painter, sel, w, h);
@@ -2526,22 +2669,24 @@ pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> [egui::Rect; 2] {
     chips
 }
 
-/// **The four bands of dim around a lit rectangle**, leaving the rectangle
-/// itself entirely unpainted -- which is what "stays lit" means on a window
-/// that is genuinely see-through.
+/// **The four bands around a lit rectangle in [`SURROUND_INK`], and the
+/// rectangle itself in [`DIM_INK`]** -- which is what "stays lit" has to mean
+/// on a window whose transparency is one uniform alpha.
 ///
-/// Extracted rather than written twice, because there are now two lit
-/// rectangles on this surface -- the box the user drags and the code the scan
-/// found -- and the four-band arithmetic is exactly the kind of thing that
-/// gets corrected in one copy. A band with no area is skipped rather than
-/// painted inverted: a selection flush with an edge produces one, and an
-/// inverted `Rect` fills nothing in egui but says something wrong here.
-fn paint_dim_around(
-    painter: &egui::Painter,
-    full: egui::Rect,
-    lit: egui::Rect,
-    dim: egui::Color32,
-) {
+/// It used to mean *unpainted*, and the change is the whole of what
+/// [`SURROUND_INK`] argues about. The rectangle is still filled here rather
+/// than left to the clear: a layered window's clear is not a hole, it is
+/// `rgb(0, 0, 0)` at [`DIM_ALPHA`], so an unpainted selection would be the
+/// **darkest** thing on the surface instead of the lightest. Every fill on
+/// this surface is opaque for the same reason -- the alpha is the window's.
+///
+/// Extracted rather than written twice, because there are two lit rectangles
+/// on this surface -- the box the user drags and the code the scan found --
+/// and the four-band arithmetic is exactly the kind of thing that gets
+/// corrected in one copy. A band with no area is skipped rather than painted
+/// inverted: a selection flush with an edge produces one, and an inverted
+/// `Rect` fills nothing in egui but says something wrong here.
+fn paint_dim_around(painter: &egui::Painter, full: egui::Rect, lit: egui::Rect) {
     for band in [
         egui::Rect::from_min_max(full.left_top(), egui::pos2(full.right(), lit.top())),
         egui::Rect::from_min_max(egui::pos2(full.left(), lit.bottom()), full.right_bottom()),
@@ -2549,9 +2694,13 @@ fn paint_dim_around(
         egui::Rect::from_min_max(lit.right_top(), egui::pos2(full.right(), lit.bottom())),
     ] {
         if band.is_positive() {
-            painter.rect_filled(band, 0.0, dim);
+            painter.rect_filled(band, 0.0, SURROUND_INK);
         }
     }
+    // And the lit rectangle, last, so a rounding overlap between a band and
+    // the selection resolves in the selection's favour -- the user's framing
+    // is the thing that must be exact.
+    painter.rect_filled(lit, 0.0, DIM_INK);
 }
 
 /// **The reveal**: the code the whole-screen scan just read, ringed where it
@@ -2586,18 +2735,18 @@ fn paint_dim_around(
 ///
 /// Worth stating where the drawing is, because it is the constraint this
 /// whole feature is built around: what is inside the ring is the **live
-/// desktop showing through a transparent window**, not a picture of it. The
+/// desktop showing through a translucent window**, not a picture of it. The
 /// capture that found the code was decoded and dropped, and nothing here has
 /// or wants a copy. See this module's header and
 /// `nothing_in_this_module_uploads_a_capture_to_a_texture`.
-fn paint_reveal(
-    painter: &egui::Painter,
-    full: egui::Rect,
-    found: egui::Rect,
-    dim: egui::Color32,
-) {
+///
+/// It shows through at [`DIM_ALPHA`] rather than untouched, which is the same
+/// trade [`SURROUND_INK`] sets out and matters less here than it does on a
+/// drag: this state is a statement lasting under half a second about a code
+/// that has **already been read**, not a rectangle the user is trying to aim.
+fn paint_reveal(painter: &egui::Painter, full: egui::Rect, found: egui::Rect) {
     let lit = found.intersect(full);
-    paint_dim_around(painter, full, lit, dim);
+    paint_dim_around(painter, full, lit);
     paint_selection_edge(painter, lit);
     paint_badge(painter, full, lit, SCAN_FOUND);
 }
@@ -2982,8 +3131,14 @@ fn exclude_from_capture(title: &str) {
     set_capture_exclusion(title, true);
 }
 
-/// **Makes this window's per-pixel alpha real**, which is the whole of why
-/// the overlay is a dimmed desktop rather than a solid black screen.
+/// **Makes this window translucent**, which is the whole of why the overlay is
+/// a dimmed desktop rather than a solid black screen.
+///
+/// It is a **layered window** -- `WS_EX_LAYERED` and one uniform alpha -- and
+/// it is that after two DWM per-pixel-alpha recipes were accepted by the
+/// compositor and were wrong on the owner's monitor. The history is below in
+/// full, because each of those recipes is the obvious thing to try and the
+/// next reader will otherwise try one of them again.
 ///
 /// # The bug, all the way down
 ///
@@ -3044,27 +3199,62 @@ fn exclude_from_capture(title: &str) {
 /// screenshot of it -- shows the bar at the bottom pin-sharp and legible and
 /// everything above it a lavender haze with no recoverable detail.
 ///
-/// # Which is why it is `DwmExtendFrameIntoClientArea` now
+/// # `DwmExtendFrameIntoClientArea` was the second failure, not the fix
 ///
-/// The other documented way to get per-pixel alpha on a composited window, and
-/// the one with **no blur region and no blur concept in it at all**. Margins of
-/// `-1` extend the composited frame through the entire client area -- the
-/// sheet-of-glass case, the same call every app with a custom title bar makes
-/// -- and DWM then honours the window's alpha channel across the whole surface.
-/// The Aero blur that this call carried on Vista and 7 was removed in Windows
-/// 8; there is nothing left in it that can soften what is behind the window.
+/// Margins of `-1` extend the composited frame through the entire client area
+/// -- the sheet-of-glass case, the same call every app with a custom title bar
+/// makes -- and DWM is then supposed to honour the window's alpha channel
+/// across the whole surface, with no blur region and no blur concept anywhere
+/// in it. The Aero blur that call carried on Vista and 7 was removed in
+/// Windows 8. It shipped on that reasoning, and `deskwarden.log` records it
+/// **accepted** on every overlay it ran on -- `0x1e80c66`, `0xf50066`,
+/// `0x6047c`, twice each. The owner's verdict after testing it was *"scan not
+/// fixed"*.
 ///
-/// **The guarantee is structural, and it has to be.** See "Not measured, and
-/// cannot be" below: this process cannot photograph its own effect on the
-/// display. So the argument is not "the blur was measured gone" -- it is that
-/// nothing here asks for a blur any more. That is a weaker kind of claim than
-/// this file usually makes and it is the strongest one available.
+/// So on this machine two different DWM compositing recipes have now been
+/// accepted by DWM and been wrong on the glass, and the second one was wrong
+/// with an `S_OK` in the log next to it. That is the pattern this module
+/// stopped arguing with.
 ///
-/// The two things that were **not** the problem are still not the problem and
-/// are still left alone: the framebuffer really does have an alpha channel
-/// (`glutin`'s `ConfigTemplate` defaults `alpha_size: 8` unconditionally, with
-/// no reference to the transparency flag) and `window_host::clear_color`
-/// already returns a fully transparent clear.
+/// There is a plausible Windows 11 explanation for the second failure --
+/// extending the frame is how a window opts into a system-drawn backdrop
+/// material, `DWMWA_SYSTEMBACKDROP_TYPE` (attribute 38) defaults to
+/// `DWMSBT_AUTO`, and Mica and Acrylic are both blurs -- and setting that
+/// attribute to `DWMSBT_NONE` (1) would be two lines. **It is written down
+/// here as the next thing to try rather than shipped**, because "plausible" is
+/// the whole of the case for it: see "Not tested, and cannot be" below, where
+/// the reason nothing in this process can tell a fixed screen from a broken
+/// one is set out. A third unverifiable DWM guess costs the owner another
+/// round of looking at their own desktop through a haze to find out.
+///
+/// # Which is why it is a layered window now
+///
+/// `WS_EX_LAYERED` plus `SetLayeredWindowAttributes(.., LWA_ALPHA)` is the
+/// oldest transparency mechanism Windows has. It predates DWM, it is what
+/// every fade-in on the platform was built out of, and **there is no blur
+/// anywhere in it**: the constant is one opacity the compositor applies to the
+/// finished window. An earlier pass measured it working here. Nothing about it
+/// depends on a redirection surface's alpha channel, on a frame margin, or on
+/// which material Windows 11 decided to draw under the glass -- which is the
+/// entire reason to prefer it to a mechanism that is more elegant and has now
+/// been wrong twice.
+///
+/// **What it costs is the per-pixel part, and that is not hidden anywhere.**
+/// `LWA_ALPHA` is *uniform* over the whole window, so 6b's undimmed selection
+/// hole cannot be expressed at all. [`draw`] therefore paints the dim as an
+/// **opaque** fill and lets this one alpha do all of the work rather than
+/// compounding two -- see [`DIM_INK`] and [`SURROUND_INK`] for what stands in
+/// for the hole, and [`BAR_BG_ALPHA`] for what the same trade costs the bottom
+/// bar. The owner was told this trade before it was made.
+///
+/// The two things that were **not** the problem are still not the problem: the
+/// framebuffer really does have an alpha channel (`glutin`'s `ConfigTemplate`
+/// defaults `alpha_size: 8` unconditionally) and `window_host::clear_color`
+/// already returns a fully transparent clear. Neither of them matters any more
+/// -- a layered window's opacity is the constant above and not the surface's
+/// alpha -- and that is precisely why [`draw`] must leave **no pixel of this
+/// window unpainted**: what the clear leaves behind is no longer a hole, it is
+/// whatever `rgb(0, 0, 0)` looks like at [`DIM_ALPHA`].
 ///
 /// # Why here and not in the viewport builder
 ///
@@ -3088,56 +3278,68 @@ fn exclude_from_capture(title: &str) {
 /// and the doubt is worth writing down because the obvious "simplification" is
 /// to delete one of them.
 ///
-/// The doubt: does a blur-behind registration made on a **hidden** window
-/// survive being shown? Showing a window can rebuild its redirection surface,
-/// and a registration that was dropped there would leave the overlay
-/// compositing no alpha at all -- which does not look like a subtle bug, it
-/// looks like a **black screen**, because `window_host`'s clear is fully
-/// transparent and `DIM_ALPHA` over nothing is `rgb(14, 13, 13)`. The history
-/// fits that shape: before the window was created hidden the call was made on
-/// a visible window and the surface was see-through (at the cost of 1315 ms of
+/// The doubt: does an ex-style bit and a layered attribute set on a **hidden**
+/// window survive being shown? Showing a window can rebuild its redirection
+/// surface, and an attribute dropped there leaves the overlay fully opaque --
+/// a solid near-black rectangle over every pixel of the display, which is the
+/// shape of complaint this module has already collected twice. The history
+/// fits it: before the window was created hidden the call was made on a
+/// visible window and the surface was see-through (at the cost of 1315 ms of
 /// white); after, a black screen was reported.
 ///
-/// **It is not what was measured on this machine.** The probe in
-/// `scratchpad/dimprobe` drives the real [`RegionOverlay::show`] and the real
-/// [`Appearing`] machine through exactly the hidden-then-shown path, samples a
-/// patch of a checkerboard backdrop every ~17 ms and fits two models to it.
-/// With the single hidden call and nothing else, from the first visible sample
-/// onwards: mean absolute error **0.37** against `backdrop * (1 - a) + dim *
-/// a` and **59.71** against `dim * a`, correlation with the backdrop
-/// **1.0000**, and no black or white sample anywhere in the run. A
-/// registration that had been dropped by the show could not produce that: 0.37
-/// out of 255 is the blend, per pixel, at exactly `DIM_ALPHA`. So on this
-/// desktop and this driver the hidden call does survive.
+/// **It is not what was measured on this machine**, for the mechanism this
+/// paragraph was written about. The probe in `scratchpad/dimprobe` drove the
+/// real [`RegionOverlay::show`] and the real [`Appearing`] machine through
+/// exactly the hidden-then-shown path with a single hidden call and nothing
+/// else, and from the first visible sample onwards it fitted
+/// `backdrop * (1 - a) + dim * a` at a mean absolute error of **0.37** with no
+/// black or white sample anywhere in the run. An attribute dropped by the show
+/// could not produce that. That measurement was taken against
+/// `DwmEnableBlurBehindWindow`, so what it is now evidence *for* is narrow and
+/// worth stating exactly: on this desktop, a compositing attribute set on a
+/// hidden window is still in force after the show. It says nothing about which
+/// attribute, and by the section below it never could have said anything about
+/// the blur.
 ///
 /// The second call stays anyway, and the argument for keeping it is not
 /// superstition:
 ///
-/// * It costs one `EnumWindows` and one DWM call, once per overlay, on a frame
-///   that is already doing two of each for the raise and the minimise.
+/// * It costs one `EnumWindows` and two window calls, once per overlay, on a
+///   frame that is already doing two of the former for the raise and the
+///   minimise.
 /// * It cannot reintroduce the white box. The white box was the window being
 ///   *on screen* before anything had composited it; this runs a frame after
 ///   the window was composited, asks for the same thing that was already
 ///   asked for, and changes nothing about when the window appears.
-/// * "The registration survived the show on the machine I could measure" is a
-///   weaker claim than "the registration is in place while the window is
+/// * Both calls are idempotent: the ex-style bit is or-ed into whatever is
+///   there and `SetLayeredWindowAttributes` overwrites one constant with the
+///   same constant.
+/// * "The attribute survived the show on the machine I could measure" is a
+///   weaker claim than "the attribute is in place while the window is
 ///   visible", and the second one is what the surface actually needs. A driver
-///   or a compositor generation where the first is false costs the user a
-///   black rectangle covering their screen, and this is the cheapest possible
+///   or a compositor generation where the first is false costs the user an
+///   opaque rectangle covering their screen, and this is the cheapest possible
 ///   insurance against it.
 ///
 /// What it is **not** allowed to become is a call made *instead* of the hidden
-/// one, or one made from the viewport callback. Both put the DWM call behind
-/// the window appearing, which is the 1315 ms regression [`Appearing`] carries
-/// the measurement for.
+/// one, or one made from the viewport callback. Both put the transparency
+/// behind the window appearing, which is the 1315 ms regression [`Appearing`]
+/// carries the measurement for.
 ///
 /// # Not tested, and cannot be -- and NOT measurable either, which is new
 ///
 /// There is no window in a test process, so this is a no-op there and no
 /// assertion in this crate says the compositor accepted anything. It belongs
 /// with the other real-desktop facts in this module's header: what a test can
-/// hold is that the call is made on the frame the window first exists, which
-/// is what `the_overlay_asks_dwm_to_composite_its_alpha` pins by source.
+/// hold is that the calls are made on the frame the window first exists, which
+/// is what `the_overlay_makes_itself_a_layered_window_before_it_is_shown` pins
+/// by source.
+///
+/// What the **log** can hold, and now does, is which mechanism ran and what it
+/// answered. One line per overlay naming `WS_EX_LAYERED`, the ex-style before
+/// and after, and the result of `SetLayeredWindowAttributes` is the difference
+/// between "the fix is not in this build" and "the fix is in and did not
+/// work", and for two rounds nobody could tell those apart.
 ///
 /// **The stronger statement, learned the hard way: a screen capture cannot
 /// answer this question at all.** The probe in `scratchpad/dimprobe` gained a
@@ -3158,73 +3360,94 @@ fn exclude_from_capture(title: &str) {
 /// a camera pointed at the screen does. Any future change here that claims
 /// "measured, no blur" on the strength of a capture is claiming something its
 /// instrument cannot see.
-/// `dwmapi.dll`'s margin struct, declared here because the `windows` crate's
-/// copy of it lives behind a feature this crate does not turn on.
 ///
-/// **`Cargo.toml` is a whole-file byte pin with a ledger in
-/// `crate::job_object`**, so "add `Win32_UI_Controls` to the features list" is
-/// not a two-line change -- it is a change to a file this crate deliberately
-/// makes expensive to touch, for a struct that is four `i32`s in declaration
-/// order. `MARGINS` has been stable since Windows Vista and is
-/// `{ cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight }`, all `c_int`.
-/// `#[repr(C)]` is what makes that layout a promise rather than a hope.
-#[repr(C)]
-struct Margins {
-    cx_left_width: i32,
-    cx_right_width: i32,
-    cy_top_height: i32,
-    cy_bottom_height: i32,
-}
-
-// The one function, from the library this crate already links -- the
-// `Win32_Graphics_Dwm` feature is on, so `dwmapi` is on the link line and this
-// adds a symbol to it rather than a dependency. `HRESULT` is `i32`; the
-// `windows` crate's own binding for this call has exactly this shape.
-#[link(name = "dwmapi")]
-extern "system" {
-    fn DwmExtendFrameIntoClientArea(
-        hwnd: windows::Win32::Foundation::HWND,
-        p_mar_inset: *const Margins,
-    ) -> windows::core::HRESULT;
-}
-
+/// **That is why the mechanism changed rather than the measurement.** A fourth
+/// recipe justified by a fourth green probe would be the same mistake a fourth
+/// time. What is claimed for the layered window is only this: it asks Windows
+/// for one opacity and nothing else, so there is no blur for an instrument to
+/// miss. Whether the owner's screen is now legible is a question only the
+/// owner's next look answers, and the answer is not in this crate.
 fn let_the_desktop_through(title: &str) {
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{COLORREF, HWND};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA,
+        WS_EX_LAYERED,
+    };
 
     let Some(hwnd) = crate::foreground::own_window_titled(title) else {
         log::warn!(
-            "region overlay: no window titled {title:?} to make see-through, so it will be a              solid dim rectangle. This is the defect that shipped through 0.15.21: the caller              is meant to wait for the window to exist"
+            "region overlay: no window titled {title:?} to make see-through, so it will be a \
+             solid dim rectangle. This is the defect that shipped through 0.15.21: the caller \
+             is meant to wait for the window to exist"
         );
         return;
     };
-    // **-1 on every side is the documented "whole client area" value**, not a
-    // sentinel this module invented: `DwmExtendFrameIntoClientArea` treats a
-    // negative margin as "extend the frame through the entire window", which is
-    // the sheet-of-glass case. Any non-negative set of margins would extend the
-    // composited frame only that many pixels in from each edge and leave the
-    // middle of a full-screen overlay opaque.
-    let margins = Margins {
-        cx_left_width: -1,
-        cx_right_width: -1,
-        cy_top_height: -1,
-        cy_bottom_height: -1,
-    };
-    let result = unsafe { DwmExtendFrameIntoClientArea(HWND(hwnd as *mut _), &margins) };
+    let window = HWND(hwnd as *mut _);
+    // **Or-ed into what is there, never assigned.** The ex-style of this window
+    // already carries whatever `winit` put in it -- `WS_EX_TOPMOST` for
+    // `with_always_on_top` and `WS_EX_TOOLWINDOW` for `with_taskbar(false)`
+    // among them -- and a full-screen overlay that stopped being topmost, or
+    // came back into the taskbar, would be a new defect introduced by the fix
+    // for an old one. Reading first costs nothing: `GetWindowLongPtrW` is a
+    // lookup in the window's own structure.
+    //
+    // The read is not checked for failure, which is the documented idiom for
+    // this pair and is safe for one reason worth naming: the only way it can
+    // fail is an invalid `HWND`, and this one came back from
+    // `own_window_titled` on this frame -- the same handle
+    // `exclude_from_capture` is about to act on. A window that had gone away
+    // between the two would take the capture mask with it as well, and that is
+    // a louder failure than this one.
+    let before = unsafe { GetWindowLongPtrW(window, GWL_EXSTYLE) };
+    let after = before | WS_EX_LAYERED.0 as isize;
+    if after != before {
+        unsafe { SetWindowLongPtrW(window, GWL_EXSTYLE, after) };
+    }
+    // **The colour key is zero and is not read.** `SetLayeredWindowAttributes`
+    // takes both a key and an alpha and uses whichever the flags name;
+    // `LWA_ALPHA` alone names the alpha, so `crkey` is a required argument with
+    // no meaning here. It must not become `LWA_COLORKEY`: a colour key punches
+    // a genuine hole in the window, and a hole in a full-screen always-on-top
+    // overlay is a rectangle of the user's desktop that swallows no clicks and
+    // answers no Escape.
+    //
+    // `DIM_ALPHA` is the whole of the dim now, which is why it is passed here
+    // and nowhere else. See its doc, and
+    // `the_dim_is_painted_opaque_and_the_window_carries_the_alpha`.
+    let result = unsafe { SetLayeredWindowAttributes(window, COLORREF(0), DIM_ALPHA, LWA_ALPHA) };
     // **Logged, not discarded, and that is a deliberate reversal.** This line
     // used to read `let _ = ..`, on the reasoning that there is nothing useful
     // to do about a refusal. True, and beside the point: the cost of discarding
     // it was that nobody could tell a call that was never made from one that
-    // failed from one that succeeded and did nothing -- and for two rounds of
+    // failed from one that succeeded and did nothing -- and for three rounds of
     // fixes, nobody could. One line in `deskwarden.log` per overlay settles
-    // which.
-    if result.is_ok() {
-        log::info!(
-            "region overlay: DwmExtendFrameIntoClientArea accepted on {hwnd:#x} with margins              -1 on every side; the dim composites over the desktop, unblurred"
-        );
-    } else {
-        log::warn!(
-            "region overlay: DwmExtendFrameIntoClientArea refused on {hwnd:#x} ({result:?});              the overlay will be a solid dim rectangle rather than a dimmed desktop"
-        );
+    // which, and now names the mechanism as well, because that has changed
+    // three times.
+    match result {
+        Ok(()) => log::info!(
+            "region overlay: layered window on {hwnd:#x} -- ex-style {before:#x} -> {after:#x} \
+             and SetLayeredWindowAttributes accepted at alpha {DIM_ALPHA}/255, LWA_ALPHA. The \
+             whole window is that opaque over the desktop; no blur and no per-pixel alpha are \
+             asked for anywhere"
+        ),
+        // **And the style comes back off**, which is not tidiness. A window
+        // that carries `WS_EX_LAYERED` and has been given neither a
+        // `SetLayeredWindowAttributes` nor an `UpdateLayeredWindow` is not
+        // drawn at all -- and this one is full-screen, always-on-top and
+        // takes the mouse, so "not drawn" means an invisible sheet over every
+        // pixel of the display that eats clicks. Failing back to an opaque dim
+        // rectangle is a bad overlay; failing forward to an invisible one is a
+        // desktop the user cannot use.
+        Err(e) => {
+            if after != before {
+                unsafe { SetWindowLongPtrW(window, GWL_EXSTYLE, before) };
+            }
+            log::warn!(
+                "region overlay: SetLayeredWindowAttributes refused on {hwnd:#x} ({e}); \
+                 WS_EX_LAYERED has been taken back off and the overlay will be a solid dim \
+                 rectangle rather than a dimmed desktop"
+            );
+        }
     }
 }
 
@@ -5066,40 +5289,90 @@ mod tests {
         assert_eq!(BAR_REASON_INK, theme::BLUE_SOFT);
     }
 
-    /// **Every piece of type on this surface sits on a plate of its own, not
-    /// on the dim -- which is why lightening the dim moved none of them.**
+    /// **The dim is painted opaque and the WINDOW carries [`DIM_ALPHA`]** --
+    /// which is the invariant the layered window rests on, and the one that
+    /// would be silently destroyed by the obvious edit.
     ///
-    /// Written when [`DIM_ALPHA`] was taken down from the design's 68% to 45%
-    /// on the owner's instruction. The reasonable worry is that a control
-    /// picked for a near-black ground stops working when the ground lightens;
-    /// the answer is that no control on this surface is on that ground. The
-    /// bar and the size readout carry the design's own plates, and those did
-    /// not move. This is the assertion that keeps it so: if somebody ever
-    /// lightens a plate toward the wash, the inks above become a real
-    /// question again and this fails rather than the screen quietly going
-    /// unreadable.
+    /// The obvious edit is to give the dim back an alpha of its own, because
+    /// that is what every other translucent thing in this crate does and
+    /// because [`DIM_ALPHA`] is sitting right there. On this surface it is
+    /// wrong twice over: the framebuffer alpha would compound with the
+    /// window's and dim the desktop to about 70%, and it would do so without
+    /// any error, warning or visible symptom other than a screen the owner
+    /// says is too dark -- which is the report this module has already been
+    /// through three times.
+    ///
+    /// So the pin is a **count**: `DIM_ALPHA` appears exactly once in this
+    /// module's code, in the `SetLayeredWindowAttributes` call. Anything that
+    /// wants a second use of it is a change that has to come here first.
     #[test]
-    fn the_bar_carries_its_own_ground_and_not_the_dim() {
-        // Both plates are far heavier than the wash, so type on them is on a
-        // near-opaque dark ground however transparent the dim becomes.
+    fn the_dim_is_painted_opaque_and_the_window_carries_the_alpha() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        let statements: String = code
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The painters that make the dim, with their prose cut away: `draw`,
+        // `paint_dim_around` and `paint_reveal`, up to the first function that
+        // paints something other than the wash.
+        let painters = statements
+            .split("pub fn draw(")
+            .nth(1)
+            .expect("`draw` is gone")
+            .split("fn paint_selection_edge(")
+            .next()
+            .expect("the paint section no longer ends where it did");
         assert!(
-            BAR_BG_ALPHA > DIM_ALPHA + 80,
-            "the bottom bar's plate is closing on the dim; BAR_REASON_INK and BAR_HINT_INK are \
-             chosen for a dark ground and would need re-picking"
+            !painters.contains("DIM_ALPHA"),
+            "the dim is painted with `DIM_ALPHA` again. It is the LAYERED WINDOW's alpha now, \
+             not a paint alpha: a framebuffer alpha compounds with the window's and takes the \
+             desktop down to about 30% -- silently, with no symptom but a screen the owner \
+             says is too dark. See `DIM_ALPHA` and `let_the_desktop_through`"
         );
         assert!(
-            SIZE_BG_ALPHA > DIM_ALPHA + 80,
-            "the size readout's plate is closing on the dim; its monospace ink would need \
-             re-picking"
+            !painters.contains("from_rgba_unmultiplied"),
+            "something in the dim's own painters is translucent again; every fill on this \
+             surface has to be opaque, because the window is what carries the alpha"
         );
-        // And they are the design's own numbers, untouched by the departure
-        // the dim made: `rgba(32, 30, 29, 0.92)` and `0.86`.
+        assert!(
+            statements.contains("LWA_ALPHA"),
+            "the window's alpha is no longer set with `LWA_ALPHA`, so `DIM_ALPHA` is not \
+             reaching the compositor at all and the overlay is opaque"
+        );
+
+        // The two inks the surface is painted out of are opaque, and the
+        // surround is the darker of the two -- the direction 6b's hole used to
+        // supply, now that a hole cannot exist. See `SURROUND_INK`.
+        assert_eq!(DIM_INK.a(), 255, "the dim has an alpha of its own again");
+        assert_eq!(SURROUND_INK.a(), 255, "the surround has an alpha of its own again");
+        assert!(
+            SURROUND_INK.r() < DIM_INK.r()
+                && SURROUND_INK.g() < DIM_INK.g()
+                && SURROUND_INK.b() < DIM_INK.b(),
+            "the surround is no longer darker than the selection, so the drag reads inverted: \
+             the rectangle the user framed would be the dimmest thing on the screen"
+        );
+        // And the dim is still the design's `#201e1d`, which is the one part
+        // of this the mechanism change was not allowed to move.
+        assert_eq!((DIM_INK.r(), DIM_INK.g(), DIM_INK.b()), (0x20, 0x1e, 0x1d));
+
+        // The plates are the design's own numbers still: `rgba(32, 30, 29,
+        // 0.92)` and `0.86`. What they buy has changed -- see `BAR_BG_ALPHA`,
+        // which carries the contrast numbers -- but they compose over an
+        // opaque ground, so they are colours here and no longer a second
+        // transparency.
         assert_eq!(BAR_BG_ALPHA, 235);
         assert_eq!(SIZE_BG_ALPHA, 219);
-        // The only alpha-over-the-wash thing left is the halo, which is a glow
-        // around a solid ring rather than a control -- and the ring it
-        // surrounds is opaque, which is what actually separates lit from
-        // dimmed at the selection's edge.
+        // The halo is the one alpha left in the framebuffer, and it is a glow
+        // around a solid ring rather than a control -- the ring it surrounds is
+        // opaque, which is what actually separates lit from dimmed at the
+        // selection's edge.
         assert_eq!(HALO_ALPHA, 71);
         assert_eq!(SELECTION_RING, 2.0);
     }
@@ -5902,30 +6175,41 @@ mod tests {
         );
     }
 
-    /// **The window asks DWM to composite its alpha, on the frame it first
-    /// exists.**
+    /// **The window makes itself layered, on the frame it first exists, before
+    /// it is shown.**
     ///
     /// Not a proof that the overlay is see-through -- that needs a real
     /// compositor and is in this module's list of things a test cannot hold.
-    /// It is a pin on the one thing that can be checked from here: that the
-    /// call `winit` skips is made at all, and made where an HWND exists.
+    /// It is a pin on the things that can be checked from here: that the calls
+    /// are made at all, made where an HWND exists, made before the show, and
+    /// that neither of the two mechanisms this surface has already been broken
+    /// by is back.
     ///
-    /// The flag alone is not enough and that is the whole point of the
-    /// function: `glutin_winit::finalize_window` strips `with_transparent`
-    /// whenever the GL config says it cannot do colour-key transparency, which
-    /// on Windows is always, and `winit` only makes the DWM call when the flag
-    /// survived. A future edit that deleted this call because "the viewport
-    /// already asks for transparency" would be re-introducing the black
-    /// screen, so the argument is pinned next to the call.
+    /// The viewport's own transparency flag is not enough and never was, which
+    /// is the whole point of the function: `glutin_winit::finalize_window`
+    /// strips `with_transparent` whenever the GL config says it cannot do
+    /// colour-key transparency, which on Windows is always. A future edit that
+    /// deleted these calls because "the viewport already asks for
+    /// transparency" would be re-introducing the black screen, so the argument
+    /// is pinned next to the call.
     #[test]
-    fn the_overlay_asks_dwm_to_composite_its_alpha() {
+    fn the_overlay_makes_itself_a_layered_window_before_it_is_shown() {
         let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
         let code = source.split("#[cfg(test)]").next().unwrap();
         assert!(code.len() < source.len(), "the test module marker was not found");
-        assert!(
-            code.contains("DwmExtendFrameIntoClientArea(HWND(hwnd as *mut _), &margins)"),
-            "nothing makes the DWM call that makes this window transparent"
-        );
+        for needle in [
+            "GetWindowLongPtrW(window, GWL_EXSTYLE)",
+            "WS_EX_LAYERED.0 as isize",
+            "SetWindowLongPtrW(window, GWL_EXSTYLE, after)",
+            "SetLayeredWindowAttributes(window, COLORREF(0), DIM_ALPHA, LWA_ALPHA)",
+        ] {
+            assert!(
+                code.contains(needle),
+                "`{needle}` is gone, so this window is no longer made translucent the one way \
+                 that has not yet been wrong on the owner's monitor. See \
+                 `let_the_desktop_through`"
+            );
+        }
         // **And it is NOT `DwmEnableBlurBehindWindow`.** That call, with the
         // empty region `winit` uses and twenty years of documentation behind
         // it, blurs the whole window on Windows 11 build 26200 -- established
@@ -5961,23 +6245,37 @@ mod tests {
         ] {
             assert!(
                 !statements.contains(gone),
-                "`{gone}` is back. `DwmEnableBlurBehindWindow` with an empty blur region is the                  documented per-pixel-alpha idiom and on Windows 11 26200 it blurs the entire                  window; the owner could not see their own screen through it. See                  `let_the_desktop_through`"
+                "`{gone}` is back. `DwmEnableBlurBehindWindow` with an empty blur region is the \
+                 documented per-pixel-alpha idiom and on Windows 11 26200 it blurs the entire \
+                 window; the owner could not see their own screen through it. See \
+                 `let_the_desktop_through`"
             );
         }
-        // Margins of -1 on every side: the whole client area, which is what
-        // makes DWM honour this window's alpha across the surface rather than
-        // in a border.
-        for margin in [
-            "cx_left_width: -1",
-            "cx_right_width: -1",
-            "cy_top_height: -1",
-            "cy_bottom_height: -1",
-        ] {
-            assert!(
-                code.contains(margin),
-                "`{margin}` is gone, so the composited frame no longer covers the whole client                  area and the middle of a full-screen overlay is opaque"
-            );
-        }
+        // **`LWA_ALPHA` and never `LWA_COLORKEY`.** A colour key is a real hole
+        // in the window, and a hole in a full-screen always-on-top overlay
+        // swallows no clicks and answers no Escape -- so a live rectangle of
+        // the user's desktop would sit underneath a surface that looks like it
+        // is covering it. The prose in `let_the_desktop_through` names the flag
+        // while rejecting it, which is why this reads the statements.
+        assert!(
+            !statements.contains("LWA_COLORKEY"),
+            "`LWA_COLORKEY` is being asked for; see `let_the_desktop_through` for why a \
+             genuine hole in this window is worse than a uniform dim"
+        );
+        // **And the viewport does not ask `winit` to make that call either.**
+        // `with_transparent(true)` is `winit`'s trigger for
+        // `DwmEnableBlurBehindWindow` on Windows, so a flag in the builder is
+        // the same blur asked for at one remove. It is stripped by
+        // `glutin_winit` on every Windows machine anyone has run this on --
+        // which is exactly why it could sit there for three rounds of fixes
+        // looking harmless.
+        assert!(
+            !statements.contains(".with_transparent(true)"),
+            "the overlay's viewport asks for transparency again. On Windows that flag is \
+             `winit`'s trigger for `DwmEnableBlurBehindWindow`, which is the blur this surface \
+             was broken by; the layered window above needs no framebuffer alpha at all. See \
+             `let_the_desktop_through`"
+        );
         // It happens on the frame the window first exists, beside the
         // capture exclusion, because that is the first moment there is a
         // window to call it on -- and BEFORE the window is shown, which is the
@@ -5987,17 +6285,17 @@ mod tests {
             .nth(1)
             .expect("`appear` is gone");
         let first = first.split("\n    }").next().unwrap();
-        let dwm = first
+        let layered = first
             .find("let_the_desktop_through(REGION_TITLE);")
-            .expect("the DWM call is not made on the frame the window first exists");
+            .expect("the window is not made layered on the frame it first exists");
         let shown = first
             .find("ViewportCommand::Visible(true)")
             .expect("the overlay is never shown");
         assert!(
-            dwm < shown,
-            "the window is shown before DWM has been asked to composite its alpha, so the \
-             user gets a solid full-screen rectangle until the call lands -- measured at 1315 \
-             ms of pure white, which is the defect this ordering exists to remove"
+            layered < shown,
+            "the window is shown before it has been made translucent, so the user gets a solid \
+             full-screen rectangle until the call lands -- measured at 1315 ms of pure white, \
+             which is the defect this ordering exists to remove"
         );
         assert!(
             first
@@ -6013,18 +6311,18 @@ mod tests {
         // driver where it does not -- where the cost to the user is a black
         // rectangle over their screen rather than a subtle artefact. It is
         // insurance only: it must be an ADDITION to the hidden call and never
-        // a replacement for it, which is what `dwm < shown` above holds.
+        // a replacement for it, which is what `layered < shown` above holds.
         assert_eq!(
             first.matches("let_the_desktop_through(REGION_TITLE);").count(),
             2,
-            "the DWM call is no longer made exactly twice in `appear` -- once on the hidden \
+            "the layering is no longer done exactly twice in `appear` -- once on the hidden \
              window and once on the first frame it is up. Dropping the second one takes the \
-             black-screen insurance away; dropping the first one puts the 1315 ms white box \
+             opaque-screen insurance away; dropping the first one puts the 1315 ms white box \
              back"
         );
         assert!(
             first.rfind("let_the_desktop_through(REGION_TITLE);").unwrap() > shown,
-            "the second DWM call is not after the show, so both of them are made on a hidden \
+            "the second call is not after the show, so both of them are made on a hidden \
              window and the surface has no call made while it is visible at all"
         );
         // **And the step means "the window exists", not "this has not run

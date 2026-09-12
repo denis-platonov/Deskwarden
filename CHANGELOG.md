@@ -222,11 +222,28 @@ and also blurred it -- so the QR code you were being asked to drag a box around
 was a soft smear with no edges. The bar at the bottom stayed sharp, which made
 it look like the screen behind it had simply gone dark.
 
-The cause was the call that asks Windows to let a window's transparency through.
-The twenty-year-old way to make that request is to ask for a blur behind the
-window and then hand Windows an empty list of places to blur; on Windows 11
-build 26200 the empty list is being read as "everywhere". Deskwarden now asks
-for the same transparency a different way, one that has no blur in it at all.
+The cause was the call that asks Windows to let a window's transparency through,
+and two separate ways of making that request turned out to be wrong on this
+build of Windows 11. The twenty-year-old one asks for a blur behind the window
+and hands Windows an empty list of places to blur; the empty list is being read
+as "everywhere". The newer one asks Windows to treat the whole window as a sheet
+of glass; Windows accepted it and drew a material of its own behind the glass,
+which is also a blur.
+
+So the overlay no longer asks the compositor for anything clever. It is now a
+**layered window** -- the oldest and plainest transparency Windows has, a single
+opacity applied to the finished window, with no blur anywhere in the idea. The
+dim is painted solid and that one opacity does all of the work.
+
+There is a visible trade, and it is the reason this is described rather than
+just fixed. The opacity is the same everywhere on the window, so the rectangle
+you drag is no longer a clear hole in the dim. What marks it out instead is
+everything around it -- the blue ring and its glow, the four corner brackets,
+the *Code found* badge and the pixel readout -- plus the area outside it
+dropping a step darker while you drag. The bottom bar is affected the same way:
+it used to sit on a nearly solid plate and now it is as see-through as the rest
+of the surface, so its two lines of small print are fainter than they were
+against a busy desktop.
 
 While the overlay was opening, a small white window used to appear and then
 jump to its final size and position. It is created off-screen and placed before
