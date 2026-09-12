@@ -1712,8 +1712,21 @@ pub fn state_pill(
             x += PILL_CHECK + PILL_GAP;
         }
     }
+    // Optically centred, like every other single line this app sets in a
+    // band -- see `centred_galley_top`. Box-centring put the label a couple
+    // of points high in every pill in the app, which is the same defect the
+    // owner reported on the parameter chips.
+    let font = FontId::new(PILL_TEXT_PX, FontFamily::Name(BOLD.into()));
+    let drop = painter.ctx().fonts_mut(|f| {
+        let probe = f.layout_no_wrap(ASCENT_PROBE.to_string(), font.clone(), Color32::BLACK);
+        probe.rows.first().and_then(|row| row.glyphs.first()).map_or(0.0, |g| {
+            let above = g.pos.y + g.uv_rect.offset.y;
+            let below = g.font_height - g.pos.y;
+            ((below - above) / 2.0).max(0.0)
+        })
+    });
     painter.galley(
-        Pos2::new(x, rect.center().y - galley.size().y / 2.0),
+        Pos2::new(x, rect.center().y - galley.size().y / 2.0 + drop),
         galley,
         tone.ink,
     );
@@ -5594,6 +5607,30 @@ pub fn ascent_of(ctx: &egui::Context, font: &FontId) -> f32 {
             .and_then(|row| row.glyphs.first())
             .map_or_else(|| f.row_height(font), |glyph| glyph.font_ascent)
     })
+}
+
+/// **A galley's top-left, for a galley that is to sit optically centred in
+/// `band`.**
+///
+/// Box-centring a galley is what almost every caller reaches for and it reads
+/// high, because the face inks only the upper part of its row box -- the
+/// measurement [`ink_drop`] carries. This is that correction applied, so a
+/// caller centring one line in a pill, a chip or a band does not have to know
+/// the rule, only to use this instead of the arithmetic.
+///
+/// `x` is the caller's: nothing here knows whether the line is left-aligned
+/// against a column or centred across the band.
+pub fn centred_galley_top(
+    ctx: &egui::Context,
+    band: Rect,
+    galley: &egui::Galley,
+    font: &FontId,
+    x: f32,
+) -> Pos2 {
+    Pos2::new(
+        x,
+        band.center().y - galley.size().y / 2.0 + ink_drop(ctx, font, None),
+    )
 }
 
 /// **How far a galley of `font` has to move DOWN to sit optically centred**,

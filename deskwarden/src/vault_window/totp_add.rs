@@ -1866,19 +1866,6 @@ fn refuse_camera(state: &mut TotpAdd, why: CameraRefusal) {
     state.refusal = Some(PickerRefusal::Camera(why));
 }
 
-fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(egui::Margin::same(12))
-        .show(ui, add)
-        .inner
-}
-
-fn note(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
-    ui.label(egui::RichText::new(text).size(11.0).color(colour));
-}
-
 // ---------------------------------------------------------------------------
 // Design 6d's surface.
 //
@@ -4127,68 +4114,6 @@ pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
     PickerFrame { action, rows, close }
 }
 
-/// What the card says while the 6b overlay is up in front of it.
-///
-/// The words are [`crate::region_overlay`]'s own, so this window and that one
-/// cannot come to describe the same gesture differently.
-/// It reports nothing: the only thing that can end this stage from *this*
-/// window is the way back, and the outcome that really ends it arrives from
-/// the overlay through [`apply_region_outcome`]. A Cancel here would be a
-/// second way to close a surface whose other window is still up.
-///
-/// # And that is why this stage gets no ✕, when every other one has one
-///
-/// 6a's header carries [`theme::modal_dismiss_mark`], `manual_header` now
-/// carries the same mark, and the camera stage draws 6a's header outright --
-/// so this is the one card in the flow with no corner gesture, and it is a
-/// decision rather than an oversight. A ✕ is a *dismiss*, and this card
-/// cannot dismiss anything: the surface the user is actually looking at is
-/// `region_overlay`'s full-screen window, which is in front of this one and
-/// owns both the keyboard and the scan. That is the same fact
-/// [`draw_add_modal`] encodes by not answering Escape here. A mark in this
-/// corner would either be invisible (covered by the overlay) or be a second
-/// cancel that tears the form down while the capture window is still up --
-/// and it would contradict the Escape rule one line of code away from it.
-/// The way out of this stage is the overlay's own Escape, which cancels the
-/// scan and captures nothing, and the way back this card draws.
-///
-/// **This card is also what is on screen for the moment before the overlay
-/// exists**, while `region_overlay` takes and decodes its whole-screen scan,
-/// and its heading is the one word for both: *"Scanning your screen"*. The
-/// instruction under it is the overlay's and is a beat early -- there is
-/// nothing to drag a box on yet -- and it is left that way rather than given
-/// a second state, because the alternative is a card that changes its own
-/// sentence twice inside a second on the way to a surface that replaces it.
-///
-/// **How long it is the only thing on screen has changed, and the wording has
-/// not had to.** A scan that finds one code used to end the overlay before a
-/// window existed, so this card was the last thing the user saw before 6c;
-/// the overlay now opens for `region_overlay::REVEAL_DWELL` to show them the
-/// code it found, and covers this card while it does. Either way this is what
-/// is up while the scan itself runs, and *"Scanning your screen"* is the right
-/// heading for exactly that.
-pub fn draw_scanning(ui: &mut egui::Ui, state: &mut TotpAdd) {
-    let mut go_back = false;
-    card(ui, |ui| {
-        ui.label(egui::RichText::new(SCANNING_HEADING).size(14.0).color(theme::INK).strong());
-        ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new(crate::region_overlay::DRAG_TITLE)
-                .size(12.0)
-                .color(theme::INK),
-        );
-        ui.add_space(2.0);
-        note(ui, crate::region_overlay::DRAG_HINT, theme::TEXT_MUTED);
-        ui.add_space(10.0);
-        if theme::link_label(ui, OTHER_WAYS_LABEL, 11.0).clicked() {
-            go_back = true;
-        }
-    });
-    if go_back {
-        state.back_to_picker();
-    }
-}
-
 // ---------------------------------------------------------------------------
 // The camera stage
 // ---------------------------------------------------------------------------
@@ -4897,23 +4822,29 @@ fn row_action(ui: &mut egui::Ui, text: &str) -> egui::Response {
 
 /// One parameter chip, as 6c draws them.
 fn param_chip(ui: &mut egui::Ui, text: &str) {
-    let galley = ui.painter().layout_no_wrap(
-        text.to_owned(),
-        egui::FontId::new(PARAM_CHIP_PX, egui::FontFamily::Monospace),
-        theme::TEXT_SECONDARY,
-    );
+    let font = egui::FontId::new(PARAM_CHIP_PX, egui::FontFamily::Monospace);
+    let galley =
+        ui.painter().layout_no_wrap(text.to_owned(), font.clone(), theme::TEXT_SECONDARY);
     let size = galley.size() + egui::vec2(PARAM_CHIP_PAD_X * 2.0, PARAM_CHIP_PAD_Y * 2.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    ui.painter().rect_filled(
+    ui.painter().rect_filled(rect, CornerRadius::same(PARAM_CHIP_RADIUS), theme::CANVAS);
+    // **Optically centred, not padded.** The chip is sized from the galley's
+    // BOX and the padding was then applied to that box, which is geometrically
+    // even and reads high: the face inks only the upper part of its row, so
+    // equal padding above and below a box puts unequal air above and below the
+    // letters. The owner: "also param text within pill not centered".
+    //
+    // `theme::centred_galley_top` is the same correction the app's other
+    // single-line bands take, so a chip here and a pill elsewhere sit their
+    // text at the same height.
+    let at = theme::centred_galley_top(
+        ui.ctx(),
         rect,
-        CornerRadius::same(PARAM_CHIP_RADIUS),
-        theme::CANVAS,
+        &galley,
+        &font,
+        rect.min.x + PARAM_CHIP_PAD_X,
     );
-    ui.painter().galley(
-        rect.min + egui::vec2(PARAM_CHIP_PAD_X, PARAM_CHIP_PAD_Y),
-        galley,
-        theme::TEXT_SECONDARY,
-    );
+    ui.painter().galley(at, galley, theme::TEXT_SECONDARY);
 }
 
 /// [`draw_add_form`] over a dimmed scrim, centred, for `vault_window::mod` to
@@ -4928,6 +4859,33 @@ pub fn draw_add_modal(
     state: &mut TotpAdd,
     now_unix: u64,
 ) -> TotpAddAction {
+    // **Nothing at all while the screen is being scanned** -- no card, no
+    // scrim, not a pixel.
+    //
+    // There was a card here reading `Scanning your screen` with 6b's own
+    // `Drag a box...` under it, and its doc admitted the instruction was "a
+    // beat early -- there is nothing to drag a box on yet", kept rather than
+    // given a second state. On the path where the whole-screen scan FINDS a
+    // code, that beat is the whole story: there is never an overlay, never a
+    // box to drag, and the card told the user to drag one anyway. The owner:
+    // "if QR code present - there is still white popup shows Scanning your
+    // screen - draw a square - which is misledaing", and then "I think we can
+    // remove that modal completely".
+    //
+    // Removing it is better than correcting its words. The scan takes about a
+    // second, and what the user needs in that second is either nothing (a code
+    // was found; the confirmation is a blink away) or the overlay, which says
+    // what to do in its own stripe. A white card that appears, says something
+    // true for a moment, and is replaced is worse than no card -- and it is
+    // the "small white popup" reported against every scan since this stage
+    // existed.
+    //
+    // The way out is unchanged: the overlay answers Escape, and on the found
+    // path there is nothing to escape from.
+    if state.stage == Stage::Scanning {
+        return TotpAddAction::None;
+    }
+
     theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("totp-add-scrim")));
 
     // **The one card in the app that is four cards, and the size it was last
@@ -5079,10 +5037,12 @@ pub fn draw_stage(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> Totp
         .flatten();
     match state.stage {
         Stage::Picker => draw_picker(ui, state).action,
-        Stage::Scanning => {
-            draw_scanning(ui, state);
-            TotpAddAction::None
-        }
+        // **Nothing.** The scan has no card of its own -- see
+        // `draw_add_modal`, which returns before the scrim for this stage.
+        // The arm stays so the match is exhaustive and so a reader of the
+        // state machine finds the answer here rather than two functions
+        // away.
+        Stage::Scanning => TotpAddAction::None,
         Stage::Webcam => draw_webcam(ui, state, frame),
         Stage::Manual => draw_add_form(ui, state, now_unix),
     }
@@ -7773,23 +7733,70 @@ mod tests {
         assert!(!painted.has(SECRET_HINT), "the modal opened straight into the by-hand form");
     }
 
-    /// **What the card says while the overlay is up**, in the overlay's own
-    /// words.
+    /// **The scan has no card at all**, and the modal paints nothing for it --
+    /// not a card, not a scrim.
+    ///
+    /// There was one: `Scanning your screen`, with 6b's `Drag a box...` under
+    /// it borrowed verbatim from the overlay. Its own doc admitted the
+    /// instruction was "a beat early -- there is nothing to drag a box on
+    /// yet". On the path where the whole-screen scan FINDS a code that beat is
+    /// the whole story: no overlay ever opens, no box is ever dragged, and the
+    /// card told the user to drag one. The owner: "if QR code present - there
+    /// is still white popup shows Scanning your screen - draw a square - which
+    /// is misledaing", then "I think we can remove that modal completely".
+    ///
+    /// Read through `draw_add_modal` and not `draw_stage`, because the scrim
+    /// is the modal's and a stage drawn on its own has none -- and the scrim
+    /// is half of what "nothing" has to mean here.
     #[test]
-    fn the_scanning_card_borrows_the_overlays_own_instruction() {
+    fn the_scan_paints_nothing_at_all() {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        crate::theme::apply(&ctx);
         let mut state = TotpAdd::opening("id-1", "Git Host", false);
         state.stage = Stage::Scanning;
-        let painted = paint(|ui| {
-            draw_stage(ui, &mut state, BOUNDARY);
+        let _ = ctx.run_ui(input(), |_ui| {
+            let _ = draw_add_modal(&ctx, &mut state, BOUNDARY);
         });
-        assert!(painted.has(SCANNING_HEADING));
+        let output = ctx.run_ui(input(), |_ui| {
+            let _ = draw_add_modal(&ctx, &mut state, BOUNDARY);
+        });
+        let mut painted = Painted(Vec::new());
+        let mut rects = Vec::new();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
+            collect_rects(&clipped.shape, &mut rects);
+        }
+        assert!(painted.0.is_empty(), "the scan drew text: {:?}", painted.0);
         assert!(
-            painted.has(crate::region_overlay::DRAG_TITLE),
-            "the card and the overlay describe the same gesture differently: {:?}",
-            painted.0
+            !rects.iter().any(|r| r.fill == egui::Color32::from_black_alpha(
+                crate::theme::MODAL_SCRIM_ALPHA
+            )),
+            "the scan drew the modal scrim, so the screen is dimmed by this window as well \
+             as by the overlay"
         );
-        assert!(painted.has(crate::region_overlay::DRAG_HINT));
-        assert!(painted.has(OTHER_WAYS_LABEL), "there is no way out of the scanning stage");
+
+        // The control: the SAME harness on the picker really does paint, so
+        // the emptiness above is this stage and not a frame that drew nothing.
+        state.stage = Stage::Picker;
+        let _ = ctx.run_ui(input(), |_ui| {
+            let _ = draw_add_modal(&ctx, &mut state, BOUNDARY);
+        });
+        let output = ctx.run_ui(input(), |_ui| {
+            let _ = draw_add_modal(&ctx, &mut state, BOUNDARY);
+        });
+        let mut picker = Painted(Vec::new());
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut picker);
+        }
+        assert!(picker.has(PICKER_TITLE), "control: the harness paints nothing at all");
     }
 
     /// **A decoded region reaches 6c's card, through the entry point the
@@ -8165,7 +8172,15 @@ mod tests {
         );
         // The stage changes BETWEEN frames, which is how `vault_window`'s
         // action handler changes it: after `draw_add_modal` has returned.
-        state.stage = Stage::Scanning;
+        // **The MANUAL stage, not `Scanning`.** This test was written
+        // against Scanning because it was the one card of a different
+        // width; that stage draws nothing at all now (see
+        // `draw_add_modal`), so there is no card to measure and the
+        // control below would fail for the wrong reason. Manual is a
+        // different HEIGHT from the picker, which is all this needs: the
+        // defect is an anchor taken from the previous stage's size, and a
+        // size differs if either axis does.
+        state.stage = Stage::Manual;
         let _ = modal.frame(&mut state, Vec::new());
         let scanning = egui::AreaState::load(&modal.ctx, id).expect("the card was drawn").rect();
         assert_ne!(
@@ -8175,7 +8190,7 @@ mod tests {
         );
         assert!(
             (scanning.center() - centre).length() < 1.0,
-            "the scanning card was placed off-centre on the first frame of its stage, at \
+            "the new stage's card was placed off-centre on its first frame, at \
              {scanning:?} against a centre of {centre:?}: it was anchored by the picker's size \
              and painted in the picker's corner, and the next frame will move it"
         );
