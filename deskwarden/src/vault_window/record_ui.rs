@@ -1622,10 +1622,28 @@ impl RecordSend {
     }
 }
 
-/// The composer card's width. Design §5a's composer is a narrow column — the
-/// tick list is the widest control in it — and the seed warning is a paragraph
-/// that has to wrap somewhere.
-const MODAL_WIDTH: f32 = 360.0;
+/// **Design §5a's own 690**, measured off the design rather than described from
+/// it.
+///
+/// The number that stood here was 360, under a doc saying "§5a's composer is a
+/// narrow column". It is not one. §5a is a 690-point figure and the card fills
+/// it, and 330 points of missing width is most of what the owner was looking
+/// at when they said the built card was not the design: every §5a include row
+/// is `[tick] [name -------- flex] [value]`, and at 360 there is no value
+/// column left for the address, the masked password or `3 apps` to sit in --
+/// so they crowd the name instead of aligning down a right edge. The Access
+/// rows lose the same way: a 96-point label column and a 14-point gap out of
+/// 336 of content leaves the control less than two thirds of the row.
+///
+/// It fits the smallest window this app opens. `settings::MIN_VAULT_WINDOW_SIZE`
+/// is 900 x 600 and this card is centred in the WINDOW, not in the detail
+/// column, so 690 leaves 105 points either side.
+///
+/// **This does not reopen the Expires dropdown**, which
+/// `send_ui::draw_access_block` argues at length: that decision is about NINE
+/// choices not fitting a segmented run, and nine cells sized to their own
+/// labels do not fit 544 points any more than they fit 226.
+const MODAL_WIDTH: f32 = 690.0;
 
 /// [`draw_export_form`] over a dimmed scrim, centred, for `vault_window::mod`
 /// to call from its frame closure.
@@ -3438,11 +3456,23 @@ mod paint_tests {
     // egui resolves by swallowing the click.
     // -----------------------------------------------------------------------
 
+    /// The window these modal tests are drawn in.
+    ///
+    /// **900 wide, which is `settings::MIN_VAULT_WINDOW_SIZE`'s width** -- the
+    /// narrowest window this app opens, and therefore the narrowest one the
+    /// composer has to be reachable in. It was 640, which was wider than the
+    /// card until the card became design 5a's own 690; a harness narrower than
+    /// the thing it measures puts the card's right-hand controls off screen,
+    /// where egui culls them and every click test reports nothing.
+    ///
+    /// The height is deliberately not 600: these tests are about where
+    /// controls sit across the card, and a viewport that forces the body to
+    /// scroll measures the scroll rather than the layout.
     fn modal_input(events: &[egui::Event]) -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(640.0, 900.0),
+                egui::vec2(900.0, 900.0),
             )),
             events: events.to_vec(),
             ..Default::default()
