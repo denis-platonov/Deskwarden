@@ -1062,11 +1062,13 @@ pub fn refusal_sentence(refusal: &OtpRefusal) -> String {
     }
 }
 
-/// The secret as design 6c draws it: groups of four bullets, `•••• •••• ••••`.
+/// The secret as a run of bullets, one for each character.
 ///
 /// Length-shaped rather than a fixed run, so the row says how much seed there
 /// is without saying what it is -- and so an eight-character seed and a
-/// thirty-two-character one do not look identical.
+/// thirty-two-character one do not look identical. Ungrouped, because the
+/// seed it stands in for is: see [`secret_as_typed`]. 6c draws its own mask
+/// in fours; this row is the owner's.
 /// **This app's general rule is the opposite**, and the exception is this
 /// card's alone. `theme::MASKED_BULLETS` forbids a length-tracking mask -- it
 /// tells a shoulder-surfer how many characters to expect -- and the Send
@@ -1076,39 +1078,27 @@ pub fn refusal_sentence(refusal: &OtpRefusal) -> String {
 /// thing I scanned", and a mask the same shape for every seed answers
 /// nothing.
 pub fn masked(secret: &str) -> String {
-    in_fours(&"\u{2022}".repeat(secret.chars().count()))
+    "\u{2022}".repeat(secret.chars().count())
 }
 
-/// The same seed with the same grouping, for when it is actually shown.
+/// The seed exactly as it was read, for when it is actually shown.
 ///
-/// **The masked row and the revealed row are one shape.** They were two: the
-/// mask came in groups of four and the seed came out as one unbroken run, so
-/// pressing Reveal changed the row's LENGTH as well as its contents -- a
-/// 26-character seed masked to 26 bullets plus six spaces, revealed to 26
-/// characters and none. The owner: "make secret lenths same as real - right
-/// now it is some random number and also diff formatting should be same".
+/// **The masked row and the revealed row are one shape, and neither is
+/// grouped.**
 ///
-/// The grouping is also what a seed being READ wants. This row exists to be
-/// checked against a screen or typed somewhere else; base32 in fours is how
-/// authenticators print it, and 6d's own field accepts spaces for the same
-/// reason (`spaces ignored`).
-pub fn grouped_secret(secret: &str) -> String {
-    in_fours(secret)
-}
-
-/// `text` with a space after every fourth character.
+/// They were two shapes: the mask came in groups of four and the seed came
+/// out as one unbroken run, so Reveal changed the row's LENGTH as well as
+/// its contents. The owner asked for one shape -- "diff formatting should be
+/// same like ******** abcdefgh" -- and the first reading of that put BOTH in
+/// fours. That was wrong: `********` beside `abcdefgh` is eight of one
+/// against eight of the other with no separator in either. The correction,
+/// verbatim: "secret jsut store as text no separators".
 ///
-/// One function, so the mask and the seed cannot come to be grouped
-/// differently -- which is precisely what had happened.
-fn in_fours(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + text.len() / 4 + 1);
-    for (i, c) in text.chars().enumerate() {
-        if i > 0 && i % 4 == 0 {
-            out.push(' ');
-        }
-        out.push(c);
-    }
-    out
+/// This function is kept rather than inlined because [`masked`] is its pair,
+/// and a row whose two halves are produced in one place cannot drift apart
+/// again -- which is the whole history of this row.
+pub fn secret_as_typed(secret: &str) -> String {
+    secret.to_string()
 }
 
 /// The parameters row of the confirmation, spelled out -- **as four separate
@@ -4681,9 +4671,9 @@ fn draw_field_table(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd) {
                 |ui| {
                     // Both forms go through the same grouping, so Reveal
                     // changes what the row says and not how long it is.
-                    // See [`grouped_secret`].
+                    // See [`secret_as_typed`].
                     let shown = if state.revealed {
-                        grouped_secret(&auth.secret)
+                        secret_as_typed(&auth.secret)
                     } else {
                         masked(&auth.secret)
                     };
@@ -4751,7 +4741,26 @@ fn table_row(
     // it. `detail::header_row` carries the same finding about the same egui
     // behaviour, and `theme::section_row_impl` solves it the same way: paint
     // the caption, do not add it.
-    let cell_and_row = ui.horizontal(|ui| {
+    // **The band's height is STATED**, which is what lets egui centre anything
+    // in it.
+    //
+    // A `ui.horizontal` is laid out in one pass, so `Align::Center` can only
+    // centre a child against the height the row has reached SO FAR. The
+    // caption is the first child and was fixed by painting it afterwards; the
+    // VALUE has the same problem whenever what follows it is taller, which on
+    // this table is every row with a `Reveal` or a row of chips in it. The
+    // owner, of the secret row: "also it is not centered".
+    //
+    // `FIELD_ROW_CONTENT` is a floor and not a cap -- egui grows the band for
+    // anything taller -- so a row is at least this tall and every child in it
+    // is centred against a height known before the first of them is placed.
+    // `detail::header_row` states its band for the same reason and records the
+    // same egui behaviour.
+    let band = egui::vec2(ui.available_width(), FIELD_ROW_CONTENT);
+    let cell_and_row = ui.allocate_ui_with_layout(
+        band,
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.add_space(FIELD_PAD_X);
         // Width only. A zero height keeps the label out of the row's own
@@ -4770,7 +4779,8 @@ fn table_row(
             trailing(ui);
         });
         cell
-    });
+        },
+    );
     let cell = cell_and_row.inner;
     let row = cell_and_row.response.rect;
     let font = egui::FontId::proportional(FIELD_LABEL_PX);
@@ -4794,6 +4804,15 @@ fn table_row(
     );
     ui.add_space(FIELD_PAD_Y);
 }
+
+/// The height every row of the field table is at least, so each row's caption,
+/// value and control are centred against one number rather than against
+/// whatever had been placed when egui reached them.
+///
+/// The tallest thing a row holds is a parameter chip -- an 11px monospace line
+/// inside `PARAM_CHIP_PAD_Y` top and bottom -- and 20 clears it. A floor, not
+/// a cap: a row with something taller in it simply grows.
+const FIELD_ROW_CONTENT: f32 = 20.0;
 
 /// The `1px solid #f3f2f2` between two rows. Full-bleed, because 6c's rows are
 /// divided rather than spaced: the line runs the whole width of the table and
@@ -5281,11 +5300,26 @@ mod tests {
     // The masked secret
     // -----------------------------------------------------------------
 
+    /// **The mask is one bullet per character and nothing else.**
+    ///
+    /// It was grouped in fours, which is what §6c draws. The owner asked for
+    /// the mask and the revealed seed to be one shape, and then said which:
+    /// "secret jsut store as text no separators". A seed has no separators,
+    /// so neither has the thing standing in for it.
     #[test]
-    fn the_secret_is_masked_in_groups_of_four_and_by_length() {
-        assert_eq!(masked("JBSWY3DPEHPK3PXP"), "\u{2022}\u{2022}\u{2022}\u{2022} \
-             \u{2022}\u{2022}\u{2022}\u{2022} \u{2022}\u{2022}\u{2022}\u{2022} \
-             \u{2022}\u{2022}\u{2022}\u{2022}".replace("             ", ""));
+    fn the_secret_is_masked_by_length_and_not_grouped() {
+        assert_eq!(masked("JBSWY3DPEHPK3PXP"), "\u{2022}".repeat(16));
+        assert!(
+            !masked("JBSWY3DPEHPK3PXP").contains(' '),
+            "the mask is grouped and the seed beside it is not"
+        );
+        // The two halves of the row are one shape: same length, same lack of
+        // separators, so Reveal changes the contents and not the geometry.
+        assert_eq!(
+            masked("JBSWY3DPEHPK3PXP").chars().count(),
+            secret_as_typed("JBSWY3DPEHPK3PXP").chars().count(),
+            "the row changes length when it is revealed"
+        );
         assert!(
             !masked("JBSWY3DPEHPK3PXP").contains('J'),
             "the mask leaked a character of the seed"
@@ -5967,10 +6001,10 @@ mod tests {
         });
         assert!(
             // **Grouped**, because the revealed row and the masked one are
-            // one shape now -- see `grouped_secret`. Built through the same
+            // one shape now -- see `secret_as_typed`. Built through the same
             // function the row uses rather than written out in fours, so a
             // change to the grouping moves the assertion with it.
-            revealed.has(&grouped_secret("JBSWY3DPEHPK3PXP")),
+            revealed.has(&secret_as_typed("JBSWY3DPEHPK3PXP")),
             "Reveal showed nothing, so the masked assertion above proves nothing: {:?}",
             revealed.0
         );
@@ -7853,10 +7887,10 @@ mod tests {
         });
         assert!(
             // **Grouped**, because the revealed row and the masked one are
-            // one shape now -- see `grouped_secret`. Built through the same
+            // one shape now -- see `secret_as_typed`. Built through the same
             // function the row uses rather than written out in fours, so a
             // change to the grouping moves the assertion with it.
-            revealed.has(&grouped_secret("JBSWY3DPEHPK3PXP")),
+            revealed.has(&secret_as_typed("JBSWY3DPEHPK3PXP")),
             "Reveal showed nothing, so the masked assertions above prove nothing"
         );
     }
