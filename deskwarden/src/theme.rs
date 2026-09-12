@@ -6278,15 +6278,61 @@ pub fn form_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> (Rect, R) {
 /// in the app for the Send composer's heading to be the one heading that is
 /// bigger than the rest.
 pub fn form_card_header(ui: &mut Ui, title: &str) -> Rect {
+    form_card_header_marked(ui, title, false)
+}
+
+/// [`form_card_header`] **with §5a's paper plane in front of the title**.
+///
+/// §5a opens its composer with a send glyph, and it is the one thing on that
+/// band that says what KIND of card this is before the words are read. Drawn
+/// rather than typed, for the reason every mark in this file is: U+2708 and
+/// its neighbours resolve out of egui's fallback emoji face at a weight and
+/// an optical size nobody here chose, and §4d's own keycaps were tofu.
+///
+/// A flag on the existing function rather than a second header, because the
+/// band is otherwise identical -- same padding, same 14px, same rule closing
+/// it -- and two headers a point apart is this file's most-repeated defect.
+pub fn form_card_header_marked(ui: &mut Ui, title: &str, plane: bool) -> Rect {
     let line = egui::Frame::new()
         .inner_margin(Margin::symmetric(FORM_CARD_PAD_X, FORM_CARD_PAD_Y))
         .show(ui, |ui| {
-            ui.label(RichText::new(title).size(14.0).color(INK).strong()).rect
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if plane {
+                    let (mark, _) =
+                        ui.allocate_exact_size(Vec2::splat(SEND_PLANE), Sense::hover());
+                    paint_send_plane(ui.painter(), mark, BLUE);
+                    ui.add_space(SEND_PLANE_GAP);
+                }
+                ui.label(RichText::new(title).size(14.0).color(INK).strong()).rect
+            })
+            .inner
         })
         .inner;
     hairline(ui);
     line
 }
+
+/// §5a's send glyph: `M4 4l16 8-16 8 3-8z` in a 24-unit box, stroked.
+///
+/// The same path §8a hangs off its `Send` button, so the mark that opens the
+/// composer and the mark that reaches it are one drawing.
+pub fn paint_send_plane(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let unit = rect.width() / 24.0;
+    let at = |ux: f32, uy: f32| rect.min + Vec2::new(ux * unit, uy * unit);
+    // The outline, closed: tail, nose, tail again, and the notch that makes
+    // it a plane rather than a triangle.
+    painter.add(egui::Shape::closed_line(
+        vec![at(4.0, 4.0), at(20.0, 12.0), at(4.0, 20.0), at(7.0, 12.0)],
+        Stroke::new(2.2 * unit, color),
+    ));
+}
+
+/// §5a's `<svg width="17" height="17">` on the composer's title, and the
+/// `gap: 10px` after it.
+const SEND_PLANE: f32 = 17.0;
+/// See [`SEND_PLANE`].
+const SEND_PLANE_GAP: f32 = 10.0;
 
 /// The card's middle band: everything the form is actually asking, at the
 /// card's padding.

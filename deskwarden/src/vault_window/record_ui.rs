@@ -162,19 +162,37 @@ pub fn send_plan_from(record: &Record, access: SendPlan) -> SendPlan {
 // Task 6 -- the export surface
 // ---------------------------------------------------------------------------
 
-/// The heading over the export form.
-pub const EXPORT_HEADING: &str = "Send this record";
+/// The heading over the export form -- §5a's own words.
+///
+/// It read `Send this record`, which is more precise (it IS this record,
+/// named in the chip directly under the band) and is not what the design
+/// says. The owner, looking at the two side by side: "also tigheten the UI
+/// as per design - it is not 100% as". Precision the design did not ask for
+/// is still a departure from it, and this one bought nothing: the chip
+/// answers `which record` a line later, in bold, with its own tile.
+pub const EXPORT_HEADING: &str = "Send a record";
 
 /// The tick-box labels, in the order they are drawn.
 pub const USERNAME_LABEL: &str = "Username";
 /// See [`USERNAME_LABEL`].
 pub const PASSWORD_LABEL: &str = "Password";
-/// See [`USERNAME_LABEL`].
-pub const URI_LABEL: &str = "Website";
+/// See [`USERNAME_LABEL`]. **§5a's word, which is the READ pane's card
+/// title too**: a login's addresses are where it is OFFERED, and the row
+/// counts them rather than naming one. `Website` was this file's own word
+/// for the same field and the singular was wrong the moment a record had
+/// two.
+pub const URI_LABEL: &str = "Autofill targets";
 /// See [`USERNAME_LABEL`].
 pub const NOTES_LABEL: &str = "Notes";
-/// See [`USERNAME_LABEL`]. **Not ticked by default.** A seed is not a default.
-pub const TOTP_LABEL: &str = "TOTP seed";
+/// See [`USERNAME_LABEL`]. **Not ticked by default.** A seed is not a
+/// default.
+///
+/// §5a's word, and the one the rest of this app uses for the same thing --
+/// the edit form's card, the read pane's row and 6d's card all say
+/// `One-time code`. `TOTP seed` was accurate and was the only place in the
+/// app that said it; the sentence under the row is where the word SEED
+/// belongs, because that is the sentence about what a seed is.
+pub const TOTP_LABEL: &str = "One-time code";
 
 /// Design §5a's first section eyebrow, over the record the composer was
 /// opened against.
@@ -247,14 +265,22 @@ pub const PASSPHRASE_NOTE: &str =
 /// The label on the export form's submit button.
 ///
 /// **Not §5a's `Create & copy link`, and that is a refusal rather than an
-/// oversight.** Pressing this starts a `bw send create` whose link comes back
-/// in `vault_window`'s create banner; nothing on that path touches the
-/// clipboard. A button promising a copy that does not happen is worse than
-/// one that promises less, and the alternative -- making the copy happen --
-/// is a behaviour change (a public URL silently replacing whatever the user
-/// had on the clipboard) that belongs to whoever owns the clipboard rules in
-/// this app, not to a design pass. See this file's report note.
-pub const EXPORT_SUBMIT_LABEL: &str = "Create link";
+/// answered.** This used to read `Create link`, on the argument that a
+/// button promising a copy that does not happen is worse than one promising
+/// less -- and that making the copy happen was a behaviour change belonging
+/// to whoever owns this app's clipboard rules rather than to a design pass.
+///
+/// The copy happens now. `vault_window::drain_send_create` puts the access
+/// URL on the clipboard through `clipboard::copy_secret`, under the same
+/// clearing timer a password gets, because that URL carries the Send's
+/// decryption key in its fragment. So the design's own words are true and
+/// this says them.
+///
+/// What settled it was not the design: until that copy existed the ONLY
+/// copy of a new link was a sentence in a toast -- a label, unselectable,
+/// gone when dismissed. The button was honest about an app that could not
+/// hand the user the thing it had just made.
+pub const EXPORT_SUBMIT_LABEL: &str = "Create & copy link";
 
 /// The export form's way out.
 ///
@@ -1081,7 +1107,10 @@ pub fn draw_export_form(
     let mut action = RecordUiAction::None;
     let enabled = !in_flight;
     let (card_rect, title) = card(ui, |ui| {
-        let title = heading(ui, EXPORT_HEADING);
+        // **§5a's paper plane**, which only this card wears: the import form
+        // below is the same band without one, because the design draws the
+        // mark on the card that SENDS.
+        let title = theme::form_card_header_marked(ui, EXPORT_HEADING, true);
         theme::form_card_body(ui, |ui| {
             // **§5a's `RECORD` block: the record is NAMED, not mentioned.**
             //

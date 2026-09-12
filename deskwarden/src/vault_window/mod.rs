@@ -10889,8 +10889,8 @@ fn send_create_message(report: &SendCreateReport) -> (CreateTone, String) {
         SendCreateReport::Created { name, access_url } => (
             CreateTone::Good,
             format!(
-                "\u{201c}{name}\u{201d} is published. Its link is {access_url} \u{2014} anyone \
-                 who has it can open the Send.",
+                "\u{201c}{name}\u{201d} is published and its link is on your clipboard. \
+                 Anyone who has it can open the Send. {access_url}",
             ),
         ),
         SendCreateReport::Failed { name, error } if error.is_ambiguous() => (
@@ -11226,6 +11226,24 @@ fn drain_send_create(
 ) {
     if let Ok(report) = rx.try_recv() {
         create.in_flight = false;
+        // **The link goes on the clipboard the moment it exists**, which is
+        // what §5a's `Create & copy link` says the button does and what this
+        // app did not do. Until now the ONLY copy of a new Send's link was
+        // the sentence in the toast below: a label, unselectable, gone when
+        // it was dismissed. A link nobody can take is a Send nobody can send.
+        //
+        // `copy_secret` and not a plain copy: an access URL carries the
+        // Send's decryption key in its fragment -- `SendCreateReport`'s own
+        // `Debug` elides it for exactly that reason -- so it belongs under
+        // the same clearing timer as a password.
+        //
+        // Both composers, not just the record one. The Sends screen's button
+        // reads `Create link` and promises less than this does, which is a
+        // pleasant surprise rather than a lie; a link created there was
+        // equally unreachable.
+        if let SendCreateReport::Created { access_url, .. } = &report {
+            crate::clipboard::copy_secret(access_url);
+        }
         if report.list_is_now_stale() {
             fetch.invalidate();
         }
