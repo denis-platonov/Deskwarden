@@ -13884,6 +13884,8 @@ mod tests {
                 false,
                 &mut apps,
                 Some(&bound),
+                0,
+                &crate::rest::organizations::Audience::Personal,
                 &TotpState::NoSecret,
             );
         });

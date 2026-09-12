@@ -1097,12 +1097,16 @@ pub enum Section {
     CustomFields,
     /// 8a's `Notes`.
     Notes,
+    /// 8a's `Sharing`: who can see this record besides the account holder.
+    Sharing,
+    /// 8a's `History`: when the record was made, changed and used.
+    History,
 }
 
 impl Section {
     /// Every section, in the order the form draws them and the rail lists
     /// them.
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 9] = [
         Section::Item,
         Section::Details,
         Section::OneTimeCode,
@@ -1110,6 +1114,8 @@ impl Section {
         Section::FillRule,
         Section::CustomFields,
         Section::Notes,
+        Section::Sharing,
+        Section::History,
     ];
 
     /// The card's own title, **which depends on the kind**: 8a's `LOGIN
@@ -1136,6 +1142,8 @@ impl Section {
             Section::FillRule => "Fill rule",
             Section::CustomFields => "Custom fields",
             Section::Notes => "Notes",
+            Section::Sharing => "Sharing",
+            Section::History => "History",
         }
     }
 
@@ -6301,6 +6309,119 @@ fn section<R>(
     inner
 }
 
+/// **8a's `History` card, as rows of fact and value.**
+///
+/// Pure, and taking the two numbers it cannot derive, for this file's
+/// standing reason: every string on this card is decided somewhere a test can
+/// call rather than inside a paint closure.
+///
+/// # What 8a shows that this does not, and why
+///
+/// 8a's `Filled` row reads `41 times \u{b7} last 2 h ago in ledgerline.exe`.
+/// The COUNT is real -- `FillStats::count` has kept it per item since the
+/// feature landed -- and the rest is not: that file stores a tally and
+/// nothing else, so there is no instant to say `2 h ago` from and no
+/// executable to name. A row that invented either would be the
+/// drawn-and-dead defect this project has shipped twice, and the honest row
+/// is the count on its own.
+///
+/// 8a also hangs `Archive` and `Delete` under this card. `Delete` exists
+/// elsewhere on this window and is not duplicated here -- a second delete
+/// two clicks from the first, with its own confirmation, is a second way to
+/// destroy something. `Archive` is not implemented anywhere in this build;
+/// the sidebar's own Archive row already draws a dash for the same reason.
+fn history_rows(
+    item: Option<&VaultItem>,
+    fills: u32,
+    previous_passwords: usize,
+) -> Vec<(&'static str, String)> {
+    let mut rows = Vec::new();
+    let Some(item) = item else {
+        return rows;
+    };
+    // `creationDate` and `revisionDate` ride in `other` -- see
+    // `vault_bridge`'s `REVISION_DATE_KEY`, which is where this app learned
+    // not to invent either of them.
+    let stamp = |key: &str| item.other.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    if let Some(created) = stamp("creationDate") {
+        rows.push(("Created", detail::history_label(Some(&created))));
+    }
+    if let Some(updated) = stamp("revisionDate") {
+        rows.push(("Updated", detail::history_label(Some(&updated))));
+    }
+    // 8a's `3 previous`, as a count rather than a link: the previous
+    // passwords are drawn in full on the credentials card above, so a link
+    // here would scroll to something already on screen.
+    if previous_passwords > 0 {
+        rows.push(("Password changed", previous_password_count(previous_passwords)));
+    }
+    rows.push(("Filled", fill_count_label(fills)));
+    rows
+}
+
+/// 8a's `3 previous`, with the word agreeing with the number.
+fn previous_password_count(previous: usize) -> String {
+    match previous {
+        1 => "1 previous password".to_string(),
+        n => format!("{n} previous passwords"),
+    }
+}
+
+/// 8a's `41 times`, with the word agreeing with the number and saying so
+/// plainly when there are none -- `0 times` reads as a broken counter.
+fn fill_count_label(fills: u32) -> String {
+    match fills {
+        0 => "Never".to_string(),
+        1 => "Once".to_string(),
+        n => format!("{n} times"),
+    }
+}
+
+/// **8a's `Sharing` card**: who can see this record besides its owner.
+///
+/// `None` where there is nothing to say -- a personal item in an account with
+/// no organisations -- and the card is not drawn at all then, which is what
+/// this form does everywhere else rather than draw an empty box.
+///
+/// # What 8a shows that this does not
+///
+/// 8a's card leads with a live Send: `Send to m.reyes@ledgerline.com /
+/// Waiting \u{b7} username only \u{b7} expires in 23 h`, and a `Revoke` button
+/// beside it. **Nothing in this build can find the Sends belonging to an
+/// item.** A record Send carries the record's NAME and no id (see
+/// `record_ui::send_plan_from`), so the only link available is a string
+/// match on a name the user can change -- which would sooner or later offer
+/// to revoke somebody else's Send. The Sends screen lists them all and
+/// revokes them there.
+///
+/// What is left is 8a's own last line, `Also visible to 14 people in
+/// Engineering`, which comes from `rest::organizations::Audience` and is the
+/// half of this card that answers the question the card is named for.
+fn sharing_line(audience: &crate::rest::organizations::Audience) -> Option<String> {
+    use crate::rest::organizations::Audience;
+    let Audience::Shared { organisation, collections, others } = audience else {
+        return None;
+    };
+    let where_ = if collections.is_empty() {
+        organisation.clone()
+    } else {
+        // The collections it is filed in, which is where a reader looks for
+        // it -- the organisation alone would name a place with hundreds of
+        // items in it.
+        format!("{organisation} \u{b7} {}", collections.join(", "))
+    };
+    Some(match others {
+        // **`None` is not zero.** The roster is `Roster::Unknown` -- the
+        // server has no such route, or refused it, or has not been asked --
+        // and a card that said `0 other people` would be stating as fact the
+        // one thing this app does not know. See `Roster`'s own doc.
+        None => format!("Shared through {where_}."),
+        Some(0) => format!("In {where_}, and nobody else can see it."),
+        Some(1) => format!("Also visible to 1 other person in {where_}."),
+        Some(n) => format!("Also visible to {n} other people in {where_}."),
+    })
+}
+
 /// **The sections rail is gone, and this is where it was.**
 ///
 /// A 212-point left column listing every card, with counts, a dirty dot, a
@@ -6471,6 +6592,16 @@ pub fn draw_detail_edit(
     // does not edit either and the item is the only thing that knows them.
     // Everything else on screen still comes from the draft.
     item: Option<&VaultItem>,
+    // **What 8a's last two cards say, computed by the window and handed over.**
+    //
+    // Neither is a draft field and neither can be edited here: `fills` is
+    // `FillStats::count`, which reads a file, and `audience` is
+    // `rest::organizations::Directory::audience_of`, which walks the
+    // organisation roster. The window already holds both -- the sidebar draws
+    // from the same directory -- and a form that fetched its own would be a
+    // second reader of two things this window is the one owner of.
+    fills: u32,
+    audience: &crate::rest::organizations::Audience,
     // The vault window's ONE `detail::TotpState`, so the keystroke preview can
     // show what `{TOTP}` would type. Not a second poll: this form cannot fetch
     // a code and does not try.
@@ -7698,6 +7829,43 @@ pub fn draw_detail_edit(
                             .desired_width(ui.available_width())
                             .desired_rows(4),
                     );
+                });
+            }
+
+            // **8a's last two cards**, and they are the only two on this form
+            // that the user cannot edit: they say what the record IS rather
+            // than what it will become. 8a pairs them in a
+            // `grid-template-columns: 1fr 1fr` at the bottom of its column;
+            // these are full width and stacked, like every other card here,
+            // because this pane is 298 points at the window's floor and two
+            // columns of it are 140 each -- narrower than the label column a
+            // section row wants before it gives up and stacks.
+            //
+            // Neither is drawn with nothing in it. A create has no dates, no
+            // fills and no organisation, so on that form neither card exists
+            // -- which is this form's rule everywhere else and the reason
+            // `Section::ALL` is a list of what MAY be drawn rather than what
+            // is.
+            if let Some(line) = sharing_line(audience) {
+                section(ui, kind, Section::Sharing, false, wanted, |ui| {
+                    ui.label(
+                        RichText::new(line).size(12.0).color(theme::TEXT_SECONDARY),
+                    );
+                });
+            }
+            let facts = history_rows(item, fills, history.len());
+            if !facts.is_empty() {
+                section(ui, kind, Section::History, false, wanted, |ui| {
+                    for (index, (label, value)) in facts.iter().enumerate() {
+                        if index > 0 {
+                            ui.add_space(theme::BLOCK_GAP);
+                        }
+                        theme::section_row(ui, label, |ui| {
+                            ui.label(
+                                RichText::new(value).size(13.0).color(theme::INK),
+                            );
+                        });
+                    }
                 });
             }
         });
@@ -10592,7 +10760,7 @@ mod generator_row_tests {
         let mut apps = AppIdentityCache::default();
         let mut action = EditAction::None;
         let output = ctx.run_ui(raw_input(events), |ui| {
-            action = draw_detail_edit(ui, draft, &[], false, &mut apps, None, &detail::TotpState::NoSecret);
+            action = draw_detail_edit(ui, draft, &[], false, &mut apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret);
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -12340,7 +12508,17 @@ mod sequence_builder_tests {
     ) -> Painted {
         let mut apps = AppIdentityCache::default();
         let output = ctx.run_ui(raw_input(pane, events), |ui| {
-            let _ = draw_detail_edit(ui, draft, &[], false, &mut apps, Some(item), totp);
+            let _ = draw_detail_edit(
+                ui,
+                draft,
+                &[],
+                false,
+                &mut apps,
+                Some(item),
+                0,
+                &crate::rest::organizations::Audience::Personal,
+                totp,
+            );
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -12365,7 +12543,17 @@ mod sequence_builder_tests {
         let mut apps = AppIdentityCache::default();
         let mut action = EditAction::None;
         let output = ctx.run_ui(raw_input(pane, events), |ui| {
-            action = draw_detail_edit(ui, draft, &[], false, &mut apps, Some(item), totp);
+            action = draw_detail_edit(
+                ui,
+                draft,
+                &[],
+                false,
+                &mut apps,
+                Some(item),
+                0,
+                &crate::rest::organizations::Audience::Personal,
+                totp,
+            );
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -14248,7 +14436,17 @@ mod edit_pane_layout_tests {
         let mut apps = AppIdentityCache::default();
         let mut action = EditAction::None;
         let output = ctx.run_ui(raw_input(pane, events), |ui| {
-            action = draw_detail_edit(ui, draft, &[], creating, &mut apps, item, totp);
+            action = draw_detail_edit(
+                ui,
+                draft,
+                &[],
+                creating,
+                &mut apps,
+                item,
+                0,
+                &crate::rest::organizations::Audience::Personal,
+                totp,
+            );
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -16242,7 +16440,7 @@ mod edit_pane_layout_tests {
         for _ in 0..2 {
             let _ = ctx.run_ui(raw_input(pane, &[]), |ui| {
                 let before = sample(ui);
-                let _ = draw_detail_edit(ui, &mut draft, &[], true, &mut apps, None, &detail::TotpState::NoSecret);
+                let _ = draw_detail_edit(ui, &mut draft, &[], true, &mut apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret);
                 seen = Some((before, sample(ui)));
             });
         }
@@ -18631,6 +18829,94 @@ mod edit_pane_layout_tests {
             assert!(titles >= 5, "{pane:?}: only {titles} cards were checked");
         }
         assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
+    }
+
+    /// **8a's last two cards say what the record IS, and never guess.**
+    ///
+    /// Both are read-only, both are the owner's ask ("Sharing and History
+    /// cards - go"), and both are drawn from facts this app really holds --
+    /// which is most of what there is to test, because the half of 8a that is
+    /// NOT drawn is the half nothing could answer honestly.
+    #[test]
+    fn the_history_card_counts_what_is_counted_and_invents_nothing() {
+        let item: VaultItem = serde_json::from_str(
+            r#"{"id":"h-1","type":1,"name":"Ledgerline","fields":[],
+                "creationDate":"2020-01-01T00:00:00.000Z",
+                "revisionDate":"2020-06-01T00:00:00.000Z",
+                "login":{"username":"a"}}"#,
+        )
+        .expect("fixture");
+
+        let rows = history_rows(Some(&item), 41, 3);
+        let labels: Vec<&str> = rows.iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels, ["Created", "Updated", "Password changed", "Filled"]);
+        assert_eq!(rows[3].1, "41 times");
+        assert_eq!(rows[2].1, "3 previous passwords");
+
+        // **The count, and nothing after it.** §8a reads `41 times · last 2 h
+        // ago in ledgerline.exe`; `FillStats` keeps a tally and no instant and
+        // no executable, so the tail would have to be invented.
+        for (_, value) in &rows {
+            assert!(!value.contains("ago in"), "{value:?} names a program nothing recorded");
+        }
+
+        // The words agree with the numbers, including at one and none --
+        // `0 times` reads as a broken counter rather than as a record nobody
+        // has used.
+        assert_eq!(fill_count_label(0), "Never");
+        assert_eq!(fill_count_label(1), "Once");
+        assert_eq!(previous_password_count(1), "1 previous password");
+
+        // A record with no previous passwords gets no row about them, rather
+        // than a row reading `0`.
+        let none = history_rows(Some(&item), 0, 0);
+        assert!(
+            !none.iter().any(|(l, _)| *l == "Password changed"),
+            "a record whose password has never changed was given a row about it"
+        );
+
+        // And a CREATE has no item, so the card does not exist -- which is
+        // what stops it drawing an empty box on the new-item form.
+        assert!(history_rows(None, 0, 0).is_empty());
+    }
+
+    /// **The sharing line counts people, and says nothing when it cannot.**
+    #[test]
+    fn the_sharing_line_never_reports_a_roster_it_has_not_got() {
+        use crate::rest::organizations::Audience;
+        let shared = |others| Audience::Shared {
+            organisation: "Ledgerline".to_string(),
+            collections: vec!["Engineering".to_string()],
+            others,
+        };
+
+        assert_eq!(
+            sharing_line(&shared(Some(14))).as_deref(),
+            Some("Also visible to 14 other people in Ledgerline · Engineering.")
+        );
+        assert_eq!(
+            sharing_line(&shared(Some(1))).as_deref(),
+            Some("Also visible to 1 other person in Ledgerline · Engineering.")
+        );
+
+        // **`None` is not zero**, and this is the assertion that says so.
+        // `Roster::Unknown` is a server with no such route, or one that
+        // refused it, or one nobody has asked -- and `0 other people` would
+        // state as fact the one thing this app does not know.
+        let unknown = sharing_line(&shared(None)).expect("a shared item says something");
+        assert!(!unknown.contains('0'), "{unknown:?} reports a roster that was never read");
+        assert!(
+            !unknown.contains("visible to"),
+            "{unknown:?} counts an audience out of a roster this app has not got"
+        );
+
+        // Zero others is a real answer and a different one: the roster came
+        // back and the account holder is alone in it.
+        let alone = sharing_line(&shared(Some(0))).expect("still shared");
+        assert!(alone.contains("nobody else"), "{alone:?}");
+
+        // A personal item draws no card at all.
+        assert_eq!(sharing_line(&Audience::Personal), None);
     }
 
     /// **The section rail is gone, and nothing draws it again by accident.**

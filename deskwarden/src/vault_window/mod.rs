@@ -5050,7 +5050,30 @@ pub fn build_frame_with_search(
                         // lazy (see `EditDraft::offer_bank_domains`), so a
                         // frame with the picker shut walks nothing.
                         draft.offer_bank_domains(&items);
-                        match draw_detail_edit(ui, draft, &folders, false, &mut app_identities, selected_item.as_ref(), &totp_state) {
+                        // **8a's Sharing and History cards' two facts.**
+                        // The directory is the sidebar's own -- one
+                        // reader of `rest::organizations` in this
+                        // window -- and the count is the file
+                        // `FillStats` keeps per item.
+                        let audience = selected_item
+                            .as_ref()
+                            .map_or(crate::rest::organizations::Audience::Personal, |item| {
+                                crate::rest::organizations::current().audience_of(item)
+                            });
+                        let fills = selected_item
+                            .as_ref()
+                            .map_or(0, |item| fill_stats.count(&item.id));
+                        match draw_detail_edit(
+                            ui,
+                            draft,
+                            &folders,
+                            false,
+                            &mut app_identities,
+                            selected_item.as_ref(),
+                            fills,
+                            &audience,
+                            &totp_state,
+                        ) {
                             EditAction::Save => {
                                 if let Some(item) = &selected_item {
                                     let updated = draft.apply_to(item);
@@ -5164,7 +5187,21 @@ pub fn build_frame_with_search(
                     }
                     DetailMode::Create(draft) => {
                         detail::forget_copy_toast(ui.ctx());
-                        match draw_detail_edit(ui, draft, &folders, true, &mut app_identities, None, &totp_state) {
+                        // A create has no item, so neither card has
+                        // anything to say and neither is drawn -- see
+                        // `history_rows` and `sharing_line`, which answer
+                        // empty rather than being guarded here.
+                        match draw_detail_edit(
+                            ui,
+                            draft,
+                            &folders,
+                            true,
+                            &mut app_identities,
+                            None,
+                            0,
+                            &crate::rest::organizations::Audience::Personal,
+                            &totp_state,
+                        ) {
                             // `to_new_item` is fallible because `NewItem` has no
                             // variant for `ItemKind::Unknown(_)`: a future Bitwarden
                             // type has no create payload, and every total
@@ -25944,11 +25981,35 @@ mod edit_seam_argument_tests {
     // The split points are also chosen so that no literal here contains
     // `app_block_wiring_tests::PASSES_THE_CACHE` -- one that did would break
     // that module's count of exactly two.
-    const EDIT_ARM: &str =
-        concat!("&folders, false, &mut app_ident", "ities, selected_item.as_ref(), &totp_state) {");
-    const CREATE_ARM: &str =
-        concat!("&folders, true, &mut app_ident", "ities, None, &totp_state) {");
-    const BOTH_EDITORS: &str = concat!("draw_detail_", "edit(ui,");
+    // **The needles are matched against the source with its whitespace
+    // removed**, and that is the whole of what changed here.
+    //
+    // They used to be exact one-line spellings of the two calls. Both calls
+    // went multi-line the day they gained §8a's `Sharing` and `History`
+    // arguments, and the pin did not fail -- it found NOTHING, twice, and
+    // said so only because a control counts the calls themselves. A pin that
+    // goes silent when the thing it watches is reformatted is a pin that
+    // watches formatting.
+    //
+    // Flattened, a needle is the ARGUMENT SEQUENCE it is about: which item
+    // each arm passes, and which TOTP state, in order, however the call is
+    // wrapped. `split_whitespace` joins with nothing, so `&mut app_identities`
+    // flattens to `&mutapp_identities` -- the needles are written the same
+    // way, which is ugly and exact.
+    const EDIT_ARM: &str = concat!(
+        "&folders,false,&mutapp_ident",
+        "ities,selected_item.as_ref(),fills,&audience,&totp_state,"
+    );
+    const CREATE_ARM: &str = concat!(
+        "&folders,true,&mutapp_ident",
+        "ities,None,0,&crate::rest::organizations::Audience::Personal,&totp_state,"
+    );
+    const BOTH_EDITORS: &str = concat!("draw_detail_", "edit(");
+
+    /// [`production`] with every run of whitespace gone. See the needles.
+    fn flattened() -> String {
+        production().split_whitespace().collect()
+    }
 
     fn source() -> &'static str {
         include_str!("mod.rs")
@@ -25971,7 +26032,14 @@ mod edit_seam_argument_tests {
     #[test]
     fn the_counter_finds_needles_that_are_really_there() {
         // The positive control, driving the same counting the assertions use.
-        let planted = concat!("x(ui, draft, &folders, true, &mut app_ident", "ities, None, &totp_state) {");
+        // The positive control, flattened the way the assertions flatten.
+        let planted: String = concat!(
+            "x(ui, draft, &folders, true, &mut app_ident",
+            "ities, None, 0, &crate::rest::organizations::Audience::Personal, &totp_state,"
+        )
+        .split_whitespace()
+        .collect();
+        let planted = planted.as_str();
         assert_eq!(occurrences(planted, CREATE_ARM), 1, "planted: {planted}");
         assert_eq!(occurrences(planted, EDIT_ARM), 0);
         assert_eq!(occurrences("nothing here", BOTH_EDITORS), 0);
@@ -25979,7 +26047,8 @@ mod edit_seam_argument_tests {
 
     #[test]
     fn the_edit_form_is_handed_the_selected_item_and_the_windows_one_totp_state() {
-        let production = production();
+        let production = flattened();
+        let production = production.as_str();
         assert_eq!(
             occurrences(production, BOTH_EDITORS),
             2,
