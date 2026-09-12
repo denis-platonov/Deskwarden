@@ -1663,12 +1663,34 @@ pub fn build_frame_with_search(
             }
             match woken.swap(0, Ordering::SeqCst) {
                 1 => {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                    // **Shown the way it was shown the first time**, and not
+                    // by a bare `Visible(true)`.
+                    //
+                    // A hidden window has no redirection surface, so the show
+                    // creates an empty one and DWM composites THAT until the
+                    // next swap lands -- one frame of white, on every restore
+                    // from the tray. It is the same defect
+                    // `window_host::Reveal` was built for on the way up, and
+                    // that type's own doc names this re-show as the place it
+                    // recurs and leaves it to this file.
+                    //
+                    // Putting the machine back to `Hidden` is the whole fix:
+                    // it cloaks, shows, waits a frame for the swap to land in
+                    // the real surface, uncloaks, and raises -- and the raise
+                    // is what replaces the `Focus` command sent here, which
+                    // was this file asking for the same thing one step
+                    // earlier and with no cloak around it.
+                    //
+                    // `advance` runs later in this same closure, so the show
+                    // still begins on this frame.
+                    window_reveal = crate::window_host::Reveal::hidden();
                     (hooks.on_shown)();
                     hidden.set(false);
                     waiting_for_show.set(false);
-                    log::info!("the vault window was asked to show itself, and did");
+                    log::info!(
+                        "the vault window was asked to show itself, and did -- cloaked \
+                         until its first frame is in its surface"
+                    );
                 }
                 2 => {
                     log::warn!(
@@ -13740,9 +13762,13 @@ mod hide_delivery_tests {
     ///    guaranteed to run another frame, and the old code started the wait
     ///    only from inside one.
     /// 2. releasing that wait with `true` moves the window's own `woken` cell
-    ///    to `1`, which is the value the frame closure reads to send
-    ///    `ViewportCommand::Visible(true)`. The raise reaches the window's
-    ///    state, rather than stopping at the kernel event.
+    ///    to `1`, which is the value the frame closure reads to put
+    ///    `window_host::Reveal` back to `Hidden` -- the machine that cloaks,
+    ///    shows, waits for the swap and uncloaks. (It used to send
+    ///    `ViewportCommand::Visible(true)` and a `Focus` directly, which
+    ///    showed an empty surface for a frame; see that assignment.) The
+    ///    raise reaches the window's state, rather than stopping at the
+    ///    kernel event.
     #[test]
     fn a_hidden_window_is_waiting_to_be_raised_before_any_frame_runs() {
         use std::sync::atomic::Ordering;
