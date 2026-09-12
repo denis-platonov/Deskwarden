@@ -643,21 +643,34 @@ const BADGE_SIZE: f32 = 38.0;
 /// does not.
 const BADGE_TO_LABEL: f32 = 16.0;
 
-/// **This app's item-title size, not §7a's 17.**
+/// **§7a's own 17, measured off the design rather than argued from it.**
 ///
-/// The owner, against 7a's own frame: "splash is same small size like
-/// Decpryting text". They are right about the drawing -- 17 over a 13-point
-/// sub-line is a ratio of 1.3, and at that distance a heading and its caption
-/// read as one block set slightly unevenly. The screen has four words on it
-/// and several seconds to be looked at; there is nothing here for a heading to
-/// be economical with.
+/// This number has now been wrong in both directions, so here is the
+/// measurement that settles it. Design 7a is a **1240 × 700** frame -- the
+/// vault window's real size, 1:1, which its 260px progress track confirms
+/// against [`WIDE_BAR`] -- and inside it the stack is:
 ///
-/// 22 is `detail::TITLE_SIZE` -- what this app sets an ITEM's name at, one
-/// pane and one second later -- and it is taken rather than invented so the
-/// window the vault arrives in does not change what a title is on the way.
-/// Against `SUB_SIZE` that is 1.7, which is the difference between a title
-/// and a line under it.
-const TITLE_SIZE: f32 = crate::vault_window::detail::TITLE_SIZE;
+/// ```text
+/// 260 x 3 track, radius 2
+/// gap: 22px                      -> BAR_TO_LABEL
+/// "Loading your vault"           -> 17px, font-weight 700
+/// gap: 7px                       -> TITLE_TO_SUB
+/// "Decrypting 214 items ..."     -> 13px, #7d7979
+/// ```
+///
+/// Every other number on that list was already right. This one was
+/// `detail::TITLE_SIZE` -- 22, the size an ITEM's name is set at one pane
+/// later -- taken after the owner reported the heading reading "same small
+/// size like Decpryting text". That report was about a heading drawn at the
+/// SUB-line's own size, and the repair overshot the design by five points;
+/// the owner's second report, against the overshoot, was that it "is too big
+/// now".
+///
+/// 17 over 13 is a ratio of 1.3, which is what 7a asks for and what the two
+/// lines are: a heading and the sentence under it, not a title and a caption.
+/// The weight carries the rest of the difference -- 700 against the sub's
+/// regular -- which is exactly how the design draws it.
+const TITLE_SIZE: f32 = 17.0;
 const SUB_SIZE: f32 = 13.0;
 const FOOT_SIZE: f32 = 12.0;
 const TITLE_TO_SUB: f32 = 7.0;

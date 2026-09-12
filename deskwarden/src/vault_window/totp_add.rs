@@ -404,8 +404,39 @@ pub const OTHER_WAYS_LABEL: &str = "Other ways to add it";
 pub const CANCEL_LABEL: &str = "Cancel";
 
 
-/// The heading while the 6b overlay is up.
-pub const SCANNING_HEADING: &str = "Scanning your screen";
+/// The heading on the card that stands while the screen is being read.
+///
+/// **The card came back, and what came back is a spinner rather than an
+/// instruction.** The one that was removed said "Scanning your screen -- drag
+/// a box", and it was removed because on the path where the whole-screen scan
+/// FINDS a code there is never an overlay and never a box to drag: it asked
+/// for something that would not exist. The owner then: "the read a screen etc
+/// - takes few seconds and not clear what to expect - render the spinner in
+/// the meantime maybe on that open modal".
+///
+/// Both reports are about the same second and a half, and they are not in
+/// conflict. What was wrong was the WORDS, not the card: a surface that tells
+/// you to drag a box you may never be given is misleading, and a surface that
+/// says the app is busy is the plain truth on both paths. So the card says
+/// what is happening, the bar says it is still happening, and neither
+/// promises a step that may not come. The overlay, when there is one, still
+/// says what to do in its own stripe.
+pub const SCANNING_HEADING: &str = "Reading your screen";
+
+/// The line under [`SCANNING_HEADING`]. Says what to expect, which is the
+/// whole of what the owner asked for -- a wait with no end in sight is what
+/// makes a second and a half feel like a hang.
+pub const SCANNING_NOTE: &str = "This takes a moment on a large display.";
+
+/// The track width on the scanning card.
+///
+/// Design 7b's 200 rather than 7a's 260: this is a card, not a window, and it
+/// is [`MODAL_WIDTH`] wide. `loading_ui` makes the same choice between the
+/// same two numbers for the same reason.
+const SCANNING_BAR: f32 = 200.0;
+
+/// Between the heading, the bar and the note.
+const SCANNING_GAP: f32 = 12.0;
 
 /// The heading over the camera preview.
 ///
@@ -4638,13 +4669,17 @@ fn draw_field_table(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd) {
                 ui,
                 ISSUER_ROW_LABEL,
                 |ui| {
-                    ui.label(
-                        theme::semibold(
-                            auth.issuer.as_deref().unwrap_or("\u{2014}"),
-                            FIELD_VALUE_PX,
-                        )
-                        .color(theme::INK),
+                    let font = egui::FontId::new(
+                        FIELD_VALUE_PX,
+                        egui::FontFamily::Name(theme::SEMIBOLD.into()),
                     );
+                    let job = table_line(
+                        ui,
+                        auth.issuer.as_deref().unwrap_or("\u{2014}"),
+                        font,
+                        theme::INK,
+                    );
+                    ui.label(job);
                 },
                 |_| {},
             );
@@ -4654,11 +4689,14 @@ fn draw_field_table(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd) {
                 ui,
                 ACCOUNT_ROW_LABEL,
                 |ui| {
-                    ui.label(
-                        egui::RichText::new(auth.account.as_deref().unwrap_or("\u{2014}"))
-                            .size(FIELD_VALUE_PX)
-                            .color(theme::INK),
+                    let font = egui::FontId::proportional(FIELD_VALUE_PX);
+                    let job = table_line(
+                        ui,
+                        auth.account.as_deref().unwrap_or("\u{2014}"),
+                        font,
+                        theme::INK,
                     );
+                    ui.label(job);
                 },
                 |_| {},
             );
@@ -4680,11 +4718,19 @@ fn draw_field_table(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd) {
                     // The tracking is 6c's and it is the mask's, not the
                     // seed's: `••••••••` set solid is one grey block, and the
                     // groups of four exist to say how much seed there is.
-                    ui.label(theme::letterspaced_mono(
+                    // The line box is the ascent -- see `table_line`, whose
+                    // note carries the whole of why. `letterspaced_mono_in`
+                    // rather than `table_line` because this one run also
+                    // carries 6c's tracking.
+                    let font =
+                        egui::FontId::new(FIELD_VALUE_PX, egui::FontFamily::Monospace);
+                    let line = theme::ascent_of(ui.ctx(), &font);
+                    ui.label(theme::letterspaced_mono_in(
                         &shown,
                         FIELD_VALUE_PX,
                         FIELD_VALUE_PX * SECRET_TRACKING,
                         theme::INK,
+                        line,
                     ));
                 },
                 |ui| {
@@ -4715,6 +4761,58 @@ fn draw_field_table(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd) {
                 |_| {},
             );
         });
+}
+
+/// **Every run in 6c's table is laid in a line box that IS its ascent**, and
+/// this is where that rule is applied.
+///
+/// The owner, of the seed: "secret clearly higher that the rest". It was, and
+/// the reason is not this table's centring -- every child of a row is centred,
+/// correctly, against the row's stated band. It is that **a centred BOX is not
+/// a centred line.** A face inks only the upper part of its row box and
+/// reserves the rest for descenders, and the monospace face reserves visibly
+/// more of it than the proportional one: box-centring both put the seed about
+/// two points above the caption and the Hide beside it, which is exactly what
+/// the report describes.
+///
+/// Correcting one run and not the others is what this table already got wrong
+/// once -- "also feels that key and value not on the same level" -- so the
+/// rule is applied to all of them: caption, issuer, account and seed. With the
+/// box equal to the ascent there is no slack left to centre, so box-centring
+/// centres the ink and every run in the row sits level whatever its face
+/// reserves. The parameter chips were already correct; they go through
+/// `theme::centred_galley_top`, which is the same correction spelled the other
+/// way round.
+fn table_line(ui: &egui::Ui, text: &str, font: egui::FontId, color: egui::Color32)
+-> egui::text::LayoutJob {
+    let line = theme::ascent_of(ui.ctx(), &font);
+    theme::text_in(text, font, color, line)
+}
+
+/// **The card that stands while the screen is read.** See
+/// [`SCANNING_HEADING`] for why there is one again and why it says what it
+/// says.
+///
+/// No control of any kind. The scan is a second of work that cannot be
+/// interrupted usefully -- the capture is one call and the decode is one pass
+/// over it -- and a Cancel that could only take effect after the thing it
+/// cancels had finished would be a button that lies about what it does. The
+/// way out of the overlay, when there is one, is Escape, which the overlay
+/// itself answers.
+fn draw_scanning(ui: &mut egui::Ui) -> TotpAddAction {
+    stage_card(ui, MODAL_WIDTH, |ui| {
+        ui.vertical_centered(|ui| {
+            ui.label(theme::bold(SCANNING_HEADING, MANUAL_HEADER_TITLE_PX).color(theme::INK));
+            ui.add_space(SCANNING_GAP);
+            // Indeterminate on purpose: nothing here knows how far through a
+            // capture is, and a bar that filled at a made-up rate would be a
+            // measurement this app does not have.
+            theme::progress_bar(ui, SCANNING_BAR);
+            ui.add_space(SCANNING_GAP);
+            ui.label(theme::regular(SCANNING_NOTE, CHOICE_TEXT_PX).color(theme::TEXT_FAINT));
+        });
+    });
+    TotpAddAction::None
 }
 
 /// One row of [`draw_field_table`]: the label column, the value, and an
@@ -4784,19 +4882,17 @@ fn table_row(
     let cell = cell_and_row.inner;
     let row = cell_and_row.response.rect;
     let font = egui::FontId::proportional(FIELD_LABEL_PX);
-    let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), theme::TEXT_FAINT);
-    // **Centred by its BOX, and deliberately NOT by its ink.**
+    let job = table_line(ui, label, font, theme::TEXT_FAINT);
+    let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
+    // **Centred by its box, which is now its INK** -- see `table_line`.
     //
-    // `theme::ink_drop` is the right correction for a line sitting alone in a
-    // band -- the face inks only the upper part of its row box, so box-centring
-    // reads high. It is the wrong correction HERE, because the thing this
-    // caption has to line up with is the VALUE beside it, and the value is
-    // placed by egui's own layout, which centres its box. Correcting one of
-    // the two and not the other is what put them a couple of points apart --
-    // "also feels that key and value not on the same level", reported against
-    // the first version of this fix.
-    //
-    // Both boxes, centred the same way, sit level whatever their faces do.
+    // The arithmetic below has not changed and is still a box centring. What
+    // changed is the box: every run in this table is laid in a line box equal
+    // to its ascent, so there is no descender slack left in any of them to
+    // pull one above another. Correcting this caption alone with
+    // `theme::ink_drop` -- which is what an earlier version of this fix did --
+    // is what put it a couple of points off the value beside it, reported as
+    // "also feels that key and value not on the same level".
     ui.painter().galley(
         egui::pos2(cell.left(), row.center().y - galley.size().y / 2.0),
         galley,
@@ -4878,33 +4974,6 @@ pub fn draw_add_modal(
     state: &mut TotpAdd,
     now_unix: u64,
 ) -> TotpAddAction {
-    // **Nothing at all while the screen is being scanned** -- no card, no
-    // scrim, not a pixel.
-    //
-    // There was a card here reading `Scanning your screen` with 6b's own
-    // `Drag a box...` under it, and its doc admitted the instruction was "a
-    // beat early -- there is nothing to drag a box on yet", kept rather than
-    // given a second state. On the path where the whole-screen scan FINDS a
-    // code, that beat is the whole story: there is never an overlay, never a
-    // box to drag, and the card told the user to drag one anyway. The owner:
-    // "if QR code present - there is still white popup shows Scanning your
-    // screen - draw a square - which is misledaing", and then "I think we can
-    // remove that modal completely".
-    //
-    // Removing it is better than correcting its words. The scan takes about a
-    // second, and what the user needs in that second is either nothing (a code
-    // was found; the confirmation is a blink away) or the overlay, which says
-    // what to do in its own stripe. A white card that appears, says something
-    // true for a moment, and is replaced is worse than no card -- and it is
-    // the "small white popup" reported against every scan since this stage
-    // existed.
-    //
-    // The way out is unchanged: the overlay answers Escape, and on the found
-    // path there is nothing to escape from.
-    if state.stage == Stage::Scanning {
-        return TotpAddAction::None;
-    }
-
     theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("totp-add-scrim")));
 
     // **The one card in the app that is four cards, and the size it was last
@@ -5056,12 +5125,7 @@ pub fn draw_stage(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> Totp
         .flatten();
     match state.stage {
         Stage::Picker => draw_picker(ui, state).action,
-        // **Nothing.** The scan has no card of its own -- see
-        // `draw_add_modal`, which returns before the scrim for this stage.
-        // The arm stays so the match is exhaustive and so a reader of the
-        // state machine finds the answer here rather than two functions
-        // away.
-        Stage::Scanning => TotpAddAction::None,
+        Stage::Scanning => draw_scanning(ui),
         Stage::Webcam => draw_webcam(ui, state, frame),
         Stage::Manual => draw_add_form(ui, state, now_unix),
     }
@@ -7783,7 +7847,31 @@ mod tests {
     /// is the modal's and a stage drawn on its own has none -- and the scrim
     /// is half of what "nothing" has to mean here.
     #[test]
-    fn the_scan_paints_nothing_at_all() {
+      /// **The scan says it is working, and says nothing it cannot keep.**
+    ///
+    /// This test has been both ways round and the history is the point. It
+    /// began as `the_scan_paints_nothing_at_all`, written when the card here
+    /// read `Scanning your screen` with 6b's `Drag a box...` under it -- an
+    /// instruction that is false on the path where the whole-screen scan finds
+    /// a code, because then there is no overlay and no box. The owner: "if QR
+    /// code present - there is still white popup shows Scanning your screen -
+    /// draw a square - which is misledaing".
+    ///
+    /// Then, of the same second and a half: "the read a screen etc - takes few
+    /// seconds and not clear what to expect - render the spinner in the
+    /// meantime maybe on that open modal".
+    ///
+    /// So the card is back and this asserts the distinction that makes both
+    /// reports satisfied at once: it says WHAT IS HAPPENING (a heading and a
+    /// moving bar) and it gives NO INSTRUCTION about a step that may never
+    /// come. `DRAG_HINT` is the overlay's own words and the words that were
+    /// wrong here, so it is named exactly, and nothing on this card may print
+    /// them.
+    ///
+    /// Read through `draw_add_modal` and not `draw_stage`, because the scrim
+    /// is the modal's.
+    #[test]
+    fn the_scan_says_it_is_working_and_promises_no_box() {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -7803,34 +7891,23 @@ mod tests {
             let _ = draw_add_modal(&ctx, &mut state, BOUNDARY);
         });
         let mut painted = Painted(Vec::new());
-        let mut rects = Vec::new();
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut painted);
-            collect_rects(&clipped.shape, &mut rects);
         }
-        assert!(painted.0.is_empty(), "the scan drew text: {:?}", painted.0);
+        assert!(painted.has(SCANNING_HEADING), "the scan says nothing: {:?}", painted.0);
+        assert!(painted.has(SCANNING_NOTE), "the scan says nothing about the wait");
+        // **The whole of the first report, as an assertion.** Not "no
+        // instruction" in general -- the exact sentence that was wrong.
         assert!(
-            !rects.iter().any(|r| r.fill == egui::Color32::from_black_alpha(
-                crate::theme::MODAL_SCRIM_ALPHA
-            )),
-            "the scan drew the modal scrim, so the screen is dimmed by this window as well \
-             as by the overlay"
+            !painted.0.iter().any(|line| line.contains(crate::region_overlay::DRAG_HINT)),
+            "the scan card tells the user to drag a box again: {:?}",
+            painted.0
         );
-
-        // The control: the SAME harness on the picker really does paint, so
-        // the emptiness above is this stage and not a frame that drew nothing.
-        state.stage = Stage::Picker;
-        let _ = ctx.run_ui(input(), |_ui| {
-            let _ = draw_add_modal(&ctx, &mut state, BOUNDARY);
-        });
-        let output = ctx.run_ui(input(), |_ui| {
-            let _ = draw_add_modal(&ctx, &mut state, BOUNDARY);
-        });
-        let mut picker = Painted(Vec::new());
-        for clipped in &output.shapes {
-            collect(&clipped.shape, &mut picker);
-        }
-        assert!(picker.has(PICKER_TITLE), "control: the harness paints nothing at all");
+        assert!(
+            !painted.0.iter().any(|line| line.contains("Scanning your screen")),
+            "the scan card is back to naming itself an instruction: {:?}",
+            painted.0
+        );
     }
 
     /// **A decoded region reaches 6c's card, through the entry point the

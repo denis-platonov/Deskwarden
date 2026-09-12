@@ -626,6 +626,28 @@ pub fn pane_title(text: &str, size: f32, color: Color32) -> egui::text::LayoutJo
     )
 }
 
+/// One line of text with no extra tracking, **in a line box of the caller's
+/// choosing** -- the plain-text twin of [`letterspaced_mono_in`].
+///
+/// For the one thing a `RichText` cannot be given: its own line height. Every
+/// caller passes [`ascent_of`]'s answer, which makes the box the ink and so
+/// makes box-centring -- which is all egui does, and all a caller painting a
+/// galley at `band.center().y - size.y / 2.0` does -- centre the ink.
+///
+/// **This exists because a run whose box is not its ascent cannot be made
+/// level with one whose box is.** Two faces reserve different descenders, so
+/// two box-centred runs of different faces sit at different heights however
+/// carefully each is centred; the only way to make a row level is to give
+/// every run in it the same rule. See [`ink_drop`] for the measurement.
+pub fn text_in(
+    text: &str,
+    font_id: FontId,
+    color: Color32,
+    line_height: f32,
+) -> egui::text::LayoutJob {
+    letterspaced_in(text, font_id, 0.0, color, Some(line_height))
+}
+
 fn letterspaced_in(
     text: &str,
     font_id: FontId,

@@ -18,6 +18,7 @@ pub mod record_ui;
 pub mod rehearsal;
 pub mod relative_time;
 pub mod send_ui;
+pub mod sequence_builder;
 pub mod sidebar;
 pub mod totp_add;
 
@@ -527,6 +528,15 @@ enum DetailMode {
     Read,
     Edit(EditDraft),
     Create(EditDraft),
+    /// **Design 4a.** The sequence builder, on the selected item's fill rule.
+    ///
+    /// A mode rather than a screen flag beside `sends_selected` and
+    /// `health_selected`, because it is *about the selected item* the way
+    /// Edit is: it opens from the read pane, it closes back onto it, and it
+    /// has nothing to draw when nothing is selected. What it borrows from the
+    /// two screens is only the LAYOUT -- it takes the item list's column as
+    /// well as the pane's, because 4a is three columns and the pane is one.
+    Sequence(sequence_builder::SequenceDraft),
 }
 
 /// One result from the background favicon loader: which item it was for,
@@ -1409,6 +1419,30 @@ pub fn build_frame_with_search(
     // The overlay reports back through `take_outcome`, which is the only place
     // a captured region's answer enters this window.
     let mut region_scan: Option<crate::region_overlay::RegionOverlay> = None;
+    /// **A scan asked for and not started yet, in frames.**
+    ///
+    /// `RegionOverlay::open` takes a picture of every display and hands it to
+    /// the decoder, which on a large or multi-monitor desktop is a second or
+    /// two of work on THIS thread. The owner: "the read a screen etc - takes
+    /// few seconds and not clear what to expect - render the spinner in the
+    /// meantime maybe on that open modal".
+    ///
+    /// A spinner alone does not answer that, and this is the reason why: the
+    /// call used to run in the action handler, inside the same frame closure
+    /// that had just drawn the card. egui presents a frame when the closure
+    /// RETURNS, so the spinner frame would have been held behind the very
+    /// work it exists to cover and the user would see the freeze and then the
+    /// overlay -- the same wait, with a card that never animated.
+    ///
+    /// So the request is recorded and the open happens a frame later. One
+    /// frame is enough: the frame that arms this draws the card that asked
+    /// (the picker), the next draws the spinner and PRESENTS it, and the one
+    /// after that does the work with the spinner already on the glass.
+    ///
+    /// It is not a timer. A duration would be a guess about how fast this
+    /// machine paints; a frame count is the thing actually being waited for.
+    const SCAN_DEFER_FRAMES: u8 = 2;
+    let mut scan_pending: u8 = 0;
     // The app launch that has been asked for and has not happened yet. See
     // [`PendingLaunch`]: the Open arm records the request and NOTHING there
     // starts a program, so every launch in this window goes through the one
@@ -3227,13 +3261,19 @@ pub fn build_frame_with_search(
         //
         // Zero while the Sends or Password health screens are up: neither has
         // a detail pane, and both take the whole area themselves.
-        let detail_pane_width = if show_sends || on_health {
+        // **4a takes the item list's column as well as the pane's.** The
+        // builder is three columns -- what the rule belongs to, the steps, and
+        // the measurements -- and the pane alone is 298pt at the app's minimum
+        // size, which is the whole reason this screen exists rather than
+        // another block inside the edit form.
+        let on_sequence = matches!(mode, DetailMode::Sequence(_));
+        let detail_pane_width = if show_sends || on_health || on_sequence {
             0.0
         } else {
             let full = (ui.available_width() - LIST_WIDTH).max(0.0);
             detail_slide.width(ui.ctx(), full, selected_id.is_some())
         };
-        if !show_sends && !on_health {
+        if !show_sends && !on_health && !on_sequence {
             // **Whether a detail pane is on screen RIGHT NOW**, read before
             // the list is drawn, because the list is what changes it. This is
             // the "with no details panel" half of the owner's second gesture:
@@ -4581,6 +4621,44 @@ pub fn build_frame_with_search(
                             let login = item.login.as_ref();
                             match action {
                                 DetailAction::Edit => mode = DetailMode::Edit(EditDraft::from_item(item)),
+                                // **4a.** The draft is built HERE, from the
+                                // item, for the reason `Edit`'s is: the
+                                // action carries nothing and this scope is
+                                // what holds the item. The app's product name
+                                // comes from the same cache the read pane's
+                                // own card just used, so the rail names the
+                                // app the card named rather than re-probing
+                                // the executable for a second answer.
+                                DetailAction::EditSequence => {
+                                    let name = crate::vault_bridge::extract_app_match(item)
+                                        .map(|m| {
+                                            let label = app_identities.label(
+                                                ui.ctx(),
+                                                detail::app_name_lookup_path(&m),
+                                                &m.process,
+                                            );
+                                            label.name.to_string()
+                                        })
+                                        .unwrap_or_default();
+                                    if let Some(draft) = sequence_builder::SequenceDraft::for_item(
+                                        item,
+                                        sidebar::folder_name(&folders, item.folder_id.as_deref())
+                                            .unwrap_or_default(),
+                                        &name,
+                                    ) {
+                                        mode = DetailMode::Sequence(draft);
+                                    } else {
+                                        // Unreachable from the pane, which
+                                        // draws no such control on an unbound
+                                        // item -- a warning rather than a
+                                        // silent drop, so a control added
+                                        // somewhere that CAN be unbound says
+                                        // so in the log.
+                                        log::warn!(
+                                            "the read pane asked to edit a sequence on an item                                              with no app binding; the click was dropped"
+                                        );
+                                    }
+                                }
                                 DetailAction::CopyUsername => {
                                     if let Some(username) = login.and_then(|l| l.username.as_deref()) {
                                         crate::clipboard::copy_secret(username);
@@ -5205,6 +5283,99 @@ pub fn build_frame_with_search(
                             }
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
+                        }
+                    }
+                    // **4a -- the sequence builder.** It takes this panel
+                    // whole: `on_sequence` above zeroed the detail pane's
+                    // width and kept the item list undrawn, so the three
+                    // columns 4a asks for really are on screen.
+                    DetailMode::Sequence(draft) => {
+                        detail::forget_copy_toast(ui.ctx());
+                        // The item's own fields, not a draft's: this screen
+                        // edits the sequence and nothing else, so the values a
+                        // step would resolve to are whatever the item stores
+                        // right now. `field_palette` is the same list the edit
+                        // form's palette is built from, so a `{S:PIN}` button
+                        // appears here exactly when a field called `PIN`
+                        // really exists.
+                        let login = selected_item.as_ref().and_then(|i| i.login.as_ref());
+                        let username = login.and_then(|l| l.username.as_deref()).unwrap_or("");
+                        let password =
+                            login.and_then(|l| l.password.as_ref()).map_or("", |p| p.as_str());
+                        let palette = selected_item
+                            .as_ref()
+                            .map(crate::key_sequence::field_palette)
+                            .unwrap_or_default();
+                        let source = crate::key_sequence::ResolveSource {
+                            username,
+                            password,
+                            custom: selected_item
+                                .as_ref()
+                                .map(crate::key_sequence::custom_pairs)
+                                .unwrap_or_default(),
+                            totp: &totp_state,
+                        };
+                        match sequence_builder::draw_sequence_builder(
+                            ui, draft, &palette, &source,
+                        ) {
+                            sequence_builder::BuilderAction::Save => {
+                                // The binding with ONE field replaced -- see
+                                // `SequenceDraft::saved`. Read before the
+                                // assignment below, which ends the borrow of
+                                // `mode` this arm is holding.
+                                let binding = draft.saved();
+                                if let Some(item) = &selected_item {
+                                    let updated =
+                                        crate::vault_bridge::with_app_match(item, &binding);
+                                    match cache.update_item(&updated) {
+                                        // The SERVER's copy, for the reason
+                                        // the edit form's Save arm gives: see
+                                        // `vault_bridge`'s
+                                        // `REVISION_DATE_KEY`.
+                                        Ok(saved) => {
+                                            if let Some(pos) =
+                                                items.iter().position(|i| i.id == item.id)
+                                            {
+                                                items[pos] = saved;
+                                            }
+                                            mode = DetailMode::Read;
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "failed to save the fill rule for item {}: {e:?}",
+                                                item.id
+                                            );
+                                            generate_error = None;
+                                            move_error = Some(item_write_failure_message(
+                                                ItemWrite::Save,
+                                                &item.name,
+                                                &e,
+                                            ));
+                                            flag_reauth_if_unauthorized(
+                                                ui.ctx(),
+                                                &needs_reauth_for_closure,
+                                                &e,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            // **4d**, started here for the reason the edit
+                            // form's is: this line is inside a running event
+                            // loop, so the rehearsal window is a viewport
+                            // opened in THIS loop and `show_open_rehearsal`
+                            // draws it. Nothing from the item is passed --
+                            // `sample_plan` builds the whole plan from the
+                            // SEQUENCE, with every field resolved to a fixed
+                            // sample.
+                            sequence_builder::BuilderAction::Rehearse => {
+                                generate_error =
+                                    crate::scratch_window::rehearsal_notice(&draft.sequence);
+                            }
+                            sequence_builder::BuilderAction::Discard => {
+                                mode = DetailMode::Read;
+                            }
+                            sequence_builder::BuilderAction::None => {}
                         }
                     }
                     DetailMode::Create(draft) => {
@@ -6059,6 +6230,39 @@ pub fn build_frame_with_search(
         // painted on this frame rather than on the next one, and so the card
         // underneath never shows "Scanning" for a scan that has already
         // finished.
+        // **The deferred open.** Counted down here, above the block that
+        // drives the overlay, so the frame that reaches zero opens the window
+        // and shows it in the same frame rather than a third one later. See
+        // `SCAN_DEFER_FRAMES` for why there is a delay at all.
+        //
+        // A form closed while this was armed disarms it: the stage that asked
+        // is gone, and a full-screen always-on-top window opening behind
+        // nothing is the state the `totp_add_state.is_none()` guard below
+        // exists to prevent.
+        if scan_pending > 0 {
+            scan_pending -= 1;
+            if totp_add_state.is_none() {
+                scan_pending = 0;
+            } else if scan_pending == 0 {
+                let monitors = crate::screen_capture::monitor_bounds();
+                match crate::region_overlay::RegionOverlay::open(
+                    &monitors,
+                    ui.ctx().pixels_per_point(),
+                ) {
+                    Some(overlay) => region_scan = Some(overlay),
+                    None => {
+                        if let Some(state) = totp_add_state.as_mut() {
+                            state.stage = totp_add::Stage::Picker;
+                            state.refusal = Some(totp_add::PickerRefusal::Capture(
+                                crate::screen_capture::CaptureRefusal::OffScreen,
+                            ));
+                        }
+                    }
+                }
+            } else {
+                ui.ctx().request_repaint();
+            }
+        }
         if let Some(overlay) = &region_scan {
             if !overlay.show(ui.ctx()) {
                 // Closed. Whatever it holds is taken exactly once -- the
@@ -6190,24 +6394,19 @@ pub fn build_frame_with_search(
                 // A second press while a scan is running is ignored: two
                 // full-screen always-on-top windows racing to answer is not a
                 // state this form has an answer for.
+                // **Recorded here, run a frame later** -- see
+                // `SCAN_DEFER_FRAMES`. The stage moves NOW, so the card the
+                // next frame draws is the spinner; the capture happens after
+                // that card has been presented.
                 totp_add::TotpAddAction::ScanRegion => {
-                    if region_scan.is_none() {
-                        let monitors = crate::screen_capture::monitor_bounds();
-                        match crate::region_overlay::RegionOverlay::open(
-                            &monitors,
-                            ui.ctx().pixels_per_point(),
-                        ) {
-                            Some(overlay) => {
-                                region_scan = Some(overlay);
-                                state.stage = totp_add::Stage::Scanning;
-                                state.refusal = None;
-                            }
-                            None => {
-                                state.refusal = Some(totp_add::PickerRefusal::Capture(
-                                    crate::screen_capture::CaptureRefusal::OffScreen,
-                                ));
-                            }
-                        }
+                    if region_scan.is_none() && scan_pending == 0 {
+                        scan_pending = SCAN_DEFER_FRAMES;
+                        state.stage = totp_add::Stage::Scanning;
+                        state.refusal = None;
+                        // The spinner animates itself, but the frame that
+                        // does the work has to be asked for: nothing else on
+                        // this screen is moving.
+                        ui.ctx().request_repaint();
                     }
                 }
                 // **The image route opens from here, and HERE is the point.**
@@ -7135,6 +7334,14 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         // moment to ask for the password is before the secrets are on screen
         // rather than after.
         | DetailAction::Clone
+        // **4a's screen, on the exposing side for a narrower reason than
+        // Edit's.** The step list masks a password unconditionally -- there is
+        // no argument to `step_rows` that turns that off -- so the builder
+        // cannot show THE password. What its eye does resolve is every other
+        // field a step names, and `{S:Recovery code}` is as much a secret as
+        // the password is. The prompt belongs before the screen opens, not
+        // after the values are drawn.
+        | DetailAction::EditSequence
         | DetailAction::Edit => true,
         DetailAction::None
         | DetailAction::OpenWebsite(_)
@@ -15912,12 +16119,18 @@ mod write_arms_adopt_the_backends_copy_tests {
         );
     }
 
+    /// **Two save arms adopt it now**, and the second is 4a's: the sequence
+    /// builder writes one field of the item's binding through the same
+    /// `cache.update_item` and must take the server's copy back for the same
+    /// reason the edit pane does -- see `vault_bridge`'s `REVISION_DATE_KEY`,
+    /// and the defect that reinstating the locally-built item caused, which
+    /// was a second save of one item being refused.
     #[test]
     fn the_edit_panes_save_arm_takes_the_item_the_cache_returned() {
         assert_eq!(
             source().matches(SAVE_ARM).count(),
-            1,
-            "the edit pane's save arm does not adopt the cache's returned item exactly once \
+            2,
+            "the item-editing save arms do not adopt the cache's returned item exactly twice \
              (needle {SAVE_ARM:?})"
         );
         assert_eq!(
@@ -25874,6 +26087,14 @@ mod copy_toast_wiring_tests {
     // `concat!`-split for `open_app_wiring_tests`' reason: `include_str!`
     // pulls this module in too.
     const CLEARS: &str = concat!("detail::forget_copy_toast", "(ui.ctx());");
+
+    /// **4a's screen is the fourth route back into the read pane.** Discard
+    /// and a successful Save both put `DetailMode::Read` back, so a copy
+    /// confirmation left standing when the builder opened would reappear over
+    /// the pane the user returns to -- which is the whole of what this test is
+    /// about, and the reason a new mode has to join the list rather than be
+    /// excused from it.
+    const SEQUENCE: &str = concat!("DetailMode::Sequence(draft)", " => {");
     const EDIT: &str = concat!("DetailMode::Edit", "(draft) => {");
     const CREATE: &str = concat!("DetailMode::Create", "(draft) => {");
     /// The no-selection branch's anchor.
@@ -25924,10 +26145,11 @@ mod copy_toast_wiring_tests {
         let source = source();
         assert_eq!(
             occurrences(source, CLEARS),
-            3,
-            "expected {CLEARS:?} exactly three times -- the edit pane, the create pane and \
-             the no-selection branch. Fewer means one of the three routes back into the read \
-             pane still resurrects a confirmation the user has looked away from"
+            4,
+            "expected {CLEARS:?} exactly four times -- the edit pane, the create pane, the \
+             sequence builder and the no-selection branch. Fewer means one of the four \
+             routes back into the read pane still resurrects a confirmation the user has \
+             looked away from"
         );
         // The clear is the statement immediately after the branch opens, for
         // the two editors; for the empty selection it is immediately before
@@ -25940,6 +26162,7 @@ mod copy_toast_wiring_tests {
             // comment, so the window is widened a little to hold the comment
             // itself -- see `NOTHING_SELECTED`.
             (NOTHING_SELECTED, "the no-selection branch", 200, 0),
+            (SEQUENCE, "the sequence builder", 0, 120),
         ] {
             assert_eq!(occurrences(source, marker), 1, "expected exactly one {marker:?}");
             let branch = window(source, marker, before, after);
@@ -37825,10 +38048,25 @@ mod send_create_wiring {
                 })
                 .count()
         }
+        // **One other file binds it, by name, and its shape is checked here
+        // rather than excused.** Design 4a puts `Save rule CTRL+S` on the
+        // sequence builder. That is not the defect this guard is about: the
+        // two chords differ by SHIFT and `consume_shortcut` compares the
+        // whole modifier set, so CTRL+SHIFT+S cannot fire a CTRL+S binding
+        // and CTRL+S cannot fire the record chord -- neither is the one that
+        // "silently never fires". The builder is also a `DetailMode` that
+        // replaces the read pane, so the two are never on screen together.
+        //
+        // Allowed by NAME and with both halves of that argument asserted
+        // below, not by loosening the count: a THIRD binding still fails
+        // here, and so does this one if it stops being exact or the record
+        // chord stops carrying SHIFT.
+        const BUILDER: &str = "vault_window/sequence_builder.rs";
         let elsewhere: Vec<String> = every_source_file()
             .into_iter()
             .filter(|(path, text)| {
                 path != "vault_window/mod.rs"
+                    && path != BUILDER
                     && binds_the_s_key(&code_without_comments(text), key) > 0
             })
             .map(|(path, _)| path)
@@ -37839,6 +38077,28 @@ mod send_create_wiring {
              bindings on one key resolve to whichever is read first and the other silently \
              never fires -- `detail.rs`'s `no_two_bindings_share_a_chord` for the chords it \
              can see, stated here for the one it cannot"
+        );
+        let builder = every_source_file()
+            .into_iter()
+            .find(|(path, _)| path == BUILDER)
+            .map(|(_, text)| code_without_comments(&text))
+            .expect("the sequence builder is one of this crate's production files");
+        assert_eq!(
+            binds_the_s_key(&builder, key),
+            1,
+            "{BUILDER} binds `egui::Key::S` more than once, so the one chord this test \
+             reasoned about is no longer the whole of what that file does with the key"
+        );
+        assert!(
+            builder.contains(concat!("Modifiers::COMMAND, egui::Key", "::S)")),
+            "{BUILDER}'s save chord is no longer an exact CTRL+S. A looser modifier test \
+             there would fire on CTRL+SHIFT+S too, which is the record chord -- and then \
+             one of the two really would silently never fire"
+        );
+        assert!(
+            SEND_RECORD_MODIFIERS.shift,
+            "the record chord no longer carries SHIFT, so it and the sequence builder's \
+             CTRL+S are the same chord on the same key"
         );
         assert_eq!(
             binds_the_s_key(&code, key),

@@ -4371,7 +4371,7 @@ const APP_SEQUENCE_HINT: &str =
 /// they are what would be typed, and a blank space where they sit would read
 /// as "nothing will be typed", which is the one thing an empty sequence does
 /// not mean (see [`key_sequence::DEFAULT_SEQUENCE`]).
-const APP_SEQUENCE_DEFAULT_NOTICE: &str =
+pub(crate) const APP_SEQUENCE_DEFAULT_NOTICE: &str =
     "Default \u{2014} username, Tab, password. Add or remove a step to change it.";
 
 /// The builder's two captions.
@@ -4994,7 +4994,7 @@ const TOTP_STAND_IN: &str = "000000";
 /// unavailable, or a code is in hand. None of those is a property of the item
 /// the user is editing, so warning about them would be telling the user to fix
 /// something that is not broken. They get the stand-in, and no warning.
-fn edit_time_totp(totp: &detail::TotpState) -> Option<&'static str> {
+pub(crate) fn edit_time_totp(totp: &detail::TotpState) -> Option<&'static str> {
     match totp {
         detail::TotpState::NoSecret => None,
         detail::TotpState::Fetching
@@ -5201,7 +5201,7 @@ fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) {
 /// Returns the edit the click asked for, applied by the caller after the loop
 /// so the borrow of the token list is over first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChipEdit {
+pub(crate) enum ChipEdit {
     Back(usize),
     Forward(usize),
     Remove(usize),
@@ -5282,7 +5282,11 @@ fn badge_ink(row: &StepRow) -> egui::Color32 {
 ///
 /// Returns the one edit clicked, applied by the caller after the loop so the
 /// borrow of the row list is over first.
-fn sequence_steps(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option<ChipEdit> {
+pub(crate) fn sequence_steps(
+    ui: &mut egui::Ui,
+    rows: &[StepRow],
+    editable: bool,
+) -> Option<ChipEdit> {
     let mut edit = None;
     for row in rows {
         // The one branch, and the whole of it: a secret step wears the band,
@@ -5391,7 +5395,7 @@ fn sequence_steps(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option
 /// [`theme::SEGMENT_HEIGHT`] is 28, because every other multiple-choice row in
 /// the app is 28 and a run two points shorter in this one form would read as a
 /// mismeasurement rather than as a decision. One control, one height.
-fn view_toggle(ui: &mut egui::Ui, template_view: bool) -> Option<bool> {
+pub(crate) fn view_toggle(ui: &mut egui::Ui, template_view: bool) -> Option<bool> {
     let cells = [
         theme::Segment { label: VIEW_STEPS, selected: !template_view },
         theme::Segment { label: VIEW_TEMPLATE, selected: template_view },
@@ -5520,13 +5524,10 @@ fn app_sequence_block(
 
     if app.template_view {
         app_template_view(ui, app, source);
-    } else if let Some(edit) = sequence_steps(ui, &step_rows(&app.sequence, source, app.previewing), true)
+    } else if let Some(edit) =
+        sequence_steps(ui, &step_rows(&app.sequence, source, app.previewing), true)
     {
-        app.sequence = match edit {
-            ChipEdit::Back(i) => sequence_moved(&app.sequence, i, true),
-            ChipEdit::Forward(i) => sequence_moved(&app.sequence, i, false),
-            ChipEdit::Remove(i) => sequence_without(&app.sequence, i),
-        };
+        app.sequence = apply_chip_edit(&app.sequence, edit);
     }
     ui.add_space(8.0);
 
@@ -5686,30 +5687,65 @@ fn rehearse_button(ui: &mut egui::Ui) -> egui::Response {
 /// merely looked at leaves the item untouched, and a template that is edited
 /// stores the user's own bytes rather than this build's spelling of them.
 fn app_template_view(ui: &mut egui::Ui, app: &mut AppMatchDraft, source: &ResolveSource<'_>) {
+    // Read before the three mutable field borrows below, which are disjoint
+    // and therefore fine together -- this one is not.
+    let fault = app.template_fault();
+    template_editor(
+        ui,
+        &mut app.template_draft,
+        &mut app.sequence,
+        &mut app.template_touched,
+        fault,
+        source,
+    );
+}
+
+/// **4c itself**, with no draft in the signature.
+///
+/// The edit form and the builder screen both draw this, and there is exactly
+/// one of it for the reason the step list has exactly one: the bridge between
+/// the string and the steps is the thing 4c is *about*, and two spellings of
+/// it would be two answers to what a template means. What the two callers
+/// differ in is where the four values live, so the four values are the
+/// arguments.
+///
+/// The bridge is one assignment: what the user types IS the stored string.
+/// There is no render step between the box and `sequence`, which is what makes
+/// the round trip byte-exact in both directions -- a template that is merely
+/// looked at leaves the item untouched, and a template that is edited stores
+/// the user's own bytes rather than this build's spelling of them.
+pub(crate) fn template_editor(
+    ui: &mut egui::Ui,
+    template_draft: &mut String,
+    sequence: &mut String,
+    touched: &mut bool,
+    fault: Option<&'static str>,
+    source: &ResolveSource<'_>,
+) {
     // Multiline, because a sequence with a wait and a rate in it is longer
-    // than the pane is wide and the pane refuses horizontal scrolling
-    // (`assert_inside`). Wrapped text is readable; a line running off the
-    // right edge is a template whose end the user cannot see.
+    // than the edit form's pane is wide and that pane refuses horizontal
+    // scrolling (`assert_inside`). Wrapped text is readable; a line running
+    // off the right edge is a template whose end the user cannot see.
     let response = ui.add(
-        egui::TextEdit::multiline(&mut app.template_draft)
+        egui::TextEdit::multiline(template_draft)
             .desired_rows(2)
             .desired_width(f32::INFINITY)
             .font(egui::TextStyle::Monospace),
     );
     if response.changed() {
-        app.template_touched = true;
-        app.sequence = app.template_draft.clone();
+        *touched = true;
+        *sequence = template_draft.clone();
     }
     ui.add_space(4.0);
 
-    if app.template_draft.is_empty() {
+    if template_draft.is_empty() {
         ui.label(RichText::new(TEMPLATE_EMPTY_NOTE).size(11.0).color(theme::TEXT_FAINT));
         ui.add_space(4.0);
     }
 
     // **The refusal, in the field that caused it.** Save is off while this is
     // on screen -- see `EditDraft::sequence_fault`.
-    if let Some(fault) = app.template_fault() {
+    if let Some(fault) = fault {
         ui.label(RichText::new(fault).size(11.0).color(theme::ERROR));
         ui.add_space(4.0);
     }
@@ -5719,9 +5755,9 @@ fn app_template_view(ui: &mut egui::Ui, app: &mut AppMatchDraft, source: &Resolv
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
         for chip in TEMPLATE_CHIPS {
             if ui.add(palette_button(chip)).clicked() {
-                app.template_draft = template_with(&app.template_draft, chip);
-                app.template_touched = true;
-                app.sequence = app.template_draft.clone();
+                *template_draft = template_with(template_draft, chip);
+                *touched = true;
+                *sequence = template_draft.clone();
             }
         }
     });
@@ -5732,7 +5768,20 @@ fn app_template_view(ui: &mut egui::Ui, app: &mut AppMatchDraft, source: &Resolv
     // what it became.
     ui.label(RichText::new(TEMPLATE_READS_AS).size(11.0).color(theme::TEXT_FAINT));
     ui.add_space(4.0);
-    let _ = sequence_steps(ui, &step_rows(&app.sequence, source, false), false);
+    let _ = sequence_steps(ui, &step_rows(sequence, source, false), false);
+}
+
+/// `sequence` with the edit a step row's controls asked for applied.
+///
+/// One function rather than a `match` at each call site, because the identity
+/// it depends on -- a row's index IS its token's index -- is the thing that
+/// must not be spelled twice.
+pub(crate) fn apply_chip_edit(sequence: &str, edit: ChipEdit) -> String {
+    match edit {
+        ChipEdit::Back(i) => sequence_moved(sequence, i, true),
+        ChipEdit::Forward(i) => sequence_moved(sequence, i, false),
+        ChipEdit::Remove(i) => sequence_without(sequence, i),
+    }
 }
 
 /// Save's caption while the keystroke template will not parse. Names the thing
@@ -5742,7 +5791,7 @@ pub const SAVE_TEMPLATE_BLOCKED: &str = "Save (fix the template)";
 /// The refusal under the wait box, said as the rule rather than as "invalid".
 const WAIT_REFUSAL: &str = "Type a number of seconds, up to 3600.";
 
-fn palette_button(label: &str) -> egui::Button<'static> {
+pub(crate) fn palette_button(label: &str) -> egui::Button<'static> {
     egui::Button::new(theme::semibold(label.to_string(), 12.0).color(theme::INK))
         .fill(theme::CARD)
         .stroke(Stroke::new(1.0, theme::BORDER_STRONG))

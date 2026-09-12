@@ -12667,18 +12667,25 @@ mod source_pins {
     /// next `}` at the gate's indentation -- and the item list panel and its
     /// draw call are required to be inside *it*, and to exist nowhere else.
     ///
-    /// **The gate is `!show_sends && !on_health`**, because the item-list
-    /// column now has a second screen that takes it over: the Password
-    /// health report (`vault_window::password_health`). Nothing here was
-    /// weakened to let it in -- that screen draws its own panel under its own
-    /// id, so the `Panel::left("vault-item-list")` count below still says
-    /// "the item list is drawn exactly once" and the block slice still says
-    /// "and that once is under this gate". `password_health` carries the
-    /// mirror of this test for its own pane.
+    /// **The gate is `!show_sends && !on_health && !on_sequence`**, because
+    /// the item-list column now has two more screens that take it over: the
+    /// Password health report (`vault_window::password_health`) and design
+    /// 4a's sequence builder (`vault_window::sequence_builder`). Nothing here
+    /// was weakened to let either in -- neither draws an item list, so the
+    /// `Panel::left("vault-item-list")` count below still says "the item list
+    /// is drawn exactly once" and the block slice still says "and that once is
+    /// under this gate". `password_health` carries the mirror of this test for
+    /// its own pane.
+    ///
+    /// The builder is a `DetailMode` rather than a screen flag, so its term is
+    /// read off `mode` a few lines above the gate; the needle is still the
+    /// whole line, which is what makes a term quietly dropped from it a
+    /// failure here.
     #[test]
     fn the_item_list_is_drawn_only_inside_the_not_sends_gate() {
         let production = production();
-        let gate = concat!("        if !show_", "sends && !on_health {\r\n");
+        let gate =
+            concat!("        if !show_", "sends && !on_health && !on_sequence {\r\n");
         assert_eq!(
             production.matches(gate).count(),
             1,

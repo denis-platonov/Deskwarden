@@ -556,6 +556,25 @@ pub const MAX_HISTORY_ROWS: usize = 8;
 pub enum DetailAction {
     None,
     Edit,
+    /// **Design 4a** -- open the sequence builder on this item's fill rule.
+    ///
+    /// Its own act rather than a corner of [`Self::Edit`], because it opens a
+    /// different screen with a different save: the builder writes one field of
+    /// the item's `AppMatch` and touches nothing else, while Edit opens a form
+    /// over every field the item has.
+    ///
+    /// Carries nothing. The caller re-resolves the selected item, exactly as
+    /// [`Self::Edit`] and [`Self::Clone`] do, because the draft this opens is
+    /// built from the item's binding and the caller is what holds the item.
+    ///
+    /// On the **exposing** side of `detail_action_exposes_secrets`. The step
+    /// list masks a password unconditionally -- there is no argument to
+    /// `step_rows` that turns that off -- but the builder's eye resolves the
+    /// item's other fields, and a custom field named in a `{S:...}` step can
+    /// be as secret as the password is. Asking before that screen opens costs
+    /// one prompt on a protected item and closes the door; asking after would
+    /// be asking once the values were already drawn.
+    EditSequence,
     CopyUsername,
     CopyPassword,
     CopyTotp,
@@ -3555,6 +3574,29 @@ pub fn draw_detail_read(
                         action = DetailAction::Edit;
                         ui.close();
                     }
+                    // **Design 4a, next to Edit**, because it is the same act
+                    // narrowed: Edit opens a form over every field, this opens
+                    // the builder over the one field that says what gets
+                    // typed. See `FILL_RULE_EDIT_LABEL` for why the door is
+                    // here and not on the card the rule belongs to.
+                    //
+                    // Gated on the PARSED binding, not on the field: a binding
+                    // that will not parse has no sequence to edit, and the
+                    // card above already offers the way to clear it.
+                    if crate::vault_window::sequence_builder::fill_rule_visible(app_match.as_ref())
+                    {
+                        let edit = ui.button(FILL_RULE_EDIT_LABEL);
+                        if edit
+                            .on_hover_text(
+                                "Open the sequence builder: what Deskwarden types into this app, \
+                                 step by step.",
+                            )
+                            .clicked()
+                        {
+                            action = DetailAction::EditSequence;
+                            ui.close();
+                        }
+                    }
                     // **Clone, next to Edit** -- the two entries that open the
                     // same form, kept adjacent.
                     //
@@ -4548,7 +4590,7 @@ pub fn app_match_is_dead(m: &AppMatch) -> bool {
 ///    worker, so the name falls back to the file name, no icon is fetched at
 ///    all, and no dialog is raised. The `Program file` row below is still
 ///    showing the full path, which is the thing the user has to act on.
-fn app_name_lookup_path<'a>(m: &'a AppMatch) -> &'a str {
+pub(crate) fn app_name_lookup_path<'a>(m: &'a AppMatch) -> &'a str {
     if app_match_is_dead(m) {
         return "";
     }
@@ -5287,6 +5329,10 @@ fn app_match_card(
         }
     }
 
+    // **4a's row, last of the rows and directly above the controls**, because
+    // it is the only one that is not a fact about the app: the three above say
+    // WHICH window this rule is for, and this one says what would be typed
+    // into it.
     theme::row_rule(ui);
     app_card_footer(ui, &app_card_notes(m), &app_open_choices(m, website), action);
 }
@@ -5700,20 +5746,38 @@ fn app_card_footer(
         });
 }
 
+/// **Design 4a's door, and it is a KEBAB ENTRY -- which is a measurement,
+/// not a preference.**
+///
+/// Two shapes were built and both were measured out of existence at the app's
+/// minimum window size, where `the_note_fits_and_is_reachable_on_the_shortest_window`
+/// asks for one scroll offset showing both the `MATCHED APP` and `NOTES`
+/// headings on the tallest item this pane can be given:
+///
+///  * A `FILL RULE` card of its own -- a heading band, a wrapped line and a
+///    control row, about 165pt with its gap. Far over.
+///  * A `Types` row plus a third button in this card's footer. The row is
+///    ~58pt and the button wraps the footer's controls on to a second line,
+///    ~38pt. **Either one alone is over**: with the button removed and
+///    nothing else changed the test passes, and with it back it fails, so the
+///    card has essentially no vertical slack left at 298x600.
+///
+/// That test is not a formality -- it is the third time a layout change in
+/// this file has pushed a control out of the scroll viewport -- and the
+/// guarantee it holds (every control on this pane is reachable on the
+/// smallest window this app opens) is worth more than a summary line that is
+/// one click away inside the builder itself.
+///
+/// So the door sits in the pane's own menu, beside `Edit`, where the item's
+/// other acts live and where a new entry costs the layout nothing. It is
+/// drawn only for an item with a parsed binding, because
+/// `AppMatch::sequence` has nowhere to live without one.
+pub const FILL_RULE_EDIT_LABEL: &str = "Edit the sequence";
+
 /// The card's one destructive control, in one place because [`app_card_footer`]
 /// draws it for the bound card and for [`app_notice_with_remove`] alike.
 ///
-/// **One click, no arming.** `confirm_click`'s two-click gate is reserved for
-/// the item Delete, which trashes the whole item; this removes one custom
-/// field, the card says so immediately by flipping to
-/// [`APP_MATCH_EMPTY_NOTICE`], and that notice names the way to put it back.
-/// Making this the third armed control on the pane would have cost
-/// `draw_detail_read` another parameter and `vault_window::mod` another piece
-/// of per-item pending state, for a click whose undo is four clicks in the
-/// tray.
-///
-/// Hand-editing `process` and `path` is deliberately NOT offered here -- see
-/// the module's own note on the card.
+/// **One click, no arming.** See the module note above this pair.
 fn app_card_remove_control(ui: &mut egui::Ui, action: &mut DetailAction) {
     if theme::row_button(ui, APP_REMOVE_LABEL)
         .on_hover_text("Stop autofilling this item into that app")
