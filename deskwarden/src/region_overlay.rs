@@ -1264,9 +1264,15 @@ struct Inner {
     /// the one fact that separates "a frame the user can see" from "a
     /// rectangle of whatever the surface held".
     painted: bool,
+    /// **How many frames painted the picture with no wash over it.** Counted
+    /// by [`RegionOverlay::note_painted`], which logs the first; reported by
+    /// [`RegionOverlay::finish`]. Zero on every overlay in which the wash did
+    /// what it is meant to, which is what the next log has to say before
+    /// "the plain desktop" can be pinned on the paint.
+    washless: u32,
     /// **The overlay window's own `HWND`, from the one lookup that found it.**
     ///
-    /// Held so that the reveal -- [`reveal_painted`], a root frame or more
+    /// Held so that the reveal -- [`uncloak_painted`], a root frame or more
     /// after the lookup -- costs no second `EnumWindows` in front of the
     /// user's first sight of the surface. Never used to make the window, and
     /// only ever used while the overlay is open, which is the lifetime of the
@@ -1435,7 +1441,7 @@ enum Reveal {
 /// era of this module, the owner's log came to read the ex-style back with
 /// `WS_EX_LAYERED` gone on the frame after the show. The layering is history
 /// ([`RegionOverlay::take_picture`]); the reason to keep `winit`'s flag
-/// machinery away from this window is not, and [`reveal_painted`] carries it.
+/// machinery away from this window is not, and [`uncloak_painted`] carries it.
 ///
 /// # Why both steps run on the ROOT's frame
 ///
@@ -1452,7 +1458,7 @@ enum Reveal {
 /// that being in front of a paint -- so the state machine lives on the root's
 /// frame, and the show happens from there. And it is this module's own
 /// `ShowWindow`, not a `ViewportCommand::Visible(true)`, for the reason
-/// [`reveal_painted`] sets out at length: the command goes through `winit`,
+/// [`uncloak_painted`] sets out at length: the command goes through `winit`,
 /// which rewrites the window's styles on every flag change and hides a window
 /// its flags believe hidden.
 ///
@@ -1482,7 +1488,7 @@ enum Reveal {
 /// [`cloak_window`] -- on the frame it is found. A cloaked window is visible
 /// to Windows and to DWM: it has its redirection surface, the callback's
 /// swaps land in it, DWM composites it, and it is drawn to no monitor. The
-/// reveal is then an uncloak ([`reveal_painted`]), on the first root frame
+/// reveal is then an uncloak ([`uncloak_painted`]), on the first root frame
 /// after the callback has painted, and what DWM draws at that composite is
 /// the surface as already swapped. Nothing of the window's reaches the glass
 /// before the first frame does. `painted` is enough of a gate for that:
@@ -1687,6 +1693,7 @@ impl RegionOverlay {
                 chips: [egui::Rect::NOTHING; 2],
                 chip_press: None,
                 painted: false,
+                washless: 0,
                 hwnd: None,
                 cloaked: false,
                 picture: None,
@@ -2000,19 +2007,36 @@ impl RegionOverlay {
     ///   so by this frame the swap has landed -- in the cloaked window's real
     ///   surface. Every `Unseen` root frame that finds it unpainted asks for
     ///   another root frame, so the gate cannot become a wait with no end.
-    /// * [`reveal_painted`]: the uncloak, or the show on the fallback path --
-    ///   **this module's own DWM call and its own `ShowWindow`, never
-    ///   `ViewportCommand::Visible(true)`**, for the reason
-    ///   [`show_window_noactivate`] sets out. An uncloak DWM refuses leaves an
-    ///   invisible full-screen window that takes the mouse and the keyboard,
-    ///   which is the one outcome worse than any flash, so a refused reveal
-    ///   cancels the overlay on the spot: the user is back on the card with
-    ///   nothing captured, and the log says why.
-    /// * `foreground::pick` skips invisible windows, so this is the first frame
-    ///   a raise can find anything at all. `window_host::Reveal` splits show
-    ///   from raise for this same reason. The raise is the last act, and
-    ///   `Inner::fronted` is set beside it so that the foreground goes back
-    ///   however the overlay ends.
+    /// * On the fallback path -- DWM refused the cloak, the window is still
+    ///   hidden -- [`show_window_noactivate`] first, because a raise cannot
+    ///   find a hidden window. On the cloaked path the window has been shown
+    ///   since step one and nothing is shown here.
+    /// * The geometry, by handle, so that no `EnumWindows` sits on this frame.
+    /// * **The raise, while the window is still cloaked.** `foreground::pick`
+    ///   finds a cloaked window (`IsWindowVisible` says so), and activation is
+    ///   a focus and z-order event the compositor re-orders around -- so it is
+    ///   made where the compositor's re-ordering reaches no monitor. This is
+    ///   the order the owner's *"dim appear, vanish to your plain desktop, and
+    ///   appear again, no moves or anything"* changed: the raise used to
+    ///   follow the reveal, a second of `EnumWindows` behind it, and was the
+    ///   only thing left in the sequence that happened to the window after
+    ///   the user could see it. `Inner::fronted` is set beside it so that the
+    ///   foreground goes back however the overlay ends.
+    /// * [`uncloak_painted`], **last** -- this module's own DWM call, never
+    ///   `ViewportCommand::Visible(true)`, for the reason
+    ///   [`show_window_noactivate`] sets out. Nothing follows it on this frame
+    ///   but the request for the overlay's next swap. An uncloak DWM refuses
+    ///   leaves an invisible full-screen window that takes the mouse and the
+    ///   keyboard, which is the one outcome worse than any flash, so a refused
+    ///   reveal cancels the overlay on the spot: the user is back on the card
+    ///   with nothing captured, and the log says why.
+    ///
+    /// Not measured, said plainly: whether the re-ordering around activation
+    /// is what the owner saw cannot be observed from inside this process. What
+    /// the paint now records is the other candidate -- a frame painted with no
+    /// wash over the picture, which would look exactly like "the plain
+    /// desktop" and is logged once per overlay if it ever happens; see
+    /// [`RegionOverlay::note_painted`].
     ///
     /// # What is no longer here: the minimise
     ///
@@ -2063,6 +2087,9 @@ impl RegionOverlay {
             // `compose` only answers `true` when told the window exists, so
             // the handle is there; kept for the reveal, a frame or more away.
             locked(&self.inner).hwnd = found;
+            let Some(hwnd) = found else {
+                return;
+            };
             // The cloak, before anything else: from here on the window can be
             // shown by anyone and drawn by nobody.
             let cloaked = found.is_some_and(cloak_window);
@@ -2072,7 +2099,7 @@ impl RegionOverlay {
             // here: this is the last moment the geometry can be inspected
             // without the user having already seen whatever it is. See
             // [`log_window_rect`].
-            log_window_rect(REGION_TITLE, "unseen, waiting for the first paint", display);
+            log_window_rect(hwnd, "unseen, waiting for the first paint", display);
             if let (true, Some(hwnd)) = (cloaked, found) {
                 // Shown cloaked: on screen to Windows and to DWM, so the
                 // callback's swaps from here on land in a real surface, and
@@ -2087,34 +2114,50 @@ impl RegionOverlay {
         let hwnd = locked(&self.inner).hwnd;
         let cloaked = locked(&self.inner).cloaked;
         if locked(&self.inner).appearing.on_screen(painted) {
-            let revealed = hwnd.is_some_and(|hwnd| reveal_painted(hwnd, cloaked));
-            if !revealed {
+            let Some(hwnd) = hwnd else {
+                return;
+            };
+            // **The fallback path shows first**: a window DWM would not cloak
+            // stayed hidden until now, and a raise cannot find a hidden
+            // window. On the cloaked path the window has been shown since
+            // step one, cloaked, and stays cloaked through everything below.
+            if !cloaked {
+                show_window_noactivate(hwnd);
+            }
+            // The geometry again, because a show is one of the moments Windows
+            // may renegotiate the rectangle -- `ShowWindow` is what moves a
+            // window onto a monitor as far as `WM_DPICHANGED` is concerned.
+            // Two lines, one before and one after, is what tells "it was never
+            // the right size" apart from "it was, and then it moved".
+            log_window_rect(hwnd, "about to be revealed", display);
+            // **The raise, BEFORE the uncloak.** A selection surface that opens
+            // behind the window being selected from is useless, so this one
+            // raises; see its row in `foreground::OPENS_A_VIEWPORT_AND_RAISES_IT`.
+            // Activation is a focus and z-order event the compositor re-orders
+            // around, and on a cloaked window all of that happens off the
+            // glass -- which is the point of doing it here rather than after
+            // the reveal, where the owner's "dim, then desktop, then dim" would
+            // have it. It owes the foreground back: every exit from `show`
+            // returns it, and `Inner`'s `Drop` covers the exits that do not
+            // come through `show` at all.
+            crate::foreground::raise_window(REGION_TITLE);
+            locked(&self.inner).fronted = true;
+            // **The uncloak is the last act of this frame.** Nothing this
+            // module does follows it before the root frame ends and the
+            // overlay's next swap lands; the frame the user first sees is the
+            // one already in the surface, active and placed.
+            if cloaked && !uncloak_painted(hwnd) {
                 // An invisible full-screen window that takes the mouse and
                 // the keyboard is the one outcome worse than a flash. The
                 // overlay ends here with nothing captured; the log has the
-                // reason.
+                // reason, and the foreground goes back on the closing frame.
                 self.finish(Outcome::Cancelled);
                 ctx.request_repaint();
                 return;
             }
-            // And again on the first frame it is up, because the reveal is
-            // one of the moments Windows may renegotiate the rectangle --
-            // `ShowWindow` is what moves a window onto a monitor as far as
-            // `WM_DPICHANGED` is concerned. Two lines, one before and one
-            // after, is what tells "it was never the right size" apart from
-            // "it was, and then it moved".
-            log_window_rect(REGION_TITLE, "revealed", display);
             // The next swap, as soon as `eframe` can make it: on the fallback
             // path it is what bounds the one composite of the empty surface.
             ctx.request_repaint_of(region_viewport());
-            // A selection surface that opens behind the window being selected
-            // from is useless, so this one raises; see its row in
-            // `foreground::OPENS_A_VIEWPORT_AND_RAISES_IT`. And it owes the
-            // foreground back: every exit from `show` returns it, and
-            // `Inner`'s `Drop` covers the exits that do not come through
-            // `show` at all.
-            crate::foreground::raise_window(REGION_TITLE);
-            locked(&self.inner).fronted = true;
         } else if matches!(locked(&self.inner).appearing, Appearing::Unseen) {
             // Unseen, being painted, and not painted yet. The overlay's own
             // paint is already asked for on every root frame by `show`; this
@@ -2131,12 +2174,44 @@ impl RegionOverlay {
         locked(&self.inner).chips = chips;
     }
 
-    /// **Records that the callback has painted a frame into the window.**
+    /// **Records that the callback has painted a frame into the window** --
+    /// and whether that frame had a wash on it.
+    ///
     /// Called after every `draw`, and read by [`RegionOverlay::appear`], which
-    /// keeps the window hidden until this has happened once. See
+    /// keeps the window unseen until this has happened once. See
     /// [`Appearing`].
-    fn note_painted(&self) {
-        locked(&self.inner).painted = true;
+    ///
+    /// # The instrument
+    ///
+    /// `washed` is [`draw`]'s answer to "was any of [`dim_wash`] painted this
+    /// frame". The owner's *"dim appear, vanish to your plain desktop, and
+    /// appear again"* has two readings and one of them is a frame that
+    /// painted the picture with no wash over it -- which, on a picture taken
+    /// with the vault window already out of captures, looks exactly like a
+    /// plain desktop. Every path through `draw` paints the wash unless the
+    /// lit rectangle covers the whole surface, so such a frame should be
+    /// impossible without a full-display selection; this counts them anyway
+    /// and logs the **first** with the selection and reveal it had, once per
+    /// overlay, so that if the impossible happens the log says what the paint
+    /// was looking at. The count goes into the line [`RegionOverlay::finish`]
+    /// writes, so a scan that ended with none says so.
+    fn note_painted(&self, washed: bool, view: &RegionView) {
+        let mut held = locked(&self.inner);
+        held.painted = true;
+        if !washed {
+            held.washless += 1;
+            if held.washless == 1 {
+                log::warn!(
+                    "region overlay: a frame painted the picture with NO wash over it -- \
+                     selection {:?}, reveal {:?}, while {:?}. A full-display selection is \
+                     the one legitimate way this happens; anything else is the 'plain \
+                     desktop' blink",
+                    view.selection,
+                    view.reveal,
+                    held.appearing
+                );
+            }
+        }
     }
 
     /// **Takes the picture of the display this overlay covers, and uploads it
@@ -2328,8 +2403,10 @@ impl RegionOverlay {
         // nothing to say what ended it. `Outcome`'s `Debug` is hand-written
         // and prints no secret.
         log::info!(
-            "region overlay: ended by {outcome:?} while {:?}",
-            held.appearing
+            "region overlay: ended by {outcome:?} while {:?}, after {} frame(s) painted with no \
+             wash",
+            held.appearing,
+            held.washless
         );
         if held.outcome.is_none() {
             held.outcome = Some(outcome);
@@ -2681,10 +2758,11 @@ impl RegionOverlay {
                 if mine.reveal_step(Instant::now()).is_some() {
                     root.request_repaint_of(region_viewport());
                     let view = mine.view();
-                    egui::CentralPanel::default()
+                    let (_, washed) = egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
-                        .show(root, |ui| draw(ui, &view));
-                    mine.note_painted();
+                        .show(root, |ui| draw(ui, &view))
+                        .inner;
+                    mine.note_painted(washed, &view);
                     return;
                 }
 
@@ -2777,7 +2855,7 @@ impl RegionOverlay {
                 }
 
                 let view = mine.view();
-                let chips = egui::CentralPanel::default()
+                let (chips, washed) = egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)
                     .show(root, |ui| draw(ui, &view))
                     .inner;
@@ -2790,7 +2868,7 @@ impl RegionOverlay {
                 mine.remember_chips(chips);
                 // And that a frame now exists in the window, which is what
                 // `appear` waits for before it lets the user see the window.
-                mine.note_painted();
+                mine.note_painted(washed, &view);
             },
         );
         // **After the viewport is registered, and on the ROOT's frame.**
@@ -2880,7 +2958,7 @@ impl Drop for Inner {
 /// paint: the bar's height follows the type it carries, and the type includes
 /// a reason line that is there or not. See
 /// [`RegionOverlay::remember_chips`].
-pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> [egui::Rect; 2] {
+pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> ([egui::Rect; 2], bool) {
     let full = ui.max_rect();
     let painter = ui.painter().clone();
 
@@ -2891,21 +2969,22 @@ pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> [egui::Rect; 2] {
     // drag that is not happening. It returns before the bar is drawn: see
     // `paint_reveal` for why this state has no bar and therefore no chips.
     if let Some(found) = view.reveal {
-        paint_reveal(&painter, full, found);
-        return [egui::Rect::NOTHING; 2];
+        let washed = paint_reveal(&painter, full, found);
+        return ([egui::Rect::NOTHING; 2], washed);
     }
 
-    match view.selection {
+    let washed = match view.selection {
         // Nothing selected yet: the whole desktop dims, at the one value the
         // owner picked. See `DIM_ALPHA`.
         None => {
             painter.rect_filled(full, 0.0, dim_wash());
+            true
         }
         // The four bands around the selection are washed and the selection is
         // not: 6b's hole, back. See `paint_dim_around`.
         Some(sel) => {
             let sel = sel.intersect(full);
-            paint_dim_around(&painter, full, sel);
+            let washed = paint_dim_around(&painter, full, sel);
             paint_selection_edge(&painter, sel);
             if let Some((w, h)) = view.size {
                 paint_size_readout(&painter, sel, w, h);
@@ -2913,8 +2992,9 @@ pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> [egui::Rect; 2] {
             if lockon_badge(view.found).is_some() {
                 paint_badge(&painter, full, sel, LOCKED_ON);
             }
+            washed
         }
-    }
+    };
 
     let chips = paint_bar(&painter, full, view.reason);
     // The one hover affordance the chips get. A fill that changed under the
@@ -2927,7 +3007,7 @@ pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> [egui::Rect; 2] {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
     }
-    chips
+    (chips, washed)
 }
 
 /// **The ground under everything: the picture of the display, or a solid
@@ -2975,7 +3055,15 @@ fn paint_ground(painter: &egui::Painter, full: egui::Rect, picture: Option<egui:
 /// corrected in one copy. A band with no area is skipped rather than painted
 /// inverted: a selection flush with an edge produces one, and an inverted
 /// `Rect` fills nothing in egui but says something wrong here.
-fn paint_dim_around(painter: &egui::Painter, full: egui::Rect, lit: egui::Rect) {
+fn paint_dim_around(painter: &egui::Painter, full: egui::Rect, lit: egui::Rect) -> bool {
+    // **Answers whether any wash was painted at all.** A lit rectangle that
+    // covers the whole surface leaves no band with area, and the frame then
+    // shows the picture bare -- which is the design's own answer for a
+    // selection that IS the display, and is also exactly what "dim, then the
+    // plain desktop, then dim" would look like if it happened when no such
+    // selection existed. The caller counts these frames and logs the first;
+    // see `RegionOverlay::note_painted`.
+    let mut washed = false;
     for band in [
         egui::Rect::from_min_max(full.left_top(), egui::pos2(full.right(), lit.top())),
         egui::Rect::from_min_max(egui::pos2(full.left(), lit.bottom()), full.right_bottom()),
@@ -2984,8 +3072,10 @@ fn paint_dim_around(painter: &egui::Painter, full: egui::Rect, lit: egui::Rect) 
     ] {
         if band.is_positive() {
             painter.rect_filled(band, 0.0, dim_wash());
+            washed = true;
         }
     }
+    washed
 }
 
 /// **The reveal**: the code the whole-screen scan just read, ringed where it
@@ -3024,11 +3114,12 @@ fn paint_dim_around(painter: &egui::Painter, full: egui::Rect, lit: egui::Rect) 
 /// picture is [`RegionOverlay::take_picture`]'s, and it is the one capture
 /// this module displays, for the reasons and within the bounds that function
 /// sets out.
-fn paint_reveal(painter: &egui::Painter, full: egui::Rect, found: egui::Rect) {
+fn paint_reveal(painter: &egui::Painter, full: egui::Rect, found: egui::Rect) -> bool {
     let lit = found.intersect(full);
-    paint_dim_around(painter, full, lit);
+    let washed = paint_dim_around(painter, full, lit);
     paint_selection_edge(painter, lit);
     paint_badge(painter, full, lit, SCAN_FOUND);
+    washed
 }
 
 /// The two rings 6b draws around the selection, plus its four corner
@@ -3668,7 +3759,7 @@ fn hide_and_place(title: &str, display: ScreenRect) {
 /// is the difference from the four mechanisms this module retired
 /// ([`RegionOverlay::take_picture`] lists them): each of those asked the
 /// compositor to blend the window's pixels and could not read back whether
-/// it had. This one can: [`reveal_painted`] reads `DWMWA_CLOAKED` after the
+/// it had. This one can: [`uncloak_painted`] reads `DWMWA_CLOAKED` after the
 /// uncloak, and a window that stayed cloaked is cancelled rather than left
 /// on screen invisible. The window's pixels are still its own and opaque,
 /// and `the_dim_is_painted_in_the_framebuffer_over_a_picture_of_the_desktop`
@@ -3696,29 +3787,29 @@ fn cloak_window(hwnd: isize) -> bool {
     set_cloak(hwnd, true)
 }
 
-/// **The reveal: uncloaks a cloaked window, or shows one that could not be
-/// cloaked.** `true` if the window is on screen afterwards.
+/// **The reveal: uncloaks a cloaked window.** `true` if the window is on
+/// screen afterwards. The fallback for a window DWM would not cloak is
+/// [`show_window_noactivate`], made by the caller in this function's place.
 ///
 /// Runs on the first root frame after the callback has painted, which -- see
 /// [`Appearing`] -- is after `eframe`'s swap of that frame has returned on
-/// this same thread. On the cloaked path the uncloak is followed by a
-/// readback of `DWMWA_CLOAKED`, because "accepted" has been the answer to
-/// every question this module has asked DWM and has meant nothing three
-/// times; a window that reads back still cloaked is reported as not revealed
-/// and the caller ends the overlay, which is the safe direction for a
-/// full-screen window that takes input.
+/// this same thread, and it is the **last** thing [`RegionOverlay::appear`]
+/// does on that frame: the geometry has been logged and the window has been
+/// raised while still cloaked, so nothing re-orders, re-activates or blocks
+/// the thread between the reveal and the overlay's next swap. The uncloak is
+/// followed by a readback of `DWMWA_CLOAKED`, because "accepted" has been the
+/// answer to every question this module has asked DWM and has meant nothing
+/// three times; a window that reads back still cloaked is reported as not
+/// revealed and the caller ends the overlay, which is the safe direction for
+/// a full-screen window that takes input.
 ///
 /// A readback that fails is treated as revealed: it is the readback that
 /// failed, not the uncloak, and cancelling a scan the user can see on the
 /// strength of a failed query is the wrong direction. Logged as such.
-fn reveal_painted(hwnd: isize, cloaked: bool) -> bool {
+fn uncloak_painted(hwnd: isize) -> bool {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 
-    if !cloaked {
-        show_window_noactivate(hwnd);
-        return true;
-    }
     if !set_cloak(hwnd, false) {
         return false;
     }
@@ -3905,17 +3996,17 @@ fn show_window_noactivate(hwnd: isize) {
     }
 }
 
-fn log_window_rect(title: &str, step: &str, asked_for: ScreenRect) {
+fn log_window_rect(hwnd: isize, step: &str, asked_for: ScreenRect) {
     use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
-    let Some(hwnd) = crate::foreground::own_window_titled(title) else {
-        log::warn!("region overlay: no window titled {title:?} to measure at {step}");
-        return;
-    };
+    // By handle, not by title: this runs on the frame the window is revealed,
+    // and an `EnumWindows` there was measured in the owner's log at a second
+    // between the uncloak and the line after it -- a second in which the UI
+    // thread swaps nothing.
     let mut rect = RECT::default();
     if let Err(e) = unsafe { GetWindowRect(HWND(hwnd as *mut _), &mut rect) } {
-        log::warn!("region overlay: GetWindowRect refused on {title:?} at {step}: {e}");
+        log::warn!("region overlay: GetWindowRect refused on {hwnd:#x} at {step}: {e}");
         return;
     }
     let got = ScreenRect {
@@ -5838,13 +5929,31 @@ mod tests {
             .next()
             .expect("`appear` no longer ends where it did");
         let raise = hook.find("raise_window(REGION_TITLE);").expect("the raise is gone");
-        let shown = hook
-            .find("reveal_painted(hwnd, cloaked)")
+        let revealed = hook
+            .find("uncloak_painted(hwnd)")
             .expect("the overlay is never revealed, so it is a window nobody can see");
+        // **Raised while cloaked, revealed last.** This used to be the other
+        // way round, on the reasoning that a raise on a window nobody can see
+        // lands the foreground on nothing. It does not: a cloaked window is
+        // visible to Windows, takes the foreground, and is drawn to no
+        // monitor -- so the activation's re-ordering happens off the glass,
+        // and the uncloak reveals an active, placed, painted window with
+        // nothing left to happen to it. The owner's "dim, then desktop, then
+        // dim" with no input is what the old order left room for.
         assert!(
-            shown < raise,
-            "the overlay is raised before it is revealed -- a raise on a cloaked window \
-             lands the foreground on a surface the user cannot see"
+            raise < revealed,
+            "the overlay is revealed before it is raised, so the activation's re-ordering \
+             happens on the glass after the user can see the window"
+        );
+        // And on the fallback path -- no cloak -- the show comes before the
+        // raise, because a hidden window cannot take the foreground.
+        let fallback_show = hook
+            .rfind("show_window_noactivate(hwnd);")
+            .expect("the fallback show is gone");
+        assert!(
+            fallback_show < raise,
+            "the fallback show comes after the raise, so a window DWM would not cloak is \
+             raised while hidden and never gets the keyboard"
         );
         assert!(
             hook.find("exclude_from_capture(REGION_TITLE);").expect("the mask is gone") < raise,
@@ -6245,7 +6354,7 @@ mod tests {
         let bar = drawn.find("paint_bar(").expect("`draw` no longer paints the bar");
         assert!(reveal < bar, "the bar is painted before the reveal returns");
         assert!(
-            drawn[reveal..bar].contains("return [egui::Rect::NOTHING; 2];"),
+            drawn[reveal..bar].contains("return ([egui::Rect::NOTHING; 2], washed);"),
             "the reveal no longer returns before the bar, or no longer answers with no chips"
         );
         // And the callback reads no input on those frames: the reveal branch
@@ -6536,7 +6645,7 @@ mod tests {
         // And exactly one show, so a second one cannot appear somewhere that
         // runs before the layering call.
         assert_eq!(
-            code.matches("reveal_painted(hwnd, cloaked)").count(),
+            code.matches("uncloak_painted(hwnd)").count(),
             1,
             "the overlay is revealed from more than one place, so the ordering the white-box \
              fix rests on is no longer decided in one spot"
@@ -6556,7 +6665,7 @@ mod tests {
             .expect("the callback no longer ends where it did");
         for needle in [
             "cloak_window(",
-            "reveal_painted(",
+            "uncloak_painted(",
             "show_window_noactivate(",
             "exclude_from_capture(",
             "raise_window(",
@@ -6633,7 +6742,7 @@ mod tests {
     /// has been painted, and nothing in this module ever gives `winit` a
     /// reason to touch the window.**
     ///
-    /// The mechanism is in [`reveal_painted`]'s doc and it is `winit`'s, not
+    /// The mechanism is in [`uncloak_painted`]'s doc and it is `winit`'s, not
     /// this crate's: `WindowFlags::apply_diff` rewrites the window's styles
     /// from its own flags on every flag change, and hides a window its flags
     /// call hidden. So what a test can hold is the shape that keeps
@@ -6664,7 +6773,7 @@ mod tests {
             0,
             "this module sends a viewport command. Whatever it is for, `winit` answers a flag \
              change on the overlay's window by hiding a window its flags call hidden and \
-             rewriting its styles -- see `reveal_painted`"
+             rewriting its styles -- see `uncloak_painted`"
         );
         // The show is the OS call, made on the handle from the one lookup,
         // and only inside the branch that has seen a paint.
@@ -6676,13 +6785,21 @@ mod tests {
             .next()
             .unwrap();
         let shown = appear
-            .find("reveal_painted(hwnd, cloaked)")
+            .find("uncloak_painted(hwnd)")
             .expect("the overlay is never revealed");
         assert!(
             appear.find("locked(&self.inner).hwnd = found;").expect("the handle is not kept")
                 < shown,
             "the handle is not kept before the reveal, so the reveal has nothing to act on \
              without a second `EnumWindows`"
+        );
+        // The fallback for a cloak DWM refused is a show, made in the same
+        // gated step, before the raise that a hidden window could not take.
+        assert_eq!(
+            appear.matches("show_window_noactivate(hwnd);").count(),
+            2,
+            "`appear` shows the window from a different number of places than two: once \
+             cloaked on the frame it is found, and once as the fallback for a refused cloak"
         );
         let gated = appear
             .find("appearing.on_screen(painted)")
@@ -6697,19 +6814,19 @@ mod tests {
         // not take is a full-screen window that is invisible and takes input;
         // the readback is what tells, and the cancel is what answers it.
         let revealer = code
-            .split("fn reveal_painted(hwnd: isize, cloaked: bool) -> bool {")
+            .split("fn uncloak_painted(hwnd: isize) -> bool {")
             .nth(1)
-            .expect("`reveal_painted` is gone")
+            .expect("`uncloak_painted` is gone")
             .split("\n}")
             .next()
             .unwrap();
         assert!(
-            revealer.contains("DWMWA_CLOAKED") && revealer.contains("show_window_noactivate(hwnd);"),
-            "`reveal_painted` no longer reads the cloak back after uncloaking, or no longer \
-             shows the window on the path where the cloak was refused"
+            revealer.contains("DWMWA_CLOAKED"),
+            "`uncloak_painted` no longer reads the cloak back after uncloaking"
         );
         assert!(
-            appear.contains("if !revealed {\n") && appear.contains("self.finish(Outcome::Cancelled);"),
+            appear.contains("if cloaked && !uncloak_painted(hwnd) {\n")
+                && appear.contains("self.finish(Outcome::Cancelled);"),
             "a reveal DWM refused no longer cancels the overlay, so the user is left with an \
              invisible sheet over the desktop that eats every click"
         );
@@ -6723,7 +6840,7 @@ mod tests {
             .next()
             .expect("the callback no longer ends where it did");
         assert_eq!(
-            callback.matches("mine.note_painted();").count(),
+            callback.matches("mine.note_painted(washed, &view);").count(),
             callback.matches("draw(ui, &view)").count(),
             "a `draw` in the callback is not followed by `note_painted`, so a route that only \
              ever takes that branch keeps the window hidden for ever -- a scan with no window"
