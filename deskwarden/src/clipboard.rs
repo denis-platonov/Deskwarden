@@ -1,8 +1,11 @@
 //! Putting a secret on the Windows clipboard **without** it being retained.
 //!
 //! Every "Copy" in this app -- `CTRL+B`, `CTRL+U`, `CTRL+T`, the
-//! `CTRL+SHIFT+` chords, the click-to-copy rows, the preflight's "copy
-//! instead" -- ends here. It exists because the ordinary way to copy text on
+//! `CTRL+SHIFT+` chords, the click-to-copy rows -- ends here. (Design 4b's
+//! send preflight used to be on that list too, with a *Copy instead* beside
+//! its refusal; the card was removed on the owner's instruction and the
+//! escape went with the screen that offered it. See
+//! `vault_window::preflight`.) It exists because the ordinary way to copy text on
 //! Windows leaves two traces the user never asked for:
 //!
 //! 1. **Clipboard history (`Win+V`).** Windows keeps a stack of recent

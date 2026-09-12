@@ -4507,7 +4507,12 @@ mod tests {
     fn the_title_is_this_window_alone() {
         assert_ne!(REGION_TITLE, crate::vault_window::WINDOW_TITLE);
         assert_ne!(REGION_TITLE, crate::vault_window::rehearsal::SCRATCH_TITLE);
-        assert_ne!(REGION_TITLE, crate::preflight_card::PREFLIGHT_CARD_TITLE);
+        // The third comparison used to be against `preflight_card`'s title.
+        // That card was design 4b's send confirmation and it has been removed
+        // -- see `vault_window::preflight`'s module doc -- so the daemon's
+        // unlock prompt takes its place here. Still three, and still a card
+        // the daemon can have on screen while this overlay is up.
+        assert_ne!(REGION_TITLE, crate::unlock_prompt::UNLOCK_PROMPT_TITLE);
         assert!(!REGION_TITLE.is_empty());
     }
 

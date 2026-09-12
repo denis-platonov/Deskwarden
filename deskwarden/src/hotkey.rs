@@ -90,6 +90,19 @@
 //! time. So [`retry_if_unavailable`] re-attempts on a fixed interval from the
 //! main loop -- see [`RETRY_EVERY`] for the interval and why it is an
 //! interval and not "when the vault window closes".
+//!
+//! # Why the retry is quiet
+//!
+//! The retry is not the log. An attempt twice a minute that wrote a line each
+//! time put 3,416 copies of one sentence into `deskwarden.log` on a machine
+//! where another program simply owns `Ctrl+Alt+S`, which is roughly 2,880 a
+//! day and enough to bury the problems somebody opens that file to find. The
+//! attempts still happen -- the same log records the chord being claimed later
+//! on, which only happened because something kept trying -- but the sentence
+//! is written when the *state* changes rather than when an attempt is made:
+//! first failure, a failure for a new reason, the recovery, and one reminder
+//! an hour while nothing moves. See [`REMIND_EVERY`] and
+//! [`should_log_failure`].
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -121,6 +134,33 @@ use crate::app::FillShortcut;
 /// work. It is only ever paid while a binding is unavailable; an armed hotkey
 /// re-attempts nothing, ever, and neither does a cleared one.
 pub const RETRY_EVERY: Duration = Duration::from_secs(30);
+
+/// How long an unchanged failure stays quiet in the log before it is worth
+/// one more line.
+///
+/// **The retry is right; logging it was not.** `deskwarden.log` carried 3,416
+/// copies of one sentence -- `CTRL+ALT+S ... could not be registered (HotKey
+/// already registerd)` -- because [`register_all`] wrote a `warn!` on every
+/// attempt and [`RETRY_EVERY`] makes an attempt twice a minute. That is about
+/// 2,880 lines a day for a machine where something else simply owns that
+/// chord, and it buried real problems during two days of debugging this app:
+/// a log nobody can read is a log that is not there.
+///
+/// The retry itself is untouched, because it works and it matters -- the same
+/// log records the chord being registered later, which only happened because
+/// something kept trying. What changes is that the *sentence* is written when
+/// it is news: the first failure, a failure for a different reason than the
+/// last one, the recovery (`announce`'s line), and then one reminder an hour
+/// so that "this has been broken all afternoon" is still answerable from the
+/// log without reconstructing it from silence.
+///
+/// **An hour, and at `warn!` rather than `debug!`.** Quieter than that and a
+/// long-running instance could go a whole session with one line near the top
+/// about a shortcut that has been dead since; noisier and it is the same
+/// defect with a smaller multiplier. An hour turns 2,880 lines a day into 24
+/// while leaving the condition visible to somebody grepping for warnings,
+/// which is what the first report was actually made of.
+pub const REMIND_EVERY: Duration = Duration::from_secs(60 * 60);
 
 // ---------------------------------------------------------------------------
 // A chord
@@ -596,6 +636,14 @@ struct Binding {
     /// chord. `a_cleared_row_answers_to_no_press_at_all` is what caught it.
     id: Option<u32>,
     status: HotkeyStatus,
+    /// When this binding's current trouble was last written to the log, or
+    /// `None` while there is nothing to be quiet about.
+    ///
+    /// Cleared the moment the binding stops being unavailable -- see
+    /// [`register_all`] -- so that a chord which works, is lost again and
+    /// fails again is reported again rather than swallowed by an hour of
+    /// quiet earned by the previous outage. See [`REMIND_EVERY`].
+    complained_at: Option<Instant>,
 }
 
 /// The five fill hotkeys and their current states.
@@ -660,12 +708,13 @@ pub fn register_fill_hotkeys_with(
             // `STATUS` starts at `None`: a well-formed answer nothing has
             // established is the defect, not the placeholder.
             status: HotkeyStatus::Unavailable(Unavailable::NotYetAttempted),
+            complained_at: None,
         }),
         last_attempt: now,
         attempt,
         publish_to,
     };
-    register_all(&mut fh, |_| true);
+    register_all(&mut fh, now, |_| true);
     fh
 }
 
@@ -675,12 +724,13 @@ pub fn register_fill_hotkeys_with(
 /// **`wanted` is what makes a retry a retry**: the first pass takes every
 /// binding, a retry takes only the unavailable ones, and neither needs its own
 /// copy of the attempt-classify-publish sequence.
-fn register_all(fh: &mut FillHotkeys, wanted: impl Fn(HotkeyStatus) -> bool) {
+fn register_all(fh: &mut FillHotkeys, now: Instant, wanted: impl Fn(HotkeyStatus) -> bool) {
     for index in 0..FillHotkeys::COUNT {
         let which = FillShortcut::ALL[index];
         if !wanted(fh.bindings[index].status) {
             continue;
         }
+        let previous = fh.bindings[index].status;
         let status = match fh.bindings[index].chord {
             // Nothing to register, and nothing wrong. Published like any
             // other status so the page has an answer for this row rather than
@@ -689,16 +739,44 @@ fn register_all(fh: &mut FillHotkeys, wanted: impl Fn(HotkeyStatus) -> bool) {
             Some(chord) => {
                 let (manager, outcome) = (fh.attempt)(fh.manager.take(), chord.to_hotkey());
                 fh.manager = manager;
+                let status = classify(outcome.as_ref().map(|_| ()).map_err(|e| e));
                 if let Err(e) = &outcome {
-                    log::warn!(
-                        "the global shortcut {chord} ({}) could not be registered ({e}); \
-                         Deskwarden is carrying on without it -- see Preferences > Shortcuts",
-                        which.label()
-                    );
+                    // **Written when it is news, not when it happens.** See
+                    // [`REMIND_EVERY`]: the attempt repeats every
+                    // [`RETRY_EVERY`] and must, but the sentence about it does
+                    // not. The elapsed time is carried on the reminder because
+                    // "still, an hour later" is the whole of what the second
+                    // line adds over the first.
+                    let quiet_for = fh.bindings[index]
+                        .complained_at
+                        .map(|at| now.saturating_duration_since(at));
+                    if should_log_failure(previous, status, quiet_for) {
+                        match quiet_for {
+                            None => log::warn!(
+                                "the global shortcut {chord} ({}) could not be registered ({e}); \
+                                 Deskwarden is carrying on without it -- see Preferences > \
+                                 Shortcuts",
+                                which.label()
+                            ),
+                            Some(quiet) => log::warn!(
+                                "the global shortcut {chord} ({}) still could not be registered \
+                                 after {} minutes of retrying ({e}); Deskwarden is carrying on \
+                                 without it -- see Preferences > Shortcuts",
+                                which.label(),
+                                quiet.as_secs() / 60
+                            ),
+                        }
+                        fh.bindings[index].complained_at = Some(now);
+                    }
                 }
-                classify(outcome.as_ref().map(|_| ()).map_err(|e| e))
+                status
             }
         };
+        // An armed or cleared row has nothing to be quiet about, so the next
+        // failure -- whenever it comes -- is news again.
+        if !matches!(status, HotkeyStatus::Unavailable(_)) {
+            fh.bindings[index].complained_at = None;
+        }
         fh.bindings[index].status = status;
         (fh.publish_to)(which, fh.bindings[index].chord, status);
     }
@@ -736,13 +814,47 @@ fn announce(which: FillShortcut, chord: Option<Chord>, status: HotkeyStatus) {
              has let go"
         ),
         (_, HotkeyStatus::Armed) => log::info!("the global shortcut for {label} is registered"),
-        // The failure itself is logged with its error text in `register_all`.
-        // Repeating it every `RETRY_EVERY` would fill the log of an app that
-        // runs for days with one unchanging line per unavailable chord, and
-        // the log is the thing somebody reads to find out why the app
-        // vanished.
+        // The failure itself is logged with its error text in `register_all`,
+        // which paces it -- see `REMIND_EVERY`. Saying it a second time from
+        // here would fill the log of an app that runs for days with one
+        // unchanging line per unavailable chord, and the log is the thing
+        // somebody reads to find out why the app vanished.
         (_, HotkeyStatus::Unavailable(_)) => {}
         (_, HotkeyStatus::Unbound) => log::info!("the global shortcut for {label} is cleared"),
+    }
+}
+
+/// Whether a failed registration is worth a line in the log this time.
+///
+/// Pure, and separated from the logging for [`should_retry`]'s reason: the
+/// pacing rule is the part worth pinning, and a rule about what happens after
+/// an hour of half-minute retries is otherwise only observable by waiting an
+/// hour. `previous` is the binding's status **before** this attempt and `next`
+/// the one it just produced; `quiet_for` is how long since this binding's
+/// trouble was last written about, or `None` if it has not been.
+///
+/// The three things that are news, in the order they are asked:
+///
+/// * Nothing has been said yet -- the first failure after a launch, a rebind,
+///   or a recovery. Always logged, which is what keeps "the shortcut is not
+///   working" in the log at all.
+/// * The reason changed -- *taken by another program* becoming *refused*, say.
+///   A different failure is a different fact even while the symptom is the
+///   same, and the two have different answers.
+/// * It has been unchanged for [`REMIND_EVERY`]. One line an hour, so that a
+///   log covering a long session still says the condition persisted rather
+///   than leaving a reader to infer it from a gap.
+///
+/// Everything else is the same sentence the log already carries, and is
+/// dropped.
+pub fn should_log_failure(
+    previous: HotkeyStatus,
+    next: HotkeyStatus,
+    quiet_for: Option<Duration>,
+) -> bool {
+    match quiet_for {
+        None => true,
+        Some(quiet) => previous != next || quiet >= REMIND_EVERY,
     }
 }
 
@@ -774,7 +886,9 @@ pub fn retry_if_unavailable(fh: &mut FillHotkeys, now: Instant) -> bool {
         return false;
     }
     fh.last_attempt = now;
-    register_all(fh, |status| matches!(status, HotkeyStatus::Unavailable(_)));
+    register_all(fh, now, |status| {
+        matches!(status, HotkeyStatus::Unavailable(_))
+    });
     true
 }
 
@@ -813,10 +927,14 @@ pub fn rebind_if_changed(
             chord,
             id: chord.map(Chord::id),
             status: HotkeyStatus::Unavailable(Unavailable::NotYetAttempted),
+            // A new chord is a new situation: whatever quiet the old one had
+            // earned is not this one's to inherit, so a rebind onto a chord
+            // that is also taken says so at once. See [`REMIND_EVERY`].
+            complained_at: None,
         };
     }
     fh.last_attempt = now;
-    register_all(fh, |_| true);
+    register_all(fh, now, |_| true);
     true
 }
 
@@ -1620,6 +1738,83 @@ mod tests {
         assert!(should_retry(taken, RETRY_EVERY));
         assert!(!should_retry(HotkeyStatus::Armed, RETRY_EVERY * 100));
         assert!(!should_retry(HotkeyStatus::Unbound, RETRY_EVERY * 100));
+    }
+
+    /// **The 3,416-line report, as a rule.**
+    ///
+    /// `deskwarden.log` carried one sentence about `Ctrl+Alt+S` 3,416 times
+    /// because the retry wrote a `warn!` on every pass. The retry is right and
+    /// is untouched; what is pinned here is that the *sentence* is written only
+    /// when something a reader did not already know has happened. See
+    /// [`REMIND_EVERY`].
+    #[test]
+    fn an_unchanged_failure_is_logged_once_and_then_once_an_hour() {
+        let taken = HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram);
+        let refused = HotkeyStatus::Unavailable(Unavailable::Refused);
+        let untried = HotkeyStatus::Unavailable(Unavailable::NotYetAttempted);
+
+        // Nothing said yet: the first failure of a launch or a rebind.
+        assert!(should_log_failure(untried, taken, None));
+        // ...and it is the ONLY one, for the next hour of half-minute retries.
+        assert!(!should_log_failure(taken, taken, Some(Duration::ZERO)));
+        assert!(!should_log_failure(taken, taken, Some(RETRY_EVERY)));
+        assert!(!should_log_failure(
+            taken,
+            taken,
+            Some(REMIND_EVERY - Duration::from_millis(1))
+        ));
+        // One line an hour, so a long session still says it never recovered.
+        assert!(should_log_failure(taken, taken, Some(REMIND_EVERY)));
+        // A different reason is a different fact, however recently the last
+        // one was written.
+        assert!(should_log_failure(taken, refused, Some(Duration::ZERO)));
+
+        // The arithmetic the report is actually about: at `RETRY_EVERY` the
+        // old rule wrote a line per attempt, the new one writes a line per
+        // `REMIND_EVERY`.
+        let a_day = Duration::from_secs(60 * 60 * 24);
+        assert_eq!(a_day.as_secs() / RETRY_EVERY.as_secs(), 2_880);
+        assert_eq!(a_day.as_secs() / REMIND_EVERY.as_secs(), 24);
+    }
+
+    /// **Quiet is earned per outage, not per process.**
+    ///
+    /// A chord that fails, is claimed when the other program exits, and is
+    /// lost again when it restarts has had two outages, and the second one is
+    /// news however little time has passed since the first was written about.
+    /// The recovery in the middle is what resets it -- see `register_all`.
+    #[test]
+    fn a_failure_after_a_recovery_is_news_again() {
+        let taken = HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram);
+        let start = Instant::now();
+        let mut fh = register_fill_hotkeys_with(shipped(), already_registered, unpublished, start);
+        for binding in &fh.bindings {
+            assert!(
+                binding.complained_at.is_some(),
+                "the first failure was not written about at all"
+            );
+        }
+
+        // The other program lets go. Nothing is outstanding any more.
+        fh.attempt = succeeds;
+        assert!(retry_if_unavailable(&mut fh, start + RETRY_EVERY));
+        for binding in &fh.bindings {
+            assert_eq!(binding.status, HotkeyStatus::Armed);
+            assert!(
+                binding.complained_at.is_none(),
+                "a shortcut that is working is still holding an hour of earned quiet, so the \
+                 next time it breaks the log will not say so"
+            );
+        }
+
+        // ...and it comes back. `should_log_failure` sees `None` again.
+        fh.attempt = already_registered;
+        fh.bindings[0].status = taken;
+        assert!(should_log_failure(
+            HotkeyStatus::Armed,
+            taken,
+            fh.bindings[0].complained_at.map(|at| start - at)
+        ));
     }
 
     /// **A conflict that goes away is picked up**, which is the whole reason

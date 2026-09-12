@@ -1,10 +1,24 @@
-# The four preflight mutations, as something you can run
+# The preflight mutations, as something you can run
 
-The preflight gate in `app.rs`'s sequence arm has four recorded mutations --
+The preflight gate in `app.rs`'s sequence arm has recorded mutations --
 escapes the suite is supposed to catch. Until now they existed only as English
 sentences in doc comments, and a figure ("3 / 2 / 1 / 2") was quoted from
 those sentences as a merge gate in
 `docs/superpowers/plans/2026-08-18-the-overlays-other-states.md`.
+
+> **Two of the four cases have been retired.** `03-confirm-deleted` and
+> `04-confirm-answer-ignored` mutated design 4b's send confirmation -- the
+> first deleted the `confirmed_by_preflight` call, the second read its answer
+> and threw it away. The owner had that confirmation removed outright ("user
+> intentionally sends the whatever needed - their right"), so mutation 03 is
+> now simply what `app.rs` says and mutation 04 has no function left to call.
+> A mutation whose "after" state is the shipped source measures nothing, so
+> both directories are gone rather than left to apply against text that is not
+> there -- `run.ps1` treats a `find.txt` that matches zero times as a hard
+> error, which is exactly the right behaviour and exactly why they cannot
+> stay. **Cases 01 and 02 are untouched**: they mutate the GATE, which
+> survived the card and is the thing this directory was built for. See
+> `deskwarden/src/vault_window/preflight.rs`'s module doc.
 
 The figure was not reproducible. Two readers independently re-derived the
 mutations from the prose, wrote slightly different code, and measured
@@ -59,6 +73,11 @@ what say whether the gate still catches the same escape. If a count changes,
 compare the names against the run below before concluding anything.
 
 ## Last measured
+
+**This run is history, not a current expectation**: it names four cases and
+two of them no longer exist, and the two killing tests listed under 03 and 04
+were deleted with the confirmation they were about. Cases 01 and 02, and their
+killers, are unchanged -- re-run to get current numbers.
 
 Commit `e22805f`, 2026-08-19, on Windows 11 / `pwsh` 7. Re-run unchanged at
 `d750693` (this work merged with the password-health branch, 2026-08-19):
@@ -116,8 +135,11 @@ written down.
   neutralising it are, to this suite, the same escape -- which is correct and
   worth knowing, but it means "neutralise vs delete" was never two data
   points.
-- Case 04 has exactly one killer. `a_cancelled_confirmation_types_nothing` is
-  the only test in the crate that notices the confirmation's answer being
-  discarded, which is precisely why it is a separate test from the one above
-  it. A single killer is not weak here, but it has no redundancy: delete that
-  test and the escape becomes free.
+- Case 04 had exactly one killer. `a_cancelled_confirmation_types_nothing` was
+  the only test in the crate that noticed the confirmation's answer being
+  discarded, which is precisely why it was a separate test from the one above
+  it. A single killer is not weak, but it has no redundancy: delete that test
+  and the escape becomes free. That turned out not to matter in the end --
+  the confirmation itself was removed, and the test went with it -- but the
+  observation is the reason this file records killer *names* rather than only
+  counts.

@@ -1888,6 +1888,45 @@ const MANUAL_BODY_PAD: i8 = 16;
 /// See [`MANUAL_BODY_PAD`].
 const MANUAL_BODY_GAP: f32 = 14.0;
 
+/// How far short of the card's own border the body's scroll bar stops.
+///
+/// **The report was "2 lines on the right side", and the second line was the
+/// scroll bar.** [`draw_add_form`]'s body scrolls -- see [`MODAL_BREATHING`]
+/// for why it must -- and egui's default floating bar is pinned flush to the
+/// right edge of the area it scrolls, which here is the inside of
+/// [`stage_card`]'s 1pt stroke: measured at a 420pt window the bar painted
+/// across x = 468.5..469.0 with the border at 469.5. A 6pt rule touching a 1pt
+/// rule is two edges on a card the design draws with one.
+///
+/// **Why an inset rather than `theme::scrollbar_in_gutter`.** That helper is
+/// this app's answer to the same defect on the item list, the edit form and
+/// the read pane, and it deliberately puts the bar FLUSH to the outer edge --
+/// "where the platform's own scroll bars sit" -- because on those three
+/// surfaces the outer edge is a PANE boundary with no ink on it, so flush
+/// costs the reader nothing and centring would spend the lane on a gap
+/// against nothing. This card's outer edge is a drawn border, so the same
+/// placement produces precisely the defect being fixed. What carries over is
+/// the helper's other three numbers -- [`theme::SCROLLBAR_WIDTH`] for the
+/// bar, the same width again for `floating_width` so it does not GROW
+/// leftward over the body when hovered -- and they are taken from `theme`
+/// rather than respelled here.
+///
+/// **And no lane is reserved.** `scrollbar_in_gutter`'s containers have zero
+/// right padding and hand the bar that space; this body already has
+/// [`MANUAL_BODY_PAD`] of its own on every side, and the bar is 6 of it. The
+/// bar therefore floats inside padding that was already empty: nothing is
+/// reserved, so the body's content width CANNOT change as the bar comes and
+/// goes, which is the width jump `AlwaysVisible` exists to prevent on the
+/// panes that do reserve. The visibility mode stays egui's default for the
+/// same reason -- a bar is painted only when there is something to scroll,
+/// and a card that fits shows no bar at all rather than a hidden-but-reserved
+/// one.
+///
+/// The value centres the bar in the padding it floats in, so the clear space
+/// either side of it is equal and neither the border nor the body's own right
+/// edge is the thing it crowds.
+const MANUAL_SCROLLBAR_INSET: f32 = (MANUAL_BODY_PAD as f32 - theme::SCROLLBAR_WIDTH) / 2.0;
+
 /// The field's block: `gap: 7px` between the caption, the box and the line
 /// under it, with the caption at `font-size: 12px; color: #605d5d`.
 ///
@@ -2804,6 +2843,17 @@ pub fn draw_add_form(ui: &mut egui::Ui, state: &mut TotpAdd, now_unix: u64) -> T
         // a different card -- and the body is only as tall as its contents
         // until it reaches `room`, so the short states of 6d do not open a
         // window-tall card round a single field.
+        // **The card keeps ONE edge.** See [`MANUAL_SCROLLBAR_INSET`]: the bar
+        // below is moved off the border and into the body's own padding, and
+        // stopped from growing back over the body when the pointer is near it.
+        // Set on the card's own `Ui` because this is the only scroll area
+        // under it; the two bands that follow read no scroll spacing at all.
+        {
+            let scroll = &mut ui.spacing_mut().scroll;
+            scroll.bar_width = theme::SCROLLBAR_WIDTH;
+            scroll.floating_width = theme::SCROLLBAR_WIDTH;
+            scroll.bar_outer_margin = MANUAL_SCROLLBAR_INSET;
+        }
         let reading = egui::ScrollArea::vertical()
             .max_height(room)
             .auto_shrink([false, true])
@@ -5309,6 +5359,168 @@ mod tests {
              against nothing"
         );
         painted
+    }
+
+    /// Every rect the form actually INKS, flattened out of the shape tree.
+    ///
+    /// Fully transparent rects are dropped: egui emits the scroll area's own
+    /// clip and content rects as shapes with no fill and no stroke, and one of
+    /// them runs the full width of the card's inside -- close enough to the
+    /// body's content edge to be mistaken for it by anything measuring widths.
+    ///
+    /// The scroll bar is the one piece of this card egui draws rather than
+    /// this module, so it cannot be checked by reading a constant back: the
+    /// only honest question is where the pixels landed.
+    fn painted_rects(short_window: bool) -> Vec<egui::Rect> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    let inked = rect.fill.a() > 0
+                        || (rect.stroke.width > 0.0 && rect.stroke.color.a() > 0);
+                    if inked {
+                        out.push(rect.rect);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let ctx = egui::Context::default();
+        // 420 is short enough that the body overflows `room` and the bar is
+        // genuinely needed; 900 is taller than the card, so nothing scrolls.
+        let height = if short_window { 420.0 } else { 900.0 };
+        let base = move || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, height),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(base(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(base(), |_ui| {});
+
+        let mut state = TotpAdd::opening("id-1", "Git Host", true);
+        state.typed = Zeroizing::new("JBSWY3DPEHPK3PXP".to_string());
+
+        // **With the pointer inside the card.** A floating bar egui has faded
+        // out is still emitted as a shape, at a fraction of its width and at
+        // zero alpha, so a frame drawn with the pointer away would measure a
+        // ghost. Frames are run until the fade-in has settled; the width
+        // assertion below is what makes a bar measured mid-animation fail
+        // loudly rather than pass against a smaller number.
+        let hovered = move || egui::RawInput {
+            events: vec![egui::Event::PointerMoved(egui::pos2(300.0, 150.0))],
+            ..base()
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..60 {
+            let output = ctx.run_ui(hovered(), |ui| {
+                draw_add_form(ui, &mut state, 1_700_000_000);
+            });
+            shapes = output.shapes;
+        }
+
+        let mut rects = Vec::new();
+        for clipped in &shapes {
+            walk(&clipped.shape, &mut rects);
+        }
+        assert!(!rects.is_empty(), "the form painted nothing at all");
+        rects
+    }
+
+    /// The rects that are the width of a scroll bar and tall enough to be one.
+    fn scrollbar_rects(rects: &[egui::Rect]) -> Vec<egui::Rect> {
+        rects
+            .iter()
+            .copied()
+            .filter(|rect| {
+                (rect.width() - theme::SCROLLBAR_WIDTH).abs() < 0.01 && rect.height() > 50.0
+            })
+            .collect()
+    }
+
+    /// The right edge of the widest thing drawn INSIDE the card, i.e. the
+    /// body's own content edge rather than the card's.
+    fn body_content_right(rects: &[egui::Rect]) -> f32 {
+        rects
+            .iter()
+            .filter(|rect| rect.width() > 300.0 && rect.width() < MANUAL_WIDTH - 1.0)
+            .map(|rect| rect.right())
+            .fold(f32::MIN, f32::max)
+    }
+
+    /// **"also 2 lines on the right side", on a card the design draws with
+    /// one.**
+    ///
+    /// The second line was egui's own. The body scrolls -- see
+    /// [`MODAL_BREATHING`] for why it must -- and a floating bar is pinned
+    /// flush to the right edge of the area it scrolls, which on this card is
+    /// the inside of [`stage_card`]'s stroke. Measured before the fix, the bar
+    /// painted across x = 468.5..469.0 against a border at 469.5: two rules a
+    /// point apart, which is exactly what was reported.
+    ///
+    /// Pinned as a GAP rather than as a coordinate. What matters is that the
+    /// bar clears the border it was crowding AND clears the body's own right
+    /// edge, so that the complaint cannot be answered by sliding the defect
+    /// off the border and onto the content. See [`MANUAL_SCROLLBAR_INSET`].
+    #[test]
+    fn the_cards_scroll_bar_does_not_read_as_a_second_right_edge() {
+        let rects = painted_rects(true);
+        let bars = scrollbar_rects(&rects);
+        assert!(
+            !bars.is_empty(),
+            "no scroll bar was painted on a window too short for the body, so either the \
+             fixture stopped overflowing or the scroll itself was lost"
+        );
+
+        // The card is drawn from the origin of this headless frame at
+        // `MANUAL_WIDTH`, so its stroke runs down the inside of that edge.
+        let card_inner_right = MANUAL_WIDTH - CARD_STROKE;
+        let content_right = body_content_right(&rects);
+        for bar in &bars {
+            assert!(
+                (card_inner_right - bar.right() - MANUAL_SCROLLBAR_INSET).abs() < 0.01,
+                "the bar at {bar:?} does not stop {MANUAL_SCROLLBAR_INSET} short of the card's \
+                 edge at {card_inner_right}; flush against it is the reported defect"
+            );
+            assert!(
+                bar.left() >= content_right,
+                "the bar at {bar:?} reaches back over the body, whose right edge is at \
+                 {content_right}"
+            );
+        }
+    }
+
+    /// **The card that fits paints no bar at all, and no narrower body.**
+    ///
+    /// Nothing is reserved for the bar -- it floats inside padding the body
+    /// already had -- so the visibility mode stays egui's default and a card
+    /// with nothing to scroll shows one edge and no rule beside it. The other
+    /// half of that claim is that the body is the same width either way, which
+    /// is what a reserved lane would have cost; both are measured here.
+    #[test]
+    fn a_card_that_fits_paints_no_bar_and_keeps_the_bodys_width() {
+        let tall = painted_rects(false);
+        assert!(
+            scrollbar_rects(&tall).is_empty(),
+            "a bar was painted down a card with nothing to scroll: {:?}",
+            scrollbar_rects(&tall)
+        );
+
+        let short = painted_rects(true);
+        assert!(
+            (body_content_right(&short) - body_content_right(&tall)).abs() < 0.01,
+            "the body's right edge moved when the bar appeared: {} while scrolling against {} \
+             while not",
+            body_content_right(&short),
+            body_content_right(&tall)
+        );
     }
 
     #[test]

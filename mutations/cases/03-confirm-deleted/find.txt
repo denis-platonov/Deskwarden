@@ -1,3 +1,0 @@
-                    if !confirmed_by_preflight(gate, guard, &item, &choice, totp.as_deref()) {
-                        return;
-                    }

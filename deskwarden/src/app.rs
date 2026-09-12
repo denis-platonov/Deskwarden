@@ -553,15 +553,29 @@ pub fn fill_from_vault_with<A: UiAutomationFiller, B: SendInputFiller>(
                     let sink = fill_outcome_sink(fill_stats, item_id);
                     let rule_image = crate::vault_bridge::extract_app_match(&item).map(|m| m.process);
                     let guard = preflight_guard_for(&choice, rule_image.as_deref());
-                    // **The 4b surface, hosted.** It runs BEFORE the gate and
-                    // never instead of it: its only affirmative answer lets
-                    // this arm go on and call `dispatch_with`, which describes
-                    // the foreground again and refuses on its own terms. See
-                    // `preflight::SendGate::confirm` for why that ordering is
-                    // what keeps the gate's mutation measurement intact.
-                    if !confirmed_by_preflight(gate, guard, &item, &choice, totp.as_deref()) {
-                        return;
-                    }
+                    // **Nothing stands here any more, and the gap is the
+                    // point.** Design 4b's card used to be opened on this
+                    // line: a confirmation that named the target window,
+                    // listed the steps, and asked for an 800 ms hold on the
+                    // space bar before a single keystroke left the app. The
+                    // owner had it removed -- "user intentionally sends the
+                    // whatever needed - their right" -- and the reasoning is
+                    // recorded in full in `vault_window::preflight`'s module
+                    // doc. In short: the user put the caret in a field and
+                    // then asked for this fill by name, and an app that asks
+                    // again about a decision it has just watched twice is not
+                    // adding a check, it is training a reflex.
+                    //
+                    // What the removal did NOT take with it is everything the
+                    // next four lines do. `dispatch_with` describes the
+                    // foreground and refuses on its own terms, exactly as
+                    // before; the refusal arms below still tell the user; and
+                    // `injector::sequence::run` still abandons the plan the
+                    // moment the target window stops being in front. The one
+                    // real change in reporting is that a refusal now reaches
+                    // the user from the `Gated::Refused` arm rather than from
+                    // the card -- which is a channel with a test on it, and
+                    // the card's was not.
                     let gated = crate::vault_window::preflight::dispatch_with(
                         gate,
                         guard,
@@ -696,98 +710,6 @@ pub fn preflight_guard_for<'a>(
         }
         FillChoice::Just(_) | FillChoice::UserTabPass | FillChoice::Saved => {
             crate::vault_window::preflight::Guard::NotRequired
-        }
-    }
-}
-
-/// **Asks the hosted 4b confirmation, and answers whether the fill may go on
-/// to ask the gate.**
-///
-/// Three ways this answers `true`, and each is deliberate:
-///
-/// 1. [`crate::vault_window::preflight::Guard::NotRequired`] -- the fill is
-///    not one the preflight speaks for (see [`preflight_guard_for`]), so no
-///    window is opened and nothing is asked. Putting a modal in front of every
-///    `UserTabPass` fill would make the app unusable, and it would ask a
-///    question about masking that those fills deliberately do not answer.
-/// 2. The foreground could not be described. **Nothing is confirmed and
-///    nothing is sent**: `dispatch_with` is still called, sees the same
-///    `None`, and answers `Gated::NoTarget`, which is the arm that tells the
-///    user. Returning `true` here rather than short-circuiting keeps the
-///    reporting of an undescribable foreground in exactly one place.
-/// 3. The user completed the hold.
-///
-/// Everything else -- Esc, Cancel, Dismiss, "Copy instead", the window closed
-/// with the X, a second preflight already open -- answers `false`, and a
-/// `false` types nothing.
-///
-/// # It is not the gate
-///
-/// A `true` from here is permission to *ask*, not permission to type.
-/// `dispatch_with` runs immediately after and makes its own observation. That
-/// is what lets this be hosted without weakening the measurement the refusal
-/// arms carry: the routing tests drive
-/// [`crate::vault_window::preflight::SendGate::describing`], whose
-/// confirmation always says `Send`, so what they see is the gate on its own.
-fn confirmed_by_preflight(
-    gate: &crate::vault_window::preflight::SendGate,
-    guard: crate::vault_window::preflight::Guard<'_>,
-    item: &VaultItem,
-    choice: &FillChoice,
-    totp: Option<&str>,
-) -> bool {
-    let crate::vault_window::preflight::Guard::Preflight { rule_image } = guard else {
-        return true;
-    };
-    let Some(target) = gate.describe() else {
-        return true;
-    };
-    // No rule recorded means no process claim to show, so the surface says the
-    // target claims itself -- the same `None` reading `dispatch_with` makes,
-    // spelled the same way so the two cannot disagree about what the user was
-    // shown and what was then checked.
-    let claim = rule_image.unwrap_or(target.image_name.as_str()).to_string();
-
-    let (username, password) = credentials_for(item);
-    let password = zeroize::Zeroizing::new(password);
-    // The step rows are built from this, and `step_rows(.., false)` writes the
-    // mask for a secret in a branch whose `else` is the only one that can
-    // resolve a value -- so nothing borrowed here can reach the screen.
-    let totp_state = crate::vault_window::detail::TotpState::NoSecret;
-    let source = crate::key_sequence::ResolveSource {
-        username: &username,
-        password: password.as_str(),
-        custom: crate::key_sequence::custom_pairs(item),
-        totp: &totp_state,
-    };
-    let sequence = match choice {
-        FillChoice::Just(field) => {
-            crate::key_sequence::render(&[crate::key_sequence::Token::Field(field.clone())])
-        }
-        // **Effectively `Saved`-only.** `UserTabPass` shares the arm because
-        // the match must be total, not because it can arrive here: it is the
-        // one choice `fill_action` answers `FillAction::Default` for, so it
-        // never reaches `confirmed_by_preflight` at all, and even if it did,
-        // `preflight_guard_for` answers `NotRequired` for it and the `else`
-        // above returns before this line. Do not read it as evidence that
-        // `UserTabPass` previews a stored sequence -- it has none to preview.
-        FillChoice::UserTabPass | FillChoice::Saved => sequence_for(item),
-    };
-    // "Copy instead" is an escape from typing, not from the vault: it is the
-    // very value this fill was going to type, and it is the only secret the
-    // window is handed. `Zeroizing` so the window's exit wipes it.
-    let copy = zeroize::Zeroizing::new(match choice {
-        FillChoice::Just(key_sequence::FieldRef::Totp) => totp.unwrap_or_default().to_string(),
-        _ => password.to_string(),
-    });
-
-    let state =
-        crate::vault_window::preflight::PreflightState::new(target, &claim, &sequence, &source);
-    match gate.confirm(state, copy) {
-        Some(crate::vault_window::preflight::PreflightAction::Send) => true,
-        answered => {
-            log::info!("the preflight was not confirmed ({answered:?}); nothing was typed");
-            false
         }
     }
 }
@@ -2015,6 +1937,369 @@ pub fn prompt_choices(item: Option<&VaultItem>) -> Vec<FillChoice> {
     item.map(fill_choices).unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// The remembered record's card, and the one numbering idiom both cards share.
+//
+// `crate::fill_recall` decides WHETHER a record is offered; everything from
+// here to the end of this block decides WHAT the card then says and which key
+// answers which row. It is in `app.rs` for the reason `FillShortcut`'s own doc
+// gives for being here and not in `hotkey`: what a press MEANS is a fill
+// question, and every other fill question in this app is answered in this
+// file. `prompt_card` paints these answers and decides none of them.
+// ---------------------------------------------------------------------------
+
+/// **The way back out of a remembered record**, as the last row says it.
+///
+/// The owner asked for it in the same breath as the feature -- "add back kind
+/// of thing if user needs to pick another records instead of the one
+/// prepopulated" -- and it is not a nicety. A prepopulated record the user
+/// cannot get past is strictly worse than no memory at all, because the
+/// picker at least opens; the memory would have *removed* a door rather than
+/// added a shortcut.
+///
+/// The wording is what it does and not where it goes. *Back* alone would be a
+/// lie -- there is nothing behind this card, it opened on a keystroke -- and
+/// *Search the vault* is the picker's own row for a narrower thing. "Pick a
+/// different record" names the only thing the row can be wanted for.
+///
+/// It lives here rather than in `prompt_card` because it is a product
+/// decision this file's tests pin, and because the painter is handed the
+/// string rather than owning it -- see [`recall_rows`].
+pub const RECALL_BACK_LABEL: &str = "Pick a different record";
+
+/// The keycap the back row draws, and the key it accepts: **Backspace**.
+///
+/// # Why not a digit, and why not a letter
+///
+/// A digit is refused for [`crate::picker_prompt::row_shortcut`]'s reason,
+/// stated there and worth obeying here: that function answers `None` past the
+/// candidate rows precisely so that no digit can land on *Search the vault*,
+/// "which means something else entirely, and a digit that landed on it would
+/// be a trap". This row means something else entirely in exactly that sense --
+/// every other row types a credential and this one types nothing -- so a user
+/// who mis-counts must not be able to reach it with the gesture they use to
+/// fill.
+///
+/// A letter is refused because the daemon's cards have spent their letter
+/// budget with reasons attached: `N` is *New login*, `S` is search, `B` is
+/// *Edit binding*, and re-using any of them here for a fourth meaning on a
+/// sibling card the user meets a minute later is the confusion those constants
+/// each argue against.
+///
+/// Backspace is free, collides with nothing, types nothing on a card with no
+/// text box, and has meant *back* to everyone who has used a browser for
+/// twenty-five years. `the_back_row_answers_backspace_and_no_digit_reaches_it`
+/// is what stops it becoming another drawn-and-dead keycap.
+pub const RECALL_BACK_KEYCAP: &str = "BKSP";
+
+/// One row of the remembered-record card: a way to type this record, or the
+/// way out.
+///
+/// **The answer type as well as the row type**, deliberately. The card's rows
+/// and the card's possible answers are the same list, indexed the same way, so
+/// [`recall_at`] cannot resolve a row to something the row did not say -- which
+/// is [`crate::prompt_card::Row`]'s own rule ("which choice a row answers is
+/// its *index*") applied to a list that now has one non-fill member in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecallRow {
+    /// Type this. The rows the item really supports, from [`fill_choices`], in
+    /// the order it offers them.
+    Fill(FillChoice),
+    /// Forget this record and open the ordinary account picker. Always last,
+    /// always present.
+    Back,
+}
+
+/// **The remembered-record card's rows**, in the order they are drawn.
+///
+/// The item's own fill choices -- the same [`prompt_choices`] the matched-item
+/// overlay offers, so a user meets one list of ways to type a record and not
+/// two -- with the way back appended.
+///
+/// **The back row is appended unconditionally**, including for a cache miss
+/// where `prompt_choices` answers an empty list. That case is the one where it
+/// matters most: an item that could not be read back offers nothing to type,
+/// and a card with no rows at all would be a window whose only exit was
+/// Escape, opened in answer to a shortcut the user pressed on purpose.
+pub fn recall_rows(item: Option<&VaultItem>) -> Vec<RecallRow> {
+    recall_rows_from(prompt_choices(item))
+}
+
+/// [`recall_rows`], from a choice list that has already been computed.
+///
+/// **This is the form the painter uses**, and it exists so that
+/// [`crate::prompt_card`] can resolve the row the user clicked without being
+/// handed a [`VaultItem`] -- the drop-early rule [`PromptSubject`] records,
+/// which this card obeys for the same reason the matched-item card does. The
+/// painter is given `&[FillChoice]`, appends nothing itself, and asks this
+/// file what the list means.
+///
+/// It is also what makes the two lists provably one list: the rows that are
+/// drawn and the answers they resolve to come out of the same call, so a card
+/// cannot draw four rows and answer from five.
+///
+/// **The fill rows are truncated so that the way back always fits**, at
+/// [`crate::prompt_card::ROW_CAP`] minus the one row this card adds. That is
+/// [`crate::prompt_card::rows`]'s own rule and its own reason: the card is a
+/// frameless window that neither scrolls nor resizes, so a row past the bottom
+/// edge is not a row the user can reach -- and it is far more important here,
+/// because the row that would fall off is the exit. Written against the cap
+/// rather than as a literal, so raising the cap widens this list by itself.
+pub fn recall_rows_from(choices: Vec<FillChoice>) -> Vec<RecallRow> {
+    choices
+        .into_iter()
+        .take(crate::prompt_card::ROW_CAP.saturating_sub(1))
+        .map(RecallRow::Fill)
+        .chain(std::iter::once(RecallRow::Back))
+        .collect()
+}
+
+/// Which row `index` answers.
+///
+/// **Out of range answers [`RecallRow::Back`]**, and that is the opposite
+/// choice from [`crate::prompt_card::choice_at`]'s deliberately. That function
+/// answers `FillChoice::Saved` out of range because its empty-choice card has
+/// exactly one meaning and no index to look up; this card always has rows, so
+/// an index past them is a row the user cannot have seen -- and the safe
+/// answer to a row nobody saw is the one that types nothing. `Back` opens the
+/// picker, which is where a confused press should end up anyway.
+pub fn recall_at(rows: &[RecallRow], index: usize) -> RecallRow {
+    rows.get(index).cloned().unwrap_or(RecallRow::Back)
+}
+
+/// Which row **Backspace** takes, on a card showing these rows.
+///
+/// Read by the window's key handling and by nothing else, so that the key and
+/// the row it lands on are one answer. `None` is unreachable through
+/// [`recall_rows`], which always appends the row -- it is stated anyway, so
+/// that a caller handed some other list swallows the key instead of picking
+/// the last credential on the card.
+pub fn recall_back_row(rows: &[RecallRow]) -> Option<usize> {
+    rows.iter().position(|row| *row == RecallRow::Back)
+}
+
+/// **The highest row number this app will ever put on a card.**
+///
+/// Nine, because the shortcuts are single digits and there is no tenth one.
+/// The owner's own words when the picker's shortcuts were first asked for
+/// were "Search should be S then and the rest 1...9", so this is the bound
+/// they already have in mind rather than one invented here.
+///
+/// A row past it simply carries no keycap -- see [`digit_keycap`] -- and no
+/// digit can reach it, see [`digit_pick`]. It is deliberately not "and the
+/// tenth gets `0`": `0` before `1` reads as a tenth row numbered zero, and a
+/// list that ran 1-9 then 0 is a list whose numbering the user has to be told
+/// about.
+pub const DIGIT_CAP: usize = 9;
+
+/// The modifier keycap, and the word it is joined to a digit with.
+///
+/// One spelling, read by the rule that fires and by the cap that is drawn, so
+/// a row cannot advertise `CTRL 2` while something else listens for a bare
+/// `2`. See [`digit_keycap`].
+pub const CTRL_KEYCAP: &str = "CTRL";
+
+/// **Which modifiers were down when a digit arrived.**
+///
+/// Two fields and not four: `SHIFT`+digit is a punctuation mark on every
+/// layout and `SUPER`+digit is the shell's taskbar chord, so neither is a
+/// thing this app may take. What is left is the pair that decides between "the
+/// user is choosing a row" and "the user is typing a character", which is the
+/// whole question [`digit_pick`] exists to answer.
+///
+/// A struct rather than two `bool` arguments because they are both `bool` and
+/// the compiler cannot tell them apart, which is this crate's standing reason
+/// for naming a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyMods {
+    pub ctrl: bool,
+    pub alt: bool,
+}
+
+impl KeyMods {
+    /// Nothing held. What every key on a card with no text box arrives as.
+    pub const NONE: KeyMods = KeyMods { ctrl: false, alt: false };
+    /// `CTRL` alone -- the binding that works on every surface.
+    pub const CTRL: KeyMods = KeyMods { ctrl: true, alt: false };
+    /// **`AltGr`, as Windows delivers it**: the right-hand Alt key sets *both*
+    /// `VK_CONTROL` and `VK_MENU`, which is why this is a named constant and
+    /// not a curiosity. See [`digit_pick`].
+    pub const ALT_GR: KeyMods = KeyMods { ctrl: true, alt: true };
+}
+
+/// **What a surface accepts as "the Nth row".**
+///
+/// One idiom, two costs. The digit is the same digit and it means the same
+/// thing on every card in this app; what changes is whether the surface can
+/// afford to hear it bare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigitBinding {
+    /// **A card with no text box.** A bare digit chooses the row, and `CTRL` +
+    /// the digit does too. This is what [`crate::picker_prompt`]'s candidate
+    /// list and its second step already do -- asked for by name: "Ctrl + Alt +
+    /// 1 etc can be replaced with just 1 I think - the window is focused and
+    /// it is temp state while it is open anyways".
+    Bare,
+    /// **A card whose text box has the keyboard.** `CTRL` + the digit chooses
+    /// the row; a bare digit is a character and belongs to the box.
+    ///
+    /// This is not a second idiom, it is the same one paying for the box. The
+    /// row draws `CTRL 2` rather than `2`, so nothing advertised is dead --
+    /// which is the defect this crate has now shipped twice.
+    Ctrl,
+}
+
+/// **Which row a digit chooses**, or `None` if it chooses nothing.
+///
+/// The one place the rule lives, read by both cards' key handling and by
+/// [`digit_keycap`], so the key a row advertises and the key that fires cannot
+/// become two answers. It is [`crate::picker_prompt::candidate_for_digit`]'s
+/// shape widened by a modifier, and it keeps that function's three refusals:
+/// a digit outside `1..=9`, a digit past the rows on screen, and a digit past
+/// [`DIGIT_CAP`] all choose nothing at all -- they do not beep, close the card,
+/// or fall through to a neighbouring row.
+///
+/// # `ALT` is refused by both bindings, and that is the load-bearing line
+///
+/// On German, Polish, Portuguese and a dozen other layouts the right-hand Alt
+/// key is `AltGr`, and Windows delivers it as `CTRL`+`ALT`. `AltGr`+`2` is the
+/// character `@`. So a rule that accepted "`CTRL` is down" would make an email
+/// address untypable in the search box -- while the user is searching for an
+/// account *by* their email address, which is the commonest thing anyone does
+/// in that box.
+///
+/// This is not hypothetical and it is not new: `picker_prompt`'s own shortcut
+/// section records that `CTRL+ALT+1..4` was removed for exactly this reason
+/// and "must not come back over that box". Requiring `ALT` to be **up** is how
+/// the modifier comes back without the hazard: plain `CTRL` is reachable on
+/// every layout and is not `AltGr` on any of them.
+/// `alt_gr_types_an_at_sign_and_does_not_choose_a_row` is the pin.
+pub fn digit_pick(
+    binding: DigitBinding,
+    mods: KeyMods,
+    digit: u32,
+    shown: usize,
+) -> Option<usize> {
+    if mods.alt {
+        return None;
+    }
+    if binding == DigitBinding::Ctrl && !mods.ctrl {
+        return None;
+    }
+    if !(1..=DIGIT_CAP as u32).contains(&digit) {
+        return None;
+    }
+    let index = digit as usize - 1;
+    (index < shown.min(DIGIT_CAP)).then_some(index)
+}
+
+/// **The keycap row `index` draws**, on a surface showing `shown` rows under
+/// this binding -- or `None` for a row that has no shortcut.
+///
+/// Derived from [`digit_pick`] rather than from arithmetic of its own, which
+/// is the only way "what is drawn is what fires" can be a fact rather than a
+/// convention: the cap exists precisely when the key the cap names would
+/// choose this row.
+///
+/// **The tenth row and beyond get `None`** -- no cap, and no digit reaches
+/// them. A list that implied a shortcut it does not have is the same defect as
+/// one that draws a key nothing binds, in the other direction.
+pub fn digit_keycap(binding: DigitBinding, index: usize, shown: usize) -> Option<String> {
+    let mods = match binding {
+        DigitBinding::Bare => KeyMods::NONE,
+        DigitBinding::Ctrl => KeyMods::CTRL,
+    };
+    let digit = u32::try_from(index).ok()?.checked_add(1)?;
+    if digit_pick(binding, mods, digit, shown)? != index {
+        return None;
+    }
+    Some(match binding {
+        DigitBinding::Bare => format!("{digit}"),
+        DigitBinding::Ctrl => format!("{CTRL_KEYCAP} {digit}"),
+    })
+}
+
+/// The keycap row `index` of the **remembered-record card** draws.
+///
+/// [`digit_keycap`] for a fill row, [`RECALL_BACK_KEYCAP`] for the way out.
+/// The card has no text box, so the digits are bare -- see [`DigitBinding`].
+///
+/// **The back row is counted in `rows` but never numbered**, which is what
+/// keeps the numbering honest in both directions: the digits run 1..n over the
+/// ways to type the record, and the row that types nothing is reached by a key
+/// that means something else.
+pub fn recall_keycap(rows: &[RecallRow], index: usize) -> Option<String> {
+    match rows.get(index)? {
+        RecallRow::Back => Some(RECALL_BACK_KEYCAP.to_string()),
+        RecallRow::Fill(_) => {
+            let fills = rows.iter().filter(|row| matches!(row, RecallRow::Fill(_))).count();
+            digit_keycap(DigitBinding::Bare, index, fills)
+        }
+    }
+}
+
+/// **What one press of the picker chord with nothing armed should open.**
+///
+/// The whole of the "is there a record to offer" decision as a pure function,
+/// for [`disposition`]'s reason: the one production caller is a branch in
+/// `main`'s event loop that no test can reach, so a `RecallPlan::Picker`
+/// written there by hand would delete this feature with every test green.
+///
+/// **The vault state is read here as well as at the lock.**
+/// `crate::fill_recall::FillRecall::forget` is called when the vault locks, so
+/// in the ordinary case this arm is unreachable -- and it is written anyway,
+/// because "the memory was cleared on the lock" is a claim about a call site
+/// in `main` and this is a claim about the answer. A record cannot be offered
+/// out of a vault this process cannot read: the card would name an item id it
+/// could not resolve to a name, and its rows would be a list of fields nobody
+/// can fetch. The locked window's own card is [`Open::Locked`] and is reached
+/// through [`disposition`] exactly as it is today; nothing here opens it.
+///
+/// **Nothing else gates it.** In particular [`OverlayPrompts::Silenced`],
+/// [`NeverForApp`] and [`BrowserWindow`] are not consulted, for the reason
+/// `disposition`'s `Trigger::Hotkey` arm does not consult them either: those
+/// three exist to stop this app interrupting somebody who did not ask, and a
+/// chord press is somebody asking. A browser in particular is the *motivating*
+/// case here -- the multi-page sign-in the owner described is a browser -- so
+/// a browser suppressor on this path would suppress the feature.
+pub fn recall_plan(
+    recall: &crate::fill_recall::FillRecall,
+    key: &crate::fill_recall::WindowKey,
+    vault: VaultAvailability,
+    now: std::time::Instant,
+) -> RecallPlan {
+    if vault == VaultAvailability::Locked {
+        return RecallPlan::Picker;
+    }
+    match recall.recall(key, now) {
+        crate::fill_recall::Recall::Offer(item_id) => RecallPlan::Offer(item_id.to_string()),
+        crate::fill_recall::Recall::Nothing(_) => RecallPlan::Picker,
+    }
+}
+
+/// [`recall_plan`]'s answer.
+///
+/// Two variants and not an `Option<&str>`, for [`NoMatchFollowUp`]'s reason:
+/// the value crosses into `main`'s event loop and decides which of two windows
+/// opens, and "there is a string" is a worse way to say "offer the record the
+/// user just used" than saying it.
+///
+/// **The id is owned**, where [`crate::fill_recall::Recall`]'s is borrowed.
+/// The running app's memory lives behind a mutex
+/// ([`crate::fill_recall::with_production`]), and a borrow of what is inside
+/// it could only be had by holding the lock -- across a card being put on
+/// screen, which is the one thing a process-wide mutex on this path must never
+/// do. One `String` per press of a hotkey is not a cost worth reasoning about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecallPlan {
+    /// Put the remembered-record card up for this vault item first. If the
+    /// user takes its last row, the picker still opens -- see
+    /// [`RecallRow::Back`].
+    Offer(String),
+    /// Open the ordinary account picker, exactly as this app always has.
+    Picker,
+}
+
 /// Everything the overlay needs about the matched item, and **nothing else**.
 ///
 /// The point of this type is what it does *not* contain. `handle_match` used
@@ -2146,6 +2431,32 @@ pub trait PromptPresenter {
         position: Option<(f32, f32)>,
         choices: &[FillChoice],
     ) -> Option<FillChoice>;
+    /// Shows the **remembered-record card** -- the same overlay as
+    /// [`Self::show`], with the fill rows numbered and
+    /// [`RECALL_BACK_LABEL`] under them -- and answers which row the user
+    /// took.
+    ///
+    /// A separate method rather than a flag on [`Self::show`], for the reason
+    /// [`Self::show_locked`] is separate: the two cards answer different
+    /// questions. `show` answers "which field of the record you are already
+    /// matched to", and its `None` means *dismissed*; this one can also answer
+    /// [`RecallRow::Back`], which is a request to open another window and is
+    /// nothing like a dismissal. A `bool` that chose between them would be a
+    /// `bool` something can pass wrongly, and the wrong pass here is a card
+    /// with no way out of it.
+    ///
+    /// **It takes `&[FillChoice]` and not `&[RecallRow]`**, and answers the
+    /// richer type. The painter is handed exactly what the matched-item card
+    /// is handed, appends nothing of its own, and asks [`recall_rows_from`]
+    /// and [`recall_at`] what its own rows mean -- so the back row cannot be
+    /// drawn in one place and resolved in another.
+    fn show_recall(
+        &self,
+        label: &str,
+        matched: Option<&crate::prompt_card::OverlayMatch>,
+        position: Option<(f32, f32)>,
+        choices: &[FillChoice],
+    ) -> Option<RecallRow>;
     /// Shows design **3c** -- the save-a-new-login form -- and answers what the
     /// user decided together with what they typed.
     ///
@@ -2224,6 +2535,15 @@ pub struct FnPresenter {
         Option<(f32, f32)>,
         &[FillChoice],
     ) -> Option<FillChoice>,
+    /// Asked to put the remembered-record card on screen; answers which row
+    /// the user took. See [`PromptPresenter::show_recall`].
+    #[allow(clippy::type_complexity)]
+    pub show_recall: fn(
+        &str,
+        Option<&crate::prompt_card::OverlayMatch>,
+        Option<(f32, f32)>,
+        &[FillChoice],
+    ) -> Option<RecallRow>,
     /// Asked to put design 3c on screen. See
     /// [`PromptPresenter::show_save_login`].
     #[allow(clippy::type_complexity)]
@@ -2261,6 +2581,16 @@ impl PromptPresenter for FnPresenter {
         (self.show)(label, matched, position, choices)
     }
 
+    fn show_recall(
+        &self,
+        label: &str,
+        matched: Option<&crate::prompt_card::OverlayMatch>,
+        position: Option<(f32, f32)>,
+        choices: &[FillChoice],
+    ) -> Option<RecallRow> {
+        (self.show_recall)(label, matched, position, choices)
+    }
+
     fn show_save_login(
         &self,
         form: save_login_card::SaveLoginForm,
@@ -2288,6 +2618,83 @@ impl PromptPresenter for FnPresenter {
     }
 }
 
+/// **Puts the remembered-record card on screen**, and answers which row the
+/// user took.
+///
+/// # Why this composition is here and not in `prompt_card`
+///
+/// It is built entirely out of [`crate::prompt_card`]'s own public parts --
+/// [`crate::prompt_card::rows`] for the fill rows,
+/// [`crate::prompt_card::account_lines`] for the block above them,
+/// [`crate::prompt_card::run_with`] over [`crate::prompt_card::REAL`] for the
+/// window -- and adds exactly one row and one mapping. It **decides** nothing
+/// that is not already decided in this file: which rows exist is
+/// [`recall_rows_from`], what the extra row says is [`RECALL_BACK_LABEL`], and
+/// what an index means is [`recall_at`].
+///
+/// The crate's rule is that a type whose only reader is a painter belongs
+/// beside the painter, and by that rule this function's natural home is
+/// `prompt_card.rs`. It is here because that file is owned by another change
+/// in flight, and because a composition of public calls is the one shape that
+/// can live on either side of the seam without altering what is drawn. Moving
+/// it there later is a cut and a paste: nothing below this line reads anything
+/// private to this module.
+///
+/// # What it cannot do from here, and what the card is missing until it can
+///
+/// The **keycaps** and the **keys**. The rows this hands over are
+/// [`crate::prompt_card::Row`]s, which carry three strings and no shortcut, and
+/// the window's key handling is `prompt_card`'s `win32::next`. So today the
+/// card is answered by clicking a row, by Tab-and-Enter, and by Escape -- all
+/// of which work -- and not yet by `2` or by Backspace. [`recall_keycap`] is
+/// the answer for what each row should draw and [`recall_back_row`] for which
+/// row Backspace takes; both are pure, tested here, and are what the drawing
+/// change consumes.
+fn show_recall_card(
+    app_name: &str,
+    matched: Option<&crate::prompt_card::OverlayMatch>,
+    anchor: Option<(f32, f32)>,
+    choices: &[FillChoice],
+) -> Option<RecallRow> {
+    let (item_name, username) = match matched {
+        Some(m) => (m.item_name.as_str(), m.username.as_deref()),
+        None => ("", None),
+    };
+    // **One list, built once.** The rows that are drawn and the answers they
+    // resolve to come out of the same `recall_rows_from` call, so the card
+    // cannot draw one list and answer from another -- which is the invariant
+    // `prompt_card::Row`'s own doc is written around ("which choice a row
+    // answers is its *index*").
+    let answers = recall_rows_from(choices.to_vec());
+    let fills: Vec<FillChoice> = answers
+        .iter()
+        .filter_map(|row| match row {
+            RecallRow::Fill(choice) => Some(choice.clone()),
+            RecallRow::Back => None,
+        })
+        .collect();
+    let mut rows = crate::prompt_card::rows(app_name, item_name, username, &fills);
+    let (account, context) = crate::prompt_card::account_lines(app_name, item_name, username);
+    // **A cache miss is the one case `rows` answers with a row of its own** --
+    // the single matched-credential row it has always painted -- and that row
+    // is not a fill choice here, because there are none. It is dropped rather
+    // than left standing above the way back: a row labelled *Saved sequence*
+    // on a card that could not read the item back is a row that answers
+    // `FillChoice::Saved` for an item nothing can resolve.
+    if fills.is_empty() {
+        rows.clear();
+    }
+    rows.push(crate::prompt_card::Row {
+        primary: RECALL_BACK_LABEL.to_string(),
+        account,
+        context,
+    });
+    match crate::prompt_card::run_with(&crate::prompt_card::REAL, &rows, anchor) {
+        crate::prompt_card::Outcome::Fill(index) => Some(recall_at(&answers, index)),
+        crate::prompt_card::Outcome::Cancelled | crate::prompt_card::Outcome::Unavailable => None,
+    }
+}
+
 /// The production presenter: the real placement calculation and the real
 /// window, named and not called.
 ///
@@ -2300,6 +2707,7 @@ impl PromptPresenter for FnPresenter {
 const REAL_OVERLAY: FnPresenter = FnPresenter {
     position: overlay_position,
     show: crate::prompt_card::show_prompt_card,
+    show_recall: show_recall_card,
     show_locked: crate::locked_card::show_locked_card,
     show_save_login: save_login_card::show_save_login_card,
     show_generate: crate::generate_prompt::show_generate_prompt,
@@ -2340,6 +2748,39 @@ pub fn prompt_arm<P: PromptPresenter>(
     let PromptRequest { label, matched, position, choices } =
         prompt_request(window, subject, position);
     presenter.show(label, matched.as_ref(), position, &choices)
+}
+
+/// **The whole of the remembered-record arm, as a pure function** --
+/// [`prompt_arm`]'s sibling, written the same way and for the same two
+/// reasons.
+///
+/// **The placement is asked about the rows this card really has**, which is
+/// one more than the matched-item card's for the same choice list: the way
+/// back is a row, and a card clamped against a height that is a row short puts
+/// its own exit under the taskbar. That would be the [`save_login_arm`] defect
+/// exactly -- its doc records why it asks about `SAVE_LOGIN_ROWS` and not
+/// about the card the user just left -- and it would land on the one row this
+/// feature cannot afford to lose.
+///
+/// The count is taken from [`recall_rows_from`] on the subject's **own** list,
+/// not from `subject.choices.len() + 1`: an arithmetic restatement of what
+/// that function does is a second answer about one card, and
+/// `the_recall_card_is_placed_for_the_rows_it_really_draws` fails on it.
+///
+/// Answers the row, `None` for a dismissal. A dismissal is not
+/// [`RecallRow::Back`]: Escape means "nothing, I am done", and opening the
+/// account picker over a user who just dismissed a card would be this app
+/// answering a refusal with another window.
+pub fn recall_arm<P: PromptPresenter>(
+    presenter: &P,
+    window: &crate::window_watch::ForegroundEvent,
+    subject: PromptSubject,
+) -> Option<RecallRow> {
+    let rows = recall_rows_from(subject.choices.clone()).len();
+    let position = presenter.position(window.hwnd, rows);
+    let PromptRequest { label, matched, position, choices } =
+        prompt_request(window, subject, position);
+    presenter.show_recall(label, matched.as_ref(), position, &choices)
 }
 
 /// **The whole of the 3c arm, as a pure function** -- [`prompt_arm`]'s
@@ -3323,6 +3764,93 @@ pub fn prompt_arm_for<P: PromptPresenter, I: std::borrow::Borrow<VaultItem>>(
     prompt_arm(presenter, window, subject)
 }
 
+/// [`prompt_arm_for`]'s sibling for the remembered-record card, and it obeys
+/// the same drop-early rule for the same reason: the card is modal and stays
+/// on screen for as long as the user is undecided, so the [`VaultItem`] must
+/// die at this statement's semicolon and not at the end of a decision.
+///
+/// **A cache miss is still a card.** `lookup` answering `None` gives a
+/// [`PromptSubject`] with no match and no choices, which [`recall_rows_from`]
+/// turns into a card with one row: the way back. That is deliberately not
+/// silence -- the user pressed a chord and is owed a window -- and it is the
+/// state where the way back is the entire card.
+pub fn recall_arm_for<P: PromptPresenter, I: std::borrow::Borrow<VaultItem>>(
+    presenter: &P,
+    window: &crate::window_watch::ForegroundEvent,
+    lookup: impl FnOnce() -> Option<I>,
+) -> Option<RecallRow> {
+    let subject = prompt_subject(lookup().as_ref().map(|item| item.borrow()));
+    recall_arm(presenter, window, subject)
+}
+
+/// **What `main` must do once the remembered-record card comes down.**
+///
+/// [`NoMatchFollowUp`]'s counterpart for this card, and deliberately a
+/// separate type: that one can ask for a vault window and an unlock prompt,
+/// neither of which this card offers, and this one can ask to be *forgotten*,
+/// which no other card can. A shared enum would be a list of requests half of
+/// which are unreachable from either card.
+///
+/// **It carries an id and a choice, never a value** -- the rule
+/// [`NoMatchFollowUp::Fill`] is written to, and the whole of what
+/// [`crate::fill_recall`] stores anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecallFollowUp {
+    /// Type this field of the remembered record, then remember it again -- see
+    /// [`crate::fill_recall::RECALL_TTL`], which runs from the last fill.
+    Fill { item_id: String, choice: FillChoice },
+    /// The user took the way back. **Forget the record**
+    /// ([`crate::fill_recall::Forgotten::UserWentBack`]) and open the ordinary
+    /// account picker, exactly as a press with nothing remembered does.
+    Picker,
+    /// The card was dismissed. Nothing follows, and the record is **kept**: a
+    /// dismissal is "not now", and the user who presses the chord again on the
+    /// next page of the same sign-in should still be offered it.
+    Nothing,
+}
+
+/// The card's answer as something `main` can carry out.
+///
+/// A pure function for [`picker_follow_up`]'s and [`locked_follow_up`]'s
+/// reason: the only production caller opens a real always-on-top window, so
+/// the mapping would otherwise be testable nowhere. The three arms are the
+/// three things that can happen and the distinction that matters is the last
+/// two -- *Back* opens a window and a dismissal does not, and collapsing them
+/// would answer a refusal with another window.
+pub fn recall_follow_up(item_id: &str, answer: Option<RecallRow>) -> RecallFollowUp {
+    match answer {
+        Some(RecallRow::Fill(choice)) => {
+            RecallFollowUp::Fill { item_id: item_id.to_string(), choice }
+        }
+        Some(RecallRow::Back) => RecallFollowUp::Picker,
+        None => RecallFollowUp::Nothing,
+    }
+}
+
+/// **The whole of the remembered-record arm that needs a vault**: read the
+/// item back so the card can name it, open the card, and say what follows.
+///
+/// [`handle_match`]'s shape, minus everything `handle_match` needs that this
+/// does not. There is no [`Injector`], no `FillStats` and no [`Reprompt`] here
+/// and there must not be: this function opens a card and reports an answer,
+/// and the fill it asks for goes through the one [`fill_from_vault`] call
+/// `main` already makes on this path -- which is where the re-prompt gate, the
+/// preflight and the fill statistics live. A second fill site reachable from a
+/// card would be a second place all three could be forgotten.
+///
+/// Reads the cache rather than `cache.bridge()`, for the reason `handle_match`
+/// records: the fill that follows resolves the item from the cache anyway, so
+/// a bridge read here would miss with the backend stopped at idle and degrade
+/// every card to a nameless one.
+pub fn handle_recall(
+    cache: &VaultCache,
+    window: &crate::window_watch::ForegroundEvent,
+    item_id: &str,
+) -> RecallFollowUp {
+    let lookup = || cache.get_by_id(item_id);
+    recall_follow_up(item_id, recall_arm_for(&REAL_OVERLAY, window, lookup))
+}
+
 /// What to call the app in a window a foreground event describes.
 ///
 /// Normally its executable's file name, which is what every overlay and log
@@ -3796,6 +4324,23 @@ mod tests {
             ));
             self.offered.borrow_mut().push(choices.to_vec());
             self.answer.clone()
+        }
+
+        /// **Deliberately not folded into the log above.** Its own doc calls a
+        /// recorder that lets one card satisfy another card's test the loosest
+        /// of the four, and the remembered-record card is the fifth: it shows
+        /// the same account block through a different method with a different
+        /// answer type. Nothing on this presenter's paths opens it, so saying
+        /// so is stronger than recording it -- `recall_presenter_tests` below
+        /// has a recorder of its own.
+        fn show_recall(
+            &self,
+            _label: &str,
+            _matched: Option<&crate::prompt_card::OverlayMatch>,
+            _position: Option<(f32, f32)>,
+            _choices: &[FillChoice],
+        ) -> Option<RecallRow> {
+            unreachable!("this presenter's paths never open the remembered-record card")
         }
 
         /// Design 3c goes into a log of its own too, for the reason 3a and 3b
@@ -4307,6 +4852,18 @@ mod tests {
             None
         }
 
+        /// Not reached: this spy's test drives the matched-window path, which
+        /// opens the card above and not the remembered-record one.
+        fn show_recall(
+            &self,
+            _label: &str,
+            _matched: Option<&crate::prompt_card::OverlayMatch>,
+            _position: Option<(f32, f32)>,
+            _choices: &[FillChoice],
+        ) -> Option<RecallRow> {
+            unreachable!("this spy's paths never open the remembered-record card")
+        }
+
         /// And so does design 3c's -- it names the app in its App row, which
         /// is the row the whole card is built around.
         fn show_save_login(
@@ -4426,6 +4983,17 @@ mod tests {
             _choices: &[FillChoice],
         ) -> Option<FillChoice> {
             self.log.borrow_mut().push("overlay shown");
+            None
+        }
+
+        fn show_recall(
+            &self,
+            _label: &str,
+            _matched: Option<&crate::prompt_card::OverlayMatch>,
+            _position: Option<(f32, f32)>,
+            _choices: &[FillChoice],
+        ) -> Option<RecallRow> {
+            self.log.borrow_mut().push("remembered-record card shown");
             None
         }
 
@@ -4578,6 +5146,32 @@ mod tests {
         Some(FillChoice::Just(key_sequence::FieldRef::Totp))
     }
 
+    static RECALL_FORWARDED: std::sync::Mutex<Vec<Shown>> = std::sync::Mutex::new(Vec::new());
+    static RECALL_OFFERED: std::sync::Mutex<Vec<Vec<FillChoice>>> =
+        std::sync::Mutex::new(Vec::new());
+
+    /// **Its own log, and its own answer.** The remembered-record card has the
+    /// same four arguments as the matched-item card and a different return
+    /// type, so a slip that pointed `show_recall` at `show` would not compile
+    /// -- but one that pointed both fields at the same recorder would, and the
+    /// forwarding test below would then pass while the two cards' logs were
+    /// one. The answer is [`RecallRow::Back`] and not a fill for the same
+    /// reason: it is the one answer `show` cannot produce.
+    fn recording_show_recall(
+        label: &str,
+        matched: Option<&crate::prompt_card::OverlayMatch>,
+        position: Option<(f32, f32)>,
+        choices: &[FillChoice],
+    ) -> Option<RecallRow> {
+        RECALL_FORWARDED.lock().unwrap().push((
+            label.to_string(),
+            matched.map(|m| (m.item_name.clone(), m.username.clone())),
+            position,
+        ));
+        RECALL_OFFERED.lock().unwrap().push(choices.to_vec());
+        Some(RecallRow::Back)
+    }
+
     static SAVE_LOGIN_FORWARDED: std::sync::Mutex<Vec<NoMatchShown>> =
         std::sync::Mutex::new(Vec::new());
 
@@ -4637,6 +5231,7 @@ mod tests {
         let presenter = FnPresenter {
             position: recording_position,
             show: recording_show,
+            show_recall: recording_show_recall,
             show_locked: recording_show_locked,
             show_save_login: recording_show_save_login,
             show_generate: recording_show_generate,
@@ -4663,7 +5258,35 @@ mod tests {
             Some(FillChoice::Just(key_sequence::FieldRef::Totp)),
             "the answer is forwarded back unaltered -- not collapsed to the first row"
         );
-        assert_eq!(*OFFERED.lock().unwrap(), vec![offered]);
+        assert_eq!(*OFFERED.lock().unwrap(), vec![offered.clone()]);
+
+        // **The remembered-record card is forwarded to its own function.** It
+        // takes the same four arguments as the card above and answers a
+        // different type, so the hazard is not a swap -- that would not
+        // compile -- it is both fields naming one recorder, or this one
+        // dropping an argument. Its answer is `Back`, which `show` cannot
+        // produce, so a body that forwarded to `show` and converted the result
+        // could never return it.
+        assert_eq!(
+            presenter.show_recall("Ledgerline.exe", Some(&matched), Some((5.0, 6.0)), &offered),
+            Some(RecallRow::Back),
+            "the way back is not forwarded -- a card the user cannot get out of"
+        );
+        assert_eq!(*RECALL_OFFERED.lock().unwrap(), vec![offered]);
+        {
+            let recalled = RECALL_FORWARDED.lock().unwrap();
+            assert_eq!(recalled.len(), 1);
+            assert_eq!(recalled[0].0, "Ledgerline.exe");
+            assert_eq!(
+                recalled[0].1,
+                Some(("Ledgerline".to_string(), Some("denis@example.com".to_string())))
+            );
+            assert_eq!(
+                recalled[0].2,
+                Some((5.0, 6.0)),
+                "the placement is forwarded, not replaced with the other card's"
+            );
+        }
 
         let forwarded = FORWARDED.lock().unwrap();
         assert_eq!(forwarded.len(), 1);
@@ -4914,15 +5537,50 @@ mod prompt_wiring_tests {
     /// reach is `handle_match` choosing to bind the item on its own line and
     /// pass a closure that ignores it, which reinstates the residency this
     /// step exists to close while leaving the arm's behaviour identical.
+    ///
+    /// **TWO now, and the count is the point.** `handle_recall` -- the
+    /// remembered-record card -- is the second card in this file that reads an
+    /// item back so a card can name it, and it is modal for exactly as long:
+    /// the user may leave it on screen while they go and read the page behind
+    /// it. So it obeys the same rule, spelled the same way, and this needle
+    /// counts both. A card added with a `let item =` on that line is a count
+    /// of one and fails here; a card added with no cache read at all cannot
+    /// name what it is offering and fails its own tests.
     #[test]
-    fn handle_match_hands_the_prompt_a_lookup_rather_than_a_held_item() {
+    fn both_item_naming_cards_are_handed_a_lookup_rather_than_a_held_item() {
         assert_eq!(
             occurrences(source(), LOOKUP),
+            2,
+            "expected {LOOKUP:?} exactly twice in app.rs -- `handle_match`'s cache read and \
+             `handle_recall`'s. A lower count means one of them binds the matched item at \
+             that line again and therefore holds it, plaintext password and TOTP seed \
+             included, for the whole time a modal card is on screen: as long as the user \
+             takes to decide"
+        );
+    }
+
+    /// The remembered-record arm's call site, pinned the way
+    /// [`GUARDED_ARM`] pins the matched card's: the answer is **bound to a
+    /// name** and routed, so the two mutants that matter -- discarding what
+    /// the user chose, and substituting a hardcoded row for it -- both stop
+    /// containing this needle.
+    ///
+    /// It matters more here than there, because one of the answers this arm
+    /// can give is [`super::RecallRow::Back`]: an arm that dropped it would
+    /// leave the user on a card whose only exit is Escape, which is the defect
+    /// the way back exists to prevent.
+    #[test]
+    fn the_remembered_record_arm_routes_the_row_the_user_took() {
+        let needle = concat!(
+            "recall_follow_up(item_id, recall_arm_for",
+            "(&REAL_OVERLAY, window, lookup))"
+        );
+        assert_eq!(
+            occurrences(source(), needle),
             1,
-            "expected {LOOKUP:?} exactly once in app.rs -- `handle_match`'s cache read. Zero \
-             means the matched item is bound at that line again and therefore alive, \
-             plaintext password and TOTP seed included, for the whole time the modal overlay \
-             is on screen: as long as the user takes to decide"
+            "expected {needle:?} exactly once in app.rs. Zero means the card's answer is no \
+             longer what `handle_recall` reports, so *Pick a different record* stops opening \
+             the picker and the card becomes one the user cannot get past"
         );
     }
 
@@ -5102,6 +5760,26 @@ mod fill_call_site_tests {
             // of `NoMatchFollowUp::Fill`, which is the field the user picked
             // on the card's second step.
             ", choice,",
+            // **The remembered-record card's fill**, and it is spelled
+            // `taken` at that call site precisely so that this row can name
+            // it. Two call sites in one file whose argument reads the same
+            // would let one of them match both forms while the other went
+            // unexamined -- which is the hole the "one call per form and one
+            // form per call" rule below exists to close, and it can only be
+            // closed if the forms are distinguishable in the first place.
+            //
+            // **No leading comma**, unlike the two forms above: that call
+            // site's arguments are one per line, so what precedes the binding
+            // is a newline and an indent rather than `, `. The name is what
+            // carries the distinction here, and it is a name nothing else in
+            // that argument list can be.
+            //
+            // What this row buys is the same thing the row above it buys:
+            // the card's fill forwards the row the **user** took, so a
+            // literal written here -- `FillChoice::UserTabPass`, say -- would
+            // type something other than the row they pressed, on a card
+            // designed to be answered from muscle memory.
+            "taken,",
         ]),
     ];
 
@@ -5259,8 +5937,28 @@ mod fill_call_site_tests {
         // Its row's second form is the forwarding one, so `main.rs` really
         // does hold both -- a row that had quietly dropped back to one form
         // would fail here rather than pass by having nothing to disagree with.
-        assert_eq!(rule("main.rs").len(), 2, "main.rs's two call sites are not both listed");
+        // **Three now**: the hotkey, the account picker, and the
+        // remembered-record card. The third is a forwarding call site like
+        // the second, and the reason it gets a form of its own rather than
+        // sharing the second's is the scan's own rule -- one call per form
+        // and one form per call -- which two identically spelled arguments
+        // would defeat, leaving one of the two fills unexamined.
+        assert_eq!(rule("main.rs").len(), 3, "main.rs's three call sites are not all listed");
         assert_eq!(rule("main.rs")[1], forwarding);
+        let remembered = rule("main.rs")[2];
+        assert!(
+            remembered != forwarding && remembered != hotkey,
+            "the remembered-record card's form has collapsed into another call site's, so one \
+             of the three fills in main.rs is no longer checked by anything"
+        );
+        assert!(
+            !forwards.contains(remembered) && !names_it.contains(remembered),
+            "the remembered-record card's form matches another call site's arguments"
+        );
+        assert!(
+            "event.hwnd,\ntaken,\n&deskwarden::injector".contains(remembered),
+            "the remembered-record card's rule rejects what main.rs really passes"
+        );
 
         assert_eq!(RULES.len(), sources().len(), "a file is scanned with no rule, or vice versa");
     }
@@ -6838,169 +7536,32 @@ mod fill_dispatch_tests {
         (typed, notifier.take())
     }
 
-    // ---- the surface is HOSTED, not merely written ------------------------
+    // ---- the confirmation that used to stand here ----------------------
     //
-    // `dispatch_with` refuses bad targets whether or not a modal exists, so
-    // every routing test above stays green with the 4b confirmation deleted
-    // from `fill_from_vault_with` entirely -- which is the state this crate
-    // shipped in at `b05c818`: a tested `draw` that nothing put on screen.
-    // These three ask the other question: was the user ASKED, and is the
-    // answer obeyed?
+    // Four tests lived on this spot and all four are gone, because their
+    // subject is. They measured design 4b's card being HOSTED -- that a
+    // bare-secret fill opened it, that a Cancel from it typed nothing, that
+    // an ungated fill opened nothing, and that the production `SendGate`
+    // held the real window by address. The owner had the card removed (see
+    // `vault_window::preflight`'s module doc for the argument), so there is
+    // no confirmation to open, no answer to obey and no seam to pin: each of
+    // those assertions had lost the thing it was about. Deleting them is not
+    // a weakening; keeping them would have meant inventing a subject.
     //
-    // The recorder is a pair of statics rather than a closure because the seam
-    // is an `fn` pointer, for the reason `SendGate`'s doc gives: a seam taking
-    // an `impl Fn` could be handed a wrapper and the identity pin below could
-    // not see it. The whole module is serialised on `sequence_test_lock`.
-    static CONFIRMS_ASKED: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
-    static CONFIRM_SAW_SECRET: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-
-    fn confirmed(
-        state: crate::vault_window::preflight::PreflightState,
-        copy: zeroize::Zeroizing<String>,
-    ) -> Option<crate::vault_window::preflight::PreflightAction> {
-        CONFIRMS_ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        // What the surface was handed: a step list that says there is a
-        // secret, and the very value "Copy instead" would put on the clipboard.
-        CONFIRM_SAW_SECRET.store(
-            state.has_secret() && copy.as_str() == PASS,
-            std::sync::atomic::Ordering::SeqCst,
-        );
-        Some(crate::vault_window::preflight::PreflightAction::Send)
-    }
-
-    fn cancelled(
-        _state: crate::vault_window::preflight::PreflightState,
-        _copy: zeroize::Zeroizing<String>,
-    ) -> Option<crate::vault_window::preflight::PreflightAction> {
-        CONFIRMS_ASKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Some(crate::vault_window::preflight::PreflightAction::Cancel)
-    }
-
-    fn must_not_be_asked(
-        _state: crate::vault_window::preflight::PreflightState,
-        _copy: zeroize::Zeroizing<String>,
-    ) -> Option<crate::vault_window::preflight::PreflightAction> {
-        panic!("a fill the preflight does not speak for opened a confirmation window");
-    }
-
-    /// Drives a whole fill with both halves of the gate as fixtures, and
-    /// reports how many times the confirmation was asked, how many sequences
-    /// were typed, and what the confirmation was handed.
-    ///
-    /// **All three are read while the lock is still held**, and handed back by
-    /// value. The two counters always were; `CONFIRM_SAW_SECRET` used to be
-    /// loaded by the caller *after* this function returned, which is after
-    /// `_serialised` had been dropped -- so the next test to take the lock
-    /// (`an_ungated_fill_opens_no_confirmation`, whose own `hosted_fill` opens
-    /// by storing `false` into it) could clobber the flag in the few
-    /// microseconds between the release and the read. `asked` and `typed` were
-    /// already snapshotted by then, so exactly the third assertion failed,
-    /// intermittently, and only on a machine loaded enough for the waiting
-    /// thread to win that race. Returning the flag alongside the counters is
-    /// what makes the three facts one observation of one fill.
-    fn hosted_fill(
-        choice: FillChoice,
-        confirm: fn(
-            crate::vault_window::preflight::PreflightState,
-            zeroize::Zeroizing<String>,
-        ) -> Option<crate::vault_window::preflight::PreflightAction>,
-    ) -> (usize, usize, bool) {
-        let _serialised = crate::injector::sequence_test_lock();
-        CONFIRMS_ASKED.store(0, std::sync::atomic::Ordering::SeqCst);
-        CONFIRM_SAW_SECRET.store(false, std::sync::atomic::Ordering::SeqCst);
-        let rec = Arc::new(Recorder::default());
-        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
-        let (_scratch, stats) = scratch_stats("preflight-hosting");
-        fill_from_vault_with(
-            &cache_with(item_with("{USERNAME}{TAB}{PASSWORD}")),
-            &injector,
-            &stats,
-            "item-1",
-            4242,
-            choice,
-            &sequence::RecordingNotifier::default(),
-            &crate::vault_window::preflight::SendGate::describing_and_confirming(
-                a_masked_box_in_the_rules_process,
-                confirm,
-            ),
-            &mut ungated(&mut crate::reprompt::Proof::default()),
-        );
-        let typed = rec.sequences.lock().unwrap().len();
-        (
-            CONFIRMS_ASKED.load(std::sync::atomic::Ordering::SeqCst),
-            typed,
-            CONFIRM_SAW_SECRET.load(std::sync::atomic::Ordering::SeqCst),
-        )
-    }
-
-    /// **The hosting, driven from the entry point.** Delete the
-    /// `confirmed_by_preflight` call from `fill_from_vault_with` and this is
-    /// red at `asked == 1` while every routing test above stays green -- the
-    /// hosting isolated from the gating. That is
-    /// `mutations/cases/03-confirm-deleted`; `mutations/run.ps1` measures how
-    /// much else goes red with it.
-    #[test]
-    fn a_bare_secret_fill_asks_the_confirmation_before_it_types() {
-        let (asked, typed, saw_secret) =
-            hosted_fill(FillChoice::Just(key_sequence::FieldRef::Password), confirmed);
-        assert_eq!(asked, 1, "the 4b confirmation was never shown");
-        assert_eq!(typed, 1, "the confirmed fill did not type, so `asked` proves nothing");
-        assert!(
-            saw_secret,
-            "the surface was handed a step list with no secret in it, or a copy payload that is \
-             not the value this fill was about to type"
-        );
-    }
-
-    /// And the answer is obeyed. Reading the confirmation's answer and
-    /// carrying on regardless -- `let _ = confirmed_by_preflight(..);`, the
-    /// neutralisation this crate has measured surviving elsewhere at zero
-    /// warnings -- is red here. It is
-    /// `mutations/cases/04-confirm-answer-ignored`, and `mutations/run.ps1`
-    /// is what says so; this test is the only thing that catches it, which is
-    /// the reason it exists separately from the one above.
-    #[test]
-    fn a_cancelled_confirmation_types_nothing() {
-        let (asked, typed, _) =
-            hosted_fill(FillChoice::Just(key_sequence::FieldRef::Password), cancelled);
-        assert_eq!(asked, 1, "control: the confirmation really was shown");
-        assert_eq!(typed, 0, "the fill typed a password the user had just cancelled");
-    }
-
-    /// The scope is `preflight_guard_for`'s and not one of its own: a
-    /// `UserTabPass` fill opens no window at all. Widening the modal to every
-    /// fill would put a hold-to-send in front of the app's ordinary path --
-    /// and would ask a masking question those fills deliberately do not answer.
-    #[test]
-    fn an_ungated_fill_opens_no_confirmation() {
-        let (asked, typed, _) = hosted_fill(FillChoice::Saved, must_not_be_asked);
-        assert_eq!(asked, 0);
-        assert_eq!(typed, 1, "control: the ungated fill really ran");
-    }
-
-    /// The production seam, pinned by ADDRESS, exactly as the foreground
-    /// lookup beside it is. A `confirm` that was a wrapper -- or a
-    /// flag-gated `|_, _| Some(Send)` -- is a different address and fails
-    /// here whatever it is spelled, and every test above would still pass.
-    #[test]
-    fn the_production_gate_hosts_the_real_confirmation_window() {
-        let production = crate::vault_window::preflight::SendGate::production();
-        assert!(
-            std::ptr::fn_addr_eq(
-                production.confirm_fn(),
-                crate::preflight_card::show_preflight_card
-                    as fn(
-                        crate::vault_window::preflight::PreflightState,
-                        zeroize::Zeroizing<String>,
-                    )
-                        -> Option<crate::vault_window::preflight::PreflightAction>
-            ),
-            "the production gate does not open the real preflight window"
-        );
-    }
-
+    // `mutations/cases/03-confirm-deleted` and `04-confirm-answer-ignored`
+    // went with them, for the same reason: mutation 03 was `remove the
+    // `confirmed_by_preflight` call`, which is now simply what the source
+    // says. Cases 01 and 02 -- the GATE deleted and the gate neutralised --
+    // are untouched and still killed by the routing tests above and by
+    // `preflight_call_site_tests`.
+    //
+    // What is left in their place is the claim that actually matters now:
+    // `a_password_fill_types_only_when_the_preflight_allows_it` drives a real
+    // `fill_from_vault_with` for a bare password and asserts it TYPED -- one
+    // call, nothing held, nothing pressed, nothing dismissed. That is the
+    // owner's instruction stated as a test, and it would be red for any
+    // reintroduced confirmation, because no fixture in this module can answer
+    // one.
     #[test]
     fn a_password_fill_types_only_when_the_preflight_allows_it() {
         // Positive control on the instrument: with the right window and a
@@ -9306,6 +9867,16 @@ mod generate_flow_tests {
             unreachable!("the 3d flow never opens the matched card")
         }
 
+        fn show_recall(
+            &self,
+            _label: &str,
+            _matched: Option<&crate::prompt_card::OverlayMatch>,
+            _position: Option<(f32, f32)>,
+            _choices: &[FillChoice],
+        ) -> Option<RecallRow> {
+            unreachable!("the 3d flow never opens the remembered-record card")
+        }
+
         fn show_save_login(
             &self,
             form: SaveLoginForm,
@@ -10091,6 +10662,588 @@ mod picker_wiring_tests {
              puts a modal card on screen -- so the copy would be alive for as long as the user \
              looks at it. Take it inside `picker_offers_for`, which returns offers and no items \
              and therefore drops it before the card is raised"
+        );
+    }
+}
+
+/// **The remembered-record card, and the numbering idiom both cards share.**
+///
+/// Everything here is a pure function of state, which is this crate's standing
+/// rule for a surface: the two `draw_*` functions paint these answers and
+/// decide none of them. That matters more than usual for this feature, because
+/// the drawing lives in `prompt_card` and `picker_prompt` -- so the keycap a
+/// row shows and the key that fires it are two files apart, and the only thing
+/// that can hold them together is that both read the same function here.
+#[cfg(test)]
+mod recall_tests {
+    use super::*;
+    use crate::fill_recall::{FillRecall, Forgotten, WindowKey};
+    use std::time::{Duration, Instant};
+
+    fn window(exe: &str, title: &str) -> crate::window_watch::ForegroundEvent {
+        crate::window_watch::ForegroundEvent {
+            hwnd: 0x1234,
+            pid: 900,
+            exe_name: exe.to_string(),
+            title: title.to_string(),
+        }
+    }
+
+    /// An item with a username and a password, which is what
+    /// [`fill_choices`] turns into three rows: both fields together, then each
+    /// on its own.
+    fn login(username: &str, password: &str) -> VaultItem {
+        VaultItem {
+            id: "item-9f2c".into(),
+            name: "Ledgerline".into(),
+            fields: Vec::new(),
+            login: Some(
+                serde_json::from_str(&format!(
+                    r#"{{"username":"{username}","password":"{password}"}}"#
+                ))
+                .unwrap(),
+            ),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: None,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    // -- the rows ------------------------------------------------------------
+
+    /// The card offers the record's own ways of being typed -- the same list
+    /// the matched-item overlay offers, so a user meets one list and not two
+    /// -- and then the way out.
+    #[test]
+    fn the_card_offers_the_records_own_rows_and_a_way_back() {
+        let item = login("denis@example.com", "hunter2");
+        let rows = recall_rows(Some(&item));
+        assert_eq!(
+            rows,
+            vec![
+                RecallRow::Fill(FillChoice::UserTabPass),
+                RecallRow::Fill(FillChoice::Just(key_sequence::FieldRef::Username)),
+                RecallRow::Fill(FillChoice::Just(key_sequence::FieldRef::Password)),
+                RecallRow::Back,
+            ]
+        );
+        assert_eq!(rows, recall_rows_from(prompt_choices(Some(&item))));
+    }
+
+    /// **The way back is the one row that is always there.** A cache miss
+    /// offers nothing to type, and the card is then the exit and nothing else
+    /// -- which is still a window, because the user pressed a chord and is
+    /// owed an answer.
+    #[test]
+    fn the_way_back_is_there_even_when_the_item_could_not_be_read_back() {
+        assert_eq!(recall_rows(None), vec![RecallRow::Back]);
+        assert_eq!(recall_back_row(&recall_rows(None)), Some(0));
+    }
+
+    /// **A prepopulated record the user cannot get past is worse than no
+    /// memory at all.** Every card this feature can produce has a way out, for
+    /// every shape of item the vault can hold.
+    #[test]
+    fn every_card_this_feature_can_produce_has_a_way_out() {
+        let bare = login("denis@example.com", "");
+        let full = login("denis@example.com", "hunter2");
+        for item in [None, Some(&bare), Some(&full)] {
+            let rows = recall_rows(item);
+            assert!(
+                recall_back_row(&rows).is_some(),
+                "a card with no way back: {rows:?}"
+            );
+            assert_eq!(
+                *rows.last().unwrap(),
+                RecallRow::Back,
+                "the way back is not the last row: {rows:?}"
+            );
+        }
+    }
+
+    /// A row past the end types nothing. The opposite of
+    /// [`crate::prompt_card::choice_at`]'s out-of-range answer, deliberately:
+    /// this card always has rows, so an index past them is a row the user
+    /// cannot have seen, and the safe answer to that is the one that opens a
+    /// picker rather than typing a credential.
+    #[test]
+    fn a_row_past_the_end_answers_back_and_never_a_credential() {
+        let item = login("denis@example.com", "hunter2");
+        let rows = recall_rows(Some(&item));
+        assert_eq!(recall_at(&rows, 0), RecallRow::Fill(FillChoice::UserTabPass));
+        assert_eq!(recall_at(&rows, 3), RecallRow::Back);
+        assert_eq!(recall_at(&rows, 4), RecallRow::Back);
+        assert_eq!(recall_at(&rows, 99), RecallRow::Back);
+        assert_eq!(recall_at(&[], 0), RecallRow::Back);
+    }
+
+    /// The fill rows are truncated so the exit always fits on a card that
+    /// cannot scroll -- and the truncation is measured against the painter's
+    /// own cap, so raising it widens the list here with no edit.
+    #[test]
+    fn the_rows_never_outgrow_the_card_they_are_drawn_on() {
+        let many = vec![
+            FillChoice::UserTabPass,
+            FillChoice::Just(key_sequence::FieldRef::Username),
+            FillChoice::Just(key_sequence::FieldRef::Password),
+            FillChoice::Just(key_sequence::FieldRef::Totp),
+            FillChoice::Saved,
+            FillChoice::Saved,
+        ];
+        let rows = recall_rows_from(many);
+        assert!(rows.len() <= crate::prompt_card::ROW_CAP, "{} rows", rows.len());
+        assert_eq!(*rows.last().unwrap(), RecallRow::Back);
+    }
+
+    // -- the way back --------------------------------------------------------
+
+    /// **The back row's key, and the fact that no digit can reach it.**
+    ///
+    /// This is [`crate::picker_prompt::row_shortcut`]'s rule applied to this
+    /// card: that function refuses a digit on *Search the vault* because "a
+    /// digit that landed on it would be a trap", and this row is a trap of
+    /// exactly the same shape in the other direction -- every other row types
+    /// a credential and this one does not.
+    #[test]
+    fn the_back_row_answers_backspace_and_no_digit_reaches_it() {
+        let item = login("denis@example.com", "hunter2");
+        let rows = recall_rows(Some(&item));
+        let back = recall_back_row(&rows).expect("no way back");
+
+        assert_eq!(recall_keycap(&rows, back).as_deref(), Some(RECALL_BACK_KEYCAP));
+        assert_eq!(recall_at(&rows, back), RecallRow::Back);
+
+        let fills = rows.len() - 1;
+        for digit in 1..=9u32 {
+            let chosen = digit_pick(DigitBinding::Bare, KeyMods::NONE, digit, fills);
+            assert_ne!(
+                chosen,
+                Some(back),
+                "digit {digit} reaches the way back, which types nothing and must not be \
+                 reachable by the gesture that fills"
+            );
+        }
+    }
+
+    /// The back row is counted among the rows but never numbered, so the
+    /// digits run 1..n over the ways to type the record and stop there.
+    #[test]
+    fn the_numbering_runs_one_to_n_over_the_ways_to_type_the_record() {
+        let item = login("denis@example.com", "hunter2");
+        let rows = recall_rows(Some(&item));
+        assert_eq!(recall_keycap(&rows, 0).as_deref(), Some("1"));
+        assert_eq!(recall_keycap(&rows, 1).as_deref(), Some("2"));
+        assert_eq!(recall_keycap(&rows, 2).as_deref(), Some("3"));
+        assert_eq!(recall_keycap(&rows, 3).as_deref(), Some(RECALL_BACK_KEYCAP));
+        assert_eq!(recall_keycap(&rows, 4), None, "a keycap for a row that is not drawn");
+    }
+
+    // -- the one numbering idiom ---------------------------------------------
+
+    /// **What a row draws is what fires.** Not "the mark is painted" -- that
+    /// is what shipped twice as a drawn-and-dead keycap -- but that the key
+    /// the cap names chooses *that* row, for every row of every list length,
+    /// on both surfaces.
+    #[test]
+    fn every_keycap_a_row_draws_is_a_key_that_chooses_that_row() {
+        for binding in [DigitBinding::Bare, DigitBinding::Ctrl] {
+            let mods = match binding {
+                DigitBinding::Bare => KeyMods::NONE,
+                DigitBinding::Ctrl => KeyMods::CTRL,
+            };
+            for shown in 0..14usize {
+                for index in 0..14usize {
+                    let cap = digit_keycap(binding, index, shown);
+                    let fires = u32::try_from(index)
+                        .ok()
+                        .and_then(|i| digit_pick(binding, mods, i + 1, shown));
+                    assert_eq!(
+                        cap.is_some(),
+                        fires == Some(index),
+                        "{binding:?} row {index} of {shown}: cap {cap:?}, key chooses {fires:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The trap, and the reason the search box's binding carries a
+    /// modifier.** On German, Polish and Portuguese layouts the right-hand Alt
+    /// key is `AltGr`, Windows delivers it as CTRL+ALT, and `AltGr`+`2` is
+    /// `@`. A user searching their vault for `denis@example.com` types it
+    /// mid-word. `picker_prompt`'s own shortcut section records that
+    /// `CTRL+ALT+1..4` was removed for exactly this and "must not come back
+    /// over that box"; this is that rule as a function.
+    #[test]
+    fn alt_gr_types_an_at_sign_and_does_not_choose_a_row() {
+        for binding in [DigitBinding::Bare, DigitBinding::Ctrl] {
+            for digit in 1..=9u32 {
+                assert_eq!(
+                    digit_pick(binding, KeyMods::ALT_GR, digit, 9),
+                    None,
+                    "{binding:?}: AltGr+{digit} chose a row instead of typing a character"
+                );
+            }
+        }
+        // The positive control: the same digit, with ALT up, does choose.
+        assert_eq!(digit_pick(DigitBinding::Ctrl, KeyMods::CTRL, 2, 9), Some(1));
+    }
+
+    /// A bare digit belongs to the text box. "1Password", "Office 365" and
+    /// "Windows 11" are things the user types there, and the box is why the
+    /// modifier is the binding on that surface.
+    #[test]
+    fn a_bare_digit_is_refused_where_a_text_box_has_the_keyboard() {
+        assert_eq!(digit_pick(DigitBinding::Ctrl, KeyMods::NONE, 1, 5), None);
+        assert_eq!(digit_pick(DigitBinding::Bare, KeyMods::NONE, 1, 5), Some(0));
+    }
+
+    /// **One idiom, and CTRL is the half of it that works everywhere.** A user
+    /// who learns `CTRL+2` in the search box finds it works on the card with
+    /// no box too, which is what keeps this one mechanism rather than two.
+    #[test]
+    fn ctrl_and_a_digit_choose_the_row_on_both_surfaces() {
+        assert_eq!(digit_pick(DigitBinding::Bare, KeyMods::CTRL, 3, 5), Some(2));
+        assert_eq!(digit_pick(DigitBinding::Ctrl, KeyMods::CTRL, 3, 5), Some(2));
+    }
+
+    /// A digit past the rows on screen chooses nothing at all: it does not
+    /// beep, close the card, or fall through to a neighbouring row. The rule
+    /// [`crate::picker_prompt::candidate_for_digit`] already holds the picker
+    /// to, widened by a modifier and applied to both surfaces.
+    #[test]
+    fn a_digit_past_the_rows_on_screen_chooses_nothing() {
+        assert_eq!(digit_pick(DigitBinding::Bare, KeyMods::NONE, 4, 3), None);
+        assert_eq!(digit_pick(DigitBinding::Ctrl, KeyMods::CTRL, 4, 3), None);
+        assert_eq!(digit_pick(DigitBinding::Bare, KeyMods::NONE, 1, 0), None);
+    }
+
+    /// **The tenth result and beyond.** Nine is the ceiling for single digits,
+    /// so the tenth row carries no keycap and no key reaches it -- the list
+    /// does not imply a shortcut it does not have, which is the same defect as
+    /// drawing a key nothing binds, in the other direction. Arrow keys and
+    /// Enter still reach every row; they are untouched by all of this.
+    #[test]
+    fn the_tenth_row_and_beyond_carry_no_shortcut_and_none_is_implied() {
+        let shown = 12;
+        for index in 0..9usize {
+            assert!(digit_keycap(DigitBinding::Ctrl, index, shown).is_some(), "row {index}");
+        }
+        for index in 9..shown {
+            assert_eq!(
+                digit_keycap(DigitBinding::Ctrl, index, shown),
+                None,
+                "row {index} advertises a shortcut past the single digits"
+            );
+        }
+        assert_eq!(DIGIT_CAP, 9);
+        assert_eq!(digit_pick(DigitBinding::Ctrl, KeyMods::CTRL, 0, shown), None);
+    }
+
+    /// The search box's rows say what they take, rather than showing a bare
+    /// digit that is a character there.
+    #[test]
+    fn a_search_result_says_the_modifier_it_really_needs() {
+        assert_eq!(digit_keycap(DigitBinding::Ctrl, 1, 5).as_deref(), Some("CTRL 2"));
+        assert_eq!(digit_keycap(DigitBinding::Bare, 1, 5).as_deref(), Some("2"));
+        assert!(digit_keycap(DigitBinding::Ctrl, 1, 5).unwrap().starts_with(CTRL_KEYCAP));
+    }
+
+    // -- the plan ------------------------------------------------------------
+
+    fn key() -> WindowKey {
+        WindowKey::of(&window("chrome.exe", "Sign in"))
+    }
+
+    #[test]
+    fn a_live_memory_is_offered_and_an_expired_one_is_not() {
+        let start = Instant::now();
+        let mut recall = FillRecall::new();
+        recall.remember(key(), "item-9f2c", start);
+
+        assert_eq!(
+            recall_plan(&recall, &key(), VaultAvailability::Readable, start),
+            RecallPlan::Offer("item-9f2c".to_string())
+        );
+        assert_eq!(
+            recall_plan(
+                &recall,
+                &key(),
+                VaultAvailability::Readable,
+                start + crate::fill_recall::RECALL_TTL,
+            ),
+            RecallPlan::Picker
+        );
+    }
+
+    /// **A locked vault offers nothing**, belt as well as braces: `main`
+    /// forgets the record on the lock, and this arm answers `Picker` even if
+    /// it did not. A card built from an id this process cannot resolve would
+    /// name nothing and offer rows nobody can fetch.
+    #[test]
+    fn a_locked_vault_never_offers_a_remembered_record() {
+        let start = Instant::now();
+        let mut recall = FillRecall::new();
+        recall.remember(key(), "item-9f2c", start);
+        assert_eq!(
+            recall_plan(&recall, &key(), VaultAvailability::Locked, start),
+            RecallPlan::Picker
+        );
+    }
+
+    /// And the lock itself empties it, which is the half that survives the
+    /// vault being readable again.
+    #[test]
+    fn locking_and_then_unlocking_leaves_nothing_to_offer() {
+        let start = Instant::now();
+        let mut recall = FillRecall::new();
+        recall.remember(key(), "item-9f2c", start);
+        recall.forget(Forgotten::VaultLocked);
+        assert_eq!(
+            recall_plan(&recall, &key(), VaultAvailability::Readable, start),
+            RecallPlan::Picker
+        );
+    }
+
+    /// A different window gets the picker, at any age.
+    #[test]
+    fn another_window_gets_the_ordinary_picker() {
+        let start = Instant::now();
+        let mut recall = FillRecall::new();
+        recall.remember(key(), "item-9f2c", start);
+        let elsewhere = WindowKey { hwnd: 0x9999, pid: 42, exe_name: "notepad.exe".into() };
+        assert_eq!(
+            recall_plan(&recall, &elsewhere, VaultAvailability::Readable, start),
+            RecallPlan::Picker
+        );
+    }
+
+    // -- the follow-up -------------------------------------------------------
+
+    /// **Back opens a window and a dismissal does not.** Collapsing the two
+    /// would answer a refusal with another window; keeping them apart is why
+    /// this is an enum and not an `Option`.
+    #[test]
+    fn the_three_answers_lead_three_different_places() {
+        assert_eq!(
+            recall_follow_up("item-9f2c", Some(RecallRow::Fill(FillChoice::UserTabPass))),
+            RecallFollowUp::Fill {
+                item_id: "item-9f2c".to_string(),
+                choice: FillChoice::UserTabPass,
+            }
+        );
+        assert_eq!(
+            recall_follow_up("item-9f2c", Some(RecallRow::Back)),
+            RecallFollowUp::Picker
+        );
+        assert_eq!(recall_follow_up("item-9f2c", None), RecallFollowUp::Nothing);
+    }
+
+    /// The follow-up carries the id it was asked about and the choice the user
+    /// took -- never a value. The same rule [`NoMatchFollowUp::Fill`] is
+    /// written to.
+    #[test]
+    fn the_follow_up_forwards_the_row_the_user_took_and_not_the_first_one() {
+        let taken = FillChoice::Just(key_sequence::FieldRef::Totp);
+        assert_eq!(
+            recall_follow_up("item-aaaa", Some(RecallRow::Fill(taken.clone()))),
+            RecallFollowUp::Fill { item_id: "item-aaaa".to_string(), choice: taken }
+        );
+    }
+
+    // -- the arm -------------------------------------------------------------
+
+    #[derive(Default)]
+    struct RecallRecorder {
+        asked_rows: std::cell::Cell<Option<usize>>,
+        asked_about: std::cell::Cell<Option<isize>>,
+        shown: std::cell::RefCell<Vec<(String, Option<String>, Option<(f32, f32)>)>>,
+        offered: std::cell::RefCell<Vec<Vec<FillChoice>>>,
+        answer: Option<RecallRow>,
+    }
+
+    impl PromptPresenter for RecallRecorder {
+        fn position(&self, hwnd: isize, rows: usize) -> Option<(f32, f32)> {
+            self.asked_about.set(Some(hwnd));
+            self.asked_rows.set(Some(rows));
+            Some((7.0, 8.0))
+        }
+        fn show(
+            &self,
+            _label: &str,
+            _matched: Option<&crate::prompt_card::OverlayMatch>,
+            _position: Option<(f32, f32)>,
+            _choices: &[FillChoice],
+        ) -> Option<FillChoice> {
+            unreachable!("the remembered-record arm never opens the matched-item card")
+        }
+        fn show_recall(
+            &self,
+            label: &str,
+            matched: Option<&crate::prompt_card::OverlayMatch>,
+            position: Option<(f32, f32)>,
+            choices: &[FillChoice],
+        ) -> Option<RecallRow> {
+            self.shown.borrow_mut().push((
+                label.to_string(),
+                matched.map(|m| m.item_name.clone()),
+                position,
+            ));
+            self.offered.borrow_mut().push(choices.to_vec());
+            self.answer.clone()
+        }
+        fn show_save_login(
+            &self,
+            _form: save_login_card::SaveLoginForm,
+            _position: Option<(f32, f32)>,
+        ) -> Option<(save_login_card::SaveLoginAction, save_login_card::SaveLoginForm)> {
+            unreachable!("the remembered-record arm never opens design 3c")
+        }
+        fn show_generate(
+            &self,
+            _label: &str,
+            _generate: &dyn Fn(
+                &crate::vault_bridge::GenerateRequest,
+            ) -> Result<zeroize::Zeroizing<String>, String>,
+        ) -> Option<zeroize::Zeroizing<String>> {
+            unreachable!("the remembered-record arm never opens design 3d")
+        }
+        fn show_locked(
+            &self,
+            _label: &str,
+            _position: Option<(f32, f32)>,
+        ) -> locked_card::LockedAnswer {
+            unreachable!("the remembered-record arm never opens design 3b")
+        }
+    }
+
+    /// **The card is placed for the rows it really draws.** One row more than
+    /// the matched-item card for the same choice list, because the way back is
+    /// a row -- and the row that would fall under the taskbar on a card
+    /// clamped a row short is the exit. This is `save_login_arm`'s defect in
+    /// the place it would hurt most.
+    #[test]
+    fn the_recall_card_is_placed_for_the_rows_it_really_draws() {
+        let item = login("denis@example.com", "hunter2");
+        let recorder = RecallRecorder::default();
+        let subject = prompt_subject(Some(&item));
+        let choices = subject.choices.len();
+        recall_arm(&recorder, &window("chrome.exe", "Sign in"), subject);
+
+        assert_eq!(
+            recorder.asked_rows.get(),
+            Some(choices + 1),
+            "the placement was computed for a card without its way back"
+        );
+        assert_eq!(recorder.asked_about.get(), Some(0x1234));
+    }
+
+    /// The arm opens the card at the placement it was answered for, names the
+    /// window, and forwards the item's own rows.
+    #[test]
+    fn the_arm_opens_the_card_for_the_window_it_was_asked_about() {
+        let item = login("denis@example.com", "hunter2");
+        let recorder = RecallRecorder { answer: Some(RecallRow::Back), ..Default::default() };
+        let answer =
+            recall_arm(&recorder, &window("chrome.exe", "Sign in"), prompt_subject(Some(&item)));
+
+        assert_eq!(answer, Some(RecallRow::Back));
+        let shown = recorder.shown.borrow();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].0, "chrome.exe");
+        assert_eq!(shown[0].1.as_deref(), Some("Ledgerline"));
+        assert_eq!(shown[0].2, Some((7.0, 8.0)));
+        assert_eq!(*recorder.offered.borrow(), vec![prompt_choices(Some(&item))]);
+    }
+
+    /// A cache miss still opens a card, and the card is the way out. Silence
+    /// here would be a chord the user pressed on purpose doing nothing.
+    #[test]
+    fn a_cache_miss_still_opens_a_card_that_can_be_left() {
+        let recorder = RecallRecorder { answer: Some(RecallRow::Back), ..Default::default() };
+        let answer = recall_arm_for(
+            &recorder,
+            &window("chrome.exe", "Sign in"),
+            || None::<VaultItem>,
+        );
+        assert_eq!(answer, Some(RecallRow::Back));
+        assert_eq!(recorder.asked_rows.get(), Some(1), "the card was placed for no rows at all");
+        assert_eq!(*recorder.offered.borrow(), vec![Vec::<FillChoice>::new()]);
+    }
+
+    /// **The whole flow, end to end over the pure parts**: a fill at a window,
+    /// the same window a minute later offering the record, the user taking the
+    /// one-time-code row, and that fill renewing the memory -- which is what
+    /// makes the third page of a slow sign-in still work.
+    #[test]
+    fn the_three_page_sign_in_costs_one_search() {
+        let start = Instant::now();
+        let mut recall = FillRecall::new();
+        let at = key();
+
+        // Page one: the user searched, picked the record, and it was filled.
+        recall.remember(at.clone(), "item-9f2c", start);
+
+        // Page two, four minutes later: offered, and taken.
+        let page_two = start + Duration::from_secs(240);
+        assert_eq!(
+            recall_plan(&recall, &at, VaultAvailability::Readable, page_two),
+            RecallPlan::Offer("item-9f2c".to_string())
+        );
+        let took = recall_follow_up(
+            "item-9f2c",
+            Some(RecallRow::Fill(FillChoice::Just(key_sequence::FieldRef::Password))),
+        );
+        assert!(matches!(took, RecallFollowUp::Fill { .. }));
+        recall.remember(at.clone(), "item-9f2c", page_two);
+
+        // Page three, four minutes after that -- eight from the first fill.
+        let page_three = page_two + Duration::from_secs(240);
+        assert_eq!(
+            recall_plan(&recall, &at, VaultAvailability::Readable, page_three),
+            RecallPlan::Offer("item-9f2c".to_string()),
+            "the one-time-code page fell outside a budget measured from the first fill"
+        );
+    }
+
+    /// And the way out of it: *Pick a different record* forgets, so the very
+    /// next press is the ordinary picker rather than the record just rejected.
+    #[test]
+    fn taking_the_way_back_leaves_the_next_press_at_the_picker() {
+        let start = Instant::now();
+        let mut recall = FillRecall::new();
+        let at = key();
+        recall.remember(at.clone(), "item-9f2c", start);
+
+        assert_eq!(recall_follow_up("item-9f2c", Some(RecallRow::Back)), RecallFollowUp::Picker);
+        recall.forget(Forgotten::UserWentBack);
+        assert_eq!(
+            recall_plan(&recall, &at, VaultAvailability::Readable, start + Duration::from_secs(1)),
+            RecallPlan::Picker
+        );
+    }
+
+    /// A **dismissal** is not a rejection: the user pressed Escape, and the
+    /// next page of the same sign-in should still be offered the record. This
+    /// is the arm that would be lost by collapsing `Nothing` into `Picker`.
+    #[test]
+    fn dismissing_the_card_keeps_the_record_for_the_next_page() {
+        let start = Instant::now();
+        let mut recall = FillRecall::new();
+        let at = key();
+        recall.remember(at.clone(), "item-9f2c", start);
+
+        assert_eq!(recall_follow_up("item-9f2c", None), RecallFollowUp::Nothing);
+        // Nothing is forgotten on that answer -- see `main`, which calls
+        // `forget` on `Picker` alone.
+        assert_eq!(
+            recall_plan(&recall, &at, VaultAvailability::Readable, start + Duration::from_secs(1)),
+            RecallPlan::Offer("item-9f2c".to_string())
         );
     }
 }

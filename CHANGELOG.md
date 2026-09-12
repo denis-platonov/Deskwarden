@@ -15,6 +15,331 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+### A browser is no longer something an item can be bound to
+
+> But I still see that popup for Edge everytime
+>
+> Microsoft (tivity) fils msedge
+
+The item was bound to the process `msedge.exe`, and **a browser runs one
+process for every site you visit**. So the binding did not mean "fill this at
+Microsoft 365"; it meant "fill this at every page I ever open", and that is
+what it did. The prompt was not too eager, it was wrong by construction -- the
+item it offered was correct only on the one tab out of hundreds where it
+happened to be.
+
+This is `ApplicationFrameHost.exe` again in a second costume. That process owns
+the top-level window for every Microsoft Store app, and a match saved against
+it fired on all of them; the fix then was that a name which identifies a
+*category* of window rather than an *application* is not a name autofill may
+act on. A browser's image name is the same kind of name. So a binding whose
+process is a browser now matches nothing, and the list of what counts as a
+browser is the one Deskwarden already keeps -- Chrome, Edge, Firefox, Brave,
+Vivaldi, Opera, and the Chromium and Gecko forks beside them.
+
+**Nothing in your vault is changed.** The field stays exactly as you saved it,
+down to the byte. What changes is that autofill stops acting on it, the same
+way it already stopped acting on a match saved against the frame host.
+
+**The item is still reachable in the browser, and by the route this app already
+prefers there.** Press the fill shortcut (`CTRL+ALT+B` by default) in the
+browser window: the account picker opens, you choose the item, and it is
+filled. Deskwarden then remembers that choice for that window for five minutes,
+so the second and third pages of a sign-in -- the password, then the one-time
+code -- are one keypress each rather than another search. That is the flow the
+recall feature was built for, and it is the browser answer, because the thing
+that tells two browser windows apart is the **site**, and no executable name
+carries one.
+
+A browser Deskwarden does not recognise by name keeps working exactly as it did
+today. The list is finite and honest rather than clever, and being wrong in
+that direction leaves a prompt you can see and report, instead of a match that
+went quiet for a reason nothing explains.
+
+### Every card on the Edit form is the same card, and it shows your password history
+
+The pass that rebuilt this form to design 8a left it half-converted and said
+so. `Item` and `Login credentials` were drawn in 8a's label column -- a
+130-point caption on the left, the field beside it -- and the per-kind bodies
+below them, Identity, Card, SSH and the one-time code, still stacked their
+captions above their boxes in the older shape. Each card was internally
+consistent; the form was not consistent between its cards, and on an identity
+that meant a column of eighteen rows in one layout sitting directly under three
+rows in another.
+
+The reason they could not be converted was the *Remove* chip. Every optional
+row carries one beside its caption, and a caption with a button after it does
+not fit a 130-point label column. There is now a row that holds one: the chip
+goes in the label cell, under the caption, in the space a 12-point caption
+leaves beside a 38-point field -- so it costs the row about ten points rather
+than a line of its own, and on a narrow pane, where there is no label column at
+all, it stays beside the caption exactly as it did. Identity, Card, SSH, the
+one-time code and the website list are all on it now. So is the website row a
+create form withholds, which used to be the one greyed row in a different
+shape from the eight live ones above it.
+
+`cargo run --example ui_preview -- --edit` renders three more states for it:
+the card kind -- which has more removable rows than any other and had no
+picture at all -- at the shipped pane's width and at the smallest window the
+app allows, and the login form with its password history open.
+
+**And the history is the other half.** `passwordHistory` has been decrypted on
+every sync for as long as the sync code has existed, and the read pane has
+drawn it as a *Previous passwords* card for nearly as long. The Edit form
+showed none of it -- while its own footer promised, in those words, that saving
+would add the current password to a history it would not then show. The
+credentials card now carries 8a's own `Password history (3)`: shut by default,
+and opening it lists each previous password by when it stopped being the
+current one.
+
+It lists *when*, not *what*. The values are masked with no reveal and no copy,
+and the list says where the reveal is. This is the one screen whose whole
+purpose is to change the password, and an old password in the clear on a form
+you leave open while you work buys nothing the read pane -- one *Cancel* away,
+with a per-row reveal already on it -- does not buy more safely. The form is
+never handed the passwords at all, only the dates.
+
+One thing underneath, for anyone reading the source. Design 4e's rule is that
+red means one thing in this product -- *this is a secret* -- and the three
+colours that say it had been written out privately in four separate files,
+where one of them had already drifted to a different border. There is a
+`theme::secret_band()` now, with the rule attached to it, and the keystroke
+builder's password step asks for it by name.
+
+### The record you just filled is offered back at the same window
+
+A modern sign-in is three pages -- the address, then the password, then the
+one-time code -- and each page was a separate `CTRL+ALT+B` that opened the
+account picker at a list you had to search again for the record you used
+ninety seconds ago. The owner asked for the obvious fix: "save the previous
+entry for tray app and offer it next time if within 5 minutes and same
+window ... this way I don't need to search for the same record 3 times."
+
+Deskwarden now remembers which record the last fill used, at which window.
+Press the fill hotkey again at that same window inside five minutes and the
+card comes up already on that record, with its ways of being typed numbered
+underneath -- *Username + Tab + Password*, *Username*, *Password*, *One-time
+code* -- so the second and third pages are a digit and Enter. The five minutes
+run from the **last** fill rather than the first, so a slow identity provider
+between the pages cannot expire the memory at exactly the step it was written
+for.
+
+The last row is always *Pick a different record*, and taking it opens the
+ordinary account picker and forgets the record, so the offer is never
+something you have to get past. Pressing Escape dismisses the card and keeps
+the record, because "not now" and "not that one" are different answers.
+
+"Same window" deliberately does not mean the same window *title*. A sign-in
+page retitles itself at every step -- "Sign in" becomes "Enter your password"
+becomes "Verify it's you" -- so a title-sensitive memory would expire at
+precisely the moments this exists for. It is the window handle together with
+the process that owns it: a handle Windows has recycled since the fill belongs
+to a different window, and offering a record there would be a password typed
+into an application it has nothing to do with.
+
+Nothing about this is written to disk. It is one record, in memory, gone when
+the vault locks, when you ask for a different record, and when the app exits --
+a file naming which record was filled into which window at what time would be
+a log of your day, and no five-minute convenience is worth one.
+
+### Search results in the account picker are numbered
+
+The picker's candidate rows have taken a bare `1`-`9` since the shortcuts were
+added; its search results did not, because the search box has the keyboard and
+"1Password", "Office 365" and "Windows 11" are things people type into it.
+They are numbered now, and the binding on that one surface is `CTRL` plus the
+digit -- drawn on the row as `CTRL 2`, so what you see is what fires. `CTRL`
+and a digit works on the cards without a text box too, so there is one thing to
+learn rather than two.
+
+Not `CTRL+ALT`: on German, Polish and Portuguese layouts that combination *is*
+`AltGr`, and `AltGr+2` is `@` -- which would make an email address untypable in
+the box while you were searching for an account by it. Arrow keys and Enter are
+untouched.
+
+### Filling no longer asks you to confirm it
+
+Pressing the fill hotkey on a password, or picking *Password* or *One-time
+code* off the match card, used to open one more window first: design 4b's send
+preflight. It named the window in front, listed the steps it was about to
+type, and asked you to hold the space bar for 800 ms before a single keystroke
+left the app. That card is gone.
+
+The owner's reasoning, and it is the right one: a fill is something you
+deliberately asked for. You put the caret in the field, then you pressed the
+hotkey or picked the field by name -- two acts, both yours, before anything was
+typed. Being asked to confirm your own deliberate action is the app
+second-guessing a decision it has just watched you make. And the question was
+worth less than it looked: anyone who fills fifty times a day answers it on
+reflex, which is how a confirmation stops being a check and turns into another
+keystroke on the way to the thing you wanted.
+
+**Nothing about where a password may be typed has changed.** The confirmation
+was a screen, not a safeguard, and the three safeguards on that path are
+untouched:
+
+- Deskwarden still refuses to type a password into a window that is not the
+  one the item's rule names, and still refuses to type one into a control that
+  is not a masked field. That decision was never the card's -- the card
+  rendered it and could not overrule it -- and with no human in the loop there
+  is now nothing that *can* wave a refusal through.
+- A refused fill still tells you so. It used to say "Nothing sent" on the card
+  itself; it now reaches you the way every other autofill refusal already did,
+  and it still leads with those two words and still names which fact was
+  wrong -- the wrong window, the wrong kind of control, or a foreground
+  Deskwarden could not identify at all.
+- Typing still stops the moment focus leaves the target window. The card's
+  footnote *described* that behaviour; it never implemented it. The sentence
+  went with the card and the behaviour did not move.
+- The master-password re-prompt, where you have asked for one, is unaffected
+  and still runs ahead of everything.
+
+What is genuinely gone, besides the asking, is the *Copy instead* button the
+refused card offered. It was an affordance of that screen and needed it; every
+other copy in the app -- the vault window's rows, the `CTRL+SHIFT+` chords,
+the match card -- is where it always was.
+
+### The sidebar knows which items you share, and with whom
+
+Deskwarden could already *open* an organisation's items -- the key hierarchy
+for them has been in place and tested since the direct-REST backend was
+written -- but nothing above that knew an item was shared, who else could see
+it, or what any of it was called. The vault listed a shared password beside a
+personal one with no way to tell them apart.
+
+* **An ORGANISATIONS section in the rail**, between the folders and Password
+  health: one row per organisation, its collections indented underneath, each
+  with a live count. Clicking one lists exactly that organisation's items, or
+  exactly that collection's, with the search box and its count following as
+  they do for any other row.
+* **Nothing at all if you have no organisations.** No heading, no divider, not
+  a pixel -- so an account that has never touched them has the rail it had
+  before. That is the same answer for an account on `bw serve`, for a server
+  that has never heard of these routes, and for a vault that has not synced
+  yet.
+* **A server that does not implement any of this behaves exactly as it did.**
+  Every refusal -- a route that is not there, a roster you are not allowed to
+  read, a connection that fails -- is read as "this app does not know" rather
+  than as an error. There is no failure screen in this feature to reach.
+* **It costs no extra request for most accounts, and one per organisation for
+  the rest.** The organisations and their collections were already in the sync
+  Deskwarden makes to load the vault, and were being thrown away; only the
+  member list needs a request of its own, and an account with no organisations
+  makes none.
+* **An organisation key stored under NodeWarden's own field name is now
+  found.** Bitwarden puts your wrapped organisation key in
+  `profile.organizations[].key`; NodeWarden puts the organisation's *public*
+  key there and the real one beside it. Deskwarden reads the standard field
+  first and falls back to the other, so the first organisation created on that
+  server opens rather than failing every field of every shared item.
+
+**Read-only, deliberately.** Creating collections, inviting people and editing
+policies belong in the web vault. Moving an item *into* a collection is not
+here either, and it is the sharp edge rather than an oversight: it re-encrypts
+the item from your key to the organisation's, it cannot bring attachments with
+it, and there is no route back out.
+
+### The add-a-code card has one right edge again
+
+The card that takes a one-time code was drawing two vertical rules down its
+right-hand side where the design has one.
+
+The second rule was the scroll bar. The card's body scrolls on purpose -- the
+fused 6c/6d card is taller than the window it opens in, and a card whose
+dismiss sits below the fold was once reported as a hang -- and egui pins a
+floating scroll bar flush to the right edge of the area it scrolls, which on
+this card is the inside of the card's own 1pt border. Measured on a short
+window, the bar painted across x = 468.5-469.0 with the border at 469.5: two
+rules a point apart.
+
+* **The bar moved into the padding the body already had, and nothing else
+  moved.** It is now the design system's 6pt wide, centred in the body's 16pt
+  inset, so there is clear space on both sides of it and it crowds neither the
+  border nor the body's own right edge. No lane is reserved for it, because the
+  padding it floats in was already empty -- which means the body's content
+  width is identical whether the bar is showing or not.
+* **The scroll is untouched.** A card that fits its window shows no bar at all
+  and never did; a card that does not still scrolls, and its dismiss is still
+  reachable. Both states are pinned by a test that measures where the bar's
+  pixels actually landed rather than reading a constant back.
+
+### A shortcut another program owns no longer floods the log
+
+`deskwarden.log` could carry thousands of copies of one line -- `the global
+shortcut CTRL+ALT+S (Type the saved sequence) could not be registered (HotKey
+already registerd)` -- at roughly 2,880 a day, which is enough to bury the
+problems somebody opens that file to find.
+
+The retry behind it is right and is unchanged: the conflict is usually another
+*program* rather than another *machine*, it goes away when that program does,
+and the same log records the chord being claimed later on precisely because
+something kept trying every thirty seconds. What was wrong is that each attempt
+wrote a line whether or not anything had changed.
+
+* **The line is written when the state changes, not when an attempt is made.**
+  The first failure is logged as before, word for word. After that the chord
+  stays quiet while the situation holds, and speaks again on a failure for a
+  different reason, on the recovery (*"registered after all; whatever was
+  holding it has let go"*, which was already there), and on one reminder an
+  hour -- 24 lines a day instead of 2,880, still at warning level so it is
+  visible to anyone grepping for warnings.
+* **The quiet is earned per outage.** A shortcut that starts working clears its
+  own silence, so if the conflicting program comes back an hour later the log
+  says so immediately rather than swallowing it.
+
+### Cyrillic on the tray's cards is the app's own typeface
+
+A vault item called "Сбербанк" drew in a visibly different typeface from
+"Netflix" sitting a row above it, on the cards the tray opens.
+
+The cause is not subtle once it is stated: all four bundled Archivo cuts carry
+zero codepoints in U+0400-04FF. GDI does not draw blanks -- it font-links an
+uncovered run to whatever the system offers for that script, which on a stock
+Windows 11 is Segoe UI -- so a card drew Latin in Archivo and Cyrillic in Segoe
+UI, in the same line. The egui windows have not had this problem since the four
+Noto Sans Cyrillic-subset faces were bundled, because `theme` puts each one
+directly behind its Archivo cut in that weight's family stack. The GDI-drawn
+cards were the only surfaces left in the app with a second answer, and they now
+give the same one.
+
+* **The pairing lives in the one place a run and its font are both in hand.**
+  Every card's text already goes through `win32_draw::draw_text`, the crate's
+  single `DrawTextW`. That function now looks at the run it is about to paint
+  and, when the run is one the bundled subset can draw whole, swaps the device
+  context's font for the Noto cut paired with the Archivo cut the card asked
+  for -- same weight, same size, same ClearType -- then puts the card's own
+  font back before it returns. Every card is fixed at once, including the one
+  nobody has written yet.
+* **`lfCharSet` was a red herring and is deliberately left where it was.**
+  Every `LOGFONTW` on these cards leaves it at 0, which is `ANSI_CHARSET`
+  rather than `DEFAULT_CHARSET`, and that reads like a smoking gun until the
+  files are read: all four Archivo cuts and all four Noto cuts declare cp1252
+  in their OS/2 code page ranges, so the charset costs nothing and the exact
+  face-name match wins outright either way. The missing glyphs were the whole
+  defect.
+* **A mixed-script name keeps Archivo, on purpose.** `DrawTextW` takes one font
+  per call, and the bundled subset is 104 usable codepoints with no Latin
+  letter, no digit and no ASCII punctuation among them. Choosing it for
+  "Netflix RU — Иван" would send seventeen characters into the fallback to
+  rescue four, and "Почта 2" would lose the digit that tells it from "Почта".
+  So the swap fires only on a run the subset covers whole -- which is most
+  single- and multi-word Cyrillic item names, usernames and folder names -- and
+  no string is drawn worse than it was before.
+* **The faces are registered with GDI once for the process, not once per
+  card.** `AddFontMemResourceEx` copies the font data into the process font
+  table rather than refcounting a shared buffer, and every card carried its own
+  copy of the registration loop -- so opening the picker and then the unlock
+  prompt paid for two private copies of all four Archivo cuts. Doubling the
+  table to eight faces would have doubled that; the registration moved to
+  `win32_draw` behind a single `OnceLock` instead.
+
+Two things this does **not** change, and both are worth saying plainly. The
+tray menu itself is a native Win32 popup built by `muda` and drawn in the
+system menu font: it never had this defect and nothing here touches it. And
+the picker's search box and the unlock prompt's password box are real `EDIT`
+controls that paint their own text, so Cyrillic typed into those still falls
+back the way it always has.
+
 ### The Edit login form is design 8a's card grid
 
 The owner screenshotted the Edit login form and said "not as per design". They

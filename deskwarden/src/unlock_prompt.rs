@@ -626,7 +626,18 @@ fn error_line() -> String {
 /// borderless `EDIT` sitting inside it. The type is the app's own Archivo,
 /// registered privately with `AddFontMemResourceEx` from
 /// [`crate::theme::ARCHIVO_FACES`] -- the same bytes egui gets, not a second
-/// copy.
+/// copy -- by [`crate::win32_draw::register_fonts`], which registers the four
+/// Noto Cyrillic cuts beside them for the same reason egui's stacks carry
+/// them.
+///
+/// **The `EDIT` control paints its own text, and that is the one surface here
+/// the Cyrillic pairing does not reach.** `win32_draw::draw_text` swaps the
+/// face for a run it is handed; the field's contents never pass through it,
+/// because `EDIT` rasterises them itself from the `HFONT` it was given at
+/// `WM_SETFONT`. A Cyrillic password typed into it therefore still falls back
+/// the way it always has. That is left alone deliberately: the alternative is
+/// re-deciding the control's font as the user types, which makes the field
+/// change typeface mid-word.
 ///
 /// Nothing in this module decides anything. See [`run_with`].
 mod win32 {
@@ -641,7 +652,7 @@ mod win32 {
     use windows::core::{w, HSTRING, PCWSTR};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        AddFontMemResourceEx, BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
+        BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
         CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject,
         EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
         SelectObject, SetBkColor, SetBkMode, SetTextCharacterExtra, SetTextColor,
@@ -696,36 +707,20 @@ mod win32 {
 
     // ---- fonts -------------------------------------------------------------
 
-    /// Registers the four bundled Archivo cuts privately with GDI, once.
+    /// Registers every bundled face privately with GDI, once.
     ///
-    /// `AddFontMemResourceEx` makes a face available to **this process only**
-    /// -- nothing is installed, nothing touches the user's font list, and the
-    /// handles are deliberately never released: the faces are wanted for the
-    /// life of the process, and freeing them while a window still has one
-    /// selected is how a surface repaints in the fallback face.
+    /// **The loop that used to be here now lives in
+    /// [`crate::win32_draw::register_fonts`], behind one process-wide
+    /// `OnceLock` instead of one per card.** `AddFontMemResourceEx` copies the
+    /// font data into the process font table rather than refcounting a shared
+    /// buffer, so every card that carried its own copy of this loop handed GDI
+    /// another private copy of all four Archivo cuts -- roughly 750 KB of pure
+    /// duplicate per card opened in a session. Adding the four Noto Cyrillic
+    /// cuts the cards now need for Cyrillic runs would have made that worse
+    /// rather than better, so the registration moved to the one module every
+    /// card already draws its text through.
     fn register_fonts() {
-        static ONCE: OnceLock<()> = OnceLock::new();
-        ONCE.get_or_init(|| unsafe {
-            for (_, _, _, bytes) in crate::theme::ARCHIVO_FACES {
-                // A `Cell` rather than a `mut` local: the parameter is
-                // `*const u32` -- GDI writes the count back through it -- so a
-                // plain immutable binding read afterwards would be a value the
-                // compiler is entitled to fold to its initialiser.
-                let installed = std::cell::Cell::new(0u32);
-                let handle = AddFontMemResourceEx(
-                    bytes.as_ptr() as *const c_void,
-                    bytes.len() as u32,
-                    None,
-                    installed.as_ptr(),
-                );
-                if handle.0.is_null() || installed.get() == 0 {
-                    // Cosmetic degradation, never a reason to refuse to ask
-                    // for the password. GDI falls back and the prompt is set
-                    // in the shell font.
-                    log::warn!("could not register a bundled Archivo face with GDI");
-                }
-            }
-        });
+        crate::win32_draw::register_fonts();
     }
 
     /// An `HFONT` for one of the app's faces at one logical size.
@@ -2313,7 +2308,11 @@ mod tests {
     fn the_prompt_opens_under_a_title_no_other_window_of_ours_uses() {
         for other in [
             crate::vault_window::WINDOW_TITLE,
-            crate::preflight_card::PREFLIGHT_CARD_TITLE,
+            // `preflight_card::PREFLIGHT_CARD_TITLE` was here. Design 4b's
+            // send confirmation has been removed -- see
+            // `vault_window::preflight`'s module doc -- so there is no such
+            // window left to collide with.
+            crate::picker_prompt::PICKER_PROMPT_TITLE,
             crate::vault_window::rehearsal::SCRATCH_TITLE,
             crate::region_overlay::REGION_TITLE,
         ] {

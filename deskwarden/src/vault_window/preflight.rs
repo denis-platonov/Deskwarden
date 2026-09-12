@@ -1,39 +1,74 @@
-//! **4b -- the only screen between a sequence and a real password.**
+//! **The send gate: whether a fill may type, and what the user is told when
+//! it may not.**
 //!
-//! Two halves, and the split is the same one `injector::target` makes.
+//! This file used to have two halves, and the split was the one
+//! `injector::target` makes: a DECISION, and a SURFACE that put the decision
+//! in front of the user and asked them to confirm it. **The surface is gone.**
 //!
-//! The DECISION is [`verdict`]: a pure function of a [`SendTarget`], the image
-//! name the rule was written for, and whether the sequence types a secret. It
-//! has no window, no COM and no vault in it, so every branch is reachable from
-//! a unit test -- and, more importantly, so the gate can be exercised from
-//! *the position it gates* (see [`dispatch_with`]).
+//! # The confirmation was removed deliberately, and this is the argument
 //!
-//! The SURFACE used to be `draw`, an egui rendering, and it is not here any
-//! more: 4b is drawn by [`crate::preflight_card`] in bare Win32 and GDI,
-//! because the first egui window this process opens costs ~50 MB of OpenGL
-//! driver arenas that are never released and 4b was the last surface on the
-//! daemon's fill path paying it. What that card is held to is still written
-//! down here -- the words it paints are the constants below, the two lines it
-//! composes are [`target_line`] and [`refusal_message`], and the arithmetic
-//! behind its hold is [`advance_hold`] and [`hold_complete`]. So the surface
-//! moved and the specification did not.
+//! Design 4b drew a card in front of every bare-secret fill -- "About to type
+//! into", "Will send", a step list, and a hold on the space bar before a
+//! single keystroke left the app. The owner's instruction was to take it out:
+//! *"Confirm before sending - remove that popup completely, user intentionally
+//! sends the whatever needed - their right."*
 //!
-//! # The step list is not built here
+//! The reasoning is theirs and it is a good one. A fill is not something that
+//! happens *to* a user. They put the caret in a field, pressed the fill
+//! hotkey, or picked an item and then picked a field off `picker_prompt`'s
+//! card -- two deliberate acts, by name, before anything was typed. Asking
+//! again is the app second-guessing a decision it has just watched the user
+//! make twice. And the second question buys less than it looks like it does:
+//! a person who has already asked answers *yes* on reflex, which is how a
+//! confirmation stops being a check and becomes a keystroke on the way to the
+//! thing they wanted. Held-to-send or not, the card's real effect on a user
+//! who fills fifty times a day is 800 ms of delay and a learned reflex.
 //!
-//! [`PreflightState::new`] asks
-//! [`crate::vault_window::detail_edit::step_rows`] for its rows and this file
-//! contains no other way to make one. That is deliberate and it is pinned
-//! ([`the_step_list_is_the_editors_and_is_never_rebuilt_here`]): `step_rows`
-//! writes [`crate::vault_window::detail_edit::SECRET_MASK`] for a password in
-//! an `if` whose `else` is the only branch that can resolve a value, so the
-//! masking is unconditional BY CONSTRUCTION rather than by a `reveal` argument
-//! being passed `false`. A second row builder here -- even one that also
-//! masked -- would be a second place for that property to stop being true.
+//! **What was removed is the asking, and only the asking.** Three things on
+//! this path were never the confirmation, and all three are still here:
+//!
+//! 1. **The gate.** [`verdict`] decides whether a fill is safe to attempt at
+//!    all, and [`dispatch_with`] is the position it decides from. A fill the
+//!    engine judges unsafe still does not happen -- and it now *cannot* be
+//!    waved through, because there is no longer a human in the loop to wave
+//!    it. Removing the card made the gate strictly more decisive, not less.
+//! 2. **The refusal.** [`refusal_notice`] is the report that nothing was
+//!    typed. It is not a confirmation -- nobody is being asked anything -- and
+//!    without it a refused fill would be indistinguishable from a hotkey that
+//!    never registered. See the next section for where it goes now.
+//! 3. **The foreground re-check.** The card's footnote said "Sending stops the
+//!    moment focus leaves this window." That sentence *described* a runtime
+//!    behaviour it did not implement: `injector::sequence::run` re-reads the
+//!    foreground before **every** step and abandons the plan the instant the
+//!    target window stops being in front. The sentence went with the card. The
+//!    behaviour is untouched, and it is the thing that was actually load
+//!    bearing.
+//!
+//! # Where the refusal goes now
+//!
+//! It goes where [`Gated::Refused`] and [`Gated::NoTarget`] have always sent
+//! it: through [`crate::injector::sequence::Notifier`], which production wires
+//! to `sequence::REAL_NOTIFIER` -- a task-modal box on its own thread -- and
+//! which a test wires to a recorder. That path already existed, was already
+//! tested, and did not depend on the card.
+//!
+//! What changed is that it is now the **only** path, and it is now always
+//! taken. Before this pass a refused verdict was computed *twice*: once in
+//! `app::confirmed_by_preflight`, to decide which shape the card took, and
+//! again inside `dispatch_with`. In production only the first one ever reached
+//! the user -- the card said "Nothing sent", the user pressed *Dismiss*, the
+//! fill returned, and `dispatch_with` was never called at all, so the notifier
+//! never fired. Deleting the card did not delete the refusal; it deleted the
+//! duplicate, and the survivor is the one with a test on it
+//! (`app::fill_dispatch_tests::a_password_fill_types_nothing_when_the_preflight_refuses`
+//! asserts the notifier was told, on all three refusing shapes).
+//!
+//! [`REFUSED_HEADING`] -- "Nothing sent", design 4b's own word for this state
+//! -- survived the card by moving into those sentences, so it is still the
+//! first thing the user reads when a fill is declined. The rest of 4b's string
+//! table went with the screen that painted it.
 
-use super::detail_edit::{step_rows, StepRow};
 use crate::injector::target::SendTarget;
-use crate::key_sequence::ResolveSource;
-use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 // The decision
@@ -54,6 +89,16 @@ pub enum Verdict {
 }
 
 /// The whole gate, as a pure function so it can be tested without a window.
+///
+/// **Both arms are refusals outright, and neither was ever "ask the user".**
+/// That distinction mattered while a card stood in front of this function, so
+/// it is worth writing down what the card did and did not do: it *rendered*
+/// the verdict, in one of two shapes, and it could never change it. A
+/// `Verdict::Refused` laid out no hold affordance at all -- there was nothing
+/// on the refused card a user could press to send anyway -- and `run_with`
+/// answered `Cancel` for a send event in that state as a third barrier. So
+/// there is no arm here that loses its meaning when the human leaves: removing
+/// the confirmation removed a screen, not a branch.
 ///
 /// Order matters for the message the user sees: naming the wrong process is
 /// more useful than naming the wrong control, because it is the more likely
@@ -99,6 +144,14 @@ pub enum Gated<T> {
 /// for the allowed case. Deleting the refusal branch, or neutralising it,
 /// breaks those assertions; a pin on [`verdict`] alone would break on neither.
 ///
+/// # One field, and it used to be two
+///
+/// The second was `confirm`, the seam design 4b's card was hosted behind. It
+/// is gone with the card -- see the module doc for the owner's reasoning. The
+/// struct is kept for the field that is left, because that field is the whole
+/// reason a live Win32 + COM foreground lookup can be driven from a test at
+/// all.
+///
 /// # `fn` pointer rather than `impl Fn` for `describe`
 ///
 /// A seam that is itself unpinned only MOVES the hole, so
@@ -109,69 +162,20 @@ pub enum Gated<T> {
 pub struct SendGate {
     /// [`crate::injector::target::describe_foreground`] in production.
     describe: fn() -> Option<SendTarget>,
-    /// [`crate::preflight_card::show_preflight_card`] in production: the
-    /// bare-Win32 card that puts 4b on screen.
-    ///
-    /// **It is no longer an egui window.** This module's `draw` is gone with
-    /// the host that ran it; nothing in this crate had a second caller for it.
-    /// See the module doc for what stayed behind.
-    ///
-    /// See [`Self::confirm`] for why the seam is here and not inside
-    /// [`dispatch_with`].
-    confirm: fn(PreflightState, zeroize::Zeroizing<String>) -> Option<PreflightAction>,
 }
 
 impl SendGate {
     pub fn production() -> Self {
-        Self {
-            describe: crate::injector::target::describe_foreground,
-            confirm: crate::preflight_card::show_preflight_card,
-        }
+        Self { describe: crate::injector::target::describe_foreground }
     }
 
     /// The foreground, through the gate's own seam.
     ///
-    /// Public so that the caller can build a [`PreflightState`] out of the
-    /// **same** observation [`dispatch_with`] will make, rather than a second
-    /// one taken from somewhere else -- a preflight that named one window and
-    /// a gate that checked another would be worse than no preflight.
+    /// Public because the seam is the point: a caller that wants to know where
+    /// a fill would land must make the **same** observation [`dispatch_with`]
+    /// will make, rather than a second one taken from somewhere else.
     pub fn describe(&self) -> Option<SendTarget> {
         (self.describe)()
-    }
-
-    /// Puts the 4b confirmation on screen and answers what the user did.
-    ///
-    /// # This is *ahead of* the gate and never *instead of* it
-    ///
-    /// The confirmation cannot decide anything. Its only affirmative answer is
-    /// [`PreflightAction::Send`], and all that answer does is let the caller
-    /// go on to call [`dispatch_with`], which describes the foreground again
-    /// and refuses on its own terms. So there is no ordering of clicks, holds
-    /// or window switches that reaches a sender without the refusal arms in
-    /// `dispatch_with` having allowed it, and the mutation measurement those
-    /// arms carry is unchanged by hosting the surface -- the tests drive this
-    /// seam with a stub that always answers `Send`, so what they measure is
-    /// still the gate alone.
-    ///
-    /// **The measurement is not quoted here.** It used to be, as
-    /// "neutralise: 3 red, delete: 2 red", and it was not reproducible: the
-    /// prose did not pin the mutants closely enough for two readers to write
-    /// the same ones. They now live as anchored source replacements under
-    /// `mutations/cases/`, and `mutations/run.ps1` applies each to a
-    /// throwaway worktree and prints the count and the killing test names.
-    /// The names are the part worth reading -- a count that moved says
-    /// nothing on its own about whether the same escape is still caught.
-    ///
-    /// The other direction is a real gain: the card's refusal state lays out no
-    /// hold affordance at all -- `preflight_card::layout` answers `None` for it
-    /// and its pump does not read the key -- so a refused target never even
-    /// offers the user a way to ask.
-    pub fn confirm(
-        &self,
-        state: PreflightState,
-        copy_payload: zeroize::Zeroizing<String>,
-    ) -> Option<PreflightAction> {
-        (self.confirm)(state, copy_payload)
     }
 }
 
@@ -198,6 +202,11 @@ pub enum Guard<'a> {
 /// `send` is `FnOnce` so it cannot be run twice and cannot be run at all
 /// without being consumed -- a refusal drops it unused, which is the state the
 /// compiler makes visible.
+///
+/// **Nothing stands between the caller and this function any more.** A fill
+/// the user asked for reaches the sender on the first pass, with no window
+/// opened, no key held and no second question: the only thing between the
+/// hotkey and the keystroke is this function's own arithmetic.
 pub fn dispatch_with<T>(
     gate: &SendGate,
     guard: Guard<'_>,
@@ -223,192 +232,42 @@ pub fn dispatch_with<T>(
     }
 }
 
+/// **Design 4b's word for a fill that did not happen**, and the one string
+/// from that card's table which outlived it.
+///
+/// The card painted it across the top of its refused shape. Nothing paints it
+/// now, so it leads every sentence [`refusal_notice`] composes instead -- the
+/// user still reads "Nothing sent" first, in the one place a refusal now
+/// reaches them.
+pub const REFUSED_HEADING: &str = "Nothing sent";
+
 /// What the user is told when a gated fill did not happen. Reaches them
 /// through the same [`crate::injector::sequence::Notifier`] every other
 /// refusal uses -- a fill that quietly does nothing is indistinguishable from
 /// a hotkey that never registered.
+///
+/// **This is now the only channel, and that is the whole of what the card's
+/// removal cost here.** It used to be the second of two: a refused verdict was
+/// computed in `app::confirmed_by_preflight` as well, the card was drawn in its
+/// refusal shape, and the fill returned before `dispatch_with` was ever
+/// reached -- so in production this function's text was what nobody saw. The
+/// surviving channel is the tested one, it fires on all three refusing shapes,
+/// and it says the same three facts the card said.
+///
+/// What is **not** offered any more is *Copy instead*, the escape the card put
+/// beside its refusal. It was an affordance of a screen, and it needed that
+/// screen: a button, the value in hand, and a user standing in front of both.
+/// The value is still one chord away in the vault window and in
+/// `picker_prompt`, which is where every other copy in this app already lives.
 pub fn refusal_notice(gated_reason: Option<Refusal>) -> String {
-    match gated_reason {
+    let why = match gated_reason {
         Some(Refusal::WrongProcess) => "The window in front is not the one this item's rule was \
-             written for. Deskwarden will not type a password there."
-            .to_string(),
+             written for. Deskwarden will not type a password there.",
         Some(Refusal::NotMasked) => "The control holding focus is not a masked field. Deskwarden \
-             will not type a password into a box that echoes it."
-            .to_string(),
-        None => "Deskwarden could not tell which window is in front, so it did not type anything."
-            .to_string(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The surface
-// ---------------------------------------------------------------------------
-
-/// What the user did with the preflight.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreflightAction {
-    /// The hold completed. The only value that may reach a sender.
-    Send,
-    Cancel,
-    /// The escape the design offers beside the refusal: put the value on the
-    /// clipboard and let the user place it themselves.
-    CopyInstead,
-}
-
-/// How long the send key must be held down before [`PreflightAction::Send`] is
-/// emitted.
-///
-/// Long enough that it cannot be a stray keypress on a window that has just
-/// taken focus, short enough not to read as a hang. A click is not an option at
-/// all: the card paints its hold affordance rather than putting a `BUTTON`
-/// under it, so there is nothing there to click.
-pub const HOLD_TO_SEND: Duration = Duration::from_millis(800);
-
-/// The design's own words, kept as constants so the tests assert on the same
-/// strings the surface paints rather than on copies of them.
-pub const HEADING_TARGET: &str = "About to type into";
-pub const HEADING_STEPS: &str = "Will send";
-pub const HOLD_HINT: &str = "Hold Space to send";
-pub const CANCEL_LABEL: &str = "Cancel \u{b7} Esc";
-pub const COPY_INSTEAD_LABEL: &str = "Copy instead";
-pub const DISMISS_LABEL: &str = "Dismiss";
-/// The line under the two answers -- **4b's first sentence, and deliberately
-/// not its second.**
-///
-/// The design writes "Sending stops the moment focus leaves this window. Skip
-/// this step for SAP Logon in Preferences." The second sentence names a
-/// preference that does not exist: nothing in [`crate::settings::Settings`]
-/// can turn this card off for a rule or for an app, and [`verdict`] takes no
-/// settings argument at all, so there is no gate a preference could be wired
-/// to. Shipping the sentence anyway would send a user to a Preferences window
-/// to look for a switch that is not there -- and, worse, would advertise an
-/// escape from the one confirmation that stands between a stored sequence and
-/// a real password. A card that offers to stop asking is a card whose asking
-/// means less.
-///
-/// If that preference is ever built the sentence comes back here, because the
-/// surface paints this constant and nothing else.
-pub const FOOTNOTE: &str = "Sending stops the moment focus leaves this window.";
-pub const REFUSED_HEADING: &str = "Nothing sent";
-/// The label on the masked step, in the design's words.
-pub const MASKED_ONLY: &str = "masked field only";
-
-/// Everything the surface needs, and nothing it does not.
-///
-/// It holds no vault item and no resolved secret: the rows were built once by
-/// [`step_rows`], which never puts a password in one.
-pub struct PreflightState {
-    pub target: SendTarget,
-    pub rule_image: String,
-    pub rows: Vec<StepRow>,
-    pub verdict: Verdict,
-    /// How long the send key has been held down, accumulated across frames.
-    /// Reset to zero the moment the key comes up, so a series of taps never
-    /// adds up to a send.
-    pub held: Duration,
-}
-
-impl PreflightState {
-    /// The rows come from the editor's [`step_rows`] with the eye SHUT, which
-    /// is the only call to it in this file. See the module doc.
-    pub fn new(
-        target: SendTarget,
-        rule_image: &str,
-        sequence: &str,
-        source: &ResolveSource<'_>,
-    ) -> Self {
-        let rows = step_rows(sequence, source, false);
-        let has_secret = rows.iter().any(|r| r.secret);
-        let verdict = verdict(&target, rule_image, has_secret);
-        Self {
-            target,
-            rule_image: rule_image.to_string(),
-            rows,
-            verdict,
-            held: Duration::ZERO,
-        }
-    }
-
-    /// Whether this sequence types something that must never be echoed in
-    /// clear. Read off the rows rather than re-parsed, so it cannot disagree
-    /// with what the list shows.
-    pub fn has_secret(&self) -> bool {
-        self.rows.iter().any(|r| r.secret)
-    }
-}
-
-/// The line under the window title: the image, the pid, and whether the rule
-/// claims this process.
-pub fn target_line(state: &PreflightState) -> String {
-    let claim = if crate::injector::target::matches_rule(&state.target, &state.rule_image) {
-        "matches this rule"
-    } else {
-        "does not match this rule"
+             will not type a password into a box that echoes it.",
+        None => "Deskwarden could not tell which window is in front, so it did not type anything.",
     };
-    format!("{} \u{b7} pid {} \u{b7} {claim}", state.target.image_name, state.target.pid)
-}
-
-/// The refusal, in words that name the window the user is actually looking at.
-///
-/// Both refusals say plainly that the sequence types a password and that it
-/// will not be sent here; what differs is which fact is wrong, and the design
-/// says both when both are.
-pub fn refusal_message(state: &PreflightState, why: Refusal) -> String {
-    let wrong_process = matches!(why, Refusal::WrongProcess);
-    let unmasked = !state.target.focused_is_masked;
-    let mut reasons = Vec::new();
-    if wrong_process {
-        reasons.push(format!(
-            "The focused window is {}, not {}",
-            state.target.image_name, state.rule_image
-        ));
-    }
-    if unmasked {
-        reasons.push("the focused control is not masked".to_string());
-    }
-    format!(
-        "{}. This sequence types a password \u{2014} Deskwarden will not send it here.",
-        reasons.join(", and ")
-    )
-}
-
-/// **How the hold accumulates, and it is the same arithmetic in both
-/// renderers.**
-///
-/// This file used to hold `draw`, an egui surface for 4b, and the daemon
-/// hosted it in an `eframe` window. It does not any more: the first egui
-/// window this process opens costs ~50 MB of OpenGL driver arenas that are
-/// never released, and 4b was the last surface on the daemon's fill path
-/// paying that. The card is [`crate::preflight_card`] now -- bare Win32, GDI,
-/// ~1.8 MB -- and this file kept the half that was never egui in the first
-/// place: the DECISION.
-///
-/// What went with `draw` was a set of behavioural tests, and this function is
-/// where the one that could not be re-expressed in geometry came back. The
-/// property is: **a series of taps never adds up to a send.** `held` grows
-/// only while the key is down and is thrown away the moment it is not, so
-/// there is no way to reach [`HOLD_TO_SEND`] except by holding.
-///
-/// Pure, and `dt` is passed in rather than read off a clock, so the whole
-/// range -- a tap, a stall, a hold that completes -- is reachable from a test
-/// with no window and no wall time.
-pub fn advance_hold(held: Duration, down: bool, dt: Duration) -> Duration {
-    if down {
-        held + dt
-    } else {
-        // **Zero, not "paused".** A user who let go has stopped asking.
-        Duration::ZERO
-    }
-}
-
-/// Whether a hold has lasted long enough to be a send.
-///
-/// A named function rather than a `>=` at the call site because the comparison
-/// is the gate: `>` instead of `>=`, or a threshold read from somewhere else,
-/// is a change to how long the most dangerous action in the app has to be
-/// asked for.
-pub fn hold_complete(held: Duration) -> bool {
-    held >= HOLD_TO_SEND
+    format!("{REFUSED_HEADING}. {why}")
 }
 
 /// A gate whose foreground is a **fixture**, for the tests that drive a whole
@@ -416,40 +275,13 @@ pub fn hold_complete(held: Duration) -> bool {
 /// Win32 + COM round trip, and a test that reached it would be asking the
 /// machine it runs on where the mouse is.
 ///
-/// Written down here, below everything production, so that this file's own
-/// source pin -- which reads the region above the first gate -- still sees the
-/// whole of the production half.
+/// Written down here, below everything production, so that a source pin that
+/// reads the region above the first gate still sees the whole of the
+/// production half.
 #[cfg(test)]
 impl SendGate {
-    /// A gate whose foreground is a fixture and whose confirmation **always
-    /// says yes**.
-    ///
-    /// Saying yes is the point: it takes the hosted modal out of the picture
-    /// entirely, so every routing assertion built on this constructor is
-    /// measuring `dispatch_with`'s refusal arms and nothing else. If the
-    /// confirmation could refuse here, a deleted gate would still look green
-    /// and the whole measurement would be worthless.
     pub fn describing(describe: fn() -> Option<SendTarget>) -> Self {
-        Self { describe, confirm: |_, _| Some(PreflightAction::Send) }
-    }
-
-    /// A gate whose confirmation is a fixture too, for the tests that ask
-    /// whether the surface is HOSTED -- i.e. whether a gated fill really opens
-    /// it before anything is typed.
-    /// The confirmation seam, by identity, for the address pin in
-    /// `app::fill_dispatch_tests`. A getter and not a `pub` field so that
-    /// production code still cannot reach past [`Self::confirm`].
-    pub fn confirm_fn(
-        &self,
-    ) -> fn(PreflightState, zeroize::Zeroizing<String>) -> Option<PreflightAction> {
-        self.confirm
-    }
-
-    pub fn describing_and_confirming(
-        describe: fn() -> Option<SendTarget>,
-        confirm: fn(PreflightState, zeroize::Zeroizing<String>) -> Option<PreflightAction>,
-    ) -> Self {
-        Self { describe, confirm }
+        Self { describe }
     }
 }
 
@@ -457,104 +289,6 @@ impl SendGate {
 mod tests {
     use super::*;
     use crate::injector::target::SendTarget;
-    use crate::key_sequence::ResolveSource;
-
-    // -- the hold ----------------------------------------------------------
-    //
-    // These came back from the egui surface's own tests when that surface was
-    // deleted. They were the one thing there that was not about geometry, and
-    // they are the reason `advance_hold` is a function rather than three lines
-    // inside `preflight_card`'s pump: the pump cannot be driven without a
-    // window, and this can be driven over any `dt` at all.
-
-    /// **A series of taps never adds up to a send**, which is the whole point
-    /// of asking for a hold rather than a click.
-    #[test]
-    fn taps_never_add_up_to_a_send() {
-        let tap = Duration::from_millis(120);
-        let mut held = Duration::ZERO;
-        for _ in 0..50 {
-            // Down for a moment...
-            held = advance_hold(held, true, tap);
-            assert!(
-                !hold_complete(held),
-                "one tap of {tap:?} completed a hold of {HOLD_TO_SEND:?}"
-            );
-            // ...and released, which throws it away.
-            held = advance_hold(held, false, tap);
-            assert_eq!(held, Duration::ZERO, "releasing did not reset the hold");
-        }
-        assert!(!hold_complete(held));
-    }
-
-    /// And it is not merely inert: holding long enough really does complete.
-    #[test]
-    fn holding_long_enough_completes_and_a_release_throws_it_away() {
-        let tick = Duration::from_millis(8);
-        let mut held = Duration::ZERO;
-        let mut ticks = 0;
-        while !hold_complete(held) {
-            held = advance_hold(held, true, tick);
-            ticks += 1;
-            assert!(ticks < 1000, "the hold never completed, at {held:?}");
-        }
-        assert!(
-            held >= HOLD_TO_SEND,
-            "the hold reported complete at {held:?}, short of {HOLD_TO_SEND:?}"
-        );
-        // Control on the instrument: it took a real number of ticks, so the
-        // loop above is not passing on its first iteration.
-        assert!(ticks > 1, "control: the hold completed on one tick of {tick:?}");
-        // A release at the very last moment still throws it away.
-        assert_eq!(advance_hold(held, false, tick), Duration::ZERO);
-    }
-
-    /// A stalled frame credits the user with exactly the time it names and no
-    /// more -- `dt` is the caller's measurement, and this function invents
-    /// none of its own.
-    #[test]
-    fn the_hold_credits_only_the_time_it_is_handed() {
-        assert_eq!(advance_hold(Duration::ZERO, true, Duration::ZERO), Duration::ZERO);
-        assert_eq!(
-            advance_hold(Duration::from_millis(100), true, Duration::from_millis(50)),
-            Duration::from_millis(150)
-        );
-        assert!(!hold_complete(HOLD_TO_SEND - Duration::from_millis(1)));
-        assert!(hold_complete(HOLD_TO_SEND));
-    }
-
-    /// The words the card paints for a refusal name **both** wrong facts when
-    /// both are wrong, and never the password.
-    ///
-    /// The surface that used to assert this by reading painted galleys is
-    /// gone; the sentence it read is composed here, so this is the same claim
-    /// against the same string.
-    #[test]
-    fn the_refusal_sentence_names_every_fact_that_is_wrong() {
-        let state = PreflightState::new(
-            t("slack.exe", false),
-            "saplogon.exe",
-            "{USERNAME}{TAB}{PASSWORD}{ENTER}",
-            &ResolveSource {
-                username: "ada@example.com",
-                password: "hunter2",
-                custom: Vec::new(),
-                totp: &crate::vault_window::detail::TotpState::NoSecret,
-            },
-        );
-        assert_eq!(state.verdict, Verdict::Refused(Refusal::WrongProcess));
-        let sentence = refusal_message(&state, Refusal::WrongProcess);
-        assert!(sentence.contains("slack.exe"), "{sentence:?} does not name the focused window");
-        assert!(sentence.contains("saplogon.exe"), "{sentence:?} does not name the rule");
-        assert!(sentence.contains("the focused control is not masked"), "{sentence:?}");
-        assert!(sentence.contains("types a password"), "{sentence:?}");
-        assert!(!sentence.contains("hunter2"), "the refusal sentence carries the password");
-
-        let line = target_line(&state);
-        assert!(line.contains("slack.exe") && line.contains("pid 7412"), "{line:?}");
-        assert!(line.contains("does not match this rule"), "{line:?}");
-        assert!(!line.contains("hunter2"));
-    }
 
     fn t(image: &str, masked: bool) -> SendTarget {
         SendTarget {
@@ -586,6 +320,37 @@ mod tests {
         // A username-only sequence has nothing to leak into a visible field,
         // and requiring a masked control would make it unusable.
         assert_eq!(verdict(&t("saplogon.exe", false), "saplogon.exe", false), Verdict::Allowed);
+    }
+
+    /// **The refusal still says what happened, now that the card that said it
+    /// is gone.**
+    ///
+    /// This is the one surviving channel for a declined fill, so the three
+    /// sentences are asserted here rather than left to the surface that used
+    /// to paint them. Each one leads with [`REFUSED_HEADING`] -- design 4b's
+    /// own word for this state -- and each names the fact that is wrong, so a
+    /// user who pressed the hotkey knows which of "press it again" and "you
+    /// are in the wrong window" is their next move.
+    #[test]
+    fn every_refusal_says_nothing_was_sent_and_why() {
+        let wrong = refusal_notice(Some(Refusal::WrongProcess));
+        let unmasked = refusal_notice(Some(Refusal::NotMasked));
+        let unknown = refusal_notice(None);
+        for notice in [&wrong, &unmasked, &unknown] {
+            assert!(
+                notice.starts_with(REFUSED_HEADING),
+                "{notice:?} does not lead with the design's word for this state"
+            );
+        }
+        assert!(wrong.contains("not the one this item's rule was written for"), "{wrong:?}");
+        assert!(unmasked.contains("not a masked field"), "{unmasked:?}");
+        assert!(unknown.contains("could not tell which window is in front"), "{unknown:?}");
+        // Control on the instrument: the three are distinguishable, so a
+        // `refusal_notice` that answered one string for every reason would
+        // fail here rather than pass all four assertions above.
+        assert_ne!(wrong, unmasked);
+        assert_ne!(unmasked, unknown);
+        assert_ne!(wrong, unknown);
     }
 
     // -- the gate, in the position that gates ------------------------------
@@ -624,6 +389,10 @@ mod tests {
 
     const RULE: Guard<'static> = Guard::Preflight { rule_image: Some("saplogon.exe") };
 
+    /// **An allowed fill goes straight through**, which is the owner's
+    /// instruction stated as a test: one call, no confirmation, and the sender
+    /// ran. There is nothing to hold, nothing to press and nothing to dismiss
+    /// between a fill the user asked for and the keystrokes it types.
     #[test]
     fn the_sender_runs_only_for_an_allowed_verdict() {
         let (gated, sent) = run(right_and_masked, RULE);
@@ -686,44 +455,5 @@ mod tests {
             ),
             "the production gate does not look at the real foreground window"
         );
-    }
-
-    /// **The masking is the editor's, not a copy of it.** `step_rows` writes
-    /// `SECRET_MASK` for a password in a branch whose `else` is the only thing
-    /// that can resolve a value; a second row builder here would be a second
-    /// place for that to stop being true. So this file must build its rows
-    /// exactly one way and must never spell a `StepRow` literal.
-    #[test]
-    fn the_step_list_is_the_editors_and_is_never_rebuilt_here() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/vault_window/preflight.rs"
-        ))
-        .expect("preflight.rs is readable");
-        let production = source
-            .split_once(concat!("#[cfg(", "test)]"))
-            .map_or(source.as_str(), |(above, _)| above);
-        assert!(
-            production.len() < source.len(),
-            "control: the test gate was not found, so this pin is reading its own fixtures"
-        );
-        assert_eq!(
-            production.matches("step_rows(sequence, source, false)").count(),
-            1,
-            "the preflight's rows must come from the editor's own builder, with the eye shut"
-        );
-        assert_eq!(
-            production.matches(concat!("StepRow", " {")).count(),
-            0,
-            "a step row is built by hand here, which is a second place for the masking to be \
-             decided"
-        );
-
-        // Positive control on both needles: they match the spellings they are
-        // meant to match, so a count of 1 is a real call and a count of 0 is a
-        // real absence rather than a typo that matches nothing.
-        let fixture = concat!("let rows = step_rows(sequence, source, false);\n", "StepRow", " {");
-        assert_eq!(fixture.matches("step_rows(sequence, source, false)").count(), 1);
-        assert_eq!(fixture.matches(concat!("StepRow", " {")).count(), 1);
     }
 }

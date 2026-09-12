@@ -771,7 +771,7 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 15] = [
+    const OPENS_WINDOWS: [&str; 14] = [
         "app_window",
         // Design 3d's password generator. The THIRD bare-Win32 window in this
         // crate, and one for the same measured reason the other two are: an
@@ -798,15 +798,16 @@ mod tests {
         // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is the table that
         // holds its raise and which stopped being a one-row table for it.
         "picker_prompt",
-        // Design 4b's send preflight. The SEVENTH bare-Win32 window in this
-        // crate, and the one that emptied
-        // `OPENS_A_WINDOW_AND_DELIBERATELY_DOES_NOT_RAISE` -- see that table,
-        // which is now zero rows and says why. It is also the card that took
-        // the daemon's whole fill path to zero GL contexts: with it ported,
-        // no window the daemon opens between a hotkey and a keystroke is an
-        // egui window. See [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`], which is
-        // the table that holds its raise.
-        "preflight_card",
+        // **`preflight_card` was the fifteenth row and is not a row any
+        // more.** Design 4b's send preflight -- "About to type into", "Will
+        // send", hold Space -- was the confirmation shown before a stored
+        // sequence typed a real password, and the owner had it removed: a fill
+        // is something the user asked for twice over, and being asked a third
+        // time is the app second-guessing them. The module went with the
+        // screen rather than being left behind as three thousand lines of
+        // Win32 nothing draws. See `vault_window::preflight`'s module doc for the
+        // whole argument, and for what stayed: the gate, the refusal and the
+        // foreground re-check.
         "prefs_ui",
         // Design 2a's matched-item card. The FOURTH bare-Win32 window in this
         // crate, and the one the measured argument bites hardest on: it fires
@@ -1024,14 +1025,13 @@ mod tests {
     /// *Unlock* button that is the one offer this state can honour. What its
     /// capture exclusion protects is neither a password nor an account list
     /// but the name of the app this user is signing into.
-    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 7] = [
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 6] = [
         ("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE"),
         ("picker_prompt", include_str!("picker_prompt.rs"), "PICKER_PROMPT_TITLE"),
         ("generate_prompt", include_str!("generate_prompt.rs"), "GENERATE_PROMPT_TITLE"),
         ("prompt_card", include_str!("prompt_card.rs"), "PROMPT_CARD_TITLE"),
         ("locked_card", include_str!("locked_card.rs"), "LOCKED_CARD_TITLE"),
         ("save_login_card", include_str!("save_login_card.rs"), "SAVE_LOGIN_CARD_TITLE"),
-        ("preflight_card", include_str!("preflight_card.rs"), "PREFLIGHT_CARD_TITLE"),
     ];
 
     /// **Opens a window, and deliberately does not raise it -- because.**
@@ -1052,26 +1052,25 @@ mod tests {
     /// It held two modules and now holds none. The egui autofill overlay went
     /// first, with `overlay_ui`; `preflight_host` -- design 4b's confirmation
     /// -- went second, when that card was redrawn in bare Win32 as
-    /// `crate::preflight_card` and moved to
-    /// [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`]. Both of the reasons its row
-    /// gave expired at once: it opened under the literal `"Deskwarden"` three
-    /// raising windows share, and the Win32 card opens under a title of its
-    /// own and holds its own `HWND`; and it was `with_always_on_top()`, which
-    /// governs Z-order and not **focus** -- the card's send is a HELD KEY, and
-    /// a card without the foreground sends that key to the app it is standing
-    /// in front of, which for this card is a run of spaces typed into the very
-    /// password box the sequence was aimed at.
+    /// `preflight_card` and joined [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`].
+    /// Both of the reasons its row gave expired at once: it opened under the
+    /// literal `"Deskwarden"` three raising windows share, and the Win32 card
+    /// opened under a title of its own and held its own `HWND`; and it was
+    /// `with_always_on_top()`, which governs Z-order and not **focus** -- the
+    /// card's send was a HELD KEY, and a card without the foreground sends
+    /// that key to the app it is standing in front of, which for that card was
+    /// a run of spaces typed into the very password box the sequence was aimed
+    /// at.
     ///
-    /// The **third** reason on that row does not expire and is worth writing
-    /// down where it was lost: `preflight::verdict` is computed from the
-    /// foreground described a moment before the card opens, and
-    /// `dispatch_with` describes the foreground **again** after it closes. So
-    /// the raise is a deliberate change to which window is in front, made by
-    /// the one surface in the app whose whole job is to tell the truth about
-    /// which window is in front. What makes it safe is that it is not the
-    /// observation the gate acts on: the second description is taken after the
-    /// card is destroyed, and if it lands before the previous window is
-    /// reactivated the gate refuses -- which is the fail-safe direction.
+    /// **Design 4b itself has since been removed**, on the owner's
+    /// instruction: a fill is something the user deliberately asked for, so
+    /// confirming it was the app second-guessing them. There is no longer any
+    /// surface between a fill and its keystrokes, and `preflight_card` is gone
+    /// from [`OPENS_WINDOWS`] and from the raise table with it. The reasoning
+    /// above is kept because it is the record of why *no* exemption was
+    /// written, which is what this table is for; the gate, the refusal and the
+    /// foreground re-check all survive in `vault_window::preflight` and
+    /// `injector::sequence`, and that module's doc carries the argument.
     ///
     /// **An empty table is not a dead one.** It is still chained into
     /// `every_module_in_this_crate_is_classified_as_opening_windows_or_not`,
@@ -1342,7 +1341,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 80] = [
+        const OPENS_NO_WINDOW: [&str; 81] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1426,6 +1425,17 @@ mod tests {
             // to match on. `RAISING_SITES` greps for `run_ui_native(TITLE,`,
             // which this file has not got and cannot be given.
             "file_picker",
+            // **Three scalars and a string, and it answers questions about
+            // them.** It remembers which vault item the last fill used, at
+            // which window, and when, so the next press of the fill hotkey at
+            // that same window inside five minutes can offer it back. It
+            // creates nothing, paints nothing, and has no title for
+            // `foreground::pick` to match -- the card its answer causes to
+            // appear is `prompt_card`'s, which is classified in its own right
+            // and raised by its own site. `app_candidates` and `app_match` are
+            // classified here for exactly this reason: deciding what to show
+            // is not showing it.
+            "fill_recall",
             "fill_stats",
             "foreground",
             "hello",
@@ -1745,8 +1755,9 @@ mod tests {
              differ: {raises:?}"
         );
         // **No control on `excused` being non-empty.** It is empty, and that
-        // is the point: `preflight_host` was the last row and design 4b is a
-        // bare-Win32 card that raises. An empty exemption list makes the
+        // is the point: `preflight_host` was the last row, design 4b became a
+        // bare-Win32 card that raised, and design 4b has since been removed
+        // outright. An empty exemption list makes the
         // reconciliation below a stronger claim rather than a weaker one --
         // every module in `OPENS_WINDOWS` must now appear in a raise table --
         // and the two loops that read it are kept for the next module that
@@ -1944,8 +1955,9 @@ mod tests {
         //
         // One comparison where there used to be two: the second named
         // `preflight_host::PREFLIGHT_TITLE`, which was a second spelling of
-        // the same `"Deskwarden"` literal, and design 4b's card opens under a
-        // title of its own now. The literal is still shared by
+        // the same `"Deskwarden"` literal. Design 4b's card took a title of
+        // its own and has since been removed altogether, so there is no third
+        // window to compare here either. The literal is still shared by
         // `vault_window`, `app_window` and `loading_ui`, and `WINDOW_TITLE` is
         // the one of those three this module can name.
         assert_ne!(
@@ -2014,7 +2026,8 @@ mod tests {
         );
         assert_ne!(
             crate::region_overlay::REGION_TITLE,
-            crate::preflight_card::PREFLIGHT_CARD_TITLE
+            crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
+            "the region overlay shares a title with a bare-Win32 card the daemon opens"
         );
         assert_ne!(
             crate::region_overlay::REGION_TITLE,

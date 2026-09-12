@@ -3087,7 +3087,10 @@ mod tests {
                 "examples/locked_preview.rs",
                 "examples/picker_preview.rs",
                 "examples/picker_probe.rs",
-                "examples/preflight_preview.rs",
+                // `examples/preflight_preview.rs` was here. It previewed
+                // design 4b's send confirmation, which has been removed on the
+                // owner's instruction -- see `vault_window::preflight`'s
+                // module doc -- so the example had nothing left to open.
                 "examples/prompt_preview.rs",
                 "examples/rest_probe.rs",
                 "examples/save_login_preview.rs",

@@ -3656,29 +3656,51 @@ fn main() {
                 // a user pressing a chord at the window they are already in.
                 // Left set, this branch would do nothing at all and every
                 // test could still pass.
-                log::info!(
-                    "the fill hotkey was pressed with nothing armed; asking what {} deserves \
-                     as a request rather than as a foreground change",
-                    deskwarden::app::window_label(&event.exe_name, &event.title)
-                );
-                last_dispatched_hwnd = None;
-                ask_for_a_vault_search(&mut pending_vault_search, dispatch_with_the_unlock_door(
+                //
+                // **The remembered record is offered ahead of all of that**,
+                // and only ahead of it: everything below this block is
+                // untouched and still runs whenever the answer is
+                // `Offered::No`. That is the shape the feature needs -- a
+                // shortcut in front of the picker, never a replacement for it
+                // -- and it is why the card's way back answers
+                // `Offered::No` rather than opening anything itself.
+                let offered = offer_the_remembered_record(
                     &event,
-                    &mut estate,
+                    &estate.cache,
                     &injector,
                     &fill_stats,
-                    &mut fill_proof,
-                    &mut pending_hotkey_fill,
-                    &mut last_dispatched_hwnd,
-                    &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD, show_locked: REAL_LOCKED_CARD },
-                    &job,
-                    &schedule,
-                    &tray,
-                    &backend_op_rx,
-                    &config_dir,
-                    deskwarden::unlock_prompt::ask,
-                    deskwarden::app::Trigger::Hotkey,
-                ));
+                    deskwarden::app::vault_availability(estate.cache.is_populated()),
+                    std::time::Instant::now(),
+                    &mut fill_proof.scoped_to(estate.active_account.as_ref().map(|a| &a.id)),
+                );
+                if offered == Offered::No {
+                    log::info!(
+                        "the fill hotkey was pressed with nothing armed; asking what {} \
+                         deserves as a request rather than as a foreground change",
+                        deskwarden::app::window_label(&event.exe_name, &event.title)
+                    );
+                    last_dispatched_hwnd = None;
+                    ask_for_a_vault_search(
+                        &mut pending_vault_search,
+                        dispatch_with_the_unlock_door(
+                            &event,
+                            &mut estate,
+                            &injector,
+                            &fill_stats,
+                            &mut fill_proof,
+                            &mut pending_hotkey_fill,
+                            &mut last_dispatched_hwnd,
+                            &mut NoMatchEnv { memo: &mut field_probe_memo, ask: REAL_PASSWORD_FIELD_PROBE, show: REAL_NO_MATCH_CARD, show_locked: REAL_LOCKED_CARD },
+                            &job,
+                            &schedule,
+                            &tray,
+                            &backend_op_rx,
+                            &config_dir,
+                            deskwarden::unlock_prompt::ask,
+                            deskwarden::app::Trigger::Hotkey,
+                        ),
+                    );
+                }
             }
         }
 
@@ -4858,6 +4880,104 @@ type LockedCard = fn(&window_watch::ForegroundEvent) -> NoMatchFollowUp;
 /// switched off for every trigger mode, the app's entire purpose -- compiled
 /// and left all 1217 lib and 113 bin tests green. See
 /// `tests::the_dispatch_that_actually_fills`.
+/// Whether the remembered-record card answered this press of the fill hotkey.
+///
+/// Two variants and not a `bool` for this crate's standing reason: the value
+/// decides whether a second window opens, and "true" is a worse way to say
+/// "the user has been dealt with" than saying it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offered {
+    /// The card went up and the press is finished with -- the record was
+    /// filled, or the card was dismissed. The account picker does **not**
+    /// follow.
+    Yes,
+    /// Nothing was offered, or the user asked for a different record. The
+    /// press carries on to the account picker exactly as it always has.
+    No,
+}
+
+/// **The remembered record, offered ahead of the account picker.**
+///
+/// This is the whole of the feature's production wiring and it is deliberately
+/// four statements long, because every decision in it is made somewhere a test
+/// can reach: [`deskwarden::app::recall_plan`] decides *whether*,
+/// [`deskwarden::app::handle_recall`] decides what the card says and answers
+/// what the user took, and [`deskwarden::app::recall_follow_up`] decides what
+/// that answer means. What is left here is naming the cache, the injector and
+/// the clock -- the three things this function has that no test does.
+///
+/// **The fill goes through the one door.** `fill_from_vault` is the same call
+/// the armed-hotkey branch and the account picker make, so this card's fill is
+/// gated by the master-password re-prompt, gated by the send preflight, and
+/// typed by the injector's own foreground check -- none of which this function
+/// re-implements or may bypass. A second fill site reachable from a card would
+/// be a second place all three could be forgotten.
+///
+/// **The memory is renewed by the fill it authorised**, which is the half of
+/// [`deskwarden::fill_recall::RECALL_TTL`] that makes it an idle timeout
+/// rather than a budget for the whole sign-in: page two of a slow sign-in
+/// restarts the five minutes for page three.
+///
+/// **Going back forgets**, and that is what stops the offer being something
+/// the user cannot get past. They said "not that one", so the next press opens
+/// the picker rather than the record they have just rejected. A *dismissal*
+/// does not forget: Escape is "not now", and the next page of the same sign-in
+/// should still be offered it.
+#[allow(clippy::too_many_arguments)]
+fn offer_the_remembered_record<A: UiAutomationFiller, B: SendInputFiller>(
+    event: &window_watch::ForegroundEvent,
+    cache: &VaultCache,
+    injector: &Injector<A, B>,
+    fill_stats: &fill_stats::FillStats,
+    vault: deskwarden::app::VaultAvailability,
+    now: std::time::Instant,
+    reprompt: &mut deskwarden::app::Reprompt<'_>,
+) -> Offered {
+    let at = deskwarden::fill_recall::WindowKey::of(event);
+    // The lock is taken and released inside this call and is never held across
+    // the card below -- see `fill_recall::with_production`.
+    let plan = deskwarden::fill_recall::with_production(|recall| {
+        deskwarden::app::recall_plan(recall, &at, vault, now)
+    });
+    let deskwarden::app::RecallPlan::Offer(remembered) = plan else {
+        return Offered::No;
+    };
+    log::info!(
+        "the fill hotkey was pressed at the window vault item {remembered} was last filled \
+         into, inside the five minutes; offering it back rather than asking for a search"
+    );
+    match deskwarden::app::handle_recall(cache, event, &remembered) {
+        // **`taken`, and not `choice`.** The name is what tells
+        // `app::every_fill_call_site_passes_the_choice_its_own_file_is_entitled_to`
+        // which call site this is: that scan gives each production fill in a
+        // file one form of its own, and two call sites spelling their argument
+        // identically would let one of them satisfy both rows while the other
+        // went unexamined. It is also the truer word here -- this is the row
+        // the user took off a card, not a choice this code made.
+        deskwarden::app::RecallFollowUp::Fill { item_id, choice: taken } => {
+            deskwarden::app::fill_from_vault(
+                cache,
+                injector,
+                fill_stats,
+                &item_id,
+                event.hwnd,
+                taken,
+                &deskwarden::injector::sequence::REAL_NOTIFIER,
+                reprompt,
+            );
+            deskwarden::fill_recall::remember_fill(at, &item_id, now);
+            Offered::Yes
+        }
+        deskwarden::app::RecallFollowUp::Picker => {
+            deskwarden::fill_recall::forget_production(
+                deskwarden::fill_recall::Forgotten::UserWentBack,
+            );
+            Offered::No
+        }
+        deskwarden::app::RecallFollowUp::Nothing => Offered::Yes,
+    }
+}
+
 fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     event: &window_watch::ForegroundEvent,
     cache: &VaultCache,
@@ -5043,7 +5163,11 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             // binding for; picking one and picking a field is a fill the user
             // asked for by name, twice. It goes through `fill_from_vault` --
             // the same door `handle_match` uses -- so it is gated by the
-            // master-password re-prompt, gated by the 4b preflight, and typed
+            // master-password re-prompt, gated by `preflight::dispatch_with`
+            // -- the DECISION, which is all that is left of design 4b: the
+            // confirmation card that used to ask a third time was removed on
+            // the owner's instruction, precisely because the user had already
+            // asked twice on this very path -- and typed
             // by `Injector::fill_sequence`, whose foreground check refuses to
             // type into a window that is no longer in front. This line is the
             // only place in this function with an injector in scope, which is
@@ -5061,6 +5185,35 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
                     deskwarden::app::fill_from_vault(
                         cache, injector, fill_stats, &item_id, event.hwnd, choice, notifier,
                         reprompt,
+                    );
+                    // **This is the search the feature exists to remove, and
+                    // it is the one that has to be remembered.** The user has
+                    // just found a record by hand for a window nothing was
+                    // bound to; the next page of the same sign-in asks for the
+                    // same record, and without this line it would ask them to
+                    // find it again.
+                    //
+                    // Recorded AFTER the fill and unconditionally, which are
+                    // two decisions. After, because a memory written before a
+                    // refused fill (the re-prompt gate, the preflight, a
+                    // foreground that moved) would offer a record this app
+                    // never typed. Unconditionally, because `fill_from_vault`
+                    // answers nothing -- it is `()` -- and inventing a return
+                    // value for it would change the one function every fill in
+                    // this app goes through, for a five-minute convenience.
+                    // What that costs when a fill really was refused is one
+                    // card offering the right record at the right window,
+                    // which is what the user asked for anyway and which they
+                    // can leave with one key.
+                    //
+                    // `WindowKey::of` reads the handle, the process and the
+                    // executable off this event and deliberately not its
+                    // title -- see `fill_recall`, where that omission is the
+                    // whole feature.
+                    deskwarden::fill_recall::remember_fill(
+                        deskwarden::fill_recall::WindowKey::of(event),
+                        &item_id,
+                        std::time::Instant::now(),
                     );
                     NoMatchFollowUp::Nothing
                 }
@@ -5618,6 +5771,19 @@ fn settle_vault_after_unlock(
 /// recovery this message names still works.
 fn stand_down_after_unlock(engine: &mut MatchEngine, reason: &str) {
     engine.clear();
+    // **The remembered record goes with the vault**, and this is the one place
+    // it can go from: every route to "the vault is effectively locked again"
+    // ends here, so a second call site would be a second answer that could
+    // disagree with this one.
+    //
+    // The reason is not that the id could no longer be resolved -- though it
+    // could not -- it is that locking is the user saying stop. Coming back to
+    // an unlocked vault and being handed a prepopulated record from before the
+    // lock would be this app deciding that a lock was about the vault file
+    // rather than about the person. See `fill_recall`'s module header, and
+    // `app::recall_plan`, which refuses to offer while locked as well, so the
+    // guarantee does not rest on this line alone.
+    deskwarden::fill_recall::forget_production(deskwarden::fill_recall::Forgotten::VaultLocked);
     log::warn!(
         "{reason}; leaving Deskwarden running with the vault effectively still locked. The app \
          matches are cleared too, so nothing can prompt to autofill until they are rebuilt: use \
@@ -31816,6 +31982,99 @@ mod tests {
             );
         }
 
+        /// **The remembered record is offered BEFORE the account picker, and
+        /// the picker still follows when it is not.**
+        ///
+        /// Every decision this feature makes is a pure function tested in
+        /// `app` and `fill_recall`; what no test can reach is the three lines
+        /// in this file that call them, and each of the three can be deleted
+        /// with the whole suite green and the feature gone:
+        ///
+        /// * the offer itself -- delete it and `CTRL+ALT+B` is the account
+        ///   picker again, exactly as before, which is what every other test
+        ///   here asserts;
+        /// * the record of the picker's own fill -- delete it and there is
+        ///   never anything to offer, because the first fill of a sign-in is
+        ///   the one the user searched for;
+        /// * the lock's forget -- delete it and a record survives a lock,
+        ///   which is the one invalidation that is about the person rather
+        ///   than about whether an id resolves.
+        ///
+        /// The needles are the whole call, so a call whose answer is thrown
+        /// away (`offer_the_remembered_record(..);` followed by the picker
+        /// unconditionally) does not contain the first one.
+        #[test]
+        fn the_remembered_record_is_offered_ahead_of_the_account_picker() {
+            let source = include_str!("main.rs");
+            let boundary = source
+                .find(concat!("mod ", "tests {"))
+                .expect("the test module is gone from main.rs");
+            let production = &source[..boundary];
+
+            let offered = concat!("let offered = offer_the_remembered_", "record(");
+            assert_eq!(
+                production.matches(offered).count(),
+                1,
+                "the fill hotkey no longer offers the record it last filled at this window, \
+                 or offers it without binding the answer -- in which case the account picker \
+                 opens over the card the user was just handed"
+            );
+            let gated = concat!("if offered == ", "Offered::No {");
+            assert_eq!(
+                production.matches(gated).count(),
+                1,
+                "the account picker is no longer gated on the offer's answer. Either it \
+                 opens on top of the remembered-record card, or -- if the gate was inverted \
+                 -- it never opens at all and *Pick a different record* leads nowhere"
+            );
+
+            let remembered = concat!("deskwarden::fill_recall::remember_", "fill(");
+            assert_eq!(
+                production.matches(remembered).count(),
+                2,
+                "expected two production records of a fill: the account picker's, which is \
+                 the search this feature exists to remove, and the remembered card's own, \
+                 which is what makes the five minutes run from the LAST fill rather than \
+                 the first. One means a three-page sign-in still searches at page three"
+            );
+
+            let forgotten = concat!("deskwarden::fill_recall::forget_", "production(");
+            assert_eq!(
+                production.matches(forgotten).count(),
+                2,
+                "expected two production forgets: the lock, and the user asking for a \
+                 different record. Losing the first leaves a record on offer across a lock; \
+                 losing the second leaves the user being handed the record they just \
+                 rejected, on every press"
+            );
+            assert!(
+                production.contains(concat!("Forgotten::", "VaultLocked")),
+                "nothing forgets the remembered record when the vault locks"
+            );
+            assert!(
+                production.contains(concat!("Forgotten::", "UserWentBack")),
+                "nothing forgets the remembered record when the user asks for another one"
+            );
+        }
+
+        /// The lock's forget is on the one function every route to "the vault
+        /// is effectively locked again" ends at, rather than beside one of
+        /// them -- so a second lock path cannot arrive without it.
+        #[test]
+        fn the_lock_that_clears_the_engine_is_the_lock_that_forgets_the_record() {
+            let source = include_str!("main.rs");
+            let start = source
+                .find(concat!("fn stand_down_after_", "unlock(engine: &mut MatchEngine"))
+                .expect("`stand_down_after_unlock` is gone from main.rs");
+            let body = &source[start..start + 1400];
+            assert!(
+                body.contains(concat!("deskwarden::fill_recall::forget_", "production(")),
+                "`stand_down_after_unlock` clears the match engine but leaves the remembered \
+                 record standing, so locking the vault no longer forgets which record was \
+                 last filled"
+            );
+        }
+
         /// **What is left unreachable, held by source position.**
         ///
         /// Handing the notifier in is what makes a test-opened dialog
@@ -31824,7 +32083,10 @@ mod tests {
         /// a recorder and every test in this file stays green while the
         /// shipped app silently stops telling anyone why a fill did nothing --
         /// the exact failure mode `app::prompt_wiring_tests` guards for the
-        /// overlay. So the three production hand-overs are counted here.
+        /// overlay. So the production hand-overs are counted here -- **four
+        /// now**, the fourth being `offer_the_remembered_record`, which fills
+        /// from the remembered-record card and is the newest production path
+        /// that can refuse.
         #[test]
         fn the_production_dispatch_uses_the_real_notifier() {
             let source = include_str!("main.rs");
@@ -31854,11 +32116,12 @@ mod tests {
                 .expect("the test module is gone from main.rs");
             assert_eq!(
                 source[..boundary].matches(real).count(),
-                3,
-                "expected the real notifier to be named exactly three times in `run` -- the \
-                 two `process_foreground_event` calls and the hotkey `fill_from_vault`. Fewer \
-                 means a production fill can refuse without telling the user; more means a \
-                 fourth production path appeared that nobody has thought about"
+                4,
+                "expected the real notifier to be named exactly four times above the test \
+                 module -- the two `process_foreground_event` calls, the hotkey \
+                 `fill_from_vault`, and `offer_the_remembered_record`'s. Fewer means a \
+                 production fill can refuse without telling the user; more means a fifth \
+                 production path appeared that nobody has thought about"
             );
             assert_eq!(
                 source[boundary..].matches(named).count(),
@@ -31869,14 +32132,14 @@ mod tests {
             );
         }
 
-        /// **The re-prompt is scoped to the account, on the three lines no
+        /// **The re-prompt is scoped to the account, on the four lines no
         /// test can execute.**
         ///
         /// This is the pin the whole threading exists for, and it guards a
         /// failure that is the opposite of the usual one. `reprompt::gate_from`
         /// answers `RepromptGate::unprovable()` for a `None` account, and an
         /// unprovable gate refuses **every** protected item -- so a
-        /// `scoped_to(None)` written on any of these three lines does not
+        /// `scoped_to(None)` written on any of these four lines does not
         /// weaken the gate, it switches autofill off for every enrolled user
         /// who ever ticked "master password re-prompt". Nothing below can see
         /// it: every dispatch test here passes `no_reprompt()` deliberately,
@@ -31918,12 +32181,13 @@ mod tests {
                 .expect("the test module is gone from main.rs");
             assert_eq!(
                 source[..boundary].matches(needle).count(),
-                3,
-                "expected the re-prompt to be scoped to the active account exactly three times \
-                 in `run` -- the two `process_foreground_event` calls and the hotkey \
-                 `fill_from_vault`. Fewer means a production fill of a protected item is \
-                 gated against no account at all, which refuses it outright for every user; \
-                 more means a fourth production fill appeared that nobody has thought about"
+                4,
+                "expected the re-prompt to be scoped to the active account exactly four times \
+                 in `run` -- the two `process_foreground_event` calls, the hotkey \
+                 `fill_from_vault`, and the remembered-record card's. Fewer means a \
+                 production fill of a protected item is gated against no account at all, \
+                 which refuses it outright for every user; more means a fifth production \
+                 fill appeared that nobody has thought about"
             );
             assert_eq!(
                 source[boundary..].matches(concat!("scoped_to(estate.", "active_account")).count(),

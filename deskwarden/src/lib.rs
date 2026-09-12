@@ -58,6 +58,7 @@ pub mod clipboard;
 pub mod dispatch;
 pub mod favicon;
 pub mod file_picker;
+pub mod fill_recall;
 pub mod fill_stats;
 pub mod foreground;
 pub mod generate_prompt;
@@ -93,9 +94,6 @@ pub mod password_gen;
 pub mod password_strength;
 pub mod picker_prompt;
 pub mod picker_ui;
-/// Design 4b: the send preflight, in bare Win32. **The card that took the
-/// daemon's fill path to zero GL contexts** -- see the module doc.
-pub mod preflight_card;
 pub mod prefs_ui;
 /// Design 2a: the matched-item autofill prompt, in bare Win32.
 pub mod prompt_card;

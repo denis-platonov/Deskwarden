@@ -1421,7 +1421,7 @@ mod win32 {
     use windows::core::{w, HSTRING, PCWSTR};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
-        AddFontMemResourceEx, AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap,
+        AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap,
         CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreatePen, CreateSolidBrush,
         DeleteDC, DeleteObject, EndPaint, FillRect, GetDC, GetDeviceCaps,
         InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA,
@@ -1487,35 +1487,24 @@ mod win32 {
 
     // ---- fonts -------------------------------------------------------------
 
-    /// Registers the bundled Archivo cuts privately with GDI, once.
+    /// Registers every bundled face privately with GDI, once.
     ///
-    /// `AddFontMemResourceEx` makes a face available to **this process only**
-    /// -- nothing is installed and nothing touches the user's font list -- and
-    /// the handles are deliberately never released, because freeing one while
-    /// a window still has it selected is how a surface repaints in the
-    /// fallback face.
+    /// **The loop that used to be here now lives in
+    /// [`crate::win32_draw::register_fonts`], behind one process-wide
+    /// `OnceLock` instead of one per card.** `AddFontMemResourceEx` copies the
+    /// font data into the process font table rather than refcounting a shared
+    /// buffer, so every card that carried its own copy of this loop handed GDI
+    /// another private copy of all four Archivo cuts -- roughly 750 KB of pure
+    /// duplicate per card opened in a session. Adding the four Noto Cyrillic
+    /// cuts this card needs for its Cyrillic rows would have made that worse
+    /// rather than better, so the registration moved to the one module every
+    /// card already draws its text through.
+    ///
+    /// This card is the one that made the defect visible: its rows are vault
+    /// item names, so it is where "Сбербанк" sat beside "Netflix" in a
+    /// different typeface.
     fn register_fonts() {
-        static ONCE: OnceLock<()> = OnceLock::new();
-        ONCE.get_or_init(|| unsafe {
-            for (_, _, _, bytes) in crate::theme::ARCHIVO_FACES {
-                // A `Cell` rather than a `mut` local: GDI writes the count back
-                // through a `*const u32`, so a plain immutable binding read
-                // afterwards is a value the compiler may fold to its
-                // initialiser.
-                let installed = std::cell::Cell::new(0u32);
-                let handle = AddFontMemResourceEx(
-                    bytes.as_ptr() as *const c_void,
-                    bytes.len() as u32,
-                    None,
-                    installed.as_ptr(),
-                );
-                if handle.0.is_null() || installed.get() == 0 {
-                    // Cosmetic degradation, never a reason to refuse to offer
-                    // the accounts. GDI falls back to the shell font.
-                    log::warn!("could not register a bundled Archivo face with GDI");
-                }
-            }
-        });
+        crate::win32_draw::register_fonts();
     }
 
     /// An `HFONT` for one of the app's faces at one logical size. The GDI
@@ -1575,6 +1564,18 @@ mod win32 {
         /// The search box's face. The app's regular cut at the size a row's
         /// name is set in, so what the user types reads as the same kind of
         /// text as the rows it filters.
+        ///
+        /// **This is the one face on the card the Cyrillic pairing does not
+        /// reach.** The box is a real `EDIT` control, and `EDIT` rasterises
+        /// its own text from the `HFONT` handed to it at `WM_SETFONT` --
+        /// nothing typed into it ever passes through
+        /// [`crate::win32_draw::draw_text`], which is where the crate decides
+        /// a run's face. So a Cyrillic query still falls back to whatever GDI
+        /// links Archivo to, while the rows it filters are now drawn in the
+        /// paired Noto cut. Left that way on purpose: the only fix available
+        /// is re-deciding the control's font on every keystroke, which makes
+        /// the field change typeface mid-word -- worse to look at than the
+        /// mismatch it would cure.
         field: HFONT,
         /// The keyboard hints' face: `theme::GDI_MONO_FACE` at
         /// `theme::CHIP_TEXT_PX`, which is what `theme::kbd_chip` renders in.
@@ -2780,8 +2781,11 @@ mod win32 {
             WM_DESTROY => {
                 // **NO `PostQuitMessage` HERE, EVER.** This window is opened
                 // on the daemon thread, and that thread goes on to run egui
-                // windows -- the save-a-login form after *New login*, the
-                // preflight host after *Password* / *One-time code*.
+                // windows -- the save-a-login form after *New login*. (Design
+                // 4b's preflight host was the second of those, after
+                // *Password* / *One-time code*; that confirmation has been
+                // removed, so those two choices now go straight to a fill.
+                // The hazard is unchanged for the one window that is left.)
                 // `close()` calls `DestroyWindow`, which dispatches this
                 // message synchronously on that thread, so a `PostQuitMessage`
                 // here leaves the thread's quit flag set with nothing left to
@@ -4137,14 +4141,16 @@ mod card_tests {
             !code.contains(concat!("PostQuit", "Message")),
             "picker_prompt.rs's production half posts a thread quit. This window is opened on \
              the daemon thread, and that thread goes on to run egui windows: the design-3c \
-             save-a-login form after *New login*, and the preflight host after *Password* / \
-             *One-time code*. `close()` calls `DestroyWindow`, which dispatches WM_DESTROY \
-             synchronously on that thread, and nothing drains the queue afterwards -- `next()` \
-             has already returned. The next `eframe::run_native` takes the stale WM_QUIT out of \
-             `GetMessageW`, leaves its loop before it draws, and returns its DEFAULT answer: \
-             the save form never appears, and the preflight reports \"not confirmed\" so the \
-             password the user picked is silently never typed. `GONE` is what `next()` reads; \
-             quitting the thread is not this window's job."
+             save-a-login form after *New login*. `close()` calls `DestroyWindow`, which \
+             dispatches WM_DESTROY synchronously on that thread, and nothing drains the queue \
+             afterwards -- `next()` has already returned. The next `eframe::run_native` takes \
+             the stale WM_QUIT out of `GetMessageW`, leaves its loop before it draws, and \
+             returns its DEFAULT answer: the save form never appears. (Design 4b's preflight \
+             host was the second such window, after *Password* / *One-time code*, and it failed \
+             the same way -- it reported \"not confirmed\" and the password the user had just \
+             picked was silently never typed. That confirmation has been removed; the hazard is \
+             unchanged for the window that is left.) `GONE` is what `next()` reads; quitting \
+             the thread is not this window's job."
         );
     }
 }
