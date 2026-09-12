@@ -2216,12 +2216,30 @@ fn secret_field(ui: &mut egui::Ui, typed: &mut String) -> egui::Response {
         ),
         egui::Sense::hover(),
     );
-    let inset = egui::vec2(
-        SECRET_BOX_STROKE + SECRET_BOX_PAD_X,
-        SECRET_BOX_STROKE + SECRET_BOX_PAD_Y,
+    // **The text row is CENTRED in the box, not laid out to fill it.**
+    //
+    // The box is `stroke*2 + pad*2 + line` tall, which is 6d's 40.8 measured
+    // as border-box, and that is right. What was wrong is what went inside
+    // it: `inner` was the whole padding box, 20.8 tall, and the layouter
+    // asked for a line height to match. A 13px row is about 16, so egui had
+    // five points of slack to place -- and it puts that slack BELOW the
+    // glyphs, not around them. The text sat high in its box by half of it,
+    // on every state of this card.
+    //
+    // So the row is measured and `inner` is exactly that tall, centred in
+    // `outer`. The box does not move -- its height is the design's and stays
+    // the formula above -- and the padding is what absorbs the difference,
+    // which is what padding is for.
+    let row = ui.fonts_mut(|f| {
+        f.row_height(&egui::FontId::new(SECRET_TEXT_PX, egui::FontFamily::Monospace))
+    });
+    let inner = egui::Rect::from_center_size(
+        outer.center(),
+        egui::vec2(
+            outer.width() - (SECRET_BOX_STROKE + SECRET_BOX_PAD_X) * 2.0,
+            row,
+        ),
     );
-    let inner = egui::Rect::from_min_max(outer.min + inset, outer.max - inset);
-
     let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _wrap: f32| {
         let mut job = egui::text::LayoutJob::default();
         // `no_max_width`, because this is a single-line field: 6d's box says
@@ -2235,7 +2253,7 @@ fn secret_field(ui: &mut egui::Ui, typed: &mut String) -> egui::Response {
             0.0,
             egui::TextFormat {
                 extra_letter_spacing: SECRET_TEXT_PX * SECRET_TEXT_TRACKING,
-                line_height: Some(line),
+                line_height: Some(row),
                 font_id: egui::FontId::new(SECRET_TEXT_PX, egui::FontFamily::Monospace),
                 color: theme::INK,
                 ..Default::default()
