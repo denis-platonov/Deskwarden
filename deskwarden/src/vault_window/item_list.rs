@@ -952,6 +952,14 @@ pub fn search_hint(count: Option<usize>, filter: &SidebarFilter) -> String {
         SidebarFilter::Archive => ("item", "items"),
         SidebarFilter::Trash => ("item", "items"),
         SidebarFilter::Folder(_) => ("item", "items"),
+        // A folder's noun, for the two rows that are the same kind of thing:
+        // a cut of the vault by where an item is filed rather than by what
+        // it is. "Search 12 shared items" would be a second name for a scope
+        // the rail already names -- and would be wrong on an organisation's
+        // collection row, where what the user picked was the collection and
+        // not the sharing.
+        SidebarFilter::Organisation(_) => ("item", "items"),
+        SidebarFilter::Collection(_) => ("item", "items"),
         SidebarFilter::Unfiled => ("item", "items"),
     };
     match count {

@@ -111,6 +111,41 @@ pub struct SyncResponse {
     pub ciphers: Vec<serde_json::Value>,
     #[serde(default)]
     pub folders: Vec<serde_json::Value>,
+    /// Every collection this account can reach, across every organisation it
+    /// is in -- **already here, and until now dropped on the floor.**
+    ///
+    /// The paragraph above says a server without organisations sends no
+    /// `collections` or sends `null`, and that was written as an argument for
+    /// tolerance rather than as an observation about a field this struct
+    /// read; it did not read one. It does now, and nothing about the
+    /// tolerance changes: `default` covers the absent key, and
+    /// `deserialize_with` is not needed because `Vec<Value>` on a `null` is
+    /// the one case `serde` would refuse -- which is why the field is read
+    /// through [`Self::collections`] rather than directly.
+    ///
+    /// `Vec<serde_json::Value>` and not a typed struct, exactly as `ciphers`
+    /// and `folders` are: the mapping is [`crate::rest::organizations`]'s
+    /// job, and a typed shape here would be a second opinion about what a
+    /// collection is, held by the module that does not decrypt one.
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub collections: Vec<serde_json::Value>,
+}
+
+/// `null` where a list was expected reads as an empty list.
+///
+/// The sync's optional sections are optional in two different ways on two
+/// different servers -- absent, or present and `null` -- and `#[serde(default)]`
+/// only covers the first. `ciphers` and `folders` have never needed this
+/// because no deployment omits them; `collections` is exactly the section the
+/// struct's own doc says a server without organisations "sends no ... or sends
+/// `null`", so it is the first field here where the second half of that
+/// sentence is real. A failure to parse it would fail the **whole sync**, which
+/// is the vault, over a section that says the account shares nothing.
+fn null_as_empty<'de, D>(de: D) -> Result<Vec<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<serde_json::Value>>::deserialize(de)?.unwrap_or_default())
 }
 
 /// The account, and the two key blobs the whole vault hangs off.
@@ -142,6 +177,48 @@ pub struct Organization {
     /// public key. A type-4 `EncString`.
     #[serde(default)]
     pub key: Option<String>,
+    /// The same key under the name **NodeWarden** puts it, and the reason
+    /// [`unwrap_one_org`] tries two fields rather than one.
+    ///
+    /// This is not tolerance for its own sake; it is a measured disagreement
+    /// between the two halves of this owner's system, and it would have made
+    /// the first organisation they ever create undecryptable. Bitwarden's
+    /// `profile.organizations[].key` is the org key wrapped to the member's
+    /// RSA public key, which is what `key` above documents and what
+    /// [`unwrap_org_key`] expects. NodeWarden's `buildProfileResponse`
+    /// (`src/utils/profile-response.ts`) sets `key: org.publicKey` -- the
+    /// organisation's **public** key, which is not an `EncString` at all and
+    /// unwraps to nothing -- and puts the member's actual wrapped key in
+    /// `encryptedOrgKey` beside it.
+    ///
+    /// So `key` is still tried first and still wins whenever it parses: a
+    /// stock Bitwarden and a Vaultwarden are unaffected, and a server that
+    /// sends both gets the field this crate already documented. The fallback
+    /// fires only where the first field cannot be an org key, which is
+    /// precisely the deployment this app is written against. See
+    /// `an_organisation_key_can_arrive_under_nodewardens_own_field_name`.
+    #[serde(rename = "encryptedOrgKey", default)]
+    pub encrypted_org_key: Option<String>,
+    /// The organisation's display name -- **plaintext, on every
+    /// implementation, and that is not an oversight.**
+    ///
+    /// Bitwarden stores an organisation's name in the clear because the
+    /// server has to show it to a user who is *not yet* a member: it is on
+    /// the invitation, and an invitee has no org key to read it with. The
+    /// collection names underneath it are the ciphertext
+    /// ([`crate::rest::organizations::Collection`]), and that split is the one
+    /// the directory in [`crate::rest::organizations`] is built around.
+    ///
+    /// `Option`, because nothing may be relied on from a server that
+    /// implements a subset -- see this module's own rule.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Whether the organisation is switched on. A disabled organisation still
+    /// appears in the profile on some servers and its items are still in the
+    /// sync; `None` means the server did not say, which this crate reads as
+    /// enabled rather than inventing a reason to hide rows.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 // ---- what comes out ---------------------------------------------------------
@@ -541,6 +618,27 @@ impl VaultKeys {
         &self.user
     }
 
+    /// One organisation's key, by id, or `None` when this account holds no
+    /// key for it -- either it is in no such organisation, or that one key
+    /// failed to unwrap and was skipped (see [`Self::unwrap_from`]).
+    ///
+    /// **Its own method rather than making [`Self::owner_of`] visible**, and
+    /// the difference is the whole point. `owner_of(None)` is the user key,
+    /// so a caller holding that function can reach the user key by passing
+    /// nothing -- which is exactly what [`Self::user`]'s doc spends a
+    /// paragraph restricting. This one cannot: there is no id that means
+    /// "personal", so no caller of it can decrypt a personal item by
+    /// accident.
+    ///
+    /// `pub(crate)`, for [`crate::rest::organizations`], which needs it for
+    /// the one value in the directory that is ciphertext -- a collection's
+    /// name. Nothing else in this crate should want it: a cipher's key is
+    /// [`CipherKeys::for_cipher`]'s answer, and that is one of three keys
+    /// rather than this one.
+    pub(crate) fn organization(&self, id: &str) -> Option<&SymmetricKey> {
+        self.owner_of(Some(id))
+    }
+
     /// The key a cipher's *own* key is wrapped under, or that its fields are
     /// wrapped under when it has none.
     fn owner_of(&self, organization_id: Option<&str>) -> Option<&SymmetricKey> {
@@ -562,12 +660,39 @@ fn private_key_der(
     decrypt(user, &wrapped.parse::<EncString>()?)
 }
 
-/// One organisation key, RSA-unwrapped.
+/// One organisation key, RSA-unwrapped -- from `key`, or from
+/// `encryptedOrgKey` when `key` is not an org key at all.
+///
+/// **Two fields, tried in order, and the order is the contract.** See
+/// [`Organization::encrypted_org_key`] for the measurement behind the second:
+/// on NodeWarden, `key` holds the organisation's *public* key, so a client
+/// that reads only that field cannot open a single organisation item on this
+/// owner's own server. `key` is still first and still wins whenever it
+/// parses and unwraps, so no server that spells the field correctly is
+/// affected by the fallback existing.
+///
+/// The error returned when both fail is the **first** one, not the second.
+/// `key` is the field every implementation is supposed to carry, so its
+/// failure is the diagnosis; reporting the fallback's would tell a reader
+/// about a field their server may never have sent.
 fn unwrap_one_org(der: &[u8], org: &Organization) -> Result<SymmetricKey, CryptoError> {
-    let Some(wrapped) = org.key.as_deref() else {
-        return Err(CryptoError::Malformed("the organisation carries no key"));
+    let first = match org.key.as_deref() {
+        Some(wrapped) => wrapped
+            .parse::<EncString>()
+            .and_then(|enc| unwrap_org_key(der, &enc)),
+        None => Err(CryptoError::Malformed("the organisation carries no key")),
     };
-    unwrap_org_key(der, &wrapped.parse::<EncString>()?)
+    let Err(why) = first else {
+        return first;
+    };
+    match org.encrypted_org_key.as_deref() {
+        Some(wrapped) => wrapped
+            .parse::<EncString>()
+            .and_then(|enc| unwrap_org_key(der, &enc))
+            // The first field's error, deliberately -- see the doc above.
+            .map_err(|_| why),
+        None => Err(why),
+    }
 }
 
 /// The key one cipher's fields actually decrypt under.
@@ -1127,6 +1252,25 @@ pub mod tests {
     /// whole of what that path needs.
     pub fn keys_from_user(bytes: &[u8; 64]) -> VaultKeys {
         VaultKeys { user: key_from_64(bytes), orgs: Vec::new() }
+    }
+
+    /// [`keys_from_user`], plus one organisation key under a known id.
+    ///
+    /// For `crate::rest::organizations`'s tests, which need the one thing in
+    /// a sharing directory that is ciphertext: a collection's name, wrapped
+    /// under its organisation's key. Built here rather than there for
+    /// [`keys_from_user`]'s reason exactly -- `VaultKeys`'s fields are
+    /// private and a production constructor taking raw key bytes would be a
+    /// far wider door than a shared test helper.
+    pub fn keys_with_organisation(
+        user: &[u8; 64],
+        organization_id: &str,
+        org: &[u8; 64],
+    ) -> VaultKeys {
+        VaultKeys {
+            user: key_from_64(user),
+            orgs: vec![(organization_id.to_string(), key_from_64(org))],
+        }
     }
 
     /// The 64 bytes behind [`key`], for sealing a key *as* a payload.
@@ -1708,6 +1852,132 @@ pub mod tests {
         // Control: the user key does not open an organisation cipher, so the
         // RSA hop above is really being taken.
         assert!(plaintext(&user, &enc(&org_key, "Shared login")).is_err());
+    }
+
+    /// **NodeWarden puts the member's wrapped organisation key in
+    /// `encryptedOrgKey`, and `key` holds the organisation's PUBLIC key.**
+    ///
+    /// This is a measured disagreement between the two halves of this owner's
+    /// own system, and without the fallback in [`unwrap_one_org`] it would
+    /// have made the first organisation they ever create undecryptable --
+    /// every field of every shared item failing, on a client that was doing
+    /// exactly what the protocol says.
+    /// `buildProfileResponse` in `nodewarden/src/utils/profile-response.ts`
+    /// is where it happens: `key: org.publicKey`.
+    ///
+    /// **Three cases, and the order between them is the contract.** The
+    /// correct field still wins when it works; the fallback fires only when
+    /// the first field cannot be an organisation key; and an organisation
+    /// with neither still fails the way it always did rather than silently
+    /// half-working.
+    #[test]
+    fn an_organisation_key_can_arrive_under_nodewardens_own_field_name() {
+        let (master, user, protected) = account();
+        let mut org_bytes = [0u8; 64];
+        for (i, b) in org_bytes.iter_mut().enumerate() {
+            *b = u8::try_from(i).expect("under 64");
+        }
+        let org_key = key_from_64(&org_bytes);
+        let wrapped = format!("4.{}", base64(&hex(ORG_KEY_WRAPPED_OAEP_SHA1)));
+        let cipher = serde_json::json!([{
+            "id": "oc1", "type": 1, "organizationId": "org1",
+            "name": enc(&org_key, "Shared login")
+        }]);
+        let vault_with = |organisation: serde_json::Value| {
+            vault_of(
+                serde_json::json!({
+                    "profile": {
+                        "key": protected,
+                        "privateKey": seal(&user, &hex(ORG_KEY_PRIVATE_PKCS8_DER)),
+                        "organizations": [organisation]
+                    },
+                    "folders": [],
+                    "ciphers": cipher
+                }),
+                &master,
+            )
+        };
+
+        // (a) NodeWarden's shape: `key` is the organisation's public key --
+        //     not an `EncString` at all -- and the real one is beside it.
+        let vault = vault_with(serde_json::json!({
+            "id": "org1",
+            "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoPUBLIC",
+            "encryptedOrgKey": wrapped
+        }));
+        assert_eq!(vault.failures, Vec::new(), "the fallback field was not tried");
+        assert_eq!(vault.items[0].name, "Shared login");
+
+        // (b) Bitwarden's shape is untouched, and `key` still wins: the
+        //     fallback here is deliberate rubbish, and the item still opens.
+        let vault = vault_with(serde_json::json!({
+            "id": "org1",
+            "key": wrapped,
+            "encryptedOrgKey": "4.AAAA"
+        }));
+        assert_eq!(vault.failures, Vec::new(), "the correct field stopped winning");
+        assert_eq!(vault.items[0].name, "Shared login");
+
+        // (c) Neither field carries a key: this fails exactly as it did
+        //     before the fallback existed, recorded against
+        //     `organizations[].key` -- the field every implementation is
+        //     supposed to carry, which is the diagnosis a reader needs.
+        let vault = vault_with(serde_json::json!({ "id": "org1", "key": "4.AAAA" }));
+        assert_eq!(vault.failures[0].field, "organizations[].key");
+        assert_eq!(vault.failures[0].cipher_id, "org1");
+        // And the item under it fails per this module's existing rule --
+        // recorded, named, and not silently absent.
+        assert!(
+            vault.failures.iter().any(|f| f.cipher_id == "oc1" && f.field == "key"),
+            "the organisation's own cipher failed silently: {:?}",
+            vault.failures
+        );
+    }
+
+    /// **The sync's `collections` array is read, and a `null` one does not
+    /// take the vault down with it.**
+    ///
+    /// [`SyncResponse`]'s own doc has said since it was written that a server
+    /// without organisations "sends no `collections`, or sends `null`". Until
+    /// the field existed that sentence cost nothing; a plain
+    /// `#[serde(default)]` would have turned the second half of it into a
+    /// vault that will not load at all, over a section whose content is "this
+    /// account shares nothing".
+    ///
+    /// The array itself is carried verbatim rather than typed here, for the
+    /// reason `ciphers` and `folders` are: the mapping is
+    /// [`crate::rest::organizations`]'s job.
+    #[test]
+    fn the_collections_array_is_read_and_a_null_one_is_empty() {
+        let (master, user, protected) = account();
+        let payload = |collections: serde_json::Value| {
+            serde_json::json!({
+                "profile": { "key": protected, "organizations": [] },
+                "folders": [],
+                "ciphers": [{ "id": "p1", "type": 1, "name": enc(&user, "Personal") }],
+                "collections": collections
+            })
+        };
+
+        let present: SyncResponse = serde_json::from_value(payload(serde_json::json!([
+            { "id": "col-1", "organizationId": "org-1", "name": "Production" }
+        ])))
+        .expect("a sync with collections in it");
+        assert_eq!(present.collections.len(), 1);
+        assert_eq!(present.collections[0]["id"], "col-1");
+
+        for empty in [serde_json::Value::Null, serde_json::json!([])] {
+            let response: SyncResponse = serde_json::from_value(payload(empty.clone()))
+                .unwrap_or_else(|e| panic!("`collections: {empty}` failed the whole sync: {e}"));
+            assert!(response.collections.is_empty());
+        }
+
+        // And the whole vault still loads through the ordinary path with the
+        // section present -- the control that says this field was added
+        // without disturbing what was already read.
+        let vault = vault_of(payload(serde_json::Value::Null), &master);
+        assert_eq!(vault.failures, Vec::new());
+        assert_eq!(vault.items[0].name, "Personal");
     }
 
     /// An organisation whose key will not unwrap must not take the personal

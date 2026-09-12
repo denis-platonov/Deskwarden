@@ -58,6 +58,47 @@ pub enum SidebarFilter {
     Trash,
     /// A real, server-side folder, by id.
     Folder(String),
+    /// Every item owned by one organisation, by its id.
+    ///
+    /// # Why this is a `SidebarFilter` and Sends are not
+    ///
+    /// [`screen_rows`] argues at length that Sends, Password health and
+    /// `Shared with me` are *screens* rather than cuts of the item list, and
+    /// that giving any of them a variant here would force it through the item
+    /// pane. This is the other side of that same rule, and it lands on the
+    /// other side: an organisation's items **are** `VaultItem`s, in the live
+    /// snapshot this window already holds, and "was this cipher owned by that
+    /// organisation" is exactly a per-item predicate. The item pane is where
+    /// they belong.
+    ///
+    /// The whole cost of that is one arm in
+    /// [`SidebarFilter::scope_contains`]. `item_list::matches_filter`
+    /// delegates to it, so the pane, its search and its empty state follow
+    /// with no edit at all -- which is the property the split was designed
+    /// for, used for the first time.
+    ///
+    /// **Membership is `organizationId`, and only that.**
+    /// [`crate::rest::organizations::organization_of`] is the single
+    /// definition, shared with the audience answer, so the row and a future
+    /// `Owner` line in the detail pane cannot come to disagree about what
+    /// "owned by" means.
+    Organisation(String),
+    /// Every item filed in one collection, by its id.
+    ///
+    /// A **sub-row of its organisation**, exactly as design 5b's three
+    /// SHARING sub-rows are sub-rows of `Sends`, and drawn with the same
+    /// [`SUB_ROW_EXTRA_INDENT`]. The relationship is the same one: a parent
+    /// naming a set and children naming cuts of it.
+    ///
+    /// It is **not** a `Folder`, and the difference is worth the second
+    /// variant rather than a clever reuse. A folder is this account's own
+    /// filing, it is personal on Bitwarden (there is no organisation folder
+    /// -- see [`crate::rest::sync::VaultKeys::user`]), and an item is in at
+    /// most one. A collection belongs to somebody else, an item can be in
+    /// several at once, and this app cannot create, rename or delete one. A
+    /// collection row wearing the FOLDERS section's edit pencil would offer
+    /// three writes that do not exist.
+    Collection(String),
     /// The items that are in no folder at all -- `bw serve`'s virtual "No
     /// Folder" bucket.
     ///
@@ -203,6 +244,22 @@ pub struct VaultLists<'a> {
     /// here, so the badge and the pane read one report and cannot disagree
     /// about how many findings there are.
     pub health_findings: usize,
+    /// The organisations and collections this account can reach, and what is
+    /// known about who else is in them.
+    ///
+    /// **Never an `Option`, unlike `sends` and the two query-backed lists**,
+    /// and this is the whole of how the ORGANISATIONS section stays off an
+    /// account that has none. There is no "not fetched" state to draw,
+    /// because there is nothing to draw: an account with no organisations, a
+    /// `bw serve` account, an account whose server has never heard of these
+    /// routes, and an account that has not synced yet all hand over the same
+    /// empty [`crate::rest::organizations::Directory`], and
+    /// [`draw_organisations`] returns before painting so much as a divider.
+    /// An `Option` here would be four call sites each deciding that again.
+    ///
+    /// A borrow, so `VaultLists` stays `Copy` and the two places that build
+    /// one keep costing nothing.
+    pub sharing: &'a crate::rest::organizations::Directory,
 }
 
 impl<'a> VaultLists<'a> {
@@ -216,6 +273,12 @@ impl<'a> VaultLists<'a> {
             sends: None,
             received: 0,
             health_findings: 0,
+            // The empty directory, borrowed from the `static` that exists so
+            // this constructor does not have to allocate one. Every caller of
+            // `live_only` is either a test or a window that has not been told
+            // about any sharing, and both want the same thing: a rail with no
+            // ORGANISATIONS section in it at all.
+            sharing: &crate::rest::organizations::NOTHING_SHARED,
         }
     }
 }
@@ -278,6 +341,13 @@ impl SidebarFilter {
             | SidebarFilter::SecureNotes
             | SidebarFilter::SshKeys
             | SidebarFilter::Folder(_)
+            // Organisation-owned items are in the ordinary sync payload
+            // alongside personal ones -- `GET /api/sync` returns both and
+            // `rest::sync` decrypts both -- so these two rows read the live
+            // snapshot like every type row above them. There is no
+            // `?organization=` query to be a third `FilterSource` for.
+            | SidebarFilter::Organisation(_)
+            | SidebarFilter::Collection(_)
             | SidebarFilter::Unfiled => FilterSource::LiveVault,
         }
     }
@@ -369,6 +439,20 @@ impl SidebarFilter {
             // to paper over a case that does not exist -- which is how the
             // empty string came to mean two things in the first place.
             SidebarFilter::Unfiled => item.folder_id.is_none(),
+            // Both go through `rest::organizations`, which is the one place
+            // this crate reads `organizationId` and `collectionIds` off an
+            // item. Not re-read from `item.other` here: a second reader would
+            // be a second answer to "is this shared", and the detail pane's
+            // eventual `Owner` row asks the same module.
+            SidebarFilter::Organisation(id) => {
+                crate::rest::organizations::organization_of(item) == Some(id.as_str())
+            }
+            // `contains`, not equality: an item can be filed in several
+            // collections at once, which is the property that makes a
+            // collection unlike a folder.
+            SidebarFilter::Collection(id) => {
+                crate::rest::organizations::collection_ids_of(item).contains(&id.as_str())
+            }
         }
     }
 }
@@ -1316,6 +1400,11 @@ pub fn draw_sidebar(
             }
             ui.spacing_mut().item_spacing.y = 0.0;
 
+            // Between the folders and the screens, and **only when there is
+            // something in it**. See `draw_organisations`, which returns
+            // before painting its own divider.
+            draw_organisations(ui, lists, selected, &mut screens);
+
             screen_rows(ui, lists, &mut screens);
         });
 
@@ -1520,6 +1609,135 @@ fn countdown_label(ui: &mut egui::Ui, text: &str) -> egui::Rect {
         theme::TEXT_GHOST,
     );
     rect
+}
+
+/// The design's own name for the organisations section.
+///
+/// **British, matching this crate's prose and not Bitwarden's own UI**, which
+/// says `Organizations`. Every doc comment in `rest::sync`, `rest::backend`
+/// and `rest::organizations` spells it with an s -- the wire spells it
+/// `organizationId` and always will, because that is the protocol -- and a
+/// rail heading that disagreed with every sentence written about it would be
+/// a difference a reader has to resolve. One constant, so the owner can
+/// disagree in one edit.
+pub const ORGANISATIONS_SECTION_LABEL: &str = "ORGANISATIONS";
+
+/// **Design 5b's SHARING section, one section up: the organisations this
+/// account is in, and their collections indented underneath.**
+///
+/// # Where organisation items appear, and what was rejected
+///
+/// The brief left this open, and 8a's `Owner` row and 5b's sidebar disagree
+/// slightly about it. Three arrangements were on the table.
+///
+/// **A badge on every organisation-owned row in the item list** was rejected,
+/// and not only because `item_list.rs` belongs to somebody else this week. A
+/// per-row badge is paid for by every row in the pane, on an account where
+/// the overwhelming majority of items are personal -- the owner's own vault
+/// is 1,654 personal items and zero shared ones -- so the common case pays
+/// list-wide visual weight for a fact that is false about every row. It is
+/// also the wrong altitude: "which of these is shared" is a question asked
+/// about a *set*, and the rail is where this app answers set questions.
+///
+/// **One flat `Shared` row**, a single cut of everything organisation-owned,
+/// was rejected as the opposite mistake. It is one row and it says almost
+/// nothing: the useful question is not "is this shared" but "shared with
+/// whom", and a single row answers the first while making the second
+/// unaskable from the rail.
+///
+/// **What is drawn instead**: one row per organisation, its collections
+/// indented under it. That answers both questions at once -- the parent names
+/// the *whom*, the children name the *what* -- with a shape the rail already
+/// has, and it costs no new interaction vocabulary at all.
+///
+/// **This is also the answer to "surface which items are org-owned".** It is
+/// not a separate mechanism: `SidebarFilter::Organisation`'s items are the
+/// org-owned ones, and `item_list::matches_filter` delegates to
+/// [`SidebarFilter::scope_contains`], so clicking the row lists exactly them,
+/// with the pane's own search and count following. Nothing in `item_list.rs`
+/// changed, and nothing had to.
+///
+/// # Above the screens, not below them, and not inside FOLDERS
+///
+/// [`screen_rows`] draws the boundary this section is placed against: every
+/// row above the first hairline names a **cut of the vault**, and the rows
+/// below the Password health divider name a **screen**. An organisation row
+/// is the first kind -- it is a predicate over `VaultItem`s, it reads the
+/// live snapshot, and it goes through the item pane -- so it belongs on the
+/// cuts side of that line, which means above Password health.
+///
+/// It is a section of its own rather than more rows in FOLDERS because a
+/// folder is this account's own filing and a collection is somebody else's;
+/// see [`SidebarFilter::Collection`], which is where the second variant is
+/// argued. Concretely, every FOLDERS row carries an edit pencil, and there is
+/// no rename, no delete and no create for a collection in this app at all.
+///
+/// # Nothing at all when there is nothing
+///
+/// **The section does not exist for an account with no organisations** -- no
+/// label, no divider, not a pixel -- which is the owner's own situation and
+/// the one the shape had to survive. That is one early return rather than a
+/// rule spread over the drawing below, and it covers four situations at once
+/// for [`VaultLists::sharing`]'s stated reason: no organisations, a
+/// `bw serve` backend, a server with no organisation routes, and a vault that
+/// has not synced yet. `the_rail_is_byte_for_byte_unchanged_without_an_\
+/// organisation` is the assertion, and it compares the painted output of a
+/// rail with an empty directory against one built before this section
+/// existed.
+///
+/// The divider is [`inset_hairline`] at the same 14px above and below the
+/// other three, because it is meant to read as the same kind of boundary.
+fn draw_organisations(
+    ui: &mut egui::Ui,
+    lists: VaultLists<'_>,
+    selected: &mut SidebarFilter,
+    screens: &mut Screens<'_>,
+) {
+    // **The whole of the empty case.** Not a guard around each paint below,
+    // and not a caller's responsibility: a section that is dead weight for an
+    // account with none is impossible from here rather than discouraged.
+    if lists.sharing.is_empty() {
+        return;
+    }
+
+    ui.add_space(14.0);
+    inset_hairline(ui, 8.0);
+    ui.add_space(14.0);
+    section_label(ui, ORGANISATIONS_SECTION_LABEL);
+    ui.add_space(SECTION_LABEL_INSET);
+    ui.spacing_mut().item_spacing.y = ROW_GAP;
+    for organisation in lists.sharing.organisations() {
+        // `item_row`, the same helper every VAULT row uses, so an
+        // organisation row clears the screen flags exactly as they do --
+        // the invariant `Screens` exists to hold, obtained rather than
+        // re-implemented. It also means the badge comes from `badge_for`,
+        // so the count and the pane's contents are one read.
+        item_row(
+            ui,
+            organisation.label(),
+            SidebarFilter::Organisation(organisation.id.clone()),
+            lists,
+            selected,
+            screens,
+        );
+        for collection in lists.sharing.collections_of(&organisation.id) {
+            let filter = SidebarFilter::Collection(collection.id.clone());
+            let count = badge_for(&filter, lists);
+            let width = ui.available_width();
+            let on = *selected == filter && !screens.any();
+            // `SUB_ROW_EXTRA_INDENT` -- 5b's own sub-row indent, reused
+            // rather than re-chosen. A second indent value here would put
+            // two different depths of "child row" in one rail for no reason
+            // a reader could recover.
+            if sidebar_row(ui, collection.label(), count, on, false, width, SUB_ROW_EXTRA_INDENT)
+                .clicked()
+            {
+                *selected = filter;
+                screens.clear();
+            }
+        }
+    }
+    ui.spacing_mut().item_spacing.y = 0.0;
 }
 
 /// The rail's own SCREENS, below the folders: Password health behind a
@@ -3608,6 +3826,7 @@ mod tests {
             sends: None,
             received: 0,
             health_findings: 0,
+            sharing: &crate::rest::organizations::NOTHING_SHARED,
         };
 
         assert_eq!(badge_for(&SidebarFilter::Trash, lists), Some(2));
@@ -3621,7 +3840,7 @@ mod tests {
     fn the_trash_row_lists_the_trashed_items_themselves() {
         let live = three_unfiled_and_two_filed();
         let trash = vec![trashed("t1"), trashed("t2")];
-        let lists = VaultLists { live: &live, trash: Some(&trash), archive: None, sends: None, received: 0, health_findings: 0 };
+        let lists = VaultLists { trash: Some(&trash), ..VaultLists::live_only(&live) };
 
         let listed: Vec<&str> = items_for(&SidebarFilter::Trash, lists)
             .expect("the trash list was fetched")
@@ -3649,7 +3868,7 @@ mod tests {
         assert_eq!(badge_text(None), UNKNOWN_COUNT);
 
         let empty: Vec<VaultItem> = Vec::new();
-        let fetched = VaultLists { live: &live, trash: Some(&empty), archive: None, sends: None, received: 0, health_findings: 0 };
+        let fetched = VaultLists { trash: Some(&empty), ..VaultLists::live_only(&live) };
         assert_eq!(badge_for(&SidebarFilter::Trash, fetched), Some(0));
         assert_eq!(badge_text(Some(0)), "0");
     }
@@ -3679,7 +3898,7 @@ mod tests {
         let folders = one_real_folder_and_the_virtual_bucket();
         let (painted, _, _) = painted_sidebar_lists(
             "Locks in 11:42",
-            VaultLists { live: &live, trash: Some(&trash), archive: Some(&archive), sends: None, received: 0, health_findings: 0 },
+            VaultLists { trash: Some(&trash), archive: Some(&archive), ..VaultLists::live_only(&live) },
             &folders,
         );
 
@@ -3793,21 +4012,39 @@ mod tests {
         // Press it, and the item filter is untouched: Sends is not a cut of
         // the item list and selecting it must not pretend to be one.
         let (filter, sends) =
-            press_row(SENDS_ROW_LABEL, SidebarFilter::Logins, false, &live, &folders);
+            press_row(
+                SENDS_ROW_LABEL,
+                SidebarFilter::Logins,
+                false,
+                VaultLists::live_only(&live),
+                &folders,
+            );
         assert!(sends, "the Sends row did not select the Sends screen");
         assert_eq!(filter, SidebarFilter::Logins, "the Sends row changed the item filter");
 
         // ...and pressing any item row leaves the Sends screen. This is the
         // invariant `draw_sidebar` exists to keep, and without it the window
         // would sit on the Sends screen while the rail highlights Cards.
-        let (filter, sends) = press_row("Cards", SidebarFilter::Logins, true, &live, &folders);
+        let (filter, sends) = press_row(
+            "Cards",
+            SidebarFilter::Logins,
+            true,
+            VaultLists::live_only(&live),
+            &folders,
+        );
         assert!(!sends, "an item row was clicked and the Sends screen stayed up");
         assert_eq!(filter, SidebarFilter::Cards);
 
         // The same for a folder row, which is a separate loop with a separate
         // click handler -- and therefore a separate chance to forget.
         let (filter, sends) =
-            press_row("Engineering", SidebarFilter::Logins, true, &live, &folders);
+            press_row(
+            "Engineering",
+            SidebarFilter::Logins,
+            true,
+            VaultLists::live_only(&live),
+            &folders,
+        );
         assert!(!sends, "a folder row was clicked and the Sends screen stayed up");
         assert_eq!(filter, SidebarFilter::Folder("f1".into()));
     }
@@ -4086,7 +4323,7 @@ mod tests {
         // sooner than it did and the LAST row is no longer Password health.
         // Both ends are asserted: Sends is still past the floor, and the row
         // that is now below it is further past it again.
-        let (resting, bounds) = scrolled_rail(&live, &folders, 0.0);
+        let (resting, bounds) = scrolled_rail(VaultLists::live_only(&live), &folders, 0.0);
         let sends_at_rest = row_top(&resting, SENDS_ROW_LABEL);
         assert!(
             sends_at_rest > bounds.bottom(),
@@ -4106,7 +4343,7 @@ mod tests {
         // window taller for. The three sub-rows and `Shared with me` are in
         // the list because they are now the lowest things in the rail, and so
         // the ones a long folder list pushes out first.
-        let (scrolled, bounds) = scrolled_rail(&live, &folders, -4000.0);
+        let (scrolled, bounds) = scrolled_rail(VaultLists::live_only(&live), &folders, -4000.0);
         for label in [
             health,
             SENDS_ROW_LABEL,
@@ -4144,7 +4381,7 @@ mod tests {
     /// Several frames, because a scroll offset applied on one frame is laid out
     /// on the next, and the clamp to the content's end takes another.
     fn scrolled_rail(
-        live: &[VaultItem],
+        lists: VaultLists<'_>,
         folders: &[Folder],
         delta: f32,
     ) -> (Vec<(String, egui::Rect)>, egui::Rect) {
@@ -4182,7 +4419,7 @@ mod tests {
                 bounds = ui.max_rect();
                 draw_sidebar(
                     ui,
-                    VaultLists::live_only(live),
+                    lists,
                     folders,
                     &mut selected,
                     Screens {
@@ -4221,7 +4458,14 @@ mod tests {
 
         // Password health selects itself and nothing else.
         let (filter, sends, health) =
-            press_row_screens(health_label, SidebarFilter::Logins, false, false, &live, &folders);
+            press_row_screens(
+                health_label,
+                SidebarFilter::Logins,
+                false,
+                false,
+                VaultLists::live_only(&live),
+                &folders,
+            );
         assert!(health, "the Password health row did not select its screen");
         assert!(!sends, "selecting Password health left the Sends screen up as well");
         assert_eq!(filter, SidebarFilter::Logins, "it changed the item filter");
@@ -4232,7 +4476,7 @@ mod tests {
             SidebarFilter::Logins,
             false,
             true,
-            &live,
+            VaultLists::live_only(&live),
             &folders,
         );
         assert!(sends && !health, "both screens were live at once (sends={sends}, health={health})");
@@ -4241,7 +4485,14 @@ mod tests {
         // the loop the two rows now sit directly beneath, and it is a separate
         // click handler from the type rows -- a separate chance to forget.
         let (filter, sends, health) =
-            press_row_screens("Engineering", SidebarFilter::Logins, true, true, &live, &folders);
+            press_row_screens(
+                "Engineering",
+                SidebarFilter::Logins,
+                true,
+                true,
+                VaultLists::live_only(&live),
+                &folders,
+            );
         assert!(
             !sends && !health,
             "a folder row was clicked and a screen stayed up (sends={sends}, health={health})"
@@ -4258,10 +4509,10 @@ mod tests {
         label: &str,
         filter: SidebarFilter,
         sends: bool,
-        live: &[VaultItem],
+        lists: VaultLists<'_>,
         folders: &[Folder],
     ) -> (SidebarFilter, bool) {
-        let (filter, sends, _) = press_row_screens(label, filter, sends, false, live, folders);
+        let (filter, sends, _) = press_row_screens(label, filter, sends, false, lists, folders);
         (filter, sends)
     }
 
@@ -4275,7 +4526,7 @@ mod tests {
         filter: SidebarFilter,
         sends: bool,
         health: bool,
-        live: &[VaultItem],
+        lists: VaultLists<'_>,
         folders: &[Folder],
     ) -> (SidebarFilter, bool, bool) {
         const HEIGHT: f32 = 900.0;
@@ -4298,7 +4549,7 @@ mod tests {
             ctx.run_ui(raw, |ui| {
                 draw_sidebar(
                     ui,
-                    VaultLists::live_only(live),
+                    lists,
                     folders,
                     &mut selected,
                     Screens {
@@ -5057,5 +5308,356 @@ mod tests {
             band.left(),
             available.left()
         );
+    }
+    // ---- design 5b's ORGANISATIONS section ----------------------------------
+
+    /// One organisation and one collection, built through the REAL mapper --
+    /// `Directory::from_sync` over a sync payload -- rather than through a
+    /// test-only constructor.
+    ///
+    /// Two reasons, and the second is the one that matters. `Directory`'s
+    /// fields are private and a `pub fn` taking them would be a door this
+    /// feature does not need. And a rail test that built its directory by
+    /// hand would pass on a shape `rest::sync` never produces, which is
+    /// exactly the always-green test this file's history is made of.
+    ///
+    /// **Not called `Engineering`**: this file's folder fixture already has a
+    /// folder by that name, and a painted-text search cannot tell two rows
+    /// with one label apart.
+    fn a_directory() -> crate::rest::organizations::Directory {
+        let response: crate::rest::sync::SyncResponse = serde_json::from_value(serde_json::json!({
+            "profile": {
+                "key": "2.aaa|bbb|ccc",
+                "organizations": [{ "id": "org-1", "name": "Acme Security", "enabled": true }]
+            },
+            "ciphers": [],
+            "folders": [],
+            "collections": [
+                { "id": "col-1", "organizationId": "org-1", "name": "Production" }
+            ]
+        }))
+        .expect("the fixture parses");
+        crate::rest::organizations::Directory::from_sync(
+            &response,
+            &crate::rest::sync::tests::keys_from_user(&[3u8; 64]),
+        )
+    }
+
+    /// One item owned by the fixture organisation and filed in the given
+    /// collections. The two facts ride `VaultItem::other`, which is where
+    /// `rest::sync`'s mapper leaves them and the only place this crate reads
+    /// them from.
+    fn shared_item(collections: &[&str]) -> VaultItem {
+        let mut shared = item(Some(1), false, None);
+        shared.other.insert("organizationId".into(), "org-1".into());
+        shared.other.insert(
+            "collectionIds".into(),
+            serde_json::Value::Array(
+                collections.iter().map(|id| serde_json::Value::String((*id).into())).collect(),
+            ),
+        );
+        shared
+    }
+
+    /// **The zero-organisation case, which is this owner's own: the section
+    /// does not exist.**
+    ///
+    /// Not "is empty", not "is collapsed" -- *absent*. No label, no divider,
+    /// not a pixel, so a rail on an account that has never touched
+    /// organisations is the rail it was before this section was written.
+    ///
+    /// **Both halves, and the second is what stops the first being vacuous.**
+    /// An assertion that a string is missing passes just as well when the
+    /// section is broken as when it is deliberately absent, so the same
+    /// harness is run again WITH a directory and the same two facts are
+    /// asserted the other way round.
+    #[test]
+    fn the_rail_has_no_organisations_section_without_an_organisation() {
+        let live = three_unfiled_and_two_filed();
+        let folders = one_real_folder_and_the_virtual_bucket();
+
+        let (painted, _, hairlines, _) =
+            painted_sidebar_parts("Locks in 11:42", VaultLists::live_only(&live), &folders);
+        assert!(
+            !painted.iter().any(|(text, _)| text == ORGANISATIONS_SECTION_LABEL),
+            "an account with no organisations was given an ORGANISATIONS heading: {painted:?}"
+        );
+        assert!(
+            !painted.iter().any(|(text, _)| text == "Acme Security" || text == "Production"),
+            "the rail painted an organisation nobody is in: {painted:?}"
+        );
+        assert_eq!(
+            hairlines.len(),
+            3,
+            "the empty section still paid for a divider -- the rail drew {} of them, not the \
+             three it drew before this section existed",
+            hairlines.len()
+        );
+
+        // The control. Same harness, same vault, same folders; only the
+        // directory differs.
+        let sharing = a_directory();
+        let (painted, _, hairlines, _) = painted_sidebar_parts(
+            "Locks in 11:42",
+            VaultLists { sharing: &sharing, ..VaultLists::live_only(&live) },
+            &folders,
+        );
+        assert!(
+            painted.iter().any(|(text, _)| text == ORGANISATIONS_SECTION_LABEL),
+            "control: the section does not appear even WITH an organisation, so the absence \
+             asserted above is not evidence of anything: {painted:?}"
+        );
+        assert_eq!(hairlines.len(), 4, "control: the section drew no divider of its own");
+    }
+
+    /// **Where the section sits, top to bottom.** Below the folders, because
+    /// an organisation row is a cut of the vault and belongs on that side of
+    /// the rail's first boundary; above Password health, because everything
+    /// below THAT boundary is a screen rather than a cut. See
+    /// [`draw_organisations`], which argues the placement, and
+    /// [`screen_rows`], which drew the line it is placed against.
+    ///
+    /// The collection is under its own organisation, which is the whole shape
+    /// of the section: a parent naming the *whom* and children naming the
+    /// *what*.
+    #[test]
+    fn the_organisations_section_sits_between_the_folders_and_the_screens() {
+        let live = three_unfiled_and_two_filed();
+        let folders = one_real_folder_and_the_virtual_bucket();
+        let sharing = a_directory();
+        let (painted, _, _, _) = painted_sidebar_parts(
+            "Locks in 11:42",
+            VaultLists { sharing: &sharing, ..VaultLists::live_only(&live) },
+            &folders,
+        );
+        let top_of = |needle: &str| row_top(&painted, needle);
+        let health = crate::vault_window::password_health::HEALTH_ROW_LABEL;
+
+        let order = [
+            ("FOLDERS", top_of("FOLDERS")),
+            ("No Folder", top_of("No Folder")),
+            (ORGANISATIONS_SECTION_LABEL, top_of(ORGANISATIONS_SECTION_LABEL)),
+            ("Acme Security", top_of("Acme Security")),
+            ("Production", top_of("Production")),
+            (health, top_of(health)),
+            (SHARING_SECTION_LABEL, top_of(SHARING_SECTION_LABEL)),
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].1,
+                "{} is painted at y={} and {} at y={} -- the rail is not in the order \
+                 folders / ORGANISATIONS / Password health / SHARING",
+                pair[0].0,
+                pair[0].1,
+                pair[1].0,
+                pair[1].1
+            );
+        }
+    }
+
+    /// **A collection is indented under its organisation by exactly the
+    /// indent design 5b gives a SHARING sub-row**, because it is the same
+    /// relationship: a parent naming a set and a child naming a cut of it.
+    ///
+    /// Measured against the SHARING rows in the same painted frame rather
+    /// than against the constant, so a rail with two different depths of
+    /// "child row" in it fails here even if both were spelled from the same
+    /// number.
+    #[test]
+    fn a_collection_is_indented_under_its_organisation_like_a_sharing_sub_row() {
+        let live = three_unfiled_and_two_filed();
+        let folders = one_real_folder_and_the_virtual_bucket();
+        let sharing = a_directory();
+        let (painted, _, _, _) = painted_sidebar_parts(
+            "Locks in 11:42",
+            VaultLists { sharing: &sharing, ..VaultLists::live_only(&live) },
+            &folders,
+        );
+        let left_of = |needle: &str| {
+            painted
+                .iter()
+                .find(|(text, _)| text == needle)
+                .unwrap_or_else(|| panic!("the rail painted no {needle:?}"))
+                .1
+                .left()
+        };
+
+        let collection_indent = left_of("Production") - left_of("Acme Security");
+        let sharing_indent = left_of(SendScope::Waiting.label()) - left_of(SENDS_ROW_LABEL);
+        assert!(
+            (collection_indent - sharing_indent).abs() < 0.01,
+            "a collection is indented {collection_indent}pt under its organisation and a \
+             SHARING sub-row {sharing_indent}pt under its parent -- two depths of child row \
+             in one rail"
+        );
+        assert!(
+            (collection_indent - SUB_ROW_EXTRA_INDENT).abs() < 0.01,
+            "control: neither row is indented by `SUB_ROW_EXTRA_INDENT` at all \
+             ({collection_indent}pt against {SUB_ROW_EXTRA_INDENT}pt), so the comparison \
+             above is between two wrong numbers"
+        );
+    }
+
+    /// **What the two rows actually list**, which is the half a painted frame
+    /// cannot show.
+    ///
+    /// Three items: one personal, one shared and filed in the collection, one
+    /// shared and filed in nothing. The organisation row holds both shared
+    /// ones and neither row holds the personal one -- and the collection row
+    /// holds only the item filed in it, which is what makes it a cut of its
+    /// parent rather than a second name for it.
+    ///
+    /// Through [`badge_for`], so the badge the rail draws and the list the
+    /// item pane shows are one read; `item_list::matches_filter` delegates to
+    /// the same [`SidebarFilter::scope_contains`].
+    #[test]
+    fn an_organisation_row_lists_its_items_and_a_collection_row_lists_its_own() {
+        let live = vec![item(Some(1), false, None), shared_item(&["col-1"]), shared_item(&[])];
+        let sharing = a_directory();
+        let lists = VaultLists { sharing: &sharing, ..VaultLists::live_only(&live) };
+
+        assert_eq!(badge_for(&SidebarFilter::All, lists), Some(3));
+        assert_eq!(
+            badge_for(&SidebarFilter::Organisation("org-1".into()), lists),
+            Some(2),
+            "the organisation row is not the organisation's items"
+        );
+        assert_eq!(
+            badge_for(&SidebarFilter::Collection("col-1".into()), lists),
+            Some(1),
+            "the collection row is not a cut of its parent"
+        );
+        // An organisation nobody is in has no items, and says zero rather
+        // than matching everything.
+        assert_eq!(badge_for(&SidebarFilter::Organisation("org-2".into()), lists), Some(0));
+
+        // An item can be in several collections at once, which is the
+        // property that makes a collection unlike a folder -- and the reason
+        // `scope_contains` asks `contains` rather than comparing.
+        let both = vec![shared_item(&["col-1", "col-2"])];
+        let lists = VaultLists { sharing: &sharing, ..VaultLists::live_only(&both) };
+        assert_eq!(badge_for(&SidebarFilter::Collection("col-1".into()), lists), Some(1));
+        assert_eq!(badge_for(&SidebarFilter::Collection("col-2".into()), lists), Some(1));
+    }
+
+    /// **An organisation row is an item row**, so the invariant every item
+    /// row carries holds here without being re-implemented: it selects
+    /// itself, and it clears every screen flag.
+    ///
+    /// That is what `item_row` is for, and it is asserted rather than assumed
+    /// because a section written with a bare `sidebar_row` would look
+    /// identical on screen and would leave the window painting the Sends
+    /// screen while the rail highlighted a collection.
+    #[test]
+    fn pressing_an_organisation_or_collection_row_clears_the_screens() {
+        let live = vec![shared_item(&["col-1"])];
+        let folders = one_real_folder_and_the_virtual_bucket();
+        let sharing = a_directory();
+        let lists = VaultLists { sharing: &sharing, ..VaultLists::live_only(&live) };
+
+        let (filter, sends, health) =
+            press_row_screens("Acme Security", SidebarFilter::Logins, true, true, lists, &folders);
+        assert_eq!(filter, SidebarFilter::Organisation("org-1".into()));
+        assert!(
+            !sends && !health,
+            "an organisation row was clicked and a screen stayed up (sends={sends}, \
+             health={health})"
+        );
+
+        let (filter, sends, health) =
+            press_row_screens("Production", SidebarFilter::Logins, true, true, lists, &folders);
+        assert_eq!(filter, SidebarFilter::Collection("col-1".into()));
+        assert!(
+            !sends && !health,
+            "a collection row was clicked and a screen stayed up (sends={sends}, \
+             health={health})"
+        );
+    }
+
+    /// **The rail's overflow, re-measured with this section in it.**
+    ///
+    /// `the_screen_rows_survive_a_vault_with_a_folder_for_every_letter` is the
+    /// existing measurement and it is untouched, because it runs on an EMPTY
+    /// directory and this section draws nothing there -- which is the whole
+    /// point of the empty case. This is the same measurement on the rail that
+    /// now exists for an account that does share: four organisations and
+    /// their collections on top of twenty-six folders.
+    ///
+    /// Both ends again, for that test's own reason: the rows really are
+    /// pushed past the floor by this much rail (so this is not a test of a
+    /// rail that happens to fit), and scrolling really does bring every one
+    /// of them back.
+    #[test]
+    fn the_organisations_section_overflows_the_rail_and_everything_is_still_reachable() {
+        let live = vec![shared_item(&["col-1"])];
+        let folders: Vec<Folder> = ('a'..='z')
+            .map(|c| Folder {
+                id: format!("f-{c}"),
+                name: format!("Folder {}", c.to_ascii_uppercase()),
+                other: serde_json::Map::new(),
+            })
+            .collect();
+        let organisations: Vec<serde_json::Value> = (1..=4)
+            .map(|n| serde_json::json!({ "id": format!("org-{n}"),
+                                         "name": format!("Organisation {n}") }))
+            .collect();
+        let collections: Vec<serde_json::Value> = (1..=4)
+            .flat_map(|n| {
+                (1..=2).map(move |c| {
+                    serde_json::json!({
+                        "id": format!("col-{n}-{c}"),
+                        "organizationId": format!("org-{n}"),
+                        "name": format!("Collection {n}.{c}")
+                    })
+                })
+            })
+            .collect();
+        let response: crate::rest::sync::SyncResponse = serde_json::from_value(serde_json::json!({
+            "profile": { "key": "2.aaa|bbb|ccc", "organizations": organisations },
+            "ciphers": [],
+            "folders": [],
+            "collections": collections
+        }))
+        .expect("the fixture parses");
+        let sharing = crate::rest::organizations::Directory::from_sync(
+            &response,
+            &crate::rest::sync::tests::keys_from_user(&[3u8; 64]),
+        );
+        let lists = VaultLists { sharing: &sharing, ..VaultLists::live_only(&live) };
+
+        // Unscrolled: the section's own first row is already past the floor.
+        let (resting, bounds) = scrolled_rail(lists, &folders, 0.0);
+        let first_at_rest = row_top(&resting, "Organisation 1");
+        assert!(
+            first_at_rest > bounds.bottom(),
+            "the ORGANISATIONS section no longer overflows the rail (its first row rests at \
+             y={first_at_rest}, floor y={}), so this test is not measuring what it is named \
+             for",
+            bounds.bottom()
+        );
+
+        // Scrolled to the end: every row the section added, and every row it
+        // pushed further down, is inside the rail.
+        let (scrolled, bounds) = scrolled_rail(lists, &folders, -6000.0);
+        for label in [
+            "Organisation 4",
+            "Collection 4.2",
+            crate::vault_window::password_health::HEALTH_ROW_LABEL,
+            SENDS_ROW_LABEL,
+            RECEIVED_ROW_LABEL,
+        ] {
+            let rect = scrolled
+                .iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{label:?} was not painted at all: {scrolled:?}"));
+            assert!(
+                bounds.contains_rect(rect),
+                "{label:?} is at {rect:?} after scrolling the rail to its end, still outside \
+                 the rail's own {bounds:?} -- the section is unreachable with {} folders and \
+                 four organisations",
+                folders.len()
+            );
+        }
     }
 }

@@ -2937,6 +2937,15 @@ pub fn build_frame_with_search(
                 session_token.clone(),
             );
         }
+        // **The sharing directory, read once per frame and outside the
+        // panel's closure.** An `Arc` clone under a momentary lock -- no I/O,
+        // no thread, nothing that can block a frame -- taken here rather than
+        // inside the closure so that the borrow the rail holds lives as long
+        // as the `VaultLists` built from it. It is filled by the sync
+        // `rest::backend::RestBackend::synced` already makes; see
+        // `rest::organizations`, and `sidebar::draw_organisations` for what
+        // an empty one draws, which is nothing.
+        let sharing = crate::rest::organizations::current();
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
@@ -2977,6 +2986,18 @@ pub fn build_frame_with_search(
                     // `live`, which is already here, so there is no
                     // unfetched state to report.
                     health_findings: health.flagged_items(),
+                    // The organisations and collections this account can
+                    // reach. **No fetch here and no thread behind it**: this
+                    // is a pointer copy out of the slot
+                    // `rest::backend::RestBackend::synced` fills as the vault
+                    // loads, so it is free to read every frame and it
+                    // describes the same sync the items came from. A
+                    // `bw serve` account, an account with no organisations
+                    // and a server with no organisation routes all hand back
+                    // the same empty directory, and the rail then draws no
+                    // ORGANISATIONS section at all -- see
+                    // `sidebar::draw_organisations`.
+                    sharing: &sharing,
                 };
                 match draw_sidebar(
                     ui,

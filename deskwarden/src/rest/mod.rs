@@ -54,10 +54,21 @@
 //! and no decryption at all. Password-protected export is not offered on
 //! either backend; see `vault_export`'s own docs for why.
 //!
-//! Still missing, and each is what keeps `bw.exe` on the machine:
+//! Still missing, and it is what keeps `bw.exe` on the machine:
 //! **attachments** (not decrypted by [`sync`], not creatable or deletable by
-//! [`write`]) and **organisations** (decrypted, but never shown working
-//! against a real server). The receive path is no longer on this list.
+//! [`write`]). The receive path is no longer on this list.
+//!
+//! **Organisations have come half off it**, and the half matters. [`sync`]
+//! has always decrypted an organisation-owned item; what did not exist was
+//! anything that knew an item was shared, with whom, or under what name.
+//! [`organizations`] is that layer: the directory of organisations and
+//! collections out of the sync payload, one roster request per organisation,
+//! and one pure question -- who else can see this item -- over a `VaultItem`
+//! the window already holds. It is **read-only by construction**; there is no
+//! create, no invite, no policy edit, and above all no move of an item into a
+//! collection, which is the one operation that changes what a cipher is
+//! encrypted under. That module's `Directory` doc enumerates what the move
+//! would take.
 //!
 //! This paragraph said "no folder write" until folder writes landed and
 //! nobody came back to it, and it said Sends were absent until they were not,
@@ -128,6 +139,11 @@ pub mod crypto;
 /// One `encrypted_json` vault export, built from the ciphertext a sync
 /// already carries. Pure but for a single `GET /api/sync`; no request body.
 pub mod export;
+/// **Who else can see this item**: organisations, collections and rosters,
+/// read-only. Two thirds of it rides the `GET /api/sync` this client already
+/// makes; only a roster costs a request, and only for an account that has an
+/// organisation at all. Nothing here writes.
+pub mod organizations;
 /// Sends over REST: the four operations `crate::send` runs the CLI for.
 pub mod send;
 /// A Send's own key hierarchy, which is not the vault's. Pure; no I/O.

@@ -1383,6 +1383,65 @@ impl RestClient {
             })
     }
 
+    // ---- reading an organisation's roster -----------------------------------
+
+    /// `GET /api/organizations/{id}/members` -- **who else is in this
+    /// organisation**, and the only question about sharing that
+    /// `GET /api/sync` does not already answer.
+    ///
+    /// # Why this is the one new request, and not four
+    ///
+    /// The obvious shape for organisation support is a fetch per noun:
+    /// `GET /api/organizations` for the list, `GET /api/collections` for the
+    /// collections, and so on. Every one of those would be a second opinion.
+    /// The sync payload this client already makes carries `profile.
+    /// organizations[]` -- which is where [`crate::rest::sync::VaultKeys`]
+    /// gets the org keys from, so it is load-bearing already -- and a
+    /// top-level `collections[]` array beside `ciphers` and `folders`, which
+    /// [`crate::rest::sync::SyncResponse`] now parses. Both halves of the
+    /// directory are therefore free, arrive at the same instant as the items
+    /// they describe, and cannot disagree with them.
+    ///
+    /// The roster is the exception because no sync carries it. Bitwarden's
+    /// `profile.organizations[].users` is `[]` on this deployment and absent
+    /// on others, and there is no member list anywhere in the payload. So one
+    /// `GET` per organisation, made **only** by an account that has one --
+    /// see [`crate::rest::organizations::Directory::load`], which is the only
+    /// caller and which skips this entirely for the zero-organisation case
+    /// that is the owner's own.
+    ///
+    /// # `/members`, and what a server that has never heard of it does
+    ///
+    /// The route is NodeWarden's (`router-authenticated.ts`); stock Bitwarden
+    /// spells the same list `/api/organizations/{id}/users`. This asks for one
+    /// of them and nothing else, because the caller treats *any* failure --
+    /// 404 from a server without the route, 403 from a member who may not
+    /// read it, a transport error, a body that is not a list -- as
+    /// [`crate::rest::organizations::Roster::Unknown`], which is a state the
+    /// UI already has to draw for "not fetched yet". Probing a second spelling
+    /// would buy a count on one more server and cost a second round trip on
+    /// every server for the case where neither answers; if the owner ever
+    /// points this client at a stock Bitwarden, the second probe belongs here
+    /// and nowhere else.
+    ///
+    /// **On `sync_agent`**, for [`Self::fetch_cipher`]'s reason exactly: this
+    /// is a read of account data, and the read deadline is the one written for
+    /// a server answering with it.
+    ///
+    /// Returns the raw JSON. The mapping -- including which envelope arrived
+    /// -- is [`crate::rest::organizations`]'s job, so this module holds no
+    /// second opinion about what a member is.
+    pub fn fetch_organization_members(
+        &self,
+        session: &mut Session,
+        id: &str,
+    ) -> Result<serde_json::Value, RestError> {
+        let url = self.organization_url(id, "/members")?;
+        self.refreshing(session, |session| {
+            self.value_from(self.bearer(self.sync_agent.get(&url), session).call())
+        })
+    }
+
     // ---- writing one cipher -------------------------------------------------
 
     /// `POST /api/ciphers` -- a new item.
@@ -2065,6 +2124,23 @@ impl RestClient {
             return Err(RestError::UnsafeId);
         }
         Ok(format!("{}/api/sends/{}", self.base_url, id))
+    }
+
+    /// `{base}/api/organizations/{id}{suffix}`, with the id checked first --
+    /// the same [`is_url_path_safe`] the three above use, so a fourth kind of
+    /// server-supplied id cannot come to be validated by a fourth rule.
+    ///
+    /// It takes a suffix for [`Self::cipher_url`]'s reason: there is one
+    /// address for an organisation in this module, and the routes under it
+    /// are spelled as what they are rather than as four separate `format!`s
+    /// that each re-derive the base. Today the only suffix is `/members`; a
+    /// second read (collections, policies) would be one more caller of this
+    /// rather than one more URL.
+    fn organization_url(&self, id: &str, suffix: &str) -> Result<String, RestError> {
+        if !is_url_path_safe(id) {
+            return Err(RestError::UnsafeId);
+        }
+        Ok(format!("{}/api/organizations/{}{}", self.base_url, id, suffix))
     }
 
     /// The server root this client was configured with.

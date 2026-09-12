@@ -324,6 +324,20 @@ impl RestBackend {
     /// not operations on this trait.
     #[must_use]
     pub fn new(client: RestClient, authenticated: Authenticated) -> Self {
+        // **The sharing directory is dropped here, and this is the account
+        // switch.** `rest::organizations` holds one directory per process,
+        // and a directory taken for one account is a statement about somebody
+        // else's sharing the moment the account changes -- a rail still
+        // drawing `Engineering` after a switch would be naming an
+        // organisation the signed-in user may not be in. This constructor is
+        // the one boundary that is exactly "a different logged-in account":
+        // its own doc says so in its first line, and the field
+        // initialisers below drop the previous backend's key and sync caches
+        // for the same reason.
+        //
+        // It is a clear and not a fetch, so `signed_in_with_no_sync_route`'s
+        // premise -- that constructing a backend touches no network -- holds.
+        crate::rest::organizations::forget();
         // `None`, and it must be: a constructor that pre-warmed the key cache
         // would be a constructor that fetches, which is exactly what
         // `signed_in_with_no_sync_route`'s doc relies on not happening.
@@ -442,6 +456,39 @@ impl RestBackend {
                 vault.failures
             );
         }
+        // **The sharing directory, off the payload already in hand.**
+        //
+        // Organisations and collections are both IN `response`: the first is
+        // `profile.organizations[]`, which `VaultKeys::unwrap_from` two lines
+        // above already reads, and the second is the top-level `collections[]`
+        // that `SyncResponse` used to discard. Building the directory here
+        // rather than from a second `GET` is what makes it impossible for a
+        // collection row and the items behind it to come from two different
+        // reads of the account.
+        //
+        // **What this can cost, stated rather than hidden.** `Directory::load`
+        // makes one `GET /api/organizations/{id}/members` per organisation --
+        // and **none at all** for an account with none, which is this owner's
+        // own situation and every `bw serve` account's. It is on the sync's
+        // own thread, behind the same revision gate as the sync (a cache hit
+        // returns above and never reaches here), and it cannot fail: every
+        // refusal a server can make -- 404 from one without the route, 403
+        // from a member who may not read it, a transport error -- becomes
+        // `Roster::Unknown`, which is the state the UI draws before any fetch
+        // has happened. So a server that implements none of this leaves the
+        // app exactly where it was, which is the requirement.
+        //
+        // It is stored in `rest::organizations` rather than returned, because
+        // `VaultBackend` is the only path to the window and a new method on
+        // that trait would oblige four impls with nothing to say about
+        // organisations each to say something. See that module's docs, which
+        // argue the trade against this file's own rule about second caches.
+        crate::rest::organizations::remember(crate::rest::organizations::Directory::load(
+            &self.client,
+            &mut state.session,
+            &response,
+            &keys,
+        ));
         drop(state);
         let vault = Arc::new(vault);
         let keys = self.remember_keys(keys);
