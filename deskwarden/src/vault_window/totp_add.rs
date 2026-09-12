@@ -4420,36 +4420,13 @@ fn device_row(ui: &mut egui::Ui, name: &str) -> egui::Response {
 /// whatever follows them (`gap: 16px` on the card's body).
 const CONFIRM_GAP: f32 = 16.0;
 
-/// The live-code panel: `padding: 14px 16px; border: 1px solid #b8c7ea;
-/// border-radius: 10px; background: #eef2fc`.
-const CODE_PANEL_PAD_X: i8 = 16;
-/// See [`CODE_PANEL_PAD_X`].
-const CODE_PANEL_PAD_Y: i8 = 14;
 /// See [`CODE_PANEL_PAD_X`].
 const CODE_PANEL_RADIUS: u8 = 10;
 
-/// `Code now`, as 6c sets it: `font-size: 11px; font-weight: 700;
-/// letter-spacing: 0.1em; text-transform: uppercase`.
-const CODE_LABEL_PX: f32 = 11.0;
-/// See [`CODE_LABEL_PX`]. The design's em, which [`theme::letterspaced`] wants
-/// in points.
-const CODE_LABEL_TRACKING: f32 = 0.1;
 
-/// The code itself: monospace at `font-size: 26px; font-weight: 700;
-/// letter-spacing: 0.14em`.
-///
-/// **Six points larger than the detail pane's live code**, which is 6c's whole
-/// argument: this one is being read off the screen and typed into a comparison
-/// against the site, once, before anything is saved.
-const CODE_PX: f32 = 26.0;
 /// See [`CODE_PX`].
 const CODE_TRACKING: f32 = 0.14;
-/// The gap between the label and the code (`gap: 4px`).
-const CODE_LABEL_GAP: f32 = 4.0;
 
-/// The countdown track beside it: `width: 96px; height: 4px;
-/// border-radius: 2px`, `#b8c7ea` under `#1b3fa0`.
-const COUNTDOWN_WIDTH: f32 = 96.0;
 /// See [`COUNTDOWN_WIDTH`].
 const COUNTDOWN_HEIGHT: f32 = 4.0;
 /// See [`COUNTDOWN_WIDTH`].
@@ -4457,8 +4434,6 @@ const COUNTDOWN_RADIUS: u8 = 2;
 /// The two lines the track sits between: `font-size: 12px; color: #14307a`,
 /// stacked at `gap: 7px` and right-aligned (`align-items: flex-end`).
 const PANEL_SIDE_PX: f32 = 12.0;
-/// See [`PANEL_SIDE_PX`].
-const PANEL_SIDE_GAP: f32 = 7.0;
 
 /// §6d's code, which is smaller than §6c's: `font-size: 22px` against 26.
 ///
@@ -4568,7 +4543,7 @@ fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now
     // confirmation that buries it under four label rows is a confirmation
     // nobody makes. On the typed path it is the only thing here.
     if let Some(code) = code_at(auth, now_unix) {
-        draw_code_panel(ui, auth, &code, now_unix, scanned);
+        draw_code_panel(ui, auth, &code, now_unix);
         // The gap is the one BETWEEN the panel and the table, so it goes
         // wherever the table does. Left in on the typed path it would be a
         // stripe of nothing above the footer.
@@ -4582,99 +4557,68 @@ fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now
     }
 }
 
-/// **The live-code strip, in the design's two shapes.**
+/// **The live-code strip, and there is one of it.**
 ///
-/// §6c, the card that has just read a code off the screen, draws a two-line
-/// block: a `CODE NOW` eyebrow over a 26px code, with `refreshes in 22 s`, the
-/// track and `Matches what the site shows?` stacked against the right edge.
-/// Its job is to be checked against a screen, so it says so in words.
+/// The code, a `flex: 1` track and the seconds. Nothing else, on either card.
 ///
-/// §6d, the card you are typing a secret INTO, draws one row: the code, a
-/// `flex: 1` track and `22 s`. Nothing else. It is not asking a question --
-/// it is showing that what has been typed produces codes, under the field
-/// that produced them.
+/// §6c draws a fuller block on the SCANNED card -- a `CODE NOW` eyebrow over a
+/// 26px code, with `refreshes in 22 s`, the track and `Matches what the site
+/// shows?` stacked against the right edge -- and this app drew it for a while.
+/// The owner asked for the typed card's row first ("blue strip also should
+/// only have code and progress bar with seconds - nothing else") and then for
+/// the two to be one: "just reuse existing for manual entry".
 ///
-/// The owner, on the typed card wearing §6c's block: "blue strip also should
-/// only have code and progress bar with seconds - nothing else". Both shapes
-/// are drawn here rather than in two functions because they are one strip --
-/// same wash, same edge, same radius, same code, same countdown off the same
-/// `countdown_fraction` -- and the parts that differ are exactly the parts
-/// the design draws differently.
-fn draw_code_panel(
-    ui: &mut egui::Ui,
-    auth: &OtpAuth,
-    code: &str,
-    now_unix: u64,
-    scanned: bool,
-) {
-    let (pad_x, pad_y) = if scanned {
-        (CODE_PANEL_PAD_X, CODE_PANEL_PAD_Y)
-    } else {
-        (TYPED_PANEL_PAD_X, TYPED_PANEL_PAD_Y)
-    };
+/// **So the departure from §6c is deliberate and it is the owner's.** What it
+/// costs is §6c's question, `Matches what the site shows?`, which is the
+/// scanned card asking to be checked against the screen it was read from.
+/// That check is still the point of the card -- it is what the field table
+/// under this strip is for, issuer and account and parameters, side by side
+/// with what the QR claimed -- and the code on this row is the same live code
+/// it always was. What is gone is a sentence, not a verification.
+///
+/// The gap between the code and the track, and again between the track and
+/// the seconds, is §6d's `gap: 14px`; the padding is its `12px 14px`.
+fn draw_code_panel(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) {
     egui::Frame::new()
         .fill(theme::BLUE_WASH)
         .stroke(egui::Stroke::new(1.0, theme::BLUE_EDGE))
         .corner_radius(CornerRadius::same(CODE_PANEL_RADIUS))
-        .inner_margin(egui::Margin::symmetric(pad_x, pad_y))
+        .inner_margin(egui::Margin::symmetric(TYPED_PANEL_PAD_X, TYPED_PANEL_PAD_Y))
         .show(ui, |ui| {
-            if !scanned {
-                typed_code_row(ui, auth, code, now_unix);
-                return;
-            }
+            let seconds = seconds_line(seconds_left(auth, now_unix));
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    // Uppercased here rather than stored uppercased, because
-                    // `CODE_ROW_LABEL` is the design's own "Code now" and the
-                    // capitals are `text-transform`, a rendering of it.
-                    ui.label(theme::letterspaced(
-                        &CODE_ROW_LABEL.to_uppercase(),
-                        CODE_LABEL_PX,
-                        theme::BOLD,
-                        CODE_LABEL_PX * CODE_LABEL_TRACKING,
-                        theme::BLUE_DEEP,
-                    ));
-                    ui.add_space(CODE_LABEL_GAP);
-                    // §6c declares `line-height: 1` on its code, and the
-                    // ascent is this app's reading of that: the tightest box
-                    // the digits fit in. Without it the eyebrow above and the
-                    // code are separated by the face's descender band rather
-                    // than by the design's 4-point gap.
-                    ui.label(
-                        theme::letterspaced_mono_in(
-                            &grouped_code(code),
-                            CODE_PX,
-                            CODE_PX * CODE_TRACKING,
-                            theme::BLUE_DEEP,
-                            code_ascent(ui, CODE_PX),
-                        ),
-                    );
-                });
-                // The right-hand stack takes what the code left and hangs off
-                // the panel's right edge, which is 6c's `align-items:
-                // flex-end` on a column with `flex: 1` to its left.
-                let rest = ui.available_width().max(0.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(rest, 0.0),
-                    egui::Layout::top_down(egui::Align::RIGHT),
-                    |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        ui.label(
-                            egui::RichText::new(refresh_line(seconds_left(auth, now_unix)))
-                                .size(PANEL_SIDE_PX)
-                                .color(theme::BLUE_DEEP),
-                        );
-                        ui.add_space(PANEL_SIDE_GAP);
-                        draw_countdown(ui, countdown_fraction(auth, now_unix));
-                        ui.add_space(PANEL_SIDE_GAP);
-                        ui.label(
-                            egui::RichText::new(MATCH_QUESTION)
-                                .size(PANEL_SIDE_PX)
-                                .color(theme::BLUE_DEEP),
-                        );
-                    },
+                // **The line box is the face's ascent**, so egui's vertical
+                // centring of this label against the track and the seconds
+                // beside it centres the DIGITS rather than a row box that
+                // reserves a descender band a six-digit code has no use for.
+                // The owner: "6 digit code is not centered either". See
+                // `theme::ascent_of`.
+                ui.label(theme::letterspaced_mono_in(
+                    &grouped_code(code),
+                    CODE_PX_TYPED,
+                    CODE_PX_TYPED * CODE_TRACKING,
+                    theme::BLUE_DEEP,
+                    code_ascent(ui, CODE_PX_TYPED),
+                ));
+                // **The seconds are measured before the track is drawn**,
+                // because the track is what gives way. Laid out in source
+                // order the bar would take `available_width` and push the
+                // seconds off the strip's right edge -- the same defect the
+                // detail header's controls are laid out right-to-left to
+                // avoid.
+                let tail = ui.painter().layout_no_wrap(
+                    seconds.clone(),
+                    egui::FontId::proportional(PANEL_SIDE_PX),
+                    theme::BLUE_DEEP,
+                );
+                let track =
+                    (ui.available_width() - tail.size().x - TYPED_PANEL_GAP * 2.0).max(0.0);
+                ui.add_space(TYPED_PANEL_GAP);
+                draw_countdown(ui, countdown_fraction(auth, now_unix), track);
+                ui.add_space(TYPED_PANEL_GAP);
+                ui.label(
+                    egui::RichText::new(seconds).size(PANEL_SIDE_PX).color(theme::BLUE_DEEP),
                 );
             });
         });
@@ -4686,56 +4630,14 @@ fn code_ascent(ui: &egui::Ui, size: f32) -> f32 {
     theme::ascent_of(ui.ctx(), &egui::FontId::new(size, egui::FontFamily::Monospace))
 }
 
-/// §6d's one row: the code, a track that takes what is left, and the seconds.
-///
-/// The track is `flex: 1` -- §6d's own -- and not §6c's fixed 96, which is why
-/// it is measured here instead of calling [`draw_countdown`]: the two cards
-/// draw the same bar at two widths, and a bar that ran to 96 in a row built
-/// to fill the strip would leave a hole between it and the seconds.
-fn typed_code_row(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) {
-    let seconds = seconds_line(seconds_left(auth, now_unix));
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        // **The line box is the face's ascent**, so egui's vertical centring
-        // of this label against the track and the seconds beside it centres
-        // the DIGITS rather than a row box that reserves a descender band a
-        // six-digit code has no use for. The owner: "6 digit code is not
-        // centered either". See `theme::ascent_of`.
-        ui.label(
-            theme::letterspaced_mono_in(
-                &grouped_code(code),
-                CODE_PX_TYPED,
-                CODE_PX_TYPED * CODE_TRACKING,
-                theme::BLUE_DEEP,
-                code_ascent(ui, CODE_PX_TYPED),
-            ),
-        );
-        // **The seconds are measured before the track is drawn**, because the
-        // track is what gives way. Laid out in source order the bar would
-        // take `available_width` and push `22 s` off the strip's right edge --
-        // the same defect the detail header's controls are laid out
-        // right-to-left to avoid.
-        let tail = ui.painter().layout_no_wrap(
-            seconds.clone(),
-            egui::FontId::proportional(PANEL_SIDE_PX),
-            theme::BLUE_DEEP,
-        );
-        let track = (ui.available_width() - tail.size().x - TYPED_PANEL_GAP * 2.0).max(0.0);
-        ui.add_space(TYPED_PANEL_GAP);
-        draw_countdown_at(ui, countdown_fraction(auth, now_unix), track);
-        ui.add_space(TYPED_PANEL_GAP);
-        ui.label(egui::RichText::new(seconds).size(PANEL_SIDE_PX).color(theme::BLUE_DEEP));
-    });
-}
-
-/// 6c's countdown track: a 96 by 4 rail of [`theme::BLUE_EDGE`] with
+/// The countdown track: a 4-point rail of [`theme::BLUE_EDGE`] with
 /// `fraction` of it filled in [`theme::BLUE`] from the left.
-fn draw_countdown(ui: &mut egui::Ui, fraction: f32) {
-    draw_countdown_at(ui, fraction, COUNTDOWN_WIDTH);
-}
-
-/// [`draw_countdown`] at a width the caller measured -- §6d's `flex: 1`.
-fn draw_countdown_at(ui: &mut egui::Ui, fraction: f32, width: f32) {
+///
+/// **The width is the caller's** -- §6d's `flex: 1`, measured against what the
+/// code and the seconds leave. There was a second entry point that drew it at
+/// §6c's fixed 96, for §6c's stacked block; that block is gone (see
+/// [`draw_code_panel`]) and a fixed width with no caller went with it.
+fn draw_countdown(ui: &mut egui::Ui, fraction: f32, width: f32) {
     let (track, _) = ui.allocate_exact_size(
         egui::vec2(width, COUNTDOWN_HEIGHT),
         egui::Sense::hover(),
@@ -5849,8 +5751,20 @@ mod tests {
             "the live code is not on screen: {:?}",
             painted.0
         );
-        assert!(painted.has("refreshes in 60 s"), "the countdown is not on screen: {:?}", painted.0);
-        assert!(painted.has(MATCH_QUESTION), "the question the code exists to answer is missing");
+        // §6d's words, on both cards now: the number and the unit. §6c's
+        // `refreshes in 60 s` belonged to the stacked block -- see
+        // `draw_code_panel`, which is one strip since the owner asked for
+        // one.
+        assert!(
+            painted.has(&seconds_line(60)),
+            "the countdown is not on screen: {:?}",
+            painted.0
+        );
+        // **§6c's question is not drawn any more**, and its absence is the
+        // owner's decision rather than a loss this test should hide: the
+        // check it invited is what the field table below does, field by
+        // field. See `draw_code_panel`.
+        assert!(!painted.has(MATCH_QUESTION), "§6c's stacked block is back");
         // The parameters SPELLED OUT: the 8/60/SHA-256 case is exactly the one
         // a confirmation exists to catch.
         assert!(painted.has("SHA256"), "the algorithm is not spelled out: {:?}", painted.0);
@@ -5867,19 +5781,24 @@ mod tests {
         // The body's `gap: 16px` between its blocks.
         assert_eq!(CONFIRM_GAP, 16.0);
 
-        // The live-code panel: `padding: 14px 16px; border-radius: 10px`.
-        assert_eq!((CODE_PANEL_PAD_X, CODE_PANEL_PAD_Y), (16, 14));
+        // **The live-code panel is §6d's row on both cards now**, so §6c's own
+        // numbers for it are not asserted here: its `padding: 14px 16px`, its
+        // `Code now` eyebrow at `11px/700`, its 26px code and its fixed 96px
+        // track went with the stacked block. The owner asked for one strip --
+        // "just reuse existing for manual entry" -- and `draw_code_panel`'s
+        // doc carries what that costs. What both designs share is asserted
+        // instead.
         assert_eq!(CODE_PANEL_RADIUS, 10);
-        // `Code now` at `11px/700`, `letter-spacing: 0.1em`, over the code at
-        // `26px/700`, `letter-spacing: 0.14em`, `gap: 4px` between them.
-        assert_eq!((CODE_LABEL_PX, CODE_LABEL_TRACKING), (11.0, 0.1));
-        assert_eq!((CODE_PX, CODE_TRACKING), (26.0, 0.14));
-        assert_eq!(CODE_LABEL_GAP, 4.0);
-        // The track: `width: 96px; height: 4px; border-radius: 2px`, between
-        // two `12px` lines at `gap: 7px`.
-        assert_eq!((COUNTDOWN_WIDTH, COUNTDOWN_HEIGHT), (96.0, 4.0));
+        // §6d's strip: `padding: 12px 14px`, a 22px code at
+        // `letter-spacing: 0.14em`, and `gap: 14px` either side of the track.
+        assert_eq!((TYPED_PANEL_PAD_X, TYPED_PANEL_PAD_Y), (14, 12));
+        assert_eq!((CODE_PX_TYPED, CODE_TRACKING), (22.0, 0.14));
+        assert_eq!(TYPED_PANEL_GAP, 14.0);
+        // The track: `height: 4px; border-radius: 2px`, beside a `12px` line.
+        // The WIDTH is §6d's `flex: 1` and so is measured, not a constant.
+        assert_eq!(COUNTDOWN_HEIGHT, 4.0);
         assert_eq!(COUNTDOWN_RADIUS, 2);
-        assert_eq!((PANEL_SIDE_PX, PANEL_SIDE_GAP), (12.0, 7.0));
+        assert_eq!(PANEL_SIDE_PX, 12.0);
 
         // The field table: `border-radius: 10px`, rows at `padding: 11px 14px;
         // gap: 14px`, a `92px` label column at `12px` and values at `13px`.
@@ -7784,7 +7703,10 @@ mod tests {
             painted.has(grouped_code(&expected).as_str()),
             "the live code a scanned seed produces is not on screen"
         );
-        assert!(painted.has(MATCH_QUESTION));
+        // The strip is §6d's row on this card too, so §6c's question is not
+        // drawn -- see `draw_code_panel`. What the scanned card still has,
+        // and the typed one does not, is the field table asserted below.
+        assert!(!painted.has(MATCH_QUESTION), "§6c's stacked block is back");
 
         // **Masked, exactly as it is for a typed one -- and this is the
         // assertion the first draft of this surface failed.**
@@ -7943,10 +7865,17 @@ mod tests {
         assert!(scanned_frame.has(REVEAL_LABEL), "the scanned card lost the way to unmask");
         assert!(scanned_frame.has("Git Host"), "the issuer a scan must be checked against is gone");
         assert!(scanned_frame.has("anovak"), "the account a scan must be checked against is gone");
-        // And the panel is on that card too, which is what makes it the one
-        // piece common to both paths rather than a consolation for one.
-        assert!(scanned_frame.has(MATCH_QUESTION));
+        // And the strip is on that card too, which is what makes it the one
+        // piece common to both paths rather than a consolation for one -- and
+        // it is the SAME strip now, down to the seconds, since the owner
+        // asked for one: "just reuse existing for manual entry".
         assert!(scanned_frame.has(grouped_code(&code).as_str()));
+        assert!(scanned_frame.has(&seconds_line(60)), "the scanned strip lost its countdown");
+        assert!(
+            !scanned_frame.has(MATCH_QUESTION),
+            "§6c's stacked block is back on the scanned card: {:?}",
+            scanned_frame.0
+        );
     }
 
     /// The caution band is **not** part of the gate above.
