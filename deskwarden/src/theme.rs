@@ -231,6 +231,11 @@ pub const SEMIBOLD: &str = "Archivo-SemiBold";
 /// Named font family for Archivo Bold (the design's 700 weight: headings,
 /// section labels). Use via [`bold`].
 pub const BOLD: &str = "Archivo-Bold";
+
+/// The monospace family's BOLD cut -- the design's `font-weight: 700` on the
+/// live one-time code, and the only place this app asks for a heavy
+/// monospace. See [`system_monospace_bold`].
+pub const MONO_BOLD: &str = "Consolas-Bold";
 /// Named font family for Archivo ExtraBold — the design's 800 weight. Used
 /// for the wordmark ("Deskwarden" at 25px in the login window, 14px in the
 /// vault titlebar) and for the detail pane's item title (2b: `font-size:
@@ -261,15 +266,40 @@ pub const EXTRABOLD: &str = "Archivo-ExtraBold";
 /// `None` — leaving egui's Hack in place — whenever it can't be read: this
 /// is a cosmetic match, never a reason to fail startup.
 fn system_monospace() -> Option<Vec<u8>> {
+    system_font("consola.ttf")
+}
+
+/// **The BOLD cut of the same face**, for the one place the design asks for
+/// a heavy monospace: the live one-time code, which §6c and §6d both declare
+/// at `font-weight: 700`.
+///
+/// This family used to be a single weight -- Consolas Regular in front of
+/// egui's Hack -- and a comment two functions up said so as a statement of
+/// fact: "Monospace is also a single weight here; there is no lost-weight
+/// problem to fix". There was: a six-digit code asking for 700 got 400, and
+/// the owner read it as "6 digit code font feels samller not that bold as
+/// per design".
+///
+/// Registered as a NAMED family rather than pushed into `Monospace`, because
+/// everything else in that family -- the keycaps, the chips, the seed field,
+/// the masked rows -- is correctly regular and must not move.
+fn system_monospace_bold() -> Option<Vec<u8>> {
+    system_font("consolab.ttf")
+}
+
+/// One face out of the system's font directory, or `None` with a line
+/// saying which and why.
+///
+/// `None` is never a reason to fail startup: this is a cosmetic match, and
+/// each caller has a face to fall back to.
+fn system_font(file: &str) -> Option<Vec<u8>> {
     let system_root = std::env::var_os("SystemRoot")?;
-    let path = std::path::Path::new(&system_root)
-        .join("Fonts")
-        .join("consola.ttf");
+    let path = std::path::Path::new(&system_root).join("Fonts").join(file);
     match std::fs::read(&path) {
         Ok(bytes) => Some(bytes),
         Err(e) => {
             log::debug!(
-                "could not read {} ({e}); keeping egui's bundled monospace face",
+                "could not read {} ({e}); keeping the face already in that family",
                 path.display()
             );
             None
@@ -438,6 +468,22 @@ fn font_definitions() -> egui::FontDefinitions {
         }
     }
 
+    // **A named family of its own**, and the regular monospace behind it: a
+    // machine without `consolab.ttf` gets the code at the weight it has
+    // always had rather than a tofu column. See [`system_monospace_bold`].
+    let mut bold_mono = vec![];
+    if let Some(bytes) = system_monospace_bold() {
+        fonts.font_data.insert(
+            MONO_BOLD.to_owned(),
+            Arc::new(egui::FontData::from_owned(bytes)),
+        );
+        bold_mono.push(MONO_BOLD.to_owned());
+    }
+    bold_mono.extend(
+        fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default(),
+    );
+    fonts.families.insert(FontFamily::Name(MONO_BOLD.into()), bold_mono);
+
     fonts
 }
 
@@ -514,6 +560,29 @@ pub fn letterspaced_mono(
     color: Color32,
 ) -> egui::text::LayoutJob {
     letterspaced_in(text, FontId::new(size, FontFamily::Monospace), tracking, color, None)
+}
+
+/// [`letterspaced_mono_in`] in the monospace family's BOLD cut.
+///
+/// The live code and nothing else: §6c and §6d both declare it at
+/// `font-weight: 700`, and every other monospace run in this app -- the
+/// keycaps, the parameter chips, the seed field, the masked rows -- is
+/// correctly regular. See [`MONO_BOLD`], whose family falls back to the
+/// regular face on a machine that has no `consolab.ttf`.
+pub fn letterspaced_mono_bold(
+    text: &str,
+    size: f32,
+    tracking: f32,
+    color: Color32,
+    line_height: f32,
+) -> egui::text::LayoutJob {
+    letterspaced_in(
+        text,
+        FontId::new(size, FontFamily::Name(MONO_BOLD.into())),
+        tracking,
+        color,
+        Some(line_height),
+    )
 }
 
 /// [`letterspaced_mono`] in a line box of the caller's choosing.

@@ -148,9 +148,6 @@ pub const CODE_READ_LABEL: &str = "Code read";
 /// See [`CODE_READ_LABEL`]. What kind of thing it was.
 pub const CODE_READ_KIND: &str = "otpauth://totp";
 
-/// The heading over the confirmation half, verbatim from design 6c.
-pub const CONFIRM_HEADING: &str = "What was extracted";
-
 /// The question printed beside the live code, verbatim from design 6c. It is
 /// the reason the code and the countdown are on screen at all.
 pub const MATCH_QUESTION: &str = "Matches what the site shows?";
@@ -203,8 +200,17 @@ pub const PARAMETERS_ROW_LABEL: &str = "Parameters";
 /// The label over the live code.
 pub const CODE_ROW_LABEL: &str = "Code now";
 
-/// Why the two controls are dead: the pasted URI already said.
-pub const PARAMETERS_FROM_URI: &str = "from the URI";
+/// Why the two controls are dead: the link already said.
+///
+/// **A sentence, not a fragment.** It read `from the URI`, which is the
+/// tail of a sentence whose head was never drawn -- on screen, under two
+/// greyed controls, it said nothing at all. The owner read it next to a
+/// heading that should not have been there and reported both together.
+///
+/// It is still the app's own words rather than the design's: 6d draws
+/// these controls LIVE and so has no line for this state, and greyed
+/// controls with no reason beside them are worse than either.
+pub const PARAMETERS_FROM_URI: &str = "Set by the link that was read.";
 
 /// The captions on the two parameter controls.
 pub const DIGITS_LABEL: &str = "Digits";
@@ -4416,10 +4422,6 @@ fn device_row(ui: &mut egui::Ui, name: &str) -> egui::Response {
 // Design 6c's numbers, all of them lifted out of the CSS under `id="6c"`
 // ---------------------------------------------------------------------------
 
-/// The gap between 6c's three blocks -- the live code, the field table and
-/// whatever follows them (`gap: 16px` on the card's body).
-const CONFIRM_GAP: f32 = 16.0;
-
 /// See [`CODE_PANEL_PAD_X`].
 const CODE_PANEL_RADIUS: u8 = 10;
 
@@ -4534,22 +4536,36 @@ fn draw_confirmation(ui: &mut egui::Ui, auth: &OtpAuth, state: &mut TotpAdd, now
     // Read out before `state` is lent to the table below.
     let scanned = state.scanned;
 
-    if scanned {
-        ui.label(egui::RichText::new(CONFIRM_HEADING).size(12.0).color(theme::INK).strong());
-        ui.add_space(6.0);
-    }
+    // **There is no heading over this table, and there never should have
+    // been one.**
+    //
+    // It read `What was extracted`, and its doc said "verbatim from design
+    // 6c". It is verbatim from 6c's CAPTION -- the words beside the `6c`
+    // badge that name the figure for somebody reading the design document.
+    // The card itself begins below that line, and it begins with this
+    // table. The owner, on seeing it on screen: "not on design".
+    //
+    // Nothing replaces it. The table's own rows say what they are, and the
+    // card's title band one strip up already says a code was read.
 
     // The live code first: it is what the user is here to compare, and a
     // confirmation that buries it under four label rows is a confirmation
     // nobody makes. On the typed path it is the only thing here.
     if let Some(code) = code_at(auth, now_unix) {
         draw_code_panel(ui, auth, &code, now_unix);
-        // The gap is the one BETWEEN the panel and the table, so it goes
-        // wherever the table does. Left in on the typed path it would be a
-        // stripe of nothing above the footer.
-        if scanned {
-            ui.add_space(CONFIRM_GAP);
-        }
+        // **No gap is added here**, and that is the fix for "vertical
+        // paddings between elements are not the same - big after 6 digits
+        // code for excample".
+        //
+        // This body is a column with `item_spacing.y = MANUAL_BODY_GAP`, so
+        // egui already puts 14 points between every pair of blocks in it.
+        // A second 16 added after the code panel made ONE gap of 30 in a
+        // column of 14s -- which is exactly what an eye notices, and the
+        // only place on the card where two spacings were asked for.
+        //
+        // §6c declares its body `gap: 16px` and §6d declares 14. This is one
+        // card that is both, so it takes one gap, and the one already in
+        // force everywhere else on it is the one that stays.
     }
 
     if scanned {
@@ -4594,7 +4610,12 @@ fn draw_code_panel(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64)
                 // reserves a descender band a six-digit code has no use for.
                 // The owner: "6 digit code is not centered either". See
                 // `theme::ascent_of`.
-                ui.label(theme::letterspaced_mono_in(
+                // **The BOLD monospace cut.** Both designs declare this code
+                // at `font-weight: 700` and this family used to have one
+                // weight, so it was drawn at 400 -- "6 digit code font feels
+                // samller not that bold as per design". See
+                // `theme::MONO_BOLD`.
+                ui.label(theme::letterspaced_mono_bold(
                     &grouped_code(code),
                     CODE_PX_TYPED,
                     CODE_PX_TYPED * CODE_TRACKING,
@@ -4754,21 +4775,51 @@ fn table_row(
     trailing: impl FnOnce(&mut egui::Ui),
 ) {
     ui.add_space(FIELD_PAD_Y);
-    ui.horizontal(|ui| {
+    // **The label's column is RESERVED here and PAINTED after the row**, and
+    // that is the fix for what the owner reported as "labels are not
+    // centered".
+    //
+    // It was an `allocate_ui` holding a `ui.label`, which is two problems at
+    // once. `allocate_ui` gives its child egui's DEFAULT layout -- top-down,
+    // `Align::Min` -- rather than the centring one this row is in; and even
+    // with the right layout it would not have helped, because egui lays a
+    // horizontal row out in ONE PASS and the label is its FIRST child, so
+    // `Align::Center` had nothing to centre against yet. Everything after it
+    // -- a 13-point value, a masked secret, a row of 20-point parameter
+    // chips -- then grew the row DOWNWARD and left the label at the top of
+    // it. `detail::header_row` carries the same finding about the same egui
+    // behaviour, and `theme::section_row_impl` solves it the same way: paint
+    // the caption, do not add it.
+    let cell_and_row = ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         ui.add_space(FIELD_PAD_X);
-        ui.allocate_ui(egui::vec2(FIELD_LABEL_W, 0.0), |ui| {
-            ui.label(
-                egui::RichText::new(label).size(FIELD_LABEL_PX).color(theme::TEXT_FAINT),
-            );
-        });
+        // Width only. A zero height keeps the label out of the row's own
+        // height, which is what lets the value decide it.
+        let (cell, _) =
+            ui.allocate_exact_size(egui::vec2(FIELD_LABEL_W, 0.0), egui::Sense::hover());
         ui.add_space(FIELD_GAP);
         value(ui);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(FIELD_PAD_X);
             trailing(ui);
         });
+        cell
     });
+    let cell = cell_and_row.inner;
+    let row = cell_and_row.response.rect;
+    let font = egui::FontId::proportional(FIELD_LABEL_PX);
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), theme::TEXT_FAINT);
+    // Centred on the row, then dropped by the ink offset -- the face inks
+    // only the upper part of its row box, so a galley centred by its BOX
+    // reads high. See `theme::ink_drop`, which measures it.
+    ui.painter().galley(
+        egui::pos2(
+            cell.left(),
+            row.center().y - galley.size().y / 2.0 + theme::ink_drop(ui.ctx(), &font, None),
+        ),
+        galley,
+        theme::TEXT_FAINT,
+    );
     ui.add_space(FIELD_PAD_Y);
 }
 
@@ -5744,7 +5795,7 @@ mod tests {
             draw_add_form(ui, &mut state, BOUNDARY);
         });
 
-        assert!(painted.has(CONFIRM_HEADING), "the confirmation heading is missing");
+        assert!(painted.has(ISSUER_ROW_LABEL), "the field table the confirmation IS did not draw");
         let expected = code_at(&auth(UNUSUAL), BOUNDARY).expect("decodes");
         assert!(
             painted.has(grouped_code(&expected).as_str()),
@@ -5778,8 +5829,12 @@ mod tests {
     /// quoted here beside the CSS it came from, in the order the card stacks.
     #[test]
     fn the_confirmations_numbers_are_the_designs_own() {
-        // The body's `gap: 16px` between its blocks.
-        assert_eq!(CONFIRM_GAP, 16.0);
+        // **One gap down the body, and it is the column's own.** §6c says
+        // `gap: 16px` here and §6d says 14; the card is both designs, so it
+        // takes one -- and a second one added after the live code made a
+        // single 30-point gap in a column of 14s, which is what the owner
+        // saw.
+        assert_eq!(MANUAL_BODY_GAP, 14.0);
 
         // **The live-code panel is §6d's row on both cards now**, so §6c's own
         // numbers for it are not asserted here: its `padding: 14px 16px`, its
@@ -5920,7 +5975,7 @@ mod tests {
         });
         assert!(painted.has("plain URL"), "the refusal is not on screen: {:?}", painted.0);
         assert!(
-            !painted.has(CONFIRM_HEADING),
+            !painted.has(ISSUER_ROW_LABEL),
             "a refused field still painted a confirmation to save from"
         );
     }
@@ -7045,7 +7100,7 @@ mod tests {
             frame.painted.0
         );
         // And nothing of 6d is on screen yet: the picker is a picker.
-        assert!(!frame.painted.has(CONFIRM_HEADING));
+        assert!(!frame.painted.has(ISSUER_ROW_LABEL));
         assert_eq!(frame.rows.len(), ROUTES.len(), "a route was drawn without a hit area");
     }
 
@@ -7697,7 +7752,7 @@ mod tests {
         let painted = paint(|ui| {
             draw_stage(ui, &mut state, BOUNDARY);
         });
-        assert!(painted.has(CONFIRM_HEADING), "a scan did not reach 6c: {:?}", painted.0);
+        assert!(painted.has(ISSUER_ROW_LABEL), "a scan did not reach 6c's table: {:?}", painted.0);
         let expected = code_at(&auth(UNUSUAL), BOUNDARY).expect("decodes");
         assert!(
             painted.has(grouped_code(&expected).as_str()),
@@ -7789,7 +7844,7 @@ mod tests {
 
         // 6c's furniture, gone: the heading and every row of the table.
         assert!(
-            !typed_frame.has(CONFIRM_HEADING),
+            !typed_frame.has(ISSUER_ROW_LABEL),
             "a typed secret still got 6c's heading: {:?}",
             typed_frame.0
         );
@@ -7849,7 +7904,7 @@ mod tests {
             draw_stage(ui, &mut scanned, BOUNDARY);
         });
         assert!(
-            scanned_frame.has(CONFIRM_HEADING),
+            scanned_frame.has(ISSUER_ROW_LABEL),
             "the scanned card lost 6c's heading: {:?}",
             scanned_frame.0
         );
@@ -7901,7 +7956,7 @@ mod tests {
         assert!(painted.has(REPLACE_LABEL), "the destructive button stopped saying so");
         // Control, in the same frame: the table really is gone from this card,
         // so the band above survived a gate rather than there being no gate.
-        assert!(!painted.has(CONFIRM_HEADING));
+        assert!(!painted.has(ISSUER_ROW_LABEL));
     }
 
     // -----------------------------------------------------------------
@@ -8587,7 +8642,7 @@ mod tests {
             "a refused field still claimed to be valid base32"
         );
         assert!(
-            !refused.painted.has(CONFIRM_HEADING),
+            !refused.painted.has(ISSUER_ROW_LABEL),
             "a refused field still painted a confirmation to save from"
         );
     }
