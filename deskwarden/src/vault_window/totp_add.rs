@@ -4904,7 +4904,16 @@ pub fn draw_add_modal(
             );
         });
 
-    let action = theme::movable_modal(ctx, egui::Area::new(egui::Id::new("totp-add-modal")))
+    // **The one card in the app that is four cards, and the size it was last
+    // pass is what egui will anchor this pass by.** On the frame a stage
+    // changes -- the picker's 470 by a column of rows becoming the scanning
+    // stage's 380 by four lines -- egui lays the new card out at the old
+    // card's corner, and the owner watched it appear there and then move.
+    // `settle_reshaped_modal`, below the show, throws that pass away before
+    // it is painted; see it for egui's own lines and for why it is keyed on
+    // the stage rather than on the size.
+    let modal_id = egui::Id::new("totp-add-modal");
+    let action = theme::movable_modal(ctx, egui::Area::new(modal_id))
         .show(ctx, |ui| {
             // **The handle goes on before the stage does, and it is the
             // stage's own header.** Registered first because a drag-sensing
@@ -4917,6 +4926,7 @@ pub fn draw_add_modal(
             draw_stage(ui, state, now_unix)
         })
         .inner;
+    theme::settle_reshaped_modal(ctx, modal_id, state.stage);
 
     // **Escape closes it, and this is the only key the modal answers.**
     //
@@ -8021,6 +8031,54 @@ mod tests {
                 "{stage:?}: the drag handle swallowed the press on the ✕"
             );
         }
+    }
+
+    /// **The card is in the middle on the first frame of a new stage, not in
+    /// the old stage's corner.**
+    ///
+    /// The owner: *"Scan same two small windows 'Scanning your screen', first
+    /// and then second on diff place"*, and before that *"White small popup
+    /// shows up. Same popup moves position."* An anchored `egui::Area` is
+    /// placed by the size it had on the previous pass, so the frame after the
+    /// stage changes from the picker to the scanning card laid the new, smaller
+    /// card out with its top-left at the picker's top-left -- and the frame
+    /// after that put it in the middle. `theme::settle_resized_modal` discards
+    /// the first of those passes; this drives the real `draw_add_modal`
+    /// through the same change the `ScanRegion` handler makes and reads where
+    /// egui says the card is.
+    ///
+    /// Through the modal harness rather than `draw_stage`, because the
+    /// anchoring is the modal's and a stage drawn on its own has none.
+    #[test]
+    fn the_card_is_centred_on_the_first_frame_of_a_new_stage() {
+        let modal = Modal::new();
+        let mut state = TotpAdd::opening("i1", "Git Host", false);
+        let id = egui::Id::new("totp-add-modal");
+        let centre = Modal::input(Vec::new()).screen_rect.expect("the harness sets one").center();
+        // Two warm-ups on the picker: egui's own sizing pass, then a real one.
+        let _ = modal.frame(&mut state, Vec::new());
+        let _ = modal.frame(&mut state, Vec::new());
+        let picker = egui::AreaState::load(&modal.ctx, id).expect("the picker was drawn").rect();
+        assert!(
+            (picker.center() - centre).length() < 1.0,
+            "control: the picker itself is not centred, at {picker:?}"
+        );
+        // The stage changes BETWEEN frames, which is how `vault_window`'s
+        // action handler changes it: after `draw_add_modal` has returned.
+        state.stage = Stage::Scanning;
+        let _ = modal.frame(&mut state, Vec::new());
+        let scanning = egui::AreaState::load(&modal.ctx, id).expect("the card was drawn").rect();
+        assert_ne!(
+            scanning.size(),
+            picker.size(),
+            "control: the two stages are the same size, so this test could not see a jump"
+        );
+        assert!(
+            (scanning.center() - centre).length() < 1.0,
+            "the scanning card was placed off-centre on the first frame of its stage, at \
+             {scanning:?} against a centre of {centre:?}: it was anchored by the picker's size \
+             and painted in the picker's corner, and the next frame will move it"
+        );
     }
 
     /// **A frame with no keystroke reports nothing**, which is the control

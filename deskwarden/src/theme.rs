@@ -7398,10 +7398,105 @@ pub fn movable_modal(ctx: &egui::Context, area: egui::Area) -> egui::Area {
     // The size egui measured last pass. `None` before the card has ever been
     // drawn, which is the frame an anchored `Area` paints nothing on anyway
     // -- see `prefs_ui`'s `an_anchored_area_paints_nothing_on_its_first_frame`.
-    let size = egui::AreaState::load(ctx, id).and_then(|state| state.size);
+    let size = modal_last_size(ctx, id);
     let by = modal_offset(ctx, id, size);
     area.order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_CENTER, by)
+}
+
+/// The size egui measured a modal's `Area` at on the last pass, or `None`
+/// before it has ever been laid out. What [`movable_modal`] clamps the drag
+/// offset against.
+pub fn modal_last_size(ctx: &egui::Context, area_id: egui::Id) -> Option<Vec2> {
+    egui::AreaState::load(ctx, area_id).and_then(|state| state.size)
+}
+
+/// **Throws away the pass on which a modal changed SHAPE, so the card is never
+/// painted anchored by a size it no longer has.** Call it after the area's
+/// `show`, handing it whatever decides the card's shape -- `totp_add` hands
+/// it the stage.
+///
+/// # The report
+///
+/// > Scan same two small windows "Scanning your screen", first and then
+/// > second on diff place
+///
+/// and, earlier, *"White small popup shows up. Same popup moves position."*
+/// That is `totp_add`'s card going from the picker (470 wide, tall) to the
+/// scanning stage (380 wide, four lines) between two frames, and it is egui
+/// doing exactly what an anchored `Area` does. `Area::begin` places an
+/// anchored area by the size stored from the **previous** pass:
+///
+/// ```text
+/// let size = *state.size.get_or_insert_with(|| { sizing_pass = true; .. });
+/// ..
+/// if let Some((anchor, offset)) = anchor {
+///     state.set_left_top_pos(anchor.align_size_within_rect(size, constrain_rect).left_top() + offset);
+/// }
+/// ```
+///
+/// A stage change is not a sizing pass -- `state.size` is `Some`, it is just
+/// the wrong `Some` -- so the new, smaller card is laid out with its top-left
+/// where the old card's top-left was: `centre - old_size / 2`, which for a
+/// card that shrank in both directions is up and to the left of centre. Only
+/// `Prepared::end` stores the new size, and it asks for nothing; the next
+/// frame anchors by the new size and the card lands in the middle. The user
+/// sees the card in the picker's corner, then sees it move.
+///
+/// # Why a discard and not a fixed position
+///
+/// `prefs_ui` avoids all of this by computing its rectangle and placing the
+/// area with `fixed_pos` -- see [`movable_modal_at`] -- and that is the right
+/// answer for a card whose size is known before it is laid out. This card's
+/// is not: it is four cards, each sized by its type, and measuring them ahead
+/// of layout would be a second layout kept in step with the first by hand.
+///
+/// `Context::request_discard` is egui's own answer to "this pass laid
+/// something out in the wrong place": the pass is thrown away, not painted,
+/// and run again with the memory the first one wrote -- which now holds the
+/// new size, so the second pass anchors correctly. egui caps the passes it
+/// will run per frame at `Options::max_passes`, two by default, so a shape
+/// that somehow changed on every pass would be painted after two rather than
+/// spinning.
+///
+/// # Keyed on the shape, and NOT on the measured size -- which was tried
+///
+/// The first draft compared the area's size before and after the show and
+/// discarded on any difference. It fired on the **second frame of every
+/// modal**, and it cost a keystroke. egui's own first pass of a never-sized
+/// area is a sizing pass, laid out invisible with no width constraint, and
+/// the size it stores is an estimate that the first real layout then
+/// corrects -- a difference, so a discard. And a discarded pass is re-run on
+/// `RawInput::take()`, which leaves the persistent fields and **empties the
+/// events**: an Escape or a click that arrived on that frame is consumed by
+/// the pass that was thrown away and never seen by the one that is kept.
+/// `each_card_wears_its_own_footer` caught it -- an Escape on a card's second
+/// frame answered nothing.
+///
+/// So the trigger is the thing that actually changes the card, remembered
+/// from the last pass in the context's temporary data under the area's id:
+/// a card that is on a different stage than it was drawn on last pass is
+/// re-anchored, and a card on the same stage never is, whatever egui
+/// measured. That includes the two frames after a first open, where the
+/// stage has not changed, and it includes a REOPEN on a different stage than
+/// the one the card closed on -- egui keeps `AreaState` across a close, so
+/// that reopen would otherwise anchor the new card by the old one's size.
+///
+/// The one frame this still spends a pass on is the frame after a stage
+/// changes, and the events on that frame belong to the discarded pass. That
+/// is the frame after the press that changed the stage was answered; a
+/// second input arriving within it is a sixteen-millisecond window, and the
+/// alternative is the card the owner watched jump.
+pub fn settle_reshaped_modal<K>(ctx: &egui::Context, area_id: egui::Id, shape: K)
+where
+    K: Copy + PartialEq + Send + Sync + 'static,
+{
+    let key = area_id.with("modal-shape");
+    let last: Option<K> = ctx.data(|d| d.get_temp(key));
+    ctx.data_mut(|d| d.insert_temp(key, shape));
+    if last.is_some_and(|last| last != shape) {
+        ctx.request_discard("a modal changed shape, so this pass anchored it by the old one");
+    }
 }
 
 /// [`movable_modal`] for a card that COMPUTES its own rectangle instead of

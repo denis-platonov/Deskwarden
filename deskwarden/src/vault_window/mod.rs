@@ -1592,11 +1592,13 @@ pub fn build_frame_with_search(
         // that takes the request literally, in exchange for a flag that the
         // window-creation path strips again anyway.
         //
-        // What actually fixed the overlay is
-        // `region_overlay::let_the_desktop_through`, which makes on the
-        // overlay's own HWND the `DwmEnableBlurBehindWindow` call `winit`
-        // skips whenever the transparent attribute has been stripped. That is
-        // a fix on the window that needs it, and it leaves this one alone.
+        // What makes the overlay see-through is
+        // `region_overlay::let_the_desktop_through`, which makes the overlay's
+        // own HWND a layered window at one uniform alpha -- asking nothing of
+        // the framebuffer's alpha channel, and nothing of DWM. (It was a
+        // `DwmEnableBlurBehindWindow` once, and that blurred the owner's
+        // desktop; that module's doc has the history.) That is a fix on the
+        // window that needs it, and it leaves this one alone.
         //
         // This window is opaque, paints its own background on every frame
         // rather than relying on the clear colour, and is unaffected either

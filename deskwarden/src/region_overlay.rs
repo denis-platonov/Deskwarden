@@ -402,6 +402,25 @@ pub fn scan_miss_line(miss: ScanMiss) -> String {
 /// what keeps that true.
 pub const DIM_ALPHA: u8 = 115;
 
+/// **The alpha the window is SHOWN at: none.**
+///
+/// The first of [`let_the_desktop_through`]'s two calls uses this, the second
+/// uses [`DIM_ALPHA`], and the window is shown between them. So the window is
+/// on screen -- `IsWindowVisible` says so, `eframe` paints it, the raise can
+/// find it -- and the user sees nothing at all, until a root frame finds that
+/// the callback has painted into it and raises the alpha to the dim. See
+/// [`Appearing`]'s "shown INVISIBLE" section for why this exists: it is what
+/// takes the count of unpainted frames the user can be shown from "at most
+/// one" to none, on every machine rather than on the one it was measured on.
+///
+/// Zero and not, say, one: a layered window at alpha zero lets mouse input
+/// fall through to whatever is beneath it (the layered-windows documentation
+/// says so, in as many words), and for the few frames this lasts that is the
+/// right thing -- nothing is painted, nothing is raised, and a click the user
+/// makes in that moment belongs to the desktop they can still see. At
+/// [`DIM_ALPHA`] the window takes the mouse as it always has.
+pub const UNSEEN_ALPHA: u8 = 0;
+
 /// **The dim's ink, opaque**: the design's `background: #201e1d` with no alpha
 /// of its own, because [`DIM_ALPHA`] is now the window's and not the paint's.
 ///
@@ -1310,6 +1329,23 @@ struct Inner {
     /// Which chip the primary button went down on, while it is still down.
     /// See [`RegionOverlay::chip_gesture`].
     chip_press: Option<usize>,
+    /// **Whether the viewport callback has painted a frame into the window
+    /// yet.** Set once, by the callback, after its first `draw`; read by
+    /// [`RegionOverlay::appear`], which will not raise the window's alpha
+    /// above [`UNSEEN_ALPHA`] until this is true. See [`Appearing`]'s "shown
+    /// INVISIBLE" section: this is the one fact that separates "a frame the
+    /// user can see" from "a rectangle of whatever the surface held".
+    painted: bool,
+    /// **The overlay window's own `HWND`, from the one lookup that found it.**
+    ///
+    /// Held for the calls that come AFTER the window has gone or is going --
+    /// [`log_layering`] on the frame the overlay closes -- where an
+    /// `EnumWindows` by title is both a cost on the user's way back to the
+    /// vault and a lookup that may not find a window `eframe` is in the middle
+    /// of destroying. Never used to make the window; a handle this module did
+    /// not create is a handle it must check with `IsWindow` before use, and
+    /// the one reader does.
+    hwnd: Option<isize>,
 }
 
 /// How far [`scan_screen_with`] has got on this overlay's behalf.
@@ -1427,22 +1463,42 @@ enum Reveal {
 /// Build the viewport `with_visible(false)`, make the DWM call and set the
 /// capture mask on the window while it is still hidden, and only then ask for
 /// it to be shown. Re-measured the same way on the same code: **one** sample of
-/// white instead of eighty -- at most one unpainted frame, which is the floor
-/// for this architecture and exactly what `window_host::Reveal` already accepts
-/// for every other window in this crate.
+/// white instead of eighty -- at most one unpainted frame, which was thought
+/// to be the floor for this architecture and is what `window_host::Reveal`
+/// accepts for every other window in this crate.
+///
+/// **That measurement was of a build whose show did not undo the layering.
+/// The shipped one did.** The show was sent as `ViewportCommand::Visible(true)`
+/// and went through `winit`, whose `WindowFlags::apply_diff` answers every
+/// flag change by rewriting `GWL_EXSTYLE` from its own flag set -- which has
+/// no `WS_EX_LAYERED` in it. The owner's log has the proof: on the frame after
+/// the show, the second layering call read the ex-style back as `0x40118`,
+/// the bit gone, and had to put it on again. Between those two lines the
+/// window was on screen, opaque, first unpainted and then painted near-black
+/// with the bar along the bottom -- *"2 black blinks and pitch dark screen"*,
+/// with the "pitch dark" lasting until the next root frame's two
+/// `EnumWindows` had finished. See [`show_unseen`] for the fix and the exact
+/// `winit` lines, and the section below for why the floor is now zero
+/// unpainted frames rather than one.
 ///
 /// # Why both steps run on the ROOT's frame
 ///
-/// The first has no choice. **A hidden deferred viewport's callback does not
-/// run at all**: `eframe`'s `glow_integration::run_ui_and_paint` computes
-/// `run_ui` as `is_visible || is_viewport_or_descendant_visible(..)`, and
-/// `epi_integration::update` calls a child viewport's `viewport_ui_cb` only
-/// `if is_visible`; a hidden viewport with no children of its own fails both. A
-/// state machine that lived in the callback and waited to be shown would wait
-/// for ever, behind a full-screen window with no way to cancel it. So the show
-/// is sent with `send_viewport_cmd_to`, from outside -- `eframe` buffers
-/// commands addressed at another viewport in `deferred_commands` and applies
-/// them as soon as that viewport has a window.
+/// The first was argued from a premise that `eframe` 0.35 does not hold, and
+/// the argument is restated here on the one that does. The premise was that a
+/// hidden deferred viewport's callback does not run -- `run_ui_and_paint`
+/// gates on `is_visible`. It does gate on that name, but the value is
+/// `viewport.info.visible().unwrap_or(true)`, and `ViewportInfo::visible()`
+/// is computed from `minimized` and `occluded` alone; `egui_winit` never
+/// fills `occluded` on Windows, so it is `None`, `unwrap_or` makes it `true`,
+/// and **the callback runs and paints on a hidden window**. What the callback
+/// still cannot do is know when its window *exists* as an `HWND` this module
+/// can act on, or make the window visible to the user without the cost of
+/// that being in front of a paint -- so the state machine lives on the root's
+/// frame, and the show happens from there. And it is this module's own
+/// `ShowWindow`, not a `ViewportCommand::Visible(true)`, for the reason
+/// [`show_unseen`] sets out at length: the command went through `winit`, and
+/// `winit` rewrote the window's ex-style on the way, taking `WS_EX_LAYERED`
+/// off the window this module had just put it on.
 ///
 /// The second is a choice, and it was measured. The raise and the minimise are
 /// an `EnumWindows` each; put them on the overlay's own first visible frame and
@@ -1450,14 +1506,31 @@ enum Reveal {
 /// pixel. Measured both ways, same probe, same code: **54** white samples with
 /// them in the callback against **one** with them on the root's next frame.
 ///
+/// # The window is shown INVISIBLE, and made visible only once it has painted
+///
+/// This is the second thing the owner's *"2 black blinks"* report changed,
+/// and it is what takes the count of unpainted frames on screen from "at most
+/// one" to **none**. A window that is shown before anything has painted into
+/// it shows whatever its surface happens to hold -- measured white on this
+/// machine, described as black on the owner's -- for at least one composite,
+/// and there is no way to paint a hidden window first: `eframe` will not run
+/// a hidden viewport's callback. What a **layered** window has that an
+/// ordinary one does not is an opacity of its own, so the show is made at
+/// [`UNSEEN_ALPHA`] -- fully transparent, on screen as far as Windows and
+/// `eframe` are concerned and invisible as far as the user is -- and the alpha
+/// is raised to [`DIM_ALPHA`] only on a root frame that has seen the
+/// callback paint at least once. That is what `Unseen` is, and what the
+/// `painted` argument of [`Appearing::on_screen`] gates on.
+///
 /// # Every transition is forwards, as with [`Prescan`] and [`Reveal`]
 ///
 /// `Waiting` is where an overlay whose window does not exist yet stays, and the
 /// lookup that leaves it is the only `EnumWindows` this costs -- two or three
-/// per overlay, none afterwards. `Hidden` lasts one root frame, and that frame
-/// is guaranteed rather than hoped for: the step that enters `Hidden` asks the
-/// root for it. `Up` is absorbing, and each method below is the only way out of
-/// one state, so neither can run twice.
+/// per overlay, none afterwards. `Unseen` lasts until the overlay has painted
+/// once, which is at most a few root frames and is guaranteed rather than
+/// hoped for: every `Unseen` root frame asks for the next one, and every root
+/// frame asks the overlay to paint. `Up` is absorbing, and each method below
+/// is the only way out of one state, so neither can run twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Appearing {
     /// `eframe` has not created the OS window yet. **Checked rather than
@@ -1466,39 +1539,50 @@ enum Appearing {
     /// that shipped through 0.15.21 and cost the DWM call, the capture mask
     /// and the raise all three, silently.
     Waiting,
-    /// The window exists and is **hidden**. DWM has been asked to composite
-    /// its per-pixel alpha, it is out of screen captures, and `Visible(true)`
-    /// is queued for the end of this frame.
-    Hidden,
-    /// It is on screen. Raised, and Deskwarden's own window has gone down
-    /// behind it.
+    /// The window exists, is layered at [`UNSEEN_ALPHA`], is out of screen
+    /// captures, and has been shown by [`show_unseen`] -- so it is on screen
+    /// in every sense but the one that matters to the user, who cannot see
+    /// it. It stays here until the callback has painted a frame into it.
+    ///
+    /// This used to be `Hidden`, and the rename is the point: the window is
+    /// **not** hidden here. `eframe` would never paint a hidden window, and a
+    /// window that has never been painted is the black or white rectangle
+    /// every report this module has collected begins with.
+    Unseen,
+    /// It is on screen at [`DIM_ALPHA`]. Raised, and Deskwarden's own window
+    /// has gone down behind it.
     Up,
 }
 
 impl Appearing {
     /// **Leaves `Waiting`, and nothing else.** Answers `true` on the one frame
-    /// the caller should composite the window and ask for it to be shown.
+    /// the caller should layer the window and show it, invisibly.
     ///
     /// `window_exists` is what the caller's lookup found, and is only consulted
     /// here -- once the window has been seen it is never looked for again.
     fn compose(&mut self, window_exists: bool) -> bool {
         if matches!(self, Self::Waiting) && window_exists {
-            *self = Self::Hidden;
+            *self = Self::Unseen;
             true
         } else {
             false
         }
     }
 
-    /// **Leaves `Hidden`, and nothing else.** Answers `true` on the one frame
-    /// the caller should raise the window and send Deskwarden's own window
-    /// down.
+    /// **Leaves `Unseen`, and nothing else, and only once the overlay has
+    /// painted.** Answers `true` on the one frame the caller should raise the
+    /// window's alpha to [`DIM_ALPHA`], raise the window, and send
+    /// Deskwarden's own window down.
+    ///
+    /// `painted` is whether the viewport callback has drawn a frame into the
+    /// window yet. Until it has, the surface holds nothing the user should
+    /// see, and raising the alpha would show them exactly that.
     ///
     /// A caller that never composed stays in `Waiting` and gets `false` for
     /// ever, which is what a test overlay and an overlay whose window never
     /// appeared both are.
-    fn on_screen(&mut self) -> bool {
-        if matches!(self, Self::Hidden) {
+    fn on_screen(&mut self, painted: bool) -> bool {
+        if matches!(self, Self::Unseen) && painted {
             *self = Self::Up;
             true
         } else {
@@ -1629,6 +1713,8 @@ impl RegionOverlay {
                 reveal: Reveal::Nothing,
                 chips: [egui::Rect::NOTHING; 2],
                 chip_press: None,
+                painted: false,
+                hwnd: None,
             })),
         })
     }
@@ -1821,18 +1907,20 @@ impl RegionOverlay {
                 // next frame itself. `None` -- an overlay that never stood
                 // aside -- has nothing to wait for and does not.
                 //
-                // **And not while the window has only just been shown,
-                // either.** `Appearing::Hidden` means `Visible(true)` has gone
-                // out and the minimise has not happened yet -- it is on the
-                // root's next frame, one `request_repaint` away and guaranteed
-                // by it. Without this the dwell could start a whole root frame
-                // before the window it exists to get out of the way had even
-                // been asked to go, which is the same defect `MINIMISE_SETTLE`
-                // carries the measurement for, reached from the other side. A
-                // test overlay is `Waiting` and never `Hidden`, so this waits
-                // for nothing there; and the state only moves forwards, so it
+                // **And not while the window is on screen but unseen,
+                // either.** `Appearing::Unseen` means the window has been
+                // shown at `UNSEEN_ALPHA` and the frame that raises its
+                // alpha, raises it and minimises the vault window has not
+                // happened yet -- it is a root frame away, and guaranteed:
+                // every `Unseen` root frame asks for the next. Without this
+                // the dwell could start while the window was still fully
+                // transparent, spending the front of `REVEAL_DWELL` on a ring
+                // nobody can see -- the same defect `MINIMISE_SETTLE` carries
+                // the measurement for, reached from the other side. A test
+                // overlay is `Waiting` and never `Unseen`, so this waits for
+                // nothing there; and the state only moves forwards, so it
                 // cannot wait for ever.
-                if matches!(held.appearing, Appearing::Hidden) {
+                if matches!(held.appearing, Appearing::Unseen) {
                     return Some(at);
                 }
                 if let Some(down_at) = held.aside_at {
@@ -1944,9 +2032,9 @@ impl RegionOverlay {
         }
     }
 
-    /// **Takes the overlay's window from "created" to "composited, on screen,
-    /// raised, with Deskwarden out of the way behind it"** -- two steps, one
-    /// root frame apart, and never a third.
+    /// **Takes the overlay's window from "created" to "on screen at the dim's
+    /// alpha, raised, with Deskwarden out of the way behind it"** -- two
+    /// steps, at least one root frame apart, and never a third.
     ///
     /// Both steps run here, on the ROOT's frame. See [`Appearing`] for why
     /// neither can be in the viewport callback, and for the measurement of what
@@ -1954,38 +2042,61 @@ impl RegionOverlay {
     ///
     /// # Step one, on a window nobody can see yet
     ///
-    /// 1. [`let_the_desktop_through`] **first**. It makes this window layered
-    ///    and is the only thing that makes the surface a dimmed desktop rather
-    ///    than a rectangle. Window attributes set on a hidden window are
-    ///    honoured when it appears -- the same property
+    /// 1. [`let_the_desktop_through`] **first**, at [`UNSEEN_ALPHA`]. It makes
+    ///    this window layered, which is the only thing that makes the surface
+    ///    a dimmed desktop rather than a rectangle -- and at an alpha of zero,
+    ///    which is what makes the show below invisible. Window attributes set
+    ///    on a hidden window are honoured when it appears -- the same property
     ///    `foreground::own_window_titled` records for `login_ui`'s rounded
-    ///    corners.
+    ///    corners -- **provided nothing rewrites them on the way**, which is
+    ///    what step 3 is about.
     /// 2. [`exclude_from_capture`], also while hidden, so there is no frame in
     ///    which this window is on screen and *in* a capture. A region dragged
     ///    on this surface is captured through where this surface is, and a
     ///    capture that included its own dim reads as "no code there" for a code
     ///    that is plainly on screen.
-    /// 3. `Visible(true)`, addressed at the overlay's viewport. `eframe` reads
-    ///    `is_visible` at the TOP of a frame and applies queued viewport
-    ///    commands at the BOTTOM, so the frame that asks to be shown is the
-    ///    frame that does not paint; the two repaint requests beside it are
-    ///    what buy the frame that does, one for the overlay and one for the
-    ///    root. Without them nothing else would ask -- an always-on-top window
-    ///    over every monitor gets no events of its own.
+    /// 3. [`show_unseen`] -- **this module's own `ShowWindow`, and not
+    ///    `ViewportCommand::Visible(true)`.** The command was what shipped,
+    ///    and it undid step 1: it goes through `winit`, whose
+    ///    `WindowFlags::apply_diff` rewrites `GWL_EXSTYLE` from its own flags
+    ///    on every flag change, and its flags have no `WS_EX_LAYERED`. The
+    ///    owner's log recorded the second layering call finding the bit gone
+    ///    (`0x40118 -> 0xc0118`, twice) on every run. `show_unseen` carries
+    ///    the `winit` lines and the argument; what matters here is that it
+    ///    touches nothing but visibility, so what step 1 set is what the
+    ///    window is shown with.
     ///
-    /// The `return` is load-bearing: the show is applied at the END of this
-    /// frame, so step two must not be on it.
+    /// Two repaint requests follow, one for the overlay and one for the root.
+    /// The overlay's is what buys the first painted frame; the root's is what
+    /// buys the frame step two runs on. Without them nothing else would ask --
+    /// an always-on-top window over every monitor gets no events of its own.
     ///
-    /// # Step two, on the root's next frame
+    /// The `return` is load-bearing: the window has not painted yet, so step
+    /// two must not be on this frame.
     ///
+    /// # Step two, on the first root frame after the overlay has painted
+    ///
+    /// * Gated on `Inner::painted`, set by the callback after its first
+    ///   `draw`. Until then the surface holds whatever it held when Windows
+    ///   made it, and raising the alpha would put that on screen -- which is
+    ///   the *"blinks black, then white box"* this module has already been
+    ///   reported for once. Every `Unseen` root frame that finds it unpainted
+    ///   asks for another root frame, so the gate cannot become a wait with no
+    ///   end.
+    /// * [`let_the_desktop_through`] again, at [`DIM_ALPHA`]: this is the
+    ///   frame the user first sees the surface, and it is a painted one. Its
+    ///   log line reports whether `WS_EX_LAYERED` was still on the window,
+    ///   which is the one line in `deskwarden.log` that says whether the show
+    ///   left step 1 alone.
     /// * `foreground::pick` skips invisible windows, so this is the first frame
     ///   a raise can find anything at all. `window_host::Reveal` splits show
     ///   from raise for this same reason.
     /// * The minimise must not land while this process's only live viewport is
     ///   the one being minimised -- a minimised `eframe` root alone takes no
     ///   further frames at all, measured twice at 5.5 s of nothing. By this
-    ///   frame the overlay is not merely registered but visible, which is a
-    ///   stronger guarantee than the one the shipped arrangement had.
+    ///   frame the overlay is not merely registered but visible and painted,
+    ///   which is a stronger guarantee than the one the shipped arrangement
+    ///   had.
     /// * The minimise stays after the raise: `SW_SHOWMINNOACTIVE` activates
     ///   nothing, so a foreground this window has already taken is one it keeps
     ///   -- which is what leaves Escape working with the app down. See
@@ -1994,7 +2105,7 @@ impl RegionOverlay {
     /// One thing moved with it. The reveal's dwell must not start before
     /// Deskwarden is down, and the minimise is now a frame later than the
     /// overlay's first paint, so [`RegionOverlay::reveal_step`] holds while
-    /// [`Appearing::Hidden`] as well as while `MINIMISE_SETTLE` runs.
+    /// [`Appearing::Unseen`] as well as while `MINIMISE_SETTLE` runs.
     fn appear(&self, ctx: &egui::Context) {
         // The lookup, and only while there is something to find.
         // `own_window_titled` does NOT skip invisible windows -- see its doc,
@@ -2002,7 +2113,11 @@ impl RegionOverlay {
         // is an `EnumWindows`, measured in the hundreds of milliseconds in an
         // unoptimised build. Two or three per overlay, none after that.
         let waiting = matches!(locked(&self.inner).appearing, Appearing::Waiting);
-        let exists = waiting && crate::foreground::own_window_titled(REGION_TITLE).is_some();
+        let found = if waiting {
+            crate::foreground::own_window_titled(REGION_TITLE)
+        } else {
+            None
+        };
         let display = locked(&self.inner).display;
         // **Every waiting frame, and before anything else touches the
         // window.** See [`hide_and_place`]: the builder's `with_visible(false)`
@@ -2014,20 +2129,26 @@ impl RegionOverlay {
         if waiting {
             hide_and_place(REGION_TITLE, display);
         }
-        if locked(&self.inner).appearing.compose(exists) {
-            let_the_desktop_through(REGION_TITLE);
+        if locked(&self.inner).appearing.compose(found.is_some()) {
+            // `compose` only answers `true` when told the window exists, so
+            // the handle is there; kept for the readback on the way out.
+            locked(&self.inner).hwnd = found;
+            let_the_desktop_through(REGION_TITLE, UNSEEN_ALPHA);
             exclude_from_capture(REGION_TITLE);
             // **Before the show**, which is the whole value of measuring here:
             // this is the last moment the geometry can be inspected without
             // the user having already seen whatever it is. See
             // [`log_window_rect`].
             log_window_rect(REGION_TITLE, "hidden, about to be shown", display);
-            ctx.send_viewport_cmd_to(region_viewport(), egui::ViewportCommand::Visible(true));
+            if let Some(hwnd) = found {
+                show_unseen(hwnd);
+            }
             ctx.request_repaint_of(region_viewport());
             ctx.request_repaint();
             return;
         }
-        if locked(&self.inner).appearing.on_screen() {
+        let painted = locked(&self.inner).painted;
+        if locked(&self.inner).appearing.on_screen(painted) {
             // And again on the first frame it is up, because the show itself
             // is one of the moments Windows may renegotiate the rectangle --
             // `ShowWindow` is what moves a window onto a monitor as far as
@@ -2035,13 +2156,13 @@ impl RegionOverlay {
             // after, is what tells "it was never the right size" apart from
             // "it was, and then it moved".
             log_window_rect(REGION_TITLE, "shown", display);
-            // **The layering, a second time, now that the window is really on
-            // screen.** See [`let_the_desktop_through`]'s "Twice, and why"
-            // -- this is the half that is made on a visible window, and it is
-            // here rather than in the callback so that it lands before the
-            // raise and the minimise rather than behind their two
-            // `EnumWindows`.
-            let_the_desktop_through(REGION_TITLE);
+            // **The layering, a second time, now that the window is on screen
+            // and painted -- and this is the call that raises the alpha from
+            // nothing to the dim.** See [`let_the_desktop_through`]'s "Twice,
+            // and why". It is here rather than in the callback so that it
+            // lands before the raise and the minimise rather than behind their
+            // two `EnumWindows`.
+            let_the_desktop_through(REGION_TITLE, DIM_ALPHA);
             // A selection surface that opens behind the window being selected
             // from is useless, so this one raises; see its row in
             // `foreground::OPENS_A_VIEWPORT_AND_RAISES_IT`.
@@ -2050,6 +2171,13 @@ impl RegionOverlay {
             // puts it back, and `Inner`'s `Drop` covers the exits that do not
             // come through `show` at all.
             self.stand_aside(true);
+        } else if matches!(locked(&self.inner).appearing, Appearing::Unseen) {
+            // Shown, invisible, and not painted yet. The overlay's own paint
+            // is already asked for on every root frame by `show`; this is
+            // what keeps the root frames coming until one of them finds the
+            // paint has happened. Bounded by the paint, which `eframe` owes a
+            // visible viewport that has asked for it.
+            ctx.request_repaint();
         }
     }
 
@@ -2057,6 +2185,14 @@ impl RegionOverlay {
     /// pointer handling can tell a press on one from a drag.
     fn remember_chips(&self, chips: [egui::Rect; 2]) {
         locked(&self.inner).chips = chips;
+    }
+
+    /// **Records that the callback has painted a frame into the window.**
+    /// Called after every `draw`, and read by [`RegionOverlay::appear`], which
+    /// keeps the window at [`UNSEEN_ALPHA`] until this has happened once. See
+    /// [`Appearing`].
+    fn note_painted(&self) {
+        locked(&self.inner).painted = true;
     }
 
     /// Whether the button is down on a chip, in which case this frame's
@@ -2202,6 +2338,18 @@ impl RegionOverlay {
     /// overlay; answers `false` when there is nothing left to show.
     pub fn show(&self, ctx: &egui::Context) -> bool {
         if !self.is_open() {
+            // **What the window's layering was at the end, written down
+            // before the window goes.** This frame does not re-register the
+            // viewport, so `eframe` destroys the window when it ends; this is
+            // the last moment the OS can be asked what it thinks the window's
+            // ex-style and alpha were while the user was looking at it. See
+            // [`log_layering`] for what that line settles.
+            {
+                let held = locked(&self.inner);
+                if let (Some(hwnd), Appearing::Up) = (held.hwnd, held.appearing) {
+                    log_layering(hwnd, "on the frame the overlay closes");
+                }
+            }
             // **Both, and in this order.** Standing aside was the last thing
             // done on the way in, so coming back is the first thing done on
             // the way out; and the window is put back before it is put back
@@ -2400,10 +2548,12 @@ impl RegionOverlay {
                 // [`RegionOverlay::appear`], on the ROOT's frame, in two steps
                 // one frame apart. Two reasons, and they point the same way:
                 //
-                // * This viewport is created hidden, and **a hidden deferred
-                //   viewport's callback is not called at all** -- `eframe`
-                //   gates it on `is_visible`. A hook here would be a hook
-                //   waiting for a show that only it could send.
+                // * This callback cannot tell when its window exists as an
+                //   `HWND`, or whether the user can see it: `eframe` 0.35
+                //   runs and paints it from the moment the window exists,
+                //   hidden or not (`ViewportInfo::visible()` is minimised-or-
+                //   occluded, and neither is set for a hidden window). So a
+                //   hook here has no frame it can call "first on screen".
                 // * Everything on this callback's critical path is in front of
                 //   a paint. The raise and the minimise are an `EnumWindows`
                 //   each, measured in the hundreds of milliseconds in an
@@ -2438,6 +2588,7 @@ impl RegionOverlay {
                     egui::CentralPanel::default()
                         .frame(egui::Frame::NONE)
                         .show(root, |ui| draw(ui, &view));
+                    mine.note_painted();
                     return;
                 }
 
@@ -2530,15 +2681,19 @@ impl RegionOverlay {
                 // there is nothing to have clicked, and after it the
                 // rectangles only move if the reason line does.
                 mine.remember_chips(chips);
+                // And that a frame now exists in the window, which is what
+                // `appear` waits for before it lets the user see the window.
+                mine.note_painted();
             },
         );
         // **After the viewport is registered, and on the ROOT's frame.**
         //
         // Both halves are load-bearing. The viewport has to be registered first
-        // so the `Visible(true)` this may send has an entry in this frame's
-        // viewport output to land in; and it has to be here rather than in the
-        // callback above because the callback does not run while the window is
-        // hidden, which is exactly the stretch this drives. See [`Appearing`].
+        // so that the repaint `appear` asks of the overlay has an entry in this
+        // frame's viewport output to land in; and it has to be here rather than
+        // in the callback above because the callback cannot tell when its
+        // window exists or when the user can see it, and every `EnumWindows`
+        // on its frames sits in front of a paint. See [`Appearing`].
         if self.is_open() {
             self.appear(ctx);
         }
@@ -3270,61 +3425,93 @@ fn exclude_from_capture(title: &str) {
 /// `login_ui::round_window_corners` for the same pattern and the longer
 /// argument about why the lookup must be process-scoped.
 ///
-/// # Twice, and why -- once hidden and once on screen
+/// # Twice, and why -- once hidden at no alpha, once painted at the dim's
 ///
 /// [`RegionOverlay::appear`] calls this on **both** of its steps: on the frame
-/// the window first exists and is still hidden, and again on the first frame
-/// it is up. That is deliberate belt-and-braces against one specific doubt,
-/// and the doubt is worth writing down because the obvious "simplification" is
-/// to delete one of them.
+/// the window first exists and is still hidden, at [`UNSEEN_ALPHA`], and
+/// again on the first root frame after the callback has painted into it, at
+/// [`DIM_ALPHA`]. The two are not belt and braces any more; they are two
+/// halves of one fade with nothing in between, and each is load-bearing.
 ///
-/// The doubt: does an ex-style bit and a layered attribute set on a **hidden**
-/// window survive being shown? Showing a window can rebuild its redirection
-/// surface, and an attribute dropped there leaves the overlay fully opaque --
-/// a solid near-black rectangle over every pixel of the display, which is the
-/// shape of complaint this module has already collected twice. The history
-/// fits it: before the window was created hidden the call was made on a
-/// visible window and the surface was see-through (at the cost of 1315 ms of
-/// white); after, a black screen was reported.
+/// The first is what makes the show invisible. The window is shown between
+/// the two calls, and a window shown at alpha zero puts nothing on the glass
+/// however long it takes `eframe` to paint its first frame. The second is the
+/// user's first sight of the surface, and it is a painted one.
 ///
-/// **It is not what was measured on this machine**, for the mechanism this
-/// paragraph was written about. The probe in `scratchpad/dimprobe` drove the
-/// real [`RegionOverlay::show`] and the real [`Appearing`] machine through
-/// exactly the hidden-then-shown path with a single hidden call and nothing
-/// else, and from the first visible sample onwards it fitted
-/// `backdrop * (1 - a) + dim * a` at a mean absolute error of **0.37** with no
-/// black or white sample anywhere in the run. An attribute dropped by the show
-/// could not produce that. That measurement was taken against
-/// `DwmEnableBlurBehindWindow`, so what it is now evidence *for* is narrow and
-/// worth stating exactly: on this desktop, a compositing attribute set on a
-/// hidden window is still in force after the show. It says nothing about which
-/// attribute, and by the section below it never could have said anything about
-/// the blur.
+/// # What the second call used to be, and what its log line proved
 ///
-/// The second call stays anyway, and the argument for keeping it is not
-/// superstition:
+/// It used to be *insurance* against a doubt: does an ex-style bit set on a
+/// hidden window survive being shown? The doubt was answered from the wrong
+/// direction. **It did not survive, and the reason was never the
+/// compositor** -- it was the show itself. The show was
+/// `ViewportCommand::Visible(true)`, which `egui_winit` turns into
+/// `winit::Window::set_visible(true)`, which is `WindowState::set_window_flags`,
+/// which ends in `WindowFlags::apply_diff` (`winit` 0.30.13,
+/// `platform_impl/windows/window_state.rs`):
 ///
-/// * It costs one `EnumWindows` and two window calls, once per overlay, on a
-///   frame that is already doing two of the former for the raise and the
-///   minimise.
-/// * It cannot reintroduce the white box. The white box was the window being
-///   *on screen* before anything had composited it; this runs a frame after
-///   the window was composited, asks for the same thing that was already
-///   asked for, and changes nothing about when the window appears.
-/// * Both calls are idempotent: the ex-style bit is or-ed into whatever is
-///   there and `SetLayeredWindowAttributes` overwrites one constant with the
-///   same constant.
-/// * "The attribute survived the show on the machine I could measure" is a
-///   weaker claim than "the attribute is in place while the window is
-///   visible", and the second one is what the surface actually needs. A driver
-///   or a compositor generation where the first is false costs the user an
-///   opaque rectangle covering their screen, and this is the cheapest possible
-///   insurance against it.
+/// ```text
+/// if diff != WindowFlags::empty() {
+///     let (style, style_ex) = new.to_window_styles();
+///     ...
+///     SetWindowLongW(window, GWL_STYLE, style as i32);
+///     SetWindowLongW(window, GWL_EXSTYLE, style_ex as i32);
+/// ```
 ///
-/// What it is **not** allowed to become is a call made *instead* of the hidden
-/// one, or one made from the viewport callback. Both put the transparency
-/// behind the window appearing, which is the 1315 ms regression [`Appearing`]
-/// carries the measurement for.
+/// `to_window_styles` builds the ex-style from `winit`'s own flags --
+/// `WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES`, `WS_EX_APPWINDOW`, `WS_EX_TOPMOST`,
+/// and `WS_EX_LAYERED` only together with `WS_EX_TRANSPARENT` for a
+/// click-through window -- and *assigns* it. Whatever this function or-ed in
+/// is gone, one line after `ShowWindow`. The owner's `deskwarden.log` says so
+/// in this function's own words, on every run of the layered build:
+///
+/// ```text
+/// 03:57:51  layered window on 0x4900b8 -- ex-style 0x40118 -> 0xc0118 ...   (hidden)
+/// 03:57:52  hidden, about to be shown ...
+/// 03:57:53  shown ...
+/// 03:57:53  layered window on 0x4900b8 -- ex-style 0x40118 -> 0xc0118 ...   (after the show)
+/// ```
+///
+/// `0x40118` on the second line is the ex-style with `0x80000`
+/// (`WS_EX_LAYERED`) missing again. Had the bit survived, the second call
+/// would have read `0xc0118 -> 0xc0118`. So from the show until the second
+/// call landed -- a root frame plus two `EnumWindows` -- the window was on
+/// screen and **opaque**: first as whatever the surface held, then as the
+/// callback's first paint, `#201e1d` edge to edge with the bar along the
+/// bottom. That is *"2 black blinks and pitch dark screen"* with a black strip
+/// of controls, and it is why the show is now [`show_unseen`]'s own
+/// `ShowWindow`, which touches nothing but visibility.
+///
+/// The second call's log line is now the instrument. It names whether the bit
+/// was **already on** the window when it ran: `WS_EX_LAYERED survived the
+/// show` is the fix working; `WS_EX_LAYERED was NOT on the window` is
+/// something else rewriting the ex-style, and the next report will be
+/// answered from that line rather than from another guess.
+///
+/// What the second call is **not** allowed to become is a call made *instead*
+/// of the hidden one, or one made from the viewport callback. Both put the
+/// transparency behind the window appearing, which is the 1315 ms regression
+/// [`Appearing`] carries the measurement for -- and the first call is now also
+/// what makes the show invisible, so dropping it is the unpainted rectangle
+/// back at full opacity.
+///
+/// # What this cannot settle, stated plainly
+///
+/// The bit being stripped explains an opaque window **until the second call
+/// landed**. If the owner's screen was still opaque after that -- and *"pitch
+/// dark"* for the four seconds the 03:57 overlay was up suggests it may have
+/// been -- then something on that desktop does not honour `LWA_ALPHA` on a
+/// window whose content arrives through OpenGL's swap, or does not honour it
+/// after the style is toggled on a visible window. Neither has a measurement
+/// in this crate, and neither can have one: see below. What this build does
+/// about it is (a) never toggle the style on a visible window at all -- the
+/// bit is set once, hidden, and now survives -- and (b) write down, on the
+/// frame the overlay closes, what `GetLayeredWindowAttributes` and the
+/// ex-style say the window was ([`log_layering`]). If that line reports the
+/// bit on and the alpha at 115 and the owner still saw an opaque screen, the
+/// mechanism is wrong on this desktop and the answer is per-pixel alpha with
+/// the frame extended and `DWMWA_SYSTEMBACKDROP_TYPE` set to `DWMSBT_NONE` --
+/// the fourth attempt that is written down above and deliberately not made
+/// blind.
 ///
 /// # Not tested, and cannot be -- and NOT measurable either, which is new
 ///
@@ -3367,7 +3554,7 @@ fn exclude_from_capture(title: &str) {
 /// for one opacity and nothing else, so there is no blur for an instrument to
 /// miss. Whether the owner's screen is now legible is a question only the
 /// owner's next look answers, and the answer is not in this crate.
-fn let_the_desktop_through(title: &str) {
+fn let_the_desktop_through(title: &str, alpha: u8) {
     use windows::Win32::Foundation::{COLORREF, HWND};
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE, LWA_ALPHA,
@@ -3411,10 +3598,11 @@ fn let_the_desktop_through(title: &str) {
     // overlay is a rectangle of the user's desktop that swallows no clicks and
     // answers no Escape.
     //
-    // `DIM_ALPHA` is the whole of the dim now, which is why it is passed here
-    // and nowhere else. See its doc, and
+    // `alpha` is `UNSEEN_ALPHA` on the hidden call and `DIM_ALPHA` on the
+    // painted one, and `DIM_ALPHA` reaches the compositor here and nowhere
+    // else. See its doc, and
     // `the_dim_is_painted_opaque_and_the_window_carries_the_alpha`.
-    let result = unsafe { SetLayeredWindowAttributes(window, COLORREF(0), DIM_ALPHA, LWA_ALPHA) };
+    let result = unsafe { SetLayeredWindowAttributes(window, COLORREF(0), alpha, LWA_ALPHA) };
     // **Logged, not discarded, and that is a deliberate reversal.** This line
     // used to read `let _ = ..`, on the reasoning that there is nothing useful
     // to do about a refusal. True, and beside the point: the cost of discarding
@@ -3423,12 +3611,23 @@ fn let_the_desktop_through(title: &str) {
     // fixes, nobody could. One line in `deskwarden.log` per overlay settles
     // which, and now names the mechanism as well, because that has changed
     // three times.
+    //
+    // **And it says whether the bit was already there.** On the second call
+    // that is the whole question -- see "Twice, and why" above: the log that
+    // read `0x40118 -> 0xc0118` twice is what found the show stripping the
+    // style, and this wording is so that the next log answers it in words
+    // rather than in hex.
+    let survived = if after == before {
+        "WS_EX_LAYERED survived the show (the bit was already on the window)"
+    } else {
+        "WS_EX_LAYERED was NOT on the window and has been put on"
+    };
     match result {
         Ok(()) => log::info!(
-            "region overlay: layered window on {hwnd:#x} -- ex-style {before:#x} -> {after:#x} \
-             and SetLayeredWindowAttributes accepted at alpha {DIM_ALPHA}/255, LWA_ALPHA. The \
-             whole window is that opaque over the desktop; no blur and no per-pixel alpha are \
-             asked for anywhere"
+            "region overlay: layered window on {hwnd:#x} -- ex-style {before:#x} -> {after:#x}: \
+             {survived}; SetLayeredWindowAttributes accepted at alpha {alpha}/255, LWA_ALPHA. \
+             The whole window is that opaque over the desktop; no blur and no per-pixel alpha \
+             are asked for anywhere"
         ),
         // **And the style comes back off**, which is not tidiness. A window
         // that carries `WS_EX_LAYERED` and has been given neither a
@@ -3616,7 +3815,7 @@ fn own_window_centre() -> Option<(i32, i32)> {
 /// has painted showing through as a flat rectangle.
 ///
 /// So the two rectangles are compared and the answer is written down. On the
-/// hidden frame -- [`Appearing::Hidden`] -- this is the last chance to see the
+/// hidden frame -- the one that enters [`Appearing::Unseen`] -- this is the last chance to see the
 /// geometry before the user does; on the frame it is shown it is the record of
 /// what they saw. A mismatch is a `warn` with both rectangles in it, which is
 /// the line the next multi-monitor report will be answered from.
@@ -3663,7 +3862,7 @@ fn own_window_centre() -> Option<(i32, i32)> {
 /// window did it before then. One call would leave whatever happened in that
 /// gap on screen until the next one. Driving it from every `Appearing::Waiting`
 /// frame bounds the exposure at one frame and, more importantly, guarantees
-/// that the *last* thing to happen before `Visible(true)` is this: hidden, and
+/// that the *last* thing to happen before [`show_unseen`] is this: hidden, and
 /// at the right rectangle.
 ///
 /// `SWP_NOACTIVATE` and `SWP_NOZORDER` because neither is this call's business:
@@ -3710,6 +3909,209 @@ fn hide_and_place(title: &str, display: ScreenRect) {
             "region overlay: SetWindowPos refused on {title:?} ({hwnd:#x}) for {display:?}: \
              {e}; the window keeps whatever rectangle it was given"
         );
+    }
+}
+
+/// **Shows the overlay's window: this module's own `ShowWindow`, and NOT
+/// `ViewportCommand::Visible(true)`.**
+///
+/// # The report, and the line in the log that answered it
+///
+/// > Scan same two small windows "Scanning your screen", first and then
+/// > second on diff place, after that 2 black blinks and pitch dark screen
+///
+/// The "pitch dark screen" is a full-screen window that is **opaque** while
+/// this module believes it is layered at [`DIM_ALPHA`]. The owner's log,
+/// same run:
+///
+/// ```text
+/// 03:57:51  layered window on 0x4900b8 -- ex-style 0x40118 -> 0xc0118 ...
+/// 03:57:52  hidden, about to be shown ...
+/// 03:57:53  shown ...
+/// 03:57:53  layered window on 0x4900b8 -- ex-style 0x40118 -> 0xc0118 ...
+/// ```
+///
+/// The fourth line reads the ex-style back as `0x40118` -- `WS_EX_LAYERED`
+/// (`0x80000`) is gone, one show after it was set. `SetLayeredWindowAttributes`
+/// was accepted on both lines and it did not matter: a window without the
+/// style bit is composited opaque whatever its layered attributes say.
+///
+/// # What took it off: `winit`, on the show
+///
+/// The show used to be `ctx.send_viewport_cmd_to(.., Visible(true))`.
+/// `egui_winit::process_viewport_command` turns that into
+/// `window.set_visible(true)`; `winit`'s Windows backend implements that as a
+/// change to its own `WindowFlags`, applied by `WindowFlags::apply_diff`
+/// (`winit` 0.30.13, `platform_impl/windows/window_state.rs`), whose tail is:
+///
+/// ```text
+/// if diff != WindowFlags::empty() {
+///     let (style, style_ex) = new.to_window_styles();
+///     ...
+///     SetWindowLongW(window, GWL_STYLE, style as i32);
+///     SetWindowLongW(window, GWL_EXSTYLE, style_ex as i32);
+///     ...
+///     SetWindowPos(window, 0, 0, 0, 0, 0, SWP_NOZORDER | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED ..);
+/// ```
+///
+/// `to_window_styles` composes the ex-style from `winit`'s flags alone and
+/// **assigns** it -- `WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES`, `WS_EX_APPWINDOW`
+/// if on the taskbar, `WS_EX_TOPMOST` if always on top, and `WS_EX_LAYERED`
+/// only paired with `WS_EX_TRANSPARENT` for a click-through window. A bit this
+/// module or-ed in with `SetWindowLongPtrW` is not in that set, so it is
+/// written over. And the order inside `apply_diff` is `ShowWindow` **first**,
+/// then the style rewrite: the window goes on screen layered and is made
+/// opaque a line later, before it has painted. Everything the owner saw
+/// follows from those two lines: a blink of the unpainted surface, a blink
+/// of the callback's first frame at full opacity, and then the near-black
+/// dim with the bar at the bottom until the next root frame's second
+/// layering call put the bit back -- a frame plus two `EnumWindows` later.
+///
+/// # So the show is made here, with the one call that changes only visibility
+///
+/// `ShowWindow(SW_SHOWNOACTIVATE)` is exactly what `winit` itself issues on a
+/// window's first show (`apply_diff` picks `SW_SHOWNOACTIVATE` until its
+/// `MARKER_ACTIVATE` flag is set), so at the level of the OS nothing differs
+/// from the command this replaces -- except that the style rewrite that
+/// followed it does not happen. `SW_SHOWNOACTIVATE` and not `SW_SHOW` for the
+/// same reason [`hide_and_place`] passes `SWP_NOACTIVATE`: activating the
+/// window is [`crate::foreground::raise_window`]'s job, on the step after this
+/// one, once there is a painted frame for the foreground to land on.
+///
+/// The window is layered at [`UNSEEN_ALPHA`] when this runs, so the user
+/// sees nothing; see [`Appearing`].
+///
+/// # What this costs, and what it forbids
+///
+/// `winit`'s flags go on believing the window is hidden. Two consequences,
+/// both checked:
+///
+/// * `eframe` does not read those flags -- and, checked against `eframe`
+///   0.35 rather than remembered, it does not read the window's visibility at
+///   all. `glow_integration::run_ui_and_paint` gates on
+///   `viewport.info.visible().unwrap_or(true)`, and `ViewportInfo::visible()`
+///   is computed from `minimized` and `occluded` alone: `egui_winit` fills
+///   `minimized` from `window.is_minimized()` (`IsIconic` on Windows) and
+///   never fills `occluded` there, so the answer is `None` and `eframe` takes
+///   `true`. The overlay's callback therefore runs and paints from the frame
+///   the window exists, hidden or not; `winit`'s `VISIBLE` flag is consulted
+///   nowhere on that path. (Which also means the surface has usually been
+///   painted before this show is even made -- the `painted` gate in
+///   [`Appearing`] is then satisfied on the very next root frame.)
+/// * **This module must never send a `ViewportCommand` to its own viewport
+///   again, and the builder it passes every frame must never change.** Any
+///   flag diff `winit` ever computes for this window runs `apply_diff`, whose
+///   first act for a window its flags call hidden is `ShowWindow(SW_HIDE)`,
+///   and whose last is the ex-style rewrite. The builder is a literal, and
+///   `the_overlay_is_shown_by_this_module_and_winit_never_touches_it_again`
+///   pins the absence of commands. `WM_DPICHANGED` is the one place `winit`
+///   changes a flag on its own (`MAXIMIZED = false`), and a flag set to the
+///   value it already has is an empty diff.
+///
+/// Logged either way, and the readback is `IsWindowVisible` rather than the
+/// return value, which is the previous visibility and says nothing about
+/// success.
+fn show_unseen(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{IsWindowVisible, ShowWindow, SW_SHOWNOACTIVATE};
+
+    let handle = HWND(hwnd as *mut _);
+    // The return is the PREVIOUS visibility; the readback below is the check.
+    let _ = unsafe { ShowWindow(handle, SW_SHOWNOACTIVATE) };
+    if unsafe { IsWindowVisible(handle) }.as_bool() {
+        log::info!(
+            "region overlay: shown on {hwnd:#x} at alpha {UNSEEN_ALPHA}/255 by this module's \
+             own ShowWindow(SW_SHOWNOACTIVATE); winit's window flags were not touched, so the \
+             ex-style set while hidden is the ex-style it was shown with"
+        );
+    } else {
+        log::warn!(
+            "region overlay: ShowWindow(SW_SHOWNOACTIVATE) was issued on {hwnd:#x} and \
+             IsWindowVisible still says no. The overlay is not on screen, nothing will paint \
+             it, and the alpha will never be raised -- the user has a scan with no window"
+        );
+    }
+}
+
+/// **What the OS says the window's layering IS**, written to the log at a
+/// moment this module can name -- the frame the overlay closes.
+///
+/// # Why a readback, when every call already logs its result
+///
+/// Because every call logs what it *asked for*, and this module has now had
+/// three mechanisms accepted by the OS and wrong on the glass. The one thing
+/// no previous round could say is what the window's state was **while the
+/// user was looking at it**: a bit set on one frame can be taken off on a
+/// later one by code that is not this module's -- which is exactly what
+/// happened, see [`show_unseen`] -- and no log line at the moment of setting
+/// can see that.
+///
+/// `GetWindowLongPtrW(GWL_EXSTYLE)` and `GetLayeredWindowAttributes`, read
+/// together, answer the one question the next report needs answered before
+/// anything else is tried: **was the window layered at [`DIM_ALPHA`] at the
+/// end, or not?**
+///
+/// * Bit on, alpha 115, and the owner saw a dimmed desktop: fixed.
+/// * Bit off or alpha not 115: something is still rewriting the window, and
+///   the search is for what -- not for a fourth compositing recipe.
+/// * Bit on, alpha 115, and the owner still saw an opaque screen: the OS is
+///   not honouring `LWA_ALPHA` for this window on that desktop, which is a
+///   fact about OpenGL content in a layered window that no call from this
+///   process can change, and the mechanism has to change instead. See the
+///   last section of [`let_the_desktop_through`]'s doc.
+///
+/// # On the closing frame, and by handle
+///
+/// The frame `show` first answers `false` is the frame `eframe` stops
+/// re-registering the viewport, so the window is destroyed when that frame
+/// ends and this is the last chance to ask. It takes the handle
+/// `Inner::hwnd` kept from the one lookup that found the window rather than
+/// doing another `EnumWindows` on the user's way back to the vault, and it
+/// checks `IsWindow` first because a kept handle is a handle this module did
+/// not create.
+///
+/// Logged and never acted on: nothing useful can be done about a bad answer
+/// on the frame the window goes away, which is the same reason the other
+/// readbacks in this module are lines and not branches.
+fn log_layering(hwnd: isize, step: &str) {
+    use windows::Win32::Foundation::{COLORREF, HWND};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetLayeredWindowAttributes, GetWindowLongPtrW, IsWindow, GWL_EXSTYLE,
+        LAYERED_WINDOW_ATTRIBUTES_FLAGS, WS_EX_LAYERED,
+    };
+
+    let handle = HWND(hwnd as *mut _);
+    if !unsafe { IsWindow(handle) }.as_bool() {
+        log::warn!(
+            "region overlay: {step} -- {hwnd:#x} is no longer a window, so what its layering \
+             was cannot be read back"
+        );
+        return;
+    }
+    let ex_style = unsafe { GetWindowLongPtrW(handle, GWL_EXSTYLE) };
+    let layered = ex_style & WS_EX_LAYERED.0 as isize != 0;
+    let mut key = COLORREF(0);
+    let mut alpha = 0u8;
+    let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+    let read = unsafe {
+        GetLayeredWindowAttributes(handle, Some(&mut key), Some(&mut alpha), Some(&mut flags))
+    };
+    match read {
+        Ok(()) => log::info!(
+            "region overlay: {step} -- {hwnd:#x} has ex-style {ex_style:#x} (WS_EX_LAYERED \
+             {}), and GetLayeredWindowAttributes says alpha {alpha}/255 with flags {:#x}. \
+             This is what the window WAS while the user looked at it; the dim asks for the \
+             bit on and alpha {DIM_ALPHA}",
+            if layered { "on" } else { "OFF" },
+            flags.0
+        ),
+        Err(e) => log::warn!(
+            "region overlay: {step} -- {hwnd:#x} has ex-style {ex_style:#x} (WS_EX_LAYERED \
+             {}) and GetLayeredWindowAttributes refused ({e}); a layered window with no \
+             attributes to read is one that was never given any, or one whose bit was taken \
+             off and put back without them",
+            if layered { "on" } else { "OFF" }
+        ),
     }
 }
 
@@ -5565,18 +5967,21 @@ mod tests {
         // minimise on that frame would be a minimise with no visible viewport
         // of this process left, which is the hang `MINIMISE_SETTLE` records.
         let shown = hook
-            .find("ViewportCommand::Visible(true)")
+            .find("show_unseen(hwnd);")
             .expect("the overlay is never shown, so it is a window nobody can see");
         assert!(
             shown < raise && shown < down,
-            "the overlay is raised or minimised into on the same step that asks for it to be \
-             shown -- `Visible(true)` is applied at the END of that frame, so at this point \
-             there is still nothing visible to raise"
+            "the overlay is raised or minimised into on the same step that shows it -- the \
+             window has not painted on that step, so a raise there lands the foreground on a \
+             surface with nothing on it"
         );
         assert!(
-            hook.find("appearing.on_screen()").expect("the second step's gate is gone") < raise,
-            "the raise and the minimise are no longer behind `Appearing::on_screen`, so they \
-             can run on the frame that only asked for the show -- or twice"
+            hook.find("appearing.on_screen(painted)")
+                .expect("the second step's gate is gone, or no longer waits for a paint")
+                < raise,
+            "the raise and the minimise are no longer behind `Appearing::on_screen(painted)`, \
+             so they can run on the frame that only showed the window -- or twice, or before \
+             anything has been painted into it"
         );
     }
 
@@ -5591,11 +5996,15 @@ mod tests {
     /// `spawn_show_waiter`) that goes with it -- the same distinction that
     /// file's own `ChromeAction::Minimize` arm is built around.
     ///
-    /// It used to forbid `ViewportCommand::Visible` outright, and that stopped
-    /// being the right question when the overlay's own window started being
-    /// created hidden -- see [`Appearing`]. The needle is now about *which*
-    /// viewport the command is addressed at, which is the distinction that was
-    /// always meant.
+    /// It used to forbid `ViewportCommand::Visible` outright, then allowed
+    /// exactly one addressed at the overlay's own viewport, and now forbids it
+    /// outright again -- for a new reason, which is the one worth pinning.
+    /// The addressed command was how the overlay was shown, and it went
+    /// through `winit`, which rewrote the window's ex-style on the way and
+    /// took the layering off: see [`show_unseen`]. So the overlay is shown by
+    /// `ShowWindow` and no `Visible` of any shape may exist here: not for
+    /// the vault window, which `keep_ui_loaded` owns, and not for the
+    /// overlay, which `winit` must never be given a reason to restyle.
     #[test]
     fn the_vault_window_is_minimised_rather_than_hidden() {
         let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
@@ -5658,34 +6067,48 @@ mod tests {
             placer.contains("SW_HIDE"),
             "the one permitted `SW_HIDE` is not the one in `hide_and_place`"
         );
-        // **`Visible` is allowed now, and in exactly one shape.**
+        // **No `Visible` command at all, in any shape.**
         //
-        // This module shows its OWN viewport: the overlay is created hidden and
-        // shown once it is composited, which is the white-box fix `Appearing`
-        // carries the measurement for. What is still forbidden is a `Visible`
-        // that lands on the VAULT window -- and that distinction is not a
-        // matter of intent, it is the addressed form. `show` runs on the vault
-        // window's own context, so a bare `send_viewport_cmd` there drives the
-        // visibility of the window `vault_window`'s `keep_ui_loaded` machinery
-        // believes only it produces, with none of its bookkeeping. So the pin
-        // is an identity: every `Visible` in this module is an addressed one,
-        // aimed at this module's own viewport.
+        // Two windows, two reasons, one needle. A `Visible` on the VAULT
+        // window drives the visibility of the window `vault_window`'s
+        // `keep_ui_loaded` machinery believes only it produces, with none of
+        // its bookkeeping. A `Visible` on the OVERLAY's own viewport is what
+        // shipped as its show, and `winit` answered it by rewriting the
+        // window's ex-style from its own flags -- `WS_EX_LAYERED` gone, window
+        // opaque, the owner's "pitch dark screen". See `show_unseen` for the
+        // `winit` lines and the log that proved it. The overlay is shown by
+        // that function's `ShowWindow` now, so there is no legitimate
+        // `Visible` left in this module and the count is zero.
         assert_eq!(
             code.matches("ViewportCommand::Visible").count(),
-            code.matches("send_viewport_cmd_to(region_viewport(), egui::ViewportCommand::Visible")
-                .count(),
-            "this module sends a `Visible` command that is not addressed at its own viewport, \
-             so it is driving the vault window's visibility -- which is the state \
-             `vault_window`'s keep_ui_loaded machinery owns"
+            0,
+            "this module sends a `Visible` command. On the vault window that is a hide the \
+             keep_ui_loaded machinery does not know about; on the overlay it is `winit` \
+             rewriting the ex-style and taking `WS_EX_LAYERED` off -- see `show_unseen`"
         );
-        // Positive control on that identity, which would otherwise be true of a
-        // module that sent no `Visible` at all -- including one whose overlay is
-        // created hidden and then never shown, which is a full-screen window
-        // nobody can see and nobody can cancel.
+        // Positive control, which would otherwise be true of a module whose
+        // overlay is created hidden and then never shown -- a full-screen
+        // window nobody can see and nobody can cancel. The show is one
+        // `ShowWindow(SW_SHOWNOACTIVATE)`, in `show_unseen`, and the constant
+        // is named exactly twice: its import and its one call.
+        // Counted as the call and not as the constant: the constant is also
+        // named by the two log lines that report the call's outcome.
         assert_eq!(
-            code.matches("ViewportCommand::Visible").count(),
+            code.matches("ShowWindow(handle, SW_SHOWNOACTIVATE)").count(),
             1,
-            "the overlay is shown from a different number of places than one"
+            "`ShowWindow(.., SW_SHOWNOACTIVATE)` is made somewhere other than `show_unseen`, \
+             so the overlay is shown from more than one place -- or from none"
+        );
+        let shower = code
+            .split("fn show_unseen(hwnd: isize) {")
+            .nth(1)
+            .expect("`show_unseen` is gone")
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(
+            shower.contains("ShowWindow(handle, SW_SHOWNOACTIVATE)"),
+            "the one permitted show is not the one in `show_unseen`"
         );
         // `SW_MINIMIZE` also activates the next top-level window in Z order,
         // which is somebody else's -- measured to cost this overlay the
@@ -6146,7 +6569,7 @@ mod tests {
             .find("hide_and_place(REGION_TITLE, display);")
             .expect("nothing hides and places the window before it is shown");
         let shown = appear
-            .find("ViewportCommand::Visible(true)")
+            .find("show_unseen(hwnd);")
             .expect("the overlay is never shown");
         assert!(
             hide < shown,
@@ -6206,7 +6629,7 @@ mod tests {
             "GetWindowLongPtrW(window, GWL_EXSTYLE)",
             "WS_EX_LAYERED.0 as isize",
             "SetWindowLongPtrW(window, GWL_EXSTYLE, after)",
-            "SetLayeredWindowAttributes(window, COLORREF(0), DIM_ALPHA, LWA_ALPHA)",
+            "SetLayeredWindowAttributes(window, COLORREF(0), alpha, LWA_ALPHA)",
         ] {
             assert!(
                 code.contains(needle),
@@ -6291,14 +6714,14 @@ mod tests {
             .expect("`appear` is gone");
         let first = first.split("\n    }").next().unwrap();
         let layered = first
-            .find("let_the_desktop_through(REGION_TITLE);")
-            .expect("the window is not made layered on the frame it first exists");
+            .find("let_the_desktop_through(REGION_TITLE, UNSEEN_ALPHA);")
+            .expect("the window is not made layered, at no alpha, on the frame it first exists");
         let shown = first
-            .find("ViewportCommand::Visible(true)")
+            .find("show_unseen(hwnd);")
             .expect("the overlay is never shown");
         assert!(
             layered < shown,
-            "the window is shown before it has been made translucent, so the user gets a solid \
+            "the window is shown before it has been made layered, so the user gets a solid \
              full-screen rectangle until the call lands -- measured at 1315 ms of pure white, \
              which is the defect this ordering exists to remove"
         );
@@ -6310,25 +6733,33 @@ mod tests {
             "the window is shown before it is taken out of screen captures, so a capture \
              taken in between reads this overlay's own dim"
         );
-        // **And a second time, after the show.** See `let_the_desktop_through`'s
-        // "Twice, and why": the hidden call was measured to survive the show
-        // on this machine, and the second one is the insurance against a
-        // driver where it does not -- where the cost to the user is a black
-        // rectangle over their screen rather than a subtle artefact. It is
-        // insurance only: it must be an ADDITION to the hidden call and never
-        // a replacement for it, which is what `layered < shown` above holds.
+        // **And a second time, after the show, at the dim's alpha.** See
+        // `let_the_desktop_through`'s "Twice, and why". The two calls are two
+        // halves of one fade: the hidden one at `UNSEEN_ALPHA` is what makes
+        // the show invisible, and the one after it at `DIM_ALPHA` is the
+        // user's first sight of a painted surface. Neither may replace the
+        // other: drop the first and the show is an opaque unpainted
+        // rectangle; drop the second and the overlay is never seen at all.
         assert_eq!(
-            first.matches("let_the_desktop_through(REGION_TITLE);").count(),
+            first.matches("let_the_desktop_through(REGION_TITLE,").count(),
             2,
             "the layering is no longer done exactly twice in `appear` -- once on the hidden \
-             window and once on the first frame it is up. Dropping the second one takes the \
-             opaque-screen insurance away; dropping the first one puts the 1315 ms white box \
-             back"
+             window at `UNSEEN_ALPHA` and once after the paint at `DIM_ALPHA`"
         );
+        let dimmed = first
+            .find("let_the_desktop_through(REGION_TITLE, DIM_ALPHA);")
+            .expect("nothing raises the window to `DIM_ALPHA`, so the overlay stays invisible");
         assert!(
-            first.rfind("let_the_desktop_through(REGION_TITLE);").unwrap() > shown,
-            "the second call is not after the show, so both of them are made on a hidden \
-             window and the surface has no call made while it is visible at all"
+            dimmed > shown,
+            "the call at `DIM_ALPHA` is not after the show, so the window is shown at the dim \
+             with nothing painted in it -- the unpainted rectangle, at 45%"
+        );
+        // `DIM_ALPHA` reaches the compositor from that one call and nowhere
+        // else, which is what `DIM_ALPHA`'s doc promises.
+        assert_eq!(
+            statements.matches("let_the_desktop_through(REGION_TITLE, DIM_ALPHA)").count(),
+            1,
+            "`DIM_ALPHA` is handed to the compositor from more than one place, or from none"
         );
         // **And the step means "the window exists", not "this has not run
         // before".** That was the defect that shipped through 0.15.21 and it is
@@ -6338,8 +6769,9 @@ mod tests {
         // anyway, so none was ever tried again. `Appearing::compose` takes the
         // answer as an argument and only leaves `Waiting` when it is true.
         assert!(
-            first.contains("own_window_titled(REGION_TITLE).is_some()"),
-            "`appear` no longer waits for the window to exist, so the DWM call and the capture \
+            first.contains("crate::foreground::own_window_titled(REGION_TITLE)")
+                && first.contains("appearing.compose(found.is_some())"),
+            "`appear` no longer waits for the window to exist, so the layering and the capture \
              exclusion run against an HWND that is not there yet -- which is a solid overlay \
              and a capture taken through its own dim, both silently"
         );
@@ -6377,9 +6809,11 @@ mod tests {
     /// `sd = 0.00` and nothing else in between; zero and one across two runs
     /// after the change.
     ///
-    /// It is also the reason the DWM call and the capture mask left the
-    /// viewport callback: a hidden deferred viewport's callback is not run at
-    /// all, so a hook there would wait for a show only it could send.
+    /// It is also the reason the layering and the capture mask left the
+    /// viewport callback: that callback cannot tell when its window exists as
+    /// an `HWND` or when the user can see it -- `eframe` 0.35 runs and paints
+    /// it hidden or not -- and every `EnumWindows` on its frames sits in front
+    /// of a paint.
     #[test]
     fn the_overlay_window_is_created_hidden_and_shown_once_it_is_composited() {
         let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
@@ -6403,9 +6837,9 @@ mod tests {
         // string.
         assert!(builder.contains(".with_title(REGION_TITLE)"));
         // And exactly one show, so a second one cannot appear somewhere that
-        // runs before the DWM call.
+        // runs before the layering call.
         assert_eq!(
-            code.matches("ViewportCommand::Visible(true)").count(),
+            code.matches("show_unseen(hwnd);").count(),
             1,
             "the overlay is shown from more than one place, so the ordering the white-box fix \
              rests on is no longer decided in one spot"
@@ -6431,9 +6865,9 @@ mod tests {
         ] {
             assert!(
                 !callback.contains(needle),
-                "`{needle}` is back inside the viewport callback. While the window is hidden \
-                 that callback does not run at all, and once it does run everything in front \
-                 of the paint is more solid rectangle on screen"
+                "`{needle}` is back inside the viewport callback. That callback cannot tell \
+                 when its window exists or when the user can see it, and everything it puts \
+                 in front of the paint is more time before the first painted frame"
             );
         }
     }
@@ -6450,36 +6884,190 @@ mod tests {
     /// overlay.
     #[test]
     fn the_window_appears_in_two_steps_and_neither_repeats() {
-        // Nothing happens while there is no window, however many frames pass.
+        // Nothing happens while there is no window, however many frames pass
+        // -- and a paint claimed before there is a window changes nothing,
+        // because there is nothing it could have been painted into.
         let mut appearing = Appearing::Waiting;
         for _ in 0..50 {
             assert!(!appearing.compose(false));
             assert!(
-                !appearing.on_screen(),
+                !appearing.on_screen(true),
                 "the overlay raised and minimised into a window that does not exist yet"
             );
             assert_eq!(appearing, Appearing::Waiting);
         }
-        // The frame the window appears composites it and asks for the show.
+        // The frame the window appears layers it at no alpha and shows it.
         assert!(appearing.compose(true));
-        assert_eq!(appearing, Appearing::Hidden);
-        // And not twice, which would be a second DWM call, a second mask and a
-        // second `Visible(true)` every frame.
+        assert_eq!(appearing, Appearing::Unseen);
+        // And not twice, which would be a second layering, a second mask and a
+        // second show every frame.
         for _ in 0..50 {
             assert!(!appearing.compose(true));
-            assert_eq!(appearing, Appearing::Hidden);
+            assert_eq!(appearing, Appearing::Unseen);
         }
-        // The next frame is the one that raises and stands the vault window
-        // aside.
-        assert!(appearing.on_screen());
+        // **Unseen holds for as long as nothing has been painted.** However
+        // many root frames pass, the alpha is not raised over an unpainted
+        // surface: that is the rectangle of "whatever the surface held" that
+        // every report this module has collected begins with.
+        for _ in 0..50 {
+            assert!(
+                !appearing.on_screen(false),
+                "the window was made visible before anything had been painted into it"
+            );
+            assert_eq!(appearing, Appearing::Unseen);
+        }
+        // The first root frame after a paint is the one that raises the alpha,
+        // raises the window and stands the vault window aside.
+        assert!(appearing.on_screen(true));
         assert_eq!(appearing, Appearing::Up);
         // Absorbing, both ways. A `true` here is a window that re-raises itself
         // every frame and a vault window minimised again each time the user
         // clicks its taskbar button.
         for _ in 0..50 {
-            assert!(!appearing.on_screen());
+            assert!(!appearing.on_screen(true));
             assert!(!appearing.compose(true));
             assert_eq!(appearing, Appearing::Up);
+        }
+    }
+
+    /// **The overlay is shown by this module's own `ShowWindow`, and nothing
+    /// in this module ever gives `winit` a reason to restyle the window.**
+    ///
+    /// The pin for the owner's *"2 black blinks and pitch dark screen"*. The
+    /// mechanism is in [`show_unseen`]'s doc and it is `winit`'s, not this
+    /// crate's: `WindowFlags::apply_diff` rewrites `GWL_EXSTYLE` from its own
+    /// flags on every flag change, and its flags have no `WS_EX_LAYERED`. The
+    /// log proved it (`0x40118 -> 0xc0118` on the call AFTER the show). So
+    /// what a test can hold is the shape that keeps `apply_diff` from ever
+    /// running on this window after the layering: the show is a bare
+    /// `ShowWindow`, no `ViewportCommand` of any kind is sent to the viewport,
+    /// and the window is not made visible to the user until the callback has
+    /// painted into it.
+    ///
+    /// Not a proof that the desktop shows through -- see the module header
+    /// and the last section of [`let_the_desktop_through`]'s doc for what
+    /// only the owner's eyes can settle, and [`log_layering`] for the line in
+    /// the log that will say which of the remaining explanations is left.
+    #[test]
+    fn the_overlay_is_shown_by_this_module_and_winit_never_touches_it_again() {
+        let source = include_str!("region_overlay.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        let statements: String = code
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // **No viewport command, addressed or bare.** Every one of them is a
+        // `winit` `set_*` on this window, and any that changes a flag runs
+        // `apply_diff`, whose first act for a window `winit` believes hidden
+        // is `ShowWindow(SW_HIDE)` and whose last is the ex-style rewrite.
+        assert_eq!(
+            statements.matches("send_viewport_cmd").count(),
+            0,
+            "this module sends a viewport command. Whatever it is for, `winit` answers a flag \
+             change on the overlay's window by rewriting its ex-style from its own flags, \
+             which takes `WS_EX_LAYERED` off -- see `show_unseen`"
+        );
+        // The show is the OS call, made on the handle from the one lookup.
+        let appear = code
+            .split("fn appear(&self, ctx: &egui::Context) {")
+            .nth(1)
+            .expect("`appear` is gone")
+            .split("\n    }")
+            .next()
+            .unwrap();
+        let layered = appear
+            .find("let_the_desktop_through(REGION_TITLE, UNSEEN_ALPHA);")
+            .expect("the window is not layered at `UNSEEN_ALPHA` before it is shown");
+        let shown = appear.find("show_unseen(hwnd);").expect("the overlay is never shown");
+        assert!(
+            layered < shown,
+            "the show comes before the layering, so the window is on screen opaque and \
+             unpainted until the call lands"
+        );
+        assert!(
+            appear.find("locked(&self.inner).hwnd = found;").expect("the handle is not kept")
+                < shown,
+            "the handle is not kept before the show, so `log_layering` has nothing to read \
+             back on the frame the overlay closes"
+        );
+        // **The alpha goes up only after a paint**, and the callback is what
+        // says a paint happened -- once per `draw`, on both of its branches.
+        assert!(
+            appear.contains("let painted = locked(&self.inner).painted;")
+                && appear.contains("appearing.on_screen(painted)"),
+            "the second step no longer waits for the callback to have painted, so the alpha \
+             can be raised over an unpainted surface -- the black or white rectangle"
+        );
+        let callback = code
+            .split("move |root, _class| {")
+            .nth(1)
+            .expect("the viewport callback is gone")
+            .split("// **After the viewport is registered")
+            .next()
+            .expect("the callback no longer ends where it did");
+        assert_eq!(
+            callback.matches("mine.note_painted();").count(),
+            callback.matches("draw(ui, &view)").count(),
+            "a `draw` in the callback is not followed by `note_painted`, so a route that only \
+             ever takes that branch keeps the window at `UNSEEN_ALPHA` for ever -- a scan \
+             with no window"
+        );
+        assert!(
+            callback.matches("draw(ui, &view)").count() >= 2,
+            "the callback no longer paints on both the reveal and the drag branches"
+        );
+        // And an `Unseen` frame that finds nothing painted asks for the next
+        // root frame, so the gate is a wait with an end.
+        let unseen_frame = appear
+            .split("else if matches!(locked(&self.inner).appearing, Appearing::Unseen) {")
+            .nth(1)
+            .expect("`appear` no longer has an arm for an `Unseen` window that has not painted")
+            .split("\n        }")
+            .next()
+            .unwrap();
+        assert!(
+            unseen_frame.contains("ctx.request_repaint();"),
+            "an `Unseen` root frame that finds the overlay unpainted no longer asks for \
+             another root frame, so if the overlay paints after this frame the alpha is never \
+             raised"
+        );
+        // The invisible alpha really is invisible, and the dim is the owner's
+        // number still.
+        assert_eq!(UNSEEN_ALPHA, 0);
+        assert_eq!(DIM_ALPHA, 115);
+        // **And the readback exists, on the closing frame, by the kept handle.**
+        // It is the one line that will tell the next report apart: bit on and
+        // alpha 115 at the end, or not.
+        let closing = code
+            .split("pub fn show(&self, ctx: &egui::Context) -> bool {")
+            .nth(1)
+            .expect("`show` is gone")
+            .split("self.stand_aside(false);")
+            .next()
+            .expect("`show`'s early return no longer brings the vault window back");
+        assert!(
+            closing.contains("log_layering(hwnd, \"on the frame the overlay closes\");"),
+            "the closing frame no longer reads the window's layering back, so the next \
+             'pitch dark' report has nothing in the log to be answered from"
+        );
+        let reader = code
+            .split("fn log_layering(hwnd: isize, step: &str) {")
+            .nth(1)
+            .expect("`log_layering` is gone")
+            .split("\n}")
+            .next()
+            .unwrap();
+        for needle in ["IsWindow(handle)", "GetWindowLongPtrW(handle, GWL_EXSTYLE)", "GetLayeredWindowAttributes("] {
+            assert!(
+                reader.contains(needle),
+                "`log_layering` no longer reads `{needle}`, so its line cannot say what the \
+                 window's layering was"
+            );
         }
     }
 
@@ -6496,7 +7084,7 @@ mod tests {
     #[test]
     fn the_reveal_waits_for_the_window_to_have_finished_appearing() {
         let overlay = found_on(rect(0, 0, 1920, 1080), 1.0, FOUND_AT);
-        locked(&overlay.inner).appearing = Appearing::Hidden;
+        locked(&overlay.inner).appearing = Appearing::Unseen;
         let t0 = Instant::now();
         // Frames pass, the mark is painted, and the clock does not start: the
         // reveal is still `Due`, so a dwell later is still a whole dwell.
