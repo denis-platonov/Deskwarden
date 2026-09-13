@@ -6035,6 +6035,25 @@ pub fn ink_drop(ctx: &egui::Context, font: &FontId, line_height: Option<f32>) ->
     })
 }
 
+/// **How tall the INK of a capital is** in `font` -- the cap height, which
+/// is what a reader sees as "the size of the text".
+///
+/// [`ascent_of`] answers something larger: the face's ascent reserves room
+/// for accents no unaccented line uses, about 23% above the caps on the
+/// bundled cuts. That is the right measurement for a line BOX, and the wrong
+/// one for anything that has to look the size of the letters beside it --
+/// see [`FieldShape::line`], which is the one caller.
+pub fn cap_height_of(ctx: &egui::Context, font: &FontId) -> f32 {
+    ctx.fonts_mut(|f| {
+        let galley = f.layout_no_wrap(ASCENT_PROBE.to_string(), font.clone(), Color32::BLACK);
+        galley
+            .rows
+            .first()
+            .and_then(|row| row.glyphs.first())
+            .map_or_else(|| f.row_height(font), |glyph| glyph.uv_rect.size[1] as f32)
+    })
+}
+
 /// The character [`ascent_of`] measures.
 ///
 /// A capital with no descender and no accent, so the glyph's own ink box is
@@ -6096,12 +6115,17 @@ pub fn title_field(ui: &mut Ui, value: &mut String) -> Response {
 /// difference is what lets the two be laid out in reading order without the
 /// box eating the pill's place. See `detail_edit`'s `edit_header`.
 pub fn title_field_within(ui: &mut Ui, value: &mut String, room: f32) -> Response {
+    let font = FontId::new(TITLE_FIELD_PX, FontFamily::Name(EXTRABOLD.into()));
+    // The caret, cut to the height of the capitals beside it. See
+    // `FieldShape::line`.
+    let line = Some(cap_height_of(ui.ctx(), &font));
     field_box(
         ui,
         value,
         FieldShape {
             width: room.min(TITLE_FIELD_WIDTH),
-            font: FontId::new(TITLE_FIELD_PX, FontFamily::Name(EXTRABOLD.into())),
+            font,
+            line,
             ..FieldShape::wide(ui)
         },
     )
@@ -6170,6 +6194,7 @@ pub fn inline_field(
             height: BUTTON_HEIGHT,
             right_pad: 10.0,
             font: FontId::new(14.0, FontFamily::Proportional),
+            line: None,
         },
     )
     .0
@@ -6459,6 +6484,22 @@ struct FieldShape<'a> {
     /// at `font-size: 20px` -- and a 38-point box holding 14-point text is
     /// what made the edit form's name row read as one more setting.
     font: FontId,
+    /// **The line box this field's text is laid in**, or `None` for
+    /// [`ascent_of`] -- which is what every box but one takes and what the
+    /// comment inside [`field_box`] argues for at length.
+    ///
+    /// It exists for the CARET. egui draws the caret at the row's height, so
+    /// the line box is the caret, and the ascent is about 23% taller than the
+    /// letters it is standing beside. At 13 points nobody notices two of
+    /// them; at [`TITLE_FIELD_PX`]'s 20, in a 38-point box, it is four -- the
+    /// owner's "text cursor in header seems wrong size", reported twice.
+    ///
+    /// So the name box lays its line at the cap height instead
+    /// ([`cap_height_of`]) and the caret comes out the height of the capitals
+    /// it sits against. Only that box: the rule everywhere else is still the
+    /// ascent, and a form-wide change here would move the text in every field
+    /// in the app to fix a caret in one of them.
+    line: Option<f32>,
 }
 
 impl<'a> FieldShape<'a> {
@@ -6472,6 +6513,7 @@ impl<'a> FieldShape<'a> {
             height: FIELD_HEIGHT,
             right_pad: 10.0,
             font: FontId::new(14.0, FontFamily::Proportional),
+            line: None,
         }
     }
 
@@ -6519,7 +6561,10 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
     // With the line box set to the ascent both go away at once and no fudge
     // is left behind -- see [`ascent_of`], which carries the measurements.
     let font = shape.font.clone();
-    let ascent = ascent_of(ui.ctx(), &font);
+    // The line box, which is the ascent unless the caller says otherwise --
+    // see `FieldShape::line`, and the paragraph below for why it is the
+    // ascent at all.
+    let ascent = shape.line.unwrap_or_else(|| ascent_of(ui.ctx(), &font));
     let inner = Rect::from_center_size(
         Pos2::new((outer.min.x + 10.0 + outer.max.x - right_pad) / 2.0, outer.center().y),
         Vec2::new(outer.width() - 10.0 - right_pad, ascent),
@@ -7435,6 +7480,24 @@ pub fn section_card_header_at(
     let line = egui::Frame::new()
         .inner_margin(Margin::symmetric(pad_x, SECTION_CARD_HEADER_PAD_Y))
         .show(ui, |ui| {
+            // **The row is its TITLE's height and nothing else's.**
+            //
+            // egui floors a horizontal row at `interact_size.y`, which this
+            // theme sets to 20 -- so a band holding one 12-point caption came
+            // out 22 + 20 = 42, where the READ pane's heading is 22 + its
+            // galley = 36. Six points, on every card of the form, against a
+            // pane one click away. The owner: "too tall headers for those
+            // tiles".
+            //
+            // Zeroed rather than the caption padded, because the floor is
+            // about CONTROLS being clickable and there is no control in this
+            // band -- the pill below paints, it does not sense.
+            //
+            // **Set on the OUTER `Ui`, before `horizontal`.** `Ui::horizontal`
+            // reads the spacing when it builds the row, so zeroing it inside
+            // the closure is two points late and measurably so: 42 became 40
+            // rather than 36.
+            ui.spacing_mut().interact_size.y = 0.0;
             ui.horizontal(|ui| {
                 // §8a's `gap: 10px` between the title and what follows it.
                 ui.spacing_mut().item_spacing.x = SECTION_HEADER_GAP;
@@ -7469,13 +7532,19 @@ pub fn section_card_header_at(
                     // card rather than leave it off.
                     let width = state_pill_width(ui.painter(), CHANGED_TONE, CHANGED_PILL);
                     if ui.available_width() >= width {
-                        let (rect, _) = ui.allocate_exact_size(
-                            Vec2::new(ui.available_width(), PILL_HEIGHT),
-                            Sense::hover(),
-                        );
+                        // **Zero height, and centred on the TITLE.** The slot
+                        // claims the width it needs and none of the height:
+                        // a `PILL_HEIGHT` allocation would make the band 42
+                        // when the card is dirty and 38 when it is not, so
+                        // every card on the form would grow four points as
+                        // the user typed. The pill is 20 tall and the band's
+                        // padding is 11 a side, so it sits comfortably inside
+                        // the strip without defining it.
+                        let (rect, _) = ui
+                            .allocate_exact_size(Vec2::new(ui.available_width(), 0.0), Sense::hover());
                         state_pill(
                             ui.painter(),
-                            Pos2::new(rect.right() - width, rect.center().y),
+                            Pos2::new(rect.right() - width, title_rect.center().y),
                             CHANGED_TONE,
                             CHANGED_PILL,
                         );
