@@ -6035,24 +6035,29 @@ pub fn ink_drop(ctx: &egui::Context, font: &FontId, line_height: Option<f32>) ->
     })
 }
 
-/// **How tall the INK of a capital is** in `font` -- the cap height, which
-/// is what a reader sees as "the size of the text".
-///
-/// [`ascent_of`] answers something larger: the face's ascent reserves room
-/// for accents no unaccented line uses, about 23% above the caps on the
-/// bundled cuts. That is the right measurement for a line BOX, and the wrong
-/// one for anything that has to look the size of the letters beside it --
-/// see [`FieldShape::line`], which is the one caller.
-pub fn cap_height_of(ctx: &egui::Context, font: &FontId) -> f32 {
-    ctx.fonts_mut(|f| {
-        let galley = f.layout_no_wrap(ASCENT_PROBE.to_string(), font.clone(), Color32::BLACK);
-        galley
-            .rows
-            .first()
-            .and_then(|row| row.glyphs.first())
-            .map_or_else(|| f.row_height(font), |glyph| glyph.uv_rect.size[1] as f32)
-    })
-}
+// **`cap_height_of` was here.** It measured the ink of a capital so the
+// name box could lay its line at that height and give the caret the size of
+// the letters beside it -- the owner's "text cursor in header seems wrong
+// size", asked twice.
+//
+// It does not work, and the reason is worth keeping. In egui the caret IS the
+// galley's row: `TextEdit` draws it from the row's top to its bottom, and the
+// BASELINE stays where the face puts it whatever the row height says. Cut the
+// row to the cap height and the ink no longer fits in it -- the glyphs render
+// from `ascent - cap` to `ascent`, most of it below a row that now ends at
+// `cap`, and `ui.put`'s clip rect takes the difference off the top and the
+// bottom of every letter. That is exactly what the owner screenshotted next:
+// "cut off".
+//
+// Making the clip rect taller fixes the clipping and breaks the thing it was
+// for: the caret then runs from the row's top to `cap` below it, which no
+// longer straddles the text at all.
+//
+// So the line stays the ascent, which is already this module's answer to the
+// same complaint one size down -- see `field_box`, where cutting the full row
+// (ascent plus descent) to the ascent is what fixed "cursor is huge". The
+// remaining overshoot is the accent band the face reserves, and it is the
+// price of egui tying the two together.
 
 /// The character [`ascent_of`] measures.
 ///
@@ -6115,17 +6120,12 @@ pub fn title_field(ui: &mut Ui, value: &mut String) -> Response {
 /// difference is what lets the two be laid out in reading order without the
 /// box eating the pill's place. See `detail_edit`'s `edit_header`.
 pub fn title_field_within(ui: &mut Ui, value: &mut String, room: f32) -> Response {
-    let font = FontId::new(TITLE_FIELD_PX, FontFamily::Name(EXTRABOLD.into()));
-    // The caret, cut to the height of the capitals beside it. See
-    // `FieldShape::line`.
-    let line = Some(cap_height_of(ui.ctx(), &font));
     field_box(
         ui,
         value,
         FieldShape {
             width: room.min(TITLE_FIELD_WIDTH),
-            font,
-            line,
+            font: FontId::new(TITLE_FIELD_PX, FontFamily::Name(EXTRABOLD.into())),
             ..FieldShape::wide(ui)
         },
     )
@@ -6194,7 +6194,6 @@ pub fn inline_field(
             height: BUTTON_HEIGHT,
             right_pad: 10.0,
             font: FontId::new(14.0, FontFamily::Proportional),
-            line: None,
         },
     )
     .0
@@ -6484,22 +6483,6 @@ struct FieldShape<'a> {
     /// at `font-size: 20px` -- and a 38-point box holding 14-point text is
     /// what made the edit form's name row read as one more setting.
     font: FontId,
-    /// **The line box this field's text is laid in**, or `None` for
-    /// [`ascent_of`] -- which is what every box but one takes and what the
-    /// comment inside [`field_box`] argues for at length.
-    ///
-    /// It exists for the CARET. egui draws the caret at the row's height, so
-    /// the line box is the caret, and the ascent is about 23% taller than the
-    /// letters it is standing beside. At 13 points nobody notices two of
-    /// them; at [`TITLE_FIELD_PX`]'s 20, in a 38-point box, it is four -- the
-    /// owner's "text cursor in header seems wrong size", reported twice.
-    ///
-    /// So the name box lays its line at the cap height instead
-    /// ([`cap_height_of`]) and the caret comes out the height of the capitals
-    /// it sits against. Only that box: the rule everywhere else is still the
-    /// ascent, and a form-wide change here would move the text in every field
-    /// in the app to fix a caret in one of them.
-    line: Option<f32>,
 }
 
 impl<'a> FieldShape<'a> {
@@ -6513,7 +6496,6 @@ impl<'a> FieldShape<'a> {
             height: FIELD_HEIGHT,
             right_pad: 10.0,
             font: FontId::new(14.0, FontFamily::Proportional),
-            line: None,
         }
     }
 
@@ -6561,10 +6543,7 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
     // With the line box set to the ascent both go away at once and no fudge
     // is left behind -- see [`ascent_of`], which carries the measurements.
     let font = shape.font.clone();
-    // The line box, which is the ascent unless the caller says otherwise --
-    // see `FieldShape::line`, and the paragraph below for why it is the
-    // ascent at all.
-    let ascent = shape.line.unwrap_or_else(|| ascent_of(ui.ctx(), &font));
+    let ascent = ascent_of(ui.ctx(), &font);
     let inner = Rect::from_center_size(
         Pos2::new((outer.min.x + 10.0 + outer.max.x - right_pad) / 2.0, outer.center().y),
         Vec2::new(outer.width() - 10.0 - right_pad, ascent),

@@ -6144,17 +6144,23 @@ fn app_block(
 ///
 /// **Where it comes from is the difference from the two siblings.** In
 /// `item_list.rs` and `detail.rs` the lane REPLACES a right padding those
-/// functions own, so the content keeps the width it always had. This function
-/// owns no such padding: the edit pane's horizontal inset is the vault
-/// window's central-panel `Margin`, applied outside the `Ui` handed in here.
-/// So the lane is taken out of the form's own width instead, and the card is
-/// 10pt narrower than it was. That is a deliberate trade -- 10pt of card
-/// against a scroll bar the user can see -- and not a width that CHANGES:
-/// `AlwaysVisible` below reserves the lane whether or not a bar is painted.
-const FORM_SCROLL_GUTTER: f32 = 10.0;
+/// functions own, so the content keeps the width it always had.
+///
+/// **This one does the same now, and did not.** It used to be a 10-point lane
+/// taken out of the form's width ON TOP of [`FORM_PAD_X`], on the argument
+/// that this function owned no right padding to replace -- the inset was the
+/// central panel's, outside the `Ui` handed in. That inset is this file's
+/// own now, so the arrangement can be the read pane's: the column is inset on
+/// the left and the lane is the right inset, which is why this is
+/// `FORM_PAD_X` and not a number of its own. The owner's "cards are smaller
+/// for edit screen" was the 10 points, plus 4 more from an inset that was
+/// 8a's 28 against the read pane's 24.
+///
+/// Not a width that CHANGES: `AlwaysVisible` below reserves the lane whether
+/// or not a bar is painted.
+const FORM_SCROLL_GUTTER: f32 = FORM_PAD_X as f32;
 
-/// **8a's `padding: ... 28px` down the side of the form**, and the reason it
-/// has to be spelled here.
+/// **The READ pane's side inset**, and the reason it has to be spelled here.
 ///
 /// The body and the footer used to inherit this from the central panel, and
 /// the comments on both still said so. They stopped being true: that panel's
@@ -6165,18 +6171,26 @@ const FORM_SCROLL_GUTTER: f32 = 10.0;
 /// on the left", with the buttons flush against the pane and the standing note
 /// on the right clipped by the window's own edge.
 ///
-/// **Not applied to the title strip above them.** That strip is the READ
-/// pane's, at the owner's request -- the same tile, the same name in the same
-/// place -- so it keeps the read pane's `detail::HEADER_PAD_X`. The four
-/// points between them are the price of the two panes not moving under each
-/// other when Edit is pressed, which is the property that was asked for.
-const FORM_PAD_X: i8 = 28;
+/// **8a's own number is 28 and this is 24**, which is `detail::BODY_PAD_X`.
+/// The owner, with the two panes screenshotted one above the other: "cards
+/// are smaller for edit screen". They were, by four points a side plus the
+/// scroll lane -- see [`FORM_SCROLL_GUTTER`], which used to be taken out of
+/// the form's width ON TOP of this inset where the read pane's lane REPLACES
+/// its right padding. Both are the read pane's arrangement now, so a card
+/// keeps its rectangle across the click that opens the form.
+///
+/// **Not applied to the title strip above them**, which is the READ pane's
+/// at the owner's request -- the same tile, the same name in the same place
+/// -- so it keeps `detail::HEADER_PAD_X`. That is also 24, so the strip's
+/// avatar and the cards under it now share a left edge; they did not when
+/// this was 28.
+const FORM_PAD_X: i8 = detail::BODY_PAD_X;
 
 /// The pane below which the form gives its side inset back.
 ///
-/// 8a is a 1028-point card and 28 a side is nothing in it. This pane's FLOOR
+/// 8a is a 1028-point card and 24 a side is nothing in it. This pane's FLOOR
 /// is 298 points (`MIN_VAULT_WINDOW_SIZE` less the sidebar and the list), and
-/// 56 points off that is a fifth of the form -- measured, not estimated: with
+/// 48 points off that is a sixth of the form -- measured, not estimated: with
 /// the inset applied unconditionally, seven layout tests failed at 298 with
 /// controls painted past the pane's right edge on a surface that refuses to
 /// scroll sideways.
@@ -7063,6 +7077,16 @@ pub fn draw_detail_edit(
     icon: Option<&egui::TextureHandle>,
 ) -> EditAction {
     let mut action = EditAction::None;
+    // **The pane's ground, painted the way the READ pane paints its own.**
+    //
+    // This form drew nothing behind itself, so what showed between its cards
+    // was the vault window's central panel -- `theme::CANVAS`, `#f3f2f2`.
+    // The read pane fills its whole rect with `theme::WINDOW_BG`, `#f7f6f5`,
+    // which is four points lighter in every channel and visibly so against a
+    // white card. The owner, with the two panes side by side: "background is
+    // not same gray color".
+    ui.painter()
+        .rect_filled(ui.clip_rect(), egui::CornerRadius::ZERO, theme::WINDOW_BG);
     // Read before the closure borrows `draft` mutably.
     let may_unfile = draft.may_unfile();
     // **8a's `CTRL+S`, read before anything else this frame.**
@@ -7531,10 +7555,18 @@ pub fn draw_detail_edit(
     // border is the "card in a card" the design has nowhere on the page.
     let pad_x = form_pad_x(ui.available_width());
     egui::Frame::new()
-        // 8a's own side inset -- see `FORM_PAD_X`, which is where the panel
-        // margin these cards used to inherit went, and `FORM_PAD_AT` for the
-        // width below which it is given back.
-        .inner_margin(Margin::symmetric(pad_x, 0))
+        // **The inset on the LEFT only**, exactly as `detail.rs` insets its
+        // own body: the scroll lane below is `FORM_SCROLL_GUTTER` wide and it
+        // IS the right inset, rather than being taken out of the card's width
+        // on top of one. That difference is what the owner saw as "cards are
+        // smaller for edit screen" -- four points a side from the inset and
+        // ten more from the lane, against a read pane whose cards run from
+        // `BODY_PAD_X` to `right - BODY_PAD_X`.
+        //
+        // See `FORM_PAD_X`, which is where the panel margin these cards used
+        // to inherit went, and `FORM_PAD_AT` for the width below which it is
+        // given back.
+        .inner_margin(Margin { left: pad_x, right: 0, top: 0, bottom: 0 })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
 
@@ -20357,6 +20389,48 @@ mod edit_pane_layout_tests {
             "the first card starts {}pt under the rule, not 8a's SECTION_COLUMN_TOP ({})",
             card.top() - rule.bottom(),
             theme::SECTION_COLUMN_TOP
+        );
+    }
+
+    /// **A card keeps its rectangle across the click that opens the form.**
+    ///
+    /// The owner, with the read pane screenshotted above the edit pane:
+    /// "cards are smaller for edit screen". They were, by fourteen points on
+    /// the right and four on the left -- 8a's 28-point inset against the read
+    /// pane's 24, plus a ten-point scroll lane taken out of the card's width
+    /// where `detail.rs`'s lane REPLACES its right padding.
+    ///
+    /// Both ends, against `detail::BODY_PAD_X` rather than against 24: the
+    /// claim is that the two panes share one number, and a literal here would
+    /// be satisfied by a read pane that had moved.
+    #[test]
+    fn a_card_is_inset_by_the_read_panes_own_body_padding() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let mut draft = full_login_draft();
+        draft.name = "Ledgerline".to_string();
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+        let title = painted.rect_of("ITEM");
+        let card = painted
+            .rects
+            .iter()
+            .filter(|(r, fill)| *fill == theme::CARD && r.contains(title.center()))
+            .map(|(r, _)| *r)
+            .max_by(|a, b| a.height().total_cmp(&b.height()))
+            .expect("the ITEM card is painted");
+        let inset = f32::from(detail::BODY_PAD_X);
+        assert!(
+            (card.left() - inset).abs() <= 0.5,
+            "the card starts at {}, not the read pane's {inset}",
+            card.left()
+        );
+        assert!(
+            (pane.x - card.right() - inset).abs() <= 0.5,
+            "the card ends {}pt from the pane's edge, not the read pane's {inset} -- the \
+             scroll lane is being taken out of the card rather than being the inset",
+            pane.x - card.right()
         );
     }
 

@@ -184,7 +184,11 @@ const TITLE_MIN: f32 = 120.0;
 /// rearrangement the design does not draw at all.
 const HEADER_ROW_GAP: f32 = 10.0;
 /// The body below the strip: `padding: 18px 24px`.
-const BODY_PAD_X: i8 = 24;
+/// `pub(crate)` so the EDIT pane can take the same inset rather than a
+/// same-valued constant of its own -- see `detail_edit::FORM_PAD_X`, and the
+/// owner's "cards are smaller for edit screen", which is what two numbers
+/// four apart looked like across one click.
+pub(crate) const BODY_PAD_X: i8 = 24;
 const BODY_PAD_Y: i8 = 18;
 /// `gap: 14px` between the body's cards.
 const CARD_GAP: f32 = 14.0;
