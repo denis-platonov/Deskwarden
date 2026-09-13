@@ -15,6 +15,140 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.23 - 2026-09-12
+
+### Reading a code off your screen stopped freezing for two seconds, and the reason was not in this app
+
+> fix slowliness when capturing and make sure spinner is spinning fine while
+> background capturing happens without blocking the system/app
+
+The capture and the decode already ran on a worker. What did not was the
+second and a half after them: the waiting card's bar stopped dead, and the
+overlay arrived when it arrived.
+
+The app's own log measured it -- **the overlay's window existed 1816 ms after
+it was asked for, with one frame painted in that whole time.** A blocked
+event loop, not a slow one. Two things were inside that number and neither was
+the culprit. The 29 MB picture of the desktop was ruled out by skipping it
+entirely: 1790 ms. Building a full-screen window and its OpenGL surface was
+measured directly in a standalone probe: **9 to 19 milliseconds**, and not one
+attribute of the window made any difference.
+
+It was reading a window's title.
+
+Deskwarden looks up its own windows by name, and reading a caption with
+`GetWindowTextW` is, for a window this process owns, a message the owning
+thread has to answer. **The graphics driver keeps two hidden windows in every
+program that draws with OpenGL**, on a thread that services messages about ten
+times a second -- so each read waited about 108 milliseconds, four reads made
+one lookup 430, and the scan made ten lookups.
+
+The caption is now read out of the window itself with
+`InternalGetWindowText`, which asks nobody anything. The lookup went from 415
+milliseconds to nought, and the probe's window from a second to **64
+milliseconds**. Nothing else was touched: the picture is still taken while
+Deskwarden is masked and before the overlay exists, the window still opens
+cloaked and is still raised before it is shown.
+
+The probe is kept as an example, because a test process never holds an OpenGL
+context and is the one place this was reproducible.
+
+### The sequence builder is a screen you can find
+
+> Don't see sequebce builder as per design anywhere on UI
+
+It was one block inside the edit form's Fill rule card -- shut by default,
+inside a card only drawn for an item bound to an app, inside a form reached by
+pressing Edit. Four doors, all closed, in a column 298 points wide.
+
+It is its own screen now, reached from a record's menu: what the rule belongs
+to on the left, the steps in the middle with the template view behind its own
+toggle, and the measurements on the right. **Timing** draws a bar per step
+with every duration taken from the plan that would really run. **Checks** are
+four statements this app can stand behind -- a field change before the secret,
+the masked-control gate, an Enter with something after it and no pause behind
+it (with the pause offered), and that no empty step is ever sent. **Budget** is
+measured against the real limits rather than the design's illustrative ones.
+
+Not built, and not pretended: the design's *Send for real*. A fill happens
+against a window you have focused, through a gate that refuses the window this
+screen would be. Rehearsing with fake data is the honest form of the same
+want, and it is on the screen.
+
+### A record with a live Send says so, and can stop it
+
+A filled **shared** pill on the row, beside the outlined `app` and `2FA`: those
+two say what a record is, this one says what is happening to it right now. And
+a **Sharing** card on the record itself, with **Revoke** -- which turns the
+link off rather than deleting it, so it stays in Sends and can be switched back
+on -- and **Send again**.
+
+The pill means *someone can open this right now*, never "was shared once", so
+it disappears on its own the moment the Send expires, is used up or is revoked.
+
+**Two lines the design draws are missing, both for the same reason.** A
+Bitwarden Send has no recipient -- it is a link, and whoever holds it can open
+it -- so the card says `Anyone with the link` rather than naming a person. And
+which fields travelled is knowable only where and when the Send was made, so
+saying it here and not on your other machine would read as two different Sends
+rather than as a missing line.
+
+**A Send is matched to a record by name**, which is how record Sends are
+already named. That needs nothing stored anywhere and works from any machine
+you are signed in on -- and it means two records with the same name share a
+pill, and renaming a record loses the pill on a link that is still live. The
+exact alternative was a file on this machine recording what you have shared,
+and it was refused for the same reason this app refuses to keep a timeline of
+which accounts you have filled.
+
+### Every field on the add-a-code card copies
+
+> make 6 digit code clickable and copiable - most of the MFA require
+> copy-paste it first before applying
+
+The six-digit code copies on a click anywhere in its blue strip, and so do the
+issuer, the account and the secret on their own rows. Parameters does not and
+does not react: it is a row of chips with no single value a click could mean.
+Reveal still reveals without copying.
+
+Each copy confirms itself in the same box, in the same corner, with the same
+words as every other copy in the app.
+
+### Send a record is the width it was designed at
+
+The card was 360 points wide under a note calling the design "a narrow
+column". It is 690, which is what the design is, and the missing third of it
+was most of what made the card look unlike the picture: there was no room for
+the value beside each field, so the addresses and the masked password crowded
+their own labels instead of lining up.
+
+Form cards also take the design's own 18 points of side padding at the width
+the design draws them, and keep the tighter 12 in the Sends screen's narrow
+column, where 18 comes out of the one row that cannot spare it.
+
+### Text that sits where its letters are, in the last places it did not
+
+Rows on the add-a-code card are level with each other now -- the caption, the
+value, the Reveal beside it, and the parameter chips, which sat two points low
+because they were optically centred by a different rule than everything around
+them. One rule for the whole table, and a test that measures every row's runs
+against each other so this stops being reported one row at a time.
+
+### Two hairlines where a card has one border
+
+> two lines next to each other like last time on the right edge
+
+Two cards in this app paint their border twice, because a band that reaches the
+edge would otherwise cover it. That is only harmless while both strokes land on
+the same pixels, and they did not: one was drawn inside the card's edge and the
+other centred on it, half a stroke apart. Visible on the add-a-code card in
+grey, and on the delete confirmation in red.
+
+### "Loading your vault" is the size the design says
+
+17 points over the 13-point line beneath it. It had been 22 -- an overshoot
+correcting an earlier report that it was too small.
+
 ## 0.15.22 - 2026-09-12
 
 ### Scanning a code shows your own desktop, dimmed, with the box you drag cut out of it
