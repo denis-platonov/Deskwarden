@@ -7992,11 +7992,27 @@ pub fn modal_card(
             // dropping the `Frame`'s stroke would shrink the rect the bands
             // are laid out against, and un-bleeding the bands would put the
             // white line back.
+            //
+            // **`Inside`, and the `Middle` it replaces is why the owner saw a
+            // "double red line to the right" on the delete card.** The claim
+            // above -- that this is the same border and not a second one --
+            // is only true if the two strokes land on the same pixels, and
+            // they did not: a `Frame` draws its stroke `Inside` the rect, and
+            // `Middle` centres it ON the edge, half a stroke-width further
+            // out. At `MODAL_STROKE`'s weight that is a visible parallel
+            // line, and on the delete card it is in alarm red.
+            //
+            // The same slip, in the same shape, was fixed in `totp_add`'s
+            // `stage_card` one commit earlier -- a `Frame` stroke plus a
+            // `Middle` repaint -- and these two are the only places in the
+            // crate that stroke one rect twice. Every other `StrokeKind` here
+            // is a lone stroke, where `Middle` straddles the edge on purpose
+            // and has nothing to disagree with.
             ui.painter().rect_stroke(
                 framed.response.rect,
                 CornerRadius::same(MODAL_RADIUS),
                 Stroke::new(MODAL_STROKE, card.accent),
-                egui::StrokeKind::Middle,
+                egui::StrokeKind::Inside,
             );
         });
     press
@@ -12679,6 +12695,70 @@ mod modal_card_tests {
             dismiss_arms(&drawn.painted, band).len(),
             2,
             "the glyph-less card's header carries no ✕"
+        );
+    }
+}
+
+#[cfg(test)]
+mod one_border_is_one_line_tests {
+    /// **A rectangle stroked twice must be stroked the same way twice.**
+    ///
+    /// Two cards in this app paint one border twice -- `theme::modal_card` and
+    /// `totp_add`'s `stage_card` -- because a `Frame`'s stroke is drawn under
+    /// its contents and a band that bleeds to the edge covers it. Painting the
+    /// same border again over the top is the fix, and it is only a fix while
+    /// the two strokes land on the same pixels.
+    ///
+    /// They did not, in both cards, for the same reason: a `Frame` draws its
+    /// stroke `Inside` the rect and `StrokeKind::Middle` centres it ON the
+    /// edge, half a stroke-width further out. The owner saw it twice and named
+    /// it the same way both times -- "two lines next to each other like last
+    /// time on the right edge", and then "double red line to the right - same
+    /// as before".
+    ///
+    /// So the rule is pinned where it can only be broken deliberately: every
+    /// repaint of a `Frame`'s own rect is `Inside`. This counts them off the
+    /// source across the whole crate, because the next card to do this will be
+    /// written in a third file.
+    ///
+    /// **`Middle` elsewhere is untouched and correct.** A lone stroke has
+    /// nothing to disagree with; straddling the edge is what it is for. This
+    /// asserts only about rects that are stroked on top of a `Frame` that
+    /// already stroked them, which is what `framed.response.rect` spells.
+    #[test]
+    fn a_border_painted_twice_is_painted_the_same_way_twice() {
+        let files = [
+            ("theme.rs", include_str!("theme.rs")),
+            ("vault_window/totp_add.rs", include_str!("vault_window/totp_add.rs")),
+            ("vault_window/detail.rs", include_str!("vault_window/detail.rs")),
+            ("vault_window/record_ui.rs", include_str!("vault_window/record_ui.rs")),
+            ("vault_window/send_ui.rs", include_str!("vault_window/send_ui.rs")),
+            ("vault_window/item_list.rs", include_str!("vault_window/item_list.rs")),
+        ];
+        let needle = concat!("framed.response.", "rect,");
+        let mut found = 0usize;
+        for (name, text) in files {
+            let text = text.replace("\r\n", "\n");
+            for (at, _) in text.match_indices(needle) {
+                // The `StrokeKind` of this call, which is inside the next few
+                // lines: a `rect_stroke` takes rect, rounding, stroke, kind.
+                let tail = &text[at..(at + 400).min(text.len())];
+                let Some(kind_at) = tail.find("StrokeKind::") else { continue };
+                found += 1;
+                let kind = &tail[kind_at..];
+                assert!(
+                    kind.starts_with("StrokeKind::Inside"),
+                    "{name} repaints a `Frame`'s own rect with something other than \
+                     `StrokeKind::Inside`, so the two strokes of one border land half a \
+                     stroke-width apart and the card is outlined twice: {}",
+                    &kind[..kind.len().min(40)]
+                );
+            }
+        }
+        assert!(
+            found >= 2,
+            "the two cards that repaint their own border were not found, so this test is \
+             asserting about nothing"
         );
     }
 }
