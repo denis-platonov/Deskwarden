@@ -6374,18 +6374,20 @@ const COMPACT_BAND_PAD_Y: i8 = detail::HEADER_PAD_Y / 2;
 /// "Login under title - remove, it will go in a separate block, title center
 /// vertically".
 ///
-/// **The taller of the box and the TILE**, not the box alone. The avatar is
-/// 40 and the name box 38, and a band declared at 38 is a band the tile
-/// overflows by two -- which egui answers by growing the strip, leaving the
-/// box centred in 38 inside a row of 40 and the owner's "center vertically"
-/// off by a point. Stated as the max so the strip's height is the taller
-/// child's by decision rather than by accident, which is the same argument
-/// `detail::HEADER_ROW` makes one file over.
-const EDIT_HEADER_ROW: f32 = if theme::FIELD_HEIGHT > detail::HEADER_AVATAR {
-    theme::FIELD_HEIGHT
-} else {
-    detail::HEADER_AVATAR
-};
+/// **The READ pane's row, and that is the whole of the definition now.**
+///
+/// It was the taller of the name box and the tile -- 40, against the read
+/// pane's 44 -- which left the edit band four points shorter than the strip
+/// it replaces, so the whole form stepped up by four the moment Edit was
+/// pressed. The owner, with a screenshot of the gap: "there is some empty
+/// space - make height of that header same as details".
+///
+/// Taking `detail::HEADER_ROW` outright also keeps the property that
+/// constant's own doc argues for: the row is stated rather than inferred from
+/// whichever child happens to be tallest. It is comfortably above both (the
+/// box is 38, the tile 40), so the name is centred in it with room either
+/// side rather than defining it.
+const EDIT_HEADER_ROW: f32 = detail::HEADER_ROW;
 
 /// **8a's title bar: the item's avatar, its name in a box, and what it is.**
 ///
@@ -6496,51 +6498,61 @@ fn edit_header(
             }
             ui.add_space(detail::HEADER_GAP);
         }
-        // **The pill claims its width first**, exactly as the read pane's
-        // controls do and for the same reason: laid out the other way round
-        // the name box takes `available_width` and the pill is pushed off the
-        // pane. What is left is the name column's, and `title_field` caps
-        // itself at 8a's 480 before it gets anywhere near the far edge.
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = detail::HEADER_GAP;
-            if dirty {
-                let width =
-                    theme::state_pill_width(ui.painter(), theme::CHANGED_TONE, UNSAVED_PILL);
-                // Measured before it is placed, and left off when it does not
-                // fit, for the reason `theme::section_card_header`'s own pill
-                // is: at the pane's floor a name box and a pill do not share a
-                // line, and a pill pushed off the pane is a pill drawn into
-                // the item list. The footer says the same thing in words and
-                // is never elided.
-                if ui.available_width() >= width {
-                    let (rect, _) = ui.allocate_exact_size(
-                        egui::vec2(width, theme::PILL_HEIGHT),
-                        egui::Sense::hover(),
-                    );
-                    theme::state_pill(
-                        ui.painter(),
-                        egui::pos2(rect.left(), rect.center().y),
-                        theme::CHANGED_TONE,
-                        UNSAVED_PILL,
-                    );
-                }
-            }
-            // **One control, added straight into the row.**
-            //
-            // It used to be a `top_down` column holding the box and the
-            // kind-and-folder line under it; with that line gone there is no
-            // column left, and a nested column is exactly what stopped the
-            // box being centred: this row is `right_to_left(Align::Center)`,
-            // which cross-aligns the WIDGETS in it, and a child `Ui` is not a
-            // widget -- it takes the full height it is offered and lays out
-            // from the top. Measured: 20 points of strip above the box and 22
-            // below, against the owner's "title center vertically".
-            //
-            // Added directly, the box is a widget in a centring row and the
-            // arithmetic is egui's. See `EDIT_HEADER_ROW` for why the row is
-            // two points taller than the box in the first place.
-            theme::title_field(ui, &mut draft.name);
-        });
+        // **The name box sits against the tile, and the pill on the far
+        // right** -- the owner's "move title to the left".
+        //
+        // It used to be a `right_to_left` row, so that the pill could claim
+        // its width before the box took `available_width`. That works and it
+        // put the BOX on the right too: a `right_to_left` layout places a
+        // widget narrower than the space it is offered against the right
+        // edge, and 8a caps this box at 480, so every pane wider than the
+        // tile plus 480 drew the name floating off beside its own avatar.
+        //
+        // Reading order instead, with the pill's width MEASURED rather than
+        // claimed: the measurement is what the other layout was really for,
+        // and it does not need the row reversed to happen. `state_pill_width`
+        // is pure, so asking it first costs nothing and leaves the box with
+        // exactly the room it may have.
+        let pill = dirty
+            .then(|| theme::state_pill_width(ui.painter(), theme::CHANGED_TONE, UNSAVED_PILL))
+            // Left off when it does not fit, for the reason
+            // `theme::section_card_header`'s own pill is: at the pane's floor
+            // a name box and a pill do not share a line, and a pill pushed
+            // off the pane is a pill drawn into the item list. The footer
+            // says the same thing in words and is never elided.
+            .filter(|width| ui.available_width() >= width + detail::HEADER_GAP);
+        let room = ui.available_width()
+            - pill.map_or(0.0, |width| width + detail::HEADER_GAP);
+
+        // **One control, added straight into the row.**
+        //
+        // It used to be a `top_down` column holding the box and the
+        // kind-and-folder line under it; with that line gone there is no
+        // column left, and a nested column is exactly what stopped the box
+        // being centred: this band is `left_to_right(Align::Center)`, which
+        // cross-aligns the WIDGETS in it, and a child `Ui` is not a widget --
+        // it takes the full height it is offered and lays out from the top.
+        // Measured: 20 points of strip above the box and 22 below, against
+        // the owner's "title center vertically".
+        //
+        // Added directly, the box is a widget in a centring row and the
+        // arithmetic is egui's. See `EDIT_HEADER_ROW` for why the row is two
+        // points taller than the box in the first place.
+        theme::title_field_within(ui, &mut draft.name, room);
+
+        if let Some(width) = pill {
+            // Pushed to the far edge: what is left of the row after the box
+            // is the gap, whatever the box's 480-point cap left over.
+            ui.add_space(ui.available_width() - width);
+            let (rect, _) = ui
+                .allocate_exact_size(egui::vec2(width, theme::PILL_HEIGHT), egui::Sense::hover());
+            theme::state_pill(
+                ui.painter(),
+                egui::pos2(rect.left(), rect.center().y),
+                theme::CHANGED_TONE,
+                UNSAVED_PILL,
+            );
+        }
     });
     action
 }
@@ -20197,6 +20209,71 @@ mod edit_pane_layout_tests {
         );
     }
 
+    /// **The name box sits against the tile, not against the far edge.**
+    ///
+    /// The owner: "move title to the left". The band was a `right_to_left`
+    /// row -- so that the `Unsaved changes` pill could claim its width before
+    /// the box took the rest -- and a `right_to_left` layout places a widget
+    /// NARROWER than its space against the right edge. 8a caps this box at
+    /// `theme::TITLE_FIELD_WIDTH`, so every pane wider than the tile plus 480
+    /// drew the name floating away from its own avatar.
+    ///
+    /// Measured at a pane where that cap really binds, since at a narrow one
+    /// the box fills the row and the two layouts are indistinguishable. Both
+    /// ends: the box begins a `HEADER_GAP` after the tile, and the pill is
+    /// still on the far right -- the property the old layout was for.
+    #[test]
+    fn the_name_box_sits_against_the_tile_with_the_pill_on_the_far_edge() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        // Renamed, so the `Unsaved changes` pill is really up: this test is
+        // about where that pill sits as much as about where the box does.
+        draft.name = "Ledgerline Holdings".to_string();
+        let dirty = |draft: &mut EditDraft| {
+            frame_for(&ctx, pane, draft, false, &[], Some(&item), &detail::TotpState::NoSecret)
+        };
+        let _ = dirty(&mut draft);
+        let painted = dirty(&mut draft);
+        assert!(
+            painted.strings().contains(&UNSAVED_PILL),
+            "the fixture is not dirty, so the pill this test is about was never drawn: {:?}",
+            painted.strings()
+        );
+
+        let ink = painted.rect_of(&draft.name);
+        let name_box = painted
+            .rects
+            .iter()
+            .map(|(r, _)| *r)
+            .find(|r| (r.height() - theme::FIELD_HEIGHT).abs() <= 0.5 && r.contains(ink.center()))
+            .expect("the name sits in a field box");
+        assert!(
+            name_box.width() <= theme::TITLE_FIELD_WIDTH + 0.5,
+            "the box is {}pt wide, so 8a's cap is not binding at this pane and this test \
+             cannot tell the two layouts apart",
+            name_box.width()
+        );
+
+        let tile_right = f32::from(detail::HEADER_PAD_X) + detail::HEADER_AVATAR;
+        let wanted = tile_right + detail::HEADER_GAP;
+        assert!(
+            (name_box.left() - wanted).abs() <= 0.5,
+            "the name box starts at {} and the tile ends at {tile_right} -- the box is not \
+             a HEADER_GAP from the avatar",
+            name_box.left()
+        );
+
+        let pill = painted.rect_of(UNSAVED_PILL);
+        assert!(
+            pill.left() > name_box.right(),
+            "the pill is at {pill:?} and the box ends at {} -- the pill lost its place on \
+             the far edge",
+            name_box.right()
+        );
+    }
+
     /// **The name box is the whole of the title band, centred in it.**
     ///
     /// This replaces `the_kind_line_clears_the_name_box_it_sits_under`, which
@@ -20258,6 +20335,14 @@ mod edit_pane_layout_tests {
             // And the strip is the row plus the read pane's own padding,
             // which is what keeps the two bands from jumping under each other
             // when Edit is pressed.
+            // And it is the READ pane's strip, to the point -- the owner:
+            // "make height of that header same as details". Pinned as the
+            // constants rather than as a number so the two move together.
+            assert_eq!(
+                EDIT_HEADER_ROW,
+                detail::HEADER_ROW,
+                "the edit band's row is no longer the read pane's, so the form steps up or                  down the moment Edit is pressed"
+            );
             let wanted = EDIT_HEADER_ROW + 2.0 * f32::from(detail::HEADER_PAD_Y);
             assert!(
                 (band.height() - wanted).abs() <= 0.5,

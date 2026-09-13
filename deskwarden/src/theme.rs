@@ -6084,11 +6084,23 @@ pub fn section_text_field(ui: &mut Ui, value: &mut String, password: bool) -> Re
 /// show the same name one keystroke apart -- a name that changed WEIGHT when
 /// the form opened would read as a different name.
 pub fn title_field(ui: &mut Ui, value: &mut String) -> Response {
+    title_field_within(ui, value, ui.available_width())
+}
+
+/// [`title_field`] told how much of the row is really its own.
+///
+/// The edit band's name box is drawn LEFT, beside the tile, with the
+/// `Unsaved changes` pill on the far right of the same row -- so the room the
+/// box may take is the row minus that pill, and `ui.available_width()` at the
+/// moment the box is added is the whole rest of the row. Passing it the
+/// difference is what lets the two be laid out in reading order without the
+/// box eating the pill's place. See `detail_edit`'s `edit_header`.
+pub fn title_field_within(ui: &mut Ui, value: &mut String, room: f32) -> Response {
     field_box(
         ui,
         value,
         FieldShape {
-            width: ui.available_width().min(TITLE_FIELD_WIDTH),
+            width: room.min(TITLE_FIELD_WIDTH),
             font: FontId::new(TITLE_FIELD_PX, FontFamily::Name(EXTRABOLD.into())),
             ..FieldShape::wide(ui)
         },
