@@ -2433,6 +2433,13 @@ impl Preview {
                     // A preview draws no window, so nothing reads the open
                     // gesture here; the slide it arms lives in ault_window::mod.
                     &mut false,
+                    // **Design 5d's `shared` pill: nothing is shared
+                    // here.** The set comes from the Sends list the window
+                    // fetches, and a preview fetches nothing -- an empty
+                    // set is the same answer `send_ui::shared_names` gives
+                    // before that list has been answered, which is the
+                    // state every shot of this screen has been taken in.
+                    &std::collections::HashSet::new(),
                 );
             });
     }
@@ -2472,6 +2479,13 @@ impl Preview {
                     // A preview draws no window, so nothing reads the open
                     // gesture here; the slide it arms lives in ault_window::mod.
                     &mut false,
+                    // **Design 5d's `shared` pill: nothing is shared
+                    // here.** The set comes from the Sends list the window
+                    // fetches, and a preview fetches nothing -- an empty
+                    // set is the same answer `send_ui::shared_names` gives
+                    // before that list has been answered, which is the
+                    // state every shot of this screen has been taken in.
+                    &std::collections::HashSet::new(),
                 );
             });
     }
@@ -2510,6 +2524,13 @@ impl Preview {
                     None,
                     false,
                     &mut false,
+                    // **Design 5d's `shared` pill: nothing is shared
+                    // here.** The set comes from the Sends list the window
+                    // fetches, and a preview fetches nothing -- an empty
+                    // set is the same answer `send_ui::shared_names` gives
+                    // before that list has been answered, which is the
+                    // state every shot of this screen has been taken in.
+                    &std::collections::HashSet::new(),
                 );
             });
     }
@@ -2806,6 +2827,13 @@ impl Preview {
                         // an icon and what those shots have always shown.
                         header_icon.as_ref(),
                         &mut fixtures.apps,
+                        // **Design 5d's `SHARING` card: no live Send.**
+                        // Same reason as the pill above -- the answer
+                        // comes from a Sends list a preview does not
+                        // fetch -- and the card is drawn only when there
+                        // IS one, so this is the screen as every shot of
+                        // it has shown it.
+                        None,
                         // Breach checking OFF -- `detail::should_check` is the
                         // gate, and with it false the cache below is never
                         // asked anything and no worker is started. A preview
