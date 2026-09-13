@@ -4089,7 +4089,7 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
         // dead field; in the label column it is one row among eight and the
         // grey box carries the whole message.
         theme::section_row(ui, WEBSITE_LABEL, |ui| {
-            theme::disabled_text_field(ui, WEBSITE_CREATE_NOTICE);
+            theme::section_disabled_text_field(ui, WEBSITE_CREATE_NOTICE);
         });
         return;
     }
@@ -4127,7 +4127,7 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
                     &website_label(i),
                     Some(WEBSITE_REMOVE_BUTTON),
                     |ui| {
-                        theme::text_field(ui, &mut entry.uri, false);
+                        theme::section_text_field(ui, &mut entry.uri, false);
                     },
                 ) {
                     remove = Some(i);
@@ -4160,6 +4160,33 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     ui.label(RichText::new(WEBSITE_MATCH_NOTE).size(11.0).color(theme::TEXT_FAINT));
 }
 
+/// The custom fields, as rows of name, value and Remove.
+///
+/// # What 8a draws here that this does not
+///
+/// 8a's rows are ONE LINE each: a `width: 118px; height: 32px` name box, a
+/// value box beside it, a `text` / `hidden` type chip and a `\u{2715}`, with
+/// `+ Add field` and `text \u{b7} hidden \u{b7} boolean \u{b7} linked` under
+/// them. This block stacks each field's name over its value with a `Remove`
+/// button under both, and the shape is a decision rather than a leftover:
+///
+/// * The card body is about 264 points at `settings::MIN_VAULT_WINDOW_SIZE`.
+///   118 for the name plus a chip, a mark, three gaps and a value box leaves
+///   the value around 90 points -- which is `LGL-4471` and nothing longer.
+///   `theme::section_row` has a fit rule for exactly this problem, but that
+///   rule stacks a LABEL over a control; here both halves are controls and
+///   there is no arm in which the row still reads as a row.
+/// * `boolean` and `linked` are not offered because this form cannot edit
+///   them -- see [`FieldRole`] -- so the hint line would name two things the
+///   control under it cannot do.
+///
+/// The type chip's information is carried by the box instead: a hidden
+/// field's value is a masked `section_password_field`, a text field's is a
+/// plain one, and its caption says which (see [`FIELD_HIDDEN_VALUE_LABEL`]).
+/// The boxes are [`theme::SECTION_FIELD_HEIGHT`] rather than 8a's 32, because
+/// 32 is the height of an inline box in a row this block does not draw, and
+/// a box two points shorter than every other box on the form would read as a
+/// third field size rather than as 8a's second.
 fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating: bool) {
     // **No rule and no heading here any more.** Design 8a gives this block a
     // card of its own, whose title band already says `Custom fields` in the
@@ -4235,7 +4262,7 @@ fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating
                     egui::UiBuilder::new()
                         .id(egui::Id::new(("custom-field", field.row_id()))),
                     |ui| {
-                        theme::text_field(ui, &mut field.name, false);
+                        theme::section_text_field(ui, &mut field.name, false);
                         ui.add_space(4.0);
                         theme::field_label(
                             ui,
@@ -4247,9 +4274,9 @@ fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating
                         // screen for anyone standing behind the user, which is
                         // most of what "hidden" buys them.
                         if hidden {
-                            theme::password_field(ui, &mut field.value, &mut field.reveal);
+                            theme::section_password_field(ui, &mut field.value, &mut field.reveal);
                         } else {
-                            theme::text_field(ui, &mut field.value, false);
+                            theme::section_text_field(ui, &mut field.value, false);
                         }
                         ui.add_space(4.0);
                         if theme::secondary_button(ui, FIELD_REMOVE_BUTTON).clicked() {
@@ -5061,6 +5088,46 @@ pub fn sequence_warning(sequence: &str, source: &ResolveSource<'_>) -> Option<St
 /// enumeration, reached through [`running_app_rows`]. The list is drawn with
 /// this form's own widgets, which costs a scroll area and buys a picker that
 /// cannot hang the window.
+/// The running-window list, opened by `Choose a running app\u{2026}` on the
+/// app block.
+///
+/// # Design 8b, and how far this is from it
+///
+/// 8b (`Pick a running window`) is a MODAL: a §5a-shaped card titled `Add a
+/// native app` with `6 windows open` at its right, rows of a 28-point
+/// monogram tile over a 13-point name and an 11-point mono executable, an
+/// `already a target` chip on the row that is one, the chosen row washed in
+/// blue, a `Match this window by` block of three radios -- `Process only`,
+/// `Process + title contains <box>`, `Exact title` -- with a verdict beside
+/// each (`too broad`, `recommended`, `breaks when the title changes`), and
+/// `Add target` / `Cancel` in a footer. This is an inline list under the
+/// button that opened it, with a filter box and one plain row per window.
+///
+/// The gap is recorded rather than closed, and the reasons are the app
+/// block's own one level up:
+///
+/// * **The radios would choose a match mode the matcher does not have.**
+///   `Process + title contains` and `Exact title` are two rules
+///   `match_engine` has never implemented; the one title match it does is the
+///   hosted-frame case, and [`AppMatchDraft::choose_window`] already records
+///   the title exactly when that case applies. A radio the user could set to
+///   `Exact title` on an ordinary window would persist a choice nothing acts
+///   on.
+/// * **The verdicts beside the radios are judgements this build cannot
+///   make.** `too broad -- every RDP session` requires knowing how many
+///   windows a process owns across time; this list sees one enumeration.
+/// * **A modal here would be a card inside a form inside a pane.** The row
+///   list is opened and closed in place so the form's own Save is still the
+///   only thing that writes, and the picker's answer is one draft field.
+///
+/// What IS 8b's: the rows are rows of name and executable, and the one
+/// refusal this build has -- a Store frame whose app cannot be identified --
+/// is drawn on the row through [`window_row_refusal`] rather than in a
+/// tooltip. 8b's greyed `Deskwarden -- can't target itself` row is not drawn
+/// because the row is not offered at all: [`running_app_rows`] excludes this
+/// process, so there is nothing to grey. The 28-point tile, the `already a
+/// target` chip and the row wash are not drawn, and would be the next thing
+/// to draw if this list is ever given 8b's card.
 fn app_window_picker(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
     ui.horizontal(|ui| {
         if theme::secondary_button(ui, "Refresh").clicked() {
@@ -5071,7 +5138,7 @@ fn app_window_picker(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
         }
     });
     ui.add_space(6.0);
-    theme::text_field(ui, &mut app.window_filter, false);
+    theme::section_text_field(ui, &mut app.window_filter, false);
     ui.add_space(4.0);
 
     let filter = app.window_filter.to_lowercase();
@@ -5158,7 +5225,7 @@ fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) {
         card.bank_picking = false;
     }
     ui.add_space(6.0);
-    theme::text_field(ui, &mut card.bank_filter, false);
+    theme::section_text_field(ui, &mut card.bank_filter, false);
     ui.add_space(4.0);
 
     let filter = card.bank_filter.to_lowercase();
@@ -5842,6 +5909,34 @@ fn app_add_block(ui: &mut egui::Ui) -> bool {
 /// the sequence when design 8a split `Autofill targets` from `Fill rule`, and
 /// a function that still asked for a palette it never showed would be the next
 /// reader's fifteen minutes.
+///
+/// # What 8a's `Native apps` row draws that this does not
+///
+/// 8a draws each app as one line: a 30-point monogram tile, a box holding the
+/// app's name with its executable in a mono chip (`Ledgerline Desktop
+/// \u{2007}ledgerline.exe`), a 150-point dropdown reading `Process name` or
+/// `Process + title`, and a `\u{2715}`; under the rows, `+ Pick a running
+/// window` beside `or type a process name`. This block draws the app's name
+/// and icon, then its window title, program file, arguments and a Remove --
+/// and the two differences are recorded here rather than left to be found:
+///
+/// * **There is no match-mode dropdown because there is no match mode.**
+///   [`AppMatch`] carries a process and, for a hosted frame only, a title;
+///   which of the two the matcher uses is decided by
+///   [`AppMatch::hosted`] and not by a setting (see
+///   [`AppMatchDraft::choose_window`], the one writer of `title`). A
+///   dropdown offering `Process + title` on an unhosted app would set a value
+///   `match_engine` never reads -- the drawn-and-dead control this file
+///   refuses everywhere.
+/// * **The program file and arguments are drawn and 8a's row has no room
+///   for them**, because 8a's binding is a process name and this app's is a
+///   launchable path: the read pane's open-the-matched-app action
+///   (`detail::OPEN_APP_CHORD`) starts the program from
+///   [`AppMatch::launchable_path`] when it is not running, and a row that
+///   could not say WHICH program would be a row that could not do that.
+///
+/// `+ Pick a running window` is `Choose a running app\u{2026}` below, and
+/// `or type a process name` is the program-file box itself.
 fn app_block(
     ui: &mut egui::Ui,
     app: &mut AppMatchDraft,
@@ -5888,7 +5983,7 @@ fn app_block(
         // identify a suspended Store app. Typing over it would be typing a new
         // identity for something that is not there to check it against.
         theme::disabled_field_label(ui, APP_WINDOW_LABEL);
-        theme::disabled_text_field(ui, &app.title);
+        theme::section_disabled_text_field(ui, &app.title);
         ui.add_space(10.0);
     }
 
@@ -5896,7 +5991,7 @@ fn app_block(
     let path_row = app_path_row(app.hosted);
     match path_row {
         AppPathRow::Editable => {
-            if theme::text_field(ui, &mut app.path, false).changed() {
+            if theme::section_text_field(ui, &mut app.path, false).changed() {
                 // `process` is re-derived on every keystroke, which is what
                 // keeps `launchable_path`'s file-name tie-back satisfiable --
                 // see `AppMatchDraft::set_path`.
@@ -5905,7 +6000,7 @@ fn app_block(
             }
         }
         AppPathRow::NotApplicable(text) => {
-            theme::disabled_text_field(ui, text);
+            theme::section_disabled_text_field(ui, text);
         }
     }
     ui.add_space(6.0);
@@ -5975,13 +6070,13 @@ fn app_block(
     theme::field_label(ui, APP_ARGS_LABEL);
     match path_row {
         AppPathRow::Editable => {
-            theme::text_field(ui, &mut app.args, false);
+            theme::section_text_field(ui, &mut app.args, false);
         }
         // A Store app is not started by path, so there is no command line to
         // give it. Disabled for the same reason the path box is, and saying so
         // in the same words.
         AppPathRow::NotApplicable(_) => {
-            theme::disabled_text_field(ui, APP_ARGS_STORE_APP);
+            theme::section_disabled_text_field(ui, APP_ARGS_STORE_APP);
         }
     }
     ui.add_space(4.0);
@@ -6346,15 +6441,32 @@ fn section<R>(
         // be narrower than the card above it -- a grid whose columns do not
         // line up, which is worse than the flat column it replaced.
         ui.set_width(ui.available_width());
-        theme::section_card_header(ui, section.title(kind), section.note(), changed);
-        theme::section_card_body(ui, add)
+        // **8a's `padding: 11px 16px` / `12px 16px`, at the width this card
+        // is being drawn at.** The bands are asked at the padding
+        // `theme::section_card_pad_x` answers for THIS card's width, on this
+        // frame -- 16 in the shipped pane, 12 at the window's floor -- for the
+        // reason that function's doc gives. Both bands read the same width so
+        // the title and the rows under it start on one vertical line.
+        let pad_x = theme::section_card_pad_x(ui.available_width());
+        theme::section_card_header_at(ui, pad_x, section.title(kind), section.note(), changed);
+        theme::section_card_body_at(ui, pad_x, add)
     });
     if wanted == Some(section) {
         // `Align::TOP`: the rail says "take me to this section", and a card
         // centred in the viewport puts its title band off the top of it.
         ui.scroll_to_rect(rect, Some(egui::Align::TOP));
     }
-    ui.add_space(theme::SECTION_GAP);
+    // 8a's `gap: 14px` down the card column -- `theme::SECTION_COLUMN_GAP`,
+    // and not the `SECTION_GAP` the sequence builder's cards keep; see the
+    // two constants for why the builder does not move with this form.
+    //
+    // **Net of `item_spacing.y`**, which egui has already put under the card
+    // by the time this runs: a `Frame` is an allocated widget and the layout
+    // spaces after it. `SECTION_GAP` never subtracted that, so the column
+    // was drawn at 8 + 12 = 20 while its constant said 12 -- measured, not
+    // inferred, by `the_card_column_is_20_under_the_strip_and_its_cards_14_apart`
+    // on its first run.
+    ui.add_space(theme::SECTION_COLUMN_GAP - ui.spacing().item_spacing.y);
     inner
 }
 
@@ -6407,6 +6519,10 @@ fn history_rows(
     rows.push(("Filled", fill_count_label(fills)));
     rows
 }
+
+/// The gap between two rows of the `History` card: 8a's `gap: 8px 16px` on
+/// its facts grid, in the vertical.
+const HISTORY_ROW_GAP: f32 = 8.0;
 
 /// 8a's `3 previous`, with the word agreeing with the number.
 fn previous_password_count(previous: usize) -> String {
@@ -6742,7 +6858,17 @@ pub fn draw_detail_edit(
     // The strip's `border-bottom: 1px solid #eae7e7`, exactly as the read
     // pane closes its own.
     theme::hairline(ui);
-    ui.add_space(12.0);
+    // 8a's body `padding: 20px 28px 0`: the column's top inset, between the
+    // strip's rule and the first card. The horizontal half is the pane's own
+    // central-panel margin, applied outside this `Ui`, and is the read pane's
+    // 24 rather than 8a's 28 -- the same inset the footer below reports
+    // spending elsewhere, and for the same reason: this form is a pane in the
+    // vault window and takes that window's margin, not a whole window's.
+    //
+    // Net of the `item_spacing.y` the rule above has already been followed
+    // by, so the drawn gap is the constant and not the constant plus eight.
+    // See `theme::SECTION_COLUMN_TOP` for what the old `12` here really drew.
+    ui.add_space(theme::SECTION_COLUMN_TOP - ui.spacing().item_spacing.y);
 
 
     // A create of a kind `NewItem` cannot express has no payload at all (see
@@ -6865,14 +6991,26 @@ pub fn draw_detail_edit(
             let summary = change_summary(&changes, &draft.password);
             let summary_width = theme::form_footer_note_width(ui, &summary);
             let note_width = theme::form_footer_note_width(ui, SYNC_NOTE);
-            let gap = ui.spacing().item_spacing.x;
+            // 8a's `gap: 10px` between the two buttons, and it is the SAME
+            // number the row below sets as its item spacing -- so the width
+            // measured here is the width laid out there.
+            let gap = theme::SECTION_FOOTER_GAP;
             // What the two buttons will take, laid out before either is drawn.
             // `theme::action_button_width` is the measurement both of them are
             // built from, so this is the width they really occupy rather than
-            // a guess that a longer caption would invalidate.
-            let buttons = theme::action_button_width(ui.painter(), save_label(draft), 14.0)
-                + gap
-                + theme::action_button_width(ui.painter(), CANCEL_BUTTON, 14.0);
+            // a guess that a longer caption would invalidate -- and its pad is
+            // the buttons' own `SECTION_FOOTER_BUTTON_PAD_X`, which is what
+            // makes that sentence true rather than approximately true.
+            let buttons = theme::action_button_width(
+                ui.painter(),
+                save_label(draft),
+                theme::SECTION_FOOTER_BUTTON_PAD_X,
+            ) + gap
+                + theme::action_button_width(
+                    ui.painter(),
+                    CANCEL_BUTTON,
+                    theme::SECTION_FOOTER_BUTTON_PAD_X,
+                );
             let beside = ui.available_width() >= buttons + gap + 4.0 + summary_width;
             if !beside {
                 ui.label(RichText::new(summary.clone()).size(12.0).color(theme::TEXT_FAINT));
@@ -6880,6 +7018,9 @@ pub fn draw_detail_edit(
             }
 
             ui.horizontal(|ui| {
+                // 8a's `gap: 10px`. Scoped to this row, as every spacing
+                // change on this form is.
+                ui.spacing_mut().item_spacing.x = theme::SECTION_FOOTER_GAP;
                 // `min_size`, and the SAME height Cancel beside it gets from
                 // `theme::secondary_button`. Measured before this line
                 // existed: Save 26pt tall, Cancel 32, both starting at the
@@ -6916,17 +7057,26 @@ pub fn draw_detail_edit(
                 // (needs a name)" / `SAVE_TEMPLATE_BLOCKED`), which is how
                 // the strip says what is wrong beside the control it is wrong
                 // about; the width follows the label as it always did.
-                if theme::primary_button_enabled(
+                //
+                // **At 8a's own footer metrics** -- `height: 34px; padding:
+                // 0 14px; border-radius: 8px` -- through the two
+                // `section_footer_*` helpers, which are the pair above with
+                // the numbers changed and nothing else. They were
+                // `primary_button_enabled` and `secondary_button`, at
+                // `BUTTON_HEIGHT`'s 32 and radius 7, which is 3h's and 2b's
+                // toolbar button and not this footer's. See
+                // `theme::SECTION_FOOTER_BUTTON_HEIGHT` for the weight 8a
+                // draws on Save and why it is not drawn.
+                if theme::section_footer_primary_button(
                     ui,
                     save_label(draft),
-                    None,
                     draft.is_saveable() && creatable,
                 )
                 .clicked()
                 {
                     action = EditAction::Save;
                 }
-                if theme::secondary_button(ui, CANCEL_BUTTON).clicked() {
+                if theme::section_footer_secondary_button(ui, CANCEL_BUTTON).clicked() {
                     // **Not `EditAction::Cancel` outright.** A draft with
                     // unsaved edits asks first; an untouched one closes now.
                     // See `EditDraft::is_dirty` for why the gate is on the
@@ -7130,7 +7280,7 @@ pub fn draw_detail_edit(
                 });
                 ui.add_space(theme::BLOCK_GAP);
                 theme::section_row(ui, "Type", |ui| {
-                    theme::disabled_text_field(ui, kind_noun(kind));
+                    theme::section_disabled_text_field(ui, kind_noun(kind));
                 });
             });
 
@@ -7154,17 +7304,21 @@ pub fn draw_detail_edit(
                     // from `Slot::label`, so the Add menu could never name
                     // one of them differently from the row it reveals.
                     theme::section_row(ui, Slot::Username.label(), |ui| {
-                        theme::text_field(ui, &mut draft.username, false);
+                        theme::section_text_field(ui, &mut draft.username, false);
                     });
                     ui.add_space(theme::BLOCK_GAP);
 
                     theme::section_row(ui, Slot::Password.label(), |ui| {
-                        theme::password_field(
+                        theme::section_password_field(
                             ui,
                             &mut draft.password,
                             &mut draft.reveal_password,
                         );
-                        ui.add_space(8.0);
+                        // No `add_space` between the box and the meter: 8a's
+                        // control column is `gap: 8px`, and eight is what egui
+                        // has already put under the box as item spacing. The
+                        // `add_space(8.0)` that stood here drew the meter 16
+                        // under its box.
                         // **8a's strength meter, on the form that CHANGES the
                         // password.**
                         //
@@ -7403,7 +7557,7 @@ pub fn draw_detail_edit(
                             Slot::CardholderName.label(),
                             removable(Slot::CardholderName),
                             |ui| {
-                                theme::text_field(ui, &mut card.cardholder_name, false);
+                                theme::section_text_field(ui, &mut card.cardholder_name, false);
                             },
                         ) {
                             hide = Some(Slot::CardholderName);
@@ -7452,7 +7606,7 @@ pub fn draw_detail_edit(
                     ui.add_space(theme::BLOCK_GAP);
 
                     theme::section_row(ui, Slot::CardNumber.label(), |ui| {
-                        theme::password_field(ui, &mut card.number, &mut card.reveal_number);
+                        theme::section_password_field(ui, &mut card.number, &mut card.reveal_number);
                     });
                     // Every frame, unconditionally. `suggest_brand` is
                     // idempotent and returns immediately once the user has
@@ -7468,7 +7622,7 @@ pub fn draw_detail_edit(
                             Slot::CardExpMonth.label(),
                             removable(Slot::CardExpMonth),
                             |ui| {
-                                theme::text_field(ui, &mut card.exp_month, false);
+                                theme::section_text_field(ui, &mut card.exp_month, false);
                             },
                         ) {
                             hide = Some(Slot::CardExpMonth);
@@ -7482,7 +7636,7 @@ pub fn draw_detail_edit(
                             Slot::CardExpYear.label(),
                             removable(Slot::CardExpYear),
                             |ui| {
-                                theme::text_field(ui, &mut card.exp_year, false);
+                                theme::section_text_field(ui, &mut card.exp_year, false);
                             },
                         ) {
                             hide = Some(Slot::CardExpYear);
@@ -7496,7 +7650,7 @@ pub fn draw_detail_edit(
                             Slot::CardCode.label(),
                             removable(Slot::CardCode),
                             |ui| {
-                                theme::password_field(ui, &mut card.code, &mut card.reveal_code);
+                                theme::section_password_field(ui, &mut card.code, &mut card.reveal_code);
                             },
                         ) {
                             hide = Some(Slot::CardCode);
@@ -7523,7 +7677,7 @@ pub fn draw_detail_edit(
                             removable(Slot::CardBank),
                             |ui| {
                                 if creating {
-                                    theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                                    theme::section_disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
                                 } else {
                                     bank_domain_row(ui, card);
                                 }
@@ -7545,14 +7699,14 @@ pub fn draw_detail_edit(
                             removable(Slot::CardBillingZip),
                             |ui| {
                                 if creating {
-                                    theme::disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                                    theme::section_disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
                                 } else {
                                     // Free text, unlike the bank: a postcode
                                     // has no closed set to pick from, and a
                                     // wrong one fails in front of the user on
                                     // the payment form rather than silently
                                     // here.
-                                    theme::text_field(ui, &mut card.billing_zip, false);
+                                    theme::section_text_field(ui, &mut card.billing_zip, false);
                                 }
                             },
                         ) {
@@ -7576,7 +7730,7 @@ pub fn draw_detail_edit(
                             continue;
                         }
                         if slot_row(ui, field.label(), removable(slot), |ui| {
-                            theme::text_field(ui, value, false);
+                            theme::section_text_field(ui, value, false);
                         }) {
                             hide = Some(slot);
                         }
@@ -7599,12 +7753,19 @@ pub fn draw_detail_edit(
                     ui.add_space(theme::EYEBROW_GAP);
                     // A multiline box rather than `theme::text_field`: a
                     // secure note's body is the whole item and is routinely
-                    // several lines. `theme` has no multiline helper.
-                    ui.add(
-                        egui::TextEdit::multiline(&mut draft.note_body)
-                            .desired_width(ui.available_width())
-                            .desired_rows(8),
-                    );
+                    // several lines.
+                    //
+                    // **`theme::text_area`, and not a bare
+                    // `egui::TextEdit::multiline`.** The comment here used to
+                    // say "`theme` has no multiline helper", which was true
+                    // when it was written and is not now: the Send composer
+                    // grew one for exactly the defect this box had -- egui's
+                    // own frame, egui's own radius and none of the focus halo,
+                    // next to boxes that have all three. 8a's notes box is
+                    // `border: 1px solid #d7d3d3; border-radius: 8px; padding:
+                    // 10px 11px`, which is the design's field box eight rows
+                    // tall, and `text_area` is that box.
+                    theme::text_area(ui, &mut draft.note_body, "", 8);
                     ui.add_space(theme::BLOCK_GAP);
                 }
                 FormBody::SshKey => {
@@ -7626,7 +7787,7 @@ pub fn draw_detail_edit(
                         // reveal. Multiline would suit a PEM block better, but
                         // `theme` has no masked multiline box and an unmasked
                         // one would show the key by default.
-                        theme::password_field(
+                        theme::section_password_field(
                             ui,
                             &mut ssh.private_key,
                             &mut ssh.reveal_private_key,
@@ -7635,12 +7796,12 @@ pub fn draw_detail_edit(
                     ui.add_space(theme::BLOCK_GAP);
 
                     slot_row(ui, Slot::SshPublicKey.label(), false, |ui| {
-                        theme::text_field(ui, &mut ssh.public_key, false);
+                        theme::section_text_field(ui, &mut ssh.public_key, false);
                     });
                     ui.add_space(theme::BLOCK_GAP);
 
                     slot_row(ui, Slot::SshFingerprint.label(), false, |ui| {
-                        theme::text_field(ui, &mut ssh.key_fingerprint, false);
+                        theme::section_text_field(ui, &mut ssh.key_fingerprint, false);
                     });
                     ui.add_space(theme::BLOCK_GAP);
                 }
@@ -7680,6 +7841,23 @@ pub fn draw_detail_edit(
             // credentials one, because it is the second factor and not part of
             // the first: a user changing a password must not be one mis-click
             // from replacing the seed that lets them back in.
+            //
+            // **What 8a draws on this card that this does not.** 8a's row is
+            // a live readout -- `482 913` in 18-point mono, a 96-by-4
+            // countdown bar, `18 s`, `SHA1` and `6 \u{b7} 30 s` chips -- with
+            // `Replace by scanning` and `Remove` beside it, and a `2FA` chip
+            // on the title band. This card draws the seed, masked, with its
+            // Remove in the label cell. The readout is not drawn because
+            // this form does not fetch codes: the one `detail::TotpState` in
+            // the window is the READ pane's poll, and `edit_time_totp` says
+            // why the editor treats every moment-dependent state of it as a
+            // stand-in rather than a fact about the item. The `SHA1` /
+            // `6 \u{b7} 30 s` chips would need the seed parsed, and this form
+            // carries the seed as the bytes the vault holds -- an
+            // `otpauth://` link or a bare base32 key, whichever the site gave
+            // -- without reading either. `Replace by scanning` names a QR
+            // scanner this build does not have. What is kept is the part a
+            // user can act on: the seed itself, and 8a's `Remove`.
             if showing(Slot::Totp) {
                 section(
                     ui,
@@ -7694,7 +7872,7 @@ pub fn draw_detail_edit(
                             removable(Slot::Totp),
                             |ui| {
                                 if creating {
-                                    theme::disabled_text_field(ui, TOTP_CREATE_NOTICE);
+                                    theme::section_disabled_text_field(ui, TOTP_CREATE_NOTICE);
                                 } else {
                                     // Masked, like the password and for the
                                     // same reason: it is a secret, and this
@@ -7704,7 +7882,7 @@ pub fn draw_detail_edit(
                                     // `text_field` here is the mutation
                                     // `the_totp_seed_is_masked_and_never_painted_in_the_clear`
                                     // exists to catch.
-                                    theme::password_field(
+                                    theme::section_password_field(
                                         ui,
                                         &mut draft.totp,
                                         &mut draft.reveal_totp,
@@ -7872,12 +8050,12 @@ pub fn draw_detail_edit(
                 section(ui, kind, Section::Notes, changed(Section::Notes), wanted, |ui| {
                     // The same multiline box the note kind gets, and for the
                     // same reason: notes run to several lines on any kind.
-                    // `theme` has no multiline helper, so this is egui's own.
-                    ui.add(
-                        egui::TextEdit::multiline(&mut draft.note_body)
-                            .desired_width(ui.available_width())
-                            .desired_rows(4),
-                    );
+                    // `theme::text_area` -- 8a's `border: 1px solid #d7d3d3;
+                    // border-radius: 8px` box -- and no longer egui's own
+                    // `TextEdit` frame; see the note kind's box for the
+                    // history. Four rows, which is about what 8a's box holds
+                    // beside the `Custom fields` card it shares a line with.
+                    theme::text_area(ui, &mut draft.note_body, "", 4);
                 });
             }
 
@@ -7897,9 +8075,12 @@ pub fn draw_detail_edit(
             // is.
             if let Some(line) = sharing_line(audience) {
                 section(ui, kind, Section::Sharing, false, wanted, |ui| {
-                    ui.label(
-                        RichText::new(line).size(12.0).color(theme::TEXT_SECONDARY),
-                    );
+                    // 8a's own last line on this card -- `Also visible to 14
+                    // people in Engineering.` -- is `font-size: 12px; color:
+                    // #7d7979`, which is `TEXT_FAINT`. It was `TEXT_SECONDARY`,
+                    // the ink of 8a's Send line above it, which this card
+                    // does not draw (see `sharing_line`).
+                    ui.label(RichText::new(line).size(12.0).color(theme::TEXT_FAINT));
                 });
             }
             let facts = history_rows(item, fills, history.len());
@@ -7907,12 +8088,24 @@ pub fn draw_detail_edit(
                 section(ui, kind, Section::History, false, wanted, |ui| {
                     for (index, (label, value)) in facts.iter().enumerate() {
                         if index > 0 {
-                            ui.add_space(theme::BLOCK_GAP);
+                            // 8a's `gap: 8px 16px` on the facts grid: eight
+                            // between rows, not the `BLOCK_GAP` a row of
+                            // fields gets -- these are lines of text, and at
+                            // 12 apart they read as separate paragraphs. Net
+                            // of the item spacing the row above has already
+                            // been followed by, which happens to BE eight, so
+                            // this adds nothing today and says so rather than
+                            // being deleted: the day `item_spacing` moves,
+                            // this row's gap stays 8a's.
+                            ui.add_space(HISTORY_ROW_GAP - ui.spacing().item_spacing.y);
                         }
+                        // The row is the form's own label column rather than
+                        // 8a's `grid-template-columns: 1fr 1fr`, so the
+                        // captions line up with every other caption on the
+                        // form; the VALUE is 8a's `font-size: 12px`, which is
+                        // the whole grid's size. It was 13.
                         theme::section_row(ui, label, |ui| {
-                            ui.label(
-                                RichText::new(value).size(13.0).color(theme::INK),
-                            );
+                            ui.label(RichText::new(value).size(12.0).color(theme::INK));
                         });
                     }
                 });
@@ -15382,11 +15575,13 @@ mod edit_pane_layout_tests {
                 "{name} is painted {save:?} beside Cancel's {cancel:?} -- the strip's two \
                  buttons are different sizes"
             );
+            // 8a's `height: 34px`, which is `SECTION_FOOTER_BUTTON_HEIGHT` and
+            // no longer `BUTTON_HEIGHT`'s 32 -- see that constant.
             assert!(
-                (save.height() - theme::BUTTON_HEIGHT).abs() <= 0.5,
-                "the strip is {}pt tall, not theme::BUTTON_HEIGHT ({})",
+                (save.height() - theme::SECTION_FOOTER_BUTTON_HEIGHT).abs() <= 0.5,
+                "the strip is {}pt tall, not theme::SECTION_FOOTER_BUTTON_HEIGHT ({})",
                 save.height(),
-                theme::BUTTON_HEIGHT
+                theme::SECTION_FOOTER_BUTTON_HEIGHT
             );
         }
     }
@@ -19190,6 +19385,308 @@ mod edit_pane_layout_tests {
                     painted.strings()
                 );
             }
+        }
+        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
+    }
+
+    // -----------------------------------------------------------------
+    // Design 8a -- the numbers, measured off the paint
+    // -----------------------------------------------------------------
+    //
+    // Everything below pins a declaration of 8a's -- `padding: 11px 16px`,
+    // `gap: 16px`, `height: 34px`, `gap: 3px` -- against the rectangle or
+    // glyph the frame really drew, in the harness the tests above already
+    // use. Each was found off by a few points when the form was put beside
+    // the design, and a number that was silently 14 once can be silently 14
+    // again.
+
+    /// The smallest white card containing `inner`: `theme::CARD` fill, wider
+    /// than the run by more than a caption's worth of padding. The same
+    /// search `every_section_card_is_titled_and_carries_the_designs_own_edge`
+    /// makes, taking the smallest rather than the first so the pane's own
+    /// white bands cannot answer for a card.
+    fn card_around(painted: &Painted, inner: Rect) -> Rect {
+        let mut found: Vec<Rect> = painted
+            .rects
+            .iter()
+            .filter(|(r, fill)| {
+                *fill == theme::CARD && r.contains_rect(inner) && r.width() > inner.width() + 24.0
+            })
+            .map(|(r, _)| *r)
+            .collect();
+        found.sort_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())));
+        *found.first().unwrap_or_else(|| panic!("no white card is painted around {inner:?}"))
+    }
+
+    /// The field BOX round the run painted from `text`: the smallest
+    /// `theme::CARD`-filled rect containing it.
+    ///
+    /// Not [`Painted::frame_around`], which answers with the smallest rect of
+    /// any fill -- and the smallest rect round a field's text is the
+    /// `TextEdit`'s own empty frame, one line tall and ten points in from the
+    /// box's edge. Measured against that, a 34-point box reads as 14 and its
+    /// left edge as ten points right of where it is; the first run of the
+    /// two field tests below reported exactly those numbers.
+    ///
+    /// The run's RIGHT edge is deliberately not required to be inside the
+    /// box. A `TextEdit` lays its galley out unwrapped and clips it to the
+    /// box, so at the window's floor the name box is 79 points wide holding a
+    /// 107-point run -- the pill beside it claims its width first, see
+    /// `edit_header` -- and a box that contains the run's left edge and its
+    /// whole height is the box the run is in.
+    fn field_around(painted: &Painted, text: &str) -> Rect {
+        let inner = painted.rect_of(text);
+        let mut found: Vec<Rect> = painted
+            .rects
+            .iter()
+            .filter(|(r, fill)| {
+                *fill == theme::CARD
+                    && r.min.x <= inner.min.x + 1.0
+                    && r.max.x > inner.min.x
+                    && r.min.y <= inner.min.y + 1.0
+                    && r.max.y >= inner.max.y - 1.0
+            })
+            .map(|(r, _)| *r)
+            .collect();
+        found.sort_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())));
+        *found
+            .first()
+            .unwrap_or_else(|| panic!("no white box is painted around {text:?} at {inner:?}"))
+    }
+
+    /// **8a's `padding: 11px 16px` on the title band and `12px 16px` on the
+    /// rows, at the width 8a draws them -- and 12 where the card cannot
+    /// afford 16.** `theme::section_card_pad_x`, measured off the paint at
+    /// both of the widths the window really has.
+    ///
+    /// Two runs are measured on the same card, the band's title and the
+    /// first row's caption, because the two bands are two `inner_margin`
+    /// calls: a header at 16 over rows at 12 is the defect asking both at one
+    /// width exists to prevent, and it would not show in either run alone.
+    #[test]
+    fn the_section_cards_take_8as_padding_at_the_width_8a_draws_them() {
+        let mut panes = 0;
+        for (pane, expected) in [
+            (GRID_PANE, theme::SECTION_CARD_PAD_X_WIDE),
+            (GRID_MIN_PANE, theme::SECTION_CARD_PAD_X),
+        ] {
+            panes += 1;
+            let ctx = styled_context(pane);
+            let mut draft = full_login_draft();
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+            let title = painted.rect_of(&Section::Item.title(draft.kind).to_uppercase());
+            let card = card_around(&painted, title);
+            let expected = f32::from(expected);
+            assert!(
+                (title.left() - card.left() - expected).abs() <= 0.5,
+                "{pane:?}: the ITEM band's title starts {} in from the card's edge, not 8a's {}",
+                title.left() - card.left(),
+                expected
+            );
+            let caption = painted.rect_of("Folder");
+            assert!(
+                (caption.left() - card.left() - expected).abs() <= 0.5,
+                "{pane:?}: the first row's caption starts {} in from the card's edge, not {} -- \
+                 the rows are not padded like the band above them",
+                caption.left() - card.left(),
+                expected
+            );
+        }
+        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
+    }
+
+    /// **A row's box is 8a's `height: 34px`, and the name box in the title bar
+    /// is still the design's 38.**
+    ///
+    /// Both are asserted, because the fix that put the rows at 34 could have
+    /// been a change to `theme::FIELD_HEIGHT` -- which would have taken the
+    /// title bar, the login window and the overlay down with it -- and a
+    /// test of the rows alone would be green after that too.
+    #[test]
+    fn a_row_field_is_8as_34_points_and_the_name_box_is_the_designs_38() {
+        let mut panes = 0;
+        for pane in GRID_PANES {
+            panes += 1;
+            let ctx = styled_context(pane);
+            let mut draft = full_login_draft();
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+            let username = field_around(&painted, "a.novak@ledgerline.com");
+            assert!(
+                (username.height() - theme::SECTION_FIELD_HEIGHT).abs() <= 0.5,
+                "{pane:?}: the user-name box is {}pt tall, not 8a's `height: 34px` ({})",
+                username.height(),
+                theme::SECTION_FIELD_HEIGHT
+            );
+            let name = field_around(&painted, "Ledgerline");
+            assert!(
+                (name.height() - theme::FIELD_HEIGHT).abs() <= 0.5,
+                "{pane:?}: the name box is {}pt tall, not 8a's `height: 38px` ({}) -- the row \
+                 height has leaked into the title bar",
+                name.height(),
+                theme::FIELD_HEIGHT
+            );
+        }
+        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
+    }
+
+    /// **The label column is 8a's `width: 130px` and the gap after it 8a's
+    /// `gap: 16px`**, measured from a caption's left edge to its box's --
+    /// in the shipped pane, which is the one wide enough for the row to be a
+    /// row at all.
+    #[test]
+    fn a_rows_control_starts_130_and_16_in_from_its_caption() {
+        let ctx = styled_context(GRID_PANE);
+        let mut draft = full_login_draft();
+        let _ = frame(&ctx, GRID_PANE, &mut draft, false, &[]);
+        let painted = frame(&ctx, GRID_PANE, &mut draft, false, &[]);
+        assert!(
+            theme::section_rows_fit_at(GRID_PANE.x),
+            "the shipped pane is too narrow for a label column, so this measures nothing"
+        );
+
+        let caption = painted.rect_of(Slot::Username.label());
+        let field = field_around(&painted, "a.novak@ledgerline.com");
+        let expected = theme::SECTION_LABEL_WIDTH + theme::SECTION_ROW_GAP;
+        assert!(
+            (field.left() - caption.left() - expected).abs() <= 0.5,
+            "the user-name box starts {} right of its caption, not 130 + 16 = {expected}",
+            field.left() - caption.left()
+        );
+        assert_eq!(theme::SECTION_ROW_GAP, 16.0, "8a's `gap: 16px` on every row");
+    }
+
+    /// **The footer's two buttons are 8a's `height: 34px`, `gap: 10px`
+    /// apart.** `the_button_strips_controls_share_one_baseline` holds them to
+    /// one height; this holds that height and the gap to the design's own
+    /// numbers.
+    #[test]
+    fn the_footer_buttons_are_8as_34_points_and_10_apart() {
+        let ctx = styled_context(ROOMY_PANE);
+        let mut draft = full_login_draft();
+        let _ = frame(&ctx, ROOMY_PANE, &mut draft, false, &[]);
+        let painted = frame(&ctx, ROOMY_PANE, &mut draft, false, &[]);
+
+        let save = painted.frame_around(painted.rect_of(SAVE_BUTTON));
+        let cancel = painted.frame_around(painted.rect_of(CANCEL_BUTTON));
+        for (name, rect) in [(SAVE_BUTTON, save), (CANCEL_BUTTON, cancel)] {
+            assert!(
+                (rect.height() - theme::SECTION_FOOTER_BUTTON_HEIGHT).abs() <= 0.5,
+                "{name:?} is {}pt tall, not 8a's `height: 34px`",
+                rect.height()
+            );
+        }
+        assert!(
+            (cancel.left() - save.right() - theme::SECTION_FOOTER_GAP).abs() <= 0.5,
+            "Cancel starts {} right of Save's edge, not 8a's `gap: 10px`",
+            cancel.left() - save.right()
+        );
+        assert_eq!(theme::SECTION_FOOTER_BUTTON_HEIGHT, 34.0);
+        assert_eq!(theme::SECTION_FOOTER_GAP, 10.0);
+    }
+
+    /// **The strength meter's bars are 8a's `width: 26px; height: 4px`, 3
+    /// apart, with the word 12 after the last one.**
+    ///
+    /// Found by geometry, because a bar paints no string: four `theme::BLUE`
+    /// rectangles of exactly the bar's size, on a password strong enough to
+    /// fill all four.
+    #[test]
+    fn the_strength_bars_sit_3_apart_and_the_word_12_after_them() {
+        let mut panes = 0;
+        for pane in GRID_PANES {
+            panes += 1;
+            let ctx = styled_context(pane);
+            let mut draft = EditDraft::from_item(&a_login());
+            draft.password = "correct-horse-battery-staple-7".to_string();
+            assert_eq!(
+                password_strength::rate(&draft.password),
+                password_strength::Strength::Strong,
+                "the fixture wants a password that fills every bar"
+            );
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+            let mut bars: Vec<Rect> = painted
+                .rects
+                .iter()
+                .filter(|(r, fill)| {
+                    *fill == theme::BLUE
+                        && (r.width() - theme::STRENGTH_BAR.x).abs() <= 0.5
+                        && (r.height() - theme::STRENGTH_BAR.y).abs() <= 0.5
+                })
+                .map(|(r, _)| *r)
+                .collect();
+            bars.sort_by(|a, b| a.left().total_cmp(&b.left()));
+            assert_eq!(
+                bars.len(),
+                theme::STRENGTH_BARS,
+                "{pane:?}: expected four filled bars, found {bars:?}"
+            );
+            for pair in bars.windows(2) {
+                assert!(
+                    (pair[1].left() - pair[0].right() - 3.0).abs() <= 0.5,
+                    "{pane:?}: two bars are {} apart, not 8a's `gap: 3px`",
+                    pair[1].left() - pair[0].right()
+                );
+            }
+            let word = painted
+                .texts
+                .iter()
+                .find(|(t, _)| t.starts_with(password_strength::Strength::Strong.label()))
+                .map(|(_, r)| *r)
+                .expect("a strong password draws its rating");
+            assert!(
+                (word.left() - bars[bars.len() - 1].right() - 12.0).abs() <= 1.0,
+                "{pane:?}: the rating starts {} after the last bar, not 8a's `gap: 12px`",
+                word.left() - bars[bars.len() - 1].right()
+            );
+        }
+        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
+    }
+
+    /// **The card column stands 8a's `padding: 20px` off the strip's rule,
+    /// and its cards sit 8a's `gap: 14px` apart.**
+    ///
+    /// The rule is the topmost `theme::HAIRLINE` line; the first card is the
+    /// white card round `ITEM`, the second the one round the credentials
+    /// title. Both gaps used to be 12, which was neither 8a's number nor the
+    /// read pane's.
+    #[test]
+    fn the_card_column_is_20_under_the_strip_and_its_cards_14_apart() {
+        let mut panes = 0;
+        for pane in GRID_PANES {
+            panes += 1;
+            let ctx = styled_context(pane);
+            let mut draft = full_login_draft();
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+            let rule = painted
+                .rects
+                .iter()
+                .filter(|(r, fill)| *fill == theme::HAIRLINE && r.height() <= 1.5)
+                .map(|(r, _)| *r)
+                .min_by(|a, b| a.top().total_cmp(&b.top()))
+                .expect("the strip is closed by a hairline");
+            let item = card_around(&painted, painted.rect_of(&Section::Item.title(draft.kind).to_uppercase()));
+            assert!(
+                (item.top() - rule.bottom() - theme::SECTION_COLUMN_TOP).abs() <= 0.5,
+                "{pane:?}: the first card starts {} under the strip's rule, not 8a's 20",
+                item.top() - rule.bottom()
+            );
+            let details = card_around(
+                &painted,
+                painted.rect_of(&Section::Details.title(draft.kind).to_uppercase()),
+            );
+            assert!(
+                (details.top() - item.bottom() - theme::SECTION_COLUMN_GAP).abs() <= 0.5,
+                "{pane:?}: the second card starts {} under the first, not 8a's `gap: 14px`",
+                details.top() - item.bottom()
+            );
         }
         assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
     }

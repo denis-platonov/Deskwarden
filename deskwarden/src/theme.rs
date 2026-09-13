@@ -2074,6 +2074,66 @@ pub fn primary_button_matching_field(ui: &mut Ui, label: &str) -> Response {
     primary_button_with_metrics(ui, label, None, SEARCH_FIELD_HEIGHT, 8, true)
 }
 
+/// §8a's footer buttons: `height: 34px; padding: 0 14px; border-radius: 8px`
+/// on both `Save changes` and `Cancel`, with `gap: 10px` between them.
+///
+/// **Not [`BUTTON_HEIGHT`]'s 32 and 7**, which is what the edit form's footer
+/// drew until it was measured against §8a: two points shorter and one point
+/// squarer than the design, on the two controls the whole form ends in. They
+/// are 2b's `+ New` metrics exactly ([`primary_button_matching_field`]), which
+/// is not a coincidence the constants lean on -- §8a declares its own numbers
+/// and these are those, named for the footer they belong to.
+///
+/// `Save changes` is `font-weight: 700` in §8a and `Cancel` 600; both are
+/// drawn in [`semibold`] here, deliberately. The owner's report on this very
+/// footer was "one bold and not bold now for some reason", and
+/// `detail_edit`'s `the_two_footer_buttons_are_set_in_one_face` pins the two
+/// to one face on that ground; a weight the design draws and the owner has
+/// asked not to see is the owner's call.
+pub const SECTION_FOOTER_BUTTON_HEIGHT: f32 = 34.0;
+/// See [`SECTION_FOOTER_BUTTON_HEIGHT`].
+pub const SECTION_FOOTER_BUTTON_RADIUS: u8 = 8;
+/// §8a's `padding: 0 14px` on both footer buttons -- two more than the
+/// style's `button_padding`, and set on the buttons themselves so the width
+/// [`action_button_width`] measures for the footer's line-fitting is the
+/// width the buttons then take.
+pub const SECTION_FOOTER_BUTTON_PAD_X: f32 = 14.0;
+/// §8a's `gap: 10px` between the footer's two answers.
+pub const SECTION_FOOTER_GAP: f32 = 10.0;
+
+/// [`primary_button_enabled`] at §8a's footer metrics. See
+/// [`SECTION_FOOTER_BUTTON_HEIGHT`].
+pub fn section_footer_primary_button(ui: &mut Ui, label: &str, enabled: bool) -> Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding.x = SECTION_FOOTER_BUTTON_PAD_X;
+        primary_button_with_metrics(
+            ui,
+            label,
+            None,
+            SECTION_FOOTER_BUTTON_HEIGHT,
+            SECTION_FOOTER_BUTTON_RADIUS,
+            enabled,
+        )
+    })
+    .inner
+}
+
+/// [`secondary_button`] at §8a's footer metrics. See
+/// [`SECTION_FOOTER_BUTTON_HEIGHT`].
+pub fn section_footer_secondary_button(ui: &mut Ui, label: &str) -> Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding.x = SECTION_FOOTER_BUTTON_PAD_X;
+        ui.add(
+            egui::Button::new(semibold(label, 13.0).color(INK))
+                .fill(CARD)
+                .stroke(Stroke::new(1.0, BORDER_STRONG))
+                .corner_radius(CornerRadius::same(SECTION_FOOTER_BUTTON_RADIUS))
+                .min_size(Vec2::new(0.0, SECTION_FOOTER_BUTTON_HEIGHT)),
+        )
+    })
+    .inner
+}
+
 /// The filled button that confirms **destroying** something -- today, the
 /// delete modal's confirm and nothing else.
 ///
@@ -5711,6 +5771,18 @@ pub fn text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
     field_box(ui, value, FieldShape { password, ..FieldShape::wide(ui) }).0
 }
 
+/// [`text_field`] **in a §8a section row**: the same box at
+/// [`SECTION_FIELD_HEIGHT`] with [`SECTION_FIELD_PX`] text.
+///
+/// The one place the edit form's boxes differ from the login window's, and
+/// the reason is in [`SECTION_FIELD_HEIGHT`]'s doc. Everything else -- the
+/// fill, the border, the radius, the focus halo, the 10-point inset -- is
+/// [`field_box`]'s, so a row box is visibly the same control as the name box
+/// above it, four points shorter.
+pub fn section_text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
+    field_box(ui, value, FieldShape { password, ..FieldShape::section(ui) }).0
+}
+
 /// §8a's item-name box: the record's own name, set as the heading it is.
 ///
 /// `font-size: 20px; font-weight: 800` inside the design's ordinary field, at
@@ -5899,9 +5971,26 @@ fn field_border(ui: &Ui, outer: Rect, focused: bool) -> Stroke {
 /// (3h's master-password input). Same box treatment as [`text_field`];
 /// `revealed` is the caller's persistent toggle state.
 pub fn password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> Response {
+    password_field_shaped(ui, value, revealed, FieldShape::wide(ui))
+}
+
+/// [`password_field`] **in a §8a section row**, at [`SECTION_FIELD_HEIGHT`].
+/// See [`section_text_field`].
+pub fn section_password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> Response {
+    password_field_shaped(ui, value, revealed, FieldShape::section(ui))
+}
+
+/// Both password fields, in one body: the box `shape` describes, masked
+/// unless `revealed`, with the in-field toggle on its right.
+fn password_field_shaped(
+    ui: &mut Ui,
+    value: &mut String,
+    revealed: &mut bool,
+    shape: FieldShape<'_>,
+) -> Response {
     // The wide right inset keeps typed text from running under the toggle.
     let (response, box_rect) =
-        field_box(ui, value, FieldShape { password: !*revealed, right_pad: 52.0, ..FieldShape::wide(ui) });
+        field_box(ui, value, FieldShape { password: !*revealed, right_pad: 52.0, ..shape });
 
     // 3h's in-field reveal: a click-sensing label, not a Button, so no
     // padding or fill fights the field it sits inside.
@@ -5956,7 +6045,15 @@ pub fn masked_readout() -> String {
 /// same way here. Nothing is allocated with a `Sense::click`, so the pointer
 /// passes over this box as if it were background.
 pub fn disabled_text_field(ui: &mut Ui, text: &str) -> Rect {
-    disabled_field_box(ui, text, 10.0)
+    disabled_field_box(ui, text, 10.0, FIELD_HEIGHT, 14.0)
+}
+
+/// [`disabled_text_field`] **in a §8a section row**: the greyed box at
+/// [`SECTION_FIELD_HEIGHT`] with [`SECTION_FIELD_PX`] text, so a row the
+/// form cannot edit -- the `Item` card's `Type`, a create form's website --
+/// is the same height as the rows it can.
+pub fn section_disabled_text_field(ui: &mut Ui, text: &str) -> Rect {
+    disabled_field_box(ui, text, 10.0, SECTION_FIELD_HEIGHT, SECTION_FIELD_PX)
 }
 
 /// [`password_field`]'s box while an attempt is in flight: [`masked_readout`]
@@ -5972,7 +6069,7 @@ pub fn disabled_text_field(ui: &mut Ui, text: &str) -> Rect {
 /// they submitted, so "Hide" would be offering to hide something already
 /// hidden.
 pub fn disabled_password_field(ui: &mut Ui) -> Rect {
-    let box_rect = disabled_field_box(ui, &masked_readout(), 52.0);
+    let box_rect = disabled_field_box(ui, &masked_readout(), 52.0, FIELD_HEIGHT, 14.0);
     let label = ui.painter().layout_no_wrap(
         "Show".to_string(),
         FontId::new(11.0, FontFamily::Name(SEMIBOLD.into())),
@@ -5997,9 +6094,9 @@ pub fn disabled_password_field(ui: &mut Ui) -> Rect {
 /// [`CANVAS`] instead of [`CARD`], [`BORDER`] instead of [`BORDER_STRONG`],
 /// [`TEXT_GHOST`] instead of the ambient body colour. Any one of them alone
 /// reads as a styling accident rather than as a control that is switched off.
-fn disabled_field_box(ui: &mut Ui, text: &str, right_pad: f32) -> Rect {
+fn disabled_field_box(ui: &mut Ui, text: &str, right_pad: f32, height: f32, font_px: f32) -> Rect {
     let (outer, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), FIELD_HEIGHT),
+        Vec2::new(ui.available_width(), height),
         // Hover, NOT click: this box is not a control, and giving it a click
         // sense is how a disabled field starts swallowing the clicks meant
         // for whatever is behind or beside it.
@@ -6018,7 +6115,7 @@ fn disabled_field_box(ui: &mut Ui, text: &str, right_pad: f32) -> Rect {
     // straight through the bottom border and on down the card.
     let mut job = egui::text::LayoutJob::single_section(
         text.to_string(),
-        egui::TextFormat::simple(FontId::new(14.0, FontFamily::Proportional), TEXT_GHOST),
+        egui::TextFormat::simple(FontId::new(font_px, FontFamily::Proportional), TEXT_GHOST),
     );
     job.wrap = egui::text::TextWrapping::truncate_at_width(
         (outer.width() - 10.0 - right_pad).max(0.0),
@@ -6076,6 +6173,17 @@ impl<'a> FieldShape<'a> {
             height: FIELD_HEIGHT,
             right_pad: 10.0,
             font: FontId::new(14.0, FontFamily::Proportional),
+        }
+    }
+
+    /// §8a's row field: [`Self::wide`] at [`SECTION_FIELD_HEIGHT`] with
+    /// [`SECTION_FIELD_PX`] text. See [`SECTION_FIELD_HEIGHT`] for why the
+    /// two are not one box.
+    fn section(ui: &Ui) -> Self {
+        Self {
+            height: SECTION_FIELD_HEIGHT,
+            font: FontId::new(SECTION_FIELD_PX, FontFamily::Proportional),
+            ..Self::wide(ui)
         }
     }
 }
@@ -6672,8 +6780,8 @@ pub fn form_footer_note_width(ui: &Ui, text: &str) -> f32 {
 pub const SECTION_CARD_RADIUS: u8 = 10;
 
 /// §8a's `padding: 11px 16px` header and `12px 16px` rows, in the horizontal
-/// axis: **12, and not §8a's 16**, for exactly the reason
-/// [`FORM_CARD_PAD_X`]'s doc argues at length and which is sharper here.
+/// axis, **for a card too narrow to draw at 16**. See [`section_card_pad_x`],
+/// which is what the edit form's bands actually ask.
 ///
 /// §8a is drawn at 1240 points with a 1028-point card column. This card is
 /// drawn in the vault window's DETAIL PANE, which is 298 points at
@@ -6686,7 +6794,53 @@ pub const SECTION_CARD_RADIUS: u8 = 10;
 /// it, because two cards in one app padded to two different numbers is the
 /// drift this module exists to prevent, and neither design's number is more
 /// right than the other's at 298 points.
+///
+/// **This used to be the card's ONLY padding**, and its doc used to end on
+/// that last sentence as if it settled the wide case too. It did not: the
+/// shipped detail pane at the 1240-point window is 638 points, the card in it
+/// 628, and §8a's 16 fits there with room to spare -- so the form was drawing
+/// §8a's cards at a padding argued entirely from a width it is almost never
+/// at. That is the same history [`form_card_pad_x`] records for §5a's card,
+/// and it is resolved the same way. The sequence builder's rail cards still
+/// read this constant directly, through [`section_card_header`] and
+/// [`section_card_body`], because they are 252 points wide and the wide arm
+/// is not theirs.
 pub const SECTION_CARD_PAD_X: i8 = FORM_CARD_PAD_X;
+
+/// §8a's own horizontal padding, `padding: 11px 16px` on the header band and
+/// `12px 16px` on every row, **at the width the design draws it**.
+pub const SECTION_CARD_PAD_X_WIDE: i8 = 16;
+
+/// The width at which a section card takes §8a's 16.
+///
+/// [`FORM_CARD_WIDE_AT`]'s rule applied to this card's own design rather than
+/// its number borrowed: the narrowest card §8a draws at 16 is one half of its
+/// `grid-template-columns: 1fr 1fr; gap: 14px` pair -- `Custom fields` beside
+/// `Notes`, `Sharing` beside `History` -- inside a 1028-point column, which is
+/// (1028 - 14) / 2 = 507. §5a's 470 was considered and rejected: it is the
+/// narrowest card a DIFFERENT design draws at a DIFFERENT padding, and a
+/// threshold is only a measurement if it is measured off the thing it
+/// thresholds.
+///
+/// The read pane's cards, one click away, draw 2b's `padding: 11px 16px` at
+/// every width; above this line the two panes agree to the point, which is
+/// where the eye that just clicked Edit is.
+pub const SECTION_CARD_WIDE_AT: f32 = 507.0;
+
+/// **How much air a section card's bands put either side of their contents,
+/// for a card this wide.** [`form_card_pad_x`]'s rule for §8a's card:
+/// [`SECTION_CARD_PAD_X_WIDE`] from [`SECTION_CARD_WIDE_AT`] up,
+/// [`SECTION_CARD_PAD_X`] below it.
+///
+/// Asked of the width the band has to fill, on this frame, for the reason
+/// `form_card_pad_x` gives: the detail pane is resized with the window.
+pub fn section_card_pad_x(width: f32) -> i8 {
+    if width >= SECTION_CARD_WIDE_AT {
+        SECTION_CARD_PAD_X_WIDE
+    } else {
+        SECTION_CARD_PAD_X
+    }
+}
 
 /// §8a's header band padding: `padding: 11px 16px`.
 ///
@@ -6700,16 +6854,54 @@ pub const SECTION_CARD_HEADER_PAD_Y: i8 = 11;
 /// §8a's row band padding: `padding: 12px 16px`.
 pub const SECTION_CARD_PAD_Y: i8 = 12;
 
-/// The gap between one section card and the next. §8a's `gap: 14px` on the
-/// card column, drawn at the 12 [`BLOCK_GAP`] already sets for every other
-/// stacked block in this app.
+/// The gap between one section card and the next **in the sequence
+/// builder**, which is [`BLOCK_GAP`] -- the 12 every other stacked block in
+/// this app sits at.
 ///
-/// **The same constant, not a same-valued one.** A form whose cards sit 14
-/// apart and whose blocks inside them sit 12 apart is a form with two
-/// rhythms, and the two points are not visible at any width this pane is
-/// drawn at -- whereas the disagreement is visible the moment one of them
-/// moves.
+/// **The edit form no longer reads this.** It used to, on the argument that a
+/// form whose cards sit 14 apart and whose blocks inside them sit 12 apart is
+/// a form with two rhythms. §8a draws exactly those two rhythms -- `gap: 14px`
+/// between its cards, `padding: 12px` inside its rows -- and the owner asked
+/// for §8a to the point, so the edit form's column is
+/// [`SECTION_COLUMN_GAP`] now. This constant is kept for the builder because
+/// its design is 4a, whose `gap: 14px` is the figure's own wrapper and not a
+/// card column; moving the builder's cards on §8a's authority would be moving
+/// another screen's pixels for a number its design never declared.
 pub const SECTION_GAP: f32 = BLOCK_GAP;
+
+/// The gap between one of §8a's cards and the next: its card column's
+/// `gap: 14px`, exactly -- and exactly is the point.
+///
+/// A constant beside [`SECTION_GAP`] rather than a change to it, for the
+/// reason that constant's doc now gives. It is not [`BLOCK_GAP`] + 2 either:
+/// the two are different numbers because the design draws them as different
+/// numbers, not because one is derived from the other.
+///
+/// **What the column was really drawn at before this existed was 20, not
+/// 12.** `SECTION_GAP` is spent as a bare `add_space` after a `Frame`, and
+/// egui spaces after every allocated widget, so the card column's gaps were
+/// `item_spacing.y` + 12. The edit form spends this constant net of that
+/// spacing (see `detail_edit::section`), so §8a's 14 is a six-point
+/// tightening of what shipped and not the two-point loosening the two
+/// constants' values suggest side by side. The builder's 20 is left as it is,
+/// for the reason [`SECTION_GAP`] gives.
+pub const SECTION_COLUMN_GAP: f32 = 14.0;
+
+/// How far §8a's card column stands off the rule under the title bar:
+/// its body's `padding: 20px 28px 0`, in the vertical.
+///
+/// The read pane's body is 2b's `padding: 18px 24px`, and the edit form's
+/// title bar IS the read pane's -- but the column under it is §8a's, and §8a
+/// says 20.
+///
+/// **The drawn number, spent net of `item_spacing`.** What used to stand
+/// here was `ui.add_space(12.0)` -- and it DREW 20, because egui had already
+/// put eight points of item spacing under the rule before the twelve were
+/// added. The first draft of this constant replaced the 12 with 20 and drew
+/// 28, which its own test caught; the caller now subtracts the spacing, so
+/// the constant is the gap the reader sees and not an addend to a number
+/// nobody wrote down.
+pub const SECTION_COLUMN_TOP: f32 = 20.0;
 
 /// The section card title's type size: §8a's `font-size: 12px`.
 pub const SECTION_TITLE_PX: f32 = 12.0;
@@ -6729,9 +6921,48 @@ pub const SECTION_TITLE_TRACKING: f32 = 0.72;
 /// The width of a section row's label column: §8a's `width: 130px`.
 pub const SECTION_LABEL_WIDTH: f32 = 130.0;
 
-/// The gap between a section row's label and its control: §8a's `gap: 16px`,
-/// at the 14 §8a's own card grid uses and this app's rows already do.
-pub const SECTION_ROW_GAP: f32 = 14.0;
+/// The gap between a section row's label and its control: §8a's `gap: 16px`.
+///
+/// **16, and it was 14.** The 14 was borrowed from §8a's `Item` grid
+/// (`gap: 14px` between its three columns) and from this app's other rows,
+/// on the ground that two points would not be seen. §8a draws every row on
+/// every card at 16 -- `display: flex; align-items: center; gap: 16px` --
+/// and the read pane's rows one click away are 2b's `gap: 16px` too, so the
+/// 14 was the one row gap in the window that was not 16. It also moves
+/// [`section_rows_fit_at`]'s floor by the same two points, which is the
+/// arithmetic following the design rather than a second decision.
+pub const SECTION_ROW_GAP: f32 = 16.0;
+
+/// The gap between a section card's title and the note beside it: §8a's
+/// `gap: 10px` on the header band.
+///
+/// Set on the band rather than left to `item_spacing`, whose 8 is what the
+/// band used to draw the note at.
+pub const SECTION_HEADER_GAP: f32 = 10.0;
+
+/// §8a's row field: `height: 34px` on every box a card's rows hold, against
+/// [`FIELD_HEIGHT`]'s 38.
+///
+/// **Two field heights on one screen, and both are the design's.** §8a's
+/// title bar puts the record's name in a `height: 38px` box -- the same box
+/// 2a, 3a and 3h draw, which is [`FIELD_HEIGHT`] and is what [`title_field`]
+/// stays at -- and then draws every box on every card four points shorter.
+/// The form used to draw all of them at 38, so a name box and a user-name box
+/// were the same height on a screen whose design makes the name the taller
+/// of the two by exactly this much. Read as the box, not the box plus a
+/// border, because that is how this module read 2a's `height: 38px` into
+/// [`FIELD_HEIGHT`]; the two constants are the same convention four points
+/// apart.
+///
+/// Only the section-row variants below draw at this height. [`text_field`],
+/// [`password_field`] and [`disabled_text_field`] are the login window's and
+/// the overlay's, and their designs say 38.
+pub const SECTION_FIELD_HEIGHT: f32 = 34.0;
+
+/// The type size inside a §8a row field: `font-size: 13px`, against the 14
+/// [`FieldShape::wide`] sets for the 38-point box. One step down with the
+/// box, so the text keeps the same proportion of it.
+pub const SECTION_FIELD_PX: f32 = 13.0;
 
 /// The narrowest a section row's CONTROL may be before the row stops being a
 /// row.
@@ -6816,10 +7047,30 @@ pub fn section_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> (Rect, R)
 /// visible in a column that is only sometimes on screen is a dirty state the
 /// user cannot rely on.
 pub fn section_card_header(ui: &mut Ui, title: &str, note: &str, changed: bool) -> Rect {
+    section_card_header_at(ui, SECTION_CARD_PAD_X, title, note, changed)
+}
+
+/// [`section_card_header`] at a stated horizontal padding -- the one
+/// [`section_card_pad_x`] answers for the card's width.
+///
+/// A second entry point rather than a width read inside the band, because
+/// the band cannot know whether its caller wants the width rule at all: the
+/// edit form does, and the sequence builder's 252-point rail cards do not.
+/// The plain function above is the builder's and keeps the number it always
+/// had.
+pub fn section_card_header_at(
+    ui: &mut Ui,
+    pad_x: i8,
+    title: &str,
+    note: &str,
+    changed: bool,
+) -> Rect {
     let line = egui::Frame::new()
-        .inner_margin(Margin::symmetric(SECTION_CARD_PAD_X, SECTION_CARD_HEADER_PAD_Y))
+        .inner_margin(Margin::symmetric(pad_x, SECTION_CARD_HEADER_PAD_Y))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
+                // §8a's `gap: 10px` between the title and what follows it.
+                ui.spacing_mut().item_spacing.x = SECTION_HEADER_GAP;
                 // **Uppercased here rather than stored uppercased.** §8a's
                 // band declares `text-transform: uppercase` over titles
                 // written in sentence case, and the RAIL beside it prints the
@@ -6874,8 +7125,14 @@ pub fn section_card_header(ui: &mut Ui, title: &str, note: &str, changed: bool) 
 
 /// The section card's body band: its rows, at the card's padding.
 pub fn section_card_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    section_card_body_at(ui, SECTION_CARD_PAD_X, add)
+}
+
+/// [`section_card_body`] at a stated horizontal padding. See
+/// [`section_card_header_at`] for why the padding is the caller's to state.
+pub fn section_card_body_at<R>(ui: &mut Ui, pad_x: i8, add: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
-        .inner_margin(Margin::symmetric(SECTION_CARD_PAD_X, SECTION_CARD_PAD_Y))
+        .inner_margin(Margin::symmetric(pad_x, SECTION_CARD_PAD_Y))
         .show(ui, add)
         .inner
 }
@@ -6983,7 +7240,7 @@ fn section_row_impl<R>(
         // The caption itself is still painted rather than added, so its
         // position is byte-for-byte what it was before this variant existed.
         ui.allocate_ui_with_layout(
-            Vec2::new(SECTION_LABEL_WIDTH, FIELD_HEIGHT),
+            Vec2::new(SECTION_LABEL_WIDTH, SECTION_FIELD_HEIGHT),
             egui::Layout::top_down(egui::Align::Min),
             |ui| {
                 ui.set_width(SECTION_LABEL_WIDTH);
@@ -6996,21 +7253,27 @@ fn section_row_impl<R>(
                 // **The cell reserves the whole field's height, EXCEPT when
                 // something follows the caption inside it.**
                 //
-                // A §8a caption is optically centred against a 38-point field
-                // but is itself about 15 points tall, so the bottom half of
-                // the cell is slack. Reserving all 38 and then putting the
-                // chip below that is what the first render of this row did,
-                // and it cost the row 28 points -- an `Email` row half again
-                // as tall as the `First name` row above it, in a column whose
-                // whole job is to look like a column. Reserving down to the
-                // caption's own bottom edge instead spends the slack, and the
-                // row grows by only what the chip cannot fit inside it.
+                // A §8a caption is optically centred against a
+                // [`SECTION_FIELD_HEIGHT`] field but is itself about 15
+                // points tall, so the bottom half of the cell is slack.
+                // Reserving the whole field and then putting the chip below
+                // that is what the first render of this row did, and it cost
+                // the row 28 points -- an `Email` row half again as tall as
+                // the `First name` row above it, in a column whose whole job
+                // is to look like a column. Reserving down to the caption's
+                // own bottom edge instead spends the slack, and the row grows
+                // by only what the chip cannot fit inside it.
                 //
                 // The caption is painted at the same y either way, so a row
                 // with no aside is byte-for-byte what it was before this
-                // variant existed.
-                let top = (FIELD_HEIGHT - galley.size().y) / 2.0;
-                let reserved = if aside.is_some() { top + galley.size().y } else { FIELD_HEIGHT };
+                // variant existed. Centred against the ROW field's 34 and not
+                // [`FIELD_HEIGHT`]'s 38, which is what it was measured against
+                // when every box on the form was 38: (34 - 15) / 2 is §8a's
+                // own `padding-top: 9px` on its multi-line rows, to the half
+                // point.
+                let top = (SECTION_FIELD_HEIGHT - galley.size().y) / 2.0;
+                let reserved =
+                    if aside.is_some() { top + galley.size().y } else { SECTION_FIELD_HEIGHT };
                 let (cell, _) = ui.allocate_exact_size(
                     Vec2::new(SECTION_LABEL_WIDTH, reserved),
                     Sense::hover(),
@@ -7070,6 +7333,7 @@ pub const CHANGED_TONE: PillTone = PillTone {
 /// about, and a `Weak` painted in the brand's own blue would be praise.
 pub fn strength_meter(ui: &mut Ui, filled: usize, word: &str, characters: usize) {
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = STRENGTH_BAR_GAP;
         let full = filled >= STRENGTH_BARS;
         for bar in 0..STRENGTH_BARS {
             let (rect, _) =
@@ -7087,7 +7351,7 @@ pub fn strength_meter(ui: &mut Ui, filled: usize, word: &str, characters: usize)
                 if bar < filled { BLUE } else { TOGGLE_OFF },
             );
         }
-        ui.add_space(STRENGTH_GAP);
+        ui.add_space(STRENGTH_WORD_GAP - STRENGTH_BAR_GAP);
         let ink = if full { BLUE_DEEP } else { TEXT_FAINT };
         let face = FontId::new(
             12.0,
@@ -7140,9 +7404,17 @@ pub const STRENGTH_BARS: usize = 4;
 /// One bar's box: §8a's `width: 26px; height: 4px; border-radius: 2px`.
 pub const STRENGTH_BAR: Vec2 = Vec2::new(26.0, 4.0);
 
-/// The gap between the last bar and the word. §8a's `gap: 12px`, less the
-/// item spacing egui has already put there.
-const STRENGTH_GAP: f32 = 6.0;
+/// The gap between one bar and the next: §8a's `gap: 3px` on the bar run.
+///
+/// Set on the row rather than left to `item_spacing`, whose 8 is what the
+/// bars used to be drawn at -- four bars 8 apart are four dashes, and 3 apart
+/// they are one meter with notches in it, which is the thing §8a draws.
+const STRENGTH_BAR_GAP: f32 = 3.0;
+
+/// The gap between the last bar and the word: §8a's `gap: 12px` on the
+/// readout row. Spent as `12 - 3`, because the row's item spacing is already
+/// [`STRENGTH_BAR_GAP`] by the time the word is placed.
+const STRENGTH_WORD_GAP: f32 = 12.0;
 
 // ---------------------------------------------------------------------------
 // The modal card
@@ -12816,6 +13088,28 @@ mod form_card_padding_tests {
             0,
             "a band is still padded with the narrow constant directly ({hard_coded:?}), so it \
              stays at 12 on a card the design draws at 18"
+        );
+    }
+
+    /// **§8a's card has the same two answers, at its own measured threshold.**
+    ///
+    /// The shipped detail pane at the 1240-point window is 638 points -- a
+    /// 628-point card -- and §8a's narrowest card is 507; the pane at
+    /// `settings::MIN_VAULT_WINDOW_SIZE` is 298, a 288-point card. Both ends
+    /// are pinned against the widths the window really has, and the
+    /// threshold against the design's own arithmetic.
+    #[test]
+    fn a_section_card_takes_8as_padding_at_the_width_8a_draws_it() {
+        assert_eq!(section_card_pad_x(628.0), SECTION_CARD_PAD_X_WIDE);
+        // (1028 - 14) / 2: one half of §8a's two-column grid, the narrowest
+        // card the design draws at 16.
+        assert_eq!(section_card_pad_x(507.0), SECTION_CARD_PAD_X_WIDE);
+        assert_eq!(section_card_pad_x(SECTION_CARD_WIDE_AT - 1.0), SECTION_CARD_PAD_X);
+        assert_eq!(section_card_pad_x(288.0), SECTION_CARD_PAD_X);
+        assert_eq!(SECTION_CARD_PAD_X_WIDE, 16, "§8a's `padding: 11px 16px`");
+        assert!(
+            SECTION_CARD_PAD_X_WIDE > SECTION_CARD_PAD_X,
+            "the wide answer is meant to be the roomier one"
         );
     }
 }
