@@ -7152,23 +7152,46 @@ pub fn draw_detail_edit(
     // to**, decided before it is drawn and while `available_height` is still
     // the whole pane's.
     let full_band = band_fits(ui.available_height());
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .inner_margin(Margin::symmetric(
-            detail::HEADER_PAD_X,
-            if full_band { detail::HEADER_PAD_Y } else { COMPACT_BAND_PAD_Y },
-        ))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let from_badge =
-                edit_header(ui, kind, draft, !changes.is_empty(), full_band, item, icon);
-            if from_badge != EditAction::None {
-                action = from_badge;
-            }
-        });
-    // The strip's `border-bottom: 1px solid #eae7e7`, exactly as the read
-    // pane closes its own.
-    theme::hairline(ui);
+    // **The strip and its rule, with NO spacing between them.**
+    //
+    // The rule is the strip's own `border-bottom`; egui was putting eight
+    // points of `item_spacing` between the two, so the white band ended, a
+    // band of CANVAS followed, and the hairline was drawn below that -- a
+    // grey stripe under the header that belongs to nothing. Measured: the
+    // strip ends at 84 and the rule was at 92. The owner: "it is gray space
+    // with separator under that is wrong".
+    //
+    // The read pane has never had it, because `draw_detail_read` zeroes
+    // `item_spacing` on the child `Ui` it builds for the whole pane. This
+    // form draws into the caller's `Ui`, so the zero is scoped to the two
+    // things it is about rather than left on for everything after them.
+    //
+    // The gap BELOW the rule is unaffected: `SECTION_COLUMN_TOP` is already
+    // spent net of the spacing that follows this scope, which is the parent's
+    // and not the scope's.
+    let from_badge = ui
+        .scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let from_badge = egui::Frame::new()
+                .fill(theme::CARD)
+                .inner_margin(Margin::symmetric(
+                    detail::HEADER_PAD_X,
+                    if full_band { detail::HEADER_PAD_Y } else { COMPACT_BAND_PAD_Y },
+                ))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    edit_header(ui, kind, draft, !changes.is_empty(), full_band, item, icon)
+                })
+                .inner;
+            // The strip's `border-bottom: 1px solid #eae7e7`, exactly as the
+            // read pane closes its own -- and now in the same place.
+            theme::hairline(ui);
+            from_badge
+        })
+        .inner;
+    if from_badge != EditAction::None {
+        action = from_badge;
+    }
     // 8a's body `padding: 20px 28px 0`: the column's top inset, between the
     // strip's rule and the first card. The horizontal half is the pane's own
     // central-panel margin, applied outside this `Ui`, and is the read pane's
@@ -20271,6 +20294,69 @@ mod edit_pane_layout_tests {
             "the pill is at {pill:?} and the box ends at {} -- the pill lost its place on \
              the far edge",
             name_box.right()
+        );
+    }
+
+    /// **The header's rule is the header's, with nothing between them.**
+    ///
+    /// egui puts `item_spacing` between two stacked children, so the white
+    /// strip ended at 84, eight points of CANVAS followed, and the hairline
+    /// was drawn at 92 -- a grey stripe under the header belonging to
+    /// neither it nor the cards below. The owner: "it is gray space with
+    /// separator under that is wrong".
+    ///
+    /// Both halves, because either alone has a trivial way to pass: the rule
+    /// is flush under the strip, AND the cards still start 8a's
+    /// `SECTION_COLUMN_TOP` below the rule rather than being pulled up with
+    /// it.
+    #[test]
+    fn the_headers_rule_is_flush_under_it_and_the_cards_clear_the_rule() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let mut draft = full_login_draft();
+        draft.name = "Ledgerline".to_string();
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+        let full_width = |r: &Rect| r.width() >= pane.x - 0.5;
+        let strip = painted
+            .rects
+            .iter()
+            .filter(|(r, fill)| *fill == theme::CARD && full_width(r) && r.height() > 40.0)
+            .map(|(r, _)| *r)
+            .min_by(|a, b| a.top().total_cmp(&b.top()))
+            .expect("the title strip is painted");
+        let rule = painted
+            .rects
+            .iter()
+            .filter(|(r, fill)| {
+                *fill == theme::HAIRLINE && full_width(r) && r.top() >= strip.bottom() - 0.5
+            })
+            .map(|(r, _)| *r)
+            .min_by(|a, b| a.top().total_cmp(&b.top()))
+            .expect("the strip's rule is painted");
+        assert!(
+            (rule.top() - strip.bottom()).abs() <= 0.5,
+            "the strip ends at {} and its rule is at {} -- there is canvas between them",
+            strip.bottom(),
+            rule.top()
+        );
+
+        // The first card: the topmost white box under the rule. Found by
+        // geometry and not by `frame_around` on a caption, which answers the
+        // card's BODY band rather than the card.
+        let card = painted
+            .rects
+            .iter()
+            .filter(|(r, fill)| *fill == theme::CARD && r.top() > rule.bottom())
+            .map(|(r, _)| *r)
+            .min_by(|a, b| a.top().total_cmp(&b.top()))
+            .expect("the card column is painted");
+        assert!(
+            (card.top() - rule.bottom() - theme::SECTION_COLUMN_TOP).abs() <= 0.5,
+            "the first card starts {}pt under the rule, not 8a's SECTION_COLUMN_TOP ({})",
+            card.top() - rule.bottom(),
+            theme::SECTION_COLUMN_TOP
         );
     }
 
