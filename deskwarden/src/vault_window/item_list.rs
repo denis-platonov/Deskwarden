@@ -1331,7 +1331,19 @@ const MODAL_SCRIM_AREAS: &[&str] = &[
 /// keystroke in it is the click or chord that opened the modal -- never an
 /// arrow key, because the user cannot yet see the thing they would be
 /// arrowing behind.
-fn a_modal_is_up(ctx: &egui::Context) -> bool {
+/// **`pub(crate)` for a second reader, and it is the read pane.**
+///
+/// The list asks this to keep arrow keys out from behind an open modal. The
+/// read pane asks it for a related reason with the same shape: the copy
+/// confirmation is ONE toast in the context's memory, and both the pane and
+/// the add-a-code card can draw it -- so a copy made on the card was painted
+/// twice, once over the card and once over the window behind it. The owner's
+/// screenshot: two `Secret copied` boxes.
+///
+/// The rule is that the toast belongs to the topmost surface. A modal is
+/// topmost whenever one is up, so the pane stands down and the modal draws
+/// it; with no modal up the pane draws it as it always has.
+pub(crate) fn a_modal_is_up(ctx: &egui::Context) -> bool {
     ctx.memory(|m| {
         MODAL_SCRIM_AREAS.iter().any(|name| {
             m.areas()

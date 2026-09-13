@@ -4452,7 +4452,17 @@ pub fn draw_detail_read(
     }
     // Last, so a copy reported anywhere above -- click or chord -- is already
     // on the clock by the time this reads it and shows it in the same frame.
-    draw_copy_toast(ui, pane);
+    //
+    // **And not at all while a modal is up.** The toast is ONE record in the
+    // context's memory and the add-a-code card draws it too, so a copy made on
+    // that card was painted twice -- once over the card, once over the window
+    // behind it. The owner's screenshot: two `Secret copied` boxes. The rule
+    // is that the confirmation belongs to the topmost surface, and a modal is
+    // topmost whenever there is one; see `item_list::a_modal_is_up`, which the
+    // list already asks the same question of for the same kind of reason.
+    if !super::item_list::a_modal_is_up(ui.ctx()) {
+        draw_copy_toast(ui, pane);
+    }
     action
 }
 
@@ -24196,6 +24206,58 @@ mod read_pane_scroll_tests {
         let toast = boxes[0];
         assert_eq!(toast.right(), bounds.right() - COPY_TOAST_INSET);
         assert_eq!(toast.bottom(), bounds.bottom() - COPY_TOAST_INSET);
+    }
+
+    /// **One copy, one confirmation.**
+    ///
+    /// The toast is a single record in the context's memory and two surfaces
+    /// can draw it -- this pane and the add-a-code card. Both drew it, so a
+    /// copy made on the card was painted twice: once over the card and once
+    /// over the window behind it, which is what the owner sent back as "it
+    /// duped".
+    ///
+    /// Read off the source. Producing the pair through a frame means standing
+    /// up the modal, its scrim and the pane together, and what would be
+    /// asserted at the end of it is exactly this: the pane's call is inside
+    /// the gate. A gate that got moved, negated or deleted is the whole of the
+    /// defect, and the needle carries the `!`.
+    #[test]
+    fn the_pane_leaves_the_confirmation_to_whatever_is_on_top_of_it() {
+        // **The whole file, and NOT the pre-`#[cfg(test)]` slice** that this
+        // module's other source pins take. The first `#[cfg(test)]` in
+        // `detail.rs` is on line 30 -- a test-only fixture, thousands of lines
+        // above the code this is about -- so that slice is thirty lines long
+        // and every needle checked against it matches nothing and passes
+        // whatever production does. Measured here, and worth remembering: a
+        // slice taken to exclude tests has to be checked against the file it
+        // is taken from.
+        //
+        // Both needles are `concat!`, so neither can match itself.
+        let code = include_str!("detail.rs").replace("\r\n", "\n");
+        let call = concat!("draw_copy_", "toast(ui, pane);");
+        assert_eq!(
+            code.matches(call).count(),
+            1,
+            "the pane draws the confirmation somewhere other than the one place, or not at all"
+        );
+        let gate = concat!("if !super::item_list::a_modal_is_", "up(ui.ctx()) {");
+        let at = code
+            .find(gate)
+            .unwrap_or_else(|| panic!("the pane no longer stands its toast down behind a modal"));
+        let called = code.find(call).expect("counted above");
+        assert!(
+            at < called,
+            "the pane's toast is drawn outside the modal gate, so a copy made on a modal is \
+             confirmed twice -- once by the modal and once by the window behind it"
+        );
+        // And nothing between them but the gate's own brace and the comment
+        // above it: a second statement sneaking in is a second thing the gate
+        // silently governs.
+        let between = &code[at + gate.len()..called];
+        assert!(
+            between.trim().is_empty(),
+            "something else was put inside the toast's gate: {between:?}"
+        );
     }
 
     /// **The NOTES card at the app's minimum window size.** Three times a
