@@ -7350,8 +7350,16 @@ pub fn section_grid_fits_at(width: f32) -> bool {
 /// every other caption on the form, so a cell in the wrong grey would have
 /// re-tinted the whole screen.
 pub fn section_grid_cell<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    // **The gap is SET, not added.** 8a's cell is `flex-direction: column;
+    // gap: 6px`, and an `add_space(EYEBROW_GAP)` between two widgets draws
+    // six points plus the `item_spacing` egui puts on either side of it --
+    // 22 where the design says 6. The owner: "Folder Owner Type should be
+    // closer to fields - check the design".
+    //
+    // Scoped to this cell, which is a column `Ui` of its own, so nothing
+    // outside it changes.
+    ui.spacing_mut().item_spacing.y = EYEBROW_GAP;
     ui.label(RichText::new(label).size(12.0).color(TEXT_FAINT));
-    ui.add_space(EYEBROW_GAP);
     add(ui)
 }
 
@@ -7411,6 +7419,21 @@ pub fn section_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> (Rect, R)
     let framed = egui::Frame::new()
         .fill(CARD)
         .corner_radius(CornerRadius::same(SECTION_CARD_RADIUS))
+        // **This card does NOT reserve its 1-point border, and `detail::card`
+        // does.** So its bands sit one point higher and two points wider than
+        // the same band one click away -- the owner's "now card title is not
+        // same height", which is exactly that one point.
+        //
+        // Reserving it was tried, as `.inner_margin(Margin::same(1))`, and it
+        // is measurably worse: the card takes `available_width`, so the
+        // margin pushes it two points PAST the pane, and at the app's 298pt
+        // minimum four layout tests catch a 299.7-point card in a 298-point
+        // pane. The border is painted after the contents on purpose -- a row
+        // rule drawn edge to edge would otherwise land on a reserved border
+        // -- and that is the arrangement worth keeping.
+        //
+        // One point of caption position against a card that fits: the card
+        // that fits wins.
         .show(ui, |ui| {
             // **The card's bands stack with NOTHING between them**, which is
             // what `detail::card` has always done (`ui.spacing_mut()

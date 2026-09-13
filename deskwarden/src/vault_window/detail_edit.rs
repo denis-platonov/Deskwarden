@@ -20488,9 +20488,13 @@ mod edit_pane_layout_tests {
                 .min_by(|a, b| a.top().total_cmp(&b.top()))
                 .unwrap_or_else(|| panic!("{title}'s band is closed by a rule"));
 
+            // The band's own padding. NOT plus the card's border, which
+            // this card paints rather than reserves -- see
+            // `theme::section_card`, where reserving it was tried and
+            // pushed the card past the app's minimum pane.
             let pad = f32::from(theme::SECTION_CARD_HEADER_PAD_Y);
             assert!(
-                (caption.top() - card.top() - pad).abs() <= 1.0,
+                (caption.top() - card.top() - pad).abs() <= 0.5,
                 "{title} sits {}pt down its card, not 8a's `padding: 11px`",
                 caption.top() - card.top()
             );
@@ -20559,6 +20563,45 @@ mod edit_pane_layout_tests {
                  not on one line",
                 rect.top(),
                 first.top()
+            );
+        }
+    }
+
+    /// **8a's `gap: 6px` between a grid cell's caption and its control.**
+    ///
+    /// `add_space(EYEBROW_GAP)` between two widgets draws six points plus the
+    /// `item_spacing` egui puts on either side of it -- 22 where the design
+    /// says 6, which is what the owner saw: "Folder Owner Type should be
+    /// closer to fields - check the design". The cell SETS the spacing now
+    /// rather than adding to it.
+    #[test]
+    fn an_item_cells_caption_sits_8as_six_points_over_its_control() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let mut draft = full_login_draft();
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+        for (caption, value) in [
+            (ITEM_FOLDER_LABEL, NO_FOLDER_LABEL),
+            (ITEM_OWNER_LABEL, OWNER_PERSONAL),
+            (ITEM_TYPE_LABEL, kind_noun(draft.kind)),
+        ] {
+            let label = painted.rect_of(caption);
+            let ink = painted.rect_of(value);
+            let control = painted
+                .rects
+                .iter()
+                .map(|(r, _)| *r)
+                .find(|r| {
+                    (r.height() - theme::SECTION_FIELD_HEIGHT).abs() <= 0.5
+                        && r.contains(ink.center())
+                })
+                .unwrap_or_else(|| panic!("{caption}'s control is a {}pt box", 0));
+            let gap = control.top() - label.bottom();
+            assert!(
+                (gap - theme::EYEBROW_GAP).abs() <= 0.5,
+                "{caption} stands {gap}pt over its control, not 8a's `gap: 6px`"
             );
         }
     }
