@@ -13986,11 +13986,17 @@ mod frame_promptness {
     /// caller of. The count is the fixture's own two items, so a list that
     /// drew its chrome over an empty vault does not satisfy it either.
     const ITEM_LIST_ONLY: &str = "Search 2 items";
-    /// **The `DetailMode::Edit` arm's control**: `detail_edit::form_title`'s
-    /// answer for an existing login. `draw_detail_edit` is its only caller,
-    /// and the read pane's Edit *button* reads "Edit" alone, so this cannot
-    /// be satisfied by the pane the click started from.
-    const EDITOR_EDIT_TITLE: &str = "Edit login";
+    /// **The `DetailMode::Edit` arm's control**: the footer's own Save, which
+    /// `draw_detail_edit` is the only thing in this crate that draws.
+    ///
+    /// It was `detail_edit::form_title`'s `Edit login`, which the form no
+    /// longer says: the owner asked for that subtitle to read exactly what the
+    /// READ pane's does -- "should be just regular same as on details page
+    /// label along with folder" -- so the one string this test used to tell
+    /// the two panes apart became a string they share. `Save changes` is the
+    /// better sentinel anyway: it is the control that makes this an editor,
+    /// and the read pane has no button by that name.
+    const EDITOR_EDIT_TITLE: &str = "Save changes";
     /// **The `DetailMode::Create` arm's control**, the same title's other
     /// half. `creating` is the only thing that chooses between them, and
     /// `DetailMode::Create` is the only arm that passes `true`.

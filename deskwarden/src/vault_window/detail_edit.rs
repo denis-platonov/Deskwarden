@@ -6037,7 +6037,7 @@ fn app_block(
         // `draw_detail_edit`'s action strip, where Save was a bare `Button`
         // beside a themed Cancel for the same reason and the user reported it
         // as "one bold and not bold now for some reason" -- pinned there by
-        // `the_two_footer_buttons_are_set_in_one_face`, and pinned here by
+        // `each_footer_button_is_set_in_a_face_the_theme_names`, and pinned here by
         // `the_two_app_path_buttons_are_set_in_one_face`.
         //
         // `add_enabled_ui` around the theme's own button rather than a new
@@ -6137,6 +6137,55 @@ fn app_block(
 /// against a scroll bar the user can see -- and not a width that CHANGES:
 /// `AlwaysVisible` below reserves the lane whether or not a bar is painted.
 const FORM_SCROLL_GUTTER: f32 = 10.0;
+
+/// **8a's `padding: ... 28px` down the side of the form**, and the reason it
+/// has to be spelled here.
+///
+/// The body and the footer used to inherit this from the central panel, and
+/// the comments on both still said so. They stopped being true: that panel's
+/// inner margin was removed to fix a band the owner marked out around the
+/// detail pane ("there is another band around the whole details panel when
+/// screen becomes smaller - shouldn't be"), and nothing replaced it here. So
+/// the cards and the footer ran edge to edge -- "right now there is no padding
+/// on the left", with the buttons flush against the pane and the standing note
+/// on the right clipped by the window's own edge.
+///
+/// **Not applied to the title strip above them.** That strip is the READ
+/// pane's, at the owner's request -- the same tile, the same name in the same
+/// place -- so it keeps the read pane's `detail::HEADER_PAD_X`. The four
+/// points between them are the price of the two panes not moving under each
+/// other when Edit is pressed, which is the property that was asked for.
+const FORM_PAD_X: i8 = 28;
+
+/// The pane below which the form gives its side inset back.
+///
+/// 8a is a 1028-point card and 28 a side is nothing in it. This pane's FLOOR
+/// is 298 points (`MIN_VAULT_WINDOW_SIZE` less the sidebar and the list), and
+/// 56 points off that is a fifth of the form -- measured, not estimated: with
+/// the inset applied unconditionally, seven layout tests failed at 298 with
+/// controls painted past the pane's right edge on a surface that refuses to
+/// scroll sideways.
+///
+/// So the inset is the design's where the pane can afford it and nothing
+/// where it cannot, which is the rule `theme::form_card_pad_x` already makes
+/// one level down for the same reason. The threshold is the floor plus what
+/// the inset costs: a pane that is 298 points of content after paying for it
+/// is a pane that was already proven to fit.
+const FORM_PAD_AT: f32 = MIN_FORM_CONTENT + 2.0 * FORM_PAD_X as f32;
+
+/// The width every layout test proves this form fits in.
+const MIN_FORM_CONTENT: f32 = crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32
+    - crate::vault_window::SIDEBAR_WIDTH
+    - crate::vault_window::LIST_WIDTH;
+
+/// [`FORM_PAD_X`] for a pane this wide. See [`FORM_PAD_AT`].
+fn form_pad_x(width: f32) -> i8 {
+    if width >= FORM_PAD_AT {
+        FORM_PAD_X
+    } else {
+        0
+    }
+}
 
 /// The id under which the edit form's "did it overflow last frame?" reading
 /// is kept.
@@ -6390,15 +6439,32 @@ fn edit_header(
                     return;
                 }                // The subtitle, in the read pane's own two runs with the
                 // folder mark between them: what this record IS, then where
-                // it lives. The lead is `form_title`'s word rather than the
-                // kind's bare noun, because the mode has to be said SOMEWHERE
-                // once the heading that used to say it is gone -- and a line
-                // that already names the kind is where it costs nothing.
+                // it lives.
+                //
+                // **The kind's own word on an edit, exactly as the read pane
+                // says it.** The lead used to be `form_title`'s `Edit login`,
+                // on the argument that the mode had to be said somewhere once
+                // 8a's heading was gone. The owner, looking at it: "Edit Login
+                // - should be just regular same as on details page label along
+                // with folder, basically it is the same block but with square
+                // around title". The mode does not need saying: the name sits
+                // in a box, every field below it is editable, and the footer
+                // has Save and Cancel in it. Saying it here made the one line
+                // that is supposed to be identical to the read pane's the one
+                // line that was not.
+                //
+                // A CREATE keeps `form_title`'s `New login`, because there is
+                // no read pane behind it to be identical to and nothing else
+                // on the form says the record does not exist yet.
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     ui.label(
-                        RichText::new(form_title(kind, creating))
-                            .size(detail::SUBTITLE_SIZE)
+                        RichText::new(if creating {
+                            form_title(kind, creating)
+                        } else {
+                            kind.label().to_string()
+                        })
+                        .size(detail::SUBTITLE_SIZE)
                             .color(theme::TEXT_FAINT),
                     );
                     if let Some(name) = folder {
@@ -6669,13 +6735,32 @@ pub const CANCEL_BUTTON: &str = "Cancel";
 /// draws it. One function means the measured caption and the drawn caption are
 /// the same string by construction.
 ///
-/// The chord 8a draws on this button -- `CTRL+S` -- is deliberately not drawn.
-/// `egui::Key::S` is Send-a-record's in `vault_window::mod`, and a guard there
-/// asserts the key is spelled nowhere else in production, so Ctrl+S cannot be
-/// bound here without taking a chord off another screen. A hint for a chord
-/// that does nothing is a control that lies, which is the one thing this file
-/// consistently refuses to ship; the same goes for 8a's rail hints `Esc
-/// cancel` and `Ctrl+G generate`, neither of which this form binds either.
+/// 8a's `CTRL+S` chip **is drawn on this button now**, and the doc that used
+/// to stand here saying it could not be is worth keeping the shape of, because
+/// it was right when it was written and stopped being right without anyone
+/// noticing.
+///
+/// It read: `egui::Key::S` is Send-a-record's, and a guard in
+/// `vault_window::mod` asserts the key is spelled nowhere else in production,
+/// so Ctrl+S cannot be bound here without taking a chord off another screen.
+/// That guard has since learned to allow a second binding by NAME with its
+/// shape asserted -- design 4a's sequence builder needed the same chord -- and
+/// the argument it accepts is exactly the one this form can make: the chords
+/// differ by SHIFT, `consume_shortcut` compares the whole modifier set, and
+/// this form is a `DetailMode` that REPLACES the read pane rather than sitting
+/// beside it, so the two are never on screen together.
+///
+/// 8a's rail hints `Esc cancel` and `Ctrl+G generate` are still not drawn, for
+/// the reason this one used to be: neither is bound. Escape belongs to the
+/// discard prompt this form raises, and there is no generate chord.
+/// What the chip reads, and the one place it is spelled.
+///
+/// The same string the chord is built from is not available -- `egui`'s
+/// `KeyboardShortcut` has no display this app uses -- so the pair is held
+/// together by `the_save_chord_is_spelled_the_way_it_is_bound`, which reads
+/// both out of this file.
+pub const SAVE_CHORD_LABEL: &str = "CTRL+S";
+
 fn save_label(draft: &EditDraft) -> &'static str {
     if !draft.is_valid() {
         "Save (needs a name)"
@@ -6775,6 +6860,25 @@ pub fn draw_detail_edit(
     let mut action = EditAction::None;
     // Read before the closure borrows `draft` mutably.
     let may_unfile = draft.may_unfile();
+    // **8a's `CTRL+S`, read before anything else this frame.**
+    //
+    // Read at the top so a text box that happens to have focus cannot swallow
+    // it: the box takes a bare `s`, never the chord, and `consume_shortcut`
+    // compares the WHOLE modifier set -- which is also what keeps this off
+    // Send-a-record's CTRL+SHIFT+S. See `SAVE_CHORD_LABEL` for why this can be
+    // bound here at all, and `the_record_chord_is_a_key_no_other_binding_takes`
+    // for the guard that holds the three apart.
+    //
+    // Gated on the same predicate the button is, so the chord cannot save a
+    // draft the button refuses: an unnamed item, an unparseable template, or a
+    // kind this app cannot create.
+    let save_chord = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+    if draft.is_saveable()
+        && (!creating || is_creatable(draft.kind))
+        && ui.input_mut(|i| i.consume_shortcut(&save_chord))
+    {
+        action = EditAction::Save;
+    }
     // **Once per frame, at the top, and shared by four things**: the pill on
     // this line, the `Changed` mark on each card, the list down the rail and
     // the count in the footer. `changes()` walks the whole draft and hashes
@@ -6905,6 +7009,10 @@ pub fn draw_detail_edit(
     // is, and the `ScrollArea` below then gets exactly the rest. The title
     // stays outside both, so it does not scroll away either -- see
     // `edit_pane_layout_tests`, which pins all three facts as geometry.
+    // The same answer the body above takes, measured on the same width, so
+    // the buttons and the cards are never inset differently. See
+    // `FORM_PAD_AT`.
+    let footer_pad_x = form_pad_x(ui.available_width());
     egui::Panel::bottom("detail-edit-actions")
         // The strip is part of the pane, not a docked tool window: the pane's
         // own card already carries the only edge this form draws.
@@ -6927,17 +7035,23 @@ pub fn draw_detail_edit(
         .frame(
             egui::Frame::new()
                 .fill(theme::CARD)
-                // 8a's `padding: 12px 28px`, at the pane's own horizontal
-                // inset -- which is the central panel's margin and is applied
-                // outside this `Ui`, so only the vertical half is spent here.
-                .inner_margin(Margin::symmetric(0, 12)),
+                // 8a's `padding: 12px 28px`, both halves. The horizontal
+                // one used to be the central panel's margin; see `FORM_PAD_X`
+                // for where that went, and `FORM_PAD_AT` for the width below
+                // which it is given back -- the same answer the body above
+                // takes, so the buttons never sit off the cards' own edge.
+                .inner_margin(Margin::symmetric(footer_pad_x, 12)),
         )
         .show(ui, |ui| {
             // The rule that opens the band, drawn INSIDE the frame's top
             // margin rather than as a panel separator line, so it is the
             // design's `#eae7e7` hairline and not egui's darker stroke -- and
             // so it spans the band's full width including the pane's inset.
-            let top = ui.max_rect();
+            // **Widened back out by the inset the band now carries.** 8a's
+            // `border-top` spans the footer edge to edge; the rule is painted
+            // from inside the padded `Ui`, so without this it would start and
+            // stop where the buttons do.
+            let top = ui.max_rect().expand2(egui::vec2(f32::from(footer_pad_x), 0.0));
             ui.painter().rect_filled(
                 egui::Rect::from_min_size(
                     egui::pos2(top.left(), top.top() - 12.0),
@@ -7001,10 +7115,10 @@ pub fn draw_detail_edit(
             // a guess that a longer caption would invalidate -- and its pad is
             // the buttons' own `SECTION_FOOTER_BUTTON_PAD_X`, which is what
             // makes that sentence true rather than approximately true.
-            let buttons = theme::action_button_width(
+            let buttons = theme::section_footer_save_width(
                 ui.painter(),
                 save_label(draft),
-                theme::SECTION_FOOTER_BUTTON_PAD_X,
+                SAVE_CHORD_LABEL,
             ) + gap
                 + theme::action_button_width(
                     ui.painter(),
@@ -7048,10 +7162,14 @@ pub fn draw_detail_edit(
                 // rather than worked around: it runs the same body as every
                 // other primary button in the app inside an `add_enabled_ui`,
                 // so the disabled fade `the_disabled_save_button_does_not_
-                // look_enabled` measures is still there and the weight now
-                // matches Cancel's BY CONSTRUCTION -- both are
-                // `theme::semibold(_, 13.0)`. See
-                // `the_two_footer_buttons_are_set_in_one_face`.
+                // look_enabled` measures is still there and BOTH buttons now
+                // take a face the theme names.
+                //
+                // **Not the same face, though**, and that is 8a: Save is 700
+                // and Cancel 600. Putting the two in one weight was an
+                // overshoot of the stack fix above, and the owner's next look
+                // at this strip was "buttons text not bold". See
+                // `each_footer_button_is_set_in_a_face_the_theme_names`.
                 //
                 // The label still changes with the validity ("Save" / "Save
                 // (needs a name)" / `SAVE_TEMPLATE_BLOCKED`), which is how
@@ -7065,11 +7183,14 @@ pub fn draw_detail_edit(
                 // `primary_button_enabled` and `secondary_button`, at
                 // `BUTTON_HEIGHT`'s 32 and radius 7, which is 3h's and 2b's
                 // toolbar button and not this footer's. See
-                // `theme::SECTION_FOOTER_BUTTON_HEIGHT` for the weight 8a
-                // draws on Save and why it is not drawn.
+                // `theme::SECTION_FOOTER_BUTTON_HEIGHT` for the weights 8a
+                // draws on the two of them.
                 if theme::section_footer_primary_button(
                     ui,
                     save_label(draft),
+                    // **8a's chip, and it is drawn because the chord is real
+                    // now.** See `SAVE_CHORD_LABEL`.
+                    Some(SAVE_CHORD_LABEL),
                     draft.is_saveable() && creatable,
                 )
                 .clicked()
@@ -7178,11 +7299,12 @@ pub fn draw_detail_edit(
     // `theme::CANVAS`, which is 8a's `#f7f6f5` ground. There is no outer box
     // any more, and there must not be: nine bordered cards inside a tenth
     // border is the "card in a card" the design has nowhere on the page.
+    let pad_x = form_pad_x(ui.available_width());
     egui::Frame::new()
-        // No inset: the cards start at the pane's own margin. This used to
-        // hold them off the section rail's hairline -- see the note where
-        // that rail was.
-        .inner_margin(Margin::ZERO)
+        // 8a's own side inset -- see `FORM_PAD_X`, which is where the panel
+        // margin these cards used to inherit went, and `FORM_PAD_AT` for the
+        // width below which it is given back.
+        .inner_margin(Margin::symmetric(pad_x, 0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
 
@@ -14412,7 +14534,7 @@ mod edit_pane_layout_tests {
         /// a bare `egui::Button` Save in egui's default proportional face
         /// beside a `theme::secondary_button` Cancel in Archivo SemiBold,
         /// with every geometry assertion in this module green. See
-        /// [`the_two_footer_buttons_are_set_in_one_face`].
+        /// [`each_footer_button_is_set_in_a_face_the_theme_names`].
         fonts: Vec<(String, egui::FontId)>,
         /// Every OTHER shape the frame drew ink with, named and boxed:
         /// carets, icons, circles, lines, curves, meshes.
@@ -15586,31 +15708,39 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// **Save and Cancel are set in ONE face, at one size.**
+    /// **Each footer button is set in a face the theme NAMES**, and in the
+    /// one §8a gives it: Save at 700, Cancel at 600.
     ///
-    /// The other half of the same report: "even one bold and not bold now for
-    /// some reason". There was no reason -- nothing on this screen means to
-    /// emphasise one footer button over the other typographically. Save was a
-    /// bare `egui::Button`, which takes egui's default `FontId` (the
-    /// `Proportional` family at the style's body size); Cancel goes through
-    /// `theme::secondary_button`, which is `theme::semibold(_, 13.0)` and so
-    /// asks for the `FontFamily::Name("Archivo-SemiBold")` face. Two
-    /// families, read as two weights.
+    /// The other half of an older report: "even one bold and not bold now for
+    /// some reason". The cause was not emphasis -- Save was a bare
+    /// `egui::Button`, which takes egui's default `FontId` (the
+    /// `Proportional` family at the style's body size), while Cancel went
+    /// through `theme::secondary_button`'s `theme::semibold(_, 13.0)` and so
+    /// asked for `FontFamily::Name("Archivo-SemiBold")`. Two font STACKS,
+    /// read as two weights.
+    ///
+    /// **This test used to pin the two to one face, and that was an
+    /// overshoot.** Putting Save in Cancel's semibold fixed the stack and
+    /// also flattened the 700/600 step §8a really draws, and the owner's next
+    /// look at the strip was "buttons text not bold". So the rule is the one
+    /// that was always meant: neither button may fall back to egui's default
+    /// stack, and the named weight each wears is the design's call.
     ///
     /// Asserted on the `FontId` the layout job carried and not on ink width,
-    /// because ink width is what was already green while this was wrong.
-    /// Both halves: they must MATCH each other, and -- so this cannot be
-    /// satisfied by regressing Cancel to a bare button too -- the face they
-    /// share must be the theme's semibold, positively named.
+    /// because ink width is what was already green while this was wrong --
+    /// and positively, against a spelled-out expectation, so it cannot be
+    /// satisfied by both buttons agreeing on something neither should wear.
     ///
     /// Run over all three Save captions, since each is a different layout job
     /// and only one of them is exercised by any given draft.
     #[test]
-    fn the_two_footer_buttons_are_set_in_one_face() {
-        // What `theme::semibold(_, 13.0)` -- the face both button helpers ask
-        // for -- resolves to. Spelled out rather than read back off a
-        // `RichText`, whose font id is private.
-        let expected =
+    fn each_footer_button_is_set_in_a_face_the_theme_names() {
+        // What `theme::bold(_, 13.0)` and `theme::semibold(_, 13.0)` resolve
+        // to. Spelled out rather than read back off a `RichText`, whose font
+        // id is private.
+        let expect_save =
+            egui::FontId::new(13.0, egui::FontFamily::Name(theme::BOLD.into()));
+        let expect_cancel =
             egui::FontId::new(13.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
         for name in [SAVE, SAVE_TEMPLATE_BLOCKED, SAVE_BUTTON] {
             let ctx = styled_context(ROOMY_PANE);
@@ -15642,23 +15772,23 @@ mod edit_pane_layout_tests {
             let save = painted.font_of(name);
             let cancel = painted.font_of("Cancel");
             assert_eq!(
-                save, cancel,
-                "{name} is laid out in {save:?} beside Cancel's {cancel:?} -- the footer's two \
-                 buttons come from different font stacks, which is what the user saw as one \
-                 bold and one not"
+                save,
+                expect_save,
+                "{name} is laid out in {save:?}, which is not the theme's bold \
+                 ({expect_save:?}) -- 8a draws this button at font-weight: 700, and egui's \
+                 default proportional face is what a bare `egui::Button` here would give it"
             );
             assert_eq!(
-                save, expected,
-                "{name} is laid out in {save:?}, which is not the theme's semibold ({expected:?}) \
-                 -- the two buttons agreeing on egui's default face would satisfy the check \
-                 above while taking BOTH of them out of the design system"
+                cancel, expect_cancel,
+                "Cancel is laid out in {cancel:?}, which is not the theme's semibold \
+                 ({expect_cancel:?}) -- 8a draws it at 600, one step under the Save beside it"
             );
         }
     }
 
     /// **The app block's two path buttons are set in ONE face, at one height.**
     ///
-    /// [`the_two_footer_buttons_are_set_in_one_face`]'s defect, found a second
+    /// [`each_footer_button_is_set_in_a_face_the_theme_names`]'s defect, found a second
     /// time one row up. "Browse..." was a bare `egui::Button` standing
     /// immediately beside `theme::secondary_button`'s "Choose a running
     /// app...", and the two are not the same control even though three of
@@ -19378,13 +19508,25 @@ mod edit_pane_layout_tests {
             let mut draft = full_login_draft();
             let _ = frame(&ctx, pane, &mut draft, false, &[]);
             let painted = frame(&ctx, pane, &mut draft, false, &[]);
-            for chord in ["CTRL+S", "Ctrl+S", "Ctrl+G", "Esc cancel"] {
+            // **`CTRL+S` came off this list when the chord was bound**, and
+            // the rest stayed. The rule is unchanged and is the point of the
+            // test: a hint is drawn exactly when the form reads the chord.
+            // `Ctrl+G` and `Esc cancel` are 8a's rail hints, and this form
+            // binds neither -- Escape belongs to the discard prompt.
+            for chord in ["Ctrl+G", "Esc cancel"] {
                 assert!(
                     !painted.strings().iter().any(|s| s.contains(chord)),
                     "{pane:?}: the form advertises {chord:?}, which nothing in it binds: {:?}",
                     painted.strings()
                 );
             }
+            // And the one it does bind is drawn, on both panes, so this test
+            // cannot pass by the footer having quietly lost its chip.
+            assert!(
+                painted.strings().contains(&SAVE_CHORD_LABEL),
+                "{pane:?}: the footer does not advertise the chord it reads: {:?}",
+                painted.strings()
+            );
         }
         assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
     }

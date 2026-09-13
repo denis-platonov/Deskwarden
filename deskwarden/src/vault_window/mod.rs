@@ -38209,12 +38209,22 @@ mod send_create_wiring {
         // below, not by loosening the count: a THIRD binding still fails
         // here, and so does this one if it stops being exact or the record
         // chord stops carrying SHIFT.
-        const BUILDER: &str = "vault_window/sequence_builder.rs";
+        //
+        // **Two other files bind it now**, and the second is the edit form's
+        // own Save, which design 8a draws a `CTRL+S` chip on. Same argument as
+        // the builder's, and it is worth stating that the two of them do not
+        // collide with each other either: both are exact CTRL+S, and both are
+        // `DetailMode`s -- `Edit` and `Sequence` -- so the window is showing
+        // one or the other or neither, never both.
+        const SCREENS: [&str; 2] = [
+            "vault_window/sequence_builder.rs",
+            "vault_window/detail_edit.rs",
+        ];
         let elsewhere: Vec<String> = every_source_file()
             .into_iter()
             .filter(|(path, text)| {
                 path != "vault_window/mod.rs"
-                    && path != BUILDER
+                    && !SCREENS.contains(&path.as_str())
                     && binds_the_s_key(&code_without_comments(text), key) > 0
             })
             .map(|(path, _)| path)
@@ -38226,23 +38236,26 @@ mod send_create_wiring {
              never fires -- `detail.rs`'s `no_two_bindings_share_a_chord` for the chords it \
              can see, stated here for the one it cannot"
         );
-        let builder = every_source_file()
-            .into_iter()
-            .find(|(path, _)| path == BUILDER)
-            .map(|(_, text)| code_without_comments(&text))
-            .expect("the sequence builder is one of this crate's production files");
-        assert_eq!(
-            binds_the_s_key(&builder, key),
-            1,
-            "{BUILDER} binds `egui::Key::S` more than once, so the one chord this test \
-             reasoned about is no longer the whole of what that file does with the key"
-        );
-        assert!(
-            builder.contains(concat!("Modifiers::COMMAND, egui::Key", "::S)")),
-            "{BUILDER}'s save chord is no longer an exact CTRL+S. A looser modifier test \
-             there would fire on CTRL+SHIFT+S too, which is the record chord -- and then \
-             one of the two really would silently never fire"
-        );
+        for screen in SCREENS {
+            let text = every_source_file()
+                .into_iter()
+                .find(|(path, _)| path == screen)
+                .map(|(_, text)| code_without_comments(&text))
+                .unwrap_or_else(|| panic!("{screen} is one of this crate's production files"));
+            assert_eq!(
+                binds_the_s_key(&text, key),
+                1,
+                "{screen} binds `egui::Key::S` a number of times other than once, so the one \
+                 chord this test reasoned about is no longer the whole of what that file does \
+                 with the key"
+            );
+            assert!(
+                text.contains(concat!("Modifiers::COMMAND, egui::Key", "::S)")),
+                "{screen}'s chord is no longer an exact CTRL+S. A looser modifier test there \
+                 would fire on CTRL+SHIFT+S too, which is the record chord -- and then one of \
+                 them really would silently never fire"
+            );
+        }
         assert!(
             SEND_RECORD_MODIFIERS.shift,
             "the record chord no longer carries SHIFT, so it and the sequence builder's \

@@ -2084,12 +2084,21 @@ pub fn primary_button_matching_field(ui: &mut Ui, label: &str) -> Response {
 /// is not a coincidence the constants lean on -- §8a declares its own numbers
 /// and these are those, named for the footer they belong to.
 ///
-/// `Save changes` is `font-weight: 700` in §8a and `Cancel` 600; both are
-/// drawn in [`semibold`] here, deliberately. The owner's report on this very
-/// footer was "one bold and not bold now for some reason", and
-/// `detail_edit`'s `the_two_footer_buttons_are_set_in_one_face` pins the two
-/// to one face on that ground; a weight the design draws and the owner has
-/// asked not to see is the owner's call.
+/// `Save changes` is `font-weight: 700` in §8a and `Cancel` 600, and that is
+/// now what the two are drawn in -- [`bold`] and [`semibold`], the theme's
+/// own names for those two weights.
+///
+/// **This reverses an earlier reading of an earlier report.** "One bold and
+/// not bold now for some reason" was written when Save was a bare
+/// `egui::Button`, which takes egui's default `Proportional` stack, beside a
+/// Cancel in Archivo SemiBold: two font STACKS, read as a weight difference
+/// nobody had designed. The answer then was to put both in one named face,
+/// which fixed the stack and flattened §8a's real 700/600 step as a side
+/// effect -- and the owner's next look at this strip was "buttons text not
+/// bold". So the rule the pin carries is the one that was always meant: each
+/// button wears a weight the theme NAMES, and which weight is the design's
+/// call. See `detail_edit`'s
+/// `each_footer_button_is_set_in_a_face_the_theme_names`.
 pub const SECTION_FOOTER_BUTTON_HEIGHT: f32 = 34.0;
 /// See [`SECTION_FOOTER_BUTTON_HEIGHT`].
 pub const SECTION_FOOTER_BUTTON_RADIUS: u8 = 8;
@@ -2101,19 +2110,102 @@ pub const SECTION_FOOTER_BUTTON_PAD_X: f32 = 14.0;
 /// §8a's `gap: 10px` between the footer's two answers.
 pub const SECTION_FOOTER_GAP: f32 = 10.0;
 
+/// 8a's `CTRL+S` chip on the Save button: `font-size: 10px` in
+/// `ui-monospace`, `opacity: 0.8`, `gap: 9px` after the label.
+///
+/// Its own three constants rather than the keyboard chip `theme` already has
+/// ([`CHIP_TEXT_PX`] and friends): that one is a bordered pill on a card, and
+/// this is a bare run inside a filled button. Same idea, different object.
+pub const SECTION_FOOTER_CHIP_PX: f32 = 10.0;
+pub const SECTION_FOOTER_CHIP_GAP: f32 = 9.0;
+pub const SECTION_FOOTER_CHIP_OPACITY: f32 = 0.8;
+
 /// [`primary_button_enabled`] at §8a's footer metrics. See
 /// [`SECTION_FOOTER_BUTTON_HEIGHT`].
-pub fn section_footer_primary_button(ui: &mut Ui, label: &str, enabled: bool) -> Response {
+pub fn section_footer_primary_button(
+    ui: &mut Ui,
+    label: &str,
+    // **8a's `CTRL+S` chip**, drawn inside the button beside its label. An
+    // `Option` because the caller owns the question this chip answers: a hint
+    // for a chord nothing binds is a control that lies, so the form passes
+    // `Some` only where it really reads the chord. See `detail_edit`'s footer.
+    kbd: Option<&str>,
+    enabled: bool,
+) -> Response {
     ui.scope(|ui| {
         ui.spacing_mut().button_padding.x = SECTION_FOOTER_BUTTON_PAD_X;
-        primary_button_with_metrics(
-            ui,
-            label,
-            None,
-            SECTION_FOOTER_BUTTON_HEIGHT,
-            SECTION_FOOTER_BUTTON_RADIUS,
-            enabled,
-        )
+        // **The chip is painted, not appended**, and that is 8a rather than a
+        // convenience. `primary_button_with_metrics` builds one string --
+        // `format!("{label}  {k}")` -- so the chord comes out at the label's
+        // own size and weight, in the label's own face. 8a draws a separate
+        // span: `font-family: ui-monospace; font-size: 10px; opacity: 0.8`,
+        // `gap: 9px` after the label. One string cannot be two faces.
+        //
+        // Painting it also keeps the button's own galley EXACTLY the label,
+        // which is what every test that looks for `Save changes` on this form
+        // reads. Appending put `Save changes  CTRL+S` in the galley and seven
+        // of them stopped finding the button at all -- a measurement that
+        // would have been a screenshot review otherwise.
+        //
+        // The room is reserved through `min_size` rather than by padding the
+        // string with spaces (`primary_button_with_metrics`'s own trick for
+        // the painted ↵), because a space is a glyph whose width is the
+        // LABEL's face and the thing being reserved for is drawn in another.
+        // Through the SAME helper as the chipped branch, with no width
+        // floor. `primary_button_with_metrics` would be the obvious call and
+        // is the wrong one: it is every other primary button in the app, at
+        // 600, and taking it here would mean a footer whose Save changed
+        // weight depending on whether the form happened to pass a chord.
+        let Some(kbd) = kbd else {
+            return primary_button_with_metrics_sized(
+                ui,
+                label,
+                SECTION_FOOTER_BUTTON_HEIGHT,
+                SECTION_FOOTER_BUTTON_RADIUS,
+                enabled,
+                0.0,
+            );
+        };
+        let font = FontId::new(SECTION_FOOTER_CHIP_PX, FontFamily::Monospace);
+        let chip = ui.painter().layout_no_wrap(kbd.to_string(), font, Color32::WHITE);
+        let room = action_button_width(ui.painter(), label, SECTION_FOOTER_BUTTON_PAD_X)
+            + SECTION_FOOTER_CHIP_GAP
+            + chip.size().x;
+        let response = ui.scope(|ui| {
+            ui.spacing_mut().button_padding.x = SECTION_FOOTER_BUTTON_PAD_X;
+            primary_button_with_metrics_sized(
+                ui,
+                label,
+                SECTION_FOOTER_BUTTON_HEIGHT,
+                SECTION_FOOTER_BUTTON_RADIUS,
+                enabled,
+                room,
+            )
+        })
+        .inner;
+        // 8a's `opacity: 0.8` on white, and the same fade the button's own ink
+        // takes when it is switched off -- so a disabled Save does not carry a
+        // chord at full strength.
+        let ink = if enabled { Color32::WHITE } else { OFF_INK };
+        // **Placed against the LABEL, not against the button's right edge.**
+        //
+        // egui centres a button's text in whatever width the button has, so
+        // widening the button by the chip's room pushes the label right by
+        // half of it -- and a long caption (`Save (needs a name)`) then runs
+        // under a chip pinned to the right inset. Measured:
+        // `no_two_runs_on_the_tallest_edit_form_overlap` caught the two
+        // sharing 12 points.
+        //
+        // So the chip sits `SECTION_FOOTER_CHIP_GAP` past where the centred
+        // label really ends, which is 8a's `gap: 9px` between two spans of a
+        // flex row and is what that gap means.
+        let label_width = section_footer_label_width(ui.painter(), label);
+        let at = Pos2::new(
+            response.rect.center().x + label_width / 2.0 + SECTION_FOOTER_CHIP_GAP,
+            response.rect.center().y - chip.size().y / 2.0,
+        );
+        ui.painter().galley(at, chip, faded(ink, SECTION_FOOTER_CHIP_OPACITY));
+        response
     })
     .inner
 }
@@ -2191,6 +2283,102 @@ pub const OFF_FILL: Color32 = CANVAS;
 pub const OFF_EDGE: Color32 = BORDER;
 /// See [`OFF_FILL`].
 pub const OFF_INK: Color32 = TEXT_GHOST;
+
+/// §8a's `font-size: 13px` on both footer buttons. The WEIGHTS differ (700
+/// on Save, 600 on Cancel); the size does not.
+pub const SECTION_FOOTER_TEXT_PX: f32 = 13.0;
+
+/// How wide Save's label is, in the face Save is really set in.
+///
+/// [`action_button_width`] cannot answer this: it measures in [`semibold`],
+/// which is right for every other button that calls it and two per cent
+/// narrow for this one. Two per cent of `Save (needs a name)` is a point and
+/// a half, and it lands on the footer's line-fitting decision and on where
+/// the chord chip is painted -- both of which are measured to the point.
+pub fn section_footer_label_width(painter: &egui::Painter, label: &str) -> f32 {
+    painter
+        .layout_no_wrap(
+            label.to_string(),
+            FontId::new(SECTION_FOOTER_TEXT_PX, FontFamily::Name(BOLD.into())),
+            INK,
+        )
+        .size()
+        .x
+}
+
+/// The whole width Save takes: its bold label, §8a's `padding: 0 14px`, and
+/// the chord chip beside it.
+///
+/// The footer measures its own row before it draws it, and this is the one
+/// button on that row whose width [`action_button_width`] gets wrong.
+pub fn section_footer_save_width(painter: &egui::Painter, label: &str, kbd: &str) -> f32 {
+    (section_footer_label_width(painter, label) + SECTION_FOOTER_BUTTON_PAD_X * 2.0)
+        .max(ACTION_BUTTON_MIN_WIDTH)
+        + section_footer_chip_width(painter, kbd)
+}
+
+/// What [`section_footer_primary_button`] adds to a plain button's width for
+/// 8a's chord chip: the gap and the chip itself.
+///
+/// Exported because the footer measures its own row before it draws it -- the
+/// change summary is laid beside the buttons only if it fits there -- and a
+/// measurement that left the chip out would put the summary off the pane. It
+/// did: `nothing_on_the_widest_sparse_form_is_painted_outside_the_minimum_pane`
+/// caught `1 change` painted 38 points past the edge.
+pub fn section_footer_chip_width(painter: &egui::Painter, kbd: &str) -> f32 {
+    SECTION_FOOTER_CHIP_GAP
+        + painter
+            .layout_no_wrap(
+                kbd.to_string(),
+                FontId::new(SECTION_FOOTER_CHIP_PX, FontFamily::Monospace),
+                Color32::WHITE,
+            )
+            .size()
+            .x
+}
+
+/// [`primary_button_with_metrics`] in 8a's footer weight, with a width floor
+/// for a caller that has something of its own to paint inside the button.
+///
+/// **Two differences from the function it is named after**, and both belong
+/// to this one footer:
+///
+/// * the label is [`bold`] -- 8a's `font-weight: 700` on `Save changes`,
+///   against the 600 every other primary button in the app wears. See
+///   [`SECTION_FOOTER_BUTTON_HEIGHT`] for why that step is drawn now and was
+///   not before.
+/// * `min_width`, which is how Save reserves room for 8a's chord chip -- see
+///   [`section_footer_primary_button`], which explains why the chip is
+///   painted rather than appended to the label.
+///
+/// Private, and called only from that one helper, so no other button in the
+/// app can pick up the footer's weight by reaching for the nearer name.
+fn primary_button_with_metrics_sized(
+    ui: &mut Ui,
+    label: &str,
+    height: f32,
+    radius: u8,
+    enabled: bool,
+    min_width: f32,
+) -> Response {
+    let (ink, fill, edge, sense) = if enabled {
+        (Color32::WHITE, BLUE, Stroke::NONE, Sense::click())
+    } else {
+        (OFF_INK, OFF_FILL, Stroke::new(1.0, OFF_EDGE), Sense::hover())
+    };
+    let response = ui.add(
+        egui::Button::new(bold(label, SECTION_FOOTER_TEXT_PX).color(ink))
+            .fill(fill)
+            .stroke(edge)
+            .sense(sense)
+            .corner_radius(CornerRadius::same(radius))
+            .min_size(Vec2::new(min_width, height)),
+    );
+    if enabled && response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
 
 fn primary_button_with_metrics(
     ui: &mut Ui,
