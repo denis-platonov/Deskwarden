@@ -15,6 +15,39 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.24 - 2026-09-13
+
+### The edit form is drawn at design 8a's own numbers
+
+Audited element by element against the design's own declarations rather than
+against a render of them. The card indents 16 where the design says 16 (it
+indented 12), its cards sit 14 apart and its rows put 16 between a label and
+its control; the boxes in those rows are 34 points tall with 13-point text,
+which is what 8a draws and what this form was drawing at 38 and 14; the footer's
+buttons are 34 high, 8 round, 14 padded and 10 apart; the strength bars sit 3
+apart rather than 8, and the meter 8 under the box rather than 16.
+
+**One measurement explained several of those at once.** egui adds its own
+spacing after every widget it lays out, so a constant that declared a 12-point
+gap drew 20. Every gap touched here is now spent net of that, which means the
+number in the source is the number on the screen -- and that is the thing that
+had made this form hard to compare against a design in the first place.
+
+Left alone, deliberately: controls this app draws one way everywhere, because
+a form that used its own button height would be a second design system. And
+the parts of 8a this app cannot honestly draw -- a live code readout on a form
+that fetches no code, a match-mode dropdown for a binding that has no modes --
+are still absent, with the reason now written where each would have gone.
+
+### The build's own preview compiles again
+
+`examples/ui_preview.rs`, which draws every surface for the screenshot suite,
+had fallen behind two functions that gained an argument in 0.15.23. Nothing a
+user of the app could see, and it is in these notes because of what it says
+about the checks that let it through: three commands were being treated as the
+whole suite and none of them compiles the examples. `cargo check --all-targets`
+does, in about a minute.
+
 ## 0.15.23 - 2026-09-12
 
 ### Reading a code off your screen stopped freezing for two seconds, and the reason was not in this app
