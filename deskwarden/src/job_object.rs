@@ -3149,6 +3149,13 @@ mod tests {
                 "examples/generate_preview.rs",
                 "examples/icon_probe.rs",
                 "examples/locked_preview.rs",
+                // Times the region overlay's window build and this process's
+                // own-window lookups from inside a running `eframe` frame,
+                // which no test process can do: a test never holds a GL
+                // context, so it never has the graphics driver's helper
+                // windows that made those lookups cost 430 ms. See
+                // `foreground::win32::window_title`.
+                "examples/overlay_window_probe.rs",
                 "examples/picker_preview.rs",
                 "examples/picker_probe.rs",
                 // `examples/preflight_preview.rs` was here. It previewed

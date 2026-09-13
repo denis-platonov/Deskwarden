@@ -1239,14 +1239,27 @@ struct Inner {
     /// When the prescan's worker finished, so the frames after it can be
     /// measured against it.
     ///
-    /// **The tail is the part the owner can still feel**: "it is still lagging
-    /// in the end". The worker itself is a few hundred milliseconds and says
-    /// so in the log; what follows is the frame that registers the viewport
-    /// (which is also the frame that uploads a 29 MB texture) and then
-    /// `eframe` building a full-screen window and its GL surface. Both are on
-    /// the event-loop thread by construction and neither can be moved off it,
-    /// so the only way to make the wait smaller is to know which of the two it
-    /// is -- which is what this measures.
+    /// **The tail was the part the owner could still feel**: "it is still
+    /// lagging in the end". The worker itself is a few hundred milliseconds
+    /// and says so in the log; what followed was measured at 1739-1816 ms
+    /// between the viewport being registered and its window being found,
+    /// with ONE root frame in between -- the event loop working, not waiting,
+    /// and the waiting card's bar frozen for all of it.
+    ///
+    /// **It was neither of the two things this comment used to name.** Not
+    /// the 29 MB texture: the owner ran two scans with the picture skipped
+    /// and the tail was 1790 and 1739 ms against 1816 with it. Not `eframe`
+    /// building the window and its GL surface either: `examples/overlay_window_probe`
+    /// times that at 9-19 ms in every variant of the builder. It was the
+    /// four window lookups `appear` makes on those two frames -- one to find
+    /// the window and one inside [`hide_and_place`], on the registering frame
+    /// and again on the next -- at ~430 ms each, because reading a title of
+    /// a window this process owns on another thread waits on that thread's
+    /// message pump, and the graphics driver keeps two such windows in every
+    /// GL process. `foreground::win32::window_title` has the per-call numbers
+    /// and is where it was fixed; nothing in this module moved. These two
+    /// fields stay because the line they write is what says whether it has
+    /// come back.
     answered: Option<Instant>,
     /// Whether the vault window is currently masked out of screen captures.
     /// The flag rather than a second call: `SetWindowDisplayAffinity` is an
@@ -2115,9 +2128,12 @@ impl RegionOverlay {
     fn appear(&self, ctx: &egui::Context) {
         // The lookup, and only while there is something to find.
         // `own_window_titled` does NOT skip invisible windows -- see its doc,
-        // which is what makes a window created hidden findable at all -- and it
-        // is an `EnumWindows`, measured in the hundreds of milliseconds in an
-        // unoptimised build. Two or three per overlay, none after that.
+        // which is what makes a window created hidden findable at all. It was
+        // measured at ~430 ms a call, in a release build, and the cause was
+        // never the enumeration: it was the title read, waiting on the
+        // graphics driver's threads. See `foreground::win32::window_title`,
+        // which reads the caption without asking the window and brought the
+        // call back under a millisecond. Two or three per overlay either way.
         let waiting = matches!(locked(&self.inner).appearing, Appearing::Waiting);
         let found = if waiting {
             crate::foreground::own_window_titled(REGION_TITLE)
@@ -2665,21 +2681,7 @@ impl RegionOverlay {
                     let monitors = screen_capture::monitor_bounds();
                     mine.apply_scan(scan_screen_with(&RegionSeams::production(), &monitors));
                     let scanned = Instant::now();
-                    // TEMPORARY INSTRUMENT -- removed once the tail is
-                    // understood. The 1816 ms between registering the
-                    // viewport and the window existing contains two costs
-                    // that cannot be told apart from the log: this 29 MB
-                    // texture, and `eframe` building a full-screen window and
-                    // its GL surface. Skipping the picture for one run
-                    // separates them; the overlay falls back to the plain
-                    // dark ground it already uses for a refused capture.
-                    if std::env::var_os("DW_SKIP_PICTURE").is_none() {
-                        mine.take_picture(&ctx);
-                    } else {
-                        log::warn!(
-                            "region overlay: DW_SKIP_PICTURE is set, so the overlay opens on a                              plain dark ground -- this is a measurement run, not a setting"
-                        );
-                    }
+                    mine.take_picture(&ctx);
                     log::info!(
                         "region overlay: the prescan read {} monitor(s) in {} ms and took the \
                          display's picture in {} ms ({} ms in all) -- all of it off the frame \
@@ -2787,8 +2789,9 @@ impl RegionOverlay {
                 if let Some(answered) = held.answered {
                     log::info!(
                         "region overlay: the viewport is registered {} ms after the prescan \
-                         answered; the window and its surface are built by `eframe` at the end \
-                         of this frame, and the `cloaked` line below closes the tail",
+                         answered; `eframe` builds the window at the end of this frame and the \
+                         next root frame should find it -- see `Inner::answered` for what the \
+                         1.8 s that used to follow here was",
                         answered.elapsed().as_millis()
                     );
                 }

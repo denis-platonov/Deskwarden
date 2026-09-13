@@ -306,10 +306,9 @@ mod win32 {
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, FlashWindowEx, GetForegroundWindow, GetWindowLongW, GetWindowTextLengthW,
-        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetForegroundWindow,
-        ShowWindow, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG, GWL_EXSTYLE, SW_RESTORE,
-        WS_EX_TOOLWINDOW,
+        EnumWindows, FlashWindowEx, GetForegroundWindow, GetWindowLongW, GetWindowThreadProcessId,
+        InternalGetWindowText, IsIconic, IsWindowVisible, SetForegroundWindow, ShowWindow,
+        FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG, GWL_EXSTYLE, SW_RESTORE, WS_EX_TOOLWINDOW,
     };
 
     pub fn own_windows() -> Vec<OwnWindow> {
@@ -356,14 +355,7 @@ mod win32 {
             return CONTINUE;
         }
 
-        let len = GetWindowTextLengthW(hwnd);
-        let title = if len > 0 {
-            let mut buffer = vec![0u16; len as usize + 1];
-            let copied = GetWindowTextW(hwnd, &mut buffer);
-            String::from_utf16_lossy(&buffer[..copied.max(0) as usize])
-        } else {
-            String::new()
-        };
+        let title = window_title(hwnd);
 
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
 
@@ -376,6 +368,93 @@ mod win32 {
         });
 
         CONTINUE
+    }
+
+    /// How many UTF-16 units of a caption [`window_title`] reads. See there
+    /// for why it is a fixed buffer and not a length query; every title this
+    /// crate looks up is a fraction of it, which
+    /// `every_title_this_crate_looks_up_fits_the_buffer` pins.
+    pub const TITLE_CAPACITY: usize = 512;
+
+    /// **The caption, read out of the window structure and never asked of
+    /// the window.** `InternalGetWindowText` and not `GetWindowTextW`, and
+    /// the difference was 430 ms on every call to [`windows_of`].
+    ///
+    /// # The measurement
+    ///
+    /// `GetWindowTextW` on a window of ANOTHER process copies the caption
+    /// out of the window structure. On a window of THIS process it sends
+    /// `WM_GETTEXT` and waits for the owning thread to answer -- instant
+    /// when that thread is the caller's, and otherwise the owning thread's
+    /// message pump, whatever that thread happens to be doing. And this
+    /// process does not only own the windows it made. On the owner's
+    /// machine the NVIDIA OpenGL driver keeps two hidden windows in every
+    /// process that holds a GL context -- an `NVOpenGLPbuffer` titled
+    /// "NVOGLDC invisible" and its thread's "Default IME" -- on a thread of
+    /// its own that pumps roughly every 100 ms. `examples/overlay_window_probe`,
+    /// release build, from inside a frame of a process with one `eframe`
+    /// window, timing each call `enum_proc` used to make:
+    ///
+    /// ```text
+    /// "Window Class"    "overlay probe root"  thread 57900 (this thread 57900): GetWindowTextLengthW 16 us,     GetWindowTextW 11 us
+    /// "NVOpenGLPbuffer" "NVOGLDC invisible"   thread 60188 (this thread 57900): GetWindowTextLengthW 108814 us, GetWindowTextW 107049 us
+    /// "IME"             "Default IME"         thread 60188 (this thread 57900): GetWindowTextLengthW 108381 us, GetWindowTextW 109724 us
+    /// the timed enumeration took 440 ms
+    /// ```
+    ///
+    /// Four sends at ~108 ms each. [`own_window_titled`] cost 415-437 ms on
+    /// every one of eleven calls across six runs, against 0 ms for the same
+    /// call made before the event loop existed -- no GL context yet, so no
+    /// driver windows -- and `EnumWindows` itself over the same 404
+    /// top-level windows was 0 ms. That was the whole of the region
+    /// overlay's 1.8 s tail: four lookups between registering its viewport
+    /// and finding its window, on a path it had attributed first to an
+    /// unoptimised build and then to `eframe` building the window, which the
+    /// same probe puts at 9-19 ms. It was also 430 ms on every other lookup
+    /// in this crate that runs in a GL process, `window_host::Reveal`'s
+    /// included.
+    ///
+    /// # Why the answer is the same
+    ///
+    /// Every window this function has ever been asked to name is a top-level
+    /// window whose caption lives in the window structure and whose
+    /// procedure answers `WM_GETTEXT` from `DefWindowProcW`: `winit`'s (every
+    /// `eframe` window in this crate), the tray icon's helper, the hotkey
+    /// listener's, and the three bare-Win32 prompts. For those the message
+    /// was only ever a slower way to read the same field. What
+    /// `InternalGetWindowText` does not do is ask a control that keeps its
+    /// text somewhere else -- an edit box -- and this enumeration meets no
+    /// controls: `EnumWindows` walks top-level windows only. It is the entry
+    /// point Windows provides for exactly this situation, a reader that must
+    /// not wait on a message queue it does not own.
+    ///
+    /// # What was rejected
+    ///
+    /// * **Skipping windows on other threads.** Right for every window this
+    ///   crate makes today, and a rule about threads in a function about
+    ///   titles: `away_lock` calls this from the session-notification path,
+    ///   and the day a window is looked up from a thread other than the one
+    ///   that made it, a lookup that silently found nothing would be the
+    ///   defect nobody could see.
+    /// * **`SendMessageTimeoutW(WM_GETTEXT, ..)`.** Still waits out the
+    ///   timeout on every driver window, and answers with no title when it
+    ///   gives up. `SMTO_ABORTIFHUNG` does not help: a thread that pumps every
+    ///   100 ms is not hung by Windows' definition, which is five seconds.
+    /// * **Excluding the driver's window classes by name.** A list of another
+    ///   vendor's class names, wrong on the next driver and on every other
+    ///   vendor.
+    ///
+    /// # The buffer
+    ///
+    /// A fixed [`TITLE_CAPACITY`] rather than `GetWindowTextLengthW` first,
+    /// because the length query is a `WM_GETTEXTLENGTH` with the same cost.
+    /// A caption longer than the buffer is truncated, and a truncated title
+    /// cannot equal any title this crate asks for -- the right answer for a
+    /// window this crate did not make.
+    fn window_title(hwnd: HWND) -> String {
+        let mut buffer = [0u16; TITLE_CAPACITY];
+        let copied = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
+        String::from_utf16_lossy(&buffer[..copied.clamp(0, TITLE_CAPACITY as i32) as usize])
     }
 
     pub fn foreground() -> isize {
@@ -2251,5 +2330,144 @@ mod tests {
         // `GetForegroundWindow` is allowed to return 0 (no foreground window);
         // this only pins that the call itself returns.
         let _ = Win32Desktop.foreground();
+    }
+
+    /// **A title is read out of the window structure, and never asked of
+    /// the window by message.**
+    ///
+    /// The cost is in `win32::window_title`'s doc and cannot be reproduced
+    /// here: a test process holds no GL context, so it has none of the
+    /// graphics driver's windows, and every lookup in it is fast whichever
+    /// way the title is read. What can be held is the shape that makes the
+    /// cost impossible -- no `GetWindowTextW`, no `GetWindowTextLengthW`,
+    /// and no `WM_GETTEXT` sent by hand -- and that the one reader that
+    /// replaced them is the one call in this file. Reverting to the message
+    /// puts 430 ms back on every lookup in every GL process, and this is the
+    /// test that says so by name.
+    #[test]
+    fn a_title_is_read_from_the_window_structure_and_never_asked_by_message() {
+        let source = include_str!("foreground.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        assert!(code.len() < source.len(), "the test module marker was not found");
+        // Comments carry the names of the calls this forbids, so only
+        // statements are read.
+        let statements: String = code
+            .lines()
+            .map(|line| match line.find("//") {
+                Some(at) => &line[..at],
+                None => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for gone in [
+            "GetWindowTextW",
+            "GetWindowTextLengthW",
+            "SendMessageW",
+            "SendMessageTimeoutW",
+            "WM_GETTEXT",
+        ] {
+            assert!(
+                !statements.contains(gone),
+                "`{gone}` is back in this module. On a window this process owns on another \
+                 thread that is a message the owning thread has to answer, and the graphics \
+                 driver's threads answer it in ~108 ms -- see `win32::window_title`"
+            );
+        }
+        assert_eq!(
+            statements.matches("InternalGetWindowText(").count(),
+            1,
+            "the caption is read from a different number of places than one"
+        );
+        // The reader is the one `enum_proc` uses, so the enumeration cannot
+        // have a second, slower path of its own.
+        let walker = statements
+            .split("unsafe extern \"system\" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {")
+            .nth(1)
+            .expect("`enum_proc` is gone")
+            .split("\n    }")
+            .next()
+            .unwrap();
+        assert!(
+            walker.contains("let title = window_title(hwnd);"),
+            "`enum_proc` no longer names a window through `window_title`"
+        );
+        // And the buffer is the named capacity, with the copied length clamped
+        // to it rather than trusted: a fixed buffer with an unclamped index is
+        // the one way this reader could panic.
+        let reader = statements
+            .split("fn window_title(hwnd: HWND) -> String {")
+            .nth(1)
+            .expect("`window_title` is gone")
+            .split("\n    }")
+            .next()
+            .unwrap();
+        assert!(
+            reader.contains("[0u16; TITLE_CAPACITY]")
+                && reader.contains("clamp(0, TITLE_CAPACITY as i32)"),
+            "`window_title` reads into something other than a `TITLE_CAPACITY` buffer, or \
+             indexes it by an unclamped count"
+        );
+    }
+
+    /// **Every title this crate looks up fits `window_title`'s buffer.**
+    ///
+    /// A fixed buffer truncates, and a truncated caption matches nothing --
+    /// which is the right outcome for a stranger's window and the wrong one
+    /// for ours. The public titles are checked by value; the private ones
+    /// (`app_window`, `loading_ui`, `login_ui`, `picker_ui`, `prefs_ui`) are
+    /// read off their source, where each is a `const .._TITLE: &str = "..."`
+    /// on one line.
+    #[test]
+    fn every_title_this_crate_looks_up_fits_the_buffer() {
+        let capacity = win32::TITLE_CAPACITY;
+        let public: [&str; 6] = [
+            crate::vault_window::WINDOW_TITLE,
+            crate::vault_window::rehearsal::SCRATCH_TITLE,
+            crate::region_overlay::REGION_TITLE,
+            crate::picker_prompt::PICKER_PROMPT_TITLE,
+            crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
+            crate::generate_prompt::GENERATE_PROMPT_TITLE,
+        ];
+        for title in public {
+            let units = title.encode_utf16().count();
+            assert!(
+                units > 0 && units < capacity / 4,
+                "{title:?} is {units} UTF-16 units against a buffer of {capacity}; a title \
+                 near the buffer is a title one edit away from never being found"
+            );
+        }
+        let sources = [
+            ("app_window.rs", include_str!("app_window.rs")),
+            ("loading_ui.rs", include_str!("loading_ui.rs")),
+            ("login_ui.rs", include_str!("login_ui.rs")),
+            ("picker_ui.rs", include_str!("picker_ui.rs")),
+            ("prefs_ui.rs", include_str!("prefs_ui.rs")),
+        ];
+        let mut found = 0;
+        for (name, source) in sources {
+            for line in source.lines() {
+                let Some(rest) = line.trim_start().strip_prefix("const ") else {
+                    continue;
+                };
+                let Some(at) = rest.find("_TITLE: &str = \"") else {
+                    continue;
+                };
+                let literal = &rest[at + "_TITLE: &str = \"".len()..];
+                let Some(end) = literal.find('"') else {
+                    continue;
+                };
+                let units = literal[..end].encode_utf16().count();
+                assert!(
+                    units > 0 && units < capacity / 4,
+                    "{name}: {literal:?} is {units} UTF-16 units against a buffer of {capacity}"
+                );
+                found += 1;
+            }
+        }
+        assert!(
+            found >= 5,
+            "control: only {found} private title literal(s) were read off the source, so the \
+             scan above is over the wrong lines"
+        );
     }
 }
