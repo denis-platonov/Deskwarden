@@ -13849,6 +13849,7 @@ mod tests {
                 0,
                 &crate::rest::organizations::Audience::Personal,
                 &TotpState::NoSecret,
+                None,
             );
         });
         let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());

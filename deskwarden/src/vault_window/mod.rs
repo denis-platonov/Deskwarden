@@ -5211,6 +5211,13 @@ pub fn build_frame_with_search(
                             fills,
                             &audience,
                             &totp_state,
+                            // The same texture the read pane's header was
+                            // drawn from one click ago -- `icons.textures`,
+                            // keyed by the item's id, exactly as
+                            // `draw_read_arm`'s call above reads it.
+                            selected_item
+                                .as_ref()
+                                .and_then(|item| icons.textures.get(item.id.as_str())),
                         ) {
                             // **The pencil badge's icon menu, handed straight
                             // to the row menu's own arms.** The read pane's
@@ -5463,6 +5470,9 @@ pub fn build_frame_with_search(
                             0,
                             &crate::rest::organizations::Audience::Personal,
                             &totp_state,
+                            // No item, so no picture: a create's band draws
+                            // the kind's mark until the record exists.
+                            None,
                         ) {
                             // `to_new_item` is fallible because `NewItem` has no
                             // variant for `ItemKind::Unknown(_)`: a future Bitwarden

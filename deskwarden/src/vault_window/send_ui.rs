@@ -13997,10 +13997,20 @@ mod frame_promptness {
     /// better sentinel anyway: it is the control that makes this an editor,
     /// and the read pane has no button by that name.
     const EDITOR_EDIT_TITLE: &str = "Save changes";
-    /// **The `DetailMode::Create` arm's control**, the same title's other
-    /// half. `creating` is the only thing that chooses between them, and
-    /// `DetailMode::Create` is the only arm that passes `true`.
-    const EDITOR_CREATE_TITLE: &str = "New login";
+    /// **The `DetailMode::Create` arm's control.**
+    ///
+    /// It was `detail_edit::form_title`'s `New login`, drawn under the name
+    /// box; that line is gone entirely -- the owner: "Login under title -
+    /// remove, it will go in a separate block" -- so the string that told the
+    /// two arms apart no longer exists on either.
+    ///
+    /// `detail_edit::TOTP_CREATE_NOTICE` replaces it, and it is a better
+    /// sentinel than the heading was: the form draws it exactly when there is
+    /// no saved item to hang a one-time code on, which is `creating` itself
+    /// rather than a label that happened to follow it. The EDIT arm draws a
+    /// real TOTP row there instead, so the two arms still differ by this
+    /// string alone.
+    const EDITOR_CREATE_TITLE: &str = super::super::detail_edit::TOTP_CREATE_NOTICE;
     /// **The item row context menu's control.** `item_list::menu_entries`
     /// produces it and `response.context_menu`'s closure is the only thing
     /// that draws it; no pane on this screen has a "Move to folder" of its

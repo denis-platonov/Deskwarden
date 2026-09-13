@@ -3129,24 +3129,15 @@ impl EditDraft {
     }
 }
 
-/// The form's heading. Pure so the wording is asserted directly rather than
-/// inferred from a screenshot; the old hardcoded "Edit login" was the
-/// login-only era made visible, from when `kind_offers_edit` drew the read
-/// pane's button for no other kind. It now draws it for every kind
-/// [`EditDraft::apply_to`] writes, so the heading has to name them.
-fn form_title(kind: ItemKind, creating: bool) -> String {
-    let noun = match kind {
-        ItemKind::Login => "login",
-        ItemKind::SecureNote => "secure note",
-        ItemKind::Card => "card",
-        ItemKind::Identity => "identity",
-        ItemKind::SshKey => "SSH key",
-        // "item" rather than the kind's own "Unsupported item" label, which
-        // reads as "Edit unsupported item".
-        ItemKind::Unknown(_) => "item",
-    };
-    format!("{} {noun}", if creating { "New" } else { "Edit" })
-}
+// **`form_title` was here and is gone.** It answered "Edit login" / "New
+// card" for a heading this form no longer draws: 8a has no heading over the
+// pane, the name sits in a box that says what the record is called, and the
+// kind's own word is a row of the `ITEM` card. The owner took the last of it
+// off the title strip -- "Login under title - remove, it will go in a
+// separate block".
+//
+// `kind_noun` below is what survived, and it is the vocabulary that is
+// actually drawn.
 
 /// Which set of fields the form's body shows.
 ///
@@ -6369,40 +6360,32 @@ fn band_fits(pane_height: f32) -> bool {
 /// holding one control does not need a title bar's air around it.
 const COMPACT_BAND_PAD_Y: i8 = detail::HEADER_PAD_Y / 2;
 
-/// **The gap between the name BOX and the line under it**, which is not
-/// [`detail::TITLE_GAP`].
-///
-/// The read pane's 3 points sit between two runs of text, and a text run
-/// carries its own leading: the ink stops well above the line box it is laid
-/// in, so three points of layout gap read as six or seven of white. A FIELD
-/// has no such slack -- its border is exactly where it says it is -- so the
-/// same 3 put the subtitle hard against the box's bottom edge. The owner's
-/// word for it was "overlaps", with "some space in between" and an arrow at
-/// the air below the strip, which is where this comes from.
-///
-/// Eight, so the drawn white is about what the read pane's 3 draws and the
-/// two bands still read as one strip.
-const EDIT_TITLE_GAP: f32 = 8.0;
-
 /// **The height of the edit band's content row**, which is NOT
 /// [`detail::HEADER_ROW`] and cannot be.
 ///
-/// The read pane's 44 holds a 22-point title over a 12-point subtitle. The
-/// same two lines here have the title inside a [`theme::FIELD_HEIGHT`] box --
-/// 8a's `height: 38px` -- which is 16 points taller than the text it holds.
-/// So the edit band is the taller of the two, by exactly the box, and that is
-/// the whole of the difference between them. Summed from its parts rather
-/// than written as a number, so a field height that moves takes the band with
-/// it.
+/// The read pane's 44 holds a 22-point title over a 12-point subtitle. This
+/// band holds ONE thing: the name, in a [`theme::FIELD_HEIGHT`] box -- 8a's
+/// `height: 38px`. So the row is the box, and the tile and the pill beside it
+/// are centred against it.
 ///
-/// **The subtitle's line is 1.5 of its size and not 1.4**, which is a
-/// measurement and not a taste: the band is a fixed box the two lines are
-/// laid into, and 1.4 made it 0.2 of a point SHORTER than what it held, so
-/// the subtitle hung out of the bottom of its own strip. A row that is a
-/// hair too tall costs a hair of white; one that is a hair too short is the
-/// overlap.
-const EDIT_HEADER_ROW: f32 =
-    theme::FIELD_HEIGHT + EDIT_TITLE_GAP + detail::SUBTITLE_SIZE * 1.5;
+/// **The kind-and-folder line under the name is gone.** It said what the
+/// record is and where it lives, in the read pane's own words, and both of
+/// those are rows of the `ITEM` card below -- the owner's direction was
+/// "Login under title - remove, it will go in a separate block, title center
+/// vertically".
+///
+/// **The taller of the box and the TILE**, not the box alone. The avatar is
+/// 40 and the name box 38, and a band declared at 38 is a band the tile
+/// overflows by two -- which egui answers by growing the strip, leaving the
+/// box centred in 38 inside a row of 40 and the owner's "center vertically"
+/// off by a point. Stated as the max so the strip's height is the taller
+/// child's by decision rather than by accident, which is the same argument
+/// `detail::HEADER_ROW` makes one file over.
+const EDIT_HEADER_ROW: f32 = if theme::FIELD_HEIGHT > detail::HEADER_AVATAR {
+    theme::FIELD_HEIGHT
+} else {
+    detail::HEADER_AVATAR
+};
 
 /// **8a's title bar: the item's avatar, its name in a box, and what it is.**
 ///
@@ -6419,9 +6402,7 @@ const EDIT_HEADER_ROW: f32 =
 fn edit_header(
     ui: &mut egui::Ui,
     kind: ItemKind,
-    creating: bool,
     draft: &mut EditDraft,
-    folder: Option<&str>,
     dirty: bool,
     full: bool,
     // The item being edited, or `None` on a create. Read for its icon menu
@@ -6429,6 +6410,9 @@ fn edit_header(
     // `item_list::icon_menu`, which decides WHICH of the three rows an item
     // is offered and is asked here rather than second-guessed.
     item: Option<&VaultItem>,
+    // The item's picture, if the window's cache has one. See
+    // `draw_detail_edit`'s parameter.
+    icon: Option<&egui::TextureHandle>,
 ) -> EditAction {
     let mut action = EditAction::None;
     let band = egui::vec2(
@@ -6440,18 +6424,36 @@ fn edit_header(
         // `detail::header_row`, whose reasoning this band shares.
         ui.spacing_mut().item_spacing.x = 0.0;
         if full {
-            let tile = ui
-                .scope(|ui| {
-                    crate::kind_mark::avatar(
-                        ui,
-                        kind,
-                        &draft.name,
-                        detail::HEADER_AVATAR,
-                        true,
-                    );
-                })
-                .response
-                .rect;
+            // **The read pane's own two doors, in its own order.** An item
+            // whose row and read pane show a favicon must not lose it the
+            // moment Edit is pressed: the two bands are one click apart, and
+            // the tile is the same object seen twice. The `None` arm is
+            // `kind_mark::avatar` and not a monogram written out here, for
+            // that module's own rule -- an item whose row shows a note mark
+            // opens onto a note mark.
+            //
+            // The rect is the badge's anchor either way, which is why both
+            // arms answer one: `avatar_artwork_tile` allocates and returns
+            // the box it drew, and the mark's is read back off the scope.
+            let tile = match icon {
+                Some(tex) => {
+                    let tile = theme::avatar_artwork_tile(ui, detail::HEADER_AVATAR, true);
+                    theme::avatar_image(ui, tile, tex, true);
+                    tile
+                }
+                None => ui
+                    .scope(|ui| {
+                        crate::kind_mark::avatar(
+                            ui,
+                            kind,
+                            &draft.name,
+                            detail::HEADER_AVATAR,
+                            true,
+                        );
+                    })
+                    .response
+                    .rect,
+            };
             // **The badge is the icon menu's door**, and on a create it is
             // only a picture: there is no item yet, so there is no icon to
             // refresh, choose or clear. `icon_menu` answering `None` has the
@@ -6523,58 +6525,21 @@ fn edit_header(
                     );
                 }
             }
-            ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                // `EDIT_TITLE_GAP`, not the read pane's -- see it for why a
-                // box and a text run do not take the same gap.
-                ui.spacing_mut().item_spacing.y = EDIT_TITLE_GAP;
-                theme::title_field(ui, &mut draft.name);
-                if !full {
-                    return;
-                }                // The subtitle, in the read pane's own two runs with the
-                // folder mark between them: what this record IS, then where
-                // it lives.
-                //
-                // **The kind's own word on an edit, exactly as the read pane
-                // says it.** The lead used to be `form_title`'s `Edit login`,
-                // on the argument that the mode had to be said somewhere once
-                // 8a's heading was gone. The owner, looking at it: "Edit Login
-                // - should be just regular same as on details page label along
-                // with folder, basically it is the same block but with square
-                // around title". The mode does not need saying: the name sits
-                // in a box, every field below it is editable, and the footer
-                // has Save and Cancel in it. Saying it here made the one line
-                // that is supposed to be identical to the read pane's the one
-                // line that was not.
-                //
-                // A CREATE keeps `form_title`'s `New login`, because there is
-                // no read pane behind it to be identical to and nothing else
-                // on the form says the record does not exist yet.
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label(
-                        RichText::new(if creating {
-                            form_title(kind, creating)
-                        } else {
-                            kind.label().to_string()
-                        })
-                        .size(detail::SUBTITLE_SIZE)
-                            .color(theme::TEXT_FAINT),
-                    );
-                    if let Some(name) = folder {
-                        ui.label(
-                            RichText::new(" \u{b7} ")
-                                .size(detail::SUBTITLE_SIZE)
-                                .color(theme::TEXT_FAINT),
-                        );
-                        theme::folder_mark(ui, theme::TEXT_FAINT);
-                        ui.label(
-                            RichText::new(name)
-                                .size(detail::SUBTITLE_SIZE)
-                                .color(theme::TEXT_FAINT),
-                        );
-                    }
-                });
-            });
+            // **One control, added straight into the row.**
+            //
+            // It used to be a `top_down` column holding the box and the
+            // kind-and-folder line under it; with that line gone there is no
+            // column left, and a nested column is exactly what stopped the
+            // box being centred: this row is `right_to_left(Align::Center)`,
+            // which cross-aligns the WIDGETS in it, and a child `Ui` is not a
+            // widget -- it takes the full height it is offered and lays out
+            // from the top. Measured: 20 points of strip above the box and 22
+            // below, against the owner's "title center vertically".
+            //
+            // Added directly, the box is a widget in a centring row and the
+            // arithmetic is egui's. See `EDIT_HEADER_ROW` for why the row is
+            // two points taller than the box in the first place.
+            theme::title_field(ui, &mut draft.name);
         });
     });
     action
@@ -6781,9 +6746,10 @@ fn sharing_line(audience: &crate::rest::organizations::Audience) -> Option<Strin
 /// What 8a's `Type` row says: the kind's own noun, in the case the row draws
 /// it in.
 ///
-/// Derived from [`form_title`]'s own vocabulary rather than spelled a second
-/// time -- the two have to agree, because the title says `Edit login` directly
-/// above a row that says `Login`.
+/// **The only place this app names a kind on the edit form.** It used to
+/// have to agree with `form_title`'s "Edit login" one strip above it; that
+/// heading is gone, so this row is the whole of what the form says a record
+/// IS.
 fn kind_noun(kind: ItemKind) -> &'static str {
     match kind {
         ItemKind::Login => "Login",
@@ -6792,7 +6758,7 @@ fn kind_noun(kind: ItemKind) -> &'static str {
         ItemKind::SecureNote => "Secure note",
         ItemKind::SshKey => "SSH key",
         // The wire's own number is the only honest answer for a kind this
-        // build has never heard of. `form_title` says the same thing.
+        // build has never heard of.
         ItemKind::Unknown(_) => "Unknown type",
     }
 }
@@ -6956,6 +6922,16 @@ pub fn draw_detail_edit(
     // show what `{TOTP}` would type. Not a second poll: this form cannot fetch
     // a code and does not try.
     totp: &detail::TotpState,
+    // **The item's own picture**, out of the window's icon cache -- the very
+    // texture the read pane's header and the item's list row are drawn from.
+    //
+    // The owner: "draw an icon, have edit overlap in the corner like this".
+    // This band was showing a monogram for every item, including ones whose
+    // row and read pane both show a favicon, so pressing Edit changed the
+    // picture of the record you were looking at. `None` is the honest answer
+    // on a create and on an item with no icon at all, and the kind mark
+    // behind it is the same fallback the read pane takes.
+    icon: Option<&egui::TextureHandle>,
 ) -> EditAction {
     let mut action = EditAction::None;
     // Read before the closure borrows `draft` mutably.
@@ -7040,11 +7016,9 @@ pub fn draw_detail_edit(
     // The `Unsaved changes` pill stays, on the band's right edge: it is the
     // one thing on 8a's title bar that says something the rest of the window
     // does not.
-    let folder_name = draft
-        .folder_id
-        .as_ref()
-        .and_then(|id| folders.iter().find(|f| &f.id == id))
-        .map(|f| f.name.as_str());
+    // **The band no longer resolves the folder's name**, because it no longer
+    // says it: that line moved to the `ITEM` card, where the folder is a
+    // control rather than a word. See `edit_header`.
     // **What the band gives up on a pane the app cannot actually be resized
     // to**, decided before it is drawn and while `available_height` is still
     // the whole pane's.
@@ -7057,16 +7031,8 @@ pub fn draw_detail_edit(
         ))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let from_badge = edit_header(
-                ui,
-                kind,
-                creating,
-                draft,
-                folder_name,
-                !changes.is_empty(),
-                full_band,
-                item,
-            );
+            let from_badge =
+                edit_header(ui, kind, draft, !changes.is_empty(), full_band, item, icon);
             if from_badge != EditAction::None {
                 action = from_badge;
             }
@@ -10247,28 +10213,9 @@ mod tests {
         assert_eq!(filing.apply_to(&unfiled).folder_id.as_deref(), Some("f2"));
     }
 
-    #[test]
-    fn the_form_titles_name_the_kind_and_only_a_login_says_login() {
-        assert_eq!(form_title(ItemKind::Login, true), "New login");
-        assert_eq!(form_title(ItemKind::Login, false), "Edit login");
-        assert_eq!(form_title(ItemKind::Card, false), "Edit card");
-        assert_eq!(form_title(ItemKind::SecureNote, false), "Edit secure note");
-        assert_eq!(form_title(ItemKind::Identity, false), "Edit identity");
-        assert_eq!(form_title(ItemKind::SshKey, false), "Edit SSH key");
-        assert_eq!(form_title(ItemKind::Unknown(6), false), "Edit item");
-        for kind in [
-            ItemKind::SecureNote,
-            ItemKind::Card,
-            ItemKind::Identity,
-            ItemKind::SshKey,
-            ItemKind::Unknown(6),
-        ] {
-            assert!(
-                !form_title(kind, false).contains("login"),
-                "{kind:?}'s edit form still calls itself a login"
-            );
-        }
-    }
+    // **`the_form_titles_name_the_kind_and_only_a_login_says_login` was
+    // here.** It pinned `form_title`'s wording; nothing draws that wording
+    // now. `kind_noun`'s own vocabulary is pinned by the `ITEM` card's tests.
 
     /// A draft of `kind` with every kind's fields filled in with a
     /// recognisable value, so a payload that carries the wrong kind's data --
@@ -11236,7 +11183,7 @@ mod generator_row_tests {
         let mut apps = AppIdentityCache::default();
         let mut action = EditAction::None;
         let output = ctx.run_ui(raw_input(events), |ui| {
-            action = draw_detail_edit(ui, draft, &[], false, &mut apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret);
+            action = draw_detail_edit(ui, draft, &[], false, &mut apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret, None);
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -12994,6 +12941,7 @@ mod sequence_builder_tests {
                 0,
                 &crate::rest::organizations::Audience::Personal,
                 totp,
+                None,
             );
         });
         let mut painted = Painted::default();
@@ -13029,6 +12977,7 @@ mod sequence_builder_tests {
                 0,
                 &crate::rest::organizations::Audience::Personal,
                 totp,
+                None,
             );
         });
         let mut painted = Painted::default();
@@ -14922,6 +14871,7 @@ mod edit_pane_layout_tests {
                 0,
                 &crate::rest::organizations::Audience::Personal,
                 totp,
+                None,
             );
         });
         let mut painted = Painted::default();
@@ -16605,21 +16555,27 @@ mod edit_pane_layout_tests {
     /// ScrollArea" fix loses -- and this crate has already shipped a layout
     /// test that certified a pane whose title had been annihilated. It stays
     /// on screen, above the form, at the minimum size.
+    ///
+    /// **The title is the NAME now**, not a `form_title` heading over the
+    /// pane: 8a has no such heading, and the last of it came off the strip at
+    /// the owner's direction. So the draft is given a name and the claim is
+    /// made about that -- which is the stronger version of the same test,
+    /// since the name is a control and not a label.
     #[test]
     fn the_form_title_survives_the_short_pane() {
         let pane = egui::vec2(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
         let ctx = styled_context(pane);
         let mut draft = tallest_draft();
+        draft.name = "Ledgerline".to_string();
         let _ = frame(&ctx, pane, &mut draft, true, &[]);
         let painted = frame(&ctx, pane, &mut draft, true, &[]);
 
-        let heading = form_title(draft.kind, true);
-        let title = painted.rect_of(&heading);
-        assert_inside("the form title", &heading, pane, &painted);
+        let title = painted.rect_of(&draft.name);
+        assert_inside("the name box", &draft.name, pane, &painted);
         assert!(
-            title.bottom() < painted.rect_of(SAVE).top(),
-            "the title is not above the buttons: title {title:?}, Save {:?}",
-            painted.rect_of(SAVE)
+            title.bottom() < painted.rect_of(SAVE_BUTTON).top(),
+            "the name is not above the buttons: name {title:?}, Save {:?}",
+            painted.rect_of(SAVE_BUTTON)
         );
     }
 
@@ -16926,7 +16882,7 @@ mod edit_pane_layout_tests {
         for _ in 0..2 {
             let _ = ctx.run_ui(raw_input(pane, &[]), |ui| {
                 let before = sample(ui);
-                let _ = draw_detail_edit(ui, &mut draft, &[], true, &mut apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret);
+                let _ = draw_detail_edit(ui, &mut draft, &[], true, &mut apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret, None);
                 seen = Some((before, sample(ui)));
             });
         }
@@ -20066,23 +20022,21 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// **The line under the name box clears the box.**
+    /// **The name box is the whole of the title band, centred in it.**
     ///
-    /// The owner: "overlaps", then "some space in between" with an arrow at
-    /// the air below the strip. Two causes, both fixed and both pinned here
-    /// because either alone puts the subtitle back against the border:
+    /// This replaces `the_kind_line_clears_the_name_box_it_sits_under`, which
+    /// pinned the gap between the box and the kind-and-folder line under it.
+    /// That line is gone -- the owner: "Login under title - remove, it will
+    /// go in a separate block, title center vertically" -- and what is left
+    /// to hold is the band: exactly one control in it, with equal air above
+    /// and below.
     ///
-    /// * `theme`'s `field_box` gave the cursor back at the TEXT's band rather
-    ///   than under the box -- `ui.put` reports the rect it placed, and that
-    ///   rect is one ascent tall, centred. Every field in the app was five to
-    ///   ten points shorter than it drew.
-    /// * the gap itself was `detail::TITLE_GAP`, which is the read pane's 3
-    ///   between two runs of text. A box has no leading; see `EDIT_TITLE_GAP`.
-    ///
-    /// A short name, so the title's galley really is inside its box and
-    /// `frame_around` finds the box rather than the strip behind it.
+    /// Equal air is the assertion and not the band's height, because the
+    /// height is `EDIT_HEADER_ROW` plus two paddings and would be satisfied
+    /// by a box hanging off the top of it, which is what a `top_down` column
+    /// in a band taller than its content really does.
     #[test]
-    fn the_kind_line_clears_the_name_box_it_sits_under() {
+    fn the_name_box_is_centred_in_the_title_band() {
         for pane in GRID_PANES {
             let ctx = styled_context(pane);
             let mut draft = full_login_draft();
@@ -20090,11 +20044,9 @@ mod edit_pane_layout_tests {
             let _ = frame(&ctx, pane, &mut draft, false, &[]);
             let painted = frame(&ctx, pane, &mut draft, false, &[]);
 
-            // The box, not `frame_around`'s answer: the smallest rect around
-            // the name is the TextEdit's own one-ascent lane (see `theme`'s
-            // `field_box`, which places it centred), and that lane is
-            // precisely the thing this test is about not mistaking for the
-            // box. So it is found by the box's own height.
+            // The box, found by its own height: the smallest rect around the
+            // name is the TextEdit's one-ascent lane, which `theme`'s
+            // `field_box` places centred inside the box.
             let ink = painted.rect_of(&draft.name);
             let boxes: Vec<Rect> = painted
                 .rects
@@ -20111,29 +20063,32 @@ mod edit_pane_layout_tests {
                 theme::FIELD_HEIGHT
             );
             let name_box = boxes[0];
-            // The kind's own word, which is what the band says under the name
-            // -- `detail`'s label, because the two panes draw one line.
-            //
-            // The FIRST one down the pane: the Item card says the same word
-            // in its `Type` row, so `rect_of`'s one-match rule cannot be
-            // used here. The subtitle is the higher of the two by the whole
-            // height of the strip.
-            //
-            // The rect is the run's GALLEY, so the white really drawn is at
-            // least this much and typically a little more.
-            let kind = painted
-                .rects_of(&draft.kind.label())
-                .into_iter()
-                .min_by(|a, b| a.min.y.total_cmp(&b.min.y))
-                .expect("the band names the kind under the name box");
+
+            // The band: the white strip behind it, which is the widest
+            // `theme::CARD` rect the box sits inside.
+            let band = painted
+                .rects
+                .iter()
+                .filter(|(r, fill)| *fill == theme::CARD && r.contains(name_box.center()))
+                .map(|(r, _)| *r)
+                .max_by(|a, b| a.width().total_cmp(&b.width()))
+                .expect("the title strip is painted");
+            let above = name_box.top() - band.top();
+            let below = band.bottom() - name_box.bottom();
             assert!(
-                kind.min.y >= name_box.max.y,
-                "{pane:?}: {:?} starts at {} and the name box ends at {} -- the line under \
-                 the box is drawn {}pt inside it",
-                draft.kind.label(),
-                kind.min.y,
-                name_box.max.y,
-                name_box.max.y - kind.min.y
+                (above - below).abs() <= 0.5,
+                "{pane:?}: the name box has {above}pt of band above it and {below}pt below -- \
+                 it is not centred in the strip"
+            );
+            // And the strip is the row plus the read pane's own padding,
+            // which is what keeps the two bands from jumping under each other
+            // when Edit is pressed.
+            let wanted = EDIT_HEADER_ROW + 2.0 * f32::from(detail::HEADER_PAD_Y);
+            assert!(
+                (band.height() - wanted).abs() <= 0.5,
+                "{pane:?}: the title strip is {}pt tall, not `EDIT_HEADER_ROW` plus two \
+                 `HEADER_PAD_Y` ({wanted})",
+                band.height()
             );
         }
     }
