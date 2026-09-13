@@ -7223,17 +7223,17 @@ pub fn draw_detail_edit(
     if from_badge != EditAction::None {
         action = from_badge;
     }
-    // 8a's body `padding: 20px 28px 0`: the column's top inset, between the
-    // strip's rule and the first card. The horizontal half is the pane's own
-    // central-panel margin, applied outside this `Ui`, and is the read pane's
-    // 24 rather than 8a's 28 -- the same inset the footer below reports
-    // spending elsewhere, and for the same reason: this form is a pane in the
-    // vault window and takes that window's margin, not a whole window's.
+    // **The READ pane's body inset, not 8a's.** 8a says `padding: 20px 28px
+    // 0` on the column under the strip's rule; 2b says 18, and the two panes
+    // are one click apart -- two points of it is the whole of "Edit first
+    // tile is like one pixel lower than normal tile". Both halves of that
+    // padding are `detail`'s now: the horizontal one is `FORM_PAD_X`, which
+    // is `BODY_PAD_X`, and this is `BODY_PAD_Y`.
     //
     // Net of the `item_spacing.y` the rule above has already been followed
     // by, so the drawn gap is the constant and not the constant plus eight.
     // See `theme::SECTION_COLUMN_TOP` for what the old `12` here really drew.
-    ui.add_space(theme::SECTION_COLUMN_TOP - ui.spacing().item_spacing.y);
+    ui.add_space(f32::from(detail::BODY_PAD_Y) - ui.spacing().item_spacing.y);
 
 
     // A create of a kind `NewItem` cannot express has no payload at all (see
@@ -20391,11 +20391,13 @@ mod edit_pane_layout_tests {
             .map(|(r, _)| *r)
             .min_by(|a, b| a.top().total_cmp(&b.top()))
             .expect("the card column is painted");
+        // The READ pane's own body inset, so the two panes put their first
+        // card on the same line -- see the `add_space` this pins.
+        let inset = f32::from(detail::BODY_PAD_Y);
         assert!(
-            (card.top() - rule.bottom() - theme::SECTION_COLUMN_TOP).abs() <= 0.5,
-            "the first card starts {}pt under the rule, not 8a's SECTION_COLUMN_TOP ({})",
-            card.top() - rule.bottom(),
-            theme::SECTION_COLUMN_TOP
+            (card.top() - rule.bottom() - inset).abs() <= 0.5,
+            "the first card starts {}pt under the rule, not the read pane's {inset}",
+            card.top() - rule.bottom()
         );
     }
 
@@ -20729,15 +20731,20 @@ mod edit_pane_layout_tests {
         assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
     }
 
-    /// **The card column stands 8a's `padding: 20px` off the strip's rule,
-    /// and its cards sit 8a's `gap: 14px` apart.**
+    /// **The card column stands the READ pane's `padding: 18px` off the
+    /// strip's rule, and its cards sit 8a's `gap: 14px` apart.**
     ///
     /// The rule is the topmost `theme::HAIRLINE` line; the first card is the
     /// white card round `ITEM`, the second the one round the credentials
-    /// title. Both gaps used to be 12, which was neither 8a's number nor the
-    /// read pane's.
+    /// title. Both gaps used to be 12, which was neither design's number.
+    ///
+    /// **The first inset is 2b's 18 and not 8a's 20**, which is the one place
+    /// the two designs disagree that the owner has ruled on: "Edit first tile
+    /// is like one pixel lower than normal tile". The two panes are a click
+    /// apart and their first card has to land on the same line. The gap
+    /// BETWEEN cards is 14 in both designs, so that half needed no ruling.
     #[test]
-    fn the_card_column_is_20_under_the_strip_and_its_cards_14_apart() {
+    fn the_card_column_is_the_read_panes_inset_under_the_strip() {
         let mut panes = 0;
         for pane in GRID_PANES {
             panes += 1;
@@ -20754,9 +20761,11 @@ mod edit_pane_layout_tests {
                 .min_by(|a, b| a.top().total_cmp(&b.top()))
                 .expect("the strip is closed by a hairline");
             let item = card_around(&painted, painted.rect_of(&Section::Item.title(draft.kind).to_uppercase()));
+            let inset = f32::from(detail::BODY_PAD_Y);
             assert!(
-                (item.top() - rule.bottom() - theme::SECTION_COLUMN_TOP).abs() <= 0.5,
-                "{pane:?}: the first card starts {} under the strip's rule, not 8a's 20",
+                (item.top() - rule.bottom() - inset).abs() <= 0.5,
+                "{pane:?}: the first card starts {} under the strip's rule, not the read \
+                 pane's {inset}",
                 item.top() - rule.bottom()
             );
             let details = card_around(

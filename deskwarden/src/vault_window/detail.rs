@@ -189,7 +189,11 @@ const HEADER_ROW_GAP: f32 = 10.0;
 /// owner's "cards are smaller for edit screen", which is what two numbers
 /// four apart looked like across one click.
 pub(crate) const BODY_PAD_X: i8 = 24;
-const BODY_PAD_Y: i8 = 18;
+/// `pub(crate)` for [`BODY_PAD_X`]'s reason: the EDIT pane's card column
+/// starts at the same distance under the header's rule, and two numbers two
+/// apart is what the owner saw as "Edit first tile is like one pixel lower
+/// than normal tile".
+pub(crate) const BODY_PAD_Y: i8 = 18;
 /// `gap: 14px` between the body's cards.
 const CARD_GAP: f32 = 14.0;
 /// A card's `padding: 11px 16px` heading and `padding: 13px 16px` rows -- one
