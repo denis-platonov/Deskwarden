@@ -68,7 +68,6 @@ use crate::screen_capture::CaptureRefusal;
 use crate::theme;
 use crate::webcam::{CameraRefusal, Session, WebcamSeams};
 use eframe::egui::{self, CornerRadius};
-use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 // The 26px button height this form used to declare is gone with the two bare
@@ -1558,17 +1557,6 @@ pub struct TotpAdd {
     pub typed: Zeroizing<String>,
     /// The digits control. [`DEFAULT_DIGITS`] until the user says otherwise.
     pub digits: u8,
-    /// Which field row was last copied, and when. See [`CODE_COPIED_HINT`],
-    /// which is the word it shows, and [`still_copied`], which is how long
-    /// for.
-    pub field_copied: Option<(TableField, Instant)>,
-    /// When the live code was last copied off the strip, for the word the
-    /// strip shows in the seconds' place. See [`CODE_COPIED_HINT`].
-    ///
-    /// **In memory and nowhere near the item.** It is a fact about a click in
-    /// this form's lifetime; nothing is written, nothing is read back, and the
-    /// form is dropped when the card closes.
-    pub code_copied_at: Option<Instant>,
     /// The period control. [`DEFAULT_PERIOD`] until the user says otherwise.
     pub period: u16,
     /// Whether the secret row is unmasked. **Starts `false`** and is never
@@ -1615,8 +1603,6 @@ impl TotpAdd {
             already_has_code,
             typed: Zeroizing::new(String::new()),
             digits: DEFAULT_DIGITS,
-            code_copied_at: None,
-            field_copied: None,
             period: DEFAULT_PERIOD,
             revealed: false,
             stage: Stage::Picker,
@@ -3993,11 +3979,26 @@ fn stage_card<R>(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui) 
             ui.spacing_mut().item_spacing.y = 0.0;
             add(ui)
         });
+    // **`Inside`, and the `Middle` it replaces is the owner's "two lines next
+    // to each other like last time on the right edge".**
+    //
+    // This card strokes its border TWICE: once as the `Frame`'s own stroke,
+    // which `egui` draws `Inside` the rect, and once here over the top so the
+    // border is not covered by a child that reaches the edge. Two strokes of
+    // one border is fine -- they are meant to land on the same pixels -- and
+    // they did not: `Middle` centres a 1pt stroke ON the edge, half a point
+    // outside where `Inside` puts it, so at any scale where half a point is a
+    // real pixel the card was outlined by two adjacent hairlines.
+    //
+    // It is the same READING as the scroll-bar report that produced
+    // `MANUAL_SCROLLBAR_INSET` -- "two lines on the right edge" -- and a
+    // different cause, which is why the first fix did not touch it: that one
+    // was a 6pt bar beside the border, this is the border beside itself.
     ui.painter().rect_stroke(
         framed.response.rect,
         CornerRadius::same(CARD_RADIUS),
         border,
-        egui::StrokeKind::Middle,
+        egui::StrokeKind::Inside,
     );
     framed.inner
 }
@@ -4669,14 +4670,7 @@ fn draw_confirmation(
     // nobody makes. On the typed path it is the only thing here.
     let mut action = TotpAddAction::None;
     if let Some(code) = code_at(auth, now_unix) {
-        let copied = still_copied(state.code_copied_at, Instant::now());
-        if draw_code_panel(ui, auth, &code, now_unix, copied) {
-            // The moment is recorded here and the COPY is done by the caller
-            // -- see `TotpAddAction::CopyCode`. Recording it here rather than
-            // on the way back keeps the strip's wording a fact about the
-            // click, which is what the user just made, rather than about a
-            // clipboard call this surface cannot see the result of.
-            state.code_copied_at = Some(Instant::now());
+        if draw_code_panel(ui, auth, &code, now_unix) {
             action = TotpAddAction::CopyCode;
         }
         // **No gap is added here**, and that is the fix for "vertical
@@ -4699,7 +4693,6 @@ fn draw_confirmation(
         // already claim this frame -- one clipboard write per press, and the
         // two targets do not overlap on screen anyway.
         if let Some(field) = draw_field_table(ui, auth, state) {
-            state.field_copied = Some((field, Instant::now()));
             if action == TotpAddAction::None {
                 action = TotpAddAction::CopyField(field);
             }
@@ -4718,37 +4711,21 @@ fn draw_confirmation(
 /// moving the mouse after clicking is a confirmation most people never see.
 pub const CODE_COPY_HINT: &str = "Click to copy this code";
 
-/// **The confirmation, in the seconds' place.**
+/// **What the copy confirmation calls each of the five things this card
+/// copies**, in the app's own toast.
 ///
-/// This strip carries the code, a bar and the seconds and nothing else -- the
-/// owner's own rule, "blue strip also should only have code and progress bar
-/// with seconds - nothing else" -- so a `Copied` badge beside them would be a
-/// fourth element. Taking the seconds' place for [`COPIED_FOR`] is not: it is
-/// the same run, in the same place, saying the one thing that has just
-/// happened, and the countdown bar beside it is still running so the code's
-/// life is still on screen while it says so.
-///
-/// The app's own copy toast was the other candidate and cannot be used: it is
-/// painted by the READ pane, inside that pane's rect, and this card is a modal
-/// on a layer above it -- so a toast raised from here is drawn underneath the
-/// thing that was just clicked.
-pub const CODE_COPIED_HINT: &str = "Copied";
-
-/// How long the strip says `Copied` before going back to offering.
-///
-/// Deliberately shorter than a code's own life: a confirmation still standing
-/// when the digits underneath it have rolled would be telling the user that
-/// what is on their clipboard is what is on their screen, which by then is not
-/// true. `clipboard::DEFAULT_CLEAR_AFTER` is the other bound and is far longer
-/// than this one -- what this word reports is the click, not the clipboard.
-const COPIED_FOR: Duration = Duration::from_millis(1800);
-
-/// Whether the strip should still be saying [`CODE_COPIED_HINT`].
-///
-/// A pure function of the two, so the wording is decided somewhere a test can
-/// reach rather than inside a frame.
-pub fn still_copied(copied_at: Option<Instant>, now: Instant) -> bool {
-    copied_at.is_some_and(|at| now.duration_since(at) < COPIED_FOR)
+/// The row labels themselves wherever there is one -- so the row the user
+/// pressed and the sentence they read are the same `const` -- and the READ
+/// PANE's word for the live code, because that is the same value the pane
+/// copies under the same name and two words for one credential is two
+/// credentials as far as a reader is concerned.
+pub fn copied_label(field: Option<TableField>) -> &'static str {
+    match field {
+        Some(TableField::Issuer) => ISSUER_ROW_LABEL,
+        Some(TableField::Account) => ACCOUNT_ROW_LABEL,
+        Some(TableField::Secret) => SECRET_ROW_LABEL,
+        None => "TOTP",
+    }
 }
 
 /// Draws the strip, and answers whether it was clicked.
@@ -4773,13 +4750,7 @@ pub fn still_copied(copied_at: Option<Instant>, now: Instant) -> bool {
 ///
 /// The gap between the code and the track, and again between the track and
 /// the seconds, is §6d's `gap: 14px`; the padding is its `12px 14px`.
-fn draw_code_panel(
-    ui: &mut egui::Ui,
-    auth: &OtpAuth,
-    code: &str,
-    now_unix: u64,
-    copied: bool,
-) -> bool {
+fn draw_code_panel(ui: &mut egui::Ui, auth: &OtpAuth, code: &str, now_unix: u64) -> bool {
     let framed = egui::Frame::new()
         .fill(theme::BLUE_WASH)
         .stroke(egui::Stroke::new(1.0, theme::BLUE_EDGE))
@@ -4791,11 +4762,7 @@ fn draw_code_panel(
             // what the track's width is computed from -- a word measured after
             // the track was sized would push the strip's right edge out on the
             // frame it appears.
-            let seconds = if copied {
-                CODE_COPIED_HINT.to_string()
-            } else {
-                seconds_line(seconds_left(auth, now_unix))
-            };
+            let seconds = seconds_line(seconds_left(auth, now_unix));
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 // **The line box is the face's ascent**, so egui's vertical
@@ -4911,17 +4878,7 @@ fn draw_field_table(
             // Which row, if any, is still saying it was copied -- and the
             // one function that draws that word, so three rows cannot end up
             // saying it three ways.
-            let now = Instant::now();
-            let copied = state.field_copied.filter(|(_, at)| still_copied(Some(*at), now));
             let mut pressed = None;
-            let said = |ui: &mut egui::Ui, field: TableField| {
-                if copied.is_some_and(|(which, _)| which == field) {
-                    ui.label(
-                        theme::semibold(CODE_COPIED_HINT, FIELD_ACTION_PX)
-                            .color(theme::TEXT_FAINT),
-                    );
-                }
-            };
 
             if table_row(
                 ui,
@@ -4940,7 +4897,7 @@ fn draw_field_table(
                     );
                     ui.label(job);
                 },
-                |ui| said(ui, TableField::Issuer),
+                |_| {},
             ) {
                 pressed = Some(TableField::Issuer);
             }
@@ -4960,7 +4917,7 @@ fn draw_field_table(
                     );
                     ui.label(job);
                 },
-                |ui| said(ui, TableField::Account),
+                |_| {},
             ) {
                 pressed = Some(TableField::Account);
             }
@@ -5001,7 +4958,6 @@ fn draw_field_table(
                 |ui| {
                     toggle = row_action(ui, if state.revealed { HIDE_LABEL } else { REVEAL_LABEL })
                         .clicked();
-                    said(ui, TableField::Secret);
                 },
             ) {
                 pressed = Some(TableField::Secret);
@@ -5323,7 +5279,7 @@ pub fn draw_add_modal(
     // it is painted; see it for egui's own lines and for why it is keyed on
     // the stage rather than on the size.
     let modal_id = egui::Id::new("totp-add-modal");
-    let action = theme::movable_modal(ctx, egui::Area::new(modal_id))
+    let card = theme::movable_modal(ctx, egui::Area::new(modal_id))
         .show(ctx, |ui| {
             // **The handle goes on before the stage does, and it is the
             // stage's own header.** Registered first because a drag-sensing
@@ -5333,9 +5289,24 @@ pub fn draw_add_modal(
             // one card in the app whose header changes with what it is showing.
             theme::modal_drag_handle(ui, stage_header_height(state.stage));
             ui.set_max_width(stage_width(state.stage));
-            draw_stage(ui, state, now_unix)
-        })
-        .inner;
+            let reported = draw_stage(ui, state, now_unix);
+            // **The app's own copy confirmation, over this card.**
+            //
+            // The owner, of the word this card used to put in the row beside
+            // Reveal: "show copied at the bottom like usually". This IS the
+            // usual one -- `detail::draw_copy_toast`, the same box, the same
+            // five seconds, the same bottom-right inset and the same `{label}
+            // copied` wording the read pane has -- placed in this card's rect
+            // rather than the pane's.
+            //
+            // Drawn INSIDE the modal's own area, so it is on the modal's
+            // layer: a toast raised by the read pane would be painted under
+            // this card, which is why the first attempt at a confirmation here
+            // was a hover text and the second was a word in the row.
+            crate::vault_window::detail::draw_copy_toast(ui, ui.min_rect());
+            reported
+        });
+    let action = card.inner;
     theme::settle_reshaped_modal(ctx, modal_id, state.stage);
 
     // **Escape closes it, and this is the only key the modal answers.**
@@ -7236,22 +7207,27 @@ mod tests {
     // The live code, pressed
     // -----------------------------------------------------------------
 
-    /// **`Copied` is a word about a click, and it does not outstay the code
-    /// it is about.**
+    /// **Every copy this card makes names itself in the app's own
+    /// confirmation.**
+    ///
+    /// The wording is the one thing a toast raised from here can get wrong in
+    /// a way nothing else would catch: the toast reads `{label} copied`, and a
+    /// label that drifted from the row the user pressed would be a
+    /// confirmation about a different field. So the row labels themselves are
+    /// the labels, and the live code takes the READ PANE's word for the same
+    /// value -- two words for one credential is two credentials as far as a
+    /// reader is concerned.
     #[test]
-    fn the_strip_says_copied_for_a_while_and_then_offers_again() {
-        let now = Instant::now();
-        assert!(!still_copied(None, now), "an untouched strip claims a copy");
-        assert!(still_copied(Some(now), now), "the click itself is not reported");
-        assert!(still_copied(Some(now), now + Duration::from_secs(1)));
-        assert!(
-            !still_copied(Some(now), now + COPIED_FOR),
-            "the word outstays its own window"
-        );
-        assert!(
-            COPIED_FOR < Duration::from_secs(30),
-            "the confirmation can outlive the code it is about, so it would be telling the \
-             user that what is on their clipboard is what is on their screen when it is not"
+    fn every_copy_names_itself_in_the_rows_own_word() {
+        assert_eq!(copied_label(Some(TableField::Issuer)), ISSUER_ROW_LABEL);
+        assert_eq!(copied_label(Some(TableField::Account)), ACCOUNT_ROW_LABEL);
+        assert_eq!(copied_label(Some(TableField::Secret)), SECRET_ROW_LABEL);
+        assert_eq!(
+            copied_label(None),
+            crate::vault_window::detail::copy_shortcut_label(
+                crate::vault_window::detail::CopyShortcut::Totp
+            ),
+            "the card and the read pane call the same credential two different things"
         );
     }
 
@@ -7393,7 +7369,6 @@ mod tests {
             strip.rect
         );
 
-        assert!(state.code_copied_at.is_none(), "the form opened claiming a copy");
         let pressed = manual.click(&mut state, strip.rect.center());
         assert_eq!(
             pressed.action,
@@ -7401,25 +7376,13 @@ mod tests {
             "pressing the live code reported nothing -- either the strip senses no click or \
              the report is swallowed on the way out of the body"
         );
-        assert!(
-            still_copied(state.code_copied_at, Instant::now()),
-            "the strip does not say it was copied, so the click has no confirmation at all"
-        );
-        // **And the word is really painted**, which the flag alone does not
-        // say. The first version of this confirmation was a hover text, and it
-        // set the same flag and showed the user nothing -- egui suppresses a
-        // tooltip on the press that would open it. So the assertion is on the
-        // glyphs.
-        let after = manual.idle(&mut state);
-        assert!(
-            after.painted.has(CODE_COPIED_HINT),
-            "the strip does not paint {CODE_COPIED_HINT:?} after a copy: {:?}",
-            after.painted.0
-        );
-        assert!(
-            !laid_out.painted.has(CODE_COPIED_HINT),
-            "the strip says it was copied before anything was clicked"
-        );
+        // **The card reports and does not confirm.** The confirmation is
+        // the app's own toast, raised by the window beside the clipboard
+        // write and drawn over this card's rect -- see
+        // `detail::draw_copy_toast`. Two earlier versions said it here
+        // instead: a hover text egui suppresses on the press that opens it,
+        // and a word in the row that came out as `CopiedReveal` against the
+        // control beside it.
 
         // And a press somewhere the strip is not reports nothing, so the
         // assertion above is about the strip rather than about any click.
@@ -7485,13 +7448,6 @@ mod tests {
                 field_to_copy(&state, field).as_deref().map(String::as_str),
                 Some(expected),
                 "the {label:?} row would copy the wrong value"
-            );
-            // And it says so, in its own row.
-            let after = manual.idle(&mut state);
-            assert!(
-                after.painted.has(CODE_COPIED_HINT),
-                "the {label:?} row does not say it was copied: {:?}",
-                after.painted.0
             );
         }
 

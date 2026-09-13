@@ -2370,7 +2370,7 @@ fn copy_toast_now(toast: Option<&CopyToast>, now: f64) -> Option<(String, f64)> 
 /// clicked one does. That is not a nicety: a chord is the case where the user
 /// has least evidence anything happened at all, since there is no row under
 /// the pointer to have reacted.
-fn note_copied(ctx: &egui::Context, label: &str) {
+pub(crate) fn note_copied(ctx: &egui::Context, label: &str) {
     let shown_at = ctx.input(|i| i.time);
     ctx.data_mut(|data| {
         data.insert_temp(
@@ -2449,7 +2449,21 @@ fn note_body_overflow(ctx: &egui::Context, overflowed: bool) {
     ctx.data_mut(|data| data.insert_temp(body_overflow_id(), overflowed));
 }
 
-fn draw_copy_toast(ui: &mut egui::Ui, pane: egui::Rect) {
+/// **`pub(crate)` for one more caller, and the caller is a modal.**
+///
+/// The add-a-code card copies five things now, and its first two attempts at
+/// saying so were both wrong. A hover text could not work at all -- egui hides
+/// a tooltip on the press that would open it. A word in the row itself did
+/// work and looked it: `CopiedReveal`, jammed against the control beside it,
+/// which is what the owner sent back with "show copied at the bottom like
+/// usually".
+///
+/// "Like usually" is this. One confirmation, in one place, in the app's own
+/// words -- `{label} copied` -- with the same five seconds and the same
+/// bottom-right inset wherever a copy happens. The `pane` argument is what
+/// makes that possible from a modal: it is the rect the toast is placed in,
+/// so the read pane passes its pane and the card passes its card.
+pub(crate) fn draw_copy_toast(ui: &mut egui::Ui, pane: egui::Rect) {
     let now = ui.input(|i| i.time);
     let toast = ui.ctx().data(|data| data.get_temp::<CopyToast>(copy_toast_id()));
     let Some((text, left)) = copy_toast_now(toast.as_ref(), now) else {

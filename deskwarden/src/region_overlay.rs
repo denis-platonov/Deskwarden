@@ -2665,7 +2665,21 @@ impl RegionOverlay {
                     let monitors = screen_capture::monitor_bounds();
                     mine.apply_scan(scan_screen_with(&RegionSeams::production(), &monitors));
                     let scanned = Instant::now();
-                    mine.take_picture(&ctx);
+                    // TEMPORARY INSTRUMENT -- removed once the tail is
+                    // understood. The 1816 ms between registering the
+                    // viewport and the window existing contains two costs
+                    // that cannot be told apart from the log: this 29 MB
+                    // texture, and `eframe` building a full-screen window and
+                    // its GL surface. Skipping the picture for one run
+                    // separates them; the overlay falls back to the plain
+                    // dark ground it already uses for a refused capture.
+                    if std::env::var_os("DW_SKIP_PICTURE").is_none() {
+                        mine.take_picture(&ctx);
+                    } else {
+                        log::warn!(
+                            "region overlay: DW_SKIP_PICTURE is set, so the overlay opens on a                              plain dark ground -- this is a measurement run, not a setting"
+                        );
+                    }
                     log::info!(
                         "region overlay: the prescan read {} monitor(s) in {} ms and took the \
                          display's picture in {} ms ({} ms in all) -- all of it off the frame \

@@ -6420,7 +6420,13 @@ pub fn build_frame_with_search(
                 // through an enum that does not wipe.
                 totp_add::TotpAddAction::CopyField(field) => {
                     match totp_add::field_to_copy(state, field) {
-                        Some(value) => crate::clipboard::copy_secret(&value),
+                        Some(value) => {
+                            crate::clipboard::copy_secret(&value);
+                            detail::note_copied(
+                                ui.ctx(),
+                                totp_add::copied_label(Some(field)),
+                            );
+                        }
                         // Unreachable from the card, whose rows do not sense a
                         // press when there is nothing to copy. A warning
                         // rather than a silent drop.
@@ -6432,7 +6438,17 @@ pub fn build_frame_with_search(
                 }
                 totp_add::TotpAddAction::CopyCode => {
                     match totp_add::code_to_copy(state, now_unix) {
-                        Some(code) => crate::clipboard::copy_secret(&code),
+                        // **The app's own confirmation**, raised here beside
+                        // the clipboard write for the reason the read pane
+                        // raises its own at the click: the two are one
+                        // gesture, and a confirmation that lags the copy by a
+                        // frame is the defect that feature exists to remove.
+                        // The card draws it over its own rect -- see
+                        // `detail::draw_copy_toast`.
+                        Some(code) => {
+                            crate::clipboard::copy_secret(&code);
+                            detail::note_copied(ui.ctx(), totp_add::copied_label(None));
+                        }
                         // Unreachable from the card, which draws no strip to
                         // click when the field does not read as a code. A
                         // warning rather than a silent drop, so a strip drawn
