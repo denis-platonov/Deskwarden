@@ -388,18 +388,81 @@ below / above / at cursor).
 
 ## Implementation status
 
-As of 2026-07-29 (see `deskwarden/src/theme.rs` and callers):
+As of **0.15.23** (2026-09-12). Every row names the module that draws it, so
+this table can be checked against the code rather than believed.
+
+**This table covers the whole design document**, not only the first turn. The
+version it replaced was stamped 2026-07-29 and still described the vault
+window, preferences, save-a-login and generate-and-fill as unbuilt — all four
+had shipped, and one of its file names (`overlay_ui.rs`) no longer existed. A
+status table nobody updates is worse than none, because it is read as current;
+if you change what is built and do not change this, delete it instead.
+
+### The overlay and the daemon's cards
 
 | Design section | Status |
 |---|---|
-| 3g mark + palette + lockup | ✅ `theme.rs`, icon regenerated (`assets/generate-icon.py`) |
-| Typography (Archivo) | ✅ bundled Regular/SemiBold/Bold, `assets/fonts/` |
-| 2a overlay | ✅ `overlay_ui.rs` (single-match row; multi-row/TOTP pending vault support) |
-| 3h login window | ✅ `login_ui.rs` (`draw_login_window`): lockup, account email, in-field Show/Hide, Continue with a painted ↵ glyph, "or" divider + **Windows Hello panel** (Ctrl+H), Log out + server footer. Hello quick unlock is real (`hello.rs`): opt-in checkbox seals the master password under a KeyCredential-signature-derived AES-256-GCM key, DPAPI-wrapped at rest; logout unenrolls. The footer server identity is a live "Logging in on" dropdown while signing in (bitwarden.com / bitwarden.eu / self-hosted, native-client style). Still pending: "Forgot it?" (no hint API), "Switch account" (= Log out today) |
-| 3b locked wording | ✅ folded into the 3h unlock window (overlay-locked state itself pending) |
-| Pickers (not in design; built from tokens + 3e "On focus" vocabulary) | ✅ `picker_ui.rs` |
-| 3a no-match overlay | ⬜ needs focus-driven overlay trigger (today the overlay only opens on a match) |
-| 3c save-login prompt | ⬜ needs successful-sign-in detection + vault write flow |
-| 3d generate & fill | ⬜ needs password generator + password-field detection |
-| 3e preferences window | ⬜ needs a settings store; today per-app trigger lives on vault items |
-| 2b/3f vault window | ⬜ needs a full vault browser (list/detail/search/TOTP) |
+| 2a autofill overlay | ✅ `prompt_card.rs` (bare Win32) |
+| 3a no match | ✅ `prompt_card.rs`, dispatched by `app::handle_no_match` |
+| 3b locked | ✅ `locked_card.rs` |
+| 3c save a new login | ✅ `save_login_card.rs` |
+| 3d generate & fill | ✅ `generate_prompt.rs` |
+| Account picker (not in the design; built from the tokens) | ✅ `picker_ui.rs`, `picker_prompt.rs` |
+
+### The windows
+
+| Design section | Status |
+|---|---|
+| 2b / 3f vault window | ✅ `vault_window/` — list, detail, search, TOTP, folders, trash, archive, password health |
+| 3e preferences | ✅ `prefs_ui.rs` (3e's seven sections) |
+| 3h unlock / sign in | ✅ `login_ui.rs`, with Windows Hello in `hello.rs`. Still absent: "Forgot it?" (no hint API) and "Switch account" (which is Log out today) |
+| 7a loading | ✅ `loading_ui.rs` |
+| 7b slow, and failed | ✅ `loading_ui.rs` |
+| 8a edit record | ✅ `vault_window/detail_edit.rs` |
+| 8b pick a running window | ✅ `detail_edit::running_app_rows` |
+
+### Keystroke sequences (turn 4)
+
+| Design section | Status |
+|---|---|
+| 4a sequence builder | ✅ `vault_window/sequence_builder.rs`, with timing, checks and budget measured off `injector::sequence` |
+| 4b preflight card | ⛔ **removed at the owner's request.** The gate it drew is real and still enforced (`vault_window/preflight.rs`); what is gone is the card in front of it, which could only ever confirm a verdict already made. See that module's header |
+| 4c template view | ✅ `detail_edit::template_editor`, shared by the builder and the edit form |
+| 4d rehearsal | ✅ `vault_window/rehearsal.rs` + `scratch_window.rs` |
+| 4e rationale | — prose, not a screen |
+
+### Sends (turn 5)
+
+| Design section | Status |
+|---|---|
+| 5a compose a Send | ✅ `vault_window/record_ui.rs`, at the design's own 690pt. **Minus `Recipient` and its two toggles** — see below |
+| 5b shared folder | ✅ `vault_window/send_ui.rs` — the design's frame is this app's Sends screen and its sub-filters, not a screen of its own |
+| 5c history & states | ◐ the four states and the activity line are built; **the per-access timeline is not and cannot be** — a Bitwarden Send keeps no audit, no user agent and no location. `send_ui`'s header argues it |
+| 5d the Shared tag | ✅ the filled `shared` pill in `vault_window/item_list.rs`, the `SHARING` card in `vault_window/detail.rs` |
+
+### Adding a one-time code (turn 6)
+
+| Design section | Status |
+|---|---|
+| 6a how to add it | ✅ `vault_window/totp_add.rs` |
+| 6b region capture | ✅ `region_overlay.rs` |
+| 6c what was extracted | ✅ `totp_add.rs` |
+| 6d manual entry | ✅ `totp_add.rs` |
+
+### Identity
+
+| Design section | Status |
+|---|---|
+| 3g mark, palette, lockup | ✅ `theme.rs`, icon generated by `assets/generate-icon.py` |
+| Typography (Archivo) | ✅ Regular / SemiBold / Bold / ExtraBold bundled in `assets/fonts/` |
+
+### What is deliberately not built
+
+* **5a's `Recipient` field and its two toggles.** `emails` and `hideEmail`
+  exist on a Send's wire format and this client writes them null; what a
+  recipient list *means* is enforced by the server that serves the link, and
+  "tell me when it is opened" has no field at all. Three controls that cannot
+  act would be three lies on the card that is specifically about who can see
+  what.
+* **4b's preflight card**, above.
+* **5c's timeline**, above.
