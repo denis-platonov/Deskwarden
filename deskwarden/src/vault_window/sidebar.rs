@@ -2333,7 +2333,8 @@ mod drag_and_drop_tests {
                                 // Not about the open gesture; the slide's
                                 // arming is covered where it lives.
                                 &mut false,
-                            );
+                        &std::collections::HashSet::new(),
+                    );
                         },
                     );
                 });
@@ -2564,7 +2565,8 @@ mod drag_and_drop_tests {
                                 // Not about the open gesture; the slide's
                                 // arming is covered where it lives.
                                 &mut false,
-                            );
+                        &std::collections::HashSet::new(),
+                    );
                         },
                     );
                 });
@@ -2736,7 +2738,8 @@ mod drag_and_drop_tests {
                                 // Not about the open gesture; the slide's
                                 // arming is covered where it lives.
                                 &mut false,
-                            );
+                        &std::collections::HashSet::new(),
+                    );
                         },
                     );
                 });

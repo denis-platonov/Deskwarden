@@ -1543,6 +1543,10 @@ pub fn draw_item_list(
     //
     // Written only, never read here; the caller clears it.
     row_opened: &mut bool,
+    // **Design 5d**: the names of the records with a live Send. A set of
+    // NAMES and not of ids, which is `send_ui::live_send_named`'s decision
+    // and is argued there.
+    shared: &std::collections::HashSet<String>,
 ) -> ItemListAction {
     let mut action = ItemListAction::None;
     visible_ids.clear();
@@ -1906,6 +1910,7 @@ pub fn draw_item_list(
                                     icons.textures.get(&item.id),
                                     may_unfile,
                                     filter.source(),
+                                    shared.contains(&item.name),
                                 )
                             })
                             .inner;
@@ -1970,6 +1975,53 @@ fn row_badge(ui: &mut egui::Ui, text: &str, selected: bool) {
     ui.painter()
         .galley(rect.min + egui::Vec2::new(PAD_X, PAD_Y), galley, fg);
 }
+
+/// **Design 5d's `shared` pill.**
+///
+/// Filled, where `app` and `2FA` are outlined greys, and that contrast is the
+/// whole point of the design: "A record with a live Send carries a filled
+/// pill, so sharing is visible from the list -- the same slot as the existing
+/// app and 2FA pills, which stay outlined grey." The other two say what a
+/// record IS; this one says what is happening to it right now.
+///
+/// 5d's own measurements: `background: #1b3fa0; border-radius: 5px; padding:
+/// 2px 7px; gap: 5px`, a 9-point paper plane in white at `stroke-width: 2.6`,
+/// and the word at `font-size: 10px; font-weight: 700` in white. The padding
+/// is a point wider than [`row_badge`]'s because this chip has a mark in it.
+///
+/// **It keeps its fill when the row is selected.** `row_badge` swaps to the
+/// focus halo there, because a grey chip on a blue-tinted row would vanish;
+/// this one is already the strongest thing in the run and a second treatment
+/// would make the pill mean two things.
+fn shared_pill(ui: &mut egui::Ui) {
+    const PAD_X: f32 = 7.0;
+    const PAD_Y: f32 = 2.0;
+    const GAP: f32 = 5.0;
+    const MARK: f32 = 9.0;
+    let galley = ui.painter().layout_no_wrap(
+        SHARED_PILL.to_string(),
+        egui::FontId::new(10.0, egui::FontFamily::Name(theme::BOLD.into())),
+        theme::CARD,
+    );
+    let (rect, _) = ui.allocate_exact_size(
+        galley.size() + egui::Vec2::new(PAD_X * 2.0 + MARK + GAP, PAD_Y * 2.0),
+        Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, CornerRadius::same(5), theme::BLUE);
+    let mark = egui::Rect::from_min_size(
+        egui::pos2(rect.min.x + PAD_X, rect.center().y - MARK / 2.0),
+        egui::Vec2::splat(MARK),
+    );
+    theme::paint_send_plane(ui.painter(), mark, theme::CARD);
+    ui.painter().galley(
+        egui::pos2(mark.right() + GAP, rect.min.y + PAD_Y),
+        galley,
+        theme::CARD,
+    );
+}
+
+/// 5d's own word. Lower case, like the two chips beside it.
+pub const SHARED_PILL: &str = "shared";
 
 /// Design 2b's row title (`font-size: 13px`) and subtitle
 /// (`font-size: 11px`), and the `gap: 2px` between them. Named because
@@ -2134,6 +2186,11 @@ fn item_row(
     // Which list this row was drawn from -- the row's menu is entirely
     // different for a trashed or archived item. See `menu_entries`.
     source: FilterSource,
+    // **Design 5d**: this record has a Send somebody can open right now. A
+    // `bool` decided by the caller rather than a list searched here, because
+    // this function runs per visible row per frame -- see
+    // `send_ui::shared_names`.
+    shared: bool,
 ) -> RowOutcome {
     let username = item.login.as_ref().and_then(|l| l.username.as_deref()).unwrap_or("");
     // Design 2b's two trailing chips. Neither is decorative and neither is
@@ -2251,6 +2308,14 @@ fn item_row(
                     // avatar the chips would start to overlap it, but this
                     // pane is `Panel::exact_size(LIST_WIDTH).resizable(false)`
                     // in `vault_window::mod` and cannot get there.
+                    // **5d's pill first**, which in this right-to-left run
+                    // puts it furthest right -- the design's order is `app`,
+                    // `2FA`, `shared` in reading order, so `shared` is the
+                    // last of the three read and the first of the three
+                    // drawn.
+                    if shared {
+                        shared_pill(ui);
+                    }
                     for chip in chips.iter().rev().flatten() {
                         row_badge(ui, chip, selected);
                     }
@@ -3948,6 +4013,110 @@ mod row_tile_tests {
     /// tiles out exactly like one that fits -- pinned by
     /// `the_tiles_keep_one_width_whether_or_not_the_list_can_scroll`.
 
+    // -----------------------------------------------------------------
+    // Design 5d -- the `shared` pill
+    // -----------------------------------------------------------------
+
+    /// **The pill is drawn when the record is shared, and not when it is
+    /// not.**
+    ///
+    /// Both halves, because the positive alone passes against a row that
+    /// always draws it -- which is the failure that would matter most here: a
+    /// pill meaning "someone can open this right now" on every record in the
+    /// vault.
+    ///
+    /// This drives `item_row` rather than `draw_item_list`, which is a
+    /// departure from this file's rule ("pressed, not called") and is worth
+    /// naming: the list harness threads eleven arguments through four
+    /// wrappers, and what is being asked here is about one row's trailing
+    /// run. The wiring between the two -- that `draw_item_list` really hands
+    /// each row its own answer -- is asserted separately, below, off the
+    /// source.
+    #[test]
+    fn a_shared_record_wears_the_pill_and_an_unshared_one_does_not() {
+        let item = login("SAP Production", "a.novak@ledgerline.com");
+        let drawn = |shared: bool| -> Vec<String> {
+            let ctx = egui::Context::default();
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(PANE_WIDTH, 400.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input.clone(), |_ui| {});
+            crate::theme::apply(&ctx);
+            let output = ctx.run_ui(input, |ui| {
+                let _ = item_row(
+                    ui,
+                    &item,
+                    &[],
+                    false,
+                    None,
+                    false,
+                    FilterSource::LiveVault,
+                    shared,
+                );
+            });
+            let mut texts = Vec::new();
+            for clipped in &output.shapes {
+                collect_text(&clipped.shape, &mut texts);
+            }
+            texts
+        };
+
+        let with = drawn(true);
+        assert!(
+            with.iter().any(|t| t == SHARED_PILL),
+            "a shared record has no {SHARED_PILL:?} pill: {with:?}"
+        );
+        let without = drawn(false);
+        assert!(
+            !without.iter().any(|t| t == SHARED_PILL),
+            "an unshared record wears the pill anyway, so it means nothing: {without:?}"
+        );
+        // A control: the row really drew, so the negative above is about the
+        // pill and not about a frame that painted nothing.
+        assert!(
+            without.iter().any(|t| t == "SAP Production"),
+            "the row painted no name, so neither assertion is about anything: {without:?}"
+        );
+    }
+
+    /// Every painted run, flattened. The harness above has a richer collector
+    /// of its own; this is the one fact this pair of assertions needs.
+    fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// **Each row is asked about its OWN record.**
+    ///
+    /// The paint test above proves the pill can be drawn; this proves the list
+    /// decides per row rather than handing every row one answer. Read off the
+    /// source, because a list that passed `true` to all of them would paint a
+    /// pill on every row and look, in a screenshot, exactly like a vault in
+    /// which everything really is shared.
+    #[test]
+    fn the_list_asks_the_shared_set_about_each_rows_own_name() {
+        let source = include_str!("item_list.rs").replace("\r\n", "\n");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let needle = concat!("shared.contains(&item.", "name)");
+        assert_eq!(
+            code.matches(needle).count(),
+            1,
+            "the item list no longer asks {needle:?} -- every row is being given the same \
+             answer, or none"
+        );
+    }
+
     fn login(name: &str, username: &str) -> VaultItem {
         VaultItem {
             id: name.to_string(),
@@ -4247,7 +4416,8 @@ mod row_tile_tests {
                     // asserted directly, by `list_placeholder_tests`.
                     false,
                     &mut row_opened,
-                );
+                                &std::collections::HashSet::new(),
+                            );
             })
         };
         let mut visible = Vec::new();
@@ -9000,7 +9170,8 @@ mod toolbar_strip_tests {
                     // This harness is not about the open gesture; the slide's arming is
                     // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
                     &mut false,
-                );
+                                &std::collections::HashSet::new(),
+                            );
             })
         };
         let _ = draw(&ctx, search, input());
@@ -9449,7 +9620,8 @@ mod move_error_band_tests {
                     // This harness is not about the open gesture; the slide's arming is
                     // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
                     &mut false,
-                );
+                                &std::collections::HashSet::new(),
+                            );
             })
         };
         let _ = draw(&ctx, input());
@@ -9853,7 +10025,8 @@ mod list_placeholder_paint_tests {
                     // This harness is not about the open gesture; the slide's arming is
                     // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
                     &mut false,
-                );
+                                &std::collections::HashSet::new(),
+                            );
             })
         };
         let _ = draw(&mut search);
@@ -10182,7 +10355,8 @@ mod keyboard_selection_tests {
                     // This harness is not about the open gesture; the slide's arming is
                     // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
                     &mut false,
-                );
+                                &std::collections::HashSet::new(),
+                            );
                 // AFTER the pane, where the window really draws them -- so the
                 // gate is being tested through the one-frame-late
                 // `is_visible` path it actually runs on, and not through a

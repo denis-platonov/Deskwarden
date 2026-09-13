@@ -2948,7 +2948,8 @@ mod tests {
                     // Not about the open gesture; the slide's arming is
                     // covered where it lives.
                     &mut false,
-                );
+                        &std::collections::HashSet::new(),
+                    );
             });
             if frame == 2 {
                 for clipped in &output.shapes {

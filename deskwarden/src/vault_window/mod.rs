@@ -2993,7 +2993,21 @@ pub fn build_frame_with_search(
         // `Shared with me` too, and that screen's rows come off a local file:
         // asking it here would spawn a `bw send list` for a question nobody
         // on that screen has asked.
-        if send_fetch.wants_fetch(on_sends) {
+        // **Asked for on EVERY screen now, not only on the Sends one.**
+        //
+        // The gate used to be `on_sends`, and it was right while the list had
+        // exactly one reader. Design 5d gives it two more: the `shared` pill
+        // on every item row, and the read pane's `SHARING` card. Both are on
+        // the vault screen, and a list that is only fetched somewhere else is
+        // a pill that appears after a detour through a screen the user had no
+        // reason to visit.
+        //
+        // It is still one fetch per visit and not a poll: `wants_fetch` is
+        // `result.is_none() && !in_flight`, and the only thing that clears
+        // `result` is `invalidate` -- leaving the Sends screen, or a create or
+        // a revoke landing. So this adds one `bw send list` per vault-window
+        // visit, on a thread, and nothing waits for it.
+        if send_fetch.wants_fetch_now() {
             send_fetch.in_flight = true;
             (spawn_send_list)(
                 ui.ctx().clone(),
@@ -3261,6 +3275,27 @@ pub fn build_frame_with_search(
         //
         // Zero while the Sends or Password health screens are up: neither has
         // a detail pane, and both take the whole area themselves.
+        // **Design 5d's pills, derived once for the whole frame.** A record
+        // with a live Send carries one, and the answer for every row comes out
+        // of the Sends list this window already fetches -- see
+        // `send_ui::shared_names`, and `live_send_named` for why the link is
+        // the record's NAME.
+        //
+        // Empty until the list has been answered, which is the honest reading
+        // of "we have not asked yet": the pill is a positive claim, so no
+        // pill is what "unknown" has to look like.
+        let shared_names =
+            send_ui::shared_names(send_fetch.result.as_ref(), &crate::send::SystemClock);
+        // **5d's Revoke, asked for inside the pane and applied outside it.**
+        //
+        // The read pane is drawn inside the argument to `apply_send_action`,
+        // so it cannot call that function; what it can do is say which Send
+        // the user pressed Revoke on, and that request is applied a few lines
+        // below through the SAME handler the Sends screen's own Revoke goes
+        // through. One door, one lock, one report -- rather than a second copy
+        // of the spawn here, which is the drift this window keeps paying for.
+        let mut revoke_asked: Option<(String, String)> = None;
+
         // **4a takes the item list's column as well as the pane's.** The
         // builder is three columns -- what the rule belongs to, the steps, and
         // the measurements -- and the pane alone is 298pt at the app's minimum
@@ -3335,6 +3370,7 @@ pub fn build_frame_with_search(
                         // and is the only one of the three that does.
                         aux_error.is_some(),
                         &mut row_opened,
+                        &shared_names,
                     ) {
                         // The kind the `+ New` menu was clicked on -- `empty_of`,
                         // not `empty`, which would open a login form whatever row
@@ -4561,6 +4597,11 @@ pub fn build_frame_with_search(
                                 &mut reveal,
                                 icons.textures.get(item.id.as_str()),
                                 &mut app_identities,
+                                send_ui::live_send_in(
+                                    send_fetch.result.as_ref(),
+                                    &item.name,
+                                    &crate::send::SystemClock,
+                                ),
                                 check_breaches,
                                 reveal_totp_seed,
                                 &mut breaches,
@@ -4621,6 +4662,31 @@ pub fn build_frame_with_search(
                             let login = item.login.as_ref();
                             match action {
                                 DetailAction::Edit => mode = DetailMode::Edit(EditDraft::from_item(item)),
+                                // **5d.** The Send is re-found from the list
+                                // by the record's name -- the same link the
+                                // card was drawn from, asked again rather than
+                                // carried on the action, exactly as `Edit`
+                                // re-finds its item.
+                                DetailAction::RevokeSend => {
+                                    match send_ui::live_send_in(
+                                        send_fetch.result.as_ref(),
+                                        &item.name,
+                                        &crate::send::SystemClock,
+                                    ) {
+                                        Some(send) => {
+                                            revoke_asked =
+                                                Some((send.id.clone(), send.name.clone()));
+                                        }
+                                        // Unreachable from the pane, which
+                                        // draws no Sharing card when there is
+                                        // no live Send. A warning rather than
+                                        // a silent drop.
+                                        None => log::warn!(
+                                            "the read pane asked to revoke a Send that is no \
+                                             longer live; the click was dropped"
+                                        ),
+                                    }
+                                }
                                 // **4a.** The draft is built HERE, from the
                                 // item, for the reason `Edit`'s is: the
                                 // action carries nothing and this scope is
@@ -5495,11 +5561,24 @@ pub fn build_frame_with_search(
                     }
                 }
                 });
-                // The Sends screen was not showing this frame. Minting
-                // this is the ONE thing `mod.rs` may do without asking
-                // `send_ui` to draw, and it carries `SendUiAction::None`
-                // by construction -- it cannot carry anything else.
-                send_ui::no_sends_screen_this_frame()
+                // The Sends screen was not showing this frame, so the
+                // verdict is minted rather than drawn -- and there are two
+                // mints, both in `send_ui`, both carrying exactly one action
+                // by construction.
+                //
+                // **5d's Revoke is the second.** The read pane's `SHARING`
+                // card was drawn a few lines up, on this screen, with the
+                // Sends screen nowhere on the glass; its request travels as
+                // this frame's one action so that it reaches the same applier,
+                // the same `in_flight` lock and the same report band as a
+                // Revoke pressed on the Sends screen. A conditional second
+                // `apply_send_action` call would be the shape
+                // `the_frame_applies_the_sends_action_unconditionally` exists
+                // to forbid.
+                match revoke_asked {
+                    Some((id, name)) => send_ui::revoke_from_the_read_pane(id, name),
+                    None => send_ui::no_sends_screen_this_frame(),
+                }
             })
             .inner
             .into_action(),
@@ -7402,6 +7481,9 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         // into one, which is the arm directly above.
         | DetailAction::Unfile
         | DetailAction::RemoveAppMatch
+        // **5d's Revoke takes a link AWAY.** Nothing is read out of the item,
+        // painted or copied, which is the whole of what this gate asks.
+        | DetailAction::RevokeSend
         // Closing the pane HIDES the item; there is nothing here to prove a
         // master password for.
         | DetailAction::ClosePane
@@ -11703,6 +11785,11 @@ fn draw_read_arm(
     // shows what the bound app is really CALLED, and that answer comes off a
     // worker thread and is cached per path for the life of the window.
     apps: &mut crate::app_identity::AppIdentityCache,
+    // **Design 5d**: the Send this record has out right now. Forwarded, not
+    // decided here -- `send_ui::live_send_in` owns the question, and this
+    // arm's job is only to make sure the pane can be driven headlessly with
+    // it under a test's control.
+    shared: Option<&crate::send::SendSummary>,
     // `Settings::check_breaches` as this frame has it, and the window's one
     // breach cache -- forwarded, not decided here. `detail::should_check`
     // owns every condition; this arm's job is only to make sure the pane can
@@ -11725,6 +11812,7 @@ fn draw_read_arm(
         reveal,
         icon,
         apps,
+        shared,
         check_breaches,
         reveal_totp_seed,
         breaches,
@@ -21141,6 +21229,9 @@ mod draw_read_arm_tests {
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
+                // Nothing shared: 5d's card has its own tests, and a harness
+                // for the pane's chords has no Sends list behind it.
+                None,
                 // The badge off, the TOTP-secret row off, and a cache whose
                 // check answers "could not
                 // be checked" rather than "safe" if anything ever reaches it.

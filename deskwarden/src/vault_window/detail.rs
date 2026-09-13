@@ -556,6 +556,18 @@ pub const MAX_HISTORY_ROWS: usize = 8;
 pub enum DetailAction {
     None,
     Edit,
+    /// **Design 5d** -- turn off the live Send this record has out.
+    ///
+    /// Carries nothing: the window re-finds the Send the card was drawn from,
+    /// the same way `Edit` and `Clone` re-find the item. And it is a REVOKE
+    /// and not a delete -- `SendSummary::disabled`'s own note -- so the Send
+    /// stays in the Sends screen's list, revoked, where it can be switched
+    /// back on.
+    ///
+    /// On the **non**-exposing side of `detail_action_exposes_secrets`: it
+    /// takes a link away. Nothing is read out of the item, painted, or
+    /// copied.
+    RevokeSend,
     /// **Design 4a** -- open the sequence builder on this item's fill rule.
     ///
     /// Its own act rather than a corner of [`Self::Edit`], because it opens a
@@ -3153,6 +3165,11 @@ pub fn draw_detail_read(
     // with the match it is about, and moving it into `vault_window::mod`
     // would put it where this file's tests cannot call it.
     apps: &mut crate::app_identity::AppIdentityCache,
+    // **Design 5d**: the Send this record has out right now, or `None`.
+    // Resolved by the window from the Sends list it already fetches -- see
+    // `send_ui::live_send_named`, which owns the question of what links a Send
+    // to a record and why the link is the name.
+    shared: Option<&crate::send::SendSummary>,
     // `Settings::check_breaches`, as the window has it THIS frame -- the
     // preference is off by default and this pane is its first and only
     // reader. A bool rather than the whole `Settings` because that is the
@@ -4263,6 +4280,19 @@ pub fn draw_detail_read(
                 ResolvedApp { name: &app_name, icon: app_icon.as_ref() },
                 &mut action,
             );
+        });
+        ui.add_space(CARD_GAP);
+    }
+
+    // **Design 5d's SHARING card**, under `MATCHED APP` and above `NOTES`.
+    //
+    // Drawn only while there is a live Send, which is the whole of the pill's
+    // promise: "it always means someone can open this right now, never 'was
+    // shared once'". A card that stood empty saying "not shared" would be the
+    // opposite -- a permanent row about a thing that is not happening.
+    if let Some(send) = shared {
+        card(ui, SHARING_CARD_HEADING, |ui| {
+            sharing_card(ui, send, &crate::send::SystemClock, &mut action);
         });
         ui.add_space(CARD_GAP);
     }
@@ -5744,6 +5774,102 @@ fn app_card_footer(
                 app_card_remove_control(ui, action);
             });
         });
+}
+
+/// **Design 5d's card**: what is out there right now, and the way to stop it.
+pub const SHARING_CARD_HEADING: &str = "SHARING";
+
+/// The row's label column. 5d's own word for the one thing this card lists.
+const ACTIVE_SEND_LABEL: &str = "Active Send";
+
+/// 5d's two controls.
+pub const REVOKE_LABEL: &str = "Revoke";
+pub const SEND_AGAIN_LABEL: &str = "Send again";
+
+/// What the card says about a live Send's reach.
+///
+/// **Not 5d's "to m.reyes@ledgerline.com".** A Bitwarden Send has no
+/// recipient -- it is a link, and anybody holding it can open it -- which is
+/// the same fact that keeps 5a's `Recipient` field and its two toggles
+/// unbuilt. The design's line names a person; this one names what is true.
+pub const SEND_REACH: &str = "Anyone with the link";
+
+/// 5d's note under the card, which is the pill's whole meaning.
+pub const SHARING_NOTE: &str =
+    "The pill disappears on its own when the Send expires or is revoked \u{2014} it always      means someone can open this right now, never \"was shared once\".";
+
+/// **Design 5d's card body.**
+///
+/// Three facts and two controls, and every one of the three is read off the
+/// Send itself rather than remembered locally: whether it has been opened,
+/// how many views are left if the owner capped them, and when it stops
+/// working.
+///
+/// **What 5d draws and this does not** is "username and password" -- which
+/// fields of the record travelled. That is knowable only at the moment of
+/// publishing, and only on the machine that published: the Send on the server
+/// is one opaque blob of text. Writing it into a local file would make the
+/// line true on one machine and absent on the others, which is worse than not
+/// claiming it, because a card that says nothing is read as "not shown" and a
+/// card that says it here and not there is read as "different Sends".
+fn sharing_card(
+    ui: &mut egui::Ui,
+    send: &crate::send::SendSummary,
+    now: &dyn crate::send::SendClock,
+    action: &mut DetailAction,
+) {
+    row(
+        ui,
+        ACTIVE_SEND_LABEL,
+        |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 2.0;
+                ui.label(RichText::new(SEND_REACH).size(ROW_VALUE_SIZE).color(theme::INK));
+                ui.label(
+                    RichText::new(crate::vault_window::send_ui::row_subtitle(send, now))
+                        .size(ROW_HINT_SIZE)
+                        .color(theme::TEXT_FAINT),
+                );
+            });
+        },
+        |_ui| {},
+    );
+    let line = (app_card_content_width(ui) - f32::from(CARD_PAD_X) * 2.0).max(0.0);
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(line);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+                // **Send again first, Revoke second**, which is the order the
+                // app card's footer uses for the same reason: the ordinary
+                // action reads first and the one that takes something away
+                // reads last.
+                if theme::row_button(ui, SEND_AGAIN_LABEL)
+                    .on_hover_text("Publish a new link for this record")
+                    .clicked()
+                {
+                    *action = DetailAction::SendRecord;
+                }
+                if theme::row_button(ui, REVOKE_LABEL)
+                    .on_hover_text("Turn this link off. It stays in Sends and can be switched \
+                                    back on")
+                    .clicked()
+                {
+                    *action = DetailAction::RevokeSend;
+                }
+            });
+        });
+    row(
+        ui,
+        "",
+        |ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.label(RichText::new(SHARING_NOTE).size(ROW_HINT_SIZE).color(theme::TEXT_GHOST));
+        },
+        |_ui| {},
+    );
 }
 
 /// **Design 4a's door, and it is a KEBAB ENTRY -- which is a measurement,
@@ -8867,10 +8993,10 @@ mod tests {
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
+                None,
                 false,
                 false,
-                &mut inert_breach_cache(),
-            );
+                &mut inert_breach_cache());
         });
 
         let mut texts = Vec::new();
@@ -9533,10 +9659,10 @@ mod tests {
                 &mut reveal,
                 None,
                 &mut crate::app_identity::AppIdentityCache::default(),
+                None,
                 false,
                 false,
-                &mut inert_breach_cache(),
-            );
+                &mut inert_breach_cache());
         })
         .shapes
     }
@@ -10124,10 +10250,10 @@ mod tests {
                         &mut self.reveal,
                         None,
                         &mut self.apps,
+                None,
                         false,
                         self.reveal_totp_seed,
-                        &mut inert_breach_cache(),
-                    );
+                        &mut inert_breach_cache());
                 },
             );
             let mut frame = Frame {
@@ -12622,7 +12748,7 @@ mod tests {
     /// card. `the_card_heading_list_is_complete` counts the `card(` call sites
     /// in this file against it, so a ninth card fails the build's own suite
     /// rather than quietly narrowing the ordering claim.
-    const EVERY_CARD_HEADING: [&str; 9] = [
+    const EVERY_CARD_HEADING: [&str; 10] = [
         "LOGIN CREDENTIALS",
         "CARD DETAILS",
         "IDENTITY",
@@ -12631,6 +12757,7 @@ mod tests {
         "PREVIOUS PASSWORDS",
         "AUTOFILL TARGETS",
         APP_CARD_HEADING,
+        SHARING_CARD_HEADING,
         "NOTES",
     ];
 
@@ -12642,7 +12769,7 @@ mod tests {
     #[test]
     fn the_card_heading_list_is_complete() {
         let source = include_str!("detail.rs");
-        // Eight literal-heading cards plus `card(ui, pane.heading, ..)`, whose
+        // Nine literal-heading cards plus `card(ui, pane.heading, ..)`, whose
         // heading is `UNSUPPORTED ITEM` and is in the list under that name.
         // Real call sites only: a doc comment naming `card(ui, ...)` is a
         // mention, not a card, and three of them are in this file.
@@ -23596,10 +23723,10 @@ mod read_pane_scroll_tests {
                         &mut self.reveal,
                         None,
                         &mut self.apps,
+                None,
                         false,
                         false,
-                        &mut super::tests::inert_breach_cache(),
-                    );
+                        &mut super::tests::inert_breach_cache());
                 },
             );
             let mut shot = Shot::default();
@@ -25594,10 +25721,10 @@ mod breach_badge_tests {
                     &mut reveal,
                     None,
                     &mut apps,
+                None,
                     enabled,
                     false,
-                    &mut cache,
-                );
+                    &mut cache);
             });
             painted.runs.clear();
             painted.fills.clear();

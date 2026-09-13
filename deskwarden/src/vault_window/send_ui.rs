@@ -314,7 +314,23 @@ impl SendFetch {
     /// leaving the screen and coming back. Retrying a dead CLI at 60Hz is the
     /// same defect in a different costume.
     pub fn wants_fetch(&self, selected: bool) -> bool {
-        selected && self.result.is_none() && !self.in_flight
+        selected && self.wants_fetch_now()
+    }
+
+    /// **The same question with the screen taken out of it**, for the readers
+    /// that are not the Sends screen.
+    ///
+    /// Design 5d put two of them on the vault screen -- the `shared` pill on
+    /// every row and the read pane's `SHARING` card -- and a list fetched only
+    /// while the Sends screen is up is a pill that appears after a detour
+    /// through a screen the user had no reason to visit.
+    ///
+    /// Still one fetch per visit and not a poll: the only thing that clears
+    /// `result` is [`invalidate`](Self::invalidate). `wants_fetch` is this
+    /// with the screen gate in front of it, so the Sends screen's own policy
+    /// and its tests are unchanged.
+    pub fn wants_fetch_now(&self) -> bool {
+        self.result.is_none() && !self.in_flight
     }
 
     /// The tag a fetch started **now** should carry back with its answer.
@@ -942,6 +958,31 @@ pub fn no_sends_screen_this_frame() -> SendUiVerdict {
     SendUiVerdict::seal(SendUiAction::None)
 }
 
+/// **Design 5d's Revoke, minted for a frame on which the Sends screen was not
+/// drawn.**
+///
+/// The second and last thing `vault_window` can obtain without calling
+/// [`draw_send_pane`], and it exists because the read pane's `SHARING` card
+/// has a Revoke on it while the Sends screen is nowhere on the glass.
+///
+/// **Why a mint here rather than a second `apply_send_action` call there.**
+/// The frame closure applies exactly one Sends action, unconditionally, and
+/// `send_delete_wiring::the_frame_applies_the_sends_action_unconditionally`
+/// counts the call sites to keep it that way -- four separate ways of making
+/// the whole Sends screen inert were measured green before that count existed,
+/// every one of them a gate or a shadowed binding in front of the applier. A
+/// conditional second call is that shape again. So the read pane's request
+/// travels as the frame's ONE action instead, through the one applier, taking
+/// the same `in_flight` lock and reporting through the same band as a Revoke
+/// pressed on the Sends screen itself.
+///
+/// It carries exactly one action, named here, with the id and the name the
+/// caller found; `SendUiVerdict::seal` and the field stay private, so this is
+/// still not a door to substituting an arbitrary action for a drawn pane's.
+pub fn revoke_from_the_read_pane(id: String, name: String) -> SendUiVerdict {
+    SendUiVerdict::seal(SendUiAction::SetDisabled { id, name, disabled: true })
+}
+
 impl SendUiVerdict {
     /// Mints a verdict. Private on purpose: only this module decides what the
     /// Sends pane reported.
@@ -1106,6 +1147,98 @@ pub fn state_tone(state: crate::send::SendState) -> theme::PillTone {
 /// making them match again. See
 /// `vault_window::send_delete_wiring::drive_the_sends_screen_in`.
 pub const SENDS_HEADING: &str = "SENDS";
+
+// ---------------------------------------------------------------------------
+// Design 5d -- which record a live Send belongs to
+// ---------------------------------------------------------------------------
+
+/// **The Send a record has out right now, or `None`.**
+///
+/// Design 5d: "A record with a live Send carries a filled pill, so sharing is
+/// visible from the list", and the pill "always means *someone can open this
+/// right now*, never 'was shared once'". That sentence is the whole
+/// specification of this function: `Waiting` is the only state in which a link
+/// works, so it is the only state that answers `Some`.
+///
+/// # The link is the NAME, and that is a decision with a cost
+///
+/// Nothing on a Bitwarden Send records which record it was made from. There
+/// were two ways to supply that:
+///
+///   * **A local file** keyed send id to item id, written when a record Send
+///     is created. Exact, and this crate has three precedents for such a file
+///     (`fill_stats`, `scan_history`, `receive_history`). Rejected on two
+///     counts. It is another on-disk record of what the user has been doing --
+///     `fill_recall` argues at length against persisting a timeline of which
+///     accounts were used, and "which records I have shared" is the same kind
+///     of fact. And it is per-machine: a Send published from a laptop would
+///     leave no pill on the desktop, which is exactly the case where a user
+///     most needs to be told that a record is out there.
+///
+///   * **The name**, which is what this does. `record_ui::send_plan_from`
+///     names every record Send after the record -- `name: record.name.clone()`
+///     -- so the name IS the link, it needs no new state anywhere, and it
+///     works from any machine the account is signed in on.
+///
+/// **What the name cannot do**, stated because it is a real cost and not a
+/// footnote: two records with the same name share a pill, and a Send made by
+/// hand and named after a record lights that record's pill. Both are wrong in
+/// the same direction and it is the safe one -- the pill says something named
+/// after this record can be opened right now, which in each of those cases is
+/// true -- but neither is precise, and a user who renames a record loses the
+/// pill on a Send that is still live. The exact answer stays available: it is
+/// the local file above, and this doc is where the argument for it is if the
+/// trade ever stops paying.
+///
+/// The first match wins. A record with two live Sends has one pill either way;
+/// the card beside it names the one it found.
+pub fn live_send_named<'a>(
+    sends: &'a [SendSummary],
+    name: &str,
+    now: &dyn SendClock,
+) -> Option<&'a SendSummary> {
+    sends
+        .iter()
+        .find(|send| send.name == name && crate::send::send_state(send, now) == crate::send::SendState::Waiting)
+}
+
+/// [`live_send_named`] against the fetch's own answer, which is three states
+/// and not one: not asked yet, failed, or a list.
+///
+/// **A failure answers `None`, and that is the same rule `badge_count` makes
+/// for the sidebar's number**: a fetch that did not happen does not know that
+/// nothing is shared, and a pill is a claim. No pill is the honest reading of
+/// "we do not know", because the pill's meaning is positive -- it says
+/// something can be opened, never that nothing can.
+pub fn live_send_in<'a>(
+    fetched: Option<&'a Result<Vec<SendSummary>, SendError>>,
+    name: &str,
+    now: &dyn SendClock,
+) -> Option<&'a SendSummary> {
+    match fetched? {
+        Ok(sends) => live_send_named(sends, name, now),
+        Err(_) => None,
+    }
+}
+
+/// The names of every record with a live Send, for the item list.
+///
+/// A set rather than a lookup per row for the reason the list is virtualized
+/// at all: `item_row` is called for every visible row on every frame, and a
+/// linear walk of the Sends inside it would be a walk per row per frame.
+pub fn shared_names(
+    fetched: Option<&Result<Vec<SendSummary>, SendError>>,
+    now: &dyn SendClock,
+) -> std::collections::HashSet<String> {
+    let Some(Ok(sends)) = fetched else {
+        return std::collections::HashSet::new();
+    };
+    sends
+        .iter()
+        .filter(|send| crate::send::send_state(send, now) == crate::send::SendState::Waiting)
+        .map(|send| send.name.clone())
+        .collect()
+}
 
 /// The eyebrow over the `Shared with me` list. 5b's own row label, in the
 /// case the design's list strips are drawn in.
@@ -12624,15 +12757,28 @@ mod source_pins {
         // Ordering. The call above and the gate below both pass, in either
         // order, but only one order works: `note_screen` after the gate means
         // the frame the user returns on still sees the previous visit's
-        // `Some(..)`, `wants_fetch` is false, and the stale list is drawn
-        // with no refetch ever -- the very defect the policy exists for.
-        // **`on_sends`, not `show_sends`.** The wider flag became true on
-        // `Shared with me` as well when that screen joined this pane, and
-        // that screen reads a local file -- so the gate had to narrow, or
-        // opening it would spawn a `bw send list` for a question nobody
-        // asked. The ORDERING this test is about is unchanged, and so is the
-        // reason for it.
-        let gate = concat!("send_fetch.wants_", "fetch(on_sends)");
+        // `Some(..)`, and the stale list is drawn with no refetch ever -- the
+        // very defect the policy exists for.
+        //
+        // **The gate is `wants_fetch_now()` and no longer takes the screen**,
+        // and the ordering this test is about is unchanged by that. Design 5d
+        // gave the list two readers on the VAULT screen -- the `shared` pill
+        // on every row and the read pane's `SHARING` card -- so a fetch gated
+        // on the Sends screen is a pill that only appears after a detour
+        // through a screen the user had no reason to visit.
+        //
+        // What that changes, and it is worth being plain about: leaving the
+        // Sends screen invalidates, and the very next frame is on the vault
+        // screen and refetches. That is one extra `bw send list` per exit --
+        // and it is the right one, because the user may have just revoked
+        // something, and the pills behind them have to stop claiming it can
+        // be opened.
+        //
+        // The narrowing this comment used to record still stands where it
+        // was made: `note_screen(on_sends)` above takes `on_sends` and not
+        // `show_sends`, so `Shared with me` -- which reads a local file --
+        // still does not invalidate a list it has no question about.
+        let gate = concat!("send_fetch.wants_", "fetch_now()");
         assert_eq!(
             production.matches(gate).count(),
             1,
@@ -12655,6 +12801,113 @@ mod source_pins {
              that the rule, the action and the remembering cannot be separated -- spelled out \
              in the closure they can be, and were"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Design 5d -- the link between a record and a live Send
+    // -----------------------------------------------------------------
+
+    use super::{live_send_in, live_send_named, shared_names};
+    use crate::send::{SendError, SendSummary};
+
+    /// **The pill means "someone can open this right now", and nothing else.**
+    ///
+    /// 5d's own sentence, and the whole specification of `live_send_named`:
+    /// "The pill disappears on its own when the Send expires or is revoked --
+    /// it always means someone can open this right now, never 'was shared
+    /// once'." So every state but `Waiting` answers `None`, and this walks all
+    /// four rather than asserting the one -- a match arm that let `Revoked`
+    /// through would be a pill on a link the owner has already turned off.
+    #[test]
+    fn only_a_live_send_lights_a_record() {
+        let now = crate::send::FixedClock(1_700_000_000_000);
+        let live = SendSummary {
+            id: "s-1".into(),
+            name: "SAP Production".into(),
+            access_url: "https://example.test/#k".into(),
+            deletion_date: "2099-01-01T00:00:00.000Z".into(),
+            is_file: false,
+            max_access_count: None,
+            access_count: 0,
+            disabled: false,
+            expiration_date: String::new(),
+            has_password: false,
+        };
+        assert_eq!(
+            live_send_named(std::slice::from_ref(&live), "SAP Production", &now).map(|s| &s.id),
+            Some(&"s-1".to_string()),
+            "a live Send does not light its record"
+        );
+
+        // Revoked, spent and expired: three ways to be dead, none of them a
+        // pill.
+        let revoked = SendSummary { disabled: true, ..live.clone() };
+        let spent = SendSummary { max_access_count: Some(1), access_count: 1, ..live.clone() };
+        let expired = SendSummary {
+            deletion_date: "2000-01-01T00:00:00.000Z".into(),
+            ..live.clone()
+        };
+        for (what, send) in [("revoked", revoked), ("spent", spent), ("expired", expired)] {
+            assert!(
+                live_send_named(std::slice::from_ref(&send), "SAP Production", &now).is_none(),
+                "a {what} Send still lights its record, so the pill says a dead link can be \
+                 opened"
+            );
+        }
+
+        // A different record's Send is not this record's.
+        assert!(live_send_named(std::slice::from_ref(&live), "Ledgerline", &now).is_none());
+    }
+
+    /// **A fetch that has not happened, and one that failed, light nothing.**
+    ///
+    /// The pill is a positive claim -- it says something can be opened -- so
+    /// "we do not know" has to look like no pill. This is the same rule
+    /// `badge_count` makes for the sidebar's number, asserted here for the
+    /// three-state answer the pill reads.
+    #[test]
+    fn an_unknown_sends_list_lights_nothing() {
+        let now = crate::send::FixedClock(1_700_000_000_000);
+        assert!(live_send_in(None, "SAP Production", &now).is_none(), "not asked yet");
+        let failed: Result<Vec<SendSummary>, SendError> = Err(SendError::Offline);
+        assert!(
+            live_send_in(Some(&failed), "SAP Production", &now).is_none(),
+            "a failed fetch claims a record is shared"
+        );
+        assert!(shared_names(Some(&failed), &now).is_empty());
+        assert!(shared_names(None, &now).is_empty());
+    }
+
+    /// The set the item list reads and the lookup the read pane reads agree.
+    ///
+    /// Two functions answering one question is two chances to disagree, and
+    /// the disagreement would be visible: a pill on a row whose detail pane
+    /// shows no card.
+    #[test]
+    fn the_pill_and_the_card_agree_about_what_is_shared() {
+        let now = crate::send::FixedClock(1_700_000_000_000);
+        let send = |name: &str, disabled: bool| SendSummary {
+            id: format!("s-{name}"),
+            name: name.into(),
+            access_url: "https://example.test/#k".into(),
+            deletion_date: "2099-01-01T00:00:00.000Z".into(),
+            is_file: false,
+            max_access_count: None,
+            access_count: 0,
+            disabled,
+            expiration_date: String::new(),
+            has_password: false,
+        };
+        let sends = vec![send("SAP Production", false), send("Ledgerline", true)];
+        let fetched: Result<Vec<SendSummary>, SendError> = Ok(sends);
+        let names = shared_names(Some(&fetched), &now);
+        for name in ["SAP Production", "Ledgerline", "Nothing"] {
+            assert_eq!(
+                names.contains(name),
+                live_send_in(Some(&fetched), name, &now).is_some(),
+                "the row's pill and the pane's card disagree about {name:?}"
+            );
+        }
     }
 
     /// The Sends screen replaces the item list rather than being drawn beside
