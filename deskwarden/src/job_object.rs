@@ -2835,7 +2835,27 @@ mod tests {
             // implementation was first run against the PREVIOUS pinned pair and
             // reproduced (27359, 0x0893_8927_73e3_6cc1) exactly, so it is measuring
             // what this test measures.
-            (27355, 0xdabb_dc3a_25d7_6eb7_u64),
+            // **27359 bytes, new hash: the version goes back to a `-dev` suffix after
+            // the 0.15.24 release.** `version = "0.15.24"` became `"0.15.25-dev"`.
+            //
+            // The second half of the pair every release makes, and the half the
+            // 0.15.20 and 0.15.21 cuts forgot: without it every build from the
+            // working tree claims to BE the release it sits on top of.
+            //
+            // Four bytes longer, so the length moves with the hash.
+            //
+            // No dependency was added, removed, re-pointed or re-featured, no
+            // `[patch]`/`[replace]`/`[workspace.dependencies]` table appeared, no
+            // path or fork appeared, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`.
+            //
+            // Recomputed the way every hop above records -- FNV-1a/64 over the file
+            // with CRLF normalised to LF, in a separate implementation outside this
+            // crate -- rather than copied out of the failure message. That
+            // implementation was first run against the PREVIOUS pinned pair and
+            // reproduced (27355, 0xdabb_dc3a_25d7_6eb7) exactly, so it is measuring
+            // what this test measures.
+            (27359, 0x9f54_39d5_e231_e830_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
