@@ -5038,42 +5038,14 @@ pub fn build_frame_with_search(
                                 DetailAction::AddTotp => {
                                     add_totp_asked = true;
                                 }
-                                // **The kebab's Icon submenu, handed straight
-                                // back to the row menu's own arms.** Not
-                                // acted on here, and the three are listed
-                                // together because the reason is one: what
-                                // each of them does is delicate in a way this
-                                // arm cannot restate safely. Refresh deletes
-                                // three caches in an order that matters and
-                                // deliberately starts no fetch of its own;
-                                // Select must not open `IFileOpenDialog` from
-                                // inside a draw closure, so it only seeds a
-                                // modal; and "use the automatic icon" writes
-                                // an empty string through
-                                // `with_custom_field`, which REMOVES the
-                                // field rather than blanking it. Each of
-                                // those is written once, a few hundred lines
-                                // up, and this pane reaches it by the slot the
-                                // out-of-vault pane's Restore already uses.
-                                //
-                                // WHICH of the three the kebab offered is
-                                // `item_list::icon_menu`'s decision -- the
-                                // same function the row menu asks -- so there
-                                // is no per-item test to repeat here.
-                                ref action @ (DetailAction::RefreshIcon
-                                | DetailAction::SelectIcon
-                                | DetailAction::ClearIcon) => {
-                                    let command = match action {
-                                        DetailAction::RefreshIcon => {
-                                            item_list::RowCommand::RefreshIcon
-                                        }
-                                        DetailAction::SelectIcon => {
-                                            item_list::RowCommand::SelectIcon
-                                        }
-                                        _ => item_list::RowCommand::ClearIcon,
-                                    };
-                                    pane_row_command = Some((item.id.clone(), command));
-                                }
+                                // **The kebab's Icon arm was here.** It moved
+                                // with the submenu: the pencil badge on the
+                                // edit pane reports the three now, and the arm
+                                // that answers them is `EditAction`'s, a few
+                                // hundred lines down. Same slot, same
+                                // `pane_row_command`, same three effects
+                                // written once in the item row's arms.
+
                                 // **The SECOND door onto the soft delete, and
                                 // it asks the same question the first one
                                 // does.** This arm used to call
@@ -5240,6 +5212,37 @@ pub fn build_frame_with_search(
                             &audience,
                             &totp_state,
                         ) {
+                            // **The pencil badge's icon menu, handed straight
+                            // to the row menu's own arms.** The read pane's
+                            // kebab used to do exactly this and the reason is
+                            // unchanged -- see `EditAction::RefreshIcon`, and
+                            // the `DetailAction` arm this replaces, for why
+                            // each of the three is delicate enough that it is
+                            // written once and reached by a slot rather than
+                            // restated at every door.
+                            //
+                            // The draft is untouched and stays open. An icon
+                            // is not a field of this form: it is a hidden
+                            // custom field, and `EditDraft::apply_to` clones
+                            // whatever the item holds AT SAVE TIME, so a
+                            // picture chosen here survives the Save that
+                            // follows it.
+                            ref action @ (EditAction::RefreshIcon
+                            | EditAction::SelectIcon
+                            | EditAction::ClearIcon) => {
+                                if let Some(item) = &selected_item {
+                                    let command = match action {
+                                        EditAction::RefreshIcon => {
+                                            item_list::RowCommand::RefreshIcon
+                                        }
+                                        EditAction::SelectIcon => {
+                                            item_list::RowCommand::SelectIcon
+                                        }
+                                        _ => item_list::RowCommand::ClearIcon,
+                                    };
+                                    pane_row_command = Some((item.id.clone(), command));
+                                }
+                            }
                             EditAction::Save => {
                                 if let Some(item) = &selected_item {
                                     let updated = draft.apply_to(item);
@@ -5554,6 +5557,19 @@ pub fn build_frame_with_search(
                             // cannot be silently ignored by the other.
                             EditAction::Rehearse => log::warn!(
                                 "the create form asked to rehearse a sequence it does not draw"
+                            ),
+                            // Unreachable, for a reason of the same shape: the
+                            // pencil badge's menu is `item_list::icon_menu`
+                            // asked about the item being edited, and a create
+                            // has no item -- `edit_header` is handed `None`
+                            // and draws the badge as a picture with nothing
+                            // hanging off it. There is no icon to refresh,
+                            // choose or clear before the record exists.
+                            EditAction::RefreshIcon
+                            | EditAction::SelectIcon
+                            | EditAction::ClearIcon => log::warn!(
+                                "the create form asked for an icon action on an item that does \
+                                 not exist yet"
                             ),
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
@@ -7532,25 +7548,22 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         // button to it changes nothing about what it shows, so it does not
         // reopen that decision.
         | DetailAction::AddTotp
-        // **The kebab's three icon actions, and the answer is not merely
-        // inherited from the arms above it.** They are argued at
-        // `row_command_exposes_secrets`, which gives their `RowCommand`
-        // counterparts `false` for the same three reasons: a refresh forgets
-        // a cached picture of a public favicon and asks for it again;
-        // choosing one opens a modal showing the item's NAME, which is
-        // already on screen, plus an address the user types themselves; and
-        // clearing one removes a custom field holding a picture. None reads a
-        // field of the item, paints one, or copies one, which is the whole of
-        // what this gate asks.
+        // **The kebab's three icon actions were listed here.** They are the
+        // edit pane's now and reach this module as `EditAction`s, which are
+        // routed to `item_list::RowCommand`s and so are gated by
+        // `row_command_exposes_secrets` -- where the same three are argued
+        // and answered `false`, for the same reasons: a refresh forgets a
+        // cached picture of a public favicon and asks for it again; choosing
+        // one opens a modal showing the item's NAME, already on screen, plus
+        // an address the user types themselves; and clearing one removes a
+        // custom field holding a picture. None reads a field of the item,
+        // paints one, or copies one, which is the whole of what this gate
+        // asks.
         //
-        // Answering differently HERE than there is the specific failure worth
-        // naming: the two menus offer the identical three acts on the
-        // identical item, so a `true` on this side would cost a master
-        // password from the kebab and nothing from the right-click menu --
-        // an arbitrary-looking gate, and a lesson in which door is cheaper.
-        | DetailAction::RefreshIcon
-        | DetailAction::SelectIcon
-        | DetailAction::ClearIcon
+        // One gate rather than two agreeing is strictly better than what was
+        // here: the failure that was worth naming -- answering differently on
+        // the two sides, so one door cost a master password and the other did
+        // not -- is now impossible rather than merely tested for.
         | DetailAction::OpenApp(_) => false,
     }
 }

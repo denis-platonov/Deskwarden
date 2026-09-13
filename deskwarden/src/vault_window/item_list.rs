@@ -455,25 +455,17 @@ pub fn menu_entries(
             ));
         }
     }
-    // **The icon group, which is now one entry that opens a submenu.**
-    // Immediately after "Open website" because the first of the three
-    // underneath it and that one are read off the very same first URI for a
-    // login. Deliberately above Edit rather than down with Archive and
-    // Delete: that trailing pair is the lifecycle group, and entries that
-    // change nothing but a picture do not belong in it.
+    // **The icon group is NOT here any more**, and its absence is the point.
     //
-    // **The three used to sit here as three top-level entries**, at the
-    // user's request folded into one. That is a presentation change and
-    // nothing else: which of the three appear, and why each is absent rather
-    // than greyed when it does not, is still `icon_menu`'s single decision
-    // over one read of the item's icon field -- see its doc, which also
-    // records the three designs for "Refresh icon on an item that has a
-    // chosen one" that were rejected. What the fold bought is the top of this
-    // menu back: a login with a chosen URL was offering three of its ten
-    // lines to a picture.
-    if let Some(icons) = icon_menu(item) {
-        entries.push(MenuEntry::Icon(icons));
-    }
+    // It arrived as three top-level entries, was folded into one submenu at
+    // the owner's request, and has now moved off this menu entirely -- onto
+    // the pencil badge on the edit pane's avatar, which is the picture those
+    // entries are about. The owner's direction: "let's actually remove those
+    // from result set and details to strictly to Edit screen".
+    //
+    // [`icon_menu`] itself is untouched and still the one decision about
+    // WHICH of the three an item is offered; only its readers changed. See
+    // `detail_edit`'s `edit_header`, the single one left.
     // Present for every kind, enabled only for those the edit form can
     // honestly edit -- see `MenuCommand::enabled` for why this one is greyed
     // rather than hidden.
@@ -2963,25 +2955,28 @@ mod menu_entry_tests {
             .collect()
     }
 
-    /// What the **Icon** submenu offers, in order -- or an empty list when
-    /// the menu carries no such entry at all.
+    /// What the icon menu offers for `item`, in order -- or an empty list
+    /// when it is offered nothing at all.
     ///
-    /// The two cases are collapsed on purpose: every assertion below that
-    /// uses this reads the WHOLE list, so "no submenu" and "a submenu with
-    /// nothing in it" are both `[]` and neither can be mistaken for the
-    /// other's absence of a particular row. Which of the two an item really
-    /// gets is `icon_menu`'s own `Option`, pinned separately by
+    /// **Asked of `icon_menu` and not of a drawn menu**, which is the change
+    /// that came with the group moving to the edit pane's pencil badge. It
+    /// used to dig the rows out of `menu_entries`' `MenuEntry::Icon`; no menu
+    /// in THIS file carries them any more, so reading one would make every
+    /// assertion below vacuously true. The decision never moved -- see
+    /// `icon_menu`, still the one answer to "which of the three does this
+    /// item get" -- so the tests follow it rather than the door it is behind.
+    ///
+    /// The `None` and the empty list are collapsed on purpose: every
+    /// assertion here reads the WHOLE list, so neither can be mistaken for
+    /// the other's absence of a particular row. Which of the two an item
+    /// really gets is `icon_menu`'s own `Option`, pinned separately by
     /// `the_icon_submenu_is_never_offered_empty`.
-    fn icon_labels(entries: &[MenuEntry]) -> Vec<String> {
-        entries
-            .iter()
-            .find_map(|entry| match entry {
-                MenuEntry::Icon(rows) => {
-                    Some(rows.iter().map(|row| row.label.clone()).collect())
-                }
-                _ => None,
-            })
+    fn icon_rows(item: &VaultItem) -> Vec<String> {
+        icon_menu(item)
             .unwrap_or_default()
+            .iter()
+            .map(|row| row.label.clone())
+            .collect()
     }
 
     fn move_menu_of(entries: &[MenuEntry]) -> MoveMenu {
@@ -3048,14 +3043,13 @@ mod menu_entry_tests {
                 "Copy password",
                 "Copy TOTP",
                 "Open website",
-                ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
                 "Delete",
             ]
         );
-        assert_eq!(icon_labels(&entries), vec![REFRESH_ICON_LABEL, SELECT_ICON_LABEL]);
+        assert_eq!(icon_rows(&full_login()), vec![REFRESH_ICON_LABEL, SELECT_ICON_LABEL]);
     }
 
     /// The two menus for an item that is NOT in the live vault, whole.
@@ -3257,13 +3251,13 @@ mod menu_entry_tests {
         let entries = menu_entries(&of_kind(Some(3)), &[], FilterSource::LiveVault, false);
         assert_eq!(
             labels(&entries),
-            vec![ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
         assert_eq!(
             enabled_labels(&entries),
-            vec![ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
-        assert_eq!(icon_labels(&entries), vec![SELECT_ICON_LABEL]);
+        assert_eq!(icon_rows(&of_kind(Some(3))), vec![SELECT_ICON_LABEL]);
     }
 
     /// **Renamed from `..._the_same_four_as_a_card` when "Select icon..."
@@ -3278,15 +3272,15 @@ mod menu_entry_tests {
         let entries = menu_entries(&of_kind(Some(2)), &[], FilterSource::LiveVault, false);
         assert_eq!(
             labels(&entries),
-            vec![ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
         assert_eq!(
             enabled_labels(&entries),
-            vec![ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
         assert_eq!(
-            icon_labels(&entries),
-            icon_labels(&menu_entries(&of_kind(Some(3)), &[], FilterSource::LiveVault, false)),
+            icon_rows(&of_kind(Some(2))),
+            icon_rows(&of_kind(Some(3))),
             "a note and a card no longer get the same icon submenu, which is the half of \
              \"the same five\" the top-level list cannot see"
         );
@@ -3355,7 +3349,6 @@ mod menu_entry_tests {
                 "Copy username",
                 "Copy password",
                 "Copy TOTP",
-                ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -3382,7 +3375,7 @@ mod menu_entry_tests {
         // level down and reading the outer list here would make both halves
         // below vacuously true against a build that offered it.
         let live =
-            |item: &VaultItem| icon_labels(&menu_entries(item, &[], FilterSource::LiveVault, false));
+            |item: &VaultItem| icon_rows(item);
         assert!(
             live(&full_login()).contains(&REFRESH_ICON_LABEL.to_string()),
             "the live control failed: an item that DOES have a domain was offered no refresh, \
@@ -3435,11 +3428,11 @@ mod menu_entry_tests {
         let entries = menu_entries(&card, &[], FilterSource::LiveVault, false);
         assert_eq!(
             labels(&entries),
-            vec![ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"],
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"],
             "a card with a bank domain got something other than the agreed menu"
         );
         assert_eq!(
-            icon_labels(&entries),
+            icon_rows(&card),
             vec![REFRESH_ICON_LABEL, SELECT_ICON_LABEL],
             "a card with a bank domain did not get the entry, or got something else with it"
         );
@@ -3499,7 +3492,7 @@ mod menu_entry_tests {
             ("a login with no URI at all", of_kind(Some(1))),
             ("a login whose only URI names no host", app_only),
         ] {
-            let entries = icon_labels(&menu_entries(&item, &[], FilterSource::LiveVault, false));
+            let entries = icon_rows(&item);
             assert!(
                 entries.contains(&SELECT_ICON_LABEL.to_string()),
                 "{what} was offered no way to choose its own icon: {entries:?}"
@@ -3531,27 +3524,34 @@ mod menu_entry_tests {
         }
     }
 
-    /// A trashed or archived row is offered neither the group nor anything
-    /// inside it: those two menus are `out_of_vault_entries`' and share
-    /// nothing with the live one.
+    /// **No row menu offers an icon entry any more, whatever the source.**
+    ///
+    /// This used to be about the trash and the archive alone: those two menus
+    /// are `out_of_vault_entries`' and shared nothing with the live one, so
+    /// the group could not leak into them. The group has now left the live
+    /// menu too -- it is the edit pane's pencil badge, `detail_edit`'s
+    /// `edit_header` -- and the claim widens to every source rather than
+    /// being deleted, because "the icon entries are gone from this file's
+    /// menus" is exactly what the owner asked for and is worth a test that
+    /// fails if one comes back.
+    ///
+    /// Both halves: the group's own row, and each of the three underneath it,
+    /// since a menu could shed the fold while keeping its contents.
     #[test]
-    fn a_trashed_or_archived_row_is_offered_no_icon_entries_either() {
-        for source in [FilterSource::Trash, FilterSource::Archive] {
+    fn no_row_menu_offers_an_icon_entry_whatever_the_source() {
+        for source in [FilterSource::LiveVault, FilterSource::Trash, FilterSource::Archive] {
             let entries = menu_entries(&chosen_url(&full_login()), &[], source, false);
             let top = labels(&entries);
-            assert!(
-                !top.contains(&ICON_LABEL.to_string()),
-                "{source:?} offered the Icon submenu at all: {top:?}"
-            );
-            // And nothing inside it, which is a separate claim: a menu could
-            // have shed the group's own row while still carrying its three.
-            let inside = icon_labels(&entries);
-            for label in [SELECT_ICON_LABEL, CLEAR_ICON_LABEL, REFRESH_ICON_LABEL] {
+            for label in [ICON_LABEL, SELECT_ICON_LABEL, CLEAR_ICON_LABEL, REFRESH_ICON_LABEL] {
                 assert!(
-                    !top.contains(&label.to_string()) && !inside.contains(&label.to_string()),
-                    "{source:?} offered {label:?}: {top:?} / {inside:?}"
+                    !top.contains(&label.to_string()),
+                    "{source:?} offered {label:?}: {top:?}"
                 );
             }
+            assert!(
+                !entries.iter().any(|e| matches!(e, MenuEntry::Icon(_))),
+                "{source:?} carries an Icon entry that `labels` cannot see"
+            );
         }
     }
 
@@ -3567,7 +3567,7 @@ mod menu_entry_tests {
     fn the_clear_entry_follows_the_field_being_there_and_not_it_parsing() {
         let plain = full_login();
         assert!(
-            !icon_labels(&menu_entries(&plain, &[], FilterSource::LiveVault, false))
+            !icon_rows(&plain)
                 .contains(&CLEAR_ICON_LABEL.to_string()),
             "an item with no chosen icon was offered a way to un-choose one"
         );
@@ -3577,7 +3577,7 @@ mod menu_entry_tests {
             ("a value this build cannot read", with_icon_field(&plain, "not json at all")),
             ("a shape from a later build", with_icon_field(&plain, r#"{"kind":"svg"}"#)),
         ] {
-            let entries = icon_labels(&menu_entries(&item, &[], FilterSource::LiveVault, false));
+            let entries = icon_rows(&item);
             assert!(
                 entries.contains(&CLEAR_ICON_LABEL.to_string()),
                 "an item with {what} was offered no way back to the automatic icon: {entries:?}"
@@ -3597,7 +3597,7 @@ mod menu_entry_tests {
     fn refresh_is_offered_for_a_chosen_url_and_never_for_a_chosen_picture() {
         let login = full_login();
         let has_refresh = |item: &VaultItem| {
-            icon_labels(&menu_entries(item, &[], FilterSource::LiveVault, false))
+            icon_rows(item)
                 .contains(&REFRESH_ICON_LABEL.to_string())
         };
         assert!(has_refresh(&login), "the live control: an ordinary login can refresh its icon");
@@ -3644,14 +3644,16 @@ mod menu_entry_tests {
                 "Copy password",
                 "Copy TOTP",
                 "Open website",
-                ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
                 "Delete",
             ]
         );
-        assert_eq!(icon_labels(&entries), vec![SELECT_ICON_LABEL, CLEAR_ICON_LABEL]);
+        assert_eq!(
+            icon_rows(&chosen_picture(&full_login())),
+            vec![SELECT_ICON_LABEL, CLEAR_ICON_LABEL]
+        );
     }
 
     /// And for a chosen URL, which keeps Refresh at the head of the group --
@@ -3667,7 +3669,6 @@ mod menu_entry_tests {
                 "Copy password",
                 "Copy TOTP",
                 "Open website",
-                ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -3675,7 +3676,7 @@ mod menu_entry_tests {
             ]
         );
         assert_eq!(
-            icon_labels(&entries),
+            icon_rows(&chosen_url(&full_login())),
             vec![REFRESH_ICON_LABEL, SELECT_ICON_LABEL, CLEAR_ICON_LABEL]
         );
     }
@@ -3697,23 +3698,6 @@ mod menu_entry_tests {
                 assert!(row.enabled, "{:?} is greyed", row.label);
                 assert_eq!(row.disabled_reason, None);
             }
-        }
-    }
-
-    /// A trashed or archived row is not offered it either -- those two menus
-    /// are built by `out_of_vault_entries` and share nothing with the live
-    /// one, which is exactly the property that keeps this from being a
-    /// question anybody has to remember to ask again.
-    #[test]
-    fn a_trashed_or_archived_row_is_offered_no_refresh() {
-        for source in [FilterSource::Trash, FilterSource::Archive] {
-            let entries = menu_entries(&full_login(), &[], source, false);
-            assert!(
-                !labels(&entries).contains(&REFRESH_ICON_LABEL.to_string())
-                    && !icon_labels(&entries).contains(&REFRESH_ICON_LABEL.to_string()),
-                "{source:?} offered a refresh: {:?}",
-                labels(&entries)
-            );
         }
     }
 
@@ -3755,7 +3739,6 @@ mod menu_entry_tests {
                 "Copy username",
                 "Copy password",
                 "Open website",
-                ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -3782,11 +3765,11 @@ mod menu_entry_tests {
         let entries = menu_entries(&empty, &[], FilterSource::LiveVault, false);
         assert_eq!(
             labels(&entries),
-            vec![ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
         // Empty strings where the credentials should be do not make the item
         // iconless: it still carries the URI the automatic icon is read off.
-        assert_eq!(icon_labels(&entries), vec![SELECT_ICON_LABEL]);
+        assert_eq!(icon_rows(&empty), vec![SELECT_ICON_LABEL]);
     }
 
     #[test]
@@ -7633,91 +7616,13 @@ mod row_tile_tests {
         )
     }
 
-    /// Right-clicks row `row`, then rests the pointer on **Icon** so its
-    /// submenu opens -- `open_move_submenu`'s gesture, on the other submenu.
-    ///
-    /// It exists because the three icon entries are painted only while that
-    /// submenu is open: a test that read the outer menu's galleys for
-    /// "Refresh icon" would now find it missing on every item and every
-    /// absence assertion written that way would pass without meaning
-    /// anything.
-    fn open_icon_submenu(items: &[VaultItem], folders: Vec<Folder>, row: usize) -> Painted {
-        let hover = text_centre(&open_menu(items, folders.clone(), row), ICON_LABEL);
-        let at = row_centre(items, row);
-        let mut frames = click_frames(at, egui::PointerButton::Secondary);
-        frames.extend((0..4).map(|_| vec![egui::Event::PointerMoved(hover)]));
-        paint_core(
-            items,
-            None,
-            0,
-            PANE_WIDTH,
-            |_| IconCache::default(),
-            Menu { folders, frames, filter: SidebarFilter::All },
-        )
-    }
-
-    /// Every icon wording the **Icon** submenu really painted for row `row`,
-    /// in the order it painted them.
-    ///
-    /// Filtered to [`ICON_VOCABULARY`] rather than to the whole of
-    /// [`MENU_VOCABULARY`], for the reason that array's own doc gives about
-    /// exactness: the outer menu is still painted underneath an open submenu,
-    /// so an unfiltered read would return Copy username, Edit and Archive
-    /// alongside the rows being asserted about, and every expected list here
-    /// would have to restate the whole menu to say one thing about three of
-    /// its lines. These three are the only rows `icon_menu` can put in the
-    /// submenu -- pinned by `the_icon_submenu_is_never_offered_empty` and the
-    /// per-item rules beside it -- so a list over them is absolute.
-    fn icon_submenu_labels(items: &[VaultItem], folders: Vec<Folder>, row: usize) -> Vec<String> {
-        open_icon_submenu(items, folders, row)
-            .texts
-            .iter()
-            .map(|(text, _, _)| text.clone())
-            .filter(|text| ICON_VOCABULARY.contains(&text.as_str()))
-            .collect()
-    }
-
-    /// Every label the **Icon** submenu can paint. See
-    /// [`icon_submenu_labels`], and [`MENU_VOCABULARY`] for why an assertion
-    /// input like this is spelled out rather than derived.
-    const ICON_VOCABULARY: [&str; 3] =
-        [REFRESH_ICON_LABEL, SELECT_ICON_LABEL, CLEAR_ICON_LABEL];
-
-    /// Right-clicks row `row`, walks the pointer into the **Icon** submenu
-    /// and clicks the row reading `label`, returning the frame that click
-    /// resolved on.
-    ///
-    /// The pointer travels along the parent entry and then onto the row,
-    /// resting on each, for `choosing_a_folder_reports_a_move_to_that_folders_
-    /// id`'s reason: egui opens a submenu on hover and closes it when the
-    /// pointer leaves, so a jump straight from the row to a submenu row lands
-    /// on a submenu that was never open.
-    fn choose_icon_entry(
-        items: &[VaultItem],
-        folders: Vec<Folder>,
-        row: usize,
-        label: &str,
-    ) -> Painted {
-        let opened = open_icon_submenu(items, folders.clone(), row);
-        let entry = text_centre(&opened, label);
-        let hover = text_centre(&open_menu(items, folders.clone(), row), ICON_LABEL);
-        let at = row_centre(items, row);
-        let mut frames = click_frames(at, egui::PointerButton::Secondary);
-        frames.extend((0..4).map(|_| vec![egui::Event::PointerMoved(hover)]));
-        frames.extend((0..3).map(|_| vec![egui::Event::PointerMoved(entry)]));
-        let mut click = click_frames(entry, egui::PointerButton::Primary);
-        // Measured on the release -- see `choose_entry`.
-        click.pop();
-        frames.extend(click);
-        paint_core(
-            items,
-            None,
-            0,
-            PANE_WIDTH,
-            |_| IconCache::default(),
-            Menu { folders, frames, filter: SidebarFilter::All },
-        )
-    }
+    // **`open_icon_submenu`, `icon_submenu_labels`, `ICON_VOCABULARY` and
+    // `choose_icon_entry` were here and are gone.** The row menu has no Icon
+    // submenu to open: the group moved to the edit pane's pencil badge, and
+    // its painted coverage moved with it -- see `detail_edit`'s
+    // `every_row_of_the_pencil_menu_reports_its_own_action`. What is left
+    // here is the negative, `no_right_click_menu_paints_any_icon_wording`,
+    // which is the half this file can still make.
 
     /// Right-clicks row `row`, then left-clicks the menu entry reading
     /// `label`, and returns the frame that second click resolved on.
@@ -8074,28 +7979,11 @@ mod row_tile_tests {
                 "Copy password",
                 "Copy TOTP",
                 "Open website",
-                ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
                 DELETE_LABEL,
             ]
-        );
-    }
-
-    /// And the submenu behind that one line really opens onto the two rows
-    /// `menu_entries` decided for this item.
-    ///
-    /// The painted half of `a_full_login_offers_every_entry_in_the_agreed_
-    /// order`'s second assertion: a decision that never reaches a popup is
-    /// worth nothing, and a submenu that failed to open paints the same
-    /// nothing as one that opened empty.
-    #[test]
-    fn the_icon_submenu_paints_exactly_what_the_menu_decided() {
-        let items = [full_login("Ledgerline")];
-        assert_eq!(
-            icon_submenu_labels(&items, vec![folder("f1", "Work")], 0),
-            vec![REFRESH_ICON_LABEL, SELECT_ICON_LABEL]
         );
     }
 
@@ -8107,17 +7995,40 @@ mod row_tile_tests {
         let items = [card("Visa (personal)")];
         assert_eq!(
             menu_labels(&open_menu(&items, vec![folder("f1", "Work")], 0)),
-            vec![ICON_LABEL, "Edit", MOVE_TO_FOLDER_LABEL, "Archive", DELETE_LABEL]
+            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", DELETE_LABEL]
         );
-        // A card with no bank domain has no automatic icon to refresh, so
-        // its submenu opens onto the one row that always works. Asserted
-        // here rather than in a test of its own: the claim above is about
-        // this card's whole menu, and with the group folded the outer list
-        // can no longer make it.
-        assert_eq!(
-            icon_submenu_labels(&items, vec![folder("f1", "Work")], 0),
-            vec![SELECT_ICON_LABEL]
-        );
+    }
+
+    /// **No right-click menu paints any icon wording**, for either kind.
+    ///
+    /// The painted counterpart of `menu_entry_tests`'
+    /// `no_row_menu_offers_an_icon_entry_whatever_the_source`, and the whole
+    /// of what this file still has to say about the icon group: the three
+    /// entries and the fold over them now live on the edit pane's pencil
+    /// badge, where `detail_edit` paints and clicks them.
+    ///
+    /// Read off the painted galleys and not off `menu_entries`, because that
+    /// is the half a decision cannot make: a menu could go on drawing a row
+    /// it no longer decides to offer.
+    #[test]
+    fn no_right_click_menu_paints_any_icon_wording() {
+        let items = [full_login("Ledgerline"), card("Visa (personal)")];
+        for row in 0..items.len() {
+            let drawn = menu_labels(&open_menu(&items, vec![folder("f1", "Work")], row));
+            for label in [ICON_LABEL, REFRESH_ICON_LABEL, SELECT_ICON_LABEL, CLEAR_ICON_LABEL] {
+                assert!(
+                    !drawn.contains(&label.to_string()),
+                    "row {row} painted {label:?}: {drawn:?}"
+                );
+            }
+            // The live control: this harness really does paint a menu, so
+            // the four absences above are absences and not a popup that
+            // never opened.
+            assert!(
+                drawn.contains(&"Edit".to_string()),
+                "row {row} painted no menu at all: {drawn:?}"
+            );
+        }
     }
 
     #[test]
@@ -8130,7 +8041,6 @@ mod row_tile_tests {
                 "Copy username",
                 "Copy password",
                 "Open website",
-                ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -8314,102 +8224,12 @@ mod row_tile_tests {
         );
     }
 
-    /// **The real menu, really clicked, now through the submenu.**
-    /// `menu_entry_tests` pins what `menu_entries` decides; this is the other
-    /// half -- that the popup draws the entry, that a pointer can reach it
-    /// two levels down, and that clicking it comes back out of
-    /// `draw_item_list` as `RowCommand::RefreshIcon` against the row that was
-    /// right-clicked.
-    ///
-    /// **The trip through the submenu is the part that is new and the part
-    /// most likely to break.** A click that lands on a submenu which was
-    /// never opened reports `ItemListAction::None`, which is what a dead
-    /// entry reports too -- so this failing tells the two apart only because
-    /// the sibling below asserts the same click on the other two rows.
-    ///
-    /// The second row deliberately, not the first: an implementation that
-    /// reported the selected id, or the first item, or the id the menu was
-    /// last built for, passes on row 0 and fails here.
-    #[test]
-    fn choosing_refresh_icon_reports_it_against_the_row_that_was_right_clicked() {
-        let items = [full_login("Ledgerline"), full_login("Vantage")];
-        let p = choose_icon_entry(&items, vec![], 1, REFRESH_ICON_LABEL);
-        assert_eq!(
-            p.action,
-            ItemListAction::Row {
-                id: "Vantage".to_string(),
-                command: RowCommand::RefreshIcon,
-            }
-        );
-    }
-
-    /// **All three rows of the submenu answer a click**, against an item that
-    /// is offered all three.
-    ///
-    /// Written as one test over the three rather than three tests, because
-    /// the property is the same one for each and the failure worth catching
-    /// is a submenu whose rows are painted and inert -- which is what the
-    /// fold could most plausibly have produced: `menu_command` is called from
-    /// a different `Ui` now, one nested inside a `menu_button`'s closure.
-    #[test]
-    fn every_row_of_the_icon_submenu_reports_its_own_command() {
-        let mut item = full_login("Ledgerline");
-        item = crate::vault_bridge::with_custom_field(
-            &item,
-            crate::item_icon::ICON_FIELD_NAME,
-            &crate::item_icon::choice_from_url("https://cdn.example.com/logo.png")
-                .expect("a good URL")
-                .to_field_value(),
-        );
-        let items = [item];
-        // The premise: this is the one item state that gets all three rows,
-        // so a run that silently lost one would leave the loop below
-        // asserting about entries that were never on offer.
-        assert_eq!(
-            icon_submenu_labels(&items, vec![], 0),
-            vec![REFRESH_ICON_LABEL, SELECT_ICON_LABEL, CLEAR_ICON_LABEL]
-        );
-        for (label, command) in [
-            (REFRESH_ICON_LABEL, RowCommand::RefreshIcon),
-            (SELECT_ICON_LABEL, RowCommand::SelectIcon),
-            (CLEAR_ICON_LABEL, RowCommand::ClearIcon),
-        ] {
-            assert_eq!(
-                choose_icon_entry(&items, vec![], 0, label).action,
-                ItemListAction::Row { id: "Ledgerline".to_string(), command },
-                "{label:?} in the Icon submenu is decoration"
-            );
-        }
-    }
-
-    /// The painted half of `refresh_icon_is_absent_for_every_item_with_no_
-    /// icon_domain`: a row with no icon domain draws no such entry, so there
-    /// is nothing on screen to click.
-    ///
-    /// **Read from inside the opened submenu, not off the outer menu.** With
-    /// the group folded, no item paints "Refresh icon" at the top level, so
-    /// an assertion written against `open_menu` would pass for every row in
-    /// this app and mean nothing about any of them.
-    ///
-    /// Whole list, and a live control drawn by the same harness one line
-    /// down -- `icon_submenu_labels` filters through `ICON_VOCABULARY`, so a
-    /// label missing from that array would make BOTH halves silently vacuous.
-    #[test]
-    fn a_row_with_no_icon_domain_paints_no_refresh_entry() {
-        let note = VaultItem { item_type: Some(2), login: None, ..login("Recovery codes", "") };
-        let painted = icon_submenu_labels(&[note], vec![], 0);
-        assert_eq!(
-            painted,
-            vec![SELECT_ICON_LABEL],
-            "a secure note's Icon submenu painted more than the one row it is owed"
-        );
-        assert!(
-            icon_submenu_labels(&[full_login("Ledgerline")], vec![], 0)
-                .contains(&REFRESH_ICON_LABEL.to_string()),
-            "the live control failed: no row paints the entry at all, so the absence above is \
-             not about this item"
-        );
-    }
+    // **Three painted tests were here**: that clicking Refresh two levels
+    // down reported it against the row that was right-clicked, that all
+    // three rows answered a click, and that a row with no icon domain
+    // painted no Refresh. They went with the submenu. The same three claims
+    // are made on the edit pane now -- see `detail_edit`'s
+    // `every_row_of_the_pencil_menu_reports_its_own_action`.
 
     #[test]
     fn the_greyed_edit_entry_reports_nothing_when_it_is_clicked() {
@@ -8596,7 +8416,6 @@ mod row_tile_tests {
                 "Copy password",
                 "Copy TOTP",
                 "Open website",
-                ICON_LABEL,
                 "Edit",
                 MOVE_TO_FOLDER_LABEL,
                 "Archive",
@@ -8851,18 +8670,18 @@ mod row_tile_tests {
     /// are written against this list rather than against a couple of
     /// hand-picked labels, so an entry added to the live menu later cannot
     /// quietly start appearing on a trashed item too.
-    /// **`ICON_LABEL` joined the list when the icon group folded into a
-    /// submenu**, which is the first time this array could name the group at
-    /// all: the three wordings it replaced are drawn only inside an opened
-    /// submenu, and these assertions read a menu that was opened and not
-    /// walked into. The group's own row is painted on that first level, so an
-    /// out-of-vault menu that started offering it is now a failure here.
-    const LIVE_ONLY_ENTRIES: [&str; 9] = [
+    /// **`ICON_LABEL` joined this list when the icon group folded into a
+    /// submenu and left it when the group left the menu.** It is on the edit
+    /// pane's pencil badge now, so it is no longer an entry the LIVE menu can
+    /// offer and naming it here would fail every positive assertion below.
+    /// `no_right_click_menu_paints_any_icon_wording` is where its absence is
+    /// asserted instead, on both sides rather than only on the out-of-vault
+    /// one this array guards.
+    const LIVE_ONLY_ENTRIES: [&str; 8] = [
         "Copy username",
         "Copy password",
         "Copy TOTP",
         "Open website",
-        ICON_LABEL,
         "Edit",
         MOVE_TO_FOLDER_LABEL,
         "Archive",

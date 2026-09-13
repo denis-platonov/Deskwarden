@@ -3573,6 +3573,30 @@ pub enum EditAction {
     /// passed through here would be a value the rehearsal has no use for and
     /// must not have.
     Rehearse,
+    /// **The pencil badge's icon menu**, one variant per row of it.
+    ///
+    /// The same three the item row's menu and the read pane's kebab used to
+    /// offer, moved here at the owner's direction ("let's actually remove
+    /// those from result set and details to strictly to Edit screen"). They
+    /// REPORT rather than act, exactly as the kebab's did: what each one does
+    /// is delicate in a way a draw closure must not restate -- Refresh drops
+    /// three caches in an order that matters and deliberately starts no fetch
+    /// of its own, Select must not open `IFileOpenDialog` from inside a frame
+    /// and so only seeds a modal, and "use the automatic icon" writes an
+    /// empty string through `with_custom_field`, which REMOVES the field
+    /// rather than blanking it.
+    ///
+    /// **They do not touch the draft, and that is right.** An icon is not a
+    /// field of this form: it is a hidden custom field the form neither
+    /// offers nor edits, and `EditDraft::apply_to` carries it through
+    /// untouched from whatever the item holds AT SAVE TIME. So a picture
+    /// chosen mid-edit is on the item the draft is then applied to, and Save
+    /// keeps both.
+    RefreshIcon,
+    /// See [`Self::RefreshIcon`].
+    SelectIcon,
+    /// See [`Self::RefreshIcon`].
+    ClearIcon,
 }
 
 /// The folders this form may actually move an item **into**: the folder list
@@ -6400,7 +6424,13 @@ fn edit_header(
     folder: Option<&str>,
     dirty: bool,
     full: bool,
-) {
+    // The item being edited, or `None` on a create. Read for its icon menu
+    // and nothing else -- see `EditAction::RefreshIcon`, and
+    // `item_list::icon_menu`, which decides WHICH of the three rows an item
+    // is offered and is asked here rather than second-guessed.
+    item: Option<&VaultItem>,
+) -> EditAction {
+    let mut action = EditAction::None;
     let band = egui::vec2(
         ui.available_width(),
         if full { EDIT_HEADER_ROW } else { theme::FIELD_HEIGHT },
@@ -6422,7 +6452,46 @@ fn edit_header(
                 })
                 .response
                 .rect;
-            theme::edit_badge(ui.painter(), tile);
+            // **The badge is the icon menu's door**, and on a create it is
+            // only a picture: there is no item yet, so there is no icon to
+            // refresh, choose or clear. `icon_menu` answering `None` has the
+            // same effect for an item that is offered nothing -- a state it
+            // says it cannot produce today, handled rather than asserted.
+            let badge = theme::edit_badge_button(ui, tile);
+            if let Some(rows) = item.and_then(super::item_list::icon_menu) {
+                badge.clone().on_hover_text(ICON_BADGE_HINT);
+                egui::Popup::menu(&badge)
+                    // The kebab's behaviour, for the kebab's reason: a click
+                    // inside the menu closes it because the ENTRY says so
+                    // (`item_list::menu_command` calls `ui.close()`), and a
+                    // click outside dismisses it. See `detail`'s own menu.
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
+                        // `row`, not `action`: the name this closure writes
+                        // its answer into is `action`, and a loop binding
+                        // spelled the same way shadows it. The kebab this
+                        // menu came from carries the same note.
+                        for row in &rows {
+                            if super::item_list::menu_command(ui, row) {
+                                match &row.command {
+                                    super::item_list::RowCommand::RefreshIcon => {
+                                        action = EditAction::RefreshIcon;
+                                    }
+                                    super::item_list::RowCommand::SelectIcon => {
+                                        action = EditAction::SelectIcon;
+                                    }
+                                    super::item_list::RowCommand::ClearIcon => {
+                                        action = EditAction::ClearIcon;
+                                    }
+                                    other => log::warn!(
+                                        "the icon menu offered {other:?}, which is not an icon \
+                                         action; the click was dropped"
+                                    ),
+                                }
+                            }
+                        }
+                    });
+            }
             ui.add_space(detail::HEADER_GAP);
         }
         // **The pill claims its width first**, exactly as the read pane's
@@ -6508,7 +6577,14 @@ fn edit_header(
             });
         });
     });
+    action
 }
+
+/// What the pencil badge says it opens.
+///
+/// `item_list::ICON_LABEL`'s own word, so the control and the menu it opens
+/// agree, with the verb the tooltip has room for and the menu entry does not.
+const ICON_BADGE_HINT: &str = "Icon actions for this item";
 
 /// One card of design 8a's grid: its title band, its body, and the gap to the
 /// next card.
@@ -6981,7 +7057,19 @@ pub fn draw_detail_edit(
         ))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            edit_header(ui, kind, creating, draft, folder_name, !changes.is_empty(), full_band);
+            let from_badge = edit_header(
+                ui,
+                kind,
+                creating,
+                draft,
+                folder_name,
+                !changes.is_empty(),
+                full_band,
+                item,
+            );
+            if from_badge != EditAction::None {
+                action = from_badge;
+            }
         });
     // The strip's `border-bottom: 1px solid #eae7e7`, exactly as the read
     // pane closes its own.
@@ -18121,6 +18209,219 @@ mod edit_pane_layout_tests {
             uris.join(",")
         ))
         .expect("the fixture is valid item JSON")
+    }
+
+    // -----------------------------------------------------------------------
+    // The pencil badge's icon menu -- the owner's "no icons on pencil"
+    // -----------------------------------------------------------------------
+    //
+    // The three acts this app can perform on an item's picture used to hang
+    // off two menus: the item row's right-click menu and the read pane's
+    // kebab. They hang off ONE control now, the pencil on the edit pane's
+    // avatar, at the owner's direction ("let's actually remove those from
+    // result set and details to strictly to Edit screen"). The negatives are
+    // in `item_list` and `detail`; these are the positives that moved.
+
+    /// Where the badge is, derived from the constants that place it rather
+    /// than written out.
+    ///
+    /// The avatar is allocated first in a `left_to_right(Align::Center)` band
+    /// of `EDIT_HEADER_ROW`, inset by the header's own padding, so its box is
+    /// arithmetic -- and `theme::edit_badge_rect` is the same arithmetic the
+    /// badge itself uses. A layout change that moved either makes the clicks
+    /// below miss, which every test here catches through its own positive
+    /// control rather than by silently passing.
+    fn badge_rect() -> Rect {
+        let top = f32::from(detail::HEADER_PAD_Y)
+            + (EDIT_HEADER_ROW - detail::HEADER_AVATAR) / 2.0;
+        theme::edit_badge_rect(Rect::from_min_size(
+            Pos2::new(f32::from(detail::HEADER_PAD_X), top),
+            Vec2::splat(detail::HEADER_AVATAR),
+        ))
+    }
+
+    /// An item wearing a chosen icon read off `url` -- the one state that is
+    /// offered all three rows.
+    fn with_a_chosen_url(item: &VaultItem, url: &str) -> VaultItem {
+        crate::vault_bridge::with_custom_field(
+            item,
+            crate::item_icon::ICON_FIELD_NAME,
+            &crate::item_icon::choice_from_url(url).expect("a good URL").to_field_value(),
+        )
+    }
+
+    /// Opens the pencil menu and answers with the frame it was drawn on.
+    fn open_pencil_menu(ctx: &egui::Context, pane: Vec2, item: &VaultItem) -> Painted {
+        let mut draft = EditDraft::from_item(item);
+        let _ = frame_for(ctx, pane, &mut draft, false, &[], Some(item), &detail::TotpState::NoSecret);
+        let _ = frame_for(
+            ctx,
+            pane,
+            &mut draft,
+            false,
+            &click(badge_rect().center()),
+            Some(item),
+            &detail::TotpState::NoSecret,
+        );
+        frame_for(ctx, pane, &mut draft, false, &[], Some(item), &detail::TotpState::NoSecret)
+    }
+
+    /// Every icon wording, so the assertions below are absolute rather than
+    /// "the ones I looked for".
+    const ICON_ROWS: [&str; 3] = [
+        crate::vault_window::item_list::REFRESH_ICON_LABEL,
+        crate::vault_window::item_list::SELECT_ICON_LABEL,
+        crate::vault_window::item_list::CLEAR_ICON_LABEL,
+    ];
+
+    fn icon_rows_painted(painted: &Painted) -> Vec<String> {
+        painted
+            .texts
+            .iter()
+            .map(|(text, _)| text.clone())
+            .filter(|text| ICON_ROWS.contains(&text.as_str()))
+            .collect()
+    }
+
+    /// **The menu the badge opens is `item_list::icon_menu`'s decision, not a
+    /// list this form wrote out again.**
+    ///
+    /// One side is what the pane really PAINTED after a real click at the
+    /// coordinates the badge is really drawn at; the other is what
+    /// `icon_menu` decides. Three items, chosen so the answer differs between
+    /// them -- a login with a site gets Refresh, a note without one does not,
+    /// a chosen URL adds the way back and keeps Refresh -- so a form that had
+    /// grown a constant list of its own fails across the set rather than
+    /// agreeing by luck on one.
+    #[test]
+    fn the_pencil_menu_offers_exactly_what_icon_menu_decided() {
+        let pane = egui::vec2(560.0, UNCULLED_PANE_HEIGHT);
+        let login = login_with_websites(1);
+        let cases = [
+            ("a login with a site", login.clone()),
+            ("a chosen URL", with_a_chosen_url(&login, "https://cdn.example.com/logo.png")),
+            ("a secure note", {
+                let mut note = login.clone();
+                note.item_type = Some(2);
+                note.login = None;
+                note
+            }),
+        ];
+        let decided: Vec<Vec<String>> = cases
+            .iter()
+            .map(|(_, item)| {
+                crate::vault_window::item_list::icon_menu(item)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|row| row.label.clone())
+                    .collect()
+            })
+            .collect();
+        // The premise, checked before anything is compared: the three items
+        // really do disagree. Without it a build in which every item got the
+        // identical menu would satisfy every equality below.
+        assert!(
+            decided.iter().any(|rows| rows != &decided[0]),
+            "every fixture was offered the same rows ({decided:?}), so the comparisons below \
+             would pass against a surface that returned a constant"
+        );
+        for ((what, item), expected) in cases.iter().zip(&decided) {
+            let ctx = styled_context(pane);
+            let painted = open_pencil_menu(&ctx, pane, item);
+            assert_eq!(
+                &icon_rows_painted(&painted),
+                expected,
+                "{what}: the pencil menu and `icon_menu` disagree. Painted: {:?}",
+                painted.strings()
+            );
+            // And the menu really opened: `icon_menu` never answers with an
+            // empty list, so an empty painted list is a click that missed.
+            assert!(
+                !expected.is_empty(),
+                "{what}: `icon_menu` offered nothing, which it does not do -- so the equality \
+                 above compared two empty lists"
+            );
+        }
+    }
+
+    /// **The rows are not decoration**: each reports its own action, on the
+    /// menu the pane really opened, at the coordinates it really painted.
+    ///
+    /// The item wears a chosen URL, the one state offered all three rows, so
+    /// this drives every arm of the match behind them in one pass -- and a
+    /// wiring that reported the same action for all three fails on two.
+    #[test]
+    fn every_row_of_the_pencil_menu_reports_its_own_action() {
+        let pane = egui::vec2(560.0, UNCULLED_PANE_HEIGHT);
+        let item =
+            with_a_chosen_url(&login_with_websites(1), "https://cdn.example.com/logo.png");
+        let expected = [
+            (crate::vault_window::item_list::REFRESH_ICON_LABEL, EditAction::RefreshIcon),
+            (crate::vault_window::item_list::SELECT_ICON_LABEL, EditAction::SelectIcon),
+            (crate::vault_window::item_list::CLEAR_ICON_LABEL, EditAction::ClearIcon),
+        ];
+        {
+            let ctx = styled_context(pane);
+            let painted = open_pencil_menu(&ctx, pane, &item);
+            assert_eq!(
+                icon_rows_painted(&painted),
+                expected.iter().map(|(label, _)| label.to_string()).collect::<Vec<_>>(),
+                "the fixture is no longer the item offered all three rows, so the clicks below \
+                 would be aimed at entries that are not there"
+            );
+        }
+        for (label, action) in expected {
+            let ctx = styled_context(pane);
+            let opened = open_pencil_menu(&ctx, pane, &item);
+            let row = opened
+                .texts
+                .iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, rect)| *rect)
+                .unwrap_or_else(|| panic!("{label:?} was not painted: {:?}", opened.strings()));
+            let mut draft = EditDraft::from_item(&item);
+            let (reported, _) = acting_frame_for(
+                &ctx,
+                pane,
+                &mut draft,
+                false,
+                &click(row.center()),
+                Some(&item),
+                &detail::TotpState::NoSecret,
+            );
+            assert_eq!(
+                reported, action,
+                "clicking {label:?} in the pencil menu reported {reported:?}"
+            );
+        }
+    }
+
+    /// **A create is offered nothing**, because there is no item yet: no icon
+    /// to refresh, to replace or to clear before the record exists.
+    ///
+    /// The badge is still drawn -- it is what says this pane is the editor --
+    /// so the claim is about the menu and not about the pencil.
+    #[test]
+    fn the_pencil_opens_no_menu_while_an_item_is_being_created() {
+        let pane = egui::vec2(560.0, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let mut draft = EditDraft::empty();
+        draft.name = "Ledgerline".to_string();
+        let _ = frame(&ctx, pane, &mut draft, true, &[]);
+        let _ = frame(&ctx, pane, &mut draft, true, &click(badge_rect().center()));
+        let painted = frame(&ctx, pane, &mut draft, true, &[]);
+        assert!(
+            icon_rows_painted(&painted).is_empty(),
+            "the create form's badge opened an icon menu: {:?}",
+            painted.strings()
+        );
+        // The live control: the form really drew, so the absence above is
+        // about the menu rather than about a frame that painted nothing.
+        assert!(
+            painted.strings().contains(&SAVE_BUTTON),
+            "the create form painted no Save, so nothing here was exercised: {:?}",
+            painted.strings()
+        );
     }
 
     /// **Every website the login carries is drawn, labelled and reachable at

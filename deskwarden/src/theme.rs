@@ -5387,18 +5387,65 @@ pub fn paint_pencil_scaled(painter: &egui::Painter, rect: Rect, color: Color32, 
 /// band no width: the tile is 40 points and the badge hangs off its corner
 /// the way §8a's `right: -6px; bottom: -6px` does.
 pub fn edit_badge(painter: &egui::Painter, tile: Rect) {
-    let center = Pos2::new(
-        tile.right() - EDIT_BADGE / 2.0 + EDIT_BADGE_OVERHANG,
-        tile.bottom() - EDIT_BADGE / 2.0 + EDIT_BADGE_OVERHANG,
-    );
-    painter.circle(center, EDIT_BADGE / 2.0, CARD, Stroke::new(1.0, BORDER_STRONG));
+    paint_edit_badge(painter, edit_badge_rect(tile), TEXT_MUTED, CARD);
+}
+
+/// Where [`edit_badge`] draws, for a tile of `tile`.
+///
+/// Public because the badge is a CONTROL now (see [`edit_badge_button`]) and
+/// a test that wants to click it has to know where it is -- there is no
+/// widget rect to read it off, since the badge is painted over the avatar
+/// rather than allocated beside it.
+pub fn edit_badge_rect(tile: Rect) -> Rect {
+    Rect::from_center_size(
+        Pos2::new(
+            tile.right() - EDIT_BADGE / 2.0 + EDIT_BADGE_OVERHANG,
+            tile.bottom() - EDIT_BADGE / 2.0 + EDIT_BADGE_OVERHANG,
+        ),
+        Vec2::splat(EDIT_BADGE),
+    )
+}
+
+fn paint_edit_badge(painter: &egui::Painter, rect: Rect, ink: Color32, fill: Color32) {
+    painter.circle(rect.center(), EDIT_BADGE / 2.0, fill, Stroke::new(1.0, BORDER_STRONG));
     // The pencil at §8a's own `width: 10`, inside an 18-point disc.
     paint_pencil_scaled(
         painter,
-        Rect::from_center_size(center, Vec2::splat(EDIT_BADGE_GLYPH)),
-        TEXT_MUTED,
+        Rect::from_center_size(rect.center(), Vec2::splat(EDIT_BADGE_GLYPH)),
+        ink,
         EDIT_BADGE_GLYPH / PENCIL_DRAWN_SIZE,
     );
+}
+
+/// [`edit_badge`] **as a button**, which is what it is on the edit pane.
+///
+/// The badge says "you are editing this"; the owner's word on it was "no
+/// icons on pencil", and what hangs off it now is everything this app can do
+/// with an item's picture -- the menu that used to be a submenu of the item
+/// row's right-click menu and of the read pane's kebab, moved here whole.
+/// The pencil sits ON the avatar, which is the picture those three entries
+/// are about, so it is the one place in the window where the control and the
+/// thing it changes are the same object.
+///
+/// Painted, interacted and returned in one call rather than left to the
+/// caller, because the rect is this module's arithmetic ([`edit_badge_rect`])
+/// and a caller reconstructing it to place a `Popup` is a second copy of the
+/// design's `right: -6px; bottom: -6px`.
+pub fn edit_badge_button(ui: &mut Ui, tile: Rect) -> Response {
+    let rect = edit_badge_rect(tile);
+    // `ui.id().with(..)` and not `next_auto_id`: this is painted over another
+    // widget rather than allocated in the layout, so there is no auto id
+    // sequence position of its own to take.
+    let response = ui.interact(rect, ui.id().with("edit-badge"), Sense::click());
+    // The same lift every other quiet icon control in this app takes under
+    // the pointer: the ink comes up to `INK`, and the disc keeps its fill so
+    // the badge does not change SHAPE on hover.
+    let ink = if response.hovered() { INK } else { TEXT_MUTED };
+    paint_edit_badge(ui.painter(), rect, ink, CARD);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
 }
 
 /// The edit badge's disc: §8a's `width: 18px; height: 18px`.
