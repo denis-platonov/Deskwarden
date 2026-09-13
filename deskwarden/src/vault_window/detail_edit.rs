@@ -6693,6 +6693,46 @@ fn fill_count_label(fills: u32) -> String {
 /// What is left is 8a's own last line, `Also visible to 14 people in
 /// Engineering`, which comes from `rest::organizations::Audience` and is the
 /// half of this card that answers the question the card is named for.
+/// What §8a's `Owner` cell says: who this record belongs to.
+///
+/// §8a draws `Ledgerline Org · Engineering` -- the organisation, then the
+/// collection it is filed in. A personal item gets Bitwarden's own word for
+/// the other case, so the cell is never blank and never has to say "none".
+///
+/// **The FIRST collection**, not all of them. An item can be filed in several
+/// and this cell is 148 points wide on the pane the app opens at; the whole
+/// list is what the `SHARING` card is for, and `sharing_line` below draws it
+/// there. Naming one of several here would be a lie, so a second and further
+/// collection is said as a count.
+fn owner_line(audience: &crate::rest::organizations::Audience) -> String {
+    use crate::rest::organizations::Audience;
+    match audience {
+        Audience::Personal => OWNER_PERSONAL.to_string(),
+        Audience::Shared { organisation, collections, .. } => match collections.as_slice() {
+            [] => organisation.clone(),
+            [one] => format!("{organisation} \u{b7} {one}"),
+            [first, rest @ ..] => {
+                format!("{organisation} \u{b7} {first} +{}", rest.len())
+            }
+        },
+    }
+}
+
+/// [`owner_line`] for an item nobody else can see. Bitwarden's own word for
+/// the personal vault, so the cell reads as the product does.
+const OWNER_PERSONAL: &str = "My vault";
+
+/// \u{8a}'s `Owner` cell is read-only in this build, and this says why.
+///
+/// Moving an item between an organisation and a personal vault, or between
+/// collections, is not something this app can do -- see
+/// `rest::organizations`' own note on what it would take. A combo box that
+/// listed owners and refused every one of them would be worse than a field
+/// that says what the owner IS, which is what §8a's cell is for anyway.
+const OWNER_HINT: &str =
+    "Deskwarden cannot move an item between vaults or collections. Change this in the \
+     Bitwarden web vault or app.";
+
 fn sharing_line(audience: &crate::rest::organizations::Audience) -> Option<String> {
     use crate::rest::organizations::Audience;
     let Audience::Shared { organisation, collections, others } = audience else {
@@ -6742,6 +6782,83 @@ fn sharing_line(audience: &crate::rest::organizations::Audience) -> Option<Strin
 ///
 /// The cards now start at the pane's own margin, which is why the gutter that
 /// held them off the rail's hairline went too.
+
+/// 8a's three `ITEM` captions. Constants because the grid arm and the stacked
+/// arm both draw them and the tests read them, and three spellings of one
+/// word is how a card ends up saying `Folder` in one layout and `folder` in
+/// the other.
+const ITEM_FOLDER_LABEL: &str = "Folder";
+const ITEM_OWNER_LABEL: &str = "Owner";
+const ITEM_TYPE_LABEL: &str = "Type";
+
+/// What the CLI will not do, said once.
+///
+/// Drawn under the folder control in the stacked arm and under the whole row
+/// in the grid -- a 148-point cell is not where a three-line sentence goes.
+const UNFILE_REFUSAL: &str =
+    "This item can be moved to another folder, but the Bitwarden CLI this app talks to \
+     cannot remove an item from a folder. Un-file it in the web vault or app.";
+
+/// The `Owner` control: what §8a draws as a combo, and what this build can
+/// only report. See [`OWNER_HINT`], which is the sentence the box carries so
+/// the read-only state has a reason on it rather than being a greyed field
+/// the user pokes at.
+fn owner_field(ui: &mut egui::Ui, owner: &str) {
+    let rect = theme::section_disabled_text_field(ui, owner);
+    ui.interact(rect, ui.id().with("owner"), egui::Sense::hover())
+        .on_hover_text(OWNER_HINT);
+}
+
+/// The folder chooser, drawn identically in both arms of the `ITEM` card.
+///
+/// Lifted out when the card grew a grid: the control was written inline in
+/// the one row that had it, and a grid arm with its own copy is two folder
+/// pickers that agree until someone changes one.
+fn folder_combo(
+    ui: &mut egui::Ui,
+    draft: &mut EditDraft,
+    folders: &[Folder],
+    may_unfile: bool,
+) {
+    // Both the label and the rows read the *assignable* list, not the raw
+    // one, and the label matters as much as the rows: resolving a draft's
+    // folder id against the virtual bucket is what let an item carrying
+    // `folderId: ""` display the bucket's name and look correctly filed while
+    // belonging to nothing. Unresolvable now falls through to "No folder",
+    // which is at least a state the sidebar agrees exists.
+    let assignable = assignable_folders(folders);
+    egui::ComboBox::from_id_salt("edit-folder")
+        // The cell's full width in the grid arm, which is what makes three
+        // controls of three different natural widths read as a row. egui's
+        // combo is otherwise as wide as its longest option.
+        .width(ui.available_width())
+        .selected_text(
+            assignable
+                .iter()
+                .find(|f| Some(&f.id) == draft.folder_id.as_ref())
+                .map(|f| f.name.as_str())
+                .unwrap_or(NO_FOLDER_LABEL),
+        )
+        .show_ui(ui, |ui| {
+            // "No folder" is offered only when it can actually take effect --
+            // see `EditDraft::may_unfile`. Shown disabled rather than hidden,
+            // so the option's absence is a visible limitation instead of a
+            // missing row.
+            let unfile = egui::Button::selectable(draft.folder_id.is_none(), NO_FOLDER_LABEL);
+            if ui.add_enabled(may_unfile, unfile).clicked() {
+                draft.folder_id = None;
+            }
+            for folder in &assignable {
+                let selected = draft.folder_id.as_deref() == Some(folder.id.as_str());
+                if ui.selectable_label(selected, &folder.name).clicked() {
+                    draft.folder_id = Some(folder.id.clone());
+                }
+            }
+        });
+}
+
+/// What the folder cell says for an item that is in none.
+const NO_FOLDER_LABEL: &str = "No folder";
 
 /// What 8a's `Type` row says: the kind's own noun, in the case the row draws
 /// it in.
@@ -7428,7 +7545,36 @@ pub fn draw_detail_edit(
             // an existing item's type cannot be changed and the read-only row
             // is how 8a says so.
             section(ui, kind, Section::Item, changed(Section::Item), wanted, |ui| {
-                theme::section_row(ui, "Folder", |ui| {
+                // **8a's `grid-template-columns: 1fr 1fr 1fr`**, when the card
+                // can afford three cells -- see `theme::section_grid_fits_at`
+                // for the floor and what the narrow pane falls back to, which
+                // is the stacked rows this card already shipped.
+                let grid = theme::section_grid_fits_at(ui.available_width());
+                let owner = owner_line(audience);
+                if grid {
+                    ui.scope(|ui| {
+                        ui.spacing_mut().item_spacing.x = theme::SECTION_GRID_GAP;
+                        ui.columns(3, |cols| {
+                            theme::section_grid_cell(&mut cols[0], ITEM_FOLDER_LABEL, |ui| {
+                                folder_combo(ui, draft, folders, may_unfile);
+                            });
+                            theme::section_grid_cell(&mut cols[1], ITEM_OWNER_LABEL, |ui| {
+                                owner_field(ui, &owner);
+                            });
+                            theme::section_grid_cell(&mut cols[2], ITEM_TYPE_LABEL, |ui| {
+                                theme::section_disabled_text_field(ui, kind_noun(kind));
+                            });
+                        });
+                    });
+                    // The CLI's refusal, under the row it is about rather than
+                    // inside a 148-point cell. Same sentence, same condition.
+                    if !may_unfile {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(UNFILE_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
+                    }
+                    return;
+                }
+                theme::section_row(ui, ITEM_FOLDER_LABEL, |ui| {
                     // Both the label and the rows read the *assignable* list,
                     // not the raw one, and the label matters as much as the
                     // rows: resolving a draft's folder id against the virtual
@@ -7437,49 +7583,18 @@ pub fn draw_detail_edit(
                     // belonging to nothing. Unresolvable now falls through to
                     // "No folder", which is at least a state the sidebar
                     // agrees exists.
-                    let assignable = assignable_folders(folders);
-                    egui::ComboBox::from_id_salt("edit-folder")
-                        .selected_text(
-                            assignable
-                                .iter()
-                                .find(|f| Some(&f.id) == draft.folder_id.as_ref())
-                                .map(|f| f.name.as_str())
-                                .unwrap_or("No folder"),
-                        )
-                        .show_ui(ui, |ui| {
-                            // "No folder" is offered only when it can actually
-                            // take effect -- see `EditDraft::may_unfile`. Shown
-                            // disabled rather than hidden, so the option's
-                            // absence is a visible limitation instead of a
-                            // missing row.
-                            let unfile =
-                                egui::Button::selectable(draft.folder_id.is_none(), "No folder");
-                            if ui.add_enabled(may_unfile, unfile).clicked() {
-                                draft.folder_id = None;
-                            }
-                            for folder in &assignable {
-                                let selected =
-                                    draft.folder_id.as_deref() == Some(folder.id.as_str());
-                                if ui.selectable_label(selected, &folder.name).clicked() {
-                                    draft.folder_id = Some(folder.id.clone());
-                                }
-                            }
-                        });
+                    folder_combo(ui, draft, folders, may_unfile);
                     if !may_unfile {
                         ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(
-                                "This item can be moved to another folder, but the Bitwarden \
-                                 CLI this app talks to cannot remove an item from a folder. \
-                                 Un-file it in the web vault or app.",
-                            )
-                            .size(11.0)
-                            .color(theme::TEXT_FAINT),
-                        );
+                        ui.label(RichText::new(UNFILE_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
                     }
                 });
                 ui.add_space(theme::BLOCK_GAP);
-                theme::section_row(ui, "Type", |ui| {
+                theme::section_row(ui, ITEM_OWNER_LABEL, |ui| {
+                    owner_field(ui, &owner);
+                });
+                ui.add_space(theme::BLOCK_GAP);
+                theme::section_row(ui, ITEM_TYPE_LABEL, |ui| {
                     theme::section_disabled_text_field(ui, kind_noun(kind));
                 });
             });
@@ -20020,6 +20135,66 @@ mod edit_pane_layout_tests {
                  {right}pt from its far edge -- 8a's `padding: 0 14px` is one number"
             );
         }
+    }
+
+    /// **8a's `ITEM` card is three cells on one line**, in the design's own
+    /// order, wherever the card can afford them.
+    ///
+    /// The owner sent 8a's card and asked for it: Folder, Owner and Type side
+    /// by side rather than stacked down a column. Asserted as geometry -- one
+    /// line, that order -- and not as a list of strings, because three
+    /// captions in the right order stacked vertically is exactly the layout
+    /// this replaces.
+    #[test]
+    fn the_item_card_lays_its_three_cells_on_one_line() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let mut draft = full_login_draft();
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+        let folder = painted.rect_of(ITEM_FOLDER_LABEL);
+        let owner = painted.rect_of(ITEM_OWNER_LABEL);
+        // `Type` is also a word the Identity body uses; this fixture is a
+        // login, whose only `Type` is this card's.
+        let kind = painted.rect_of(ITEM_TYPE_LABEL);
+        for (name, rect) in [(ITEM_OWNER_LABEL, owner), (ITEM_TYPE_LABEL, kind)] {
+            assert!(
+                (rect.top() - folder.top()).abs() <= 0.5,
+                "{name} sits at {} and Folder at {} -- the ITEM card is not one line",
+                rect.top(),
+                folder.top()
+            );
+        }
+        assert!(
+            folder.left() < owner.left() && owner.left() < kind.left(),
+            "the cells are out of 8a's order: Folder {folder:?}, Owner {owner:?}, \
+             Type {kind:?}"
+        );
+    }
+
+    /// ...and falls back to stacked rows where it cannot.
+    ///
+    /// The other half, and the reason the grid has a floor at all: three
+    /// cells of a 472-point card body are 148 points each, and three cells of
+    /// the app's MINIMUM pane would be 86 -- which is not a field. The
+    /// fallback is the shape this card shipped before the grid, so the narrow
+    /// pane loses 8a's row and nothing else.
+    #[test]
+    fn the_item_cards_cells_stack_again_on_the_narrowest_pane() {
+        let pane = Vec2::new(MIN_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let mut draft = full_login_draft();
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+        let folder = painted.rect_of(ITEM_FOLDER_LABEL);
+        let owner = painted.rect_of(ITEM_OWNER_LABEL);
+        assert!(
+            owner.top() > folder.bottom(),
+            "Owner is at {owner:?} against Folder's {folder:?} -- the card is still trying \
+             to draw 8a's grid at a width `theme::section_grid_fits_at` refuses"
+        );
     }
 
     /// **The name box is the whole of the title band, centred in it.**

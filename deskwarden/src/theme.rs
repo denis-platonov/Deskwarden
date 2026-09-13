@@ -7268,6 +7268,49 @@ pub const SECTION_FIELD_HEIGHT: f32 = 34.0;
 /// box, so the text keeps the same proportion of it.
 pub const SECTION_FIELD_PX: f32 = 13.0;
 
+/// §8a's `gap: 14px` between the cells of a card's COLUMN grid -- the
+/// `ITEM` card's `grid-template-columns: 1fr 1fr 1fr`.
+///
+/// Its own constant and not [`SECTION_ROW_GAP`]'s 16: that one is the gap
+/// between a row's label and its control, this is the gap between two
+/// side-by-side cells, and §8a gives them different numbers.
+pub const SECTION_GRID_GAP: f32 = 14.0;
+
+/// The narrowest a cell of that grid may be before the grid stops being a
+/// grid.
+///
+/// **§8a never had to have this number either.** Its `ITEM` card is about 996
+/// points of body, so each of the three cells gets 322 and a collection name
+/// has room to spell itself out. This pane's card body is about 472 at the
+/// window the app actually opens at, which is 148 a cell -- tight, and still
+/// a field. Below that the three go back to being stacked rows, which is the
+/// shape this card already shipped and which works.
+///
+/// The same trade, and the same reasoning, as [`SECTION_ROW_CONTROL_FLOOR`]
+/// one constant down: the narrow pane loses §8a's grid and nothing else.
+pub const SECTION_GRID_CELL_FLOOR: f32 = 140.0;
+
+/// Whether a card this wide can draw §8a's three-column grid.
+pub fn section_grid_fits_at(width: f32) -> bool {
+    width >= 3.0 * SECTION_GRID_CELL_FLOOR + 2.0 * SECTION_GRID_GAP
+}
+
+/// One cell of that grid: §8a's 12-point caption over its control, with the
+/// design's `gap: 6px` between them.
+///
+/// **[`TEXT_FAINT`], not [`field_label`]'s [`TEXT_MUTED`].** §8a gives this
+/// caption `color: #7d7979`, which is the same ink its label COLUMN takes --
+/// and it has to be, because the grid arm and the row arm of the `ITEM` card
+/// are the same three captions at two widths. `every_per_kind_caption_is_
+/// the_same_grey_as_the_item_cards` reads `Folder` as its reference for
+/// every other caption on the form, so a cell in the wrong grey would have
+/// re-tinted the whole screen.
+pub fn section_grid_cell<R>(ui: &mut Ui, label: &str, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.label(RichText::new(label).size(12.0).color(TEXT_FAINT));
+    ui.add_space(EYEBROW_GAP);
+    add(ui)
+}
+
 /// The narrowest a section row's CONTROL may be before the row stops being a
 /// row.
 ///
