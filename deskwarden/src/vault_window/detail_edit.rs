@@ -6853,6 +6853,13 @@ fn folder_combo(
     // belonging to nothing. Unresolvable now falls through to "No folder",
     // which is at least a state the sidebar agrees exists.
     let assignable = assignable_folders(folders);
+    // **8a's `height: 34px`, which is what the two cells beside it are.**
+    //
+    // egui sizes a combo's button from `interact_size`, which this theme sets
+    // to 20 -- so the `ITEM` card's three cells were a 30-point chooser
+    // between two 34-point boxes. The owner, with the row screenshotted:
+    // "render as per design - should be same height".
+    ui.spacing_mut().interact_size.y = theme::SECTION_FIELD_HEIGHT;
     egui::ComboBox::from_id_salt("edit-folder")
         // The cell's full width in the grid arm, which is what makes three
         // controls of three different natural widths read as a row. egui's
@@ -20432,6 +20439,126 @@ mod edit_pane_layout_tests {
              scroll lane is being taken out of the card rather than being the inset",
             pane.x - card.right()
         );
+    }
+
+    /// **A card's three bands stack flush**, as the read pane's do.
+    ///
+    /// egui puts `item_spacing` between two stacked children, and a card is
+    /// exactly that: a title band, the rule that closes it, then the rows. So
+    /// the rule sat eight points below the band and the first row another
+    /// eight below the rule. Measured against `detail.rs`'s card on one
+    /// screen: this rule 43 points down the card where 2b puts its own at 36,
+    /// and the first caption 32 under the rule against 21. The owner: "too
+    /// much space under card title", then "still not exactly same card
+    /// title".
+    ///
+    /// Held as 2b's own numbers -- the heading's `padding: 11px 16px` above
+    /// and below its caption -- rather than as "not eight more than", so a
+    /// band that drifted the other way fails too.
+    #[test]
+    fn a_cards_rule_closes_its_title_band_with_nothing_between_them() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let mut draft = full_login_draft();
+        draft.name = "Ledgerline".to_string();
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+        for title in ["ITEM", "LOGIN CREDENTIALS"] {
+            let caption = painted.rect_of(title);
+            let card = painted
+                .rects
+                .iter()
+                .filter(|(r, fill)| *fill == theme::CARD && r.contains(caption.center()))
+                .map(|(r, _)| *r)
+                .max_by(|a, b| a.height().total_cmp(&b.height()))
+                .unwrap_or_else(|| panic!("{title}'s card is painted"));
+            let rule = painted
+                .rects
+                .iter()
+                .filter(|(r, fill)| {
+                    *fill == theme::HAIRLINE
+                        && r.height() <= 1.5
+                        && r.top() > caption.bottom()
+                        && r.left() <= card.left() + 0.5
+                })
+                .map(|(r, _)| *r)
+                .min_by(|a, b| a.top().total_cmp(&b.top()))
+                .unwrap_or_else(|| panic!("{title}'s band is closed by a rule"));
+
+            let pad = f32::from(theme::SECTION_CARD_HEADER_PAD_Y);
+            assert!(
+                (caption.top() - card.top() - pad).abs() <= 1.0,
+                "{title} sits {}pt down its card, not 8a's `padding: 11px`",
+                caption.top() - card.top()
+            );
+            assert!(
+                (rule.top() - caption.bottom() - pad).abs() <= 1.5,
+                "{title}'s rule is {}pt under the caption, not the band's own 11 -- egui's \
+                 item spacing is back between the band and the line that closes it",
+                rule.top() - caption.bottom()
+            );
+        }
+    }
+
+    /// **The `ITEM` card's three controls are one height and one line.**
+    ///
+    /// 8a draws all three of its cells at `height: 34px`; egui sizes a combo
+    /// box off `interact_size`, which this theme sets to 20, so the folder
+    /// chooser was a 30-point control between two 34-point boxes. The owner,
+    /// with the row screenshotted: "render as per design - should be same
+    /// height".
+    ///
+    /// Found by geometry rather than by asking the widgets, because that is
+    /// the half a constant cannot make: all three boxes are
+    /// `SECTION_FIELD_HEIGHT` tall and all three start on one line.
+    #[test]
+    fn the_item_cards_three_controls_are_one_height_and_one_line() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let mut draft = full_login_draft();
+        let _ = frame(&ctx, pane, &mut draft, false, &[]);
+        let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+        let folder = painted.rect_of(NO_FOLDER_LABEL);
+        let owner = painted.rect_of(OWNER_PERSONAL);
+        let kind = painted.rect_of(kind_noun(draft.kind));
+        let mut boxes = Vec::new();
+        for (what, ink) in
+            [("Folder", folder), (ITEM_OWNER_LABEL, owner), (ITEM_TYPE_LABEL, kind)]
+        {
+            let found = painted
+                .rects
+                .iter()
+                .map(|(r, _)| *r)
+                .find(|r| {
+                    (r.height() - theme::SECTION_FIELD_HEIGHT).abs() <= 0.5
+                        && r.contains(ink.center())
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{what}'s control is not {}pt tall; the row's boxes are {:?}",
+                        theme::SECTION_FIELD_HEIGHT,
+                        painted
+                            .rects
+                            .iter()
+                            .filter(|(r, _)| r.contains(ink.center()))
+                            .map(|(r, _)| r.height())
+                            .collect::<Vec<_>>()
+                    )
+                });
+            boxes.push((what, found));
+        }
+        let (_, first) = boxes[0];
+        for (what, rect) in &boxes {
+            assert!(
+                (rect.top() - first.top()).abs() <= 0.5,
+                "{what}'s control starts at {} and Folder's at {} -- the three cells are \
+                 not on one line",
+                rect.top(),
+                first.top()
+            );
+        }
     }
 
     /// **The name box is the whole of the title band, centred in it.**

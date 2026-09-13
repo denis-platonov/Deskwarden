@@ -7411,7 +7411,28 @@ pub fn section_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> (Rect, R)
     let framed = egui::Frame::new()
         .fill(CARD)
         .corner_radius(CornerRadius::same(SECTION_CARD_RADIUS))
-        .show(ui, add);
+        .show(ui, |ui| {
+            // **The card's bands stack with NOTHING between them**, which is
+            // what `detail::card` has always done (`ui.spacing_mut()
+            // .item_spacing = Vec2::ZERO`) and what this one did not.
+            //
+            // egui puts `item_spacing` between two stacked children, and a
+            // card is exactly that: a title band, its rule, then the rows. So
+            // the rule sat eight points BELOW the band it closes -- the same
+            // defect the pane's own header strip had -- and the first row
+            // another eight below the rule. Measured against the read pane on
+            // one screen: the rule 43 points down the card where 2b puts it
+            // at 36, and the first caption 32 under the rule against 21.
+            // The owner: "too much space under card title", then "still not
+            // exactly same card title".
+            //
+            // Every gap inside these cards is already written down -- the
+            // bands carry their own `Margin`, the rows their own
+            // `add_space(BLOCK_GAP)`, the cells their `EYEBROW_GAP` -- so
+            // zeroing the implicit one takes nothing away that anybody chose.
+            ui.spacing_mut().item_spacing = Vec2::ZERO;
+            add(ui)
+        });
     let rect = framed.response.rect;
     ui.painter().rect_stroke(
         rect,
@@ -7548,9 +7569,28 @@ pub fn section_card_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 pub fn section_card_body_at<R>(ui: &mut Ui, pad_x: i8, add: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
         .inner_margin(Margin::symmetric(pad_x, SECTION_CARD_PAD_Y))
-        .show(ui, add)
+        .show(ui, |ui| {
+            // **The style's own spacing, handed back inside the body.**
+            //
+            // [`section_card`] zeroes `item_spacing` so the card's three
+            // bands stack flush -- see it for the measurements. That zero is
+            // about the BANDS and not about what is in them: a row whose
+            // caption wraps onto a second line needs the spacing between
+            // them, and without it `no_two_runs_on_the_tallest_edit_form_
+            // overlap` catches `Keystrokes` and the sentence under it sharing
+            // a point of ink.
+            //
+            // Restored from the style rather than written as a number, so the
+            // body is spaced the way every other surface in the app is.
+            ui.spacing_mut().item_spacing.y = ui.style().spacing.item_spacing.y.max(SPACING.y);
+            add(ui)
+        })
         .inner
 }
+
+/// The style's own `item_spacing`, so a `Ui` that has had it zeroed can ask
+/// for it back without a literal. See [`section_card_body_at`].
+const SPACING: Vec2 = Vec2::new(8.0, 8.0);
 
 /// One §8a row: a [`SECTION_LABEL_WIDTH`] label column, a
 /// [`SECTION_ROW_GAP`], and the control -- **or, below
