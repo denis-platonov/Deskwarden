@@ -2134,28 +2134,13 @@ pub fn section_footer_primary_button(
 ) -> Response {
     ui.scope(|ui| {
         ui.spacing_mut().button_padding.x = SECTION_FOOTER_BUTTON_PAD_X;
-        // **The chip is painted, not appended**, and that is 8a rather than a
-        // convenience. `primary_button_with_metrics` builds one string --
-        // `format!("{label}  {k}")` -- so the chord comes out at the label's
-        // own size and weight, in the label's own face. 8a draws a separate
-        // span: `font-family: ui-monospace; font-size: 10px; opacity: 0.8`,
-        // `gap: 9px` after the label. One string cannot be two faces.
-        //
-        // Painting it also keeps the button's own galley EXACTLY the label,
-        // which is what every test that looks for `Save changes` on this form
-        // reads. Appending put `Save changes  CTRL+S` in the galley and seven
-        // of them stopped finding the button at all -- a measurement that
-        // would have been a screenshot review otherwise.
-        //
-        // The room is reserved through `min_size` rather than by padding the
-        // string with spaces (`primary_button_with_metrics`'s own trick for
-        // the painted ↵), because a space is a glyph whose width is the
-        // LABEL's face and the thing being reserved for is drawn in another.
-        // Through the SAME helper as the chipped branch, with no width
-        // floor. `primary_button_with_metrics` would be the obvious call and
-        // is the wrong one: it is every other primary button in the app, at
-        // 600, and taking it here would mean a footer whose Save changed
-        // weight depending on whether the form happened to pass a chord.
+        // Without a chord there is nothing to lay out beside the label, so
+        // this is an ordinary button -- through the SAME helper as the
+        // chipped branch below, with no width floor.
+        // `primary_button_with_metrics` would be the obvious call and is the
+        // wrong one: it is every other primary button in the app, at 600, and
+        // taking it here would mean a footer whose Save changed weight
+        // depending on whether the form happened to pass a chord.
         let Some(kbd) = kbd else {
             return primary_button_with_metrics_sized(
                 ui,
@@ -2166,45 +2151,80 @@ pub fn section_footer_primary_button(
                 0.0,
             );
         };
-        let font = FontId::new(SECTION_FOOTER_CHIP_PX, FontFamily::Monospace);
-        let chip = ui.painter().layout_no_wrap(kbd.to_string(), font, Color32::WHITE);
-        let room = action_button_width(ui.painter(), label, SECTION_FOOTER_BUTTON_PAD_X)
-            + SECTION_FOOTER_CHIP_GAP
-            + chip.size().x;
+        // **The button is drawn EMPTY and both runs are painted into it.**
+        //
+        // §8a's Save is a flex row of two spans -- `Save changes` at 13/700 in
+        // Archivo, then `CTRL+S` at 10px in `ui-monospace` at `opacity: 0.8`,
+        // `gap: 9px` between them -- inside `padding: 0 14px`. Three ways to
+        // get that out of egui were tried and two of them are wrong:
+        //
+        // * **One string** (`format!("{label}  {k}")`, which is what
+        //   `primary_button_with_metrics` does for its own hints) puts the
+        //   chord at the label's size, weight and face. One galley cannot be
+        //   two faces.
+        // * **Label in the button, chip painted beside it.** egui CENTRES a
+        //   button's galley in whatever width the button has, so reserving
+        //   the chip's room through `min_size` pushes the label right by half
+        //   of it, and a chip hung off the label's right edge then ends
+        //   `(gap + chip) / 2 - pad` PAST the button -- ten points of
+        //   `CTRL+S` clipped off, which is what the owner screenshotted,
+        //   above a left inset half the row wide. No `min_size` fixes that:
+        //   the overhang and the inset are the same centring, and widening
+        //   the button moves both.
+        //
+        // So the button carries no text at all, and the row is laid out here:
+        // measured as one group, centred as one group, and the two galleys
+        // placed left to right inside it. At the natural width that is
+        // exactly §8a -- `pad`, label, `gap`, chip, `pad` -- and when
+        // `section_footer_save_width`'s floor makes the button wider than its
+        // content, the whole row stays centred rather than the padding going
+        // lopsided.
+        let chip_font = FontId::new(SECTION_FOOTER_CHIP_PX, FontFamily::Monospace);
+        let chip = ui.painter().layout_no_wrap(
+            kbd.to_string(),
+            chip_font.clone(),
+            Color32::WHITE,
+        );
+        let label_font = FontId::new(SECTION_FOOTER_TEXT_PX, FontFamily::Name(BOLD.into()));
+        let label_width = section_footer_label_width(ui.painter(), label);
         let response = ui.scope(|ui| {
             ui.spacing_mut().button_padding.x = SECTION_FOOTER_BUTTON_PAD_X;
             primary_button_with_metrics_sized(
                 ui,
-                label,
+                "",
                 SECTION_FOOTER_BUTTON_HEIGHT,
                 SECTION_FOOTER_BUTTON_RADIUS,
                 enabled,
-                room,
+                section_footer_save_width(ui.painter(), label, kbd),
             )
         })
         .inner;
-        // 8a's `opacity: 0.8` on white, and the same fade the button's own ink
-        // takes when it is switched off -- so a disabled Save does not carry a
-        // chord at full strength.
+        // The button's own ink, and -- for the chip -- §8a's `opacity: 0.8` on
+        // top of it, so a disabled Save does not carry a chord at full
+        // strength.
         let ink = if enabled { Color32::WHITE } else { OFF_INK };
-        // **Placed against the LABEL, not against the button's right edge.**
-        //
-        // egui centres a button's text in whatever width the button has, so
-        // widening the button by the chip's room pushes the label right by
-        // half of it -- and a long caption (`Save (needs a name)`) then runs
-        // under a chip pinned to the right inset. Measured:
-        // `no_two_runs_on_the_tallest_edit_form_overlap` caught the two
-        // sharing 12 points.
-        //
-        // So the chip sits `SECTION_FOOTER_CHIP_GAP` past where the centred
-        // label really ends, which is 8a's `gap: 9px` between two spans of a
-        // flex row and is what that gap means.
-        let label_width = section_footer_label_width(ui.painter(), label);
-        let at = Pos2::new(
-            response.rect.center().x + label_width / 2.0 + SECTION_FOOTER_CHIP_GAP,
-            response.rect.center().y - chip.size().y / 2.0,
+        let row = label_width + SECTION_FOOTER_CHIP_GAP + chip.size().x;
+        let left = response.rect.center().x - row / 2.0;
+        let caption = ui.painter().layout_no_wrap(label.to_string(), label_font.clone(), ink);
+        // `centred_galley_top` and not `center().y - height / 2.0`: the face
+        // inks only the upper part of its row box, so a box-centred line
+        // reads high in a band -- this module's standing rule, and the reason
+        // the owner's word on the footer was "not centered". The two runs
+        // take the correction for their OWN faces, which is the whole point
+        // of doing it per galley: 13pt Archivo and 10pt mono do not reserve
+        // the same descender band, so one offset for both would trade a pair
+        // of high lines for a misaligned pair.
+        let caption_at =
+            centred_galley_top(ui.ctx(), response.rect, &caption, &label_font, left);
+        ui.painter().galley(caption_at, caption, ink);
+        let chip_at = centred_galley_top(
+            ui.ctx(),
+            response.rect,
+            &chip,
+            &chip_font,
+            left + label_width + SECTION_FOOTER_CHIP_GAP,
         );
-        ui.painter().galley(at, chip, faded(ink, SECTION_FOOTER_CHIP_OPACITY));
+        ui.painter().galley(chip_at, chip, faded(ink, SECTION_FOOTER_CHIP_OPACITY));
         response
     })
     .inner
@@ -2212,16 +2232,38 @@ pub fn section_footer_primary_button(
 
 /// [`secondary_button`] at §8a's footer metrics. See
 /// [`SECTION_FOOTER_BUTTON_HEIGHT`].
+///
+/// **Its label is painted too**, though it has no chip and needs no row. The
+/// reason is the one in [`centred_galley_top`]: egui box-centres a button's
+/// galley, which reads high, and the Save beside this one is optically
+/// centred. One corrected and one not is a worse footer than two of either --
+/// the owner's report was "not centered both", on a strip whose two controls
+/// sit on one line and are read against each other.
 pub fn section_footer_secondary_button(ui: &mut Ui, label: &str) -> Response {
     ui.scope(|ui| {
         ui.spacing_mut().button_padding.x = SECTION_FOOTER_BUTTON_PAD_X;
-        ui.add(
-            egui::Button::new(semibold(label, 13.0).color(INK))
+        let font = FontId::new(SECTION_FOOTER_TEXT_PX, FontFamily::Name(SEMIBOLD.into()));
+        // The width the label would have taken had egui laid it out, so this
+        // button is the size it always was -- `action_button_width` is
+        // `semibold` at 13, which is exactly the face above.
+        let width = action_button_width(ui.painter(), label, SECTION_FOOTER_BUTTON_PAD_X);
+        let response = ui.add(
+            egui::Button::new("")
                 .fill(CARD)
                 .stroke(Stroke::new(1.0, BORDER_STRONG))
                 .corner_radius(CornerRadius::same(SECTION_FOOTER_BUTTON_RADIUS))
-                .min_size(Vec2::new(0.0, SECTION_FOOTER_BUTTON_HEIGHT)),
-        )
+                .min_size(Vec2::new(width, SECTION_FOOTER_BUTTON_HEIGHT)),
+        );
+        let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), INK);
+        let at = centred_galley_top(
+            ui.ctx(),
+            response.rect,
+            &galley,
+            &font,
+            response.rect.center().x - galley.size().x / 2.0,
+        );
+        ui.painter().galley(at, galley, INK);
+        response
     })
     .inner
 }
@@ -2306,15 +2348,25 @@ pub fn section_footer_label_width(painter: &egui::Painter, label: &str) -> f32 {
         .x
 }
 
-/// The whole width Save takes: its bold label, §8a's `padding: 0 14px`, and
-/// the chord chip beside it.
+/// The whole width Save takes: §8a's `padding: 0 14px`, its bold label, the
+/// `gap: 9px`, and the chord chip.
 ///
-/// The footer measures its own row before it draws it, and this is the one
-/// button on that row whose width [`action_button_width`] gets wrong.
+/// **The width the button is built at AND the width the footer measures**,
+/// which is the property that matters: `section_footer_primary_button` paints
+/// its two runs itself, so anything this function is short by is clipped off
+/// the chip rather than leaving the button a little tight.
+/// [`action_button_width`] cannot stand in -- it measures in [`semibold`],
+/// which is right for every other button that calls it and two per cent
+/// narrow for this one.
+///
+/// The floor is applied to the WHOLE row rather than to the label's own box,
+/// so a short caption cannot be padded up to `ACTION_BUTTON_MIN_WIDTH` and
+/// then have the chip added outside the floor.
 pub fn section_footer_save_width(painter: &egui::Painter, label: &str, kbd: &str) -> f32 {
-    (section_footer_label_width(painter, label) + SECTION_FOOTER_BUTTON_PAD_X * 2.0)
-        .max(ACTION_BUTTON_MIN_WIDTH)
+    (section_footer_label_width(painter, label)
         + section_footer_chip_width(painter, kbd)
+        + SECTION_FOOTER_BUTTON_PAD_X * 2.0)
+        .max(ACTION_BUTTON_MIN_WIDTH)
 }
 
 /// What [`section_footer_primary_button`] adds to a plain button's width for
@@ -6472,6 +6524,23 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
             .desired_width(inner.width())
             .layouter(&mut layouter),
     );
+
+    // **The box claims the height it allocated**, which `ui.put` above had
+    // just given back.
+    //
+    // `put` places a widget AND reports that rect to the layout, and the rect
+    // it is given here is `inner` -- one ascent tall, centred in the box. So
+    // after every field in this app the cursor sat at the TEXT's baseline
+    // band rather than under the border, and the next widget started five to
+    // ten points inside the box it was supposed to follow. On the edit
+    // header that put the subtitle 0.7 of a point under a 38-point name box
+    // whose layout gap was eight -- the owner's "overlaps", with "some space
+    // in between" and an arrow at the air below the strip.
+    //
+    // Restoring it here rather than at the call sites because the defect is
+    // this function's: `outer` is what it allocated and what it paints, and
+    // nothing outside can see that `put` moved the cursor back inside it.
+    ui.advance_cursor_after_rect(outer);
 
     if surround.clicked() {
         response.request_focus();

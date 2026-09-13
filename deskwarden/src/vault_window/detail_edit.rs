@@ -6345,6 +6345,21 @@ fn band_fits(pane_height: f32) -> bool {
 /// holding one control does not need a title bar's air around it.
 const COMPACT_BAND_PAD_Y: i8 = detail::HEADER_PAD_Y / 2;
 
+/// **The gap between the name BOX and the line under it**, which is not
+/// [`detail::TITLE_GAP`].
+///
+/// The read pane's 3 points sit between two runs of text, and a text run
+/// carries its own leading: the ink stops well above the line box it is laid
+/// in, so three points of layout gap read as six or seven of white. A FIELD
+/// has no such slack -- its border is exactly where it says it is -- so the
+/// same 3 put the subtitle hard against the box's bottom edge. The owner's
+/// word for it was "overlaps", with "some space in between" and an arrow at
+/// the air below the strip, which is where this comes from.
+///
+/// Eight, so the drawn white is about what the read pane's 3 draws and the
+/// two bands still read as one strip.
+const EDIT_TITLE_GAP: f32 = 8.0;
+
 /// **The height of the edit band's content row**, which is NOT
 /// [`detail::HEADER_ROW`] and cannot be.
 ///
@@ -6355,8 +6370,15 @@ const COMPACT_BAND_PAD_Y: i8 = detail::HEADER_PAD_Y / 2;
 /// the whole of the difference between them. Summed from its parts rather
 /// than written as a number, so a field height that moves takes the band with
 /// it.
+///
+/// **The subtitle's line is 1.5 of its size and not 1.4**, which is a
+/// measurement and not a taste: the band is a fixed box the two lines are
+/// laid into, and 1.4 made it 0.2 of a point SHORTER than what it held, so
+/// the subtitle hung out of the bottom of its own strip. A row that is a
+/// hair too tall costs a hair of white; one that is a hair too short is the
+/// overlap.
 const EDIT_HEADER_ROW: f32 =
-    theme::FIELD_HEIGHT + detail::TITLE_GAP + detail::SUBTITLE_SIZE * 1.4;
+    theme::FIELD_HEIGHT + EDIT_TITLE_GAP + detail::SUBTITLE_SIZE * 1.5;
 
 /// **8a's title bar: the item's avatar, its name in a box, and what it is.**
 ///
@@ -6433,7 +6455,9 @@ fn edit_header(
                 }
             }
             ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                ui.spacing_mut().item_spacing.y = detail::TITLE_GAP;
+                // `EDIT_TITLE_GAP`, not the read pane's -- see it for why a
+                // box and a text run do not take the same gap.
+                ui.spacing_mut().item_spacing.y = EDIT_TITLE_GAP;
                 theme::title_field(ui, &mut draft.name);
                 if !full {
                     return;
@@ -19699,6 +19723,118 @@ mod edit_pane_layout_tests {
             field.left() - caption.left()
         );
         assert_eq!(theme::SECTION_ROW_GAP, 16.0, "8a's `gap: 16px` on every row");
+    }
+
+    /// **The chord chip is drawn INSIDE the button that carries it.**
+    ///
+    /// The owner's screenshot was `CTRL·` -- the `+S` clipped off the
+    /// button's right edge, with a left inset half the row wide to match. The
+    /// cause is in `theme::section_footer_primary_button`'s doc: egui centres
+    /// a button's own galley, so a chip hung off the label's right edge ends
+    /// past the button by exactly half of what was reserved for it.
+    ///
+    /// Asserted as containment and not as a width, because a width is the
+    /// thing that was already agreed between the measurement and the drawing
+    /// while the chip hung outside anyway. Both ends: the chip inside the
+    /// button, and the button's two insets equal, which is what says the row
+    /// is centred as a row rather than pushed against one edge.
+    #[test]
+    fn the_chord_chip_is_drawn_inside_the_button_that_carries_it() {
+        for pane in GRID_PANES {
+            let ctx = styled_context(pane);
+            let mut draft = full_login_draft();
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+            let label = painted.rect_of(SAVE_BUTTON);
+            let chip = painted.rect_of(SAVE_CHORD_LABEL);
+            let button = painted.frame_around(label);
+            assert!(
+                button.contains_rect(chip),
+                "{pane:?}: the chord chip is {chip:?} on a button of {button:?} -- \
+                 {}pt of it is outside the control it is drawn on",
+                (chip.max.x - button.max.x).max(button.min.x - chip.min.x)
+            );
+            let left = label.min.x - button.min.x;
+            let right = button.max.x - chip.max.x;
+            assert!(
+                (left - right).abs() <= 1.0,
+                "{pane:?}: the label starts {left}pt inside the button and the chip ends \
+                 {right}pt from its far edge -- 8a's `padding: 0 14px` is one number"
+            );
+        }
+    }
+
+    /// **The line under the name box clears the box.**
+    ///
+    /// The owner: "overlaps", then "some space in between" with an arrow at
+    /// the air below the strip. Two causes, both fixed and both pinned here
+    /// because either alone puts the subtitle back against the border:
+    ///
+    /// * `theme`'s `field_box` gave the cursor back at the TEXT's band rather
+    ///   than under the box -- `ui.put` reports the rect it placed, and that
+    ///   rect is one ascent tall, centred. Every field in the app was five to
+    ///   ten points shorter than it drew.
+    /// * the gap itself was `detail::TITLE_GAP`, which is the read pane's 3
+    ///   between two runs of text. A box has no leading; see `EDIT_TITLE_GAP`.
+    ///
+    /// A short name, so the title's galley really is inside its box and
+    /// `frame_around` finds the box rather than the strip behind it.
+    #[test]
+    fn the_kind_line_clears_the_name_box_it_sits_under() {
+        for pane in GRID_PANES {
+            let ctx = styled_context(pane);
+            let mut draft = full_login_draft();
+            draft.name = "Ledgerline".to_string();
+            let _ = frame(&ctx, pane, &mut draft, false, &[]);
+            let painted = frame(&ctx, pane, &mut draft, false, &[]);
+
+            // The box, not `frame_around`'s answer: the smallest rect around
+            // the name is the TextEdit's own one-ascent lane (see `theme`'s
+            // `field_box`, which places it centred), and that lane is
+            // precisely the thing this test is about not mistaking for the
+            // box. So it is found by the box's own height.
+            let ink = painted.rect_of(&draft.name);
+            let boxes: Vec<Rect> = painted
+                .rects
+                .iter()
+                .map(|(r, _)| *r)
+                .filter(|r| {
+                    (r.height() - theme::FIELD_HEIGHT).abs() <= 0.5 && r.contains(ink.center())
+                })
+                .collect();
+            assert_eq!(
+                boxes.len(),
+                1,
+                "{pane:?}: expected exactly one {}pt box around the name, found {boxes:?}",
+                theme::FIELD_HEIGHT
+            );
+            let name_box = boxes[0];
+            // The kind's own word, which is what the band says under the name
+            // -- `detail`'s label, because the two panes draw one line.
+            //
+            // The FIRST one down the pane: the Item card says the same word
+            // in its `Type` row, so `rect_of`'s one-match rule cannot be
+            // used here. The subtitle is the higher of the two by the whole
+            // height of the strip.
+            //
+            // The rect is the run's GALLEY, so the white really drawn is at
+            // least this much and typically a little more.
+            let kind = painted
+                .rects_of(&draft.kind.label())
+                .into_iter()
+                .min_by(|a, b| a.min.y.total_cmp(&b.min.y))
+                .expect("the band names the kind under the name box");
+            assert!(
+                kind.min.y >= name_box.max.y,
+                "{pane:?}: {:?} starts at {} and the name box ends at {} -- the line under \
+                 the box is drawn {}pt inside it",
+                draft.kind.label(),
+                kind.min.y,
+                name_box.max.y,
+                name_box.max.y - kind.min.y
+            );
+        }
     }
 
     /// **The footer's two buttons are 8a's `height: 34px`, `gap: 10px`
