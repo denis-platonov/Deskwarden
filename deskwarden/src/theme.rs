@@ -7167,8 +7167,16 @@ pub fn section_card_pad_x(width: f32) -> i8 {
 /// one column where §5a draws one.
 pub const SECTION_CARD_HEADER_PAD_Y: i8 = 11;
 
-/// §8a's row band padding: `padding: 12px 16px`.
-pub const SECTION_CARD_PAD_Y: i8 = 12;
+/// §8a's row band padding: `padding: 12px 16px` -- drawn at the READ pane's
+/// 13.
+///
+/// One point, and it is the owner's: "blocks within the module should be
+/// same size\paddings\headers as details". 2b gives its rows `padding: 13px
+/// 16px` and §8a gives its rows 12, and the two panes are one click apart
+/// showing the same record -- so a row that changes height by a point when
+/// Edit is pressed is a row that moves for no reason the reader can name.
+/// `detail::ROW_PAD_Y` is the number, read across rather than copied.
+pub const SECTION_CARD_PAD_Y: i8 = 13;
 
 /// The gap between one section card and the next **in the sequence
 /// builder**, which is [`BLOCK_GAP`] -- the 12 every other stacked block in
