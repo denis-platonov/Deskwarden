@@ -2501,6 +2501,15 @@ fn paint_return_arrow(painter: &egui::Painter, center: Pos2, size: f32, color: C
 }
 
 /// The outlined secondary button ("Not now", "Cancel", "Copy").
+/// §8a's `gap: 8px` between a row's field and the buttons after it.
+///
+/// The BUTTON is `row_button` further down -- the read pane's own 2b control,
+/// not a second one at 8a's numbers. The owner asked for "default Copy button
+/// for the rest of items", and the default is the one that pane already
+/// draws: the two panes are one click apart and a Copy that changed size
+/// between them is the difference this whole pass has been removing.
+pub const ROW_BUTTON_GAP: f32 = 8.0;
+
 pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
     ui.add(
         egui::Button::new(semibold(label, 13.0).color(INK))
@@ -3562,7 +3571,7 @@ pub fn row_button(ui: &mut Ui, label: &str) -> Response {
                 .fill(CARD)
                 .stroke(Stroke::new(1.0, BORDER_STRONG))
                 .corner_radius(CornerRadius::same(7))
-                .min_size(Vec2::new(0.0, 28.0)),
+                .min_size(Vec2::new(0.0, ROW_BUTTON_HEIGHT_2B)),
         )
     })
     .inner
@@ -3572,6 +3581,9 @@ pub fn row_button(ui: &mut Ui, label: &str) -> Response {
 /// than written twice, so [`row_button_width`] measures the button that will
 /// really be drawn instead of a second copy of its numbers.
 const ROW_BUTTON_PADDING: Vec2 = Vec2::new(10.0, 4.0);
+/// [`row_button`]'s own height, named so a caller laying a row of mixed
+/// widgets can put them all on it. See `detail_edit`'s `row_with_buttons`.
+pub const ROW_BUTTON_HEIGHT_2B: f32 = 28.0;
 const ROW_BUTTON_TEXT_SIZE: f32 = 12.0;
 
 /// How wide [`row_button`] will be for `label`, without drawing it.
@@ -6091,7 +6103,22 @@ pub fn text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
 /// [`field_box`]'s, so a row box is visibly the same control as the name box
 /// above it, four points shorter.
 pub fn section_text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
-    field_box(ui, value, FieldShape { password, ..FieldShape::section(ui) }).0
+    section_text_field_within(ui, value, password, ui.available_width())
+}
+
+/// [`section_text_field`] told how much of its row is really its own.
+///
+/// §8a's rows are `field(flex: 1)` followed by buttons, so the box takes what
+/// is left after them rather than the whole line. The caller measures the
+/// buttons -- [`row_button_width`] -- and hands the difference here; see
+/// `detail_edit`'s credentials card.
+pub fn section_text_field_within(
+    ui: &mut Ui,
+    value: &mut String,
+    password: bool,
+    room: f32,
+) -> Response {
+    field_box(ui, value, FieldShape { password, width: room, ..FieldShape::section(ui) }).0
 }
 
 /// §8a's item-name box: the record's own name, set as the heading it is.
@@ -6300,7 +6327,18 @@ pub fn password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> R
 /// [`password_field`] **in a §8a section row**, at [`SECTION_FIELD_HEIGHT`].
 /// See [`section_text_field`].
 pub fn section_password_field(ui: &mut Ui, value: &mut String, revealed: &mut bool) -> Response {
-    password_field_shaped(ui, value, revealed, FieldShape::section(ui))
+    section_password_field_within(ui, value, revealed, ui.available_width())
+}
+
+/// [`section_password_field`] at a given width. See
+/// [`section_text_field_within`], whose reason is the same.
+pub fn section_password_field_within(
+    ui: &mut Ui,
+    value: &mut String,
+    revealed: &mut bool,
+    room: f32,
+) -> Response {
+    password_field_shaped(ui, value, revealed, FieldShape { width: room, ..FieldShape::section(ui) })
 }
 
 /// Both password fields, in one body: the box `shape` describes, masked
@@ -7305,7 +7343,7 @@ pub const SECTION_HEADER_GAP: f32 = 10.0;
 /// Only the section-row variants below draw at this height. [`text_field`],
 /// [`password_field`] and [`disabled_text_field`] are the login window's and
 /// the overlay's, and their designs say 38.
-pub const SECTION_FIELD_HEIGHT: f32 = 34.0;
+pub const SECTION_FIELD_HEIGHT: f32 = 28.0;
 
 /// The type size inside a row field.
 ///

@@ -3588,6 +3588,28 @@ pub enum EditAction {
     SelectIcon,
     /// See [`Self::RefreshIcon`].
     ClearIcon,
+    /// **A row's `Copy` was pressed.**
+    ///
+    /// 8a hangs a `Copy` off the right of the rows that hold a value worth
+    /// having, and this form had none -- so the one screen where a user can
+    /// SEE a secret in the clear was the one screen they could not take it
+    /// from. The owner: "default Copy button for the rest of items".
+    ///
+    /// **They carry nothing, and the window reads the DRAFT.** Carrying the
+    /// text would make `EditAction` own a `String` and stop being `Copy`,
+    /// which every arm of two exhaustive matches relies on; the window has
+    /// the draft in hand at the call site and can read the same field this
+    /// button sits beside. What it must NOT read is the saved item: this
+    /// form may be showing something the user has just typed, and copying
+    /// what is still in the vault would hand them the old password with no
+    /// sign that it had.
+    ///
+    /// Answered through the same re-prompt the read pane's copies take. A
+    /// copy that costs a master password from one pane and nothing from the
+    /// other teaches the user which door is cheaper.
+    CopyUsername,
+    /// See [`Self::CopyUsername`].
+    CopyPassword,
 }
 
 /// The folders this form may actually move an item **into**: the folder list
@@ -6835,6 +6857,52 @@ fn owner_field(ui: &mut egui::Ui, owner: &str) {
         .on_hover_text(OWNER_HINT);
 }
 
+/// 8a's `Copy`, and the read pane's own word for the same act.
+const COPY_LABEL: &str = "Copy";
+
+/// 8a's `Generate`, moved onto the password's own line.
+const GENERATE_LABEL: &str = "Generate";
+
+/// **A row laid out as 8a lays one: a field that takes what is LEFT, and
+/// `buttons` of them after it.**
+///
+/// The buttons are measured before anything is drawn, because that is the
+/// only order that works: a field added first takes `available_width` and
+/// pushes every button after it off the card. `theme::row_button_width` lays
+/// the galley the button will really lay, so the reservation cannot drift
+/// from what is drawn -- and the buttons are all one label, `Copy` or
+/// `Generate`, so measuring the widest and multiplying is exact rather than
+/// an estimate.
+///
+/// **Wrapped, not `horizontal`.** At the app's minimum pane the control
+/// column is about 200 points and a field plus two buttons will not fit on
+/// one line; an unwrapped row does not shrink, it pushes the card past the
+/// pane and inflates every `available_width()` measured after it. That is
+/// `aae9429`'s defect, and the floor below is what sends the buttons onto a
+/// second line instead.
+fn row_with_buttons(ui: &mut egui::Ui, buttons: usize, add: impl FnOnce(&mut egui::Ui, f32)) {
+    let widest = theme::row_button_width(ui, GENERATE_LABEL)
+        .max(theme::row_button_width(ui, COPY_LABEL));
+    let reserved = (widest + theme::ROW_BUTTON_GAP) * buttons as f32;
+    let room = (ui.available_width() - reserved).max(FIELD_FLOOR);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = theme::ROW_BUTTON_GAP;
+        // The row's three kinds of widget agree on one height the way the
+        // generator row's do -- see its comment for why `interact_size.y` is
+        // the one dial all of them read.
+        ui.spacing_mut().interact_size.y = theme::ROW_BUTTON_HEIGHT_2B;
+        add(ui, room);
+    });
+}
+
+/// The narrowest a row's field may be before its buttons wrap to the next
+/// line instead of squeezing it.
+///
+/// `theme::SECTION_ROW_CONTROL_FLOOR`'s argument at one level down: below
+/// this a URL or an email address in the box is six characters and an
+/// ellipsis, which is not a field the user can work in.
+const FIELD_FLOOR: f32 = 140.0;
+
 /// The folder chooser, drawn identically in both arms of the `ITEM` card.
 ///
 /// Lifted out when the card grew a grid: the control was written inline in
@@ -7706,15 +7774,49 @@ pub fn draw_detail_edit(
                     // from `Slot::label`, so the Add menu could never name
                     // one of them differently from the row it reveals.
                     theme::section_row(ui, Slot::Username.label(), |ui| {
-                        theme::section_text_field(ui, &mut draft.username, false);
+                        // 8a's row: `field(flex: 1)` and then the buttons.
+                        // The buttons are measured first so the field takes
+                        // what is LEFT -- laid out the other way round the
+                        // box takes `available_width` and the Copy is pushed
+                        // off the card. See `row_with_buttons`.
+                        row_with_buttons(ui, 1, |ui, room| {
+                            theme::section_text_field_within(
+                                ui,
+                                &mut draft.username,
+                                false,
+                                room,
+                            );
+                            if theme::row_button(ui, COPY_LABEL).clicked() {
+                                action = EditAction::CopyUsername;
+                            }
+                        });
                     });
     
                     theme::section_row(ui, Slot::Password.label(), |ui| {
-                        theme::section_password_field(
-                            ui,
-                            &mut draft.password,
-                            &mut draft.reveal_password,
-                        );
+                        // 8a's password row, whole: the box, then `Generate`
+                        // with its chord and `Copy`, all on one line. They
+                        // used to sit on a line of their own under the box --
+                        // the owner: "buttons should be on the same line".
+                        //
+                        // `Hide` is not among them because this form's reveal
+                        // is IN the box (`section_password_field`'s own
+                        // toggle), which is the same control 8a draws beside
+                        // it and one fewer thing on a line that has to fit a
+                        // 298-point pane.
+                        row_with_buttons(ui, 2, |ui, room| {
+                            theme::section_password_field_within(
+                                ui,
+                                &mut draft.password,
+                                &mut draft.reveal_password,
+                                room,
+                            );
+                            if theme::row_button(ui, GENERATE_LABEL).clicked() {
+                                action = EditAction::GeneratePassword;
+                            }
+                            if theme::row_button(ui, COPY_LABEL).clicked() {
+                                action = EditAction::CopyPassword;
+                            }
+                        });
                         // No `add_space` between the box and the meter: 8a's
                         // control column is `gap: 8px`, and eight is what egui
                         // has already put under the box as item spacing. The
@@ -7825,9 +7927,14 @@ pub fn draw_detail_edit(
                         // -- the same property the scroll-area `scope` below
                         // relies on.
                         ui.spacing_mut().interact_size.y = theme::BUTTON_HEIGHT;
-                        if theme::secondary_button(ui, "Generate").clicked() {
-                            action = EditAction::GeneratePassword;
-                        }
+                        // **`Generate` is not here any more.** It moved onto
+                        // the password box's own line, where 8a draws it and
+                        // where the owner asked for it ("buttons should be on
+                        // the same line"). What is left on this row is the
+                        // recipe -- which kind, how long, and the options
+                        // behind the disclosure -- which 8a has nowhere at
+                        // all and which this build keeps because it is the
+                        // only place a user can choose them.
                         egui::ComboBox::from_id_salt("generator-kind")
                             .selected_text(if draft.generator.passphrase {
                                 "Passphrase"
@@ -15578,11 +15685,18 @@ mod edit_pane_layout_tests {
     /// rather than skipping when a control drew no frame, which is what a
     /// zero-sized widget looks like: on screen to a presence check, invisible
     /// to the eye.
-    fn generator_row_frames(painted: &Painted, passphrase: bool) -> [Rect; 3] {
-        let generate = painted.rect_of("Generate");
-        // The LAST match: on the password branch the form paints the field
-        // label "Password" above the row and the combo's `selected_text`
-        // spells the same word, so the combo is the lower of the two.
+    fn generator_row_frames(painted: &Painted, passphrase: bool) -> [Rect; 2] {
+        // **`Generate` is no longer one of these.** It moved onto the
+        // password box's own line, where 8a draws it -- the owner: "buttons
+        // should be on the same line" -- so what is left on this row is the
+        // recipe: which kind, and how long. The `Options` disclosure beside
+        // them is a chip rather than a control of this shape and has its own
+        // tests.
+        //
+        // The LAST match for the kind: on the password branch the form paints
+        // the field label "Password" above the row and the combo's
+        // `selected_text` spells the same word, so the combo is the lower of
+        // the two.
         let kind = if passphrase { "Passphrase" } else { "Password" };
         let combo_text = *painted.rects_of(kind).last().unwrap_or_else(|| {
             panic!(
@@ -15592,15 +15706,11 @@ mod edit_pane_layout_tests {
         });
         let spinner = painted.rect_of(spinner_suffix(passphrase));
         assert!(
-            combo_text.top() > generate.top() - 40.0 && combo_text.top() < generate.top() + 40.0,
-            "the {combo_text:?} taken for the generator combo is nowhere near the Generate \
-             button at {generate:?} -- this helper picked up the wrong galley"
+            combo_text.top() > spinner.top() - 40.0 && combo_text.top() < spinner.top() + 40.0,
+            "the {combo_text:?} taken for the generator combo is nowhere near the size \
+             spinner at {spinner:?} -- this helper picked up the wrong galley"
         );
-        [
-            painted.frame_around(generate),
-            painted.frame_around(combo_text),
-            painted.frame_around(spinner),
-        ]
+        [painted.frame_around(combo_text), painted.frame_around(spinner)]
     }
 
     /// **The generator row's three controls are one row of one height.**
@@ -15643,9 +15753,9 @@ mod edit_pane_layout_tests {
                 painted.strings()
             );
 
-            let [generate, combo, spinner] = generator_row_frames(&painted, passphrase);
-            let names = ["Generate", "the kind combo", "the size spinner"];
-            for (name, rect) in names.iter().zip([generate, combo, spinner]) {
+            let [combo, spinner] = generator_row_frames(&painted, passphrase);
+            let names = ["the kind combo", "the size spinner"];
+            for (name, rect) in names.iter().zip([combo, spinner]) {
                 assert!(
                     rect.width() > 1.0 && rect.height() > 1.0,
                     "{name} painted a {rect:?} in the passphrase={passphrase} state -- a \
@@ -15655,31 +15765,37 @@ mod edit_pane_layout_tests {
             // One row, so one top and one height; the bottoms then follow.
             // Half a point of slack for the sub-pixel positions egui lays
             // rows out at, and no more: the defect was 7pt of it.
-            for (name, rect) in names[1..].iter().zip([combo, spinner]) {
-                assert!(
-                    (rect.top() - generate.top()).abs() <= 0.5,
-                    "{name} is painted at top {} while the Generate button beside it starts \
-                     at {} -- the row does not sit on one line in the \
-                     passphrase={passphrase} state",
-                    rect.top(),
-                    generate.top()
-                );
-                assert!(
-                    (rect.height() - generate.height()).abs() <= 0.5,
-                    "{name} is {}pt tall against the Generate button's {}pt in the \
-                     passphrase={passphrase} state -- the row's controls are different sizes",
-                    rect.height(),
-                    generate.height()
-                );
-            }
+            //
+            // **Measured against the COMBO now** and not against a Generate
+            // button, which left this row when it moved onto the password
+            // box's own line. The combo is the one whose own arithmetic was
+            // wrong (`ComboBox::button_frame` starts from
+            // `available_rect_before_wrap`, so it is not centred the way a
+            // directly-added widget is), so holding the spinner to it is the
+            // same claim from the other end.
+            assert!(
+                (spinner.top() - combo.top()).abs() <= 0.5,
+                "the size spinner is painted at top {} while the kind combo beside it starts \
+                 at {} -- the row does not sit on one line in the \
+                 passphrase={passphrase} state",
+                spinner.top(),
+                combo.top()
+            );
+            assert!(
+                (spinner.height() - combo.height()).abs() <= 0.5,
+                "the size spinner is {}pt tall against the combo's {}pt in the \
+                 passphrase={passphrase} state -- the row's controls are different sizes",
+                spinner.height(),
+                combo.height()
+            );
             // And the height is the button height by construction, not
-            // whatever the three happened to agree on: a row where all three
+            // whatever the two happened to agree on: a row where both
             // collapsed to egui's 26pt default would satisfy everything above.
             assert!(
-                (generate.height() - theme::BUTTON_HEIGHT).abs() <= 0.5,
+                (combo.height() - theme::BUTTON_HEIGHT).abs() <= 0.5,
                 "the generator row is {}pt tall in the passphrase={passphrase} state, not \
                  theme::BUTTON_HEIGHT ({})",
-                generate.height(),
+                combo.height(),
                 theme::BUTTON_HEIGHT
             );
         }
@@ -15702,15 +15818,15 @@ mod edit_pane_layout_tests {
         let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
         let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
 
-        let [generate, _, _] = generator_row_frames(&painted, false);
+        let [kind, _] = generator_row_frames(&painted, false);
         let folder = painted.frame_around(painted.rect_of("No folder"));
         assert!(
-            (folder.height() - generate.height()).abs() > 0.5,
+            (folder.height() - kind.height()).abs() > 0.5,
             "the untreated folder combo measures {}pt and the treated generator row {}pt -- \
              if those are the same number, `frame_around` is reporting one shared box for \
              both and the baseline assertion proves nothing",
             folder.height(),
-            generate.height()
+            kind.height()
         );
     }
 

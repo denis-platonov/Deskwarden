@@ -5219,6 +5219,51 @@ pub fn build_frame_with_search(
                                 .as_ref()
                                 .and_then(|item| icons.textures.get(item.id.as_str())),
                         ) {
+                            // **A row's Copy, read off the DRAFT.**
+                            //
+                            // Not off `selected_item`: the form may be
+                            // showing something the user has just typed, and
+                            // copying what is still in the vault would hand
+                            // them the old password with no sign that it had.
+                            // See `EditAction::CopyUsername`.
+                            //
+                            // Behind the same re-prompt the read pane's
+                            // copies take, against the same item -- a copy
+                            // that costs a master password from one pane and
+                            // nothing from the other teaches the user which
+                            // door is cheaper. `reprompt_protected` is the
+                            // ITEM's flag, which is why this needs one at
+                            // all; a create has no item and no flag, and its
+                            // own arm below says so.
+                            ref action @ (EditAction::CopyUsername
+                            | EditAction::CopyPassword) => {
+                                let text = match action {
+                                    EditAction::CopyUsername => draft.username.clone(),
+                                    _ => draft.password.clone(),
+                                };
+                                let allowed = selected_item.as_ref().is_none_or(|item| {
+                                    matches!(
+                                        crate::reprompt::permit(
+                                            &reprompt_gate,
+                                            crate::vault_bridge::reprompt_protected(item),
+                                            &mut reprompt_proof,
+                                            Instant::now(),
+                                            || (),
+                                        ),
+                                        crate::reprompt::Outcome::Done(())
+                                    )
+                                });
+                                if allowed {
+                                    if !text.is_empty() {
+                                        crate::clipboard::copy_secret(&text);
+                                    }
+                                } else {
+                                    detail::note_refused(
+                                        ui.ctx(),
+                                        crate::reprompt::refusal_text(false),
+                                    );
+                                }
+                            }
                             // **The pencil badge's icon menu, handed straight
                             // to the row menu's own arms.** The read pane's
                             // kebab used to do exactly this and the reason is
@@ -5581,6 +5626,21 @@ pub fn build_frame_with_search(
                                 "the create form asked for an icon action on an item that does \
                                  not exist yet"
                             ),
+                            // A create has no saved item, so there is no
+                            // `reprompt_protected` flag to ask about -- and
+                            // nothing on the form the user did not type
+                            // themselves a moment ago. The copy is taken at
+                            // face value.
+                            ref action @ (EditAction::CopyUsername
+                            | EditAction::CopyPassword) => {
+                                let text = match action {
+                                    EditAction::CopyUsername => draft.username.as_str(),
+                                    _ => draft.password.as_str(),
+                                };
+                                if !text.is_empty() {
+                                    crate::clipboard::copy_secret(text);
+                                }
+                            }
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
                         }
