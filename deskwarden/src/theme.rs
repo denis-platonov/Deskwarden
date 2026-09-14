@@ -7707,14 +7707,28 @@ fn section_body_state(ui: &Ui) -> egui::Id {
 /// `ROW_PAD_Y`: two rows separated this way stand exactly as far apart as two
 /// of that pane's bands do.
 fn section_row_rule(ui: &mut Ui, pad_x: i8) {
-    ui.add_space(f32::from(SECTION_CARD_PAD_Y));
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    // **One allocation, with the line painted down its middle** -- and its
+    // height spent NET of the `item_spacing` egui puts on either side of it.
+    //
+    // Three allocations (a space, the line, a space) was the obvious shape
+    // and it draws the wrong gap: egui adds the spacing BETWEEN each pair, so
+    // a 13-point space after the row came out as 8 + 13 = 21 above the rule
+    // against 13 under the field above it. Measured on the username row: 13
+    // over the box, 21 under it. The owner: "username padding under field
+    // seems bigger".
+    //
+    // The same net-of-spacing arithmetic as `SECTION_COLUMN_TOP`'s, and for
+    // the same reason: what is written down is the gap the reader sees, not
+    // an addend to a number nobody wrote.
+    let slack = (f32::from(SECTION_CARD_PAD_Y) - ui.spacing().item_spacing.y).max(0.0);
+    let (band, _) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 2.0 * slack + 1.0), Sense::hover());
+    let line = Rect::from_min_size(Pos2::new(band.left(), band.center().y - 0.5), Vec2::new(band.width(), 1.0));
     ui.painter().rect_filled(
-        rect.expand2(Vec2::new(f32::from(pad_x), 0.0)),
+        line.expand2(Vec2::new(f32::from(pad_x), 0.0)),
         CornerRadius::ZERO,
         CANVAS,
     );
-    ui.add_space(f32::from(SECTION_CARD_PAD_Y));
 }
 
 pub fn section_card_body_at<R>(ui: &mut Ui, pad_x: i8, add: impl FnOnce(&mut Ui) -> R) -> R {

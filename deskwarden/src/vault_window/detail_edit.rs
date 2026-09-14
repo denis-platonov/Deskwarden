@@ -4047,7 +4047,19 @@ fn history_block(ui: &mut egui::Ui, open: &mut bool, dates: &[String]) {
     // row on this form: an unwrapped row does not shrink to fit, it pushes the
     // card past the pane and inflates every `available_width()` after it.
     ui.horizontal_wrapped(|ui| {
-        if ui.selectable_label(*open, history_button(dates.len())).clicked() {
+        // **A link, which is what 8a draws**: `font-size: 12px; font-weight:
+        // 600; color: #14307a`, with no box round it. It was a
+        // `selectable_label` -- egui's own toggle chrome, a tinted rectangle
+        // when open -- which is a control this design has nowhere. The owner:
+        // "Password history should be a link as per design".
+        //
+        // `theme::link_label` rather than a blue `RichText` written here: it
+        // is what every other hand-painted clickable in this app is, down to
+        // the pointing hand and the `selectable(false)` that keeps a press
+        // from being taken for a drag-select. The open state is no longer
+        // painted ON the control, and does not need to be -- the list it
+        // opens is directly underneath it.
+        if theme::link_label(ui, &history_button(dates.len()), 12.0).clicked() {
             *open = !*open;
         }
     });
@@ -6880,10 +6892,25 @@ const GENERATE_LABEL: &str = "Generate";
 /// pane and inflates every `available_width()` measured after it. That is
 /// `aae9429`'s defect, and the floor below is what sends the buttons onto a
 /// second line instead.
-fn row_with_buttons(ui: &mut egui::Ui, buttons: usize, add: impl FnOnce(&mut egui::Ui, f32)) {
-    let widest = theme::row_button_width(ui, GENERATE_LABEL)
-        .max(theme::row_button_width(ui, COPY_LABEL));
-    let reserved = (widest + theme::ROW_BUTTON_GAP) * buttons as f32;
+fn row_with_buttons(ui: &mut egui::Ui, buttons: &[&str], add: impl FnOnce(&mut egui::Ui, f32)) {
+    // **Each button's OWN width**, not the widest of them multiplied.
+    //
+    // Reserving `widest * n` leaves the narrower ones short of the row's
+    // right edge by the difference -- `Copy` is about fifteen points
+    // narrower than `Generate`, so the username row's single button stopped
+    // fifteen points early and the password row's pair stopped fifteen early
+    // too, with an uneven gap between them. The owner: "should be pushed to
+    // the right all the way with same space from the edge - fields take the
+    // rest of the space".
+    //
+    // Measured with `theme::row_button_width`, which lays the galley the
+    // button will really lay, so the reservation cannot drift from what is
+    // drawn -- and the field then takes EXACTLY the remainder, which is what
+    // puts the last button flush against the edge.
+    let reserved: f32 = buttons
+        .iter()
+        .map(|label| theme::row_button_width(ui, label) + theme::ROW_BUTTON_GAP)
+        .sum();
     let room = (ui.available_width() - reserved).max(FIELD_FLOOR);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = theme::ROW_BUTTON_GAP;
@@ -7779,7 +7806,7 @@ pub fn draw_detail_edit(
                         // what is LEFT -- laid out the other way round the
                         // box takes `available_width` and the Copy is pushed
                         // off the card. See `row_with_buttons`.
-                        row_with_buttons(ui, 1, |ui, room| {
+                        row_with_buttons(ui, &[COPY_LABEL], |ui, room| {
                             theme::section_text_field_within(
                                 ui,
                                 &mut draft.username,
@@ -7803,7 +7830,7 @@ pub fn draw_detail_edit(
                         // toggle), which is the same control 8a draws beside
                         // it and one fewer thing on a line that has to fit a
                         // 298-point pane.
-                        row_with_buttons(ui, 2, |ui, room| {
+                        row_with_buttons(ui, &[GENERATE_LABEL, COPY_LABEL], |ui, room| {
                             theme::section_password_field_within(
                                 ui,
                                 &mut draft.password,
