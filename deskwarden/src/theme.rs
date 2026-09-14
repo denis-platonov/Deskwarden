@@ -6398,6 +6398,17 @@ fn password_field_shaped(
     if toggle.clicked() {
         *revealed = !*revealed;
     }
+    // **The box claims its own right edge back**, which `ui.put` above just
+    // gave away -- the same defect `field_box` carries a paragraph about, one
+    // widget further out. `put` reports the rect it placed, and the toggle's
+    // ends six points INSIDE the box, so the next widget on the row started
+    // two points past the box instead of a full `item_spacing` past it: a
+    // password row whose `Generate` sat 2 from the field where the username
+    // row's `Copy` sat 8, and whose last button then stopped six short of the
+    // card's inset. Measured: 22 points of card to the right of `Copy` on one
+    // row against 16.4 on the other. The owner: "should be same right padding
+    // for all fields".
+    ui.advance_cursor_after_rect(box_rect);
 
     response
 }

@@ -4059,7 +4059,23 @@ fn history_block(ui: &mut egui::Ui, open: &mut bool, dates: &[String]) {
         // from being taken for a drag-select. The open state is no longer
         // painted ON the control, and does not need to be -- the list it
         // opens is directly underneath it.
-        if theme::link_label(ui, &history_button(dates.len()), 12.0).clicked() {
+        // 8a's own three values for this run -- `font-size: 12px;
+        // font-weight: 600; color: #14307a` -- rather than `link_label`'s
+        // body-weight `BLUE`. `#14307a` is `theme::BLUE_DEEP`, which is
+        // already what the password box's own `Show` is set in, so the two
+        // clickable runs on this card match. The owner: "Password history is
+        // a link not as per design".
+        //
+        // Laid here and handed to `link_galley`, because that is the only
+        // way to give a link a weight: `link_label` takes a size and sets
+        // the rest itself.
+        let caption = history_button(dates.len());
+        let galley = ui.painter().layout_no_wrap(
+            caption,
+            egui::FontId::new(12.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+            theme::BLUE_DEEP,
+        );
+        if theme::link_galley(ui, galley).clicked() {
             *open = !*open;
         }
     });
