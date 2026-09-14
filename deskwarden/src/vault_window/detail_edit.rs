@@ -20449,6 +20449,104 @@ mod edit_pane_layout_tests {
         );
     }
 
+    /// **A name too long for 8a's cap widens the box instead of being cut.**
+    ///
+    /// The owner: "text cut off with no reason - there's plenty of space for
+    /// title". `theme::title_field_within` asked for `room.min(480)` flat, and
+    /// `theme::field_box` gives the run inside a box `outer - 10 - right_pad`
+    /// -- 460 points at the cap. Measured on this 1200-point pane: `room`
+    /// reaching the field is 980.7, the box was 480 wide, and the clip rect
+    /// egui handed the run was `87..549` around a galley 672.4 wide. The name
+    /// ended mid-word with five hundred points of empty row between the box
+    /// and the `Unsaved changes` pill.
+    ///
+    /// **Not asked of `Painted::rendered`.** That is the right question for
+    /// every elided LABEL on this form, and it is the wrong one here: the box
+    /// sets `TextWrapping::no_max_width` in its layouter, so the galley always
+    /// carries every glyph and egui hides the overflow with a CLIP RECT
+    /// instead. A rendered-glyph assertion would have been green against the
+    /// defect this test is named for. What is asked instead is the geometry
+    /// the clip follows -- whether the ink the form laid out actually fits
+    /// inside the box that is painted around it.
+    ///
+    /// Both halves, because either alone passes trivially. A box that simply
+    /// took the whole row would hold any name and throw 8a's `max-width: 480`
+    /// away with it, so the ordinary name is measured at the SAME pane and
+    /// must still get exactly the 480 the design draws -- the cap is the
+    /// box's resting width, and only the content may push it.
+    #[test]
+    fn a_name_longer_than_the_cap_widens_its_box_rather_than_being_cut() {
+        let pane = Vec2::new(1200.0, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let shot = |draft: &mut EditDraft| {
+            frame_for(&ctx, pane, draft, false, &[], Some(&item), &detail::TotpState::NoSecret)
+        };
+        // The one box on the strip: `theme::FIELD_HEIGHT` tall and drawn round
+        // the name's own ink. Found by geometry rather than by order, the way
+        // `the_name_box_sits_against_the_tile_with_the_pill_on_the_far_edge`
+        // finds it -- `left_center` and not `center`, because the whole point
+        // of the defect is ink that runs out past the box's right edge.
+        let box_round = |painted: &Painted, ink: Rect| {
+            painted
+                .rects
+                .iter()
+                .map(|(r, _)| *r)
+                .find(|r| {
+                    (r.height() - theme::FIELD_HEIGHT).abs() <= 0.5
+                        && r.contains(ink.left_center())
+                })
+                .unwrap_or_else(|| panic!("the name at {ink:?} sits in no field box"))
+        };
+
+        let long = "Microsoft (Tivity) Long Enough To Wrap And Then Some More Words";
+        let mut draft = EditDraft::from_item(&item);
+        draft.name = long.to_string();
+        let _ = shot(&mut draft);
+        let painted = shot(&mut draft);
+        let ink = painted.rect_of(long);
+        // The fixture has to be long enough that the OLD width really cut it:
+        // the text area at the cap is 460 points, and a name that fits there
+        // cannot tell the two behaviours apart. Measured: 672.4.
+        assert!(
+            ink.width() > theme::TITLE_FIELD_WIDTH - 20.0,
+            "the fixture name is only {}pt of ink, which fits inside 8a's capped box -- this \
+             test cannot see the defect it is named for",
+            ink.width()
+        );
+        let name_box = box_round(&painted, ink);
+        assert!(
+            ink.right() <= name_box.right() - 10.0 + 0.5,
+            "the name's ink ends at {} and its box's text area ends at {} -- the name is cut \
+             off inside a box the row had the width to widen",
+            ink.right(),
+            name_box.right() - 10.0
+        );
+        // ... and it widened into space that was empty, not into the pill's.
+        let pill = painted.rect_of(UNSAVED_PILL);
+        assert!(
+            pill.left() > name_box.right(),
+            "the box now ends at {} and the pill starts at {} -- the name grew over the one \
+             thing on this strip that was holding the far edge",
+            name_box.right(),
+            pill.left()
+        );
+
+        let plain = "Microsoft (Tivity)";
+        let mut draft = EditDraft::from_item(&item);
+        draft.name = plain.to_string();
+        let _ = shot(&mut draft);
+        let painted = shot(&mut draft);
+        let name_box = box_round(&painted, painted.rect_of(plain));
+        assert!(
+            (name_box.width() - theme::TITLE_FIELD_WIDTH).abs() <= 0.5,
+            "an ordinary name is in a {}pt box on a 1200pt pane -- 8a's `max-width: 480` is no \
+             longer the box's resting width",
+            name_box.width()
+        );
+    }
+
+
     /// **The header's rule is the header's, with nothing between them.**
     ///
     /// egui puts `item_spacing` between two stacked children, so the white

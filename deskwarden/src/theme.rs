@@ -6146,17 +6146,45 @@ pub fn title_field(ui: &mut Ui, value: &mut String) -> Response {
 /// moment the box is added is the whole rest of the row. Passing it the
 /// difference is what lets the two be laid out in reading order without the
 /// box eating the pill's place. See `detail_edit`'s `edit_header`.
+///
+/// **[`TITLE_FIELD_WIDTH`] is the box's RESTING width, not a ceiling the name
+/// cannot push.** This used to be a flat `room.min(TITLE_FIELD_WIDTH)`, and
+/// [`field_box`] gives the run inside it `outer - 10 - right_pad` -- 460
+/// points at the cap -- so any name whose ink is longer than that ended
+/// mid-word. Measured on a 1200-point pane with a 63-character name: the
+/// `room` reaching this call is 980.7, the box is 480 wide, and the clip rect
+/// egui hands the run is `87..549` around a galley 672.4 wide. The name is cut
+/// at 462 points with FIVE HUNDRED points of empty row sitting between the
+/// box's right edge and the `Unsaved changes` pill. The owner: "text cut off
+/// with no reason - there's plenty of space for title".
+///
+/// So the width asked for is what the name needs, floored at §8a's 480 and
+/// still capped by `room`. An ordinary name gets exactly the box the design
+/// draws (a 170.4-point "Microsoft (Tivity)" still sits in 480), a long one
+/// grows into the space that was already empty beside it, and every pane
+/// narrower than the cap is untouched because `room` binds first -- which is
+/// where 8a's max-width was really doing its work.
+///
+/// The slack on the ink is the box's own two insets plus two points, because
+/// egui draws the caret AT the end of the run: a box sized to the glyphs
+/// exactly puts the cursor on the border and clips it.
 pub fn title_field_within(ui: &mut Ui, value: &mut String, room: f32) -> Response {
-    field_box(
-        ui,
-        value,
-        FieldShape {
-            width: room.min(TITLE_FIELD_WIDTH),
-            font: FontId::new(TITLE_FIELD_PX, FontFamily::Name(EXTRABOLD.into())),
-            ..FieldShape::wide(ui)
-        },
-    )
-    .0
+    let shape = FieldShape {
+        font: FontId::new(TITLE_FIELD_PX, FontFamily::Name(EXTRABOLD.into())),
+        ..FieldShape::wide(ui)
+    };
+    // The same face and size `field_box`'s layouter will set the value in, so
+    // this measures the run that is really about to be drawn. The colour is
+    // not read: `Galley::size` is the advance width and nothing else.
+    let ink = ui
+        .painter()
+        .layout_no_wrap(value.clone(), shape.font.clone(), Color32::PLACEHOLDER)
+        .size()
+        .x;
+    // 10 is `field_box`'s left inset, written out there and not a constant to
+    // borrow; `right_pad` is this shape's own.
+    let needs = ink + 10.0 + shape.right_pad + 2.0;
+    field_box(ui, value, FieldShape { width: room.min(needs.max(TITLE_FIELD_WIDTH)), ..shape }).0
 }
 
 /// The type size in [`title_field`]: §8a's `font-size: 20px`.
