@@ -1723,12 +1723,63 @@ pub struct GeneratorDraft {
     pub include_number: bool,
     /// The options disclosure is open.
     ///
-    /// **View state, and the one field on this struct that is.** It is what a
-    /// user does to the FORM, so it is excluded from
+    /// **View state, and one of the three fields on this struct that is.** It
+    /// is what a user does to the FORM, so it is excluded from
     /// [`EditDraft::content_digest`] by name -- a draft that went dirty
     /// because somebody opened the options would make Cancel ask about a
-    /// change that does not exist.
+    /// change that does not exist. [`Self::modal_open`] and [`Self::preview`]
+    /// are excluded by the same clause and for the same reason.
     pub options_open: bool,
+    /// **The generator modal is up.**
+    ///
+    /// The owner: "should be no controls under password with generator
+    /// settings etc - generator should prob be in a separate modal". So the
+    /// recipe row that used to sit under the password box is gone from the
+    /// card and lives behind this flag instead; `Generate` sets it, and
+    /// [`draw_generator_modal`] is what the flag draws.
+    ///
+    /// **On the draft, not in [`EditAction`].** That enum derives `Copy` and
+    /// two exhaustive matches in `vault_window/mod.rs` rely on it, so a
+    /// variant carrying the candidate string is not available -- and the
+    /// modal's state is per-draft anyway, exactly as
+    /// [`EditDraft::reveal_password`] and the rest of this struct are.
+    pub modal_open: bool,
+    /// **The candidate the modal is showing**, or empty while there is none
+    /// yet (the frame the modal opens on, and any frame after a generate the
+    /// backend refused).
+    ///
+    /// The crux of what the owner asked for -- "once saved it replaces the
+    /// value, otherwise if cancel - old remains there" -- is that this is a
+    /// SEPARATE string from [`EditDraft::password`]. Nothing the modal does
+    /// touches the password box; only [`EditDraft::use_generated_password`]
+    /// does, and only the footer's affirmative answer calls it.
+    ///
+    /// It holds plaintext, so [`EditDraft::zeroize_secrets`] wipes it and
+    /// [`EditDraft::close_generator`] wipes it on the way out.
+    pub preview: String,
+    /// **The recipe [`Self::preview`] was asked for**, or `None` while the
+    /// card is shut.
+    ///
+    /// The card re-rolls when the recipe changes, and this is what "changed"
+    /// is measured against. A within-frame comparison -- read the request
+    /// before the controls draw, read it again after -- was the obvious
+    /// implementation and is wrong in one case that matters: dragging the size
+    /// spinner changes the number on most frames of the drag, and
+    /// `vault_window/mod.rs` answers each `GeneratePassword` with a BLOCKING
+    /// call to `bw serve` on the UI thread. One drag would be dozens of round
+    /// trips and a frozen window.
+    ///
+    /// Remembering what was asked for lets the request be DEFERRED instead --
+    /// see [`draw_generator_modal`], which holds it back while the pointer is
+    /// down -- without the difference being forgotten in the meantime. It also
+    /// makes the check exact rather than frame-local: a generate the backend
+    /// refused leaves the preview empty and this set, so the card does not
+    /// hammer the failing route once a frame.
+    ///
+    /// A [`GenerateRequest`] and not the [`GeneratorDraft`]'s own fields,
+    /// because the wire is what the comparison is about: opening the options
+    /// disclosure changes this struct and asks for nothing different.
+    pub asked: Option<GenerateRequest>,
 }
 
 impl Default for GeneratorDraft {
@@ -1754,6 +1805,9 @@ impl Default for GeneratorDraft {
             capitalize: passphrase.capitalize,
             include_number: passphrase.include_number,
             options_open: false,
+            modal_open: false,
+            preview: String::new(),
+            asked: None,
         }
     }
 }
@@ -2198,31 +2252,105 @@ impl EditDraft {
         }
     }
 
-    /// Puts a freshly generated secret into the draft's password box.
+    /// Puts a freshly generated secret into the **generator modal's preview**.
     ///
-    /// A named method rather than `draft.password = generated.to_string()` at
-    /// the call site, because the call site is `vault_window/mod.rs` and this
-    /// is where the rule about what a generate REPLACES belongs: the whole
-    /// password, unconditionally, including one the user had already typed.
-    /// (There is no "append" or "only if empty" reading of the button --
-    /// generating a password over an empty box and over a typed one are the
-    /// same gesture.)
+    /// **It does not touch the password box, and that is the whole change.**
+    /// This method used to write `self.password` directly, because `Generate`
+    /// used to generate. The owner asked for a modal instead -- "on generate
+    /// button - it shows and user can select how to gen once saved - it
+    /// replaces the value, otherwise if cancel - old remains there" -- and a
+    /// candidate that overwrote the box on arrival would have nothing left to
+    /// cancel back to. So a generate fills [`GeneratorDraft::preview`], and
+    /// only [`Self::use_generated_password`] moves it across.
+    ///
+    /// A named method rather than `draft.generator.preview = generated
+    /// .to_string()` at the call site, because the call site is
+    /// `vault_window/mod.rs` and this is where the rule about what a generate
+    /// REPLACES belongs: the whole candidate, unconditionally, including one
+    /// the user has already looked at and re-rolled away from.
+    ///
+    /// Takes `&str` rather than the bridge's `Zeroizing<String>` so this file
+    /// does not need to own one: the caller's `Zeroizing` still wipes on
+    /// drop, and the copy that lands here is wiped by [`Self::close_generator`]
+    /// and by [`Self::zeroize_secrets`] (`CardDraft`'s doc records why the
+    /// draft's fields are not `Zeroizing` -- egui's `TextEdit` buffer is a
+    /// plain `String` regardless).
+    pub fn set_generated_candidate(&mut self, generated: &str) {
+        self.generator.preview = generated.to_string();
+    }
+
+    /// **Opens the generator modal on a clean sheet.**
+    ///
+    /// The preview is cleared rather than kept, so a modal reopened after a
+    /// Cancel never shows the candidate the user has just refused -- and so
+    /// the card that opens is never one whose affirmative answer would paste
+    /// a secret generated under a recipe the user has since forgotten. The
+    /// caller pairs this with `EditAction::GeneratePassword`, which is what
+    /// fills the sheet in again.
+    /// `asked` is seeded with the recipe the caller is about to send, rather
+    /// than left `None`: the card's own re-roll rule is "the recipe is not the
+    /// one the candidate was asked for", and a card that opened knowing
+    /// nothing would report a change on its first frame and ask twice for the
+    /// same password.
+    pub fn open_generator(&mut self) {
+        let asked = self.generator_request();
+        self.generator.modal_open = true;
+        self.clear_candidate();
+        self.generator.asked = Some(asked);
+    }
+
+    /// **Shuts the modal and throws the candidate away. The password box is
+    /// not touched.**
+    ///
+    /// This is the Cancel half of the owner's sentence -- "otherwise if
+    /// cancel - old remains there" -- and it is enforced by this method
+    /// simply not naming `self.password`. Escape, the footer's Cancel and the
+    /// header's ✕ all land here.
+    pub fn close_generator(&mut self) {
+        self.generator.modal_open = false;
+        self.clear_candidate();
+        self.generator.asked = None;
+    }
+
+    /// **The affirmative answer: the candidate becomes the password, and the
+    /// modal shuts.**
+    ///
+    /// Answers whether anything was taken, which is `false` only for a modal
+    /// closed while it had no candidate to give (a generate the backend
+    /// refused, or the frame before the first one arrived). The footer's
+    /// button is greyed in exactly that state, so this is belt and braces for
+    /// a keyboard path added later rather than a case the pointer can reach.
     ///
     /// **The box stays masked.** Bitwarden's own generators reveal what they
     /// produced; this one does not, because `reveal_password` is the user's
     /// toggle and a generate silently flipping it would show a secret the
     /// user never asked to see -- on a form that may be sitting in front of
     /// other people. The Show control is beside the box and is one click.
-    /// Stated because it is a deliberate deviation, not an oversight.
+    /// Stated because it is a deliberate deviation, not an oversight. (The
+    /// modal itself shows the candidate in the clear, which is not the same
+    /// thing: that card is a generator the user opened on purpose, and a
+    /// generator whose output is bulleted out is a generator that cannot be
+    /// read.)
+    pub fn use_generated_password(&mut self) -> bool {
+        let taken = !self.generator.preview.is_empty();
+        if taken {
+            self.password = self.generator.preview.clone();
+        }
+        self.close_generator();
+        taken
+    }
+
+    /// Empties the candidate, wiping its bytes rather than merely forgetting
+    /// them.
     ///
-    /// Takes `&str` rather than the bridge's `Zeroizing<String>` so this file
-    /// does not need to own one: the caller's `Zeroizing` still wipes on
-    /// drop, and the copy that lands in `password` is the same plain `String`
-    /// every other box on this form holds (`CardDraft`'s doc records why the
-    /// draft's fields are not `Zeroizing` -- egui's `TextEdit` buffer is a
-    /// plain `String` regardless).
-    pub fn set_generated_password(&mut self, generated: &str) {
-        self.password = generated.to_string();
+    /// One place, called by both ways out of the modal, for
+    /// [`Self::zeroize_secrets`]'s reason: a generated password is a password,
+    /// and a bare `String::clear` leaves the plaintext in the allocation.
+    /// `Zeroize for String` overwrites and then empties, so this is both
+    /// halves.
+    fn clear_candidate(&mut self) {
+        use zeroize::Zeroize as _;
+        self.generator.preview.zeroize();
     }
 
     /// A name is the one thing `bw serve`'s create/edit endpoints reject an
@@ -2344,8 +2472,13 @@ impl EditDraft {
             // old reading would have made merely OPENING the generator an
             // edit.
             //
-            // (`set_generated_password` is what turns a generate into a real
-            // change, and `password` above already counts that.)
+            // (`use_generated_password` is what turns a generate into a real
+            // change, and `password` above already counts that. The modal's
+            // own `modal_open` and `preview` are covered by this same clause:
+            // an open generator is a fact about the form, and a candidate
+            // nobody has accepted yet is not an edit -- a Cancel that asked
+            // about one would be asking the user to confirm losing a password
+            // they had just declined.)
             generator: _,
             app,
             fields,
@@ -2563,6 +2696,13 @@ impl EditDraft {
         self.ssh_key.private_key.zeroize();
         // A secure note's entire body is the secret.
         self.note_body.zeroize();
+        // **The generator's candidate is a password too.** It is not a box
+        // the user typed into and it is never written to the item, which is
+        // exactly why it was easy to forget: it arrives from `bw serve`'s
+        // `/generate` in a `Zeroizing<String>` that wipes on drop, and this
+        // draft's copy of it would otherwise outlive that wipe by the whole
+        // life of the form. See `GeneratorDraft::preview`.
+        self.generator.preview.zeroize();
         for field in &mut self.fields {
             if field.role == FieldRole::Hidden {
                 field.value.zeroize();
@@ -3009,7 +3149,7 @@ impl EditDraft {
     /// Puts a browsed-for path into the app block.
     ///
     /// A named method rather than `draft.app.as_mut().unwrap().set_path(..)` at
-    /// the call site, for the reason [`Self::set_generated_password`] exists:
+    /// the call site, for the reason [`Self::set_generated_candidate`] exists:
     /// the call site is `vault_window/mod.rs`, and the rule about what choosing
     /// a file changes (the path, and `process` derived from it -- see
     /// [`AppMatchDraft::set_path`]) belongs here.
@@ -3526,19 +3666,30 @@ pub enum EditAction {
     None,
     Save,
     Cancel,
-    /// The Generate control beside the password box was clicked.
+    /// **The generator modal wants a candidate.**
+    ///
+    /// Raised three ways, all of them inside or on the way into the modal:
+    /// the password row's `Generate` (which opens the card and asks for its
+    /// first candidate in the same gesture), a change to the recipe while the
+    /// card is up, and the card's own re-roll.
     ///
     /// It carries nothing, and the caller is expected to ask
     /// [`EditDraft::generator_request`] what to send and
-    /// [`EditDraft::set_generated_password`] where to put the answer. That
-    /// shape is deliberate: this form cannot perform the request itself
-    /// (`draw_detail_edit` has no backend handle, and it runs on the UI
-    /// thread), but the *decisions* -- which recipe, and what a generate
-    /// replaces -- belong here rather than being re-made at the call site.
+    /// [`EditDraft::set_generated_candidate`] where to put the answer. That
+    /// shape is deliberate and unchanged by the modal: this form cannot
+    /// perform the request itself (`draw_detail_edit` has no backend handle,
+    /// and it runs on the UI thread), but the *decisions* -- which recipe,
+    /// and what a generate replaces -- belong here rather than being re-made
+    /// at the call site.
+    ///
+    /// **What it no longer does is write the password box.** The answer lands
+    /// in [`GeneratorDraft::preview`], and the box is written only by the
+    /// modal's affirmative answer -- the owner: "once saved - it replaces the
+    /// value, otherwise if cancel - old remains there".
     ///
     /// A failed generate is therefore the caller's to report, and it must be
-    /// reported: the box is unchanged on failure, so a silently swallowed
-    /// error looks exactly like a button that does nothing.
+    /// reported: the card is left showing no candidate on failure, so a
+    /// silently swallowed error looks exactly like a button that does nothing.
     GeneratePassword,
     /// The app block's "Browse..." was clicked.
     ///
@@ -6316,12 +6467,14 @@ const LAST_CLASS_HINT: &str = "A password has to come from somewhere.";
 /// [`EditAction`], and keeping it that way is what lets its layout be tested
 /// against a `GeneratorDraft` alone.
 ///
-/// **Every row here is `horizontal_wrapped`.** See the disclosure's own
-/// comment in the generator row for why that is not a style choice: the row
-/// above has a content floor wider than the card at the app's minimum window
-/// size and survives only by wrapping, and a block of options laid out in
-/// unwrapped rows would reintroduce exactly the defect (`aae9429`) that one
-/// was written to avoid.
+/// **Every row here is `horizontal_wrapped`**, and it still is now that the
+/// block has moved off the card and into [`draw_generator_modal`]. The card
+/// it used to live on was 264 points wide at the app's minimum window size;
+/// the modal card is a fixed [`GENERATOR_CARD_WIDTH`], which is wider but is
+/// no less finite -- a block of options in unwrapped rows would push the
+/// card's contents past its own edge instead of past the pane's, which is the
+/// same defect (`aae9429`) wearing a different frame. See
+/// `the_generator_options_stay_inside_the_modal_card`.
 fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
     ui.spacing_mut().interact_size.y = theme::BUTTON_HEIGHT;
     if generator.passphrase {
@@ -7867,7 +8020,17 @@ pub fn draw_detail_edit(
                                 false,
                                 room,
                             );
+                            // **`Generate` opens the modal; it no longer
+                            // writes the box.** The owner: "on generate
+                            // button - it shows and user can select how to
+                            // gen". The action goes out in the same gesture
+                            // so the card is never up with an empty preview
+                            // waiting for a second click -- opening and
+                            // asking for the first candidate are one thing to
+                            // the user and are one thing here. See
+                            // `draw_generator_modal`.
                             if theme::row_button(ui, GENERATE_LABEL).clicked() {
+                                draft.open_generator();
                                 action = EditAction::GeneratePassword;
                             }
                             if theme::row_button(ui, COPY_LABEL).clicked() {
@@ -7886,9 +8049,12 @@ pub fn draw_detail_edit(
                         // `detail::metadata_line` was written; the edit form
                         // rated nothing at all, so the one screen where a user
                         // can do something about a weak password was the one
-                        // screen that would not say it was weak. A generator
-                        // sits directly under this line and its whole job is
-                        // to fix what the meter reports.
+                        // screen that would not say it was weak. The
+                        // generator `Generate` opens is the tool whose whole
+                        // job is to fix what this meter reports, and the
+                        // modal draws the same rating over its own candidate
+                        // -- so the user can read "Weak" here, generate, and
+                        // read "Strong" there before accepting anything.
                         //
                         // Withheld on an empty box, which is not the same as
                         // rating it: `password_strength::rate` answers `Weak`
@@ -7905,189 +8071,38 @@ pub fn draw_detail_edit(
                             );
                         }
                     });
-                    ui.add_space(6.0);
-                    // **Indented to the control column, by being a row whose
-                    // label is empty.** 8a hangs `Hide`, `Generate CTRL+G` and
-                    // `Copy` off the right of the password box itself; there is
-                    // no room for that here (the control column is around 200
-                    // points in the shipped pane, and one of these controls is
-                    // a 110-point combo), so the generator keeps its own line.
-                    // What it must not do is start at the CARD's left edge,
-                    // which is where the label column is: a row of buttons
-                    // under `Password` and level with it reads as another
-                    // field's worth of chrome rather than as the password's own
-                    // tools.
-                    theme::section_row(ui, "", |ui| {
-                    // The generator, in this form's own idiom rather than
-                    // design block 3d's. 3d is the OVERLAY's generator, and it
-                    // lives in a file this work does not own.
+                    // **The generator's recipe row used to be here, and is
+                    // gone.** The owner: "should be no controls under
+                    // password with generator settings etc - generator
+                    // should prob be in a separate modal". What stood on
+                    // this line was an empty-labelled `section_row` holding
+                    // a `horizontal_wrapped` with the kind combo, the
+                    // size spinner and the `Options` disclosure -- every
+                    // one of which is now inside `draw_generator_modal`,
+                    // reached from the `Generate` beside the box above.
                     //
-                    // **This comment used to say 3d was "a full panel with its
-                    // own chrome, character-class switches and a re-roll". Two of
-                    // those three are wrong**, and the error was believed long
-                    // enough to scope a task from it. 3d (`docs/design/
-                    // Deskwarden.dc.html:1479`, "Generate & fill") draws NO
-                    // character-class switches and no length control: it has a
-                    // Words/Letters/PIN selector, a static "20 chars" readout, a
-                    // CTRL+R re-roll, and a "Fill & save to vault" button. The
-                    // re-roll is the only half that was right.
-                    //
-                    // Porting its chrome into a stacked
-                    // label/field form would look like a foreign panel
-                    // dropped into the middle of it. So: one control row
-                    // under the box it fills, built from the same widgets
-                    // every other row here uses. **The overlay's generator is
-                    // a separate, still-outstanding task.**
-                    //
-                    // **Wrapped, not `horizontal`.** This row is the one place
-                    // in the whole form whose content has a floor rather than
-                    // a share: "Generate", a 110pt combo box and a
-                    // `DragValue` wide enough for " chars" come to 279.4pt of
-                    // content, and the card at the app's MINIMUM window size
-                    // offers 264. An unwrapped row does not shrink to fit --
-                    // it pushes the card out to 307pt inside a 298pt pane,
-                    // and every `available_width()` measured after it answers
-                    // with the inflated number. That is `aae9429`'s defect
-                    // exactly, and `horizontal_wrapped` is the same mechanism
-                    // that already holds the keystroke builder's chip row
-                    // (see `every_chip_and_button_is_reachable_at_the_apps_minimum_width`).
-                    ui.horizontal_wrapped(|ui| {
-                        // **Why the row sets `interact_size.y`, and why it is
-                        // `BUTTON_HEIGHT` rather than a number.** The three
-                        // controls here are the only place in this form where
-                        // widgets of three different KINDS stand side by side,
-                        // and left to themselves they came out three different
-                        // heights sitting at three different tops: the button
-                        // 32pt (its `min_size`, from `theme::secondary_button`),
-                        // the `DragValue` and the combo 26pt each -- and the
-                        // combo lower still than the spinner, because
-                        // `ComboBox` wraps itself in a nested `ui.horizontal`
-                        // whose `button_frame` starts from
-                        // `available_rect_before_wrap`, so it is not centred in
-                        // the row the way a directly-added widget is. That is
-                        // the "the dropdown sits lower than the buttons" the
-                        // user reported.
-                        //
-                        // `interact_size.y` is the one dial all three read:
-                        // `Button` takes it as a floor, `DragValue` passes it
-                        // to `min_size`, and `ComboBox::button_frame` raises
-                        // its outer rect to `at_least(interact_size.y)`. Set it
-                        // to the button's own height and the three agree by
-                        // CONSTRUCTION -- there is no second literal to drift.
-                        // `interact_size.x` is deliberately left alone: it is
-                        // what the widths are built from, and the 279.4pt
-                        // content floor this row wraps at must not move.
-                        //
-                        // Scoped to this row: `ui` here is the wrapped row's
-                        // own child, and `spacing_mut` clones its style
-                        // (`Arc::make_mut`), so nothing below the row sees it
-                        // -- the same property the scroll-area `scope` below
-                        // relies on.
-                        ui.spacing_mut().interact_size.y = theme::BUTTON_HEIGHT;
-                        // **`Generate` is not here any more.** It moved onto
-                        // the password box's own line, where 8a draws it and
-                        // where the owner asked for it ("buttons should be on
-                        // the same line"). What is left on this row is the
-                        // recipe -- which kind, how long, and the options
-                        // behind the disclosure -- which 8a has nowhere at
-                        // all and which this build keeps because it is the
-                        // only place a user can choose them.
-                        egui::ComboBox::from_id_salt("generator-kind")
-                            .selected_text(if draft.generator.passphrase {
-                                "Passphrase"
-                            } else {
-                                "Password"
-                            })
-                            .width(110.0)
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(
-                                    &mut draft.generator.passphrase,
-                                    false,
-                                    "Password",
-                                );
-                                ui.selectable_value(
-                                    &mut draft.generator.passphrase,
-                                    true,
-                                    "Passphrase",
-                                );
-                            });
-                        // One control, two meanings, because a passphrase's
-                        // "4" and a password's "20" are not the same quantity
-                        // -- so they are separate fields on the draft (see
-                        // `GeneratorDraft`) and the suffix says which is on
-                        // screen. The ranges are the route's own clamps; a
-                        // box that offered 1 would come back as 5.
-                        if draft.generator.passphrase {
-                            ui.add(
-                                egui::DragValue::new(&mut draft.generator.words)
-                                    .range(MIN_WORDS..=MAX_WORDS)
-                                    .suffix(" words"),
-                            );
-                        } else {
-                            ui.add(
-                                egui::DragValue::new(&mut draft.generator.length)
-                                    .range(MIN_LENGTH..=MAX_LENGTH)
-                                    .suffix(" chars"),
-                            );
-                        }
-                        // **A disclosure, not seven more controls on this
-                        // row.** The comment above measures this row's
-                        // content floor at 279.4pt against the 264 the card
-                        // offers at the app's minimum window size; it already
-                        // wraps. Seven more fixed-width controls beside them
-                        // would be seven more items in the same wrap, and a
-                        // popover or a modal would put the generator's own
-                        // chrome into a stacked label/field form -- which is
-                        // design block 3d's job, in the OVERLAY, in a file
-                        // this work does not own.
-                        //
-                        // So: one more chip here, and the options themselves
-                        // laid out BELOW in wrapped rows of their own. Every
-                        // control down there is a chip, a combo or a
-                        // spinner in its own `horizontal_wrapped`, so the
-                        // block's width floor is one widest chip rather than
-                        // a sum -- it cannot push the card out however many
-                        // options it grows, which is the property this row
-                        // does not have and the reason it is not the place to
-                        // put them. See
-                        // `every_generator_option_is_reachable_at_the_apps_minimum_width`.
-                        if ui
-                            .selectable_label(draft.generator.options_open, GENERATOR_OPTIONS)
-                            .clicked()
-                        {
-                            draft.generator.options_open = !draft.generator.options_open;
-                        }
-                    });
-                    if draft.generator.options_open {
-                        ui.add_space(6.0);
-                        generator_options(ui, &mut draft.generator);
-                    }
-                    });
+                    // Nothing was merely hidden: the whole point of the
+                    // move is that the card carries the password and the
+                    // things that act on its VALUE, and a recipe for a
+                    // password that does not exist yet is neither.
 
                     // **§8a's `Password history (3)`, in the control column
-                    // under the generator.**
+                    // under the password row.**
                     //
                     // 8a puts it at the far right of the strength-meter line,
-                    // inside the password row itself. It cannot go there here
-                    // for the reason the generator is not on the password's
-                    // own line either: that line is a four-bar meter, a rating
-                    // and a count in a control column around 200 points wide,
-                    // and `strength_meter` already drops its own character
-                    // count to fit. What is kept from 8a is the part that is
-                    // not furniture -- the same column, the same caption, the
-                    // same count in it.
+                    // inside the password row itself. It cannot go there here:
+                    // that line is a four-bar meter, a rating and a count in a
+                    // control column around 200 points wide, and
+                    // `strength_meter` already drops its own character count
+                    // to fit. What is kept from 8a is the part that is not
+                    // furniture -- the same column, the same caption, the same
+                    // count in it.
                     //
-                    // **Below the generator rather than between it and the
-                    // box.** The generator is the password box's own tool set;
-                    // a list of old passwords wedged between a field and the
-                    // controls that fill it would separate the two things on
-                    // this card that act on each other, and the list GROWS
-                    // when it is opened, so it would push them further apart
-                    // the moment it was used.
-                    //
-                    // Another empty-labelled row, so it starts at the control
-                    // column and not at the card's left edge -- see the
-                    // generator's own row above for why that indent matters.
+                    // An empty-labelled row, so it starts at the control
+                    // column and not at the CARD's left edge, which is where
+                    // the label column is: a block under `Password` and level
+                    // with it reads as another field's worth of chrome rather
+                    // than as this password's own history.
                     if !history.is_empty() {
                                 theme::section_row(ui, "", |ui| {
                             history_block(ui, &mut draft.history_open, &history);
@@ -8667,6 +8682,31 @@ pub fn draw_detail_edit(
     note_form_overflow(ui.ctx(), scrolled.content_size.y > scrolled.inner_rect.height());
 
 
+    // **The generator, over the form and under nothing.** Drawn here for the
+    // discard confirmation's reason -- after the form, so the scrim sits on
+    // top of the boxes rather than under them -- and BEFORE it, so that on the
+    // impossible frame where both are flagged the destructive question is the
+    // card on top.
+    //
+    // The three answers are the whole of the owner's sentence: "once saved -
+    // it replaces the value, otherwise if cancel - old remains there". `Use`
+    // is the only one that names the password box, `Cancel` is the only other
+    // way the card closes, and `Reroll` leaves it standing.
+    //
+    // **`action` is assigned only where there is an answer**, so a card that
+    // reported nothing cannot overwrite the `GeneratePassword` the `Generate`
+    // button set on this very frame when it opened the card.
+    if draft.generator.modal_open {
+        match draw_generator_modal(ui.ctx(), draft) {
+            GeneratorAnswer::Reroll => action = EditAction::GeneratePassword,
+            GeneratorAnswer::Use => {
+                draft.use_generated_password();
+            }
+            GeneratorAnswer::Cancel => draft.close_generator(),
+            GeneratorAnswer::None => {}
+        }
+    }
+
     // **Last, and over everything.** Drawn after the form so the overlay's
     // scrim sits on top of the boxes it is asking about, and only ever in
     // response to `discard_prompt`, which only the Cancel button above sets
@@ -8691,6 +8731,485 @@ pub fn draw_detail_edit(
     }
 
     action
+}
+
+// ---------------------------------------------------------------------------
+// The password generator, as a modal
+//
+// **The owner said "3a" and 3a is not this card.** Verbatim: "create 3a - on
+// generate button - it shows and user can select how to gen once saved - it
+// replaces the value, otherwise if cancel - old remains there". In
+// `docs/design/Deskwarden.dc.html`, `id="3a"` is **"No match"** -- the
+// overlay's card for an app Deskwarden knows and has no saved login for, a
+// heading, a sentence and a `Search vault` / `New login` pair. Nothing in it
+// generates anything. The card being described is `id="3d"`, **"Generate &
+// fill"**, and this file follows 3d.
+//
+// What 3d draws, read straight out of that HTML (1 CSS px = 1 point,
+// literally):
+//
+// * a card, `border: 1px solid #d7d3d3; border-radius: 10px; box-shadow: 0 8px
+//   20px rgba(45,43,43,.12)`, `424`pt wide (its parent panel is `width: 470`
+//   with `padding: 22` and a `1px` border, content-box);
+// * a body at `padding: 14px` with `gap: 12px`;
+// * a caption row: `GENERATED` at `font-size: 11px; font-weight: 700;
+//   letter-spacing: 0.1em; text-transform: uppercase; color: #7d7979`, and at
+//   the far right a `Strong` pill -- `color: #14307a; background: #eef2fc;
+//   border-radius: 999px; padding: 2px 8px; font-weight: 600`;
+// * the value itself in `ui-monospace` at `font-size: 17px; letter-spacing:
+//   0.02em; line-height: 1.35; word-break: break-all`;
+// * a control row at `gap: 10px`: a joined `Words / Letters / PIN` segmented
+//   selector (`padding: 5px 11px`, `border-radius: 7px`, the live cell
+//   `#1b3fa0` behind white), a `20 chars` readout, a spacer, and `CTRL+R NEW`
+//   in monospace `11px` `#14307a`;
+// * a footer band at `padding: 12px 14px; border-top: 1px solid #eae7e7;
+//   background: #fbfaf9`, holding a filled primary and an outlined `Copy`.
+//
+// Every one of those colours is already a constant in `theme` -- `#d7d3d3` is
+// `BORDER_STRONG`, `#7d7979` is `TEXT_FAINT`, `#14307a` is `BLUE_DEEP`,
+// `#eef2fc` is `BLUE_WASH`, `#eae7e7` is `HAIRLINE`, `#fbfaf9` is `CARD_TINT`
+// -- because `theme::modal_card` IS this card: a 10-radius outline, a body,
+// and a tinted footer band under a hairline. So the chrome comes from
+// `modal_card` and the BODY is 3d's, rather than 3d's chrome being
+// hand-rebuilt here beside an identical copy of itself.
+//
+// The three deliberate departures, each because 3d is the OVERLAY's generator
+// and this is the vault window's:
+//
+// * **Two kinds in the selector, not three.** 3d offers `Words / Letters /
+//   PIN`; `bw serve`'s `/generate` makes exactly two things (see
+//   `GenerateRequest`), so the run is `Password / Passphrase`. A third cell
+//   for a shape the backend cannot produce would be a control that lies.
+// * **The size is editable.** 3d's `20 chars` is a readout, because the
+//   overlay generates and fills in one keystroke. The owner asked that the
+//   user "can select how to gen", so it is the `DragValue` the old card row
+//   carried -- along with that row's `Options` disclosure, which is where
+//   every remaining option the route reads still lives.
+// * **The footer's second answer is Cancel, not `Copy`.** `modal_card` has
+//   exactly two slots and the left one is the way out; a card whose only exit
+//   was the ✕ would be the one card in this app without a named one. Copy is
+//   a gesture the password row already offers, on the value once it is taken.
+// ---------------------------------------------------------------------------
+
+/// The generator card's heading, in the header band's white bold.
+const GENERATOR_TITLE: &str = "Generate password";
+
+/// 3d's caption over the candidate.
+const GENERATOR_CAPTION: &str = "GENERATED";
+
+/// 3d's `font-size: 11px` and its `letter-spacing: 0.1em`, which at 11px is
+/// 1.1 points. `theme::letterspaced` wants the tracking in points because
+/// `RichText` has no em to give it.
+const GENERATOR_CAPTION_PX: f32 = 11.0;
+const GENERATOR_CAPTION_TRACKING: f32 = 1.1;
+
+/// 3d's value: `font-size: 17px`, `letter-spacing: 0.02em` (0.34pt at 17),
+/// `line-height: 1.35` (22.95pt).
+const GENERATOR_PREVIEW_PX: f32 = 17.0;
+const GENERATOR_PREVIEW_TRACKING: f32 = 0.34;
+const GENERATOR_PREVIEW_LINE: f32 = 22.95;
+
+/// 3d's `gap: 12px` down the card's body, and its `gap: 10px` across the
+/// control row.
+const GENERATOR_BODY_GAP: f32 = 12.0;
+const GENERATOR_ROW_GAP: f32 = 10.0;
+
+/// The card's width: 3d's own, derived above.
+///
+/// **It is what forced the `Options` disclosure onto a line of its own.**
+/// `theme::modal_card` insets its body by `MODAL_PAD_X`'s 20 where 3d's card
+/// uses `padding: 14`, so the row has 382 points to spend rather than 394; and
+/// this row carries two things 3d's does not -- an editable size and a re-roll
+/// BUTTON rather than a printed hint. With the disclosure on it as well the
+/// row measured 432 points of content, and the overflow does not show up as a
+/// wrap: `theme::row_button` builds itself inside a `ui.scope`, whose child
+/// `Ui` is not the wrapped one, so the button laid itself out past the card's
+/// edge and the card grew to 459 to hold it. Moving the disclosure down a line
+/// -- where a control that opens the block beneath it belongs anyway -- brings
+/// the row to 357 and leaves 25 points of slack for the widest number the
+/// spinner can show.
+///
+/// Wider than the pane the form is drawn in ever gets (the detail pane floors
+/// at 298), and that is correct rather than a mistake to be measured away: a
+/// modal is a WINDOW-level surface, centred over the whole vault window,
+/// which `crate::settings::MIN_VAULT_WINDOW_SIZE` floors at 900 across.
+const GENERATOR_CARD_WIDTH: f32 = 424.0;
+
+/// What the card shows in the value's place before the first candidate has
+/// arrived -- one frame on a healthy backend, and indefinitely after a
+/// generate the backend refused (which the window reports in its own band; see
+/// `EditAction::GeneratePassword`).
+///
+/// In the value's own 17px monospace rather than a smaller note, so the card
+/// is exactly one line tall either way: `theme::movable_modal` anchors an
+/// `Area` by the size egui measured on the PREVIOUS pass, so a body that
+/// changed height between two frames would paint the card once in a position
+/// it no longer fits -- the jump `theme::note_modal_shape_change` exists for.
+const GENERATOR_PENDING: &str = "no password yet";
+
+/// The affirmative answer's words.
+///
+/// **Not 3d's `Fill & save to vault`.** That button fills a field in another
+/// application and writes a new item; this one replaces the text in a box on a
+/// form the user still has to save. A caption promising a save would be a
+/// promise this card cannot keep.
+const GENERATOR_USE: &str = "Use password";
+
+/// The way out, and the word the header's ✕ resolves to.
+const GENERATOR_CANCEL: &str = "Cancel";
+
+/// 3d's `CTRL+R NEW`, as this app's own two controls: the chord in a keycap
+/// and the verb on a button. 3d prints the pair as one static monospace run,
+/// which is a hint rather than a control -- readable in an overlay a user
+/// drove there with the keyboard, and not enough on a card opened by a
+/// pointer.
+const GENERATOR_REROLL: &str = "New";
+const GENERATOR_REROLL_CHORD: &str = "CTRL+R";
+
+/// The segmented selector's two cells, in 3d's reading order (its own run puts
+/// the wordier choice first too).
+const GENERATOR_KIND_PASSWORD: &str = "Password";
+const GENERATOR_KIND_PASSPHRASE: &str = "Passphrase";
+
+/// What the generator modal came back with, or nothing if it is still asking.
+///
+/// Four variants rather than [`theme::ModalPress`]'s two flags, because this
+/// card has two answers the footer does not draw: a re-roll, and the recipe
+/// having been changed under the user's hand. Both mean the same thing to the
+/// caller -- ask the backend again -- and neither closes the card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GeneratorAnswer {
+    /// Still open, nothing to do.
+    None,
+    /// Ask `bw serve` for a fresh candidate and leave the card up.
+    Reroll,
+    /// The candidate becomes the password; the card closes.
+    Use,
+    /// The candidate is thrown away; the password box is untouched.
+    Cancel,
+}
+
+/// **The generator, as design block 3d's card over this window's scrim.**
+///
+/// The header of this section records what 3d draws and what this departs
+/// from. What is worth stating at the function itself is the seam, which the
+/// modal did not change: this form has no backend handle and runs on the UI
+/// thread, so it cannot generate anything. It reports [`GeneratorAnswer::
+/// Reroll`], the caller turns that into `EditAction::GeneratePassword`,
+/// `vault_window/mod.rs` calls `cache.bridge().generate(&draft
+/// .generator_request())`, and the answer comes back through
+/// [`EditDraft::set_generated_candidate`] into [`GeneratorDraft::preview`] --
+/// which is what this card is showing.
+///
+/// **A re-roll is raised by a CHANGE as well as by the button.** The recipe is
+/// read before the controls are drawn and again after, and a difference is a
+/// re-roll: a card whose selector said `Passphrase` over a candidate that is
+/// plainly a password would be lying about what the button beneath it would
+/// hand over. `GenerateRequest` is `PartialEq`, so this is the same comparison
+/// the wire would make and not a field-by-field copy of it that could fall out
+/// of step -- and it is deliberately the REQUEST rather than the draft, so
+/// that a change with no effect on the wire (opening the options disclosure)
+/// costs nothing.
+fn draw_generator_modal(ctx: &egui::Context, draft: &mut EditDraft) -> GeneratorAnswer {
+    let mut answer = GeneratorAnswer::None;
+
+    // The `Area` is declared HERE and its id is a literal, for the reason
+    // `icon_modal` gives: `item_list::MODAL_SCRIM_AREAS` is walked for exactly
+    // this declaration, and a scrim that walk cannot see is a modal the item
+    // list's arrow keys steer straight through.
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("password-generator-scrim")));
+
+    // Read before the body draws, because the body borrows the draft mutably
+    // and the footer's closure cannot borrow it again -- `theme::modal_card`'s
+    // own doc records that rule and `icon_modal` follows it for the same
+    // reason.
+    let ready = !draft.generator.preview.is_empty();
+    // **Whether a gesture is still in progress**, which is what holds a
+    // recipe change back until the user lets go. See [`GeneratorDraft::asked`]
+    // for the drag this exists for; read here rather than inside the body so
+    // it is the state at the START of the frame, before this frame's own
+    // release has been consumed by a button.
+    let settling = ctx.input(|i| i.pointer.any_down());
+    let mut rerolled = false;
+
+    let press = theme::modal_card(
+        ctx,
+        egui::Area::new(egui::Id::new("password-generator-modal")),
+        theme::ModalCard {
+            // Blue, not `ERROR`: this is an ordinary question. `icon_modal`
+            // argues the colour out in full.
+            accent: theme::BLUE,
+            glyph: theme::ModalGlyph::None,
+            title: GENERATOR_TITLE,
+            width: GENERATOR_CARD_WIDTH,
+            dismiss: GENERATOR_CANCEL,
+        },
+        |ui| rerolled = generator_card_body(ui, &mut draft.generator),
+        // **Greyed while there is no candidate**, rather than refusing on the
+        // click: an empty card is not a wrong answer, it is a request that has
+        // not come back (or one the backend refused), and a button that looked
+        // live and did nothing would be indistinguishable from a broken one.
+        // `EditDraft::use_generated_password` refuses the empty case anyway.
+        |ui| theme::primary_button_enabled(ui, GENERATOR_USE, None, ready),
+    );
+
+    // Confirm first and dismiss second, so that a frame somehow reporting both
+    // resolves to the answer that changes nothing -- the ordering
+    // `delete_modal` argues for its own pair.
+    if press.confirmed {
+        answer = GeneratorAnswer::Use;
+    }
+    if press.dismissed {
+        answer = GeneratorAnswer::Cancel;
+    }
+    // Esc cancels, same as every other transient overlay in this app -- and
+    // here it is also the SAFE answer by construction, because the card's
+    // other outcome overwrites a password the user may have typed by hand.
+    // The `None` guard is what stops an Escape arriving in the same frame as a
+    // click from throwing that click away.
+    if answer == GeneratorAnswer::None && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        answer = GeneratorAnswer::Cancel;
+    }
+    // Last, and only if nothing above answered: a card that is closing has
+    // nothing to re-roll into.
+    //
+    // The button is unconditional; a mere recipe CHANGE waits for the pointer
+    // to come up, so that dragging the size spinner is one request on release
+    // rather than one per frame of the drag against a blocking route. The
+    // difference is not lost in the meantime -- it is remembered in `asked`
+    // -- so the request goes out on the first frame after the user lets go.
+    if answer == GeneratorAnswer::None {
+        let now = draft.generator_request();
+        if rerolled || (!settling && draft.generator.asked.as_ref() != Some(&now)) {
+            draft.generator.asked = Some(now);
+            answer = GeneratorAnswer::Reroll;
+        }
+    }
+
+    answer
+}
+
+/// 3d's card body: the caption line, the value, and the control row -- plus
+/// the options disclosure's block when it is open. Answers whether the re-roll
+/// was asked for.
+///
+/// A free function taking only the [`GeneratorDraft`], exactly as
+/// [`generator_options`] is and for the same reason: it needs no other part of
+/// the draft, so its layout can be exercised against a `GeneratorDraft` alone.
+fn generator_card_body(ui: &mut egui::Ui, generator: &mut GeneratorDraft) -> bool {
+    let mut reroll = false;
+
+    generator_caption_row(ui, &generator.preview);
+    ui.add_space(GENERATOR_BODY_GAP - ui.spacing().item_spacing.y);
+    generator_preview(ui, &generator.preview);
+    ui.add_space(GENERATOR_BODY_GAP - ui.spacing().item_spacing.y);
+
+    // **Wrapped, not `horizontal`**, for the reason the row this replaces was
+    // wrapped: its content has a FLOOR rather than a share -- a two-cell
+    // segmented run, a spinner wide enough for " chars", a keycap and a button
+    // -- and an unwrapped row does not shrink to fit, it pushes its container
+    // out and inflates every `available_width()` measured after it. Inside a
+    // card of a FIXED width that means contents drawn past the card's own
+    // edge. Wrapping spends a second line instead, which is the only one of
+    // the two failures the user can still click.
+    //
+    // 3d puts its re-roll at the far right, behind a spacer. There is no
+    // spacer here: a `horizontal_wrapped` has no right-hand end to align to
+    // once the row may become two.
+    ui.horizontal_wrapped(|ui| {
+        // The one dial the segmented run, the size spinner, the keycap and the
+        // re-roll button all read, set to the run's own height so the row
+        // agrees by CONSTRUCTION rather than by four literals kept in step.
+        // `row_button` is already `theme::ROW_BUTTON_HEIGHT_2B`, which is the
+        // same 28.
+        ui.spacing_mut().interact_size.y = theme::SEGMENT_HEIGHT;
+        ui.spacing_mut().item_spacing.x = GENERATOR_ROW_GAP;
+        // **`Extend`, and without it the wrap above is decoration.** A
+        // `horizontal_wrapped` sets `Ui::wrap_mode` to `Wrap`, so a button
+        // whose turn comes with seven points of room left lays its label out
+        // INTO those seven points -- one letter per line -- reports a desired
+        // size that fits, and is never wrapped to the next row at all. What
+        // the eye sees is a stub of a control and a card that grew by the
+        // button's padding anyway. Measured: `New` came out 8.8 points wide on
+        // a card that went from 426 to 459. Extending makes every item ask for
+        // its natural width, which is the number egui's wrap test needs to be
+        // given before it can decide anything.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+        // 3d's joined run. `theme::segmented_control` reports the cell that
+        // was pressed even when it is the cell already in force, so the
+        // assignment below is deliberately unconditional -- setting a bool to
+        // what it already holds is the no-op the control expects its callers
+        // to make of that.
+        let picked = theme::segmented_control(
+            ui,
+            &[
+                theme::Segment {
+                    label: GENERATOR_KIND_PASSWORD,
+                    selected: !generator.passphrase,
+                },
+                theme::Segment {
+                    label: GENERATOR_KIND_PASSPHRASE,
+                    selected: generator.passphrase,
+                },
+            ],
+        );
+        match picked {
+            Some(0) => generator.passphrase = false,
+            Some(1) => generator.passphrase = true,
+            _ => {}
+        }
+        // One control, two meanings, because a passphrase's "4" and a
+        // password's "20" are not the same quantity -- so they are separate
+        // fields on the draft (see [`GeneratorDraft`]) and the suffix says
+        // which is on screen. The ranges are the route's own clamps; a box
+        // that offered 1 would come back as 5.
+        if generator.passphrase {
+            ui.add(
+                egui::DragValue::new(&mut generator.words)
+                    .range(MIN_WORDS..=MAX_WORDS)
+                    .suffix(" words"),
+            );
+        } else {
+            ui.add(
+                egui::DragValue::new(&mut generator.length)
+                    .range(MIN_LENGTH..=MAX_LENGTH)
+                    .suffix(" chars"),
+            );
+        }
+        // 3d's `CTRL+R NEW`, at the end of the row 3d puts it at.
+        theme::kbd_chip_on_card(ui, GENERATOR_REROLL_CHORD);
+        if theme::row_button(ui, GENERATOR_REROLL).clicked() {
+            reroll = true;
+        }
+    });
+    // **A disclosure, not seven more controls on the row above, and on a line
+    // of its own rather than at the end of that one.**
+    //
+    // Every control in the block it opens is a chip, a combo or a spinner in a
+    // `horizontal_wrapped` of its own, so the block's width floor is one
+    // widest chip rather than a sum -- it cannot push the card's contents past
+    // its edge however many options it grows, which is the property the row
+    // above does not have and the reason it is not the place to put them. See
+    // `the_generator_options_stay_inside_the_modal_card`.
+    //
+    // The line of its own is the row's width talking (see
+    // [`GENERATOR_CARD_WIDTH`]), and it is also where a disclosure belongs:
+    // directly above the thing it discloses.
+    ui.add_space(GENERATOR_BODY_GAP - ui.spacing().item_spacing.y);
+    if ui.selectable_label(generator.options_open, GENERATOR_OPTIONS).clicked() {
+        generator.options_open = !generator.options_open;
+    }
+    // The chord the keycap beside the button advertises. `consume_shortcut`
+    // compares the WHOLE modifier set, so this is CTRL+R and not CTRL+SHIFT+R
+    // -- and nothing else in this crate binds either.
+    let reroll_chord = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::R);
+    if ui.input_mut(|i| i.consume_shortcut(&reroll_chord)) {
+        reroll = true;
+    }
+    if generator.options_open {
+        ui.add_space(GENERATOR_BODY_GAP - ui.spacing().item_spacing.y);
+        generator_options(ui, generator);
+    }
+
+    reroll
+}
+
+/// 3d's caption line: `GENERATED` at the left, the candidate's strength at the
+/// far right.
+///
+/// **Laid out into an allocated rectangle against a painter**, rather than as
+/// a `ui.horizontal` with a right-to-left tail. `theme::state_pill` takes a
+/// painter and an anchor by design (`send_ui::draw_row`'s note records why:
+/// nested horizontal layouts are what has repeatedly pushed a control off a
+/// surface in this app), and a row with exactly two cells, one at each end,
+/// has nothing to gain from a layout.
+///
+/// **The pill is only blue when the rating earns it.** 3d's badge reads
+/// `Strong` in `#14307a` on `#eef2fc` because 3d's candidate always is one;
+/// this card rates whatever the backend sent, and a `Weak` badge in the
+/// affirmative colour would be telling the user the opposite of what it says.
+/// Anything short of `Strong` gets the quiet pair instead -- the same
+/// `BLUE_DEEP`/`TEXT_FAINT` split `theme::strength_meter` already makes on the
+/// form behind this card.
+///
+/// Nothing at all while there is no candidate: rating the empty string answers
+/// `Weak` (see `password_strength::rate`), and a card that opened by calling a
+/// password that does not exist yet weak would be scolding the user for a
+/// request still in flight.
+fn generator_caption_row(ui: &mut egui::Ui, preview: &str) {
+    let (row, _) = ui.allocate_exact_size(
+        egui::Vec2::new(ui.available_width(), theme::PILL_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    let galley = painter.layout_job(theme::letterspaced(
+        GENERATOR_CAPTION,
+        GENERATOR_CAPTION_PX,
+        theme::BOLD,
+        GENERATOR_CAPTION_TRACKING,
+        theme::TEXT_FAINT,
+    ));
+    painter.galley(
+        egui::Pos2::new(row.left(), row.center().y - galley.size().y / 2.0),
+        galley,
+        theme::TEXT_FAINT,
+    );
+    if preview.is_empty() {
+        return;
+    }
+    let rating = password_strength::rate(preview);
+    let strong = rating == password_strength::Strength::Strong;
+    let tone = theme::PillTone {
+        fill: if strong { theme::BLUE_WASH } else { theme::CANVAS },
+        // 3d's badge has no border at all; `state_pill` always strokes one, so
+        // the edge is the fill and the pill reads as the flat lozenge 3d draws.
+        edge: if strong { theme::BLUE_WASH } else { theme::CANVAS },
+        ink: if strong { theme::BLUE_DEEP } else { theme::TEXT_FAINT },
+        mark: theme::PillMark::None,
+    };
+    let width = theme::state_pill_width(painter, tone, rating.label());
+    theme::state_pill(
+        painter,
+        egui::Pos2::new(row.right() - width, row.center().y),
+        tone,
+        rating.label(),
+    );
+}
+
+/// The candidate itself, in 3d's 17px monospace.
+///
+/// **`break_anywhere`, which is 3d's `word-break: break-all`.** A generated
+/// password has no spaces to break at, so egui's default word wrapping would
+/// lay it out as one un-breakable run and let it overflow the card; a
+/// passphrase does have them, and breaking mid-word there is still right,
+/// because what matters is that every character is on screen and not that the
+/// words stay whole.
+///
+/// **Shown in the clear.** The form's own box is masked and stays masked (see
+/// [`EditDraft::use_generated_password`]); this is a generator the user opened
+/// on purpose, and a generator whose output is bulleted out cannot be read,
+/// judged or re-rolled.
+fn generator_preview(ui: &mut egui::Ui, preview: &str) {
+    let mut job = if preview.is_empty() {
+        theme::letterspaced_mono_in(
+            GENERATOR_PENDING,
+            GENERATOR_PREVIEW_PX,
+            0.0,
+            theme::TEXT_GHOST,
+            GENERATOR_PREVIEW_LINE,
+        )
+    } else {
+        theme::letterspaced_mono_in(
+            preview,
+            GENERATOR_PREVIEW_PX,
+            GENERATOR_PREVIEW_TRACKING,
+            theme::INK,
+            GENERATOR_PREVIEW_LINE,
+        )
+    };
+    job.wrap.max_width = ui.available_width();
+    job.wrap.break_anywhere = true;
+    ui.add(egui::Label::new(job));
 }
 
 /// What the discard confirmation came back with, or nothing if it is still
@@ -11005,15 +11524,80 @@ mod tests {
         }
     }
 
+    /// **Accepting the modal replaces a password the user had already typed.**
+    ///
+    /// The owner's words: "once saved - it replaces the value". The rule about
+    /// what a generate REPLACES lives on the draft, not at the call site --
+    /// "only if empty" and "append" are both readings of the button that this
+    /// pins out.
+    ///
+    /// **Re-targeted at the modal.** It used to call `set_generated_password`
+    /// and assert on `password`, because a generate WAS the replacement. Now a
+    /// generate only fills the candidate, and the replacement is the card's
+    /// affirmative answer -- so the test takes both steps, and the assertion
+    /// in the middle is the half that would have been silently lost: the box
+    /// is still what the user typed while the card is up.
     #[test]
     fn generating_replaces_a_password_the_user_had_already_typed() {
-        // The rule about what a generate REPLACES lives on the draft, not at
-        // the call site -- "only if empty" and "append" are both readings of
-        // the button that this pins out.
         let mut draft = EditDraft::empty();
         draft.password = "typed-by-hand".into();
-        draft.set_generated_password("Fresh-Generated-1");
+        draft.open_generator();
+        draft.set_generated_candidate("Fresh-Generated-1");
+        assert_eq!(
+            draft.password, "typed-by-hand",
+            "a candidate nobody has accepted yet overwrote the password box"
+        );
+
+        assert!(draft.use_generated_password(), "the candidate was not taken");
         assert_eq!(draft.password, "Fresh-Generated-1");
+        assert!(!draft.generator.modal_open, "accepting the candidate left the card open");
+        assert!(
+            draft.generator.preview.is_empty(),
+            "the accepted candidate is still sitting in the preview"
+        );
+    }
+
+    /// **Cancelling the modal leaves the old password exactly where it was.**
+    ///
+    /// The other half of the owner's sentence -- "otherwise if cancel - old
+    /// remains there" -- and the direction that has no second chance: a Cancel
+    /// that wrote the box would destroy a password the user typed by hand,
+    /// with nothing on screen to say it had.
+    #[test]
+    fn cancelling_the_generator_leaves_the_typed_password_alone() {
+        let mut draft = EditDraft::empty();
+        draft.password = "typed-by-hand".into();
+        draft.open_generator();
+        draft.set_generated_candidate("Fresh-Generated-1");
+
+        draft.close_generator();
+        assert_eq!(
+            draft.password, "typed-by-hand",
+            "cancelling the generator overwrote the password the user had typed"
+        );
+        assert!(!draft.generator.modal_open, "cancelling left the card open");
+        assert!(
+            draft.generator.preview.is_empty(),
+            "the refused candidate is still sitting in the preview"
+        );
+    }
+
+    #[test]
+    fn reopening_the_generator_shows_no_stale_candidate() {
+        // A card reopened after a Cancel must not offer the very password the
+        // user has just refused -- and must not offer one generated under a
+        // recipe they have since changed. `open_generator` clears rather than
+        // keeps, and this is what says so.
+        let mut draft = EditDraft::empty();
+        draft.open_generator();
+        draft.set_generated_candidate("Fresh-Generated-1");
+        draft.close_generator();
+
+        draft.open_generator();
+        assert!(
+            draft.generator.preview.is_empty(),
+            "the reopened generator is showing the candidate from last time"
+        );
     }
 
     #[test]
@@ -11021,14 +11605,32 @@ mod tests {
         // A deliberate deviation from Bitwarden's own generators, which show
         // what they produced. `reveal_password` is the user's toggle; a
         // generate flipping it would put a secret on screen that nobody asked
-        // to see.
+        // to see. (The modal's own preview IS in the clear, which is a
+        // different question -- see `generator_preview`.)
         let mut draft = EditDraft::empty();
         assert!(!draft.reveal_password, "the premise");
-        draft.set_generated_password("Fresh-Generated-1");
+        draft.open_generator();
+        draft.set_generated_candidate("Fresh-Generated-1");
+        draft.use_generated_password();
         assert!(
             !draft.reveal_password,
             "generating a password unmasked the box on the user's behalf"
         );
+    }
+
+    #[test]
+    fn accepting_an_empty_candidate_takes_nothing_and_still_closes() {
+        // The card's affirmative button is greyed while there is no candidate,
+        // so this is not a state the pointer can reach today -- which is
+        // exactly why it is pinned: a keyboard path added later must not be
+        // able to blank a password with a refused generate.
+        let mut draft = EditDraft::empty();
+        draft.password = "typed-by-hand".into();
+        draft.open_generator();
+
+        assert!(!draft.use_generated_password(), "an empty candidate reported a take");
+        assert_eq!(draft.password, "typed-by-hand", "an empty candidate blanked the box");
+        assert!(!draft.generator.modal_open, "the card stayed open on an empty take");
     }
 
     #[test]
@@ -11383,18 +11985,27 @@ mod tests {
     }
 }
 
-/// The generator row's **widget bindings**, which none of the tests above can
+/// The generator's **widget bindings**, which none of the tests above can
 /// see.
 ///
-/// `generator_request` and `set_generated_password` are pure, directly tested,
-/// and were never the risk. What was untested is what the three widgets beside
-/// the password box hand them, and a reviewer proved the gap with three
-/// mutations that left the whole suite green: deleting the Generate button
-/// outright (the feature ships inert, and `EditAction::GeneratePassword` being
-/// `pub` means not even a dead-code warning), binding the combo's "Password"
-/// entry to `true` (picking Password yields a passphrase), and pointing the
-/// "N words" spinner at `generator.length` (setting "8 words" edits the
-/// character count instead).
+/// **These have moved from the card to the modal, and the module keeps its
+/// name.** Every control they drive used to sit on a recipe row under the
+/// password box; the owner asked for that row to come off the card
+/// ("generator should prob be in a separate modal"), so each test now opens
+/// `draw_generator_modal`'s card first and presses the same control there.
+/// The claims are unchanged -- which widget is wired to which field -- and
+/// they are still the claims worth making, because a control that moved
+/// house is exactly the kind that arrives unwired.
+///
+/// `generator_request` and `set_generated_candidate` are pure, directly
+/// tested, and were never the risk. What was untested is what the widgets hand
+/// them, and a reviewer proved the gap with three mutations that left the
+/// whole suite green: deleting the Generate button outright (the feature ships
+/// inert, and `EditAction::GeneratePassword` being `pub` means not even a
+/// dead-code warning), binding the kind selector's "Password" cell to `true`
+/// (picking Password yields a passphrase), and pointing the "N words" spinner
+/// at `generator.length` (setting "8 words" edits the character count
+/// instead).
 ///
 /// These are **behavioural**, not source-text guards. `draw_detail_edit` takes
 /// a `&mut Ui` and returns its action, so a headless `egui::Context` really can
@@ -11571,14 +12182,96 @@ mod generator_row_tests {
         draft
     }
 
+    fn escape() -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    }
+
+    /// Flags the generator card open and runs the frames egui needs before it
+    /// paints anything, handing back the second one.
+    ///
+    /// **Two frames, and the second is not optional.** An `egui::Area` the
+    /// context has never seen runs a *sizing pass* on its first frame: that
+    /// `Ui` is invisible and the whole card tessellates to nothing, so a
+    /// harness that read the first frame would see the form alone and conclude
+    /// every control on the card was missing. `folder_modal`'s own `opened`
+    /// records the same fact for the same reason.
+    ///
+    /// Sets the flag rather than pressing `Generate`, so that a test about (say)
+    /// the words spinner fails for the spinner's reasons and not the button's.
+    /// `clicking_generate_opens_the_card_and_asks_for_the_first_candidate` is
+    /// the one test that goes in through the door.
+    fn open_card(ctx: &egui::Context, draft: &mut EditDraft) -> Painted {
+        // Through `open_generator` rather than by setting the flag, because
+        // that is what seeds `GeneratorDraft::asked` -- a card opened without
+        // it reports a recipe change on its very first frame. A candidate a
+        // fixture staged beforehand is handed back afterwards, which is the
+        // order the real window does it in: the button opens the card, and
+        // `set_generated_candidate` fills it a frame later.
+        let candidate = draft.generator.preview.clone();
+        draft.open_generator();
+        if !candidate.is_empty() {
+            draft.set_generated_candidate(&candidate);
+        }
+        let _ = frame(ctx, draft, &[]);
+        let (action, painted) = frame(ctx, draft, &[]);
+        assert_eq!(
+            action,
+            EditAction::None,
+            "the card reported an action on a frame with no input at all"
+        );
+        painted
+    }
+
+    /// The rectangle egui really laid the generator card's `Area` out in.
+    fn card_rect(ctx: &egui::Context) -> Rect {
+        egui::AreaState::load(ctx, egui::Id::new("password-generator-modal"))
+            .expect("the generator card has never been drawn")
+            .rect()
+    }
+
+    /// The one rect painting `label` **inside the card**.
+    ///
+    /// The form behind the scrim keeps painting, and it spells some of the
+    /// card's own words: `Password` is the password row's caption as well as
+    /// the kind selector's first cell, and `Cancel` is the form's footer as
+    /// well as the card's. Filtering by the card's own rectangle is what tells
+    /// the two apart -- by geometry rather than by paint order, which is an
+    /// implementation detail of egui's layer sort and not a fact this file
+    /// should rest on.
+    fn in_card(ctx: &egui::Context, painted: &Painted, label: &str) -> Rect {
+        let card = card_rect(ctx);
+        let found: Vec<Rect> =
+            painted.rects_of(label).into_iter().filter(|r| card.contains_rect(*r)).collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one {label:?} inside the generator card, found {}; painted: {:?}",
+            found.len(),
+            painted.strings()
+        );
+        found[0]
+    }
+
     // -- the Generate button -----------------------------------------------
 
     #[test]
-    fn clicking_generate_is_what_asks_the_caller_to_generate() {
+    fn clicking_generate_opens_the_card_and_asks_for_the_first_candidate() {
         // Mutation this catches: delete the button. Nothing else in the crate
         // notices -- `EditAction::GeneratePassword` is `pub`, so its remaining
         // producers being zero is not even a warning, and every test of the
         // conversion functions keeps passing while the feature is inert.
+        //
+        // **Both halves, because the button now does two things in one
+        // gesture.** It opens the card and asks for the candidate the card
+        // will show; a build that only opened it would leave the user looking
+        // at an empty generator with a greyed affirmative button, and one that
+        // only asked would be the old behaviour with no card at all.
         let ctx = styled_context();
         let mut draft = login_draft(false);
 
@@ -11588,6 +12281,7 @@ mod generator_row_tests {
             EditAction::None,
             "the form reported an action on a frame with no input at all"
         );
+        assert!(!draft.generator.modal_open, "the form opened the card by itself");
         let button = first.rect_of("Generate");
 
         let (action, _) = frame(&ctx, &mut draft, &click(button.center()));
@@ -11595,6 +12289,10 @@ mod generator_row_tests {
             action,
             EditAction::GeneratePassword,
             "clicking Generate did not ask for a password; the button is decoration"
+        );
+        assert!(
+            draft.generator.modal_open,
+            "clicking Generate did not open the generator card -- the owner asked for a modal"
         );
     }
 
@@ -11613,52 +12311,300 @@ mod generator_row_tests {
         assert_eq!(action, EditAction::None, "a click that hit nothing still generated");
     }
 
-    // -- the kind combo ----------------------------------------------------
+    // -- the kind selector -------------------------------------------------
+    //
+    // **A segmented run now, where this was a `ComboBox`.** Design block 3d's
+    // generator picks its kind with a joined `Words / Letters / PIN` run, and
+    // the card follows it (with the two kinds `bw serve` can actually make).
+    // The claim these two tests make is the claim they always made -- pressing
+    // the cell named X selects X -- so they are re-targeted rather than
+    // replaced; what is gone is the four-frame popup dance, because a
+    // segmented cell has no popup.
 
-    /// Opens the combo and clicks the entry named `entry`, returning the draft
-    /// afterwards. Four frames, and the shape is egui's: the popup only PAINTS
-    /// on the frame after the button that opened it was clicked, so the frame
-    /// that locates a row and the frame that clicks the button cannot be the
-    /// same one.
+    /// Opens the card and clicks the kind cell named `entry`, returning the
+    /// generator afterwards.
     fn pick_generator_kind(start: bool, entry: &str) -> GeneratorDraft {
         let ctx = styled_context();
         let mut draft = login_draft(start);
 
-        let (_, closed) = frame(&ctx, &mut draft, &[]);
-        let button = closed.combo_button(if start { "Passphrase" } else { "Password" });
+        let painted = open_card(&ctx, &mut draft);
+        let cell = in_card(&ctx, &painted, entry);
 
-        let _ = frame(&ctx, &mut draft, &click(button.center()));
-        let (_, open) = frame(&ctx, &mut draft, &[]);
-        let row = open.popup_entry(entry, button);
-
-        let _ = frame(&ctx, &mut draft, &click(row.center()));
+        let _ = frame(&ctx, &mut draft, &click(cell.center()));
         draft.generator.clone()
     }
 
     #[test]
-    fn picking_password_in_the_combo_asks_for_a_password() {
-        // Mutation this catches: `selectable_value(&mut draft.generator
-        // .passphrase, true, "Password")`. The conversion test
-        // `a_passphrase_and_a_password_do_not_share_one_number` keeps passing
-        // through that -- it guards the conversion, and this is the binding.
+    fn picking_password_in_the_selector_asks_for_a_password() {
+        // Mutation this catches: the two cells' assignments transposed. The
+        // conversion test `a_passphrase_and_a_password_do_not_share_one_number`
+        // keeps passing through that -- it guards the conversion, and this is
+        // the binding.
         let generator = pick_generator_kind(true, "Password");
         assert!(
             !generator.passphrase,
-            "the combo's \"Password\" row does not select a password"
+            "the selector's \"Password\" cell does not select a password"
         );
     }
 
     #[test]
-    fn picking_passphrase_in_the_combo_asks_for_a_passphrase() {
+    fn picking_passphrase_in_the_selector_asks_for_a_passphrase() {
         // The other direction, and the positive control for the one above: a
-        // combo whose rows were both bound to `false` would satisfy that test
-        // alone, as would one whose rows were inert with the draft already
+        // run whose cells were both bound to `false` would satisfy that test
+        // alone, as would one whose cells were inert with the draft already
         // holding the expected value.
         let generator = pick_generator_kind(false, "Passphrase");
         assert!(
             generator.passphrase,
-            "the combo's \"Passphrase\" row does not select a passphrase"
+            "the selector's \"Passphrase\" cell does not select a passphrase"
         );
+    }
+
+    // -- what the card does with the candidate ------------------------------
+    //
+    // The crux of what the owner asked for, in both directions, through the
+    // real widgets: "once saved - it replaces the value, otherwise if cancel -
+    // old remains there". `generating_replaces_a_password_the_user_had_already
+    // _typed` and `cancelling_the_generator_leaves_the_typed_password_alone`
+    // make the same two claims of the draft's own methods; these say the
+    // card's two buttons are wired to them.
+
+    /// A draft with a password already in the box and a candidate already in
+    /// the card, so both directions have something real to keep or replace.
+    fn card_draft() -> EditDraft {
+        let mut draft = login_draft(false);
+        draft.password = "typed-by-hand".to_string();
+        draft.generator.preview = "Fresh-Generated-1".to_string();
+        draft
+    }
+
+    #[test]
+    fn the_cards_affirmative_answer_replaces_the_password() {
+        let ctx = styled_context();
+        let mut draft = card_draft();
+        let painted = open_card(&ctx, &mut draft);
+        let use_it = in_card(&ctx, &painted, GENERATOR_USE);
+
+        let _ = frame(&ctx, &mut draft, &click(use_it.center()));
+        assert_eq!(
+            draft.password, "Fresh-Generated-1",
+            "{GENERATOR_USE:?} did not put the candidate in the password box"
+        );
+        assert!(!draft.generator.modal_open, "the card stayed open after its own answer");
+    }
+
+    #[test]
+    fn the_cards_cancel_leaves_the_password_alone() {
+        // The direction with no second chance: a Cancel that wrote the box
+        // would destroy a password the user typed by hand, with nothing on
+        // screen to say it had.
+        let ctx = styled_context();
+        let mut draft = card_draft();
+        let painted = open_card(&ctx, &mut draft);
+        let cancel = in_card(&ctx, &painted, GENERATOR_CANCEL);
+
+        let _ = frame(&ctx, &mut draft, &click(cancel.center()));
+        assert_eq!(
+            draft.password, "typed-by-hand",
+            "cancelling the generator card overwrote the password the user had typed"
+        );
+        assert!(!draft.generator.modal_open, "cancelling left the card open");
+    }
+
+    #[test]
+    fn escape_closes_the_card_and_keeps_the_password() {
+        // Escape is the reflex for "get this off my screen", so it must
+        // resolve to the answer that destroys nothing -- the rule every other
+        // transient overlay in this app already follows.
+        let ctx = styled_context();
+        let mut draft = card_draft();
+        let _ = open_card(&ctx, &mut draft);
+
+        let _ = frame(&ctx, &mut draft, &escape());
+        assert!(!draft.generator.modal_open, "Escape did not close the generator card");
+        assert_eq!(
+            draft.password, "typed-by-hand",
+            "Escape answered the card with its affirmative half"
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_scrim_answers_the_card_with_nothing() {
+        // The positive control for the three above: the scrim is a full-window
+        // click-catcher, and if any click anywhere resolved the card they
+        // would all pass with both buttons deleted. It also pins the scrim's
+        // own rule -- clicking away from this card must not be read as either
+        // answer, because one of them overwrites a password.
+        let ctx = styled_context();
+        let mut draft = card_draft();
+        let _ = open_card(&ctx, &mut draft);
+        let card = card_rect(&ctx);
+
+        let away = Pos2::new(card.center().x, card.top() - 40.0);
+        let (action, _) = frame(&ctx, &mut draft, &click(away));
+        assert_eq!(action, EditAction::None, "a click on the scrim answered the card");
+        assert!(draft.generator.modal_open, "a click on the scrim closed the card");
+        assert_eq!(draft.password, "typed-by-hand", "a click on the scrim wrote the box");
+    }
+
+    #[test]
+    fn the_card_shows_the_candidate_the_caller_handed_it() {
+        // Mutation this catches: a preview bound to `draft.password`. Every
+        // other test here would stay green -- the two boxes hold different
+        // strings only because this fixture makes them -- and the card would
+        // be showing the user the password it is offering to replace.
+        let ctx = styled_context();
+        let mut draft = card_draft();
+        let painted = open_card(&ctx, &mut draft);
+        assert!(
+            painted.strings().contains(&"Fresh-Generated-1"),
+            "the card is not showing its candidate; painted: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.strings().contains(&GENERATOR_CAPTION),
+            "the card is missing 3d's {GENERATOR_CAPTION:?} caption; painted: {:?}",
+            painted.strings()
+        );
+        assert!(
+            !painted.strings().contains(&GENERATOR_PENDING),
+            "the card is showing its empty-state line over a real candidate"
+        );
+    }
+
+    #[test]
+    fn a_card_with_no_candidate_says_so_instead_of_rating_nothing() {
+        // `password_strength::rate("")` answers `Weak`, so a card that rated
+        // whatever it held would open by calling a password that does not
+        // exist yet weak -- scolding the user for a request still in flight.
+        let ctx = styled_context();
+        let mut draft = login_draft(false);
+        let painted = open_card(&ctx, &mut draft);
+        assert!(
+            painted.strings().contains(&GENERATOR_PENDING),
+            "an empty card does not say it is empty; painted: {:?}",
+            painted.strings()
+        );
+        assert!(
+            !painted.strings().contains(&password_strength::Strength::Weak.label()),
+            "an empty card rated the password it has not got; painted: {:?}",
+            painted.strings()
+        );
+    }
+
+    // -- asking for a fresh candidate ---------------------------------------
+
+    #[test]
+    fn pressing_new_asks_the_caller_for_a_fresh_candidate() {
+        // 3d's `CTRL+R NEW`. Mutation this catches: a re-roll that rebuilds
+        // nothing -- the card would sit showing the same password however
+        // often it was pressed, which is the one thing a generator must not
+        // do.
+        let ctx = styled_context();
+        let mut draft = card_draft();
+        let painted = open_card(&ctx, &mut draft);
+        let button = in_card(&ctx, &painted, GENERATOR_REROLL);
+
+        let (action, _) = frame(&ctx, &mut draft, &click(button.center()));
+        assert_eq!(
+            action,
+            EditAction::GeneratePassword,
+            "{GENERATOR_REROLL:?} did not ask for a fresh password"
+        );
+        assert!(draft.generator.modal_open, "a re-roll closed the card");
+    }
+
+    #[test]
+    fn changing_the_recipe_asks_for_a_fresh_candidate() {
+        // Without this the card would show a candidate its own selector
+        // contradicts: `Passphrase` lit over a string that is plainly a
+        // password, and an affirmative button that hands over the latter.
+        let ctx = styled_context();
+        let mut draft = card_draft();
+        let painted = open_card(&ctx, &mut draft);
+        let cell = in_card(&ctx, &painted, "Passphrase");
+
+        let (action, _) = frame(&ctx, &mut draft, &click(cell.center()));
+        assert!(draft.generator.passphrase, "control: the click did not change the recipe");
+        assert_eq!(
+            action,
+            EditAction::GeneratePassword,
+            "changing the kind left the card showing a candidate made the other way"
+        );
+    }
+
+    #[test]
+    fn dragging_the_size_spinner_asks_once_on_release_and_not_once_a_frame() {
+        // **The reason `GeneratorDraft::asked` exists.** `vault_window/mod.rs`
+        // answers `GeneratePassword` with a BLOCKING call to `bw serve` on the
+        // UI thread, so a card that re-rolled on every frame the number
+        // changed would turn one drag into dozens of round trips and a frozen
+        // window. The request is held back while the pointer is down and goes
+        // out on the first frame after it comes up.
+        let ctx = styled_context();
+        let mut draft = card_draft();
+        let painted = open_card(&ctx, &mut draft);
+        let (_, rect) = spinner(&painted, " chars");
+        let from = rect.center();
+
+        let (press, _) = frame(
+            &ctx,
+            &mut draft,
+            &[
+                egui::Event::PointerMoved(from),
+                egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        assert_eq!(press, EditAction::None, "the press alone asked for a password");
+
+        let to = from + egui::vec2(120.0, 0.0);
+        let (mid, _) = frame(&ctx, &mut draft, &[egui::Event::PointerMoved(to)]);
+        assert_ne!(draft.generator.length, 33, "control: the drag moved no number");
+        assert_eq!(
+            mid,
+            EditAction::None,
+            "the card asked for a password mid-drag, against a route that blocks the UI thread"
+        );
+
+        let (release, _) = frame(
+            &ctx,
+            &mut draft,
+            &[egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert_eq!(
+            release,
+            EditAction::GeneratePassword,
+            "letting go of the size spinner never asked for the password the new size wants"
+        );
+
+        // And exactly once: the recipe it asked under is remembered, so the
+        // next idle frame has nothing left to report.
+        let (after, _) = frame(&ctx, &mut draft, &[]);
+        assert_eq!(after, EditAction::None, "the card asked again for the same recipe");
+    }
+
+    #[test]
+    fn an_idle_card_asks_for_nothing() {
+        // The positive control for both tests above: a card that reported a
+        // re-roll every frame would satisfy them with the button deleted and
+        // the recipe comparison removed -- and would ask `bw serve` for a new
+        // password sixty times a second.
+        let ctx = styled_context();
+        let mut draft = card_draft();
+        let _ = open_card(&ctx, &mut draft);
+
+        let (action, _) = frame(&ctx, &mut draft, &[]);
+        assert_eq!(action, EditAction::None, "an untouched card asked for a fresh password");
     }
 
     // -- the size spinner --------------------------------------------------
@@ -11700,7 +12646,7 @@ mod generator_row_tests {
         let ctx = styled_context();
         let mut draft = login_draft(true);
 
-        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let painted = open_card(&ctx, &mut draft);
         let (shown, rect) = spinner(&painted, " words");
         assert_eq!(
             shown, "7",
@@ -11723,7 +12669,7 @@ mod generator_row_tests {
         let ctx = styled_context();
         let mut draft = login_draft(false);
 
-        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let painted = open_card(&ctx, &mut draft);
         let (shown, rect) = spinner(&painted, " chars");
         assert_eq!(
             shown, "33",
@@ -11779,6 +12725,16 @@ mod generator_row_tests {
     // `Separator` are pure and tested to death in `tests`, and none of that
     // says the chips are WIRED. Each of these names the mutation it catches.
 
+    /// **The disclosure still opens and closes its block -- on the card now.**
+    ///
+    /// Re-targeted, not replaced: the chip and the block moved into the
+    /// generator modal together, and the claim is the one it always was.
+    ///
+    /// The chip is re-located between the two clicks rather than clicked twice
+    /// at one point, which is new and is not a stylistic choice: the card is
+    /// centred, so a block that opens makes it TALLER and every control in it
+    /// moves up by half the growth. A second click at the first frame's
+    /// coordinates would land on whatever had slid into that spot.
     #[test]
     fn the_options_chip_opens_and_closes_the_block() {
         // Mutation this catches: draw the block unconditionally, or never.
@@ -11786,16 +12742,20 @@ mod generator_row_tests {
         let ctx = styled_context();
         let mut draft = login_draft(false);
 
-        let (_, shut) = frame(&ctx, &mut draft, &[]);
+        let shut = open_card(&ctx, &mut draft);
         assert!(
             !shut.strings().contains(&"Use these characters"),
             "the options block is on screen before anybody opened it: {:?}",
             shut.strings()
         );
-        let chip = shut.rect_of(GENERATOR_OPTIONS);
+        let chip = in_card(&ctx, &shut, GENERATOR_OPTIONS);
 
         let _ = frame(&ctx, &mut draft, &click(chip.center()));
         assert!(draft.generator.options_open, "clicking Options did not open the block");
+        // One settling frame, then a fresh reading: the card has just changed
+        // height and an anchored `Area` is placed from the size measured on
+        // the previous pass.
+        let _ = frame(&ctx, &mut draft, &[]);
         let (_, open) = frame(&ctx, &mut draft, &[]);
         assert!(
             open.strings().contains(&"Use these characters"),
@@ -11803,6 +12763,7 @@ mod generator_row_tests {
             open.strings()
         );
 
+        let chip = in_card(&ctx, &open, GENERATOR_OPTIONS);
         let _ = frame(&ctx, &mut draft, &click(chip.center()));
         assert!(!draft.generator.options_open, "clicking Options again did not close the block");
     }
@@ -11813,20 +12774,24 @@ mod generator_row_tests {
         // would pass the test above with the chip deleted.
         let ctx = styled_context();
         let mut draft = login_draft(false);
-        let (_, first) = frame(&ctx, &mut draft, &[]);
-        let chip = first.rect_of(GENERATOR_OPTIONS);
+        let first = open_card(&ctx, &mut draft);
+        let chip = in_card(&ctx, &first, GENERATOR_OPTIONS);
         let miss = Pos2::new(chip.center().x, chip.top() - 60.0);
         let _ = frame(&ctx, &mut draft, &click(miss));
         assert!(!draft.generator.options_open, "a click that hit nothing opened the options");
     }
 
-    /// Opens the block and clicks the chip labelled `label`, answering with
-    /// the generator afterwards.
+    /// Opens the card with the block already showing and clicks the chip
+    /// labelled `label`, answering with the generator afterwards.
+    ///
+    /// The block is flagged open BEFORE the card is, so the card is its final
+    /// height on the very first pass egui measures it at and no control moves
+    /// between the frame that locates the chip and the frame that clicks it.
     fn click_option(mut draft: EditDraft, label: &str) -> GeneratorDraft {
         let ctx = styled_context();
         draft.generator.options_open = true;
-        let (_, painted) = frame(&ctx, &mut draft, &[]);
-        let chip = painted.rect_of(label);
+        let painted = open_card(&ctx, &mut draft);
+        let chip = in_card(&ctx, &painted, label);
         let _ = frame(&ctx, &mut draft, &click(chip.center()));
         draft.generator.clone()
     }
@@ -11873,13 +12838,13 @@ mod generator_row_tests {
 
         let ctx = styled_context();
         draft.generator.options_open = true;
-        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        let painted = open_card(&ctx, &mut draft);
         assert!(
             painted.strings().contains(&LAST_CLASS_HINT),
             "the last class standing is greyed with no explanation: {:?}",
             painted.strings()
         );
-        let chip = painted.rect_of(CharClass::Lowercase.label());
+        let chip = in_card(&ctx, &painted, CharClass::Lowercase.label());
         let _ = frame(&ctx, &mut draft, &click(chip.center()));
         assert!(
             draft.generator.classes.is_on(CharClass::Lowercase),
@@ -11912,11 +12877,11 @@ mod generator_row_tests {
         // classes -- `GenerateRequest`'s doc records that the command reads
         // every key on every request, so a form that offered both would be
         // offering controls that do nothing.
-        let ctx = styled_context();
         for passphrase in [false, true] {
+            let ctx = styled_context();
             let mut draft = login_draft(passphrase);
             draft.generator.options_open = true;
-            let (_, painted) = frame(&ctx, &mut draft, &[]);
+            let painted = open_card(&ctx, &mut draft);
             let strings = painted.strings();
             assert_eq!(
                 strings.contains(&"Use these characters"),
@@ -11941,7 +12906,7 @@ mod generator_row_tests {
         let mut draft = login_draft(true);
         draft.generator.options_open = true;
 
-        let (_, closed) = frame(&ctx, &mut draft, &[]);
+        let closed = open_card(&ctx, &mut draft);
         let button = closed.combo_button(Separator::Hyphen.label());
         let _ = frame(&ctx, &mut draft, &click(button.center()));
         let (_, open) = frame(&ctx, &mut draft, &[]);
@@ -15738,88 +16703,133 @@ mod edit_pane_layout_tests {
     /// [`the_generator_rows_controls_are_all_reachable_at_the_minimum_width`].
     const ROOMY_PANE: Vec2 = egui::vec2(560.0, 1400.0);
 
-    /// The three frames the generator row paints, in the order the user
-    /// reads them: Generate, the kind combo, the size spinner --
+    /// **The app's minimum WINDOW width**, which is what a modal is laid out
+    /// against.
+    ///
+    /// `MIN_PANE_WIDTH` above is the detail pane at that same window size --
+    /// 298 points -- and it is the right floor for anything drawn inside the
+    /// form. It is the wrong one for the generator card: that card is an
+    /// `egui::Area` centred over the whole vault window, so the room it has is
+    /// the window's, and `GENERATOR_CARD_WIDTH`'s 424 is wider than the pane
+    /// on purpose.
+    const MIN_WINDOW_WIDTH: f32 = crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32;
+
+    /// A draft whose generator card is up, over [`tallest_draft`]'s form.
+    fn generating_draft(passphrase: bool) -> EditDraft {
+        let mut draft = tallest_draft();
+        draft.generator.passphrase = passphrase;
+        // Through `open_generator`, not by setting the flag: it is what seeds
+        // `GeneratorDraft::asked`, and a card opened without that reports a
+        // recipe change on its first frame.
+        draft.open_generator();
+        // A candidate in hand, so the card is at the height it spends nearly
+        // all of its life at rather than at the one-frame empty state. It is
+        // 3d's own printed value, and it rates `Strong`, so the caption row's
+        // pill is drawn too.
+        draft.set_generated_candidate("tq7Rvk29mzpLx4-hd8");
+        draft
+    }
+
+    /// The rectangle egui really laid the generator card's `Area` out in.
+    fn generator_card_rect(ctx: &egui::Context) -> Rect {
+        egui::AreaState::load(ctx, egui::Id::new("password-generator-modal"))
+            .expect("the generator card has never been drawn")
+            .rect()
+    }
+
+    /// The one rect painting `label` inside the generator card.
+    ///
+    /// The form keeps painting behind the scrim and spells some of the card's
+    /// own words -- `Password` is the password row's caption as well as the
+    /// kind selector's first cell -- so the card's own rectangle is what tells
+    /// the two apart.
+    fn in_card(ctx: &egui::Context, painted: &Painted, label: &str) -> Rect {
+        let card = generator_card_rect(ctx);
+        let found: Vec<Rect> =
+            painted.rects_of(label).into_iter().filter(|r| card.contains_rect(*r)).collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one {label:?} inside the generator card, found {}; painted: {:?}",
+            found.len(),
+            painted.strings()
+        );
+        found[0]
+    }
+
+    /// The two frames the generator's recipe row paints, in the order the user
+    /// reads them: the kind selector's live cell, then the size spinner --
     /// **in whichever of the row's two states `passphrase` names.**
     ///
-    /// **Both states, and why that is not a detail.** The row's third control
-    /// is a `DragValue` on either branch -- `2cb45fc`'s report claimed the
-    /// widget itself changes with the kind, and that is simply false; what
-    /// changes is which draft field it is bound to and which suffix it wears
-    /// (`" words"` against `" chars"`), and the combo's `selected_text` with
-    /// it. But this helper used to key on `" chars"` unconditionally and
+    /// **This row is on the generator CARD now**, not under the password box.
+    /// The owner asked for the move ("should be no controls under password
+    /// with generator settings etc"), and design block 3d draws the same two
+    /// things on the same line -- a joined kind selector and a size readout --
+    /// so the row survived the move and so do the claims made about it here.
+    /// What changed is that the kind is a `theme::segmented_control` cell
+    /// rather than a `ComboBox` button.
+    ///
+    /// **Both states, and why that is not a detail.** The row's second control
+    /// is a `DragValue` on either branch -- what changes is which draft field
+    /// it is bound to and which suffix it wears (`" words"` against
+    /// `" chars"`). This helper used to key on `" chars"` unconditionally and
     /// every caller passed a draft with `passphrase == false`, so the
     /// passphrase branch was measured by NOTHING: an `interact_size.y = 26.0`
     /// planted inside it left the row misaligned in exactly the way the fix
-    /// was written to stop, and the whole suite stayed green. Taking the
-    /// state as a parameter is what makes the alignment a fact about the ROW
-    /// rather than about one of its two spellings.
+    /// was written to stop, and the whole suite stayed green. Taking the state
+    /// as a parameter is what makes the alignment a fact about the ROW rather
+    /// than about one of its two spellings.
     ///
-    /// **The count assertion is the point.** egui culls a shape lying
-    /// entirely outside the screen rect, so a control pushed off the pane
-    /// comes back as NOTHING -- and every "they all agree" assertion is
-    /// vacuously true of two controls, or of one. `frame_around` panics
-    /// rather than skipping when a control drew no frame, which is what a
-    /// zero-sized widget looks like: on screen to a presence check, invisible
-    /// to the eye.
-    fn generator_row_frames(painted: &Painted, passphrase: bool) -> [Rect; 2] {
-        // **`Generate` is no longer one of these.** It moved onto the
-        // password box's own line, where 8a draws it -- the owner: "buttons
-        // should be on the same line" -- so what is left on this row is the
-        // recipe: which kind, and how long. The `Options` disclosure beside
-        // them is a chip rather than a control of this shape and has its own
-        // tests.
-        //
-        // The LAST match for the kind: on the password branch the form paints
-        // the field label "Password" above the row and the combo's
-        // `selected_text` spells the same word, so the combo is the lower of
-        // the two.
+    /// **The size assertions at each call site are the point.** egui culls a
+    /// shape lying entirely outside the screen rect, so a control pushed off
+    /// the card comes back as NOTHING -- and every "they all agree" assertion
+    /// is vacuously true of one control. `frame_around` panics rather than
+    /// skipping when a control drew no frame, which is what a zero-sized
+    /// widget looks like: on screen to a presence check, invisible to the eye.
+    fn generator_row_frames(
+        ctx: &egui::Context,
+        painted: &Painted,
+        passphrase: bool,
+    ) -> [Rect; 2] {
         let kind = if passphrase { "Passphrase" } else { "Password" };
-        let combo_text = *painted.rects_of(kind).last().unwrap_or_else(|| {
-            panic!(
-                "the generator combo is showing no kind at all; painted: {:?}",
-                painted.strings()
-            )
-        });
-        let spinner = painted.rect_of(spinner_suffix(passphrase));
+        let cell_text = in_card(ctx, painted, kind);
+        let spinner = in_card(ctx, painted, spinner_suffix(passphrase));
         assert!(
-            combo_text.top() > spinner.top() - 40.0 && combo_text.top() < spinner.top() + 40.0,
-            "the {combo_text:?} taken for the generator combo is nowhere near the size \
+            cell_text.top() > spinner.top() - 40.0 && cell_text.top() < spinner.top() + 40.0,
+            "the {cell_text:?} taken for the kind selector is nowhere near the size \
              spinner at {spinner:?} -- this helper picked up the wrong galley"
         );
-        [painted.frame_around(combo_text), painted.frame_around(spinner)]
+        [painted.frame_around(cell_text), painted.frame_around(spinner)]
     }
 
-    /// **The generator row's three controls are one row of one height.**
+    /// **The generator row's controls are one row of one height.**
     ///
     /// The reported defect: "Password dropdown on Edit screen looks off since
     /// it is lower than the rest of buttons". Measured on the pre-fix layout,
-    /// on this exact pane -- Generate `top=261.94 h=32`, the combo
-    /// `top=268.94 h=26`, the spinner `top=265.44 h=26`. Three heights' worth
-    /// of disagreement and three different tops, with the combo the lowest of
-    /// the three, exactly as reported.
+    /// on the old card -- Generate `top=261.94 h=32`, the combo `top=268.94
+    /// h=26`, the spinner `top=265.44 h=26`. Three heights' worth of
+    /// disagreement and three different tops, with the combo the lowest of the
+    /// three, exactly as reported.
+    ///
+    /// **Re-targeted at the card**, because that is where the row is now. The
+    /// claim did not move with it: a row of mixed widget KINDS left to
+    /// themselves comes out at three heights on three baselines, and the one
+    /// dial that holds them together (`interact_size.y`) is set by the row and
+    /// can be deleted by anyone.
     ///
     /// Asserted on PAINTED FRAMES, not on `Response::rect` and not on the
     /// source: a widget's requested size is the thing under test, so reading
     /// it back would only restate the code. See [`Painted::frame_around`].
-    ///
-    /// **Run in BOTH of the row's states.** The row is drawn from a branch on
-    /// `draft.generator.passphrase`, and until this test was parametrised
-    /// every caller of [`generator_row_frames`] handed it a password draft --
-    /// so the passphrase arm, a separate `ui.add` on a separate line of
-    /// source, was measured by nothing at all. A stray `interact_size` set
-    /// inside that arm alone survived the entire suite.
     #[test]
     fn the_generator_row_controls_share_one_baseline() {
         for passphrase in [false, true] {
             let ctx = styled_context(ROOMY_PANE);
-            let mut draft = tallest_draft();
-            draft.generator.passphrase = passphrase;
+            let mut draft = generating_draft(passphrase);
             let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
             let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
 
             // The state really is the one asked for: the two arms differ only
-            // by suffix and by the combo's caption, so a row drawn from the
+            // by suffix and by which cell is lit, so a row drawn from the
             // wrong arm would otherwise be measured happily and reported as
             // the other one.
             assert!(
@@ -15830,9 +16840,9 @@ mod edit_pane_layout_tests {
                 painted.strings()
             );
 
-            let [combo, spinner] = generator_row_frames(&painted, passphrase);
-            let names = ["the kind combo", "the size spinner"];
-            for (name, rect) in names.iter().zip([combo, spinner]) {
+            let [cell, spinner] = generator_row_frames(&ctx, &painted, passphrase);
+            let names = ["the kind selector", "the size spinner"];
+            for (name, rect) in names.iter().zip([cell, spinner]) {
                 assert!(
                     rect.width() > 1.0 && rect.height() > 1.0,
                     "{name} painted a {rect:?} in the passphrase={passphrase} state -- a \
@@ -15842,38 +16852,30 @@ mod edit_pane_layout_tests {
             // One row, so one top and one height; the bottoms then follow.
             // Half a point of slack for the sub-pixel positions egui lays
             // rows out at, and no more: the defect was 7pt of it.
-            //
-            // **Measured against the COMBO now** and not against a Generate
-            // button, which left this row when it moved onto the password
-            // box's own line. The combo is the one whose own arithmetic was
-            // wrong (`ComboBox::button_frame` starts from
-            // `available_rect_before_wrap`, so it is not centred the way a
-            // directly-added widget is), so holding the spinner to it is the
-            // same claim from the other end.
             assert!(
-                (spinner.top() - combo.top()).abs() <= 0.5,
-                "the size spinner is painted at top {} while the kind combo beside it starts \
-                 at {} -- the row does not sit on one line in the \
+                (spinner.top() - cell.top()).abs() <= 0.5,
+                "the size spinner is painted at top {} while the kind selector beside it \
+                 starts at {} -- the row does not sit on one line in the \
                  passphrase={passphrase} state",
                 spinner.top(),
-                combo.top()
+                cell.top()
             );
             assert!(
-                (spinner.height() - combo.height()).abs() <= 0.5,
-                "the size spinner is {}pt tall against the combo's {}pt in the \
+                (spinner.height() - cell.height()).abs() <= 0.5,
+                "the size spinner is {}pt tall against the selector's {}pt in the \
                  passphrase={passphrase} state -- the row's controls are different sizes",
                 spinner.height(),
-                combo.height()
+                cell.height()
             );
-            // And the height is the button height by construction, not
+            // And the height is the segmented run's own by construction, not
             // whatever the two happened to agree on: a row where both
             // collapsed to egui's 26pt default would satisfy everything above.
             assert!(
-                (combo.height() - theme::BUTTON_HEIGHT).abs() <= 0.5,
+                (cell.height() - theme::SEGMENT_HEIGHT).abs() <= 0.5,
                 "the generator row is {}pt tall in the passphrase={passphrase} state, not \
-                 theme::BUTTON_HEIGHT ({})",
-                combo.height(),
-                theme::BUTTON_HEIGHT
+                 theme::SEGMENT_HEIGHT ({})",
+                cell.height(),
+                theme::SEGMENT_HEIGHT
             );
         }
     }
@@ -15882,94 +16884,144 @@ mod edit_pane_layout_tests {
     /// be measured as DISAGREEING, so a green run there is a fact about the
     /// row and not about the measurement.
     ///
-    /// The folder combo further down the form is a control of the same kind,
-    /// drawn on a line of its own with no `interact_size` set -- so it is
-    /// egui's untreated default height, the height the generator combo had
-    /// before this fix. If `frame_around` were returning some shared
-    /// container for everything, this would come back equal to the generator
-    /// row's and the assertion above would be vacuous.
+    /// **The reference is the card's own affirmative button**, which is
+    /// `theme::BUTTON_HEIGHT`'s 32 against the row's `theme::SEGMENT_HEIGHT`
+    /// of 28 -- two controls a few points apart inside one card, which is
+    /// exactly the kind of difference the baseline assertion is claiming it
+    /// can see. It used to be the form's folder combo, on the untreated 26pt
+    /// default; that stopped separating the two the moment the row's own
+    /// height came down from `BUTTON_HEIGHT` to the segmented run's, and a
+    /// control that measures the same as its subject proves nothing.
     #[test]
     fn the_alignment_assertion_can_tell_two_different_heights_apart() {
         let ctx = styled_context(ROOMY_PANE);
-        let mut draft = tallest_draft();
+        let mut draft = generating_draft(false);
         let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
         let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
 
-        let [kind, _] = generator_row_frames(&painted, false);
-        let folder = painted.frame_around(painted.rect_of("No folder"));
+        let [kind, _] = generator_row_frames(&ctx, &painted, false);
+        let affirmative = painted.frame_around(in_card(&ctx, &painted, GENERATOR_USE));
         assert!(
-            (folder.height() - kind.height()).abs() > 0.5,
-            "the untreated folder combo measures {}pt and the treated generator row {}pt -- \
-             if those are the same number, `frame_around` is reporting one shared box for \
-             both and the baseline assertion proves nothing",
-            folder.height(),
+            (affirmative.height() - kind.height()).abs() > 0.5,
+            "the card's footer button measures {}pt and its recipe row {}pt -- if those are \
+             the same number, `frame_around` is reporting one shared box for both and the \
+             baseline assertion proves nothing",
+            affirmative.height(),
             kind.height()
         );
     }
 
-    /// **All three generator controls are reachable at the app's minimum
-    /// width** -- the row still wraps, and wrapping is still what keeps it
-    /// inside the pane.
+    /// **The `Generate` button is reachable at the app's minimum PANE width.**
     ///
-    /// The row's content has a floor of 279.4pt against the 264pt card at
-    /// `MIN_PANE_WIDTH`, so an unwrapped `ui.horizontal` pushes the card out
-    /// past the pane and inflates every `available_width()` measured after it
-    /// -- `aae9429`'s defect. This asserts the outcome rather than the call:
-    /// each control's painted frame is inside the pane on both axes, and the
-    /// spinner's glyphs are still the glyphs (a control elided to nothing
-    /// paints an honest little box and reports the label it was handed).
+    /// What is left on the form of the generator: one `theme::row_button` on
+    /// the password row. It is the door to everything else, so a build in
+    /// which it is squeezed off the card or elided to an ellipsis has a
+    /// generator nobody can open however well the card itself is laid out.
+    ///
+    /// Split out of `the_generator_rows_controls_are_all_reachable_at_the_
+    /// minimum_width`, which used to assert this alongside the recipe row's
+    /// two controls. Those two moved onto a card measured against the WINDOW;
+    /// this one did not move at all, so its floor is still the pane's.
     #[test]
-    fn the_generator_rows_controls_are_all_reachable_at_the_minimum_width() {
+    fn the_generate_button_is_reachable_at_the_minimum_pane_width() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, 1400.0);
+        let ctx = styled_context(pane);
+        let mut draft = tallest_draft();
+        let _ = frame(&ctx, pane, &mut draft, true, &[]);
+        let painted = frame(&ctx, pane, &mut draft, true, &[]);
+        assert_inside("the generator's Generate button", "Generate", pane, &painted);
+    }
+
+    /// **The generator card's controls are all reachable at the app's minimum
+    /// WINDOW size** -- the card fits, and everything on its recipe row is
+    /// inside it.
+    ///
+    /// **This replaces a claim whose premise is gone.** The test was
+    /// `the_generator_rows_controls_are_all_reachable_at_the_minimum_width`,
+    /// and it measured the recipe row against `MIN_PANE_WIDTH` because the row
+    /// was drawn inside the detail pane: the row's content floor was 279.4pt
+    /// against the 264pt card there, so an unwrapped `ui.horizontal` pushed
+    /// the card out past the pane and inflated every `available_width()`
+    /// measured after it (`aae9429`). The row is now on an `Area` centred over
+    /// the whole window, so the pane's 298 points are not the number it has to
+    /// fit in -- but a FIXED-width card is no less finite than a pane, and a
+    /// row that overflows it draws its controls past the card's own edge.
+    /// Same failure, same mechanism (`horizontal_wrapped`), measured against
+    /// the surface the row is really on.
+    #[test]
+    fn the_generator_cards_controls_are_all_reachable_at_the_minimum_window_width() {
         for passphrase in [false, true] {
-            let pane = egui::vec2(MIN_PANE_WIDTH, 1400.0);
+            let pane = egui::vec2(MIN_WINDOW_WIDTH, 1400.0);
             let ctx = styled_context(pane);
-            let mut draft = tallest_draft();
-            draft.generator.passphrase = passphrase;
+            let mut draft = generating_draft(passphrase);
             let _ = frame(&ctx, pane, &mut draft, true, &[]);
             let painted = frame(&ctx, pane, &mut draft, true, &[]);
 
-            let bounds = Rect::from_min_size(Pos2::ZERO, pane);
-            let names = ["Generate", "the kind combo", "the size spinner"];
-            for (name, rect) in names.iter().zip(generator_row_frames(&painted, passphrase)) {
+            let card = generator_card_rect(&ctx);
+            let window = Rect::from_min_size(Pos2::ZERO, pane);
+            assert!(
+                window.contains_rect(card),
+                "the generator card is laid out at {card:?}, outside the {}x{} window",
+                pane.x,
+                pane.y
+            );
+            assert!(
+                (card.width() - GENERATOR_CARD_WIDTH).abs() < 2.5,
+                "the card measures {}pt against 3d's {GENERATOR_CARD_WIDTH}pt",
+                card.width()
+            );
+
+            let names = ["the kind selector", "the size spinner"];
+            for (name, rect) in names.iter().zip(generator_row_frames(&ctx, &painted, passphrase))
+            {
                 assert!(
                     rect.width() > 1.0 && rect.height() > 1.0,
-                    "{name} painted a {rect:?} at the minimum width in the \
+                    "{name} painted a {rect:?} at the minimum window width in the \
                      passphrase={passphrase} state -- a control drawn at no size passes \
-                     every in-pane assertion and cannot be clicked"
+                     every in-bounds assertion and cannot be clicked"
                 );
                 assert!(
-                    bounds.contains_rect(rect),
-                    "{name} is painted at {rect:?}, outside the {}x{} pane -- the user cannot \
-                     reach it. Painted: {:?}",
-                    pane.x,
-                    pane.y,
+                    card.contains_rect(rect),
+                    "{name} is painted at {rect:?}, outside the card at {card:?} -- the user \
+                     cannot reach it. Painted: {:?}",
                     painted.strings()
                 );
             }
-            assert_inside("the generator's Generate button", "Generate", pane, &painted);
+            // The re-roll and the disclosure are on the same row and are the
+            // two most likely to be pushed off the end of it.
+            for label in [GENERATOR_OPTIONS, GENERATOR_REROLL] {
+                let rect = painted.frame_around(in_card(&ctx, &painted, label));
+                assert!(
+                    card.contains_rect(rect),
+                    "the card's {label:?} control is painted at {rect:?}, outside the card at \
+                     {card:?}"
+                );
+            }
             let suffix = spinner_suffix(passphrase);
             assert_eq!(
                 painted.rendered_glyphs(suffix),
                 suffix,
-                "the size spinner's suffix was squeezed away at the minimum width"
+                "the size spinner's suffix was squeezed away on the card"
             );
         }
     }
 
-    /// **The generator's OPTIONS are reachable at the minimum width too**,
-    /// which is the whole reason they are not seven more controls on the row
-    /// above.
+    /// **The generator's OPTIONS are reachable at the app's minimum window
+    /// size too**, which is the whole reason they are not seven more controls
+    /// on the recipe row.
     ///
-    /// That row's own comment measures its content floor at 279.4pt against
-    /// the 264 the card offers here; it survives only by wrapping. Seven more
-    /// fixed-width controls in the same wrap would have been seven more
-    /// chances to push the card out to `aae9429`'s 307pt-inside-298pt and
-    /// corrupt every `available_width()` measured after it. The disclosure
-    /// answers that by putting the options in wrapped rows of their OWN, so
-    /// the block's floor is one widest chip rather than a sum -- and this is
-    /// the measurement that says so, in the same shape as the row's guard
-    /// above: painted, in the pane, at a real size, with the glyphs still the
-    /// glyphs.
+    /// Seven more fixed-width controls in that row's wrap would have been
+    /// seven more chances to push its contents past the card's edge. The
+    /// disclosure answers that by putting the options in wrapped rows of their
+    /// OWN, so the block's floor is one widest chip rather than a sum -- and
+    /// this is the measurement that says so, in the same shape as the row's
+    /// guard above: painted, in bounds, at a real size, with the glyphs still
+    /// the glyphs.
+    ///
+    /// **The width is the WINDOW's now, not the pane's**, for the reason
+    /// `the_generator_cards_controls_are_all_reachable_at_the_minimum_window_
+    /// width` records: the block is on a card centred over the window, and
+    /// `MIN_PANE_WIDTH` is narrower than the card itself.
     ///
     /// **Both states**, because the disclosure paints two disjoint sets of
     /// controls and a guard that only ever saw the password half would be
@@ -15978,10 +17030,9 @@ mod edit_pane_layout_tests {
     #[test]
     fn every_generator_option_is_reachable_at_the_apps_minimum_width() {
         for passphrase in [false, true] {
-            let pane = egui::vec2(MIN_PANE_WIDTH, 2400.0);
+            let pane = egui::vec2(MIN_WINDOW_WIDTH, 2400.0);
             let ctx = styled_context(pane);
-            let mut draft = tallest_draft();
-            draft.generator.passphrase = passphrase;
+            let mut draft = generating_draft(passphrase);
             draft.generator.options_open = true;
             let _ = frame(&ctx, pane, &mut draft, true, &[]);
             let painted = frame(&ctx, pane, &mut draft, true, &[]);
@@ -16015,12 +17066,25 @@ mod edit_pane_layout_tests {
                     pane,
                     &painted,
                 );
-                let frame_rect = painted.frame_around(painted.rect_of(label));
+                // In the CARD, not merely in the window: the card is where
+                // the user can reach it, and `assert_inside` above would be
+                // satisfied by an option painted anywhere on screen. The
+                // galley's own box rather than `frame_around`'s, for the
+                // reason `the_generator_options_stay_inside_the_modal_card`
+                // spells out -- a form card behind the scrim encloses a bare
+                // label too, and is smaller.
+                let rect = painted.rect_of(label);
                 assert!(
-                    frame_rect.width() > 1.0 && frame_rect.height() > 1.0,
-                    "the generator option {label:?} painted a {frame_rect:?} at the minimum \
-                     width -- a control drawn at no size passes every in-pane assertion and \
-                     cannot be clicked"
+                    rect.width() > 1.0 && rect.height() > 1.0,
+                    "the generator option {label:?} painted a {rect:?} at the minimum \
+                     window width -- a control drawn at no size passes every in-bounds \
+                     assertion and cannot be clicked"
+                );
+                assert!(
+                    generator_card_rect(&ctx).contains_rect(rect),
+                    "the generator option {label:?} is painted at {rect:?}, outside the card \
+                     at {:?}",
+                    generator_card_rect(&ctx)
                 );
             }
             if !passphrase {
@@ -16032,14 +17096,14 @@ mod edit_pane_layout_tests {
                 assert_eq!(
                     prefixes.len(),
                     2,
-                    "expected both minimum spinners to keep their \"min \" prefix at the \
-                     minimum width; painted: {:?}",
+                    "expected both minimum spinners to keep their \"min \" prefix on the \
+                     card; painted: {:?}",
                     painted.strings()
                 );
                 for rect in prefixes {
                     assert!(
                         bounds.contains_rect(rect),
-                        "a minimum spinner's prefix is painted at {rect:?}, off the {}x{} pane",
+                        "a minimum spinner's prefix is painted at {rect:?}, off the {}x{} window",
                         pane.x,
                         pane.y
                     );
@@ -16048,53 +17112,86 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// **The options block does not widen the card**, which is the failure
+    /// **The options block stays inside the card**, which is the failure
     /// `every_generator_option_is_reachable_at_the_apps_minimum_width` cannot
     /// see on its own.
     ///
-    /// `aae9429`'s defect was not that a control landed off-pane -- it was
-    /// that an unwrapped row pushed the CARD out and every
-    /// `available_width()` measured afterwards answered with the inflated
-    /// number, so everything below it was laid out against a width the pane
-    /// does not have. The controls above the generator would still be inside
-    /// the pane; the ones below would not. So this measures a field BELOW the
-    /// block, with the block open and closed, and asserts the two agree.
+    /// **This replaces `opening_the_generator_options_does_not_move_the_form_
+    /// around_it`, whose premise is gone**: that test measured the form's
+    /// widest painted rect with the block open and shut, because the block
+    /// used to be on the form and `aae9429`'s defect was an unwrapped row
+    /// inflating the CARD it sat in and, with it, every `available_width()`
+    /// measured afterwards. The block is not on the form any more, so there is
+    /// nothing on the form for it to inflate -- and the scrim is a full-window
+    /// rectangle, so "the widest thing painted" would answer the same number
+    /// either way and the test would pass with the block spilling out of the
+    /// card entirely.
+    ///
+    /// The equivalent claim on the new surface is the one made here: the card
+    /// is a FIXED width, so an option that does not fit is drawn outside it
+    /// rather than widening it, and the card's own rectangle is what every
+    /// control has to be inside.
     #[test]
-    fn opening_the_generator_options_does_not_move_the_form_around_it() {
-        /// The widest thing the frame filled -- the card, which is what
-        /// `aae9429` inflated. Measured rather than located, so it cannot
-        /// quietly start reporting some inner box instead.
-        fn widest(painted: &Painted) -> f32 {
-            painted.rects.iter().map(|(rect, _)| rect.width()).fold(0.0, f32::max)
-        }
-
+    fn the_generator_options_stay_inside_the_modal_card() {
         for passphrase in [false, true] {
-            let pane = egui::vec2(MIN_PANE_WIDTH, 2400.0);
+            let pane = egui::vec2(MIN_WINDOW_WIDTH, 2400.0);
             let ctx = styled_context(pane);
 
-            let mut shut = tallest_draft();
-            shut.generator.passphrase = passphrase;
+            let mut shut = generating_draft(passphrase);
             let _ = frame(&ctx, pane, &mut shut, true, &[]);
-            let closed = widest(&frame(&ctx, pane, &mut shut, true, &[]));
+            let _ = frame(&ctx, pane, &mut shut, true, &[]);
+            let closed = generator_card_rect(&ctx);
 
-            let mut open = tallest_draft();
-            open.generator.passphrase = passphrase;
+            let ctx = styled_context(pane);
+            let mut open = generating_draft(passphrase);
             open.generator.options_open = true;
             let _ = frame(&ctx, pane, &mut open, true, &[]);
-            let opened = widest(&frame(&ctx, pane, &mut open, true, &[]));
+            let painted = frame(&ctx, pane, &mut open, true, &[]);
+            let opened = generator_card_rect(&ctx);
 
-            assert!(closed > 1.0, "the closed form filled nothing; the measurement is vacuous");
-            assert_eq!(
-                closed, opened,
-                "opening the generator's options changed the card's width at the minimum pane \
-                 size (passphrase={passphrase}) -- that is `aae9429`, and every control below \
-                 the block is now laid out against a width the pane does not have"
-            );
+            assert!(closed.width() > 1.0, "the shut card measured nothing; this is vacuous");
             assert!(
-                opened <= pane.x,
-                "the card is {opened}pt wide inside a {}pt pane with the options open",
-                pane.x
+                (closed.width() - opened.width()).abs() < 0.5,
+                "opening the options changed the card's width from {} to {} \
+                 (passphrase={passphrase}) -- a card whose width follows its contents has no \
+                 edge for those contents to be kept inside of",
+                closed.width(),
+                opened.width()
             );
+
+            let labels: Vec<String> = if passphrase {
+                vec![
+                    "Between words".to_string(),
+                    Separator::Hyphen.label().to_string(),
+                    "Capitalise".to_string(),
+                    "Include a number".to_string(),
+                ]
+            } else {
+                let mut labels = vec!["Use these characters".to_string()];
+                labels.extend(CharClass::ALL.iter().map(|c| c.label().to_string()));
+                labels.push(" digits".to_string());
+                labels.push(" symbols".to_string());
+                labels.push(AVOID_AMBIGUOUS.to_string());
+                labels
+            };
+            // **The galley's own box, not `frame_around`'s.** The card's body
+            // paints no fill behind an individual row, so the smallest
+            // painted rectangle enclosing a bare label on it is the card --
+            // or, worse, one of the FORM's section cards behind the scrim,
+            // which is smaller in area than the card and encloses the label
+            // just as well. `frame_around` would then report a rectangle from
+            // the surface underneath and this test would be measuring the
+            // wrong thing. A galley's box is 384 points wide at most here
+            // (the body's own width), so containment says exactly what it
+            // looks like it says.
+            for label in &labels {
+                let rect = painted.rect_of(label);
+                assert!(
+                    opened.contains_rect(rect),
+                    "the generator option {label:?} is painted at {rect:?}, outside the card at \
+                     {opened:?} (passphrase={passphrase})"
+                );
+            }
         }
     }
 

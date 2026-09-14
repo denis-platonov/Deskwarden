@@ -5339,13 +5339,22 @@ pub fn build_frame_with_search(
                                     }
                                 }
                             }
-                            // The box is left unchanged on failure, so a
-                            // swallowed error here reads as a dead button --
-                            // which is what `log::warn!` alone made of it,
-                            // against `EditAction::GeneratePassword`'s own
-                            // doc putting the reporting here.
-                            // `generator_request` carries the form's own kind
-                            // and size choices.
+                            // **The generator MODAL asks for this**, and the
+                            // seam is unchanged by that: the form cannot
+                            // generate (no backend handle, and it runs on the
+                            // UI thread), so it names a recipe through
+                            // `generator_request` and takes the answer back
+                            // through `set_generated_candidate`. What moved is
+                            // where the answer LANDS: `GeneratorDraft::preview`
+                            // rather than the password box, which is only
+                            // written when the card's own affirmative answer is
+                            // pressed. See `EditAction::GeneratePassword`.
+                            //
+                            // The card is left showing no candidate on failure,
+                            // so a swallowed error here reads as a dead button
+                            // -- which is what `log::warn!` alone made of it,
+                            // against that variant's own doc putting the
+                            // reporting here.
                             //
                             // The sentence goes to the item list's inline
                             // band via `generate_error`; `generate_failure`
@@ -5360,7 +5369,7 @@ pub fn build_frame_with_search(
                             EditAction::GeneratePassword => {
                                 generate_error = None;
                                 match cache.bridge().generate(&draft.generator_request()) {
-                                    Ok(generated) => draft.set_generated_password(&generated),
+                                    Ok(generated) => draft.set_generated_candidate(&generated),
                                     Err(e) => {
                                         log::warn!("could not generate a password: {e:?}");
                                         let failure = generate_failure(&e);
@@ -5560,13 +5569,22 @@ pub fn build_frame_with_search(
                                     );
                                 }
                             }
-                            // The box is left unchanged on failure, so a
-                            // swallowed error here reads as a dead button --
-                            // which is what `log::warn!` alone made of it,
-                            // against `EditAction::GeneratePassword`'s own
-                            // doc putting the reporting here.
-                            // `generator_request` carries the form's own kind
-                            // and size choices.
+                            // **The generator MODAL asks for this**, and the
+                            // seam is unchanged by that: the form cannot
+                            // generate (no backend handle, and it runs on the
+                            // UI thread), so it names a recipe through
+                            // `generator_request` and takes the answer back
+                            // through `set_generated_candidate`. What moved is
+                            // where the answer LANDS: `GeneratorDraft::preview`
+                            // rather than the password box, which is only
+                            // written when the card's own affirmative answer is
+                            // pressed. See `EditAction::GeneratePassword`.
+                            //
+                            // The card is left showing no candidate on failure,
+                            // so a swallowed error here reads as a dead button
+                            // -- which is what `log::warn!` alone made of it,
+                            // against that variant's own doc putting the
+                            // reporting here.
                             //
                             // The sentence goes to the item list's inline
                             // band via `generate_error`; `generate_failure`
@@ -5581,7 +5599,7 @@ pub fn build_frame_with_search(
                             EditAction::GeneratePassword => {
                                 generate_error = None;
                                 match cache.bridge().generate(&draft.generator_request()) {
-                                    Ok(generated) => draft.set_generated_password(&generated),
+                                    Ok(generated) => draft.set_generated_candidate(&generated),
                                     Err(e) => {
                                         log::warn!("could not generate a password: {e:?}");
                                         let failure = generate_failure(&e);

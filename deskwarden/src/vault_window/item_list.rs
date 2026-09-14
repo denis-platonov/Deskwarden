@@ -1297,7 +1297,8 @@ fn scroll_offset_id() -> egui::Id {
 /// this side of the boundary because `draw_item_list` is not told which modals
 /// its caller has open.
 ///
-/// **Scrims, not the modal cards.** The scrim is the thing all seven have and
+/// **Scrims, not the modal cards.** The scrim is the thing every one of them
+/// has and
 /// the thing that MEANS "the window behind this is inert" -- `detail.rs`'s
 /// copy toast is also a `Foreground` area and has no scrim, which is exactly
 /// the difference. `every_modal_scrim_in_the_crate_is_named_here` walks `src/`
@@ -1308,6 +1309,7 @@ const MODAL_SCRIM_AREAS: &[&str] = &[
     "folder-edit-scrim",
     "icon-pick-scrim",
     "launch-confirm-scrim",
+    "password-generator-scrim",
     "prefs-modal-scrim",
     "record-import-scrim",
     "record-send-scrim",
