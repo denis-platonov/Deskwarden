@@ -7307,10 +7307,17 @@ pub const SECTION_HEADER_GAP: f32 = 10.0;
 /// the overlay's, and their designs say 38.
 pub const SECTION_FIELD_HEIGHT: f32 = 34.0;
 
-/// The type size inside a §8a row field: `font-size: 13px`, against the 14
-/// [`FieldShape::wide`] sets for the 38-point box. One step down with the
-/// box, so the text keeps the same proportion of it.
-pub const SECTION_FIELD_PX: f32 = 13.0;
+/// The type size inside a row field.
+///
+/// **14, which is the READ pane's `ROW_VALUE_SIZE`, not §8a's 13.** The two
+/// panes show the same record one click apart, and a value that changed size
+/// when Edit was pressed is the kind of difference a reader notices before
+/// they notice either size. The owner: "all text fields should have same text
+/// size but like this border around that makes it editable".
+///
+/// So the BOX is what says a field is editable, and nothing else does: same
+/// type, same size, a border around it.
+pub const SECTION_FIELD_PX: f32 = 14.0;
 
 /// §8a's `gap: 14px` between the cells of a card's COLUMN grid -- the
 /// `ITEM` card's `grid-template-columns: 1fr 1fr 1fr`.
@@ -7609,10 +7616,50 @@ pub fn section_card_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 
 /// [`section_card_body`] at a stated horizontal padding. See
 /// [`section_card_header_at`] for why the padding is the caller's to state.
+/// Where [`section_card_body_at`] leaves what [`section_row`] needs to know
+/// about the band it is being added to: the card's horizontal padding, and
+/// whether anything has been drawn in this body yet.
+///
+/// Carried through `Ui::data` rather than through a parameter because every
+/// row on this form is written as `theme::section_row(ui, ..)` in a closure
+/// that is handed one `Ui` and nothing else -- threading a second argument
+/// through would touch every row of every kind to say something none of them
+/// decides.
+fn section_body_state(ui: &Ui) -> egui::Id {
+    ui.id().with("section-body")
+}
+
+/// The rule between two rows of a card, drawn **full bleed**.
+///
+/// The read pane's rows are bands that reach the card's edge, so the hairline
+/// between two of them spans the whole card. This form's rows sit inside one
+/// padded body, so a rule allocated here would stop short by `pad_x` at each
+/// end -- which is a different object: a rule that stops inside a card reads
+/// as an underline on the row above it.
+///
+/// Padded above and below by [`SECTION_CARD_PAD_Y`], which is the read pane's
+/// `ROW_PAD_Y`: two rows separated this way stand exactly as far apart as two
+/// of that pane's bands do.
+fn section_row_rule(ui: &mut Ui, pad_x: i8) {
+    ui.add_space(f32::from(SECTION_CARD_PAD_Y));
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().rect_filled(
+        rect.expand2(Vec2::new(f32::from(pad_x), 0.0)),
+        CornerRadius::ZERO,
+        CANVAS,
+    );
+    ui.add_space(f32::from(SECTION_CARD_PAD_Y));
+}
+
 pub fn section_card_body_at<R>(ui: &mut Ui, pad_x: i8, add: impl FnOnce(&mut Ui) -> R) -> R {
     egui::Frame::new()
         .inner_margin(Margin::symmetric(pad_x, SECTION_CARD_PAD_Y))
         .show(ui, |ui| {
+            // Reset every frame: `Ui::data` outlives the frame that wrote it,
+            // and a body that remembered last frame's rows would open with a
+            // rule over its first one.
+            let id = section_body_state(ui);
+            ui.data_mut(|data| data.insert_temp(id, (pad_x, true)));
             // **The style's own spacing, handed back inside the body.**
             //
             // [`section_card`] zeroes `item_spacing` so the card's three
@@ -7698,6 +7745,22 @@ fn section_row_impl<R>(
     aside: Option<impl FnOnce(&mut Ui)>,
     add: impl FnOnce(&mut Ui) -> R,
 ) -> R {
+    // **The rule that separates this row from the one above it**, drawn by
+    // the row rather than by the caller. The owner: "fields should have same
+    // separators etc as regularly" -- the read pane puts a hairline between
+    // every two rows of a card and this form put nothing.
+    //
+    // Here and not at the call sites because "is this the first row of the
+    // body" is not something a call site knows: a row is often inside an
+    // `if`, so the first one DRAWN is not the first one written. See
+    // `section_body_state`.
+    let id = section_body_state(ui);
+    if let Some((pad_x, first)) = ui.data(|data| data.get_temp::<(i8, bool)>(id)) {
+        if !first {
+            section_row_rule(ui, pad_x);
+        }
+        ui.data_mut(|data| data.insert_temp(id, (pad_x, false)));
+    }
     if !section_rows_fit(ui) {
         // An EMPTY label is a row that belongs to the one above it -- the
         // generator under its password box. Stacked, there is no label column

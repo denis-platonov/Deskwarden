@@ -7678,11 +7678,9 @@ pub fn draw_detail_edit(
                         ui.label(RichText::new(UNFILE_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
                     }
                 });
-                ui.add_space(theme::BLOCK_GAP);
                 theme::section_row(ui, ITEM_OWNER_LABEL, |ui| {
                     owner_field(ui, &owner);
                 });
-                ui.add_space(theme::BLOCK_GAP);
                 theme::section_row(ui, ITEM_TYPE_LABEL, |ui| {
                     theme::section_disabled_text_field(ui, kind_noun(kind));
                 });
@@ -7710,8 +7708,7 @@ pub fn draw_detail_edit(
                     theme::section_row(ui, Slot::Username.label(), |ui| {
                         theme::section_text_field(ui, &mut draft.username, false);
                     });
-                    ui.add_space(theme::BLOCK_GAP);
-
+    
                     theme::section_row(ui, Slot::Password.label(), |ui| {
                         theme::section_password_field(
                             ui,
@@ -7928,8 +7925,7 @@ pub fn draw_detail_edit(
                     // column and not at the card's left edge -- see the
                     // generator's own row above for why that indent matters.
                     if !history.is_empty() {
-                        ui.add_space(theme::BLOCK_GAP);
-                        theme::section_row(ui, "", |ui| {
+                                theme::section_row(ui, "", |ui| {
                             history_block(ui, &mut draft.history_open, &history);
                         });
                     }
@@ -7966,8 +7962,7 @@ pub fn draw_detail_edit(
                         ) {
                             hide = Some(Slot::CardholderName);
                         }
-                        ui.add_space(theme::BLOCK_GAP);
-                    }
+                            }
 
                     // **The brand is floor** -- never hidden, never
                     // removable -- and not because a card needs one on the
@@ -8007,8 +8002,7 @@ pub fn draw_detail_edit(
                                 }
                             });
                     });
-                    ui.add_space(theme::BLOCK_GAP);
-
+    
                     theme::section_row(ui, Slot::CardNumber.label(), |ui| {
                         theme::section_password_field(ui, &mut card.number, &mut card.reveal_number);
                     });
@@ -8018,8 +8012,7 @@ pub fn draw_detail_edit(
                     // it on "the number changed" would mean keeping a second
                     // plaintext copy of the number to compare against.
                     card.suggest_brand();
-                    ui.add_space(theme::BLOCK_GAP);
-
+    
                     if showing(Slot::CardExpMonth) {
                         if slot_row(
                             ui,
@@ -8031,8 +8024,7 @@ pub fn draw_detail_edit(
                         ) {
                             hide = Some(Slot::CardExpMonth);
                         }
-                        ui.add_space(theme::BLOCK_GAP);
-                    }
+                            }
 
                     if showing(Slot::CardExpYear) {
                         if slot_row(
@@ -8045,8 +8037,7 @@ pub fn draw_detail_edit(
                         ) {
                             hide = Some(Slot::CardExpYear);
                         }
-                        ui.add_space(theme::BLOCK_GAP);
-                    }
+                            }
 
                     if showing(Slot::CardCode) {
                         if slot_row(
@@ -8059,8 +8050,7 @@ pub fn draw_detail_edit(
                         ) {
                             hide = Some(Slot::CardCode);
                         }
-                        ui.add_space(theme::BLOCK_GAP);
-                    }
+                            }
 
                     // The two namespaced custom fields. Withheld on a CREATE
                     // for the same reason the TOTP seed is (see
@@ -8093,8 +8083,7 @@ pub fn draw_detail_edit(
                         ) {
                             hide = Some(Slot::CardBank);
                         }
-                        ui.add_space(theme::BLOCK_GAP);
-                    }
+                            }
 
                     if showing(Slot::CardBillingZip) {
                         if slot_row(
@@ -8116,8 +8105,7 @@ pub fn draw_detail_edit(
                         ) {
                             hide = Some(Slot::CardBillingZip);
                         }
-                        ui.add_space(theme::BLOCK_GAP);
-                    }
+                            }
                 }
                 FormBody::Identity => {
                     // **The kind this feature earns its keep on.** Eighteen
@@ -8138,8 +8126,7 @@ pub fn draw_detail_edit(
                         }) {
                             hide = Some(slot);
                         }
-                        ui.add_space(theme::BLOCK_GAP);
-                    }
+                            }
                 }
                 FormBody::Note => {
                     // Floor, and the only slot a note has: the body IS the
@@ -8170,8 +8157,7 @@ pub fn draw_detail_edit(
                     // 10px 11px`, which is the design's field box eight rows
                     // tall, and `text_area` is that box.
                     theme::text_area(ui, &mut draft.note_body, "", 8);
-                    ui.add_space(theme::BLOCK_GAP);
-                }
+                    }
                 FormBody::SshKey => {
                     let ssh = &mut draft.ssh_key;
                     // Wire keys `privateKey`, `publicKey`, `keyFingerprint`,
@@ -8197,18 +8183,15 @@ pub fn draw_detail_edit(
                             &mut ssh.reveal_private_key,
                         );
                     });
-                    ui.add_space(theme::BLOCK_GAP);
-
+    
                     slot_row(ui, Slot::SshPublicKey.label(), false, |ui| {
                         theme::section_text_field(ui, &mut ssh.public_key, false);
                     });
-                    ui.add_space(theme::BLOCK_GAP);
-
+    
                     slot_row(ui, Slot::SshFingerprint.label(), false, |ui| {
                         theme::section_text_field(ui, &mut ssh.key_fingerprint, false);
                     });
-                    ui.add_space(theme::BLOCK_GAP);
-                }
+                    }
                 FormBody::UneditableNotice => {
                     ui.label(
                         RichText::new(
@@ -8339,8 +8322,7 @@ pub fn draw_detail_edit(
                 // [`Slot::Websites`].
                 if showing(Slot::Websites) {
                     websites_block(ui, &mut draft.uris, creating);
-                    ui.add_space(theme::BLOCK_GAP);
-                }
+                    }
                 match draft.app.as_mut() {
                     Some(app) => {
                         if let Some(requested) = app_block(ui, app, apps) {
@@ -20632,6 +20614,73 @@ mod edit_pane_layout_tests {
             left.floating_allocated_width
         );
         assert_eq!(left.bar_width, plain.bar_width);
+    }
+
+    /// **Two rows of a card are separated by a full-bleed hairline**, the way
+    /// the read pane separates its own.
+    ///
+    /// The owner: "fields should have same separators etc as regularly". This
+    /// form put twelve points of nothing between two rows where `detail.rs`
+    /// puts a `theme::row_rule` reaching both edges of the card -- so the two
+    /// panes read as different components showing the same record.
+    ///
+    /// Both halves: the rule is THERE, and it reaches the card's edges. A
+    /// rule that stopped inside the card would be an underline on the row
+    /// above it, which is a different object and the thing the padding makes
+    /// easy to draw by accident.
+    #[test]
+    fn two_rows_of_a_card_are_separated_by_a_full_bleed_rule() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        draft.password = "correct-horse".to_string();
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &detail::TotpState::NoSecret);
+        let painted =
+            frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &detail::TotpState::NoSecret);
+
+        let username = painted.rect_of(Slot::Username.label());
+        // The topmost: the generator's kind combo says "Password" too, a
+        // little further down the same card.
+        let password = painted
+            .rects_of(Slot::Password.label())
+            .into_iter()
+            .min_by(|a, b| a.top().total_cmp(&b.top()))
+            .expect("the password row is drawn");
+        assert!(
+            username.bottom() < password.top(),
+            "the fixture does not draw the two rows in order: {username:?}, {password:?}"
+        );
+        let card = painted
+            .rects
+            .iter()
+            .filter(|(r, fill)| *fill == theme::CARD && r.contains(username.center()))
+            .map(|(r, _)| *r)
+            .max_by(|a, b| a.height().total_cmp(&b.height()))
+            .expect("the credentials card is painted");
+
+        let between: Vec<Rect> = painted
+            .rects
+            .iter()
+            .filter(|(r, fill)| {
+                *fill == theme::CANVAS
+                    && r.height() <= 1.5
+                    && r.top() > username.bottom()
+                    && r.bottom() < password.top()
+            })
+            .map(|(r, _)| *r)
+            .collect();
+        assert_eq!(
+            between.len(),
+            1,
+            "expected exactly one hairline between the two rows, found {between:?}"
+        );
+        let rule = between[0];
+        assert!(
+            (rule.left() - card.left()).abs() <= 0.5 && (rule.right() - card.right()).abs() <= 0.5,
+            "the rule runs {rule:?} inside a card of {card:?} -- it stops short of the card's \
+             edges, which reads as an underline on the row above it"
+        );
     }
 
     /// **8a's `gap: 6px` between a grid cell's caption and its control.**
