@@ -6860,6 +6860,21 @@ fn folder_combo(
     // between two 34-point boxes. The owner, with the row screenshotted:
     // "render as per design - should be same height".
     ui.spacing_mut().interact_size.y = theme::SECTION_FIELD_HEIGHT;
+    // **The form's scroll settings do not belong in this popup.**
+    //
+    // `draw_detail_edit` scopes `theme::scrollbar_in_gutter(ui, FORM_PAD_X)`
+    // over the whole card column so the form's own bar sits in a 24-point
+    // lane. Those are `Style::spacing.scroll` values, so every `Ui` under
+    // that scope inherits them -- including the one egui builds for a combo
+    // box's drop-down, which is a `ScrollArea` of its own. A list of three
+    // folders was therefore drawn with a 24-point lane and a bar down it:
+    // the owner's "Folder has scroll in dropdown".
+    //
+    // Put back to egui's own default, which is what every list in this app
+    // that has NOT asked for a gutter gets: `theme::apply` sets no
+    // `ScrollStyle` of its own -- `scrollbar_in_gutter` is a per-surface
+    // opt-in, and this surface did not opt in.
+    ui.spacing_mut().scroll = egui::style::ScrollStyle::default();
     egui::ComboBox::from_id_salt("edit-folder")
         // The cell's full width in the grid arm, which is what makes three
         // controls of three different natural widths read as a row. egui's
@@ -20488,20 +20503,31 @@ mod edit_pane_layout_tests {
                 .min_by(|a, b| a.top().total_cmp(&b.top()))
                 .unwrap_or_else(|| panic!("{title}'s band is closed by a rule"));
 
-            // The band's own padding. NOT plus the card's border, which
-            // this card paints rather than reserves -- see
-            // `theme::section_card`, where reserving it was tried and
-            // pushed the card past the app's minimum pane.
+            // **The BAND is its padding plus one caption**, which is the
+            // claim that survives the optical shift: the caption is
+            // nudged down by `theme::ink_drop` inside the band (an
+            // all-capital line inks only the top of its row), and the top
+            // margin gains exactly what the bottom gives up. So the
+            // caption's own dy is 11 or 12 depending on a face metric,
+            // and the band is 2 x 11 + the line either way.
+            //
+            // NOT plus the card's border, which this card paints rather
+            // than reserves -- see `theme::section_card`, where reserving
+            // it was tried and pushed the card past the app's minimum
+            // pane.
             let pad = f32::from(theme::SECTION_CARD_HEADER_PAD_Y);
             assert!(
-                (caption.top() - card.top() - pad).abs() <= 0.5,
-                "{title} sits {}pt down its card, not 8a's `padding: 11px`",
-                caption.top() - card.top()
+                (rule.top() - card.top() - 2.0 * pad - caption.height()).abs() <= 0.5,
+                "{title}'s band is {}pt tall, not 8a's `padding: 11px` over and under a \
+                 {}pt line",
+                rule.top() - card.top(),
+                caption.height()
             );
             assert!(
                 (rule.top() - caption.bottom() - pad).abs() <= 1.5,
-                "{title}'s rule is {}pt under the caption, not the band's own 11 -- egui's \
-                 item spacing is back between the band and the line that closes it",
+                "{title}'s rule is {}pt under the caption, not the band's own 11 give or \
+                 take the optical shift -- egui's item spacing is back between the band \
+                 and the line that closes it",
                 rule.top() - caption.bottom()
             );
         }
@@ -20565,6 +20591,47 @@ mod edit_pane_layout_tests {
                 first.top()
             );
         }
+    }
+
+    /// **The folder drop-down does not inherit the FORM's scroll gutter.**
+    ///
+    /// `draw_detail_edit` scopes `theme::scrollbar_in_gutter` over the whole
+    /// card column so its own bar sits in a 24-point lane. Those are
+    /// `Style::spacing.scroll` values, so every `Ui` under that scope
+    /// inherits them -- including the one egui builds for a combo box's
+    /// drop-down, which is a `ScrollArea` of its own. A list of five folders
+    /// was drawn with a 24-point lane and a bar down it: the owner's "Folder
+    /// has scroll in dropdown".
+    ///
+    /// Asserted on the spacing `folder_combo` leaves behind rather than on
+    /// the painted popup, because a popup is drawn in a layer this harness
+    /// does not collect -- and because the lane is the cause, where the bar
+    /// is only the symptom.
+    #[test]
+    fn the_folder_chooser_does_not_inherit_the_forms_scroll_gutter() {
+        let ctx = styled_context(Vec2::new(WIDE_PANE_WIDTH, 800.0));
+        let mut draft = full_login_draft();
+        let mut seen = None;
+        let _ = ctx.run_ui(raw_input(Vec2::new(WIDE_PANE_WIDTH, 800.0), &[]), |ui| {
+            // The form's own lane, exactly as `draw_detail_edit` sets it.
+            theme::scrollbar_in_gutter(ui, f32::from(FORM_PAD_X));
+            assert!(
+                ui.spacing().scroll.floating_allocated_width > 0.0,
+                "the premise failed: the gutter was not applied, so the assertion below \
+                 would pass against a build that still inherited it"
+            );
+            folder_combo(ui, &mut draft, &[], true);
+            seen = Some(ui.spacing().scroll);
+        });
+        let left = seen.expect("the form drew");
+        let plain = egui::style::ScrollStyle::default();
+        assert_eq!(
+            left.floating_allocated_width, plain.floating_allocated_width,
+            "the folder chooser left the form's {}pt scroll lane on its own `Ui`, so the \
+             drop-down under it reserves one too",
+            left.floating_allocated_width
+        );
+        assert_eq!(left.bar_width, plain.bar_width);
     }
 
     /// **8a's `gap: 6px` between a grid cell's caption and its control.**

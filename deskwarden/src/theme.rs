@@ -7500,8 +7500,28 @@ pub fn section_card_header_at(
     note: &str,
     changed: bool,
 ) -> Rect {
+    // **Optically centred, not box centred.** The caption is all capitals,
+    // so its ink stops at the baseline and the row's descender band under it
+    // is empty: measured, 12 points of band over the ink and 14 under it.
+    // The owner: "both cards titles are not centered actually".
+    //
+    // Spent as a SHIFT rather than as extra padding -- the top margin gains
+    // what the bottom gives up -- so the band keeps the height 2b and 8a both
+    // give it. `ink_drop` is this module's own measurement of the slack; see
+    // it for why the correction is not a fudge factor.
+    let drop = ink_drop(
+        ui.ctx(),
+        &FontId::new(SECTION_TITLE_PX, FontFamily::Name(BOLD.into())),
+        None,
+    )
+    .round() as i8;
     let line = egui::Frame::new()
-        .inner_margin(Margin::symmetric(pad_x, SECTION_CARD_HEADER_PAD_Y))
+        .inner_margin(Margin {
+            left: pad_x,
+            right: pad_x,
+            top: SECTION_CARD_HEADER_PAD_Y + drop,
+            bottom: SECTION_CARD_HEADER_PAD_Y - drop,
+        })
         .show(ui, |ui| {
             // **The row is its TITLE's height and nothing else's.**
             //

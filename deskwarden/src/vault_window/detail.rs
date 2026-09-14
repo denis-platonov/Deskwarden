@@ -5967,8 +5967,26 @@ fn card(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            // Optically centred, for the reason and by the measurement
+            // `theme::section_card_header_at` sets out: an all-capital
+            // caption inks only the top of its row, so a box-centred one
+            // reads high. Spent as a shift, so the band keeps 2b's height.
+            let drop = theme::ink_drop(
+                ui.ctx(),
+                &egui::FontId::new(
+                    CARD_HEADING_SIZE,
+                    egui::FontFamily::Name(theme::BOLD.into()),
+                ),
+                None,
+            )
+            .round() as i8;
             egui::Frame::new()
-                .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_HEADING_PAD_Y))
+                .inner_margin(Margin {
+                    left: CARD_PAD_X,
+                    right: CARD_PAD_X,
+                    top: CARD_HEADING_PAD_Y + drop,
+                    bottom: CARD_HEADING_PAD_Y - drop,
+                })
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(theme::letterspaced(
