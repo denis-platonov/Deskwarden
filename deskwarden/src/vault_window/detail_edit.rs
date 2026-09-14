@@ -7842,15 +7842,29 @@ pub fn draw_detail_edit(
                         // the owner: "buttons should be on the same line".
                         //
                         // `Hide` is not among them because this form's reveal
-                        // is IN the box (`section_password_field`'s own
-                        // toggle), which is the same control 8a draws beside
-                        // it and one fewer thing on a line that has to fit a
-                        // 298-point pane.
+                        // is not among them at all: **this form always shows
+                        // the password**.
+                        //
+                        // The owner: "Password - remove Show/Hide - it is
+                        // already Edit mode, so not needed", and then "always
+                        // show". A mask is for a value being READ over
+                        // someone's shoulder; a value being TYPED has to be
+                        // legible to whoever is typing it, and a form that
+                        // masked what the user had just entered made them
+                        // reveal it to check their own work. The READ pane
+                        // still masks -- that is the screen the shoulder
+                        // argument is about, and it keeps its reveal.
+                        //
+                        // `section_text_field_within` and not the password
+                        // one with `revealed` pinned true: a box whose toggle
+                        // can never move is a control that lies, and the
+                        // toggle is 52 points of the box's right inset that
+                        // this row can give back to the value.
                         row_with_buttons(ui, &[GENERATE_LABEL, COPY_LABEL], |ui, room| {
-                            theme::section_password_field_within(
+                            theme::section_text_field_within(
                                 ui,
                                 &mut draft.password,
-                                &mut draft.reveal_password,
+                                false,
                                 room,
                             );
                             if theme::row_button(ui, GENERATE_LABEL).clicked() {
@@ -13757,14 +13771,32 @@ mod sequence_builder_tests {
     /// false;` from the Done arm leaves a reveal armed that the user never
     /// asked for a second time: scroll the block shut, open it again later,
     /// and the plaintext is straight back on screen.
+    ///
+    /// **Counted, not looked for.** The credentials card's own password box
+    /// shows the value in the clear on every frame now -- see the row, and
+    /// the owner's "always show" -- so "is the password on screen" is true
+    /// whatever the builder is doing and a `contains` check here would be
+    /// vacuous in both directions. What the eye controls is the SECOND
+    /// appearance, inside the builder's own step preview: one occurrence is
+    /// the field, two is the field plus a preview that is showing the
+    /// plaintext.
     #[test]
     fn closing_the_builder_closes_the_eye_so_reopening_reveals_nothing() {
         let item = item();
         let ctx = styled_context(PANE);
         let mut draft = draft_for(&item, "{USERNAME}{TAB}{PASSWORD}");
+        let shown = |painted: &Painted| {
+            painted.strings().iter().filter(|s| **s == PASSWORD).count()
+        };
         let open = reveal(&ctx, PANE, &mut draft, &item, &live_code());
-        // The control: the eye really was open, and really was showing it.
-        assert!(open.strings().contains(&PASSWORD), "{:?}", open.strings());
+        // The control: the eye really was open, and really was adding the
+        // preview's own copy to the one the field always draws.
+        assert_eq!(
+            shown(&open),
+            2,
+            "the revealed builder is not showing the password in its preview: {:?}",
+            open.strings()
+        );
 
         let at = open.rect_of(APP_SEQUENCE_CLOSE).center();
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(at));
@@ -13773,9 +13805,11 @@ mod sequence_builder_tests {
         assert!(!app.previewing, "the builder closed with the eye left open");
 
         let reopened = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
-        assert!(
-            !reopened.strings().contains(&PASSWORD),
-            "reopening the builder put the password back on screen without being asked: {:?}",
+        assert_eq!(
+            shown(&reopened),
+            1,
+            "reopening the builder put the password back in its preview without being \
+             asked: {:?}",
             reopened.strings()
         );
     }
