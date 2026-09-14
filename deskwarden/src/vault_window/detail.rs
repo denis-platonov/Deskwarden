@@ -203,6 +203,13 @@ const CARD_HEADING_PAD_Y: i8 = 11;
 const ROW_PAD_Y: i8 = 13;
 /// `font-size: 12px; font-weight: 700; letter-spacing: 0.06em` on a card's
 /// heading, in points (0.06em x 12px).
+/// 8a's `One-time code` card, in this pane's own capitals.
+///
+/// A constant because the draw site and several tests name it, and because
+/// the EDIT pane names the same card through `Section::title` -- the two are
+/// one click apart and a heading that drifted between them is exactly what
+/// moving this row out of `LOGIN CREDENTIALS` was for.
+pub(crate) const TOTP_CARD_HEADING: &str = "ONE-TIME CODE";
 const CARD_HEADING_SIZE: f32 = 12.0;
 const CARD_HEADING_TRACKING: f32 = 0.72;
 /// `gap: 16px` between a row's label column, its value and its controls.
@@ -4052,31 +4059,27 @@ pub fn draw_detail_read(
                     theme::row_rule(ui);
                     password_row(ui, password, &mut reveal.password, &mut action);
                 }
-                // Whether there is a row at all is decided by `totp_row_for` and
-                // nowhere else (see its doc), so "this item looks like it has no
-                // 2FA" is a decision a unit test can call directly instead of one
-                // buried in an `egui` closure. Exhaustive on purpose -- no catch-all
-                // arm -- so a new `TotpRow` variant fails to compile here instead of
-                // silently inheriting whatever the last arm happened to draw.
-                //
-                // Unchanged by the kind dispatch, other than moving inside
-                // this arm: only a login reaches it, and only a login ever
-                // could -- `totp_state_for_secret_presence` forces `NoSecret`
-                // (the one state that draws no row) for any item whose own
-                // login data carries no seed, and a non-login has no login
-                // data at all.
-                if let Some(row) = totp_row_for(totp) {
-                    theme::row_rule(ui);
-                    match row {
-                        TotpRow::Fetching => totp_fetching_row(ui),
-                        TotpRow::Code { code, seconds_left, period } => {
-                            totp_code_row(ui, code, seconds_left, period, &mut action)
-                        }
-                        TotpRow::Unavailable => totp_unavailable_row(ui),
-                        TotpRow::NoCode => totp_no_code_row(ui),
-                    }
-                }
-                // **The seed, under the code, and only when BOTH are true.**
+            });
+            ui.add_space(CARD_GAP);
+
+            // **8a's `One-time code` card, which this pane used to draw as
+            // two more rows of the one above.**
+            //
+            // The owner: "TOTP should be separate tile and not with
+            // password". 8a gives the code its own card between the
+            // credentials and the autofill targets, and the EDIT pane has
+            // always drawn it that way (`detail_edit`'s
+            // `Section::OneTimeCode`) -- so the two panes disagreed about
+            // which card the row belonged to, one click apart.
+            //
+            // Drawn only when it would hold something. An item with no seed
+            // gets no card at all rather than an empty one, which is the same
+            // absent-rather-than-greyed rule the rest of this pane follows;
+            // `totp_row_for` is still the one thing that decides whether
+            // there is a code row, so "this item looks like it has no 2FA"
+            // stays a decision a unit test can call directly.
+            let code = totp_row_for(totp);
+            // **The seed, under the code, and only when BOTH are true.**
                 // The preference is off unless the user turned it on, and the
                 // item has to actually carry a seed. Either one false and
                 // nothing is laid out at all -- no band, no hairline, no eye,
@@ -4095,9 +4098,41 @@ pub fn draw_detail_read(
                 // on that function's own early return** -- which its doc
                 // states is defence in depth and production-unreachable, and
                 // this row does not change that.
-                if reveal_totp_seed && masked_row_visible(totp_secret) {
-                    theme::row_rule(ui);
-                    masked_row(
+            let seed = reveal_totp_seed && masked_row_visible(totp_secret);
+            // `TotpRow` borrows, so the presence is taken as a `bool` before
+            // the match below consumes it.
+            let has_code = code.is_some();
+            if has_code || seed {
+                card(ui, TOTP_CARD_HEADING, |ui| {
+                    // Exhaustive on purpose -- no catch-all arm -- so a new
+                    // `TotpRow` variant fails to compile here instead of
+                    // silently inheriting whatever the last arm happened to
+                    // draw.
+                    //
+                    // Only a login reaches this, and only a login ever could:
+                    // `totp_state_for_secret_presence` forces `NoSecret` (the
+                    // one state that draws no row) for any item whose own
+                    // login data carries no seed, and a non-login has no
+                    // login data at all.
+                    if let Some(row) = code {
+                        match row {
+                            TotpRow::Fetching => totp_fetching_row(ui),
+                            TotpRow::Code { code, seconds_left, period } => {
+                                totp_code_row(ui, code, seconds_left, period, &mut action)
+                            }
+                            TotpRow::Unavailable => totp_unavailable_row(ui),
+                            TotpRow::NoCode => totp_no_code_row(ui),
+                        }
+                    }
+                    if seed {
+                        // The rule only when there is a row above it to
+                        // separate from, which is the same guard the
+                        // password's carries: a rule over a gap is a
+                        // separator with nothing on one side of it.
+                        if has_code {
+                            theme::row_rule(ui);
+                        }
+                        masked_row(
                         ui,
                         TOTP_SECRET_LABEL,
                         totp_secret,
@@ -4116,9 +4151,10 @@ pub fn draw_detail_read(
                         // seed has no grouping and no last four.
                         MaskedFace::default(),
                     );
-                }
-            });
-            ui.add_space(CARD_GAP);
+                    }
+                });
+                ui.add_space(CARD_GAP);
+            }
         }
         // The body is the NOTES card below, and that card is shared with
         // every other kind rather than duplicated here.
@@ -12545,8 +12581,9 @@ mod tests {
     /// card. `the_card_heading_list_is_complete` counts the `card(` call sites
     /// in this file against it, so a ninth card fails the build's own suite
     /// rather than quietly narrowing the ordering claim.
-    const EVERY_CARD_HEADING: [&str; 10] = [
+    const EVERY_CARD_HEADING: [&str; 11] = [
         "LOGIN CREDENTIALS",
+        TOTP_CARD_HEADING,
         "CARD DETAILS",
         "IDENTITY",
         "SSH KEY",
@@ -12566,7 +12603,7 @@ mod tests {
     #[test]
     fn the_card_heading_list_is_complete() {
         let source = include_str!("detail.rs");
-        // Nine literal-heading cards plus `card(ui, pane.heading, ..)`, whose
+        // Ten literal-heading cards plus `card(ui, pane.heading, ..)`, whose
         // heading is `UNSUPPORTED ITEM` and is in the list under that name.
         // Real call sites only: a doc comment naming `card(ui, ...)` is a
         // mention, not a card, and three of them are in this file.
@@ -13945,7 +13982,7 @@ mod tests {
         // The layout, MEASURED: the whole row is still inside its card, and
         // the code is still to the left of the countdown with the track
         // between them.
-        let card = frame.filled_box_around(frame.rect_of("LOGIN CREDENTIALS"), theme::CARD);
+        let card = totp_card(&frame);
         let countdown = frame.rect_of(&format!("{seconds}s"));
         assert!(
             card.contains_rect(countdown),
@@ -18473,8 +18510,15 @@ mod tests {
 
     /// The `LOGIN CREDENTIALS` card's own box, so the two passes can be
     /// compared on HEIGHT and not merely on which strings appeared.
-    fn login_card(frame: &Frame) -> egui::Rect {
-        frame.filled_box_around(frame.rect_of("LOGIN CREDENTIALS"), theme::CARD)
+    // **`login_card` was here.** Every caller was a test about the one-time
+    // code or its seed, and both rows moved to a card of their own -- see
+    // `totp_card` below, which is what they ask for now.
+
+    /// The `ONE-TIME CODE` card, which the code row and the seed row moved
+    /// into -- 8a gives them a card of their own and the EDIT pane always
+    /// has. The owner: "TOTP should be separate tile and not with password".
+    fn totp_card(frame: &Frame) -> egui::Rect {
+        frame.filled_box_around(frame.rect_of(TOTP_CARD_HEADING), theme::CARD)
     }
 
     /// One row rule inside `card` -- a 1pt `theme::CANVAS` fill, the shape
@@ -18585,7 +18629,11 @@ mod tests {
         // 2. THE CARD IS EXACTLY AS TALL as one with no such row. A row
         //    hidden rather than skipped still takes its band, and this is the
         //    only instrument that can tell the two apart.
-        let (card_off, card_on) = (login_card(&off), login_card(&on));
+        // The ONE-TIME CODE card, since that is where both rows live now.
+        // Both passes draw the code row -- asserted above -- so the card
+        // exists in both and the comparison is a row's worth of height and
+        // not a card appearing.
+        let (card_off, card_on) = (totp_card(&off), totp_card(&on));
         assert!(card_off.height() > 0.0, "the card has no box at all: {card_off:?}");
         let grew = card_on.height() - card_off.height();
         let a_row = ROW_CONTENT_HEIGHT + 2.0 * f32::from(ROW_PAD_Y);
@@ -18673,7 +18721,11 @@ mod tests {
             with.strings()
         );
 
-        let (card_without, card_with) = (login_card(&without), login_card(&with));
+        // **The `ONE-TIME CODE` card**, since that is where the seed row
+        // lives now. Both passes still draw the CODE row -- the poll in this
+        // harness yields one either way -- so the card exists in both and the
+        // comparison is a row's worth of height rather than a card appearing.
+        let (card_without, card_with) = (totp_card(&without), totp_card(&with));
         let a_row = ROW_CONTENT_HEIGHT + 2.0 * f32::from(ROW_PAD_Y);
         assert!(
             card_with.height() - card_without.height() >= a_row,
@@ -18687,6 +18739,9 @@ mod tests {
             without.eyes.len() + 1,
             "the seedless pass did not lose exactly one reveal eye"
         );
+        // Inside the `ONE-TIME CODE` card, which both passes draw: the
+        // rule being counted is the one between the code row and the seed
+        // row, and it is the only hairline either pass gains or loses.
         assert_eq!(
             rules_in(&with, card_with),
             rules_in(&without, card_without) + 1,
@@ -18724,10 +18779,10 @@ mod tests {
             "the two rows are at the same height, so the comparison above is reading one number \
              twice"
         );
-        // ...and inside the login card, not floating in the pane.
+        // ...and inside the ONE-TIME CODE card, not floating in the pane.
         assert!(
-            login_card(&frame).contains_rect(secret),
-            "the secret row is outside the LOGIN CREDENTIALS card"
+            totp_card(&frame).contains_rect(secret),
+            "the secret row is outside the {TOTP_CARD_HEADING} card"
         );
 
         // MASKED, with an eye that is not struck through -- the only visible
@@ -19225,7 +19280,9 @@ mod tests {
             );
         }
 
-        let (card_without, card_with) = (login_card(&without), login_card(&with));
+        // The `ONE-TIME CODE` card -- see the same comparison in
+        // `the_secret_row_is_not_drawn_for_an_item_with_no_seed`.
+        let (card_without, card_with) = (totp_card(&without), totp_card(&with));
         let a_row = ROW_CONTENT_HEIGHT + 2.0 * f32::from(ROW_PAD_Y);
         assert!(
             card_with.height() - card_without.height() >= a_row,
@@ -19239,6 +19296,9 @@ mod tests {
             without.eyes.len() + 1,
             "the keyless pass did not lose exactly one reveal eye"
         );
+        // Inside the `ONE-TIME CODE` card, which both passes draw: the
+        // rule being counted is the one between the code row and the seed
+        // row, and it is the only hairline either pass gains or loses.
         assert_eq!(
             rules_in(&with, card_with),
             rules_in(&without, card_without) + 1,
